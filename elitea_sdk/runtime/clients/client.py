@@ -96,7 +96,7 @@ class EliteAClient:
             self.headers.update(api_extra_headers)
         self.predict_url = f"{self.base_url}{self.api_path}/prompt_lib/predict/prompt_lib/{self.project_id}"
         self.base_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/"
-        self.base_public_app_url = f"{self.base_url}{self.api_path}/applications/public_application/prompt_lib/"
+        self.base_public_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/public_application/prompt_lib/"
         self.app = f"{self.base_app_url}{self.project_id}"
         self.mcp_tools_list = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_list/{self.project_id}"
         self.mcp_tools_call = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_call/{self.project_id}"
