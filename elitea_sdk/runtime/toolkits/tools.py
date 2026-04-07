@@ -176,8 +176,8 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 tool_handled = True
                 # Check if this is a pipeline to enable PrinterNode filtering
                 is_pipeline_subgraph = tool.get('agent_type', '') == 'pipeline'
-                # Get project_id from settings (needed for public project agents)
-                app_project_id = tool.get('settings', {}).get('project_id')
+                # Get project_id from top level (injected by BE for all data paths)
+                app_project_id = tool.get('project_id')
                 # Get agent_type for metadata
                 agent_type = tool.get('agent_type', 'agent')
                 logger.info(f"[APP_TOOL] Processing application tool '{tool.get('name')}': "
@@ -198,7 +198,8 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         mcp_tokens=mcp_tokens,
                         project_id=app_project_id,  # Use agent's project, not conversation's
                         conversation_id=conversation_id,
-                        agent_type=agent_type  # Pass agent_type for metadata
+                        agent_type=agent_type,  # Pass agent_type for metadata
+                        fallback_llm=llm,  # Fallback for embedded sub-agents with null llm_settings
                     ).get_tools())
                 except Exception as app_err:
                     # Gracefully skip application tools that fail to load (e.g., deleted agents)

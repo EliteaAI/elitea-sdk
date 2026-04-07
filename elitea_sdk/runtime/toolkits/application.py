@@ -87,7 +87,8 @@ class ApplicationToolkit(BaseToolkit):
                     selected_tools: list[str] = [], store: Optional[BaseStore] = None,
                     ignored_mcp_servers: Optional[list] = None, is_subgraph: bool = False,
                     mcp_tokens: Optional[dict] = None, project_id: int = None,
-                    conversation_id: Optional[str] = None, agent_type: str = 'agent'):
+                    conversation_id: Optional[str] = None, agent_type: str = 'agent',
+                    fallback_llm=None):
         """
         Get toolkit for an application.
 
@@ -106,21 +107,38 @@ class ApplicationToolkit(BaseToolkit):
         if is_public_project:
             # Use public application endpoint for cross-project access
             public_data = client.get_public_app_details(application_id)
-            app_details = public_data  # Contains name, description, etc.
             version_details = public_data.get('version_details', {})
+            # Verify we got the expected version; re-fetch by version name if mismatched
+            if version_details.get('id') != application_version_id:
+                target_name = None
+                for v in public_data.get('versions', []):
+                    if v.get('id') == application_version_id:
+                        target_name = v.get('name')
+                        break
+                if target_name:
+                    public_data = client.get_public_app_details(application_id, version_name=target_name)
+                    version_details = public_data.get('version_details', {})
+            app_details = public_data
         else:
             # Use standard endpoints for same-project access
             app_details = client.get_app_details(application_id)
             version_details = client.get_app_version_details(application_id, application_version_id)
-        model_settings = {
-            "max_tokens": version_details['llm_settings']['max_tokens'],
-            "reasoning_effort": version_details['llm_settings'].get('reasoning_effort'),
-            "temperature": version_details['llm_settings']['temperature'],
-        }
+        # Embedded sub-agents intentionally have null llm_settings; fall back to caller's LLM.
+        llm_settings = version_details.get('llm_settings') or {}
+        _model_name = llm_settings.get('model_name')
+        if _model_name:
+            model_settings = {
+                "max_tokens": llm_settings.get('max_tokens'),
+                "reasoning_effort": llm_settings.get('reasoning_effort'),
+                "temperature": llm_settings.get('temperature'),
+            }
+            resolved_llm = client.get_llm(_model_name, model_settings)
+        else:
+            model_settings = {}
+            resolved_llm = fallback_llm
 
         app = client.application(application_id, application_version_id, store=store,
-                                 llm=client.get_llm(version_details['llm_settings']['model_name'],
-                                                    model_settings),
+                                 llm=resolved_llm,
                                  ignored_mcp_servers=ignored_mcp_servers,
                                  mcp_tokens=mcp_tokens,
                                  conversation_id=conversation_id,
@@ -168,7 +186,7 @@ class ApplicationToolkit(BaseToolkit):
                                           "application_id": application_id,
                                           "application_version_id": application_version_id,
                                           "store": store,
-                                          "llm": client.get_llm(version_details['llm_settings']['model_name'], model_settings),
+                                          "llm": resolved_llm,
                                           "ignored_mcp_servers": ignored_mcp_servers,
                                           "is_subgraph": is_subgraph,  # Pass is_subgraph flag
                                           "mcp_tokens": mcp_tokens,
