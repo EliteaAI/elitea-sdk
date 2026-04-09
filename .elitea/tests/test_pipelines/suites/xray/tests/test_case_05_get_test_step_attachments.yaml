@@ -1,0 +1,235 @@
+name: "XR05 - get_test_step_attachments: Retrieve test step attachments"
+description: |
+  Verify the Xray 'get_test_step_attachments' tool retrieves attachments from test steps.
+
+  Objective: Test retrieval of attachment metadata for test steps
+
+  Expected Behavior:
+  - Query executes without errors
+  - Returns attachment information if attachments exist
+  - Response contains attachment metadata (id, filename, downloadLink)
+  - Handles tests without attachments gracefully
+  - No error indicators in output
+
+toolkits:
+  - id: ${XRAY_TOOLKIT_ID}
+    name: ${XRAY_TOOLKIT_NAME}
+
+state:
+  project_key:
+    type: str
+    value: ${XRAY_PROJECT_KEY:EL}
+  graphql_query:
+    type: str
+  test_issue_id:
+    type: str
+  graphql_result:
+    type: str
+  attachments_result:
+    type: str
+  expected_success_indicators:
+    type: list
+    value: ["attachments", "test", "issue_id"]
+  error_indicators:
+    type: list
+    value: ["Failed to get", "error", "exception", "Test not found", "does not exist"]
+  test_results:
+    type: dict
+
+entry_point: prepare_graphql_query
+nodes:
+  - id: prepare_graphql_query
+    type: code
+    code:
+      type: fixed
+      value: |
+        # Build a GraphQL query that returns only 1 Manual test to keep state small
+        project_key = elitea_state.get("project_key", "EL")
+        graphql_query = f'''query {{
+          getTests(jql: "project = \\"{project_key}\\" AND testType = \\"Manual\\" AND labels in (ELITEA_AI_CREATED)", limit: 1, start: 0) {{
+            results {{
+              issueId
+            }}
+          }}
+        }}'''
+        {"graphql_query": graphql_query}
+    input:
+      - project_key
+    output:
+      - graphql_query
+    structured_output: true
+    transition: execute_graphql_query
+
+  - id: execute_graphql_query
+    type: toolkit
+    input:
+      - graphql_query
+    input_mapping:
+      graphql:
+        type: variable
+        value: graphql_query
+    output:
+      - graphql_result
+    structured_output: false
+    tool: execute_graphql
+    toolkit_name: ${XRAY_TOOLKIT_NAME}
+    transition: extract_test_id
+
+  - id: extract_test_id
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        # graphql_result is small (1 test only) - safe to pass through state
+        result_str = elitea_state.get("graphql_result", "")
+        test_issue_id = "not_found"
+        try:
+            m = re.search(r"'issueId':\s*'?(\d+)'?", result_str)
+            if not m:
+                m = re.search(r'"issueId":\s*"?(\d+)"?', result_str)
+            if m:
+                test_issue_id = m.group(1)
+        except Exception:
+            pass
+        {"test_issue_id": test_issue_id}
+    input:
+      - graphql_result
+    output:
+      - test_issue_id
+    structured_output: true
+    transition: get_attachments
+
+  - id: get_attachments
+    type: toolkit
+    input:
+      - test_issue_id
+    input_mapping:
+      issue_id:
+        type: variable
+        value: test_issue_id
+    output:
+      - attachments_result
+    structured_output: false
+    tool: get_test_step_attachments
+    toolkit_name: ${XRAY_TOOLKIT_NAME}
+    transition: validate_results
+
+  - id: validate_results
+    type: llm
+    input:
+      - attachments_result
+      - test_issue_id
+      - expected_success_indicators
+      - error_indicators
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: You are a strict quality assurance validator. Only return valid JSON.
+      task:
+        type: fstring
+        value: |
+          Analyze the output from the 'get_test_step_attachments' tool execution.
+
+          Test Issue ID: {test_issue_id}
+          Attachments Result: {attachments_result}
+          Expected Success Indicators: {expected_success_indicators}
+          Error Indicators: {error_indicators}
+
+          This is a POSITIVE test - we expect successful attachment retrieval.
+          
+          IMPORTANT: If the result indicates "No attachments found", this is still a PASS
+          as long as there are no errors. The tool should handle tests without attachments gracefully.
+
+          Validation Criteria:
+          
+          CHECK EACH CRITERION:
+          
+          1. tool_executed = true (always true if we got a response)
+          
+          2. no_errors = true IF:
+             - Response does NOT contain: "Failed to get", "error", "exception", "Test not found", "does not exist"
+             - IMPORTANT: "No attachments found" is NOT an error - it's a valid success message
+          
+          3. valid_response = true IF:
+             - Response contains "No attachments found" OR
+             - Response contains attachment data (id, filename, downloadLink)
+          
+          4. test_id_valid = true IF:
+             - Response mentions a test key (like "EL-944") OR
+             - Response says "No attachments found for test" (proves test ID was used)
+          
+          5. test_passed = true IF AND ONLY IF all 4 criteria above are true
+          
+          EXAMPLE VALID SUCCESS: "No attachments found for test EL-944"
+          - tool_executed: true (got response)
+          - no_errors: true (no error keywords)
+          - valid_response: true (contains "No attachments found")
+          - test_id_valid: true (mentions "EL-944")
+          - test_passed: TRUE
+
+          Return JSON test_results:
+          {{
+            "test_passed": boolean (true only if ALL criteria pass),
+            "tool_executed": boolean,
+            "no_errors": boolean,
+            "valid_response": boolean,
+            "test_id_valid": boolean,
+            "has_attachments": boolean,
+            "attachments_count": integer (0 if none),
+            "success_indicator_found": "which indicator was found or 'none'",
+            "error_indicator_found": "which error indicator was found or 'none'",
+            "error": string | null
+          }}
+
+          Return ONLY the JSON object.
+    model: ${DEFAULT_LLM_MODEL}
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: extract_json_result
+
+  - id: extract_json_result
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+        import re
+
+        # Extract JSON from LLM response which may contain prose + JSON block
+        raw = elitea_state.get("test_results", "")
+        result_dict = {}
+
+        if isinstance(raw, dict) and "test_passed" in raw:
+            result_dict = raw
+        elif isinstance(raw, str) and raw.strip():
+            # Try direct parse first
+            try:
+                result_dict = json.loads(raw.strip())
+            except Exception:
+                # Extract JSON block from markdown fences or prose
+                m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+                if not m:
+                    m = re.search(r'(\{[^{}]*"test_passed"[^{}]*\})', raw, re.DOTALL)
+                if m:
+                    try:
+                        result_dict = json.loads(m.group(1))
+                    except Exception:
+                        pass
+
+        if not result_dict or "test_passed" not in result_dict:
+            result_dict = {"test_passed": None, "error": "Could not extract JSON from LLM response"}
+
+        # Wrap in test_results so framework finds it via result.test_results.test_passed path
+        {"test_results": result_dict}
+    input:
+      - test_results
+    output:
+      - test_results
+    structured_output: true
+    transition: END

@@ -1,0 +1,11 @@
+{
+    "tags": ["loader:text", "content:markdown", "feature:chunking", "edge:markdown-in-txt"],
+    "file_path": "../files/text_markdown.txt",
+    "configs": [
+        {"autodetect_encoding": true, "max_tokens": 512},
+        {"autodetect_encoding": true, "max_tokens": 50},
+        {"autodetect_encoding": true, "max_tokens": 100},
+        {"autodetect_encoding": true, "max_tokens": 256},
+        {"autodetect_encoding": true, "max_tokens": 2000}
+    ]
+}

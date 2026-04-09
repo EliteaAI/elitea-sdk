@@ -1,0 +1,8 @@
+{
+    "tags": ["loader:text", "content:unicode", "edge:encoding", "feature:chunking"],
+    "file_path": "../files/text_unicode.txt",
+    "configs": [
+        {"autodetect_encoding": true, "max_tokens": 512},
+        {"autodetect_encoding": true, "max_tokens": 256}
+    ]
+}

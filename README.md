@@ -1,2 +1,455 @@
-# elitea-sdk
-SDK for EliteA
+EliteA SDK
+=========
+
+EliteA SDK, built on top of Langchain, enables the creation of intelligent agents within the EliteA Platform using project-specific prompts and data sources. This SDK is designed for developers looking to integrate advanced AI capabilities into their projects with ease.
+
+Prerequisites
+-------------
+
+Before you begin, ensure you have the following requirements met:
+
+*   Python 3.10+
+*   An active deployment of Project EliteA
+*   Access to personal project
+
+Installation
+------------
+
+It is recommended to use a Python virtual environment to avoid dependency conflicts and keep your environment isolated.
+
+### 1. Create and activate a virtual environment
+
+For **Unix/macOS**:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+For **Windows**:
+```bat
+python -m venv .venv
+venv\Scripts\activate
+```
+
+### 2. Install dependencies
+
+Install all required dependencies for the SDK and toolkits:
+
+```bash
+pip install -U '.[all]'
+```
+
+Environment Setup
+-----------------
+
+Before running your EliteA agents, set up your environment variables. Create a `.env` file in the root directory of your project and include your Project EliteA credentials:
+
+```.env
+DEPLOYMENT_URL=<your_deployment_url>
+API_KEY=<your_api_key>
+PROJECT_ID=<your_project_id>
+```
+
+NOTE: these variables can be grabbed from your Elitea platform configuration page.
+![Platform configuration](docs/readme_imgs/platform_config.png "Platform configuration")
+
+### Custom .env File Location
+
+By default, the CLI looks for `.env` files in the following order:
+1. `.elitea/.env` (recommended)
+2. `.env` in the current directory
+
+You can override this by setting the `ELITEA_ENV_FILE` environment variable:
+
+```bash
+export ELITEA_ENV_FILE=/path/to/your/.env
+elitea-cli agent chat
+```
+
+Using the CLI for Interactive Chat
+----------------------------------
+
+The EliteA SDK includes a powerful CLI for interactive agent chat sessions.
+
+### Starting a Chat Session
+
+```bash
+# Interactive selection (shows all available agents + direct chat option)
+elitea-cli agent chat
+
+# Chat with a specific local agent
+elitea-cli agent chat .elitea/agents/my-agent.agent.md
+
+# Chat with a platform agent
+elitea-cli agent chat my-agent-name
+```
+
+### Direct Chat Mode (No Agent)
+
+You can start a chat session directly with the LLM without any agent configuration:
+
+```bash
+elitea-cli agent chat
+# Select option 1: "Direct chat with model (no agent)"
+```
+
+This is useful for quick interactions or testing without setting up an agent.
+
+### Chat Commands
+
+During a chat session, you can use the following commands:
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show all available commands |
+| `/model` | Switch to a different model (preserves chat history) |
+| `/add_mcp` | Add an MCP server from your local mcp.json (preserves chat history) |
+| `/add_toolkit` | Add a toolkit from $ELITEA_DIR/tools (preserves chat history) |
+| `/clear` | Clear conversation history |
+| `/history` | Show conversation history |
+| `/save` | Save conversation to file |
+| `exit` | End conversation |
+
+### Enhanced Input Features
+
+The chat interface includes readline-based input enhancements:
+
+| Feature | Key/Action |
+|---------|------------|
+| **Tab completion** | Press `Tab` to autocomplete commands (e.g., `/mo` → `/model`) |
+| **Command history** | `↑` / `↓` arrows to navigate through previous messages |
+| **Cursor movement** | `←` / `→` arrows to move within the current line |
+| **Start of line** | `Ctrl+A` jumps to the beginning of the line |
+| **End of line** | `Ctrl+E` jumps to the end of the line |
+| **Delete word** | `Ctrl+W` deletes the word before cursor |
+| **Clear line** | `Ctrl+U` clears from cursor to beginning of line |
+
+### Dynamic Model Switching
+
+Use `/model` to switch models on the fly:
+
+```
+> /model
+
+🔧 Select a model:
+
+#    Model              Type
+1    gpt-4o             openai
+2    gpt-4o-mini        openai
+3    claude-3-sonnet    anthropic
+
+Select model number: 1
+
+✓ Selected: gpt-4o
+╭──────────────────────────────────────────────────────────────╮
+│ ℹ Model switched to gpt-4o. Agent state reset, chat history  │
+│ preserved.                                                    │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+### Adding MCP Servers Dynamically
+
+Use `/add_mcp` to add MCP servers during a chat session. Servers are loaded from your local `mcp.json` file (typically at `.elitea/mcp.json`):
+
+```
+> /add_mcp
+
+🔌 Select an MCP server to add:
+
+#    Server       Type     Command/URL
+1    playwright   stdio    npx @playwright/mcp@latest
+2    filesystem   stdio    npx @anthropic/mcp-fs
+
+Select MCP server number: 1
+
+✓ Selected: playwright
+╭──────────────────────────────────────────────────────────────╮
+│ ℹ Added MCP: playwright. Agent state reset, chat history     │
+│ preserved.                                                    │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+### Adding Toolkits Dynamically
+
+Use `/add_toolkit` to add toolkits from your `$ELITEA_DIR/tools` directory (default: `.elitea/tools`):
+
+```
+> /add_toolkit
+
+🧰 Select a toolkit to add:
+
+#    Toolkit    Type    File
+1    jira       jira    jira-config.json
+2    github     github  github-config.json
+
+Select toolkit number: 1
+
+✓ Selected: jira
+╭──────────────────────────────────────────────────────────────╮
+│ ℹ Added toolkit: jira. Agent state reset, chat history       │
+│ preserved.                                                    │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+
+
+Using SDK with Streamlit for Local Development
+----------------------------------------------
+
+To use the SDK with Streamlit for local development, follow these steps:
+
+1. Ensure you have Streamlit installed:
+    ```bash
+    pip install streamlit
+    ```
+
+2. Run the Streamlit app:
+    ```bash
+    streamlit run elitea_local.py
+    ```
+
+Note: If **streamlit** throws an error related to **pytorch**, add this `--server.fileWatcherType none` extra arguments.
+Sometimes it tries to index **pytorch** modules, and since they are **C** modules it raises an exception.
+
+Example of launch configuration for Streamlit:
+Important: Make sure to set the correct path to your `.env` file and streamlit.
+![Launch configuration example](docs/readme_imgs/launch_config.png "Launch configuration")
+
+Streamlit Web Application
+------------------------
+
+The EliteA SDK includes a Streamlit web application that provides a user-friendly interface for interacting with EliteA agents. This application is powered by the `streamlit.py` module included in the SDK.
+
+### Key Features
+
+- **Agent Management**: Load and interact with agents created in the EliteA Platform
+- **Authentication**: Easily connect to your EliteA/Elitea deployment using your credentials
+- **Chat Interface**: User-friendly chat interface for communicating with your agents
+- **Toolkit Integration**: Add and configure toolkits for your agents
+- **Session Management**: Maintain conversation history and thread state
+
+### Using the Web Application
+
+1. **Authentication**:
+   - Navigate to the "EliteA Settings" tab in the sidebar
+   - Enter your deployment URL, API key, and project ID
+   - Click "Login" to authenticate with the EliteA Platform
+
+2. **Loading an Agent**:
+   - After authentication, you'll see a list of available agents
+   - Select an agent from the dropdown menu
+   - Specify a version name (default: 'latest')
+   - Optionally, select an agent type and add custom tools
+   - Click "Load Agent" to initialize the agent
+
+3. **Interacting with the Agent**:
+   - Use the chat input at the bottom of the screen to send messages to the agent
+   - The agent's responses will appear in the chat window
+   - Your conversation history is maintained until you clear it
+
+4. **Clearing Data**:
+   - Use the "Clear Chat" button to reset the conversation history
+   - Use the "Clear Config" button to reset toolkit configurations
+
+This web application simplifies the process of testing and interacting with your EliteA agents, making development and debugging more efficient.
+
+Using Elitea toolkits and tools with Streamlit for Local Development
+----------------------------------------------
+
+Actually, toolkits are part of the EliteA SDK (`elitea-sdk/tools`), so you can use them in your local development environment as well.
+To debug it, you can use the `elitea_local.py` file, which is a Streamlit application that allows you 
+to interact with your agents and toolkits by setting the breakpoints in the code of corresponding tool.
+
+# Example of agent's debugging with Streamlit:
+Assume we try to debug the user's agent called `Questionnaire` with the `Confluence` toolkit and `get_pages_with_label` method.
+Pre-requisites:
+- Make sure you have set correct variables in your `.env` file
+- Set the breakpoints in the `elitea_sdk/tools/confluence/api_wrapper.py` file, in the `get_pages_with_label` method
+
+1. Run the Streamlit app (using debug):
+    ```bash
+    streamlit run elitea_local.py
+    ```
+2. Login into the application with your credentials (populated from .env file)
+   - Enter your deployment URL, API key, and project ID (optionally)
+   - Click "Login" to authenticate with the EliteA Platform
+
+   ![login](docs/readme_imgs/login.png "login")
+3. Select `Questionnaire` agent
+
+   ![agent_selection](docs/readme_imgs/agent_selection.png "agent_selection")
+4. Query the agent with the required prompt:
+   ```
+   get pages with label `ai-mb`
+   ```
+5. Debug the agent's code:
+   - The Streamlit app will call the `get_pages_with_label` method of the `Confluence` toolkit
+   - The execution will stop at the breakpoint you set in the `elitea_sdk/tools/confluence/api_wrapper.py` file
+   - You can inspect variables, step through the code, and analyze the flow of execution
+![debugging](docs/readme_imgs/debugging.png "debugging")
+
+
+How to create a new toolkit
+----------------------------------------------
+The toolkit is a collection of pre-built tools and functionalities designed to simplify the development of AI agents. These toolkits provide developers with the necessary resources, such as APIs, data connectors to required services and systems.
+As an initial step, you have to decide on its capabilities to design required tools and its args schema.
+Example of the Testrail toolkit's capabilities:
+- `get_test_cases`: Retrieve test cases from Testrail
+- `get_test_runs`: Retrieve test runs from Testrail
+- `get_test_plans`: Retrieve test plans from Testrail
+- `create_test_case`: Create a new test case in Testrail
+- etc.
+
+### General Steps to Create a Toolkit
+### 1. Create the Toolkit package
+Create a new package under `elitea_sdk/tools/` for your toolkit, e.g., `elitea_sdk/tools/mytoolkit/`.
+
+### 2. Implement the API Wrapper
+Create an `api_wrapper.py` file in your toolkit directory. This file should:
+- Define a config class (subclassing `BaseToolApiWrapper`).
+- Implement methods for each tool/action you want to implement.
+- Provide a `get_available_tools()` method that returns tools' metadata and argument schemas.
+
+Note: 
+- args schema should be defined using Pydantic models, which will help in validating the input parameters for each tool.
+- make sure tools descriptions are clear and concise, as they will be used by LLM to define on tool's execution chain.
+- clearly define the input parameters for each tool, as they will be used by LLM to generate the correct input for the tool and whether it is required or optional (refer to https://docs.pydantic.dev/2.2/migration/#required-optional-and-nullable-fields if needed).
+
+**Example:**
+```python
+# elitea_sdk/tools/mytoolkit/api_wrapper.py
+from ...elitea_base import BaseToolApiWrapper
+from pydantic import create_model, Field
+
+
+class MyToolkitConfig(BaseToolApiWrapper):
+
+
+# Define config fields (e.g., API keys, endpoints)
+api_key: str
+
+
+def do_something(self, param1: str):
+
+
+   """Perform an action with param1."""
+# Implement your logic here
+return {"result": f"Did something with {param1}"}
+
+
+def get_available_tools(self):
+
+
+   return [
+      {
+         "name": "do_something",
+         "ref": self.do_something,
+         "description": self.do_something.__doc__,
+         "args_schema": create_model(
+            "DoSomethingModel",
+            param1=(str, Field(description="Parameter 1"))
+         ),
+      }
+   ]
+```
+
+### 3. Implement the Toolkit Configuration Class
+Create an `__init__.py` file in your toolkit directory. This file should:
+- Define a `toolkit_config_schema()` static method for toolkit's configuration (this data is used for toolkit configuration card rendering on UI).
+- Implement a `get_tools(tool)` method to grab toolkit's configuration parameters based on the configuration on UI.
+- Implement a `get_toolkit()` class method to instantiate tools.
+- Return a list of tool instances via `get_tools()`.
+**Example:**
+```python
+# elitea_sdk/tools/mytoolkit/__init__.py
+from pydantic import BaseModel, Field, create_model
+from langchain_core.tools import BaseToolkit, BaseTool
+from .api_wrapper import MyToolkitConfig
+from ...base.tool import BaseAction
+
+name = "mytoolkit"
+
+def get_tools(tool):
+    return MyToolkit().get_toolkit(
+        selected_tools=tool['settings'].get('selected_tools', []),
+        url=tool['settings']['url'],
+        password=tool['settings'].get('password', None),
+        email=tool['settings'].get('email', None),
+        toolkit_name=tool.get('toolkit_name')
+    ).get_tools()
+
+class MyToolkit(BaseToolkit):
+
+
+   tools: list[BaseTool] = []
+
+
+@staticmethod
+def toolkit_config_schema() -> BaseModel:
+
+
+   return create_model(
+         name,
+         url=(str, Field(title="Base URL", description="Base URL for the API")),
+         email=(str, Field(title="Email", description="Email for authentication", default=None)),
+         password=(str, Field(title="Password", description="Password for authentication", default=None)),
+         selected_tools=(list[str], Field(title="Selected Tools", description="List of tools to enable", default=[])),
+     )
+
+
+@classmethod
+def get_toolkit(cls, selected_tools=None, toolkit_name=None, **kwargs):
+   config = MyToolkitConfig(**kwargs)
+
+
+   available_tools = config.get_available_tools()
+   tools = []
+   for tool in available_tools:
+      if selected_tools and tool["name"] not in selected_tools:
+         continue
+   tools.append(BaseAction(
+      api_wrapper=config,
+      name=tool["name"],
+      description=tool["description"],
+      args_schema=tool["args_schema"]
+   ))
+   return cls(tools=tools)
+
+
+def get_tools(self) -> list[BaseTool]:
+
+
+   return self.tools
+```
+
+### 4. Add the Toolkit to the SDK
+Update the `__init__.py` file in the `elitea_sdk/tools/` directory to include your new toolkit:
+
+```python
+# elitea_sdk/tools/__init__.py
+
+def get_tools(tools_list, elitea: 'EliteAClient', llm: 'LLMLikeObject', *args, **kwargs):
+   ...
+   # add your toolkit here with proper type
+   elif tool['type'] == 'mytoolkittype':
+   tools.extend(get_mytoolkit(tool))
+
+# add toolkit's config schema
+def get_toolkits():
+    return [
+    ...,
+    MyToolkit.toolkit_config_schema(),
+    ]
+```
+
+### 5. Test Your Toolkit
+To test your toolkit, you can use the Streamlit application (`elitea_local.py`) to load and interact with your toolkit. 
+- Login to the platform
+- Select `Toolkit testing` tab
+- Choose your toolkit from the dropdown menu.
+- Adjust the configuration parameters as needed, and then test the tools by sending queries to them.
+
+**NOTE**: use `function mode` for testing of required tool.
+
+![custom_toolkit_config](docs/readme_imgs/custom_toolkit_config.png "custom_toolkit_config")
+![custom_toolkit_testing_interface](docs/readme_imgs/toolkit_testing_interface.png "custom_toolkit_testing_interface")

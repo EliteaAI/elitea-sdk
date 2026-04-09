@@ -1,0 +1,388 @@
+name: Execute Indexing Tests on Demand
+run-name: "Loader Tests on Demand (${{ inputs.run_mode }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment for tests'
+        required: true
+        type: choice
+        default: 'local'
+        options:
+          - local
+      run_mode:
+        description: 'How to run tests: matrix (suite-based), mark (-m expression), nodeid (single pytest node)'
+        required: true
+        type: choice
+        default: 'matrix'
+        options:
+          - matrix
+          - mark
+          - nodeid
+      test_suites:
+        description: 'Loader tests to execute (all discovers all document loader pytest files; custom allows comma-separated loader names or test file names/paths)'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - custom
+          - csv
+          - image
+          - json
+          - markdown
+          - text
+      custom_suites:
+        description: 'Comma-separated values for custom mode: EliteAXLoader, test_elitea_x_loader.py, x, or full test path'
+        required: false
+        type: string
+        default: ''
+      pytest_mark:
+        description: 'Pytest -m expression (used when run_mode=mark), e.g. loader_csv and feature_chunking'
+        required: false
+        type: string
+        default: ''
+      pytest_nodeid:
+        description: 'Pytest node id (used when run_mode=nodeid), e.g. tests/.../test_elitea_text_loader.py::test_loader[text_simple-config0]'
+        required: false
+        type: string
+        default: ''
+      exclude_suites:
+        description: 'Comma-separated loader names to exclude from execution (applies to "all" mode)'
+        required: false
+        type: string
+        default: ''
+      reportportal:
+        description: 'Add --reportportal to pytest command'
+        required: false
+        type: boolean
+        default: false
+      extra_pytest_args:
+        description: 'Additional pytest args appended as-is (optional), e.g. -v -s'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  configure-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      loader_matrix: ${{ steps.set-matrix.outputs.loader_matrix }}
+      has-tests: ${{ steps.set-matrix.outputs.has-tests }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tests/runtime/langchain/document_loaders/
+          sparse-checkout-cone-mode: false
+      
+      - name: Generate loader test matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          TEST_ROOT="tests/runtime/langchain/document_loaders"
+
+          trim() {
+            echo "$1" | xargs
+          }
+
+          normalize_loader_name() {
+            local value="$1"
+
+            # full path or filename like test_elitea_csv_loader.py
+            if [[ "$value" =~ (^|/)test_elitea_([a-z0-9_]+)_loader\.py$ ]]; then
+              local snake="${BASH_REMATCH[2]}"
+              local camel
+              camel=$(echo "$snake" | awk -F'_' '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1)) substr($i,2)}; OFS=""; print $0}')
+              echo "EliteA${camel}Loader"
+              return
+            fi
+
+            # already in EliteAXLoader format
+            if [[ "$value" =~ ^EliteA[A-Za-z0-9]+Loader$ ]]; then
+              echo "$value"
+              return
+            fi
+
+            # bare x or snake_case name
+            local normalized
+            normalized=$(echo "$value" | sed -E 's/[^A-Za-z0-9_]+/_/g')
+            local camel
+            camel=$(echo "$normalized" | awk -F'_' '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1)) substr($i,2)}; OFS=""; print $0}')
+            echo "EliteA${camel}Loader"
+          }
+
+          loader_to_test_path() {
+            local loader="$1"
+            local base="${loader#EliteA}"
+            base="${base%Loader}"
+            local snake
+            snake=$(echo "$base" | sed -E 's/([A-Z]+)([A-Z][a-z])/\1_\2/g; s/([a-z0-9])([A-Z])/\1_\2/g' | tr '[:upper:]' '[:lower:]')
+            echo "${TEST_ROOT}/test_elitea_${snake}_loader.py"
+          }
+
+          run_mode="${{ inputs.run_mode }}"
+          matrix_json="[]"
+
+          # Non-matrix modes generate a single matrix item
+          if [[ "$run_mode" == "mark" ]]; then
+            mark_expr=$(trim "${{ inputs.pytest_mark }}")
+            if [[ -z "$mark_expr" ]]; then
+              echo "::error::run_mode=mark requires pytest_mark input"
+              echo "has-tests=false" >> $GITHUB_OUTPUT
+              echo "loader_matrix=[]" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            matrix_json="[{\"loader\":\"mark:${mark_expr}\",\"mode\":\"mark\",\"mark_expr\":\"${mark_expr//\"/\\\"}\"}]"
+          elif [[ "$run_mode" == "nodeid" ]]; then
+            nodeid=$(trim "${{ inputs.pytest_nodeid }}")
+            if [[ -z "$nodeid" ]]; then
+              echo "::error::run_mode=nodeid requires pytest_nodeid input"
+              echo "has-tests=false" >> $GITHUB_OUTPUT
+              echo "loader_matrix=[]" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            matrix_json="[{\"loader\":\"nodeid\",\"mode\":\"nodeid\",\"nodeid\":\"${nodeid//\"/\\\"}\"}]"
+          fi
+
+          if [[ "$run_mode" != "matrix" ]]; then
+            echo "has-tests=true" >> $GITHUB_OUTPUT
+            echo "loader_matrix=$matrix_json" >> $GITHUB_OUTPUT
+            echo "Generated matrix: $matrix_json"
+            exit 0
+          fi
+
+          # Determine which loaders to test
+          if [[ "${{ inputs.test_suites }}" == "all" ]]; then
+            loaders=$(find "$TEST_ROOT" -maxdepth 1 -type f -name "test_elitea_*_loader.py" -printf '%f\n' | sort)
+          elif [[ "${{ inputs.test_suites }}" == "custom" ]]; then
+            # Use custom comma-separated list
+            loaders=$(echo "${{ inputs.custom_suites }}" | tr ',' '\n')
+          else
+            # Single loader specified
+            loaders="${{ inputs.test_suites }}"
+          fi
+          
+          # Parse exclusions as normalized loader names
+          normalized_excludes=""
+          if [[ -n "${{ inputs.exclude_suites }}" && "${{ inputs.test_suites }}" != "custom" ]]; then
+            exclude_list="${{ inputs.exclude_suites }}"
+            for exclude in ${exclude_list//,/ }; do
+              exclude_trimmed=$(trim "$exclude")
+              [[ -z "$exclude_trimmed" ]] && continue
+              normalized_excludes+=$(normalize_loader_name "$exclude_trimmed")
+              normalized_excludes+=$'\n'
+            done
+          fi
+          
+          # Build JSON matrix
+          matrix_json="["
+          first=true
+          while IFS= read -r raw_loader; do
+            raw_loader=$(trim "$raw_loader")
+            [[ -z "$raw_loader" ]] && continue
+
+            loader=$(normalize_loader_name "$raw_loader")
+            test_path=$(loader_to_test_path "$loader")
+
+            if [[ -n "$normalized_excludes" ]] && echo "$normalized_excludes" | grep -qx "$loader"; then
+              echo "Skipping excluded loader: $raw_loader -> $loader"
+              continue
+            fi
+
+            if [[ -n "$test_path" && -f "$test_path" ]]; then
+              if [[ "$first" == "false" ]]; then
+                matrix_json+=","
+              fi
+              matrix_json+="{\"loader\":\"$loader\",\"mode\":\"file\",\"test_path\":\"$test_path\"}"
+              first=false
+            else
+              echo "Skipping unknown or missing loader test: $raw_loader -> $loader ($test_path)"
+            fi
+          done <<< "$loaders"
+          matrix_json+="]"
+          
+          # Check if we have any tests
+          if [[ "$matrix_json" == "[]" ]]; then
+            echo "has-tests=false" >> $GITHUB_OUTPUT
+            echo "loader_matrix=[]" >> $GITHUB_OUTPUT
+          else
+            echo "has-tests=true" >> $GITHUB_OUTPUT
+            echo "loader_matrix=$matrix_json" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Generated matrix: $matrix_json"
+
+  test-execution:
+    needs: configure-matrix
+    if: needs.configure-matrix.outputs.has-tests == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      checks: write
+    env:
+      RP_ENABLED: ${{ inputs.reportportal }}
+      RP_ENDPOINT: ${{ secrets.RP_ENDPOINT }}
+      RP_PROJECT: ${{ secrets.RP_PROJECT }}
+      RP_API_KEY: ${{ secrets.RP_API_KEY }}
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        data: ${{ fromJson(needs.configure-matrix.outputs.loader_matrix) }}
+
+    container:
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      env:
+        DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve environment secrets
+        run: |
+          if [ "${{ inputs.environment }}" = "local" ]; then
+            ENV_UPPER="STAGE"
+          else
+            ENV_UPPER=$(echo "${{ inputs.environment }}" | tr '[:lower:]' '[:upper:]')
+          fi
+          echo "ENV_UPPER=${ENV_UPPER}" >> $GITHUB_ENV
+
+      - name: Setup test environment
+        uses: ./.github/actions/setup-test-environment
+        with:
+          deployment-url: ${{ secrets[format('DEPLOYMENT_URL_{0}', env.ENV_UPPER)] }}
+          api-token: ${{ secrets[format('ELITEA_API_KEY_{0}', env.ENV_UPPER)] }}
+          project-id: ${{ secrets[format('PROJECT_ID_{0}', env.ENV_UPPER)] }}
+
+      - name: Set ReportPortal launch name
+        shell: bash
+        run: |
+          launch_time=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "RP_LAUNCH=Loader Tests on Demand - ${{ matrix.data.loader }} - ${launch_time}" >> $GITHUB_ENV
+
+      - name: Ensure pytest dependencies are available
+        shell: bash
+        run: |
+          if [[ "${{ inputs.reportportal }}" == "true" ]]; then
+            python -m pip install -q ".[reporting]"
+          else
+            python -m pip install -q pytest
+          fi
+          python -m pytest --version
+
+      - name: Install additional Python dependencies
+        shell: bash
+        run: |
+          # Install packages not bundled in the base image.
+          # Add new packages here instead of rebuilding the Docker image.
+          pip install --no-cache-dir "deepeval>=3.4.6"
+
+      - name: Run document loader tests with pytest
+        id: run-tests
+        shell: bash
+        run: |
+          echo "::group::Running tests for ${{ matrix.data.loader }}"
+
+          mkdir -p ./test_results
+          mkdir -p ./tests/reports
+
+          mode="${{ matrix.data.mode }}"
+          reportportal_flag=""
+          if [[ "${{ inputs.reportportal }}" == "true" ]]; then
+            reportportal_flag="--reportportal"
+          fi
+
+          junit_path="tests/reports/test-results.xml"
+          extra_args="${{ inputs.extra_pytest_args }}"
+
+          if [[ "${{ inputs.reportportal }}" == "true" && -z "${RP_ENDPOINT:-}" ]]; then
+            RP_ENDPOINT="https://tms.onetest.ai/api/receiver"
+            export RP_ENDPOINT
+            echo "RP_ENDPOINT: defaulted to ${RP_ENDPOINT}"
+          fi
+
+          echo "ReportPortal enabled: ${{ inputs.reportportal }}"
+          echo "RP_LAUNCH: ${RP_LAUNCH:-<unset>}"
+          if [[ -n "${RP_ENDPOINT:-}" ]]; then
+            echo "RP_ENDPOINT: configured"
+          else
+            echo "RP_ENDPOINT: missing"
+          fi
+          if [[ -n "${RP_PROJECT:-}" ]]; then
+            echo "RP_PROJECT: configured"
+          else
+            echo "RP_PROJECT: missing"
+          fi
+          if [[ -n "${RP_API_KEY:-}" ]]; then
+            echo "RP_API_KEY: configured"
+          else
+            echo "RP_API_KEY: missing"
+          fi
+
+          if [[ "${{ inputs.reportportal }}" == "true" ]]; then
+            missing=()
+            [[ -z "${RP_ENDPOINT:-}" ]] && missing+=("RP_ENDPOINT")
+            [[ -z "${RP_PROJECT:-}" ]] && missing+=("RP_PROJECT")
+            [[ -z "${RP_API_KEY:-}" ]] && missing+=("RP_API_KEY")
+            if (( ${#missing[@]} > 0 )); then
+              echo "::error::ReportPortal enabled but missing required env: ${missing[*]}"
+              exit 1
+            fi
+          fi
+
+          cmd=(python -m pytest -q)
+
+          if [[ "$mode" == "mark" ]]; then
+            mark_expr="${{ matrix.data.mark_expr }}"
+              cmd+=(tests/runtime/langchain/document_loaders/ -m "$mark_expr")
+          elif [[ "$mode" == "nodeid" ]]; then
+            nodeid="${{ matrix.data.nodeid }}"
+              cmd+=("$nodeid")
+          else
+            test_path="${{ matrix.data.test_path }}"
+              cmd+=("$test_path")
+          fi
+
+            if [[ -n "$reportportal_flag" ]]; then
+              cmd+=("$reportportal_flag")
+            fi
+            cmd+=("--junit-xml=$junit_path")
+
+            if [[ -n "$extra_args" ]]; then
+              # Preserve the existing workflow behavior of shell-style splitting for extra args.
+              # shellcheck disable=SC2206
+              extra_args_array=($extra_args)
+              cmd+=("${extra_args_array[@]}")
+            fi
+
+            printf 'Running command: '
+            printf '%q ' "${cmd[@]}"
+            echo
+
+            "${cmd[@]}"
+
+          echo "::endgroup::"
+
+      - name: PUBLISH TEST REPORT
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'tests/reports/test-results.xml'
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.data.loader }}
+          path: |
+            ./tests/reports/
+            ./tests/runtime/langchain/document_loaders/test_results/
+          retention-days: 30

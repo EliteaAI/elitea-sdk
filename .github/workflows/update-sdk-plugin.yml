@@ -1,0 +1,123 @@
+name: Update SDK Plugin
+
+on:
+  workflow_run:
+    workflows: ["Publish to PyPI 📦"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      create-pr:
+        description: "Create a pull request? (false = push directly)"
+        required: true
+        type: boolean
+        default: false
+      target-branch:
+        description: "Target branch in sdk_plugin (leave empty to use current branch)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  update-sdk-plugin:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: read
+      id-token: write
+
+    steps:
+      - name: Determine target branch
+        id: branch
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            BRANCH="${{ github.event.workflow_run.head_branch }}"
+          elif [ -n "${{ inputs.target-branch }}" ]; then
+            BRANCH="${{ inputs.target-branch }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "target_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "::notice title=Target Branch::Will update sdk_plugin on branch: $BRANCH"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch.outputs.target_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Get current version
+        id: get_version
+        run: |
+          VERSION=$(python -c "import build.util; print(build.util.project_wheel_metadata('.').get('Version'))")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Checkout sdk_plugin
+        uses: actions/checkout@v4
+        with:
+          repository: EliteaAI/sdk_plugin
+          ssh-key: ${{ secrets.SDK_PLUGIN_DEPLOYMENT_KEY }}
+          path: sdk_plugin
+          ref: ${{ steps.branch.outputs.target_branch }}
+
+      - name: Update requirements.txt and metadata.json
+        run: |
+          cd sdk_plugin
+          # Update elitea-sdk version in requirements.txt
+          sed -i "s/elitea-sdk\[all\]==[0-9.]*/elitea-sdk\[all\]==${{ steps.get_version.outputs.version }}/" requirements.txt
+          # Update version in metadata.json
+          python -c "
+          import json
+          with open('metadata.json', 'r') as f:
+              data = json.load(f)
+          data['version'] = '${{ steps.get_version.outputs.version }}'
+          with open('metadata.json', 'w') as f:
+              json.dump(data, f, indent=2)
+              f.write('\n')
+          "
+
+      - name: Commit and push changes
+        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && inputs.create-pr == false)
+        run: |
+          cd sdk_plugin
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add requirements.txt metadata.json
+          if git diff --cached --quiet; then
+            echo "::notice title=No Changes::sdk_plugin already at version ${{ steps.get_version.outputs.version }}"
+          else
+            git commit -m "chore: update elitea-sdk to version ${{ steps.get_version.outputs.version }}"
+            git push
+          fi
+
+      - name: Create Pull Request
+        if: github.event_name == 'workflow_dispatch' && inputs.create-pr == true
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update elitea-sdk to version ${{ steps.get_version.outputs.version }}"
+          title: "Update elitea-sdk to version ${{ steps.get_version.outputs.version }}"
+          body: |
+            This PR updates elitea-sdk to version ${{ steps.get_version.outputs.version }}:
+            - `requirements.txt`: pip dependency pin
+            - `metadata.json`: plugin version for pylon
+
+            Automatically triggered by PyPI release.
+            Target branch: ${{ steps.branch.outputs.target_branch }}
+          branch: update-sdk-${{ steps.branch.outputs.target_branch }}
+          base: ${{ steps.branch.outputs.target_branch }}
+          delete-branch: true
+
+      - name: Show version bump annotation
+        run: |
+          echo "::notice title=Version Bump::Updated sdk_plugin to elitea-sdk ${{ steps.get_version.outputs.version }}"

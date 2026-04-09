@@ -1,0 +1,51 @@
+# Structured Output Test Suite Configuration
+# This file defines the test execution configuration for structured output tests
+#
+# These tests validate LLM structured output functionality and type handling
+
+name: structured_output
+description: LLM structured output and type handling tests
+
+# Setup steps executed before running tests
+setup: []
+
+# Test execution configuration
+execution:
+  # Tests are located in tests/ subdirectory
+  test_directory: tests
+
+  # Order of test execution (by file pattern or explicit list)
+  order:
+    - test_case_1_*.yaml
+    - test_case_2_*.yaml
+    - test_case_3_*.yaml
+    - test_case_4_*.yaml
+    - test_case_5_*.yaml
+    - test_case_6_*.yaml
+    - test_case_7_*.yaml
+    - test_case_8_*.yaml
+    - test_case_9_*.yaml
+    - test_case_10_*.yaml
+
+  # Execution settings
+  settings:
+    timeout: 180
+    parallel: 1  # Sequential for dependent tests
+    stop_on_failure: false
+
+# Composable pipelines - RCA for failure analysis
+composable_pipelines: []
+
+# Hooks for custom actions
+hooks:
+  # Run after each test - RCA on failure
+  post_test: []
+
+# Cleanup steps executed after tests complete
+cleanup:
+  # Delete seeded pipelines
+  - name: Delete Test Pipelines
+    type: pipeline
+    config:
+      pattern: "SO*"  # All structured output test pipelines
+    continue_on_error: true

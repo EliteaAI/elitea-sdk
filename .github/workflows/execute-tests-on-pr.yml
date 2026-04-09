@@ -1,0 +1,246 @@
+name: Pr verification
+
+on:
+  pull_request:
+     types: [opened, synchronize]
+     branches:
+       - main
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to analyze (required for workflow_dispatch)'
+        required: false
+        type: number
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  EXCLUDE_SUITES: 'figma,bitbucket,postman,qtest'
+  AGENT_MATRIX_FILE: '.elitea/tests/test_pipelines/test_matrix.json'
+
+jobs:
+  configure-matrix:
+    runs-on: ubuntu-latest
+    if: github.actor != 'eln1nxl'
+    outputs:
+      test_matrix: ${{ steps.set-matrix.outputs.test_matrix }}
+      has-tests: ${{ steps.set-matrix.outputs.has-tests }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      tests_config: ${{ steps.set-matrix.outputs.tests_config }}
+      skip_reason: ${{ steps.set-matrix.outputs.skip_reason }}
+      run_all: ${{ steps.set-matrix.outputs.run_all }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Docker Compose
+        run: |
+          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose --version
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull Docker image
+        run: |
+          IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          docker pull ${{ env.REGISTRY }}/$IMAGE_NAME:pyodide
+
+      - name: Run PR Impact Analyzer Agent
+        id: run-agent
+        run: |
+          # Determine PR number - fail if not available
+          if [ -z "${{ env.PR_NUMBER }}" ]; then
+            echo "::error::No PR context available - this workflow requires a PR"
+            exit 1
+          fi
+          
+          echo "::notice::Analyzing PR #${{ env.PR_NUMBER }} with AI agent"
+          
+          # Run the PR Impact Analyzer agent via docker-compose - fail if agent fails
+          docker-compose run --rm --name elitea-sdk-analyzer elitea-sdk \
+            sh -c "git config --global --add safe.directory /app && elitea agent run .elitea/agents/pr-impact-analyzer.agent.md --dir . 'Analyze PR ${{ env.PR_NUMBER }}'"
+        env:
+          DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+          DEFAULT_LLM_MODEL: ${{ secrets.DEFAULT_LLM_MODEL }}
+          ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE }}
+          ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE }}
+          ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE }}
+          GIT_TOOL_ACCESS_TOKEN: ${{ secrets.GIT_TOOL_ACCESS_TOKEN }}
+
+      - name: Parse Agent Output
+        id: set-matrix
+        uses: ./.github/actions/generate-test-matrix
+        with:
+          mode: agent
+          exclude_suites: ${{ env.EXCLUDE_SUITES }}
+          agent_matrix_file: ${{ env.AGENT_MATRIX_FILE }}
+
+      - name: Write Step Summary
+        if: steps.set-matrix.outputs.has-tests == 'true'
+        run: |
+          MATRIX_FILE="${{ env.AGENT_MATRIX_FILE }}"
+          RUN_ALL="${{ steps.set-matrix.outputs.run_all }}"
+          SUITES='${{ steps.set-matrix.outputs.matrix }}'
+          SUITE_COUNT=$(echo "$SUITES" | jq 'length')
+          REASON=$(jq -r '.reason // "No reason provided"' "$MATRIX_FILE")
+
+          {
+            echo "# 🤖 PR Impact Analysis"
+            echo ""
+            echo "## 📊 Analysis Summary"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| **PR Number** | #${{ env.PR_NUMBER }} |"
+            echo "| **Run All Tests** | $([ "$RUN_ALL" = "true" ] && echo "✅ Yes" || echo "❌ No") |"
+            echo "| **Suites Affected** | $SUITE_COUNT |"
+            echo ""
+            echo "> **Analysis Reason:** $REASON"
+            echo ""
+            echo "## 🧪 Test Suites to Execute"
+            echo ""
+            echo "| Suite | Tests to Run | Mode |"
+            echo "|-------|--------------|------|"
+            
+            jq -r '.matrix[] | "| `\(.suite)` | \(if .run_all_tests then "All tests" else (.tests_to_run | if length == 0 then "All tests" else (map("`\(.)`") | join(", ")) end) end) | \(if .run_all_tests then "🔄 Full Suite" else "🎯 Targeted" end) |"' "$MATRIX_FILE"
+            
+            echo ""
+            echo "---"
+            echo ""
+            echo "<details>"
+            echo "<summary>📋 Raw Agent Output</summary>"
+            echo ""
+            echo '```json'
+            cat "$MATRIX_FILE"
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "---"
+            echo "*Analysis performed by AI agent on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
+          } >> $GITHUB_STEP_SUMMARY
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Write Skip Summary
+        if: steps.set-matrix.outputs.has-tests == 'false'
+        run: |
+          REASON="${{ steps.set-matrix.outputs.skip_reason }}"
+          if [ -z "$REASON" ]; then
+            REASON="No reason provided"
+          fi
+          {
+            echo "# 🤖 PR Impact Analysis"
+            echo ""
+            echo "## ⏭️ Tests Skipped"
+            echo ""
+            echo "> **Reason:** $REASON"
+            echo ""
+            echo "---"
+            echo "*Analysis performed by AI agent on PR #${{ env.PR_NUMBER }}*"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload PR change context artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-change-context
+          path: .elitea/tests/test_pipelines/pr_change_context.json
+          if-no-files-found: warn
+          retention-days: 1
+
+  toolkit-tests:
+    needs: [configure-matrix]
+    if: needs.configure-matrix.outputs.has-tests == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        data: ${{ fromJson(needs.configure-matrix.outputs.test_matrix) }}
+    uses: ./.github/workflows/test-runner-reusable.yml
+    with:
+      test_cases_dir: ${{ matrix.data.suite }}
+      tests_to_run: ${{ matrix.data.tests_to_run }}
+      environment: local
+      enable_parallel: true
+      enable_bug_reporting: true
+      enable_rp_reporting: false
+    secrets: inherit
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'eln1nxl'
+    permissions:
+      contents: read
+      packages: read
+      checks: write
+    container:
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      env:
+        PYTHONDONTWRITEBYTECODE: "1"
+        PYTHONUNBUFFERED: "1"
+        DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+        ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE }}
+        ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE }}
+        ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make elitea-sdk source available
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE:${PYTHONPATH}" >> $GITHUB_ENV
+
+      - name: Ensure pytest is available
+        run: python -m pip install -q pytest && python -m pytest --version
+
+      - name: Install deepeval for document loader tests
+        run: python -m pip install --no-cache-dir "deepeval>=3.4.6"
+
+      - name: Run unit tests
+        run: |
+          mkdir -p tests/reports
+          python -m pytest tests/ --ignore=tests/runtime/test_elitea_llm.py --junit-xml=tests/reports/unit-test-results.xml
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: tests/reports/unit-test-results.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: PUBLISH TEST REPORT
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'tests/reports/unit-test-results.xml'
+
+  summarize-and-comment:
+    needs: [configure-matrix, toolkit-tests]
+    if: always() && needs.configure-matrix.outputs.has-tests == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Post test summary to PR
+        uses: ./.github/actions/post-test-summary
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ env.PR_NUMBER }}

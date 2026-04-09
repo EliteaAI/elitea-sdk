@@ -1,0 +1,75 @@
+name: bitbucket_toolkit
+description: |
+  Bitbucket toolkit integration tests
+
+  Test Structure:
+  - Branch Operations (BB01-BB06): Test branch management operations
+  - File Operations (BB07-BB16): Test file CRUD operations
+  - Pull Request Operations (BB17-BB27): Test PR management operations
+  - Branch Deletion Operations (BB24-BB25): Test branch deletion operations
+
+env_mapping:
+  toolkit_config: ${BITBUCKET_CONFIG_PATH:../../configs/bitbucket-cloud-config.json}
+  url: ${BITBUCKET_URL:https://api.bitbucket.org}
+  username: ${BITBUCKET_USERNAME:vvaryushkin@gmail.com}
+  password: ${BITBUCKET_TOKEN}
+  project: ${BITBUCKET_PROJECT:elitea-automation}
+  repository: ${BITBUCKET_REPOSITORY:automation}
+  cloud: ${BITBUCKET_CLOUD:true}
+
+setup:
+  - name: Setup Bitbucket Configuration
+    type: configuration
+    config:
+      config_type: bitbucket
+      elitea_title: ${BITBUCKET_SECRET_NAME:bitbucket}
+      data:
+        url: ${BITBUCKET_URL:https://api.bitbucket.org}
+        username: ${BITBUCKET_USERNAME:vvaryushkin@gmail.com}
+        password: ${BITBUCKET_TOKEN}
+
+  - name: Create Bitbucket Toolkit
+    type: toolkit
+    action: create_or_update
+    config:
+      config_file: ${BITBUCKET_CONFIG_PATH:../../configs/bitbucket-cloud-config.json}
+      toolkit_type: bitbucket
+      toolkit_name: ${BITBUCKET_TOOLKIT_NAME:bitbucket-testing}
+    save_to_env:
+      - key: BITBUCKET_TOOLKIT_ID
+        value: $.id
+      - key: BITBUCKET_TOOLKIT_NAME
+        value: $.name
+
+composable_pipelines: []
+
+execution:
+  test_directory: .
+  order:
+    - test_case_*.yaml
+
+  substitutions:
+    BITBUCKET_TOOLKIT_ID: ${BITBUCKET_TOOLKIT_ID}
+    BITBUCKET_TOOLKIT_NAME: ${BITBUCKET_TOOLKIT_NAME}
+    ACTIVE_BRANCH: ${ACTIVE_BRANCH:main}
+    TIMESTAMP: ${TIMESTAMP}
+    DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:gpt-4o-2024-11-20}
+
+  settings:
+    timeout: 180
+    parallel: 5
+    stop_on_failure: false
+
+cleanup:
+  - name: Delete Test Pipelines
+    type: pipeline
+    config:
+      pattern: "BB*"
+    continue_on_error: true
+
+  - name: Delete Bitbucket Toolkit
+    type: toolkit
+    config:
+      toolkit_id: ${BITBUCKET_TOOLKIT_ID}
+    enabled: true
+    continue_on_error: true

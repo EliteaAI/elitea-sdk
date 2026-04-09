@@ -1,0 +1,36 @@
+from typing import Optional, Type
+
+from langchain_core.callbacks import CallbackManagerForToolRun
+from pydantic import BaseModel, field_validator, Field
+from langchain_core.tools import BaseTool
+from traceback import format_exc
+from .api_wrapper import EliteAGitHubAPIWrapper
+
+
+class GitHubAction(BaseTool):
+    """Tool for interacting with the GitHub API."""
+
+    api_wrapper: EliteAGitHubAPIWrapper = Field(default_factory=EliteAGitHubAPIWrapper)
+    name: str
+    mode: str = ""
+    description: str = ""
+    args_schema: Optional[Type[BaseModel]] = None
+    handle_tool_error: bool = True
+    
+    @field_validator('name', mode='before')
+    @classmethod
+    def remove_spaces(cls, v):
+        return v.replace(' ', '')
+
+    def _run(
+            self,
+            *args,
+            run_manager: Optional[CallbackManagerForToolRun] = None,
+            **kwargs,
+    ) -> str:
+        """Use the GitHub API to run an operation."""
+        # Strip numeric suffix added for deduplication (_2, _3, etc.)
+        # to get the original tool name that exists in the wrapper
+        import re
+        mode = re.sub(r'_\d+$', '', self.mode) if self.mode else self.mode
+        return self.api_wrapper.run(mode, *args, **kwargs)

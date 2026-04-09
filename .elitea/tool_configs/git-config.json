@@ -1,0 +1,27 @@
+{
+  "type": "github",
+  "toolkit_name": "github",
+  "id": 3,
+  "github_configuration": {
+    "access_token": "${GIT_TOOL_ACCESS_TOKEN}"
+  },
+  "repository": "EliteaAI/elitea-sdk",
+  "active_branch": "main",
+  "base_branch": "main",
+  "selected_tools": [
+      "list_open_pull_requests",
+      "get_pull_request",
+      "list_pull_request_diffs",
+      "create_file",
+      "read_file",
+      "update_file",
+      "list_files_in_main_branch",
+      "list_branches_in_repo",
+      "set_active_branch",
+      "get_files_from_directory",
+      "get_commit_changes",
+      "get_commits_diff",
+      "generic_github_api_call",
+      "get_commits"
+  ]
+}

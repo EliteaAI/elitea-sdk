@@ -1,0 +1,10 @@
+{
+    "tags": ["loader:csv", "feature:raw_content"],
+    "file_path": "../files/csv_simple.csv",
+    "configs": [
+        {"encoding": "utf-8", "raw_content": true, "cleanse": false},
+        {"encoding": "utf-8", "raw_content": true, "cleanse": false},
+        {"encoding": "utf-8", "raw_content": true, "cleanse": false},
+        {"encoding": "utf-8", "raw_content": true, "cleanse": false}
+    ]
+}

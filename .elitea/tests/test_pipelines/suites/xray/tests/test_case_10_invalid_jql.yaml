@@ -1,0 +1,218 @@
+name: "XR10 - get_tests: Handle invalid JQL syntax (Negative Test)"
+description: |
+  Verify the Xray 'get_tests' tool properly handles malformed JQL queries.
+
+  Objective: Test error handling for invalid JQL syntax
+
+  Expected Behavior (NEGATIVE TEST):
+  - Tool returns error for malformed JQL
+  - Error message indicates JQL parsing problem
+  - Proper error handling without crashing
+  - No test data is returned
+
+toolkits:
+  - id: ${XRAY_TOOLKIT_ID}
+    name: ${XRAY_TOOLKIT_NAME}
+
+state:
+  project_key:
+    type: str
+    value: ${XRAY_PROJECT_KEY:EL}
+  invalid_jql_query:
+    type: str
+    value: "project = AND testType INVALID SYNTAX ((("
+  get_tests_result:
+    type: str
+  trimmed_error:
+    type: str
+  expected_error_indicators:
+    type: list
+    value: ["Unable to get tests", "error", "failed", "exception", "syntax", "parse"]
+  unexpected_success_indicators:
+    type: list
+    value: ["Extracted tests", "total.*results", "issueId.*16"]
+  test_results:
+    type: dict
+
+entry_point: get_tests_with_invalid_jql
+nodes:
+  - id: get_tests_with_invalid_jql
+    type: toolkit
+    input:
+      - invalid_jql_query
+    input_mapping:
+      jql:
+        type: variable
+        value: invalid_jql_query
+    output:
+      - get_tests_result
+    structured_output: false
+    tool: get_tests
+    toolkit_name: ${XRAY_TOOLKIT_NAME}
+    continue_on_error: true
+    transition: trim_error_output
+
+  - id: trim_error_output
+    type: code
+    code:
+      type: fixed
+      value: |
+        # Extract only the error message line, not the full stack trace
+        # This prevents LLM token overflow
+        result = elitea_state.get('get_tests_result', '')
+        
+        # Extract just the error message (first 300 chars)
+        if 'Error Message:' in result:
+            # Find the error message line
+            lines = result.split('\n')
+            error_msg = ''
+            for i, line in enumerate(lines):
+                if 'Error Message:' in line:
+                    # Get this line and maybe next line
+                    error_msg = line
+                    if i + 1 < len(lines) and lines[i + 1].strip():
+                        error_msg += ' ' + lines[i + 1].strip()
+                    break
+            trimmed_error = error_msg[:300] if error_msg else result[:300]
+        else:
+            # Fallback: just take first 300 chars
+            trimmed_error = result[:300]
+        
+        {"trimmed_error": trimmed_error}
+    input:
+      - get_tests_result
+    output:
+      - trimmed_error
+    structured_output: true
+    transition: validate_error_handling
+
+  - id: validate_error_handling
+    type: llm
+    input:
+      - trimmed_error
+      - invalid_jql_query
+      - expected_error_indicators
+      - unexpected_success_indicators
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: You are a strict quality assurance validator. Only return valid JSON.
+      task:
+        type: fstring
+        value: |
+          Analyze the result from executing 'get_tests' with invalid JQL syntax.
+          
+          CONTEXT:
+          - The Xray tool handles JQL errors by returning error information
+          - For this NEGATIVE test, we expect the tool to reject malformed JQL
+          - Evidence: Either error message present OR no successful test data returned
+          
+          Get Tests Result: {trimmed_error}
+          Invalid JQL Query Used: {invalid_jql_query}
+          Expected Error Indicators: {expected_error_indicators}
+          Unexpected Success Indicators: {unexpected_success_indicators}
+
+          VALIDATION LOGIC:
+          
+          CRITICAL REQUIREMENT:
+          This is a NEGATIVE test - we expect a proper error message, NOT empty/null output.
+          Empty or null error messages indicate BROKEN error handling and should FAIL the test.
+          
+          This negative test PASSES only if the tool returns a proper error message.
+
+          Validation Criteria (ALL must pass for test_passed=true):
+          1. tool_executed: Always true (we reached this validation node)
+          2. has_error_message: Result is NOT empty/null/None (length > 10 characters)
+          3. error_message_meaningful: Result contains at least one expected error indicator
+          4. no_test_data: Output does NOT contain actual test data (i.e. does NOT start with "Extracted tests" or contain numeric issueId values like "issueId: 12345")
+          5. no_success_message: Output does NOT contain the literal phrase "Extracted tests" at the start of the response
+
+          FAILURE CONDITIONS:
+          - If result is empty, null, or < 10 characters: has_error_message = false, TEST FAILS
+          - If result does not contain any expected error indicators: error_message_meaningful = false, TEST FAILS
+          - If result starts with "Extracted tests" or contains actual numeric issueId data: TEST FAILS
+          - NOTE: The error message body may reference field names like "results", "jira", "issueId" as part of explaining the error — this is NOT a success indicator
+
+          Return JSON test_results:
+          {{
+            "test_passed": boolean (true only if ALL criteria pass),
+            "tool_executed": true,
+            "has_error_message": boolean (true if result is non-empty with length > 10),
+            "error_message_meaningful": boolean (true if contains expected error indicators),
+            "no_test_data": boolean (true if no issueId/jira fields found),
+            "no_success_message": boolean (true if no 'Extracted tests' message),
+            "error_indicator_found": "which error indicator was found or 'none'",
+            "result_length": number (character count of result),
+            "result_preview": "first 150 chars of result or 'EMPTY/NULL - ERROR HANDLING BROKEN'"
+          }}
+
+          Return ONLY the JSON object.
+    model: ${DEFAULT_LLM_MODEL}
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: extract_json_result
+
+  - id: extract_json_result
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+        import re
+
+        # Extract JSON from LLM response which may contain prose + JSON block
+        raw = elitea_state.get("test_results", "")
+        result_dict = {}
+
+        def extract_json_from_text(text):
+            if not text or not isinstance(text, str):
+                return {}
+            try:
+                return json.loads(text.strip())
+            except Exception:
+                pass
+            m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+            if not m:
+                m = re.search(r'(\{[^{}]*"test_passed"[^{}]*\})', text, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except Exception:
+                    pass
+            return {}
+
+        if isinstance(raw, dict) and "test_passed" in raw:
+            result_dict = raw
+        elif isinstance(raw, str) and raw.strip():
+            result_dict = extract_json_from_text(raw)
+
+        # Fallback: scan chat_history for LLM JSON response
+        if not result_dict or "test_passed" not in result_dict:
+            chat_history = elitea_state.get("chat_history", [])
+            for msg in reversed(chat_history):
+                content = ""
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                elif hasattr(msg, "content"):
+                    content = msg.content
+                if isinstance(content, str) and "test_passed" in content:
+                    result_dict = extract_json_from_text(content)
+                    if result_dict and "test_passed" in result_dict:
+                        break
+
+        if not result_dict or "test_passed" not in result_dict:
+            result_dict = {"test_passed": None, "error": "Could not extract JSON from LLM response"}
+
+        # Wrap in test_results so framework finds it via result.test_results.test_passed path
+        {"test_results": result_dict}
+    input:
+      - test_results
+    output:
+      - test_results
+    structured_output: true
+    transition: END

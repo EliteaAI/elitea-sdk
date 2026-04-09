@@ -1,0 +1,212 @@
+name: "PST47 update request body"
+priority: High
+description: |
+  Validates that the update_request_body tool properly handles updating
+  request body with form data mode.
+  
+  Objective: Verify form data body updates
+  
+  Expected Behavior:
+  - Tool executes successfully
+  - Form data body is properly set
+  - Form fields are structured correctly
+  - Returns confirmation of the update
+
+toolkits:
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
+
+state:
+  tool_result:
+    type: dict
+  test_results:
+    type: dict
+  folder_name:
+    type: str
+  request_name:
+    type: str
+  folder_path:
+    type: str
+  request_path:
+    type: str
+  mode:
+    type: str
+    value: "formdata"
+  body:
+    type: dict
+    value:
+      mode: "formdata"
+      formdata:
+        - key: "name"
+          value: "Test User"
+          type: "text"
+        - key: "email"
+          value: "test@example.com"
+          type: "text"
+  create_folder_result:
+    type: str
+  create_request_result:
+    type: str
+  delete_request_result:
+    type: str
+  delete_folder_result:
+    type: str
+
+entry_point: prepare_test_data
+
+nodes:
+  - id: prepare_test_data
+    type: code
+    code:
+      type: fixed
+      value: |
+        import time
+        import random
+        import string
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        folder_name = f"PST47_Folder_{timestamp}_{suffix}"
+        request_name = f"PST47_Request_{timestamp}_{suffix}"
+        folder_path = folder_name
+        request_path = f"{folder_name}/{request_name}"
+        {"folder_name": folder_name, "request_name": request_name, "folder_path": folder_path, "request_path": request_path}
+    output:
+      - folder_name
+      - request_name
+      - folder_path
+      - request_path
+    structured_output: true
+    transition: create_test_folder
+
+  - id: create_test_folder
+    type: toolkit
+    toolkit_name: ${TOOLKIT_NAME}
+    tool: create_folder
+    input:
+      - folder_name
+    input_mapping:
+      name:
+        type: variable
+        value: folder_name
+    output:
+      - create_folder_result
+    structured_output: true
+    transition: create_test_request
+
+  - id: create_test_request
+    type: toolkit
+    toolkit_name: ${TOOLKIT_NAME}
+    tool: create_request
+    input:
+      - folder_path
+      - request_name
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      name:
+        type: variable
+        value: request_name
+      method:
+        type: fixed
+        value: "POST"
+      url:
+        type: fixed
+        value: "https://api.example.com/upload"
+    output:
+      - create_request_result
+    structured_output: true
+    transition: invoke_update_request_body
+
+  - id: invoke_update_request_body
+    type: toolkit
+    toolkit_name: ${TOOLKIT_NAME}
+    tool: update_request_body
+    input:
+      - request_path
+      - body
+    input_mapping:
+      request_path:
+        type: variable
+        value: request_path
+      body:
+        type: variable
+        value: body
+    output:
+      - tool_result
+    structured_output: true
+    transition: process_results
+
+  - id: process_results
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - tool_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the output from the 'update_request_body' tool with form data.
+          
+          Tool Result: {tool_result}
+          
+          This test validates that update_request_body handles form data bodies.
+          
+          Perform the following checks:
+          1. Confirm the tool executed successfully.
+          2. Verify the form data body was accepted.
+          3. Check that form fields are properly structured.
+          4. Validate the update completed successfully.
+          
+          Return a JSON object named test_results with the following structure:
+          
+          {{
+            "test_passed": boolean (true if form data body was updated),
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+          
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: cleanup_delete_request
+
+  - id: cleanup_delete_request
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${TOOLKIT_NAME}
+    tool: delete_request
+    input:
+      - request_path
+    input_mapping:
+      request_path:
+        type: variable
+        value: request_path
+    output:
+      - delete_request_result
+    structured_output: true
+    transition: cleanup_delete_folder
+
+  - id: cleanup_delete_folder
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${TOOLKIT_NAME}
+    tool: delete_folder
+    input:
+      - folder_path
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+    output:
+      - delete_folder_result
+    structured_output: true
+    transition: END

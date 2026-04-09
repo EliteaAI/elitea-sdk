@@ -1,0 +1,136 @@
+from typing import List, Literal, Optional
+
+from langchain_core.tools import BaseTool, BaseToolkit
+from pydantic import BaseModel, Field, create_model
+
+import requests
+
+from ...elitea_base import filter_missconfigured_index_tools
+from ....configurations.ado import AdoConfiguration
+from ....configurations.pgvector import PgVectorConfiguration
+from ...base.tool import BaseAction
+from .repos_wrapper import ReposApiWrapper
+from ...utils import check_connection_response
+from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
+
+name = "ado_repos"
+
+
+def get_toolkit(tool) -> BaseToolkit:
+    return AzureDevOpsReposToolkit().get_toolkit(
+        selected_tools=tool['settings'].get('selected_tools', []),
+        ado_configuration=tool['settings']['ado_configuration'],
+        repository_id=tool['settings']['repository_id'],
+        limit=tool['settings'].get('limit', 5),
+        base_branch=tool['settings'].get('base_branch', "main"),
+        active_branch=tool['settings'].get('active_branch', "main"),
+        toolkit_name=tool.get('toolkit_name', ''),
+        pgvector_configuration=tool['settings'].get('pgvector_configuration', {}),
+        embedding_model=tool['settings'].get('embedding_model'),
+        collection_name=tool['toolkit_name'],
+        elitea=tool['settings'].get('elitea', None),
+        llm=tool['settings'].get('llm', None),
+    )
+
+def get_tools(tool):
+    return get_toolkit(tool).get_tools()
+
+class AzureDevOpsReposToolkit(BaseToolkit):
+    tools: List[BaseTool] = []
+
+    @staticmethod
+    def toolkit_config_schema() -> BaseModel:
+        selected_tools = {x['name']: x['args_schema'].schema() for x in ReposApiWrapper.model_construct().get_available_tools()}
+        m = create_model(
+            name,
+            ado_configuration=(AdoConfiguration, Field(description="ADO configuration", default=None,
+                                                       json_schema_extra={'configuration_types': ['ado']})),
+            repository_id=(str, Field(description="ADO repository ID or name")),
+            base_branch=(Optional[str], Field(default="main", title="Base branch", description="ADO base branch (e.g., main)")),
+            active_branch=(Optional[str], Field(default="main", title="Active branch", description="ADO active branch (e.g., main)")),
+
+            # indexer settings
+            pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None, description="PgVector Configuration", json_schema_extra={'configuration_types': ['pgvector']})),
+            # embedder settings
+            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            __config__={
+                'json_schema_extra': {
+                    'metadata': {
+                        "label": "ADO repos",
+                        "icon_url": "ado-repos-icon.svg",
+                        "categories": ["code repositories"],
+                        "extra_categories": ["code", "repository", "version control"],
+                        "sections": {
+                            "auth": {
+                                "required": True,
+                                "subsections": [
+                                    {
+                                        "name": "Token",
+                                        "fields": ["token"]
+                                    }
+                                ]
+                            }
+                        },
+                        "configuration_group": {
+                            "name": "ado",
+                        }
+                    }
+                }
+            }
+        )
+
+        @check_connection_response
+        def check_connection(self):
+            ado_config = self.ado_configuration
+            response = requests.get(
+                f'{ado_config.organization_url}/{ado_config.project}/_apis/git/repositories/{self.repository_id}?api-version=7.0',
+                headers = {'Authorization': f'Bearer {ado_config.token.get_secret_value() if ado_config.token else ""}'},
+                timeout=5
+            )
+            return response
+
+        m.check_connection = check_connection
+        return m
+
+    @classmethod
+    @filter_missconfigured_index_tools
+    def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, **kwargs):
+        from os import environ
+
+        if not environ.get("AZURE_DEVOPS_CACHE_DIR", None):
+            environ["AZURE_DEVOPS_CACHE_DIR"] = "/tmp/.azure-devops"
+        if selected_tools is None:
+            selected_tools = []
+
+        wrapper_payload = {
+            **kwargs,
+            # Extract ADO configuration fields
+            **kwargs['ado_configuration'],
+            **(kwargs.get('pgvector_configuration') or {}),
+        }
+        azure_devops_repos_wrapper = ReposApiWrapper(**wrapper_payload)
+        available_tools = azure_devops_repos_wrapper.get_available_tools()
+        tools = []
+        for tool in available_tools:
+            if selected_tools:
+                if tool["name"] not in selected_tools:
+                    continue
+            description = tool["description"] + f"\nADO instance: {azure_devops_repos_wrapper.organization_url}/{azure_devops_repos_wrapper.project}"
+            if toolkit_name:
+                description = f"{description}\nToolkit: {toolkit_name}"
+            description = description[:1000]
+            tools.append(
+                BaseAction(
+                    api_wrapper=azure_devops_repos_wrapper,
+                    name=tool["name"],
+                    description=description,
+                    args_schema=tool["args_schema"],
+                    metadata={TOOLKIT_NAME_META: toolkit_name, TOOLKIT_TYPE_META: name, TOOL_NAME_META: tool["name"]} if toolkit_name else {TOOL_NAME_META: tool["name"]}
+                )
+            )
+        return cls(tools=tools)
+
+    def get_tools(self):
+        return self.tools

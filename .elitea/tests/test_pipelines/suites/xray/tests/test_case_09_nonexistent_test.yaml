@@ -1,0 +1,97 @@
+name: "XR09 - get_test_step_attachments: Handle non-existent test (Negative Test)"
+description: |
+  Verify the Xray 'get_test_step_attachments' tool properly handles requests for non-existent tests.
+
+  Objective: Test error handling when querying attachments for a test that doesn't exist
+
+  Expected Behavior (NEGATIVE TEST):
+  - Tool returns error for non-existent test ID
+  - Error message mentions test not found
+  - Proper error handling without crashing
+  - No attachment data is returned
+
+toolkits:
+  - id: ${XRAY_TOOLKIT_ID}
+    name: ${XRAY_TOOLKIT_NAME}
+
+state:
+  project_key:
+    type: str
+    value: ${XRAY_PROJECT_KEY:EL}
+  nonexistent_issue_id:
+    type: str
+    value: "999999999"
+  get_attachments_result:
+    type: str
+  expected_error_indicators:
+    type: list
+    value: ["Tool execution error", "Test not found", "not found", "Failed to get", "does not exist", "doesn't exist"]
+  unexpected_success_indicators:
+    type: list
+    value: ["total_attachments:", "downloadLink", "attachment_id", "filename"]
+  test_results:
+    type: dict
+
+entry_point: get_attachments_for_nonexistent_test
+nodes:
+  - id: get_attachments_for_nonexistent_test
+    type: toolkit
+    input:
+      - nonexistent_issue_id
+    input_mapping:
+      issue_id:
+        type: variable
+        value: nonexistent_issue_id
+    output:
+      - get_attachments_result
+    structured_output: false
+    tool: get_test_step_attachments
+    toolkit_name: ${XRAY_TOOLKIT_NAME}
+    continue_on_error: true
+    transition: validate_error_handling
+
+  - id: validate_error_handling
+    type: llm
+    input:
+      - get_attachments_result
+      - nonexistent_issue_id
+      - expected_error_indicators
+      - unexpected_success_indicators
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: You are a strict quality assurance validator. Only return valid JSON.
+      task:
+        type: fstring
+        value: |
+          Validate negative test: get_test_step_attachments with non-existent test ID.
+          
+          Result: {get_attachments_result}
+          Expected errors: {expected_error_indicators}
+          Unexpected success: {unexpected_success_indicators}
+
+          This NEGATIVE test PASSES if:
+          1. Result is NOT empty (length > 10)
+          2. Result contains error indicators
+          3. Result does NOT contain attachment data structures (total_attachments:, downloadLink:, attachment_id:)
+
+          Return JSON:
+          {{
+            "test_passed": boolean,
+            "tool_executed": true,
+            "has_error_message": boolean,
+            "error_message_meaningful": boolean,
+            "no_attachment_data": boolean,
+            "error_indicator_found": "string"
+          }}
+
+          Return ONLY the JSON object.
+    model: ${DEFAULT_LLM_MODEL}
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END

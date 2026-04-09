@@ -1,0 +1,116 @@
+name: ado_toolkit
+description: |
+  Azure DevOps (ADO) toolkit integration tests
+  
+  Test Structure:
+  - ADO Repos Tests (ADO01-ADO26): Test repository operations using ado_repos toolkit
+  - ADO Wiki Tests (ADO27-ADO31): Test wiki operations using ado_wiki toolkit
+  - ADO Work Items Tests (ADO32-ADO41): Test work items operations using ado_boards toolkit
+
+env_mapping:
+  toolkit_config: ${ADO_CONFIG_PATH:../../configs/ado-config.json}
+  organization_url: ${ADO_ORGANIZATION_URL}
+  project: ${ADO_PROJECT}
+  repository_id: ${ADO_REPOSITORY_ID}
+  token: ${ADO_TOKEN}
+
+setup:
+  - name: Setup ADO Configuration
+    type: configuration
+    config:
+      config_type: ado
+      elitea_title: ${ADO_SECRET_NAME:ado}
+      data:
+        token: ${ADO_TOKEN}
+        organization_url: ${ADO_ORGANIZATION_URL}
+        project: ${ADO_PROJECT}
+
+  - name: Create ADO Repos Toolkit
+    type: toolkit
+    action: create_or_update
+    config:
+      config_file: ../../configs/ado-repos-config.json
+      toolkit_type: ado_repos
+      toolkit_name: ${ADO_REPOS_TOOLKIT_NAME:ado-repos-testing}
+    save_to_env:
+      - key: ADO_REPOS_TOOLKIT_ID
+        value: $.id
+      - key: ADO_REPOS_TOOLKIT_NAME
+        value: $.name
+
+  - name: Create ADO Wiki Toolkit
+    type: toolkit
+    action: create_or_update
+    config:
+      config_file: ../../configs/ado-wiki-config.json
+      toolkit_type: ado_wiki
+      toolkit_name: ${ADO_WIKI_TOOLKIT_NAME:ado-wiki-testing}
+    save_to_env:
+      - key: ADO_WIKI_TOOLKIT_ID
+        value: $.id
+      - key: ADO_WIKI_TOOLKIT_NAME
+        value: $.name
+
+  - name: Create ADO Boards Toolkit
+    type: toolkit
+    action: create_or_update
+    config:
+      config_file: ../../configs/ado-config.json
+      toolkit_type: ado_boards
+      toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME:ado-boards-testing}
+    save_to_env:
+      - key: ADO_BOARDS_TOOLKIT_ID
+        value: $.id
+      - key: ADO_BOARDS_TOOLKIT_NAME
+        value: $.name
+
+composable_pipelines: []
+
+execution:
+  test_directory: tests
+  order:
+    - test_case_*.yaml
+
+  substitutions:
+    ADO_REPOS_TOOLKIT_ID: ${ADO_REPOS_TOOLKIT_ID}
+    ADO_REPOS_TOOLKIT_NAME: ${ADO_REPOS_TOOLKIT_NAME}
+    ADO_WIKI_TOOLKIT_ID: ${ADO_WIKI_TOOLKIT_ID}
+    ADO_WIKI_TOOLKIT_NAME: ${ADO_WIKI_TOOLKIT_NAME}
+    ADO_BOARDS_TOOLKIT_ID: ${ADO_BOARDS_TOOLKIT_ID}
+    ADO_BOARDS_TOOLKIT_NAME: ${ADO_BOARDS_TOOLKIT_NAME}
+    ADO_BASE_BRANCH: ${ADO_BASE_BRANCH:EliteaTest}
+    TIMESTAMP: ${TIMESTAMP}
+    DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:gpt-4o-2024-11-20}
+
+  settings:
+    timeout: 180
+    parallel: 1
+    stop_on_failure: false
+
+cleanup:
+  - name: Delete Test Pipelines
+    type: pipeline
+    config:
+      pattern: "ADO*"
+    continue_on_error: true
+
+  - name: Delete ADO Repos Toolkit
+    type: toolkit
+    config:
+      toolkit_id: ${ADO_REPOS_TOOLKIT_ID}
+    enabled: true
+    continue_on_error: true
+
+  - name: Delete ADO Wiki Toolkit
+    type: toolkit
+    config:
+      toolkit_id: ${ADO_WIKI_TOOLKIT_ID}
+    enabled: true
+    continue_on_error: true
+
+  - name: Delete ADO Boards Toolkit
+    type: toolkit
+    config:
+      toolkit_id: ${ADO_BOARDS_TOOLKIT_ID}
+    enabled: true
+    continue_on_error: true

@@ -1,0 +1,97 @@
+name: "GH04 - Search Issues"
+description: "Verify search_issues tool finds matching issues and PRs based on query"
+
+toolkits:
+  - id: ${GITHUB_TOOLKIT_ID}
+    name: ${GITHUB_TOOLKIT_NAME}
+
+state:
+  input:
+    type: str
+  messages:
+    type: list
+  search_query:
+    type: str
+    value: "state:open"
+  max_count:
+    type: int
+    value: 5
+  tool_result:
+    type: str
+  test_results:
+    type: dict
+
+entry_point: invoke_search
+
+nodes:
+  - id: invoke_search
+    type: toolkit
+    tool: search_issues
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
+    input:
+      - search_query
+      - max_count
+    input_mapping:
+      search_query:
+        type: variable
+        value: search_query
+      max_count:
+        type: variable
+        value: max_count
+    output:
+      - tool_result
+    structured_output: true
+    transition: process_results
+
+  - id: process_results
+    type: llm
+    model: gpt-4o
+    input:
+      - search_query
+      - max_count
+      - tool_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the output from the 'search_issues' tool.
+
+          Search Query: {search_query}
+          Max Count: {max_count}
+          Tool Result: {tool_result}
+
+          Perform the following checks:
+
+          1. Confirm the tool executed successfully (the result is not empty or null)
+          2. Verify that results were found (results_count > 0)
+          3. Check if results count is within the max_count limit
+          4. Parse the results structure (could be a list, or a dict with 'items' or 'issues' key)
+          5. Extract sample information from the first 5 results (number, title first 60 chars, state)
+
+          Return a JSON object named test_results with the following structure:
+
+          {{
+            "test_passed": boolean (true if tool executed and found results),
+            "tool_executed": boolean,
+            "search_query": string,
+            "max_count": integer,
+            "results_count": integer (number of results found),
+            "has_results": boolean (results_count > 0),
+            "within_limit": boolean (results_count <= max_count),
+            "issues_sample": list of dicts with keys: number, title, state,
+            "error": string or null (error message if any),
+            "failed_checks": list of strings (failed checks if any)
+          }}
+
+          Return **EXACTLY** **NONNEGOTIATABLE** only the `test_results` JSON object. Do not use markdown ```json when returning the json. Do not include any explanations, summaries, or additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+        test_results: "dict"
+    transition: END

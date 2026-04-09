@@ -1,0 +1,101 @@
+name: Execute Toolkit Tests on Demand
+run-name: "Toolkit Tests on Demand: ${{ inputs.environment }} - ${{ inputs.test_cases_dir == 'custom' && inputs.custom_suites || inputs.test_cases_dir }}${{ inputs.enable_parallel && ' (parallel)' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to run tests in'
+        required: true
+        type: choice
+        default: 'local'
+        options:
+          - local
+          - dev
+          - stage
+          - prod
+      test_cases_dir:
+        description: 'Toolkit tests to execute (all will execute all tests, custom allows specifying comma-separated list of suites, or choose specific suite)'
+        required: true
+        type: choice
+        options:
+          - all
+          - custom
+          - ado
+          - artifact
+          - github
+          - bitbucket
+          - confluence
+          - figma
+          - gitlab
+          - jira
+          - postman
+          - qtest
+          - testrail
+          - zephyr_essential
+          - xray
+          - sharepoint
+          - state_retrieval
+          - structured_output
+      custom_suites:
+        description: 'Comma-separated suite names (used only when test_cases_dir is "custom")'
+        required: false
+        type: string
+        default: ''
+      exclude_suites:
+        description: 'Comma-separated suite names to exclude from execution (applies to "all" and "custom" modes)'
+        required: false
+        type: string
+        default: 'bitbucket,postman,figma,qtest'
+      enable_bug_reporting:
+        description: 'Enable automatic bug report creation on GitHub (disable for testing)'
+        required: false
+        type: boolean
+        default: false
+      enable_rp_reporting:
+        description: 'Enable ReportPortal/OneTest reporting (sends test results to TMS)'
+        required: false
+        type: boolean
+        default: false
+      
+jobs:
+  configure-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      test_matrix: ${{ steps.set-matrix.outputs.test_matrix }}
+      has-tests: ${{ steps.set-matrix.outputs.has-tests }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/workflows/execute-toolkit-tests-on-demand.yml
+            .github/actions/generate-test-matrix
+          sparse-checkout-cone-mode: false
+      
+      - name: Generate test matrix
+        id: set-matrix
+        uses: ./.github/actions/generate-test-matrix
+        with:
+          mode: on-demand
+          test_cases_dir: ${{ inputs.test_cases_dir }}
+          custom_suites: ${{ inputs.custom_suites }}
+          exclude_suites: ${{ inputs.exclude_suites }}
+
+  test-execution:
+    needs: configure-matrix
+    if: needs.configure-matrix.outputs.has-tests == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        data: ${{ fromJson(needs.configure-matrix.outputs.test_matrix) }}
+    uses: ./.github/workflows/test-runner-reusable.yml
+    with:
+      test_cases_dir: ${{ matrix.data.suite }}
+      tests_to_run: ${{ matrix.data.tests_to_run }}
+      environment: ${{ github.event.inputs.environment }}
+      enable_parallel: true
+      enable_bug_reporting: ${{ inputs.enable_bug_reporting }}
+      enable_rp_reporting: ${{ inputs.enable_rp_reporting }}
+    secrets: inherit

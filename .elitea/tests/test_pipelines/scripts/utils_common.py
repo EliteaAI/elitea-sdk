@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+Common utilities shared across test pipeline scripts.
+
+This module consolidates common functions to avoid duplication across:
+- seed_pipelines.py
+- setup.py
+- run_suite.py
+- utils_local.py
+- cleanup.py
+"""
+
+import json
+import logging
+import os
+import re
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Optional, Dict
+
+import yaml
+
+# Setup logger
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Session ID Management (Parallel Execution Isolation)
+# =============================================================================
+
+
+def generate_session_id() -> str:
+    """Generate a unique short session ID for parallel execution isolation.
+
+    Returns an 8-character hex string (e.g., 'a1b2c3d4') that can be used to
+    scope resources (toolkits, pipelines, env files) to a specific test run,
+    preventing conflicts when multiple runs execute in parallel.
+    """
+    return uuid.uuid4().hex[:8]
+
+
+def get_session_pipeline_prefix(session_id: str | None) -> str:
+    """Get pipeline name prefix for a session.
+
+    Args:
+        session_id: Session ID string, or None for no prefix
+
+    Returns:
+        Prefix string like 'a1b2c3d4_' or empty string if no session
+    """
+    if session_id:
+        return f"{session_id}_"
+    return ""
+
+
+def apply_session_to_toolkit_name(toolkit_name: str, session_id: str | None) -> str:
+    """Apply session ID suffix to a toolkit name for isolation.
+
+    Args:
+        toolkit_name: Original toolkit name (e.g., 'testing-github')
+        session_id: Session ID string, or None for no change
+
+    Returns:
+        Scoped name like 'testing-github-a1b2c3d4' or unchanged if no session
+    """
+    if session_id:
+        return f"{toolkit_name}-{session_id}"
+    return toolkit_name
+
+
+def apply_session_to_pipeline_name(pipeline_name: str, session_id: str | None) -> str:
+    """Apply session ID prefix to a pipeline name for isolation.
+
+    Args:
+        pipeline_name: Original pipeline name (e.g., 'GH01 - List Branches')
+        session_id: Session ID string, or None for no change
+
+    Returns:
+        Scoped name like 'a1b2c3d4_GH01 - List Branches' or unchanged if no session
+    """
+    prefix = get_session_pipeline_prefix(session_id)
+    return f"{prefix}{pipeline_name}"
+
+
+def apply_session_to_cleanup_pattern(pattern: str, session_id: str | None) -> str:
+    """Apply session ID prefix to a cleanup pattern for scoped deletion.
+
+    Args:
+        pattern: Original cleanup pattern (e.g., 'GH*')
+        session_id: Session ID string, or None for no change
+
+    Returns:
+        Scoped pattern like 'a1b2c3d4_GH*' or unchanged if no session
+    """
+    prefix = get_session_pipeline_prefix(session_id)
+    return f"{prefix}{pattern}"
+
+
+def get_session_env_file(session_id: str | None, base_env_file: str = ".env") -> str:
+    """Get session-scoped env file path.
+
+    Args:
+        session_id: Session ID string, or None for default
+        base_env_file: Base env file name (default: '.env')
+
+    Returns:
+        Scoped path like '.env.a1b2c3d4' or unchanged if no session
+    """
+    if session_id:
+        return f"{base_env_file}.{session_id}"
+    return base_env_file
+
+
+# =============================================================================
+# Environment Variable Loading
+# =============================================================================
+
+# Global env file override (set via --env-file CLI option)
+_env_file_override: Path | None = None
+
+# Base path for resolving .env file locations (defaults to this file's parent)
+_scripts_dir: Path = Path(__file__).parent
+
+
+def set_env_file(env_file: str | Path | None):
+    """Set a custom env file to load variables from (has highest priority)."""
+    global _env_file_override
+    if env_file:
+        _env_file_override = Path(env_file)
+    else:
+        _env_file_override = None
+
+
+def load_from_env(var_name: str) -> str | None:
+    """Load value from environment variable or .env file.
+
+    Priority order:
+    1. Custom env file (if set via --env-file)
+    2. OS environment variables
+    3. Default .env file locations
+    """
+    # First check custom env file if set
+    if _env_file_override and _env_file_override.exists():
+        with open(_env_file_override) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and line.startswith(f"{var_name}="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+
+    # Then check OS environment
+    value = os.environ.get(var_name)
+    if value:
+        return value
+
+    # Finally try default .env file locations
+    # Path structure: scripts/ -> test_pipelines/ -> tests/ -> .elitea/ -> elitea-sdk/ -> elitea/
+    env_paths = [
+        _scripts_dir.parent / ".env",  # test_pipelines/.env (generated by setup.py)
+        _scripts_dir.parent.parent.parent.parent / ".env",  # elitea-sdk/.env
+        _scripts_dir.parent.parent.parent.parent.parent / ".env",  # elitea/.env (root)
+    ]
+
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and line.startswith(f"{var_name}="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+
+    return None
+
+
+def load_session_from_env() -> str | None:
+    """Load session cookie from environment variable or .env file."""
+    return load_from_env("ELITEA_SESSION")
+
+
+def load_token_from_env() -> str | None:
+    """Load API token from environment variable or .env file."""
+    return load_from_env("ELITEA_TOKEN") or load_from_env("AUTH_TOKEN") or load_from_env("API_KEY")
+
+
+def load_base_url_from_env() -> str | None:
+    """Load base URL from environment variable or .env file."""
+    return load_from_env("ELITEA_DEPLOYMENT_URL") or load_from_env("DEPLOYMENT_URL") or load_from_env("BASE_URL")
+
+
+def load_project_id_from_env() -> int | None:
+    """Load project ID from environment variable or .env file."""
+    value = load_from_env("ELITEA_PROJECT_ID") or load_from_env("PROJECT_ID")
+    if value:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return None
+
+
+# =============================================================================
+# Configuration Loading
+# =============================================================================
+
+
+def load_config(suite_folder: Path, pipeline_file: str | None = None, raise_on_missing: bool = False) -> dict | None:
+    """Load pipeline config from a suite folder.
+
+    Args:
+        suite_folder: Path to the suite directory
+        pipeline_file: Optional specific pipeline file name (e.g., 'pipeline_validation.yaml').
+                      If None, uses 'pipeline.yaml' or 'config.yaml' as fallback.
+        raise_on_missing: If True, raises FileNotFoundError when config not found.
+                         If False (default), returns None.
+
+    Returns:
+        Parsed YAML config dict, or None if not found and raise_on_missing=False.
+
+    Raises:
+        FileNotFoundError: If config not found and raise_on_missing=True.
+    """
+    if pipeline_file:
+        config_path = suite_folder / pipeline_file
+        if not config_path.exists():
+            if raise_on_missing:
+                raise FileNotFoundError(f"Config file not found: {config_path}")
+            return None
+    else:
+        # Try pipeline.yaml first (new convention)
+        config_path = suite_folder / "pipeline.yaml"
+        if not config_path.exists():
+            # Fall back to config.yaml for backwards compatibility
+            config_path = suite_folder / "config.yaml"
+            if not config_path.exists():
+                if raise_on_missing:
+                    raise FileNotFoundError(f"Config file not found in {suite_folder}")
+                return None
+
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def load_toolkit_config(
+    config_file: str,
+    base_path: Path,
+    env_substitutions: dict = None,
+    env_loader: Optional[Callable[[str], Optional[str]]] = None
+) -> dict:
+    """Load a toolkit configuration file (JSON) with environment variable substitution.
+
+    Args:
+        config_file: Path to config file (absolute or relative to base_path)
+        base_path: Base path for resolving relative paths
+        env_substitutions: Dict of variable name -> value for substitution (optional)
+        env_loader: Optional callable to load env vars (e.g., load_from_env function)
+
+    Returns:
+        Parsed JSON config dict with environment variables resolved.
+
+    Raises:
+        FileNotFoundError: If config file not found.
+    """
+    # Resolve relative path
+    if not os.path.isabs(config_file):
+        config_file = str(base_path / config_file)
+
+    with open(config_file) as f:
+        config = json.load(f)
+    
+    # Apply environment variable substitution
+    if env_substitutions is None:
+        env_substitutions = {}
+    
+    return resolve_env_value(config, env_substitutions, env_loader)
+
+
+def parse_suite_spec(suite_spec: str) -> tuple[str, str | None]:
+    """Parse suite specification into folder and optional pipeline file.
+
+    Format: 'suite_name' or 'suite_name:pipeline_file.yaml'
+
+    Examples:
+        'github_toolkit' -> ('github_toolkit', None)
+        'github_toolkit_negative:pipeline_validation.yaml' -> ('github_toolkit_negative', 'pipeline_validation.yaml')
+
+    Args:
+        suite_spec: Suite specification string
+
+    Returns:
+        Tuple of (folder_name, pipeline_file or None)
+    """
+    if ':' in suite_spec:
+        folder, pipeline_file = suite_spec.split(':', 1)
+        return folder, pipeline_file
+    return suite_spec, None
+
+
+def resolve_env_value(value: Any, env_substitutions: dict, env_loader: Optional[Callable[[str], Optional[str]]] = None) -> Any:
+    """Resolve environment variable references in a value.
+
+    Supports ${VAR} and ${VAR:default} syntax.
+    Recursively handles dicts and lists.
+
+    Args:
+        value: Value that may contain env var references (str, dict, list, or other)
+        env_substitutions: Dict of variable name -> value
+        env_loader: Optional callable to load env vars (e.g., load_from_env function).
+                   Falls back to os.environ.get if not provided.
+
+    Returns:
+        Resolved value with env vars substituted.
+    """
+    import re
+    
+    if isinstance(value, str):
+        # Pattern matches ${VAR} or ${VAR:default}
+        pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
+
+        def replace(match):
+            var_name = match.group(1)
+            default = match.group(2)
+
+            # Check substitutions dict first
+            if var_name in env_substitutions:
+                logger.debug(f"Resolved environment variable '{var_name}' from substitutions")
+                return str(env_substitutions[var_name])
+            
+            # Then check using env_loader or os.environ
+            if env_loader:
+                env_value = env_loader(var_name)
+                if env_value:
+                    logger.debug(f"Resolved environment variable '{var_name}' from .env")
+                    return env_value
+            else:
+                env_value = os.environ.get(var_name)
+                if env_value:
+                    logger.debug(f"Resolved environment variable '{var_name}' from OS environment")
+                    return env_value
+            
+            # Fall back to default
+            if default is not None:
+                logger.debug(f"Using default value for '{var_name}': '{default}'")
+                return default
+            
+            # Variable not found and no default provided - this is the ONLY error case
+            logger.error(f"❌ Environment variable '{var_name}' not found and no default value provided. Variable will remain unresolved: {match.group(0)}")
+            return match.group(0)
+
+        return re.sub(pattern, replace, value)
+    
+    elif isinstance(value, dict):
+        return {k: resolve_env_value(v, env_substitutions, env_loader) for k, v in value.items()}
+    
+    elif isinstance(value, list):
+        return [resolve_env_value(v, env_substitutions, env_loader) for v in value]
+    
+    return value
+
+
+def write_env_vars_to_file(
+    env_vars: Dict[str, Any],
+    env_file: Optional[Path] = None,
+) -> bool:
+    """
+    Write environment variables to a .env file.
+    
+    Updates existing variables or appends new ones. Preserves comments
+    and other existing content.
+    
+    Args:
+        env_vars: Dictionary of variable name -> value to write
+        env_file: Path to .env file (defaults to .env in current directory)
+        
+    Returns:
+        True if file was updated, False otherwise
+    """
+    if not env_vars:
+        return False
+    
+    env_file_path = Path(env_file) if env_file else Path(".env")
+    
+    if not env_file_path.exists():
+        # Create new file with all vars
+        with open(env_file_path, 'w') as f:
+            f.write("# Generated environment variables\n")
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+        return True
+    
+    # Read existing .env content
+    with open(env_file_path, 'r') as f:
+        lines = f.readlines()
+
+    # Build dict of existing variables with their line indices
+    existing_vars = {}
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            key = stripped.split('=', 1)[0]
+            existing_vars[key] = i
+
+    # Update or append new values
+    updated = False
+    for key, value in env_vars.items():
+        if key in existing_vars:
+            # Update existing line
+            lines[existing_vars[key]] = f"{key}={value}\n"
+        else:
+            # Append new variable
+            lines.append(f"{key}={value}\n")
+        updated = True
+
+    # Write back if any updates were made
+    if updated:
+        with open(env_file_path, 'w') as f:
+            f.writelines(lines)
+    
+    return updated
+

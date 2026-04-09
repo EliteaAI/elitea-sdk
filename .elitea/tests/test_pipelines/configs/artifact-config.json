@@ -1,0 +1,19 @@
+{
+  "type": "artifact",
+  "toolkit_name": "artifact-tk",
+  "id": 1,
+  "bucket": "artifact-test-bucket",
+  "selected_tools": [
+    "createFile",
+    "edit_file",
+    "appendData",
+    "readFile",
+    "read_multiple_files",
+    "get_file_type",
+    "readFile",
+    "grep_file",
+    "listFiles",
+    "createNewBucket",
+    "deleteFile"
+  ]
+}

@@ -1,0 +1,608 @@
+import logging
+from typing import Optional
+
+from langchain_core.tools import ToolException
+from langgraph.store.base import BaseStore
+
+from elitea_sdk.tools import get_toolkits as elitea_toolkits
+from elitea_sdk.tools import get_tools as elitea_tools
+from .application import ApplicationToolkit
+from .artifact import ArtifactToolkit
+from .vectorstore import VectorStoreToolkit
+from .mcp import McpToolkit
+from .mcp_config import McpConfigToolkit, get_mcp_config_toolkit_schemas
+from ..tools.mcp_server_tool import McpServerTool
+from ..tools.sandbox import SandboxToolkit
+from ..tools.data_analysis import DataAnalysisToolkit
+# Import community tools
+from ...community import get_toolkits as community_toolkits, get_tools as community_tools
+from ...tools.memory import MemoryToolkit
+from ..utils.mcp_oauth import canonical_resource, McpAuthorizationRequired
+from ...tools.utils import clean_string
+from elitea_sdk.tools import _inject_toolkit_id, _inject_display_metadata, _patch_tool_invoke
+
+# Human-readable display names for all internal tools.
+# Labels mirror INTERNAL_TOOLS_LIST[*].title in the FE to stay in sync.
+# Tools that produce BaseTool objects (pyodide, data_analysis) use this for chip injection.
+# The remaining entries serve as a complete registry and backwards-compat fallback.
+INTERNAL_TOOL_DISPLAY_NAMES: dict = {
+    'attachments':     'Attachments',           # artifact bucket; no chip event
+    'image_generation': 'Image creation',       # provider toolkit; no chip event
+    'data_analysis':   'Data Analysis',         # DataAnalysisToolkit — chip injected
+    'planner':         'Planner',               # deprecated no-op; no chip event
+    'pyodide':         'Python sandbox',        # SandboxToolkit — chip injected
+    'swarm':           'Swarm Mode',            # mode flag; no chip event
+    'lazy_tools_mode': 'Smart Tools Selection', # mode flag; no chip event
+}
+from .security import is_toolkit_blocked, is_tool_blocked, get_blocked_tools_for_toolkit
+
+
+logger = logging.getLogger(__name__)
+
+
+def get_toolkits():
+    # Note: Planning is now provided via PlanningMiddleware, not as a toolkit
+    # See elitea_sdk.runtime.middleware.planning
+    core_toolkits = [
+        ArtifactToolkit.toolkit_config_schema(),
+        MemoryToolkit.toolkit_config_schema(),
+        VectorStoreToolkit.toolkit_config_schema(),
+        SandboxToolkit.toolkit_config_schema(),
+        DataAnalysisToolkit.toolkit_config_schema(),
+        McpToolkit.toolkit_config_schema(),
+        McpConfigToolkit.toolkit_config_schema(),
+    ]
+
+    # Add configured MCP servers (stdio and http) as available toolkits
+    mcp_config_toolkits = get_mcp_config_toolkit_schemas()
+
+    return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
+
+
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None) -> list:
+    """
+    Process tool configurations and return instantiated tools.
+
+    Args:
+        current_participant_id: The participant ID of the agent being predicted to.
+            Used to filter out self-references (prevent agent from calling itself).
+    """
+    # Sanitize tools_list to handle corrupted tool configurations
+    sanitized_tools = []
+    seen_toolkit_ids = set()  # Track seen toolkit IDs for deduplication
+
+    for tool in tools_list:
+        if isinstance(tool, dict):
+            # Check for corrupted structure where 'type' and 'name' contain the full tool config
+            if 'type' in tool and isinstance(tool['type'], dict):
+                # This is a corrupted tool - use the inner dict instead
+                logger.warning(f"Detected corrupted tool configuration (type=dict), fixing: {tool}")
+                actual_tool = tool['type']  # or tool['name'], they should be the same
+                sanitized_tools.append(actual_tool)
+            elif 'name' in tool and isinstance(tool['name'], dict):
+                # Another corruption pattern where name contains the full config
+                logger.warning(f"Detected corrupted tool configuration (name=dict), fixing: {tool}")
+                actual_tool = tool['name']
+                sanitized_tools.append(actual_tool)
+            elif 'type' in tool and isinstance(tool['type'], str):
+                # Valid tool configuration
+                sanitized_tools.append(tool)
+            else:
+                # Skip invalid/corrupted tools that can't be fixed
+                logger.warning(f"Skipping invalid tool configuration: {tool}")
+        else:
+            logger.warning(f"Skipping non-dict tool: {tool}")
+            # Skip non-dict tools
+
+    # Deduplication and self-filtering
+    deduplicated_tools = []
+    for tool in sanitized_tools:
+        # Deduplicate by toolkit ID (for toolkits that have an ID)
+        toolkit_id = tool.get('id')
+        if toolkit_id is not None:
+            if toolkit_id in seen_toolkit_ids:
+                logger.debug(f"Skipping duplicate toolkit id={toolkit_id}")
+                continue
+            seen_toolkit_ids.add(toolkit_id)
+
+        # Self-filtering for application tools (prevent agent from calling itself)
+        if tool.get('type') == 'application' and current_participant_id is not None:
+            participant_id = tool.get('participant_id')
+            if participant_id == current_participant_id:
+                logger.info(f"Filtering out self-reference: participant_id={participant_id}")
+                continue
+
+        # Security filtering - block configured toolkits at runtime
+        tool_type = tool.get('type', '')
+        if is_toolkit_blocked(tool_type):
+            logger.warning(f"[SECURITY] Skipping blocked toolkit type '{tool_type}' "
+                          f"(toolkit_id={toolkit_id}, name={tool.get('name', 'unknown')})")
+            continue
+
+        deduplicated_tools.append(tool)
+
+    tools = []
+    unhandled_tools = []  # Track tools not handled by main processing
+
+    for tool in deduplicated_tools:
+        # Flag to track if this tool was processed by the main loop
+        # Used to prevent double processing by fallback systems
+        tool_handled = False
+        # # --- OAuth token injection for non-MCP toolkits (SharePoint and others) ---
+        # try:
+        #     settings_preview = tool.get('settings', {}) if isinstance(tool, dict) else {}
+        #     # Determine common URL fields used by toolkits
+        #     toolkit_url = settings_preview.get('base_url') or settings_preview.get('site_url') or settings_preview.get('url')
+        #     session_id_from_token = None
+        #     access_token = None
+        #     if mcp_tokens and toolkit_url:
+        #         try:
+        #             canonical_url = canonical_resource(toolkit_url)
+        #         except Exception:
+        #             canonical_url = toolkit_url
+        #         # Prefer canonical key, fallback to raw URL
+        #         token_data = mcp_tokens.get(canonical_url) or mcp_tokens.get(toolkit_url)
+        #         if token_data:
+        #             if isinstance(token_data, dict):
+        #                 access_token = token_data.get('access_token') or token_data.get('token') or None
+        #                 session_id_from_token = token_data.get('session_id')
+        #             else:
+        #                 access_token = token_data
+        #
+        #     if access_token:
+        #         # Inject token for SharePoint toolkit (expects `token` setting)
+        #         if tool.get('type') == 'sharepoint' or 'site_url' in settings_preview:
+        #             settings = dict(tool.get('settings', {}) or {})
+        #             settings['token'] = access_token
+        #             if session_id_from_token:
+        #                 settings['session_id'] = session_id_from_token
+        #             tool['settings'] = settings
+        #             logger.info(f"[OAUTH] Injected SharePoint token for toolkit {tool.get('name')}")
+        #         else:
+        #             # Generic injection: set Authorization header in settings.headers
+        #             settings = dict(tool.get('settings', {}) or {})
+        #             headers = dict(settings.get('headers') or {})
+        #             headers.setdefault('Authorization', f'Bearer {access_token}')
+        #             settings['headers'] = headers
+        #             if session_id_from_token:
+        #                 settings['session_id'] = session_id_from_token
+        #             tool['settings'] = settings
+        #             logger.info(f"[OAUTH] Injected Authorization header for toolkit {tool.get('name')}")
+        # except Exception:
+        #     # Token injection must be non-fatal
+        #     logger.debug("OAuth token injection skipped due to an error", exc_info=True)
+        try:
+            if tool['type'] == 'application':
+                tool_handled = True
+                # Check if this is a pipeline to enable PrinterNode filtering
+                is_pipeline_subgraph = tool.get('agent_type', '') == 'pipeline'
+                # Get project_id from settings (needed for public project agents)
+                app_project_id = tool.get('settings', {}).get('project_id')
+                # Get agent_type for metadata
+                agent_type = tool.get('agent_type', 'agent')
+                logger.info(f"[APP_TOOL] Processing application tool '{tool.get('name')}': "
+                           f"app_id={tool['settings'].get('application_id')}, "
+                           f"version_id={tool['settings'].get('application_version_id')}, "
+                           f"project_id={app_project_id}, "
+                           f"agent_type={agent_type}, "
+                           f"raw_settings={tool.get('settings')}")
+
+                try:
+                    tools.extend(ApplicationToolkit.get_toolkit(
+                        elitea_client,
+                        application_id=int(tool['settings']['application_id']),
+                        application_version_id=int(tool['settings']['application_version_id']),
+                        selected_tools=[],
+                        ignored_mcp_servers=ignored_mcp_servers,
+                        is_subgraph=is_pipeline_subgraph,  # Pass is_subgraph for pipelines
+                        mcp_tokens=mcp_tokens,
+                        project_id=app_project_id,  # Use agent's project, not conversation's
+                        conversation_id=conversation_id,
+                        agent_type=agent_type  # Pass agent_type for metadata
+                    ).get_tools())
+                except Exception as app_err:
+                    # Gracefully skip application tools that fail to load (e.g., deleted agents)
+                    # This is common for conversation participants that reference stale agents
+                    logger.error(f"Skipping application tool '{tool.get('name', 'unknown')}': {app_err}")
+                    continue
+            elif tool['type'] == 'memory':
+                tool_handled = True
+                memory_tools = MemoryToolkit.get_toolkit(
+                    namespace=tool['settings'].get('namespace', str(tool['id'])),
+                    pgvector_configuration=tool['settings'].get('pgvector_configuration', {}),
+                    store=memory_store,
+                    toolkit_name=tool.get('name', ''),
+                ).get_tools()
+                _inject_display_metadata(tool, memory_tools)
+                tools += memory_tools
+            # TODO: update configuration of internal tools
+            elif tool['type'] == 'internal_tool':
+                tool_handled = True
+                internal_tools = []
+                if tool['name'] == 'pyodide':
+                    internal_tools = SandboxToolkit.get_toolkit(
+                        stateful=False,
+                        allow_net=True,
+                        elitea_client=elitea_client,
+                    ).get_tools()
+                elif tool['name'] == 'planner':
+                    # Planning is now provided via PlanningMiddleware, not as an internal tool
+                    # See elitea_sdk.runtime.middleware.planning
+                    logger.warning("'planner' internal tool is deprecated. Use PlanningMiddleware instead.")
+                elif tool['name'] == 'data_analysis':
+                    # Data Analysis internal tool - uses conversation attachment bucket
+                    settings = tool.get('settings', {})
+                    bucket_name = settings.get('bucket_name')
+                    if bucket_name:
+                        internal_tools = DataAnalysisToolkit.get_toolkit(
+                            elitea_client=elitea_client,
+                            llm=llm,
+                            bucket_name=bucket_name,
+                            toolkit_name="Data Analyst",
+                        ).get_tools()
+                    else:
+                        logger.warning("Data Analysis internal tool requested "
+                                       "but no bucket_name provided in settings")
+                # Inject display metadata so FE chips show human-readable names
+                if internal_tools:
+                    internal_display_name = INTERNAL_TOOL_DISPLAY_NAMES.get(
+                        tool['name'], tool['name']
+                    )
+                    for t in internal_tools:
+                        if not hasattr(t, 'metadata'):
+                            continue
+                        if t.metadata is None:
+                            t.metadata = {}
+                        if isinstance(t.metadata, dict):
+                            # Preserve toolkit_type if the tool already defines one
+                            # (e.g. sandbox tools use 'sandbox' to match sensitive-tools config)
+                            if 'toolkit_type' not in t.metadata:
+                                t.metadata['toolkit_type'] = 'internal'
+                            t.metadata['toolkit_name'] = tool['name']           # raw code name; fallback key
+                            t.metadata['display_name'] = internal_display_name  # human-readable; chip label
+                            _patch_tool_invoke(t)  # forward metadata into LangGraph run config
+                tools.extend(internal_tools)
+            elif tool['type'] == 'artifact':
+                tool_handled = True
+                toolkit_tools = ArtifactToolkit.get_toolkit(
+                    client=elitea_client,
+                    bucket=tool['settings']['bucket'],
+                    toolkit_name=tool.get('toolkit_name', ''),
+                    selected_tools=tool['settings'].get('selected_tools', []),
+                    llm=llm,
+                    # indexer settings
+                    pgvector_configuration=tool['settings'].get('pgvector_configuration', {}),
+                    embedding_model=tool['settings'].get('embedding_model'),
+                    collection_name=f"{tool.get('toolkit_name')}",
+                    collection_schema=str(tool['settings'].get('id', tool.get('id', ''))),
+                ).get_tools()
+                # Inject toolkit_id for artifact tools as well
+                # Pass settings as the tool config since that's where the id field is
+                _inject_toolkit_id(tool['settings'], toolkit_tools)
+                _inject_display_metadata(tool, toolkit_tools)
+                tools.extend(toolkit_tools)
+
+            elif tool['type'] == 'vectorstore':
+                tool_handled = True
+                vs_tools = VectorStoreToolkit.get_toolkit(
+                    llm=llm,
+                    toolkit_name=tool.get('toolkit_name', ''),
+                    **tool['settings']).get_tools()
+                _inject_display_metadata(tool, vs_tools)
+                tools.extend(vs_tools)
+            elif tool['type'] == 'planning':
+                tool_handled = True
+                # Planning is now provided via PlanningMiddleware, not as a toolkit type
+                # See elitea_sdk.runtime.middleware.planning
+                logger.warning("'planning' toolkit type is deprecated. Use PlanningMiddleware instead.")
+            elif tool['type'] == 'mcp':
+                tool_handled = True
+                # remote mcp tool initialization with token injection
+                settings = dict(tool['settings'])
+                url = settings.get('url')
+                
+                # Check if this MCP server should be ignored (user chose to continue without auth)
+                if ignored_mcp_servers and url:
+                    canonical_url = canonical_resource(url)
+                    if canonical_url in ignored_mcp_servers or url in ignored_mcp_servers:
+                        logger.info(f"[MCP Auth] Skipping ignored MCP server: {url}")
+                        continue
+                
+                headers = settings.get('headers')
+                token_data = None
+                session_id = None
+                if mcp_tokens and url:
+                    canonical_url = canonical_resource(url)
+                    logger.info(f"[MCP Auth] Looking for token for URL: {url}")
+                    logger.info(f"[MCP Auth] Canonical URL: {canonical_url}")
+                    logger.info(f"[MCP Auth] Available tokens: {list(mcp_tokens.keys())}")
+                    token_data = mcp_tokens.get(canonical_url)
+                    if token_data:
+                        logger.info(f"[MCP Auth] Found token data for {canonical_url}")
+                        # Handle both old format (string) and new format (dict with access_token and session_id)
+                        if isinstance(token_data, dict):
+                            access_token = token_data.get('access_token')
+                            session_id = token_data.get('session_id')
+                            logger.info(f"[MCP Auth] Token data: access_token={'present' if access_token else 'missing'}, session_id={session_id or 'none'}")
+                        else:
+                            # Backward compatibility: treat as plain token string
+                            access_token = token_data
+                            logger.info(f"[MCP Auth] Using legacy token format (string)")
+                    else:
+                        access_token = None
+                        logger.warning(f"[MCP Auth] No token found for {canonical_url}")
+                else:
+                    access_token = None
+                    
+                if access_token:
+                    merged_headers = dict(headers) if headers else {}
+                    merged_headers.setdefault('Authorization', f'Bearer {access_token}')
+                    settings['headers'] = merged_headers
+                    logger.info(f"[MCP Auth] Added Authorization header for {url}")
+                    
+                # Pass session_id to MCP toolkit if available
+                if session_id:
+                    settings['session_id'] = session_id
+                    logger.info(f"[MCP Auth] Passing session_id to toolkit: {session_id}")
+                mcp_tools = McpToolkit.get_toolkit(
+                    toolkit_name=tool.get('toolkit_name', ''),
+                    client=elitea_client,
+                    **settings).get_tools()
+                _inject_display_metadata(tool, mcp_tools)
+                tools.extend(mcp_tools)
+            elif tool['type'] == 'mcp_config' or tool['type'].startswith('mcp_'):
+                tool_handled = True
+                # MCP Config toolkit - pre-configured MCP servers (stdio or http)
+                # Handle both explicit 'mcp_config' type and dynamic names like 'mcp_playwright'
+                logger.info(f"Processing mcp_config toolkit: {tool}")
+                try:
+                    settings = tool.get('settings', {})
+
+                    # Server name can come from settings or be extracted from type name
+                    server_name = settings.get('server_name')
+                    if not server_name and tool['type'].startswith('mcp_') and tool['type'] != 'mcp_config':
+                        # Extract server name from type (e.g., 'mcp_playwright' -> 'playwright')
+                        server_name = tool['type'][4:]  # Remove 'mcp_' prefix
+
+                    if not server_name:
+                        logger.error(f"❌ No server_name found for mcp_config toolkit: {tool}")
+                        continue
+
+                    toolkit_name = tool.get('toolkit_name', '') or server_name
+                    selected_tools = settings.get('selected_tools', [])
+                    excluded_tools = settings.get('excluded_tools', [])
+
+                    # Get server config (may be in settings or from global config)
+                    server_config = settings.get('server_config')
+                    toolkit_tools = McpConfigToolkit.get_toolkit(
+                        server_name=server_name,
+                        server_config=server_config,
+                        user_config=settings,
+                        selected_tools=selected_tools if selected_tools else None,
+                        excluded_tools=excluded_tools if excluded_tools else None,
+                        toolkit_name=toolkit_name,
+                        client=elitea_client,
+                        mcp_tokens=mcp_tokens,
+                    ).get_tools()
+
+                    _inject_display_metadata(tool, toolkit_tools)
+                    tools.extend(toolkit_tools)
+                    logger.info(f"✅ Successfully added {len(toolkit_tools)} tools from McpConfigToolkit ({server_name})")
+                except Exception as e:
+                    logger.error(f"❌ Failed to initialize McpConfigToolkit: {e}")
+                    if not debug_mode:
+                        raise
+        except McpAuthorizationRequired:
+            # Re-raise auth required exceptions directly
+            raise
+        except Exception as e:
+            logger.error(f"Error initializing toolkit for tool '{tool.get('name', 'unknown')}': {e}", exc_info=True)
+            if debug_mode:
+                logger.info("Skipping tool initialization error due to debug mode.")
+                continue
+            else:
+                raise ToolException(f"Error initializing toolkit for tool '{tool.get('name', 'unknown')}': {e}")
+
+        # Track unhandled tools (make a copy to avoid reference issues)
+        if not tool_handled:
+            # Ensure we only add valid tool configurations to unhandled_tools
+            if isinstance(tool, dict) and 'type' in tool and isinstance(tool['type'], str):
+                unhandled_tools.append(dict(tool))
+
+    # Add community tools (only for unhandled tools)
+    community_loaded = community_tools(unhandled_tools, elitea_client, llm)
+    tools += community_loaded
+    logger.info(f"[RUNTIME_TOOLS] Community tools loaded: {len(community_loaded)} tools")
+
+    # Add elitea tools (only for unhandled tools)
+    # set tokens to tools in order to handle case when token is required for authentication
+    # Tool must have its own logic of handling it
+    if mcp_tokens:
+        for tool in unhandled_tools:
+            tool['settings']['tokens'] = mcp_tokens
+    elitea_loaded = elitea_tools(unhandled_tools, elitea_client, llm, memory_store)
+    tools += elitea_loaded
+    logger.info(f"[RUNTIME_TOOLS] EliteA tools loaded: {len(elitea_loaded)} tools")
+
+    # Add MCP tools registered via elitea-mcp CLI (static registry)
+    # Note: Tools with type='mcp' are already handled in main loop above
+    mcp_loaded = _mcp_tools(unhandled_tools, elitea_client)
+    tools += mcp_loaded
+    logger.info(f"[RUNTIME_TOOLS] MCP tools loaded: {len(mcp_loaded)} tools")
+
+    # Final logging of all tools being returned
+    all_tool_names = [t.name if hasattr(t, 'name') else str(type(t)) for t in tools]
+    logger.info(f"[RUNTIME_TOOLS] Total tools being returned: {len(tools)}")
+    logger.info(f"[RUNTIME_TOOLS] All tool names: {all_tool_names}")
+
+    # Defence-in-depth: final blocked-tool sweep across ALL tools regardless of source.
+    # Earlier filters cover main-loop toolkits; this catches community / elitea / MCP tools.
+    pre_filter_count = len(tools)
+    tools = _final_blocked_tools_filter(tools)
+    if len(tools) < pre_filter_count:
+        logger.info(
+            "[SECURITY] Final blocked-tool filter removed %d tool(s)",
+            pre_filter_count - len(tools),
+        )
+
+    # Check for indexer tools in the final list
+    indexer_tools_final = [n for n in all_tool_names if 'index' in n.lower()]
+    if indexer_tools_final:
+        logger.warning(f"[RUNTIME_TOOLS] FINAL TOOL LIST contains indexer tools: {indexer_tools_final}")
+
+    # Sanitize tool names to meet OpenAI's function naming requirements
+    # tools = _sanitize_tool_names(tools)
+
+    return tools
+
+
+def _final_blocked_tools_filter(tools: list) -> list:
+    """Remove any remaining blocked tools from the final tool list.
+
+    Each tool's metadata is inspected for ``toolkit_type`` so the check
+    matches the same keys used by ``configure_blocklist``.
+    """
+    from langchain_core.tools import BaseTool
+
+    filtered = []
+    for tool in tools:
+        if not isinstance(tool, BaseTool):
+            filtered.append(tool)
+            continue
+        metadata = getattr(tool, 'metadata', None) or {}
+        toolkit_type = (
+            metadata.get('toolkit_type')
+            or metadata.get('type')
+            or ''
+        )
+        if toolkit_type and is_tool_blocked(toolkit_type, tool.name):
+            logger.warning(
+                "[SECURITY] Final filter: removing blocked tool '%s' (type '%s')",
+                tool.name, toolkit_type,
+            )
+            continue
+        filtered.append(tool)
+    return filtered
+
+
+def _sanitize_tool_names(tools: list) -> list:
+    """
+    Sanitize tool names to meet LLM provider function naming requirements.
+    Tool names must match pattern ^[a-zA-Z0-9_-]{1,128}$
+    """
+    import re
+    from langchain_core.tools import BaseTool
+    
+    def sanitize_name(name):
+        """Sanitize a single tool name"""
+        # Replace dots with underscores (dots not allowed in tool names)
+        sanitized = name.replace('.', '_')
+        # Replace spaces and other invalid characters with underscores
+        sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', sanitized)
+        # Remove multiple consecutive underscores
+        sanitized = re.sub(r'_{2,}', '_', sanitized)
+        # Remove leading/trailing underscores
+        sanitized = sanitized.strip('_')
+        return sanitized
+    
+    sanitized_tools = []
+    name_mapping = {}
+    
+    for tool in tools:
+        if isinstance(tool, BaseTool):
+            original_name = tool.name
+            sanitized_name = sanitize_name(original_name)
+            
+            # Only update if the name actually changed
+            if original_name != sanitized_name:
+                logger.info(f"Sanitizing tool name: '{original_name}' -> '{sanitized_name}'")
+                # Create a new tool instance with the sanitized name
+                # We need to be careful here to preserve all other tool properties
+                tool.name = sanitized_name
+                name_mapping[original_name] = sanitized_name
+            
+            sanitized_tools.append(tool)
+        else:
+            # For non-BaseTool objects (like CompiledStateGraph), just pass through
+            sanitized_tools.append(tool)
+    
+    if name_mapping:
+        logger.info(f"Tool name sanitization complete. Mapped {len(name_mapping)} tool names.")
+    
+    return sanitized_tools
+
+
+def _mcp_tools(tools_list, elitea):
+    """
+    Handle MCP tools registered via elitea-mcp CLI (static registry).
+    Skips tools with type='mcp' as those are handled by dynamic discovery.
+    """
+    try:
+        all_available_toolkits = elitea.get_mcp_toolkits()
+        toolkit_lookup = {tk["name"]: tk for tk in all_available_toolkits}
+        tools = []
+        #
+        for selected_toolkit in tools_list:
+            server_toolkit_name = selected_toolkit['type']
+            
+            # Skip tools with type='mcp' - they're handled by dynamic discovery
+            if server_toolkit_name == 'mcp':
+                continue
+            
+            toolkit_conf = toolkit_lookup.get(server_toolkit_name)
+            #
+            if not toolkit_conf:
+                logger.debug(f"Toolkit '{server_toolkit_name}' not found in available MCP toolkits. Skipping...")
+                continue
+            #
+            available_tools = toolkit_conf.get("tools", [])
+            selected_tools = [name.lower() for name in selected_toolkit['settings'].get('selected_tools', [])]
+            for available_tool in available_tools:
+                tool_name = available_tool.get("name", "").lower()
+                if not selected_tools or tool_name in selected_tools:
+                    if server_tool := _init_single_mcp_tool(server_toolkit_name,
+                                                            # selected_toolkit["name"] is None for toolkit_test
+                                                            selected_toolkit["toolkit_name"] if selected_toolkit.get("toolkit_name")
+                                                            else server_toolkit_name,
+                                                            available_tool, elitea, selected_toolkit['settings']):
+                        tools.append(server_tool)
+        return tools
+    except Exception:
+        logger.error("Error while fetching MCP tools", exc_info=True)
+        return []
+
+
+def _init_single_mcp_tool(server_toolkit_name, toolkit_name, available_tool, elitea, toolkit_settings):
+    try:
+        # Use clean tool name without prefix
+        tool_name = available_tool["name"]
+        # Add toolkit context to description (max 1000 chars)
+        toolkit_context = f" [Toolkit: {clean_string(toolkit_name)}]" if toolkit_name else ''
+        base_description = f"MCP for a tool '{tool_name}': {available_tool.get('description', '')}"
+        description = base_description
+        if toolkit_context and len(base_description + toolkit_context) <= 1000:
+            description = base_description + toolkit_context
+        
+        tool = McpServerTool(
+            name=tool_name,
+            description=description,
+            args_schema=McpServerTool.create_pydantic_model_from_schema(
+                available_tool.get("inputSchema", {})
+            ),
+            client=elitea,
+            server=server_toolkit_name,
+            tool_timeout_sec=toolkit_settings.get("timeout", 90)
+        )
+        # Inject display metadata so FE chips show human-readable names
+        # and forward metadata into LangGraph run config via patched invoke().
+        if tool.metadata is None:
+            tool.metadata = {}
+        if isinstance(tool.metadata, dict):
+            tool.metadata['toolkit_type'] = 'mcp'
+            tool.metadata['toolkit_name'] = toolkit_name or server_toolkit_name
+            tool.metadata['display_name'] = toolkit_name or server_toolkit_name
+        _patch_tool_invoke(tool)
+        return tool
+    except Exception as e:
+        logger.error(f"Failed to create McpServerTool ('{server_toolkit_name}') for '{toolkit_name}.{tool_name}': {e}")
+        return None

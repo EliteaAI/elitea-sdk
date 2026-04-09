@@ -1,0 +1,12 @@
+[
+  {
+    "page_content": "# Software Development Guide  \n## Planning Phase  \nBefore starting any project, proper planning is essential. This includes defining requirements, creating specifications, and setting timelines.  \n## Development Phase  \nDuring development, follow best practices such as code reviews, version control, and continuous integration.  \n## Testing Phase  \nTesting ensures that the software meets requirements and is free of critical bugs. Include unit tests, integration tests, and end-to-end tests.  \n## Deployment Phase  \nDeploy the application to production environments with proper monitoring and rollback strategies in place.\n",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteAMarkdownLoader/files/markdown_headers.md",
+      "chunk_id": 1,
+      "chunk_type": "document",
+      "headers": "",
+      "method_name": "text"
+    }
+  }
+]

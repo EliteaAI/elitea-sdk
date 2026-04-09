@@ -1,0 +1,218 @@
+name: "QT17 - find_entity_by_id: Universal entity lookup"
+description: |
+  Verify the QTest 'find_entity_by_id' tool finds any entity by its ID.
+
+  Objective: Test universal lookup across different entity types (TC, RQ, TR, DF)
+
+  Expected Behavior:
+  - Tool automatically detects entity type from ID prefix
+  - Returns full entity details
+  - Works for test cases (TC-xxx)
+  - Handles different entity type prefixes correctly
+
+toolkits:
+  - id: ${QTEST_TOOLKIT_ID}
+    name: ${QTEST_TOOLKIT_NAME}
+
+state:
+  project_id:
+    type: int
+    value: ${QTEST_PROJECT_ID}
+  test_case_json:
+    type: str
+  create_result:
+    type: str
+  created_test_id:
+    type: str
+  lookup_result:
+    type: str
+  expected_success_indicators:
+    type: list
+    value: ["Id", "QTest Id", "Name"]
+  error_indicators:
+    type: list
+    value: ["error", "failed", "exception", "not found", "Invalid entity"]
+  test_results:
+    type: dict
+  qtest_id_to_delete:
+    type: int
+  cleanup_result:
+    type: str
+
+entry_point: prepare_test_case
+
+nodes:
+  - id: prepare_test_case
+    type: code
+    code:
+      type: fixed
+      value: |
+        import time
+        import random
+        import string
+        import json
+        
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        
+        test_case_data = {
+            "Name": f"QT17 Entity Lookup Test {timestamp}-{random_suffix}",
+            "Description": "Test case for find_entity_by_id universal lookup",
+            "Type": "Manual",
+            "Status": "New",
+            "Priority": "Medium",
+            "Steps": [
+                {
+                    "Test Step Number": 1,
+                    "Test Step Description": "Verify entity lookup functionality",
+                    "Test Step Expected Result": "Entity is found by ID"
+                }
+            ]
+        }
+        
+        test_case_json = json.dumps(test_case_data)
+        {"test_case_json": test_case_json}
+    input: []
+    output:
+      - test_case_json
+    structured_output: true
+    transition: create_test_case
+
+  - id: create_test_case
+    type: toolkit
+    input:
+      - test_case_json
+    input_mapping:
+      test_case_content:
+        type: variable
+        value: test_case_json
+      folder_to_place_test_cases_to:
+        type: fixed
+        value: ""
+    output:
+      - create_result
+    structured_output: false
+    tool: create_test_cases
+    toolkit_name: ${QTEST_TOOLKIT_NAME}
+    transition: extract_test_id
+
+  - id: extract_test_id
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+        
+        # Extract both TC-xxx and numeric QTest ID from create_result
+        result = elitea_state.get("create_result", "")
+        
+        created_test_id = "TC-1"
+        qtest_id_to_delete = 0
+        
+        try:
+            result_dict = json.loads(result) if isinstance(result, str) else result
+            if 'test_cases' in result_dict and len(result_dict['test_cases']) > 0:
+                test_case = result_dict['test_cases'][0]
+                created_test_id = test_case.get('test_case_id', 'TC-1')
+                qtest_id_to_delete = test_case.get('qtest_id', 0)
+        except:
+            pass
+        
+        {"created_test_id": created_test_id, "qtest_id_to_delete": qtest_id_to_delete}
+    input:
+      - create_result
+    output:
+      - created_test_id
+      - qtest_id_to_delete
+    structured_output: true
+    transition: lookup_entity
+
+  - id: lookup_entity
+    type: toolkit
+    input:
+      - created_test_id
+    input_mapping:
+      entity_id:
+        type: variable
+        value: created_test_id
+    output:
+      - lookup_result
+    structured_output: false
+    tool: find_entity_by_id
+    toolkit_name: ${QTEST_TOOLKIT_NAME}
+    transition: validate_results
+
+  - id: validate_results
+    type: llm
+    input:
+      - lookup_result
+      - created_test_id
+      - expected_success_indicators
+      - error_indicators
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: you are a strict quality assurance validator. only return valid json.
+      task:
+        type: fstring
+        value: |
+          analyze the output from the find_entity_by_id tool execution.
+
+          lookup result: {lookup_result}
+          entity id searched: {created_test_id}
+          expected success indicators: {expected_success_indicators}
+          error indicators: {error_indicators}
+
+          this is a positive test - we expect successful entity lookup.
+
+          validation criteria (all must pass for test_passed=true):
+          1. tool_executed: tool ran without throwing an exception
+          2. no_errors: output does not contain error indicators
+          3. entity_found: response confirms entity was found
+          4. has_details: response contains entity details (id, name, etc)
+          5. correct_entity: returned entity id matches searched id
+
+          return json test_results:
+          {{
+            "test_passed": boolean (true only if all criteria pass),
+            "tool_executed": boolean,
+            "no_errors": boolean,
+            "entity_found": boolean,
+            "has_details": boolean,
+            "correct_entity": boolean,
+            "entity_id": "{created_test_id}",
+            "entity_type_detected": "entity type from prefix (e.g., test case)",
+            "error_indicator_found": "which error indicator was found or none",
+            "error": string | null
+          }}
+
+          return only the json object.
+    model: ${DEFAULT_LLM_MODEL}
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: delete_test_case
+
+  - id: delete_test_case
+    type: toolkit
+    input:
+      - qtest_id_to_delete
+    input_mapping:
+      qtest_id:
+        type: variable
+        value: qtest_id_to_delete
+    output:
+      - cleanup_result
+    structured_output: false
+    tool: delete_test_case
+    toolkit_name: ${QTEST_TOOLKIT_NAME}
+    continue_on_error: true
+    transition: end
+
+  - id: end
+    type: end
+

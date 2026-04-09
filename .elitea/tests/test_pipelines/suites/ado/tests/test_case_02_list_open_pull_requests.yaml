@@ -1,0 +1,65 @@
+name: "ADO02 - List Open Pull Requests"
+description: "Verify the ADO 'list_open_pull_requests' tool retrieves open PRs"
+
+toolkits:
+  - id: ${ADO_REPOS_TOOLKIT_ID}
+    name: ${ADO_REPOS_TOOLKIT_NAME}
+
+state:
+  repository_id:
+    type: str
+    value: ${ADO_REPOSITORY_ID}
+  tool_result:
+    type: str
+  test_results:
+    type: dict
+
+entry_point: invoke_list_prs
+nodes:
+  - id: invoke_list_prs
+    type: toolkit
+    input:
+      - repository_id
+    input_mapping:
+      repository_id:
+        type: variable
+        value: repository_id
+    output:
+      - tool_result
+    structured_output: true
+    tool: list_open_pull_requests
+    toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
+    transition: validate_prs
+
+  - id: validate_prs
+    type: llm
+    input:
+      - tool_result
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: >
+          You are a quality assurance validator. Your response must be ONLY a compact JSON object
+          under 100 tokens. Do NOT echo or repeat any tool output. Do NOT include PR details,
+          comments, or commit data in your response.
+      task:
+        type: fstring
+        value: |
+          Tool output from 'list_open_pull_requests': {tool_result}
+
+          Scan the output above and answer these questions:
+          1. Is there at least 1 PR? (pr_count >= 1)
+          2. Does any PR have title exactly 'PR FOR AI TEST'?
+          3. Does any PR have pull_request_id exactly 10?
+
+          Return ONLY this compact JSON (no explanation, no echoing data):
+          {{"test_passed": <true if all 3 yes>, "tool_executed": true, "open_pr_count": <integer>, "title_check": <bool>, "id_check": <bool>, "error": null}}
+    model: ${DEFAULT_LLM_MODEL}
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END

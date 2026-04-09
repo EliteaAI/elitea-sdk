@@ -1,0 +1,118 @@
+name: "BB09 - read_file: Read existing file from main branch"
+description: |
+  Verify the Bitbucket 'read_file' tool correctly reads file contents from the main branch.
+
+  Objective: Test file reading with line breaks and content validation
+
+  Expected Behavior:
+  - File content is read completely from main branch
+  - Line breaks are maintained
+  - Content matches exactly (byte-for-byte)
+
+toolkits:
+  - id: ${BITBUCKET_TOOLKIT_ID}
+    name: ${BITBUCKET_TOOLKIT_NAME}
+
+state:
+  branch_name:
+    type: str
+    value: main
+  error_indicators:
+    type: list
+    value:
+      - error
+      - not found
+      - '404'
+      - permission denied
+      - failed to read
+  expected_line_count:
+    type: int
+    value: 3
+  file_content:
+    type: str
+  expected_content:
+    type: str
+    value: |
+      Line 1: This is the original content
+      Line 2: This line will be referenced
+      Line 3: This is the end
+  test_file_path:
+    type: str
+    value: test-files/bb14-invalid-update.txt
+  test_results:
+    type: dict
+
+entry_point: read_file_content
+
+nodes:
+  - id: read_file_content
+    type: toolkit
+    input:
+      - test_file_path
+      - branch_name
+    input_mapping:
+      branch:
+        type: variable
+        value: branch_name
+      file_path:
+        type: variable
+        value: test_file_path
+    output:
+      - file_content
+    structured_output: true
+    tool: read_file
+    toolkit_name: bitbucket-testing
+    transition: validate_results
+
+  - id: validate_results
+    type: llm
+    input:
+      - file_content
+      - expected_content
+      - expected_line_count
+      - error_indicators
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: You are a strict quality assurance validator. Only return valid JSON.
+      task:
+        type: fstring
+        value: |
+          Analyze the output from the 'read_file' tool execution.
+
+          Read Content: {file_content}
+          Expected Content: {expected_content}
+          Expected Line Count: {expected_line_count}
+          Error Indicators: {error_indicators}
+
+          This is a POSITIVE test - we expect successful file reading with exact content match.
+
+          Validation Criteria (ALL must pass for test_passed=true):
+          1. no_read_errors: Read operation has no error indicators
+          2. exact_match: Read content EXACTLY matches expected content (including whitespace)
+          3. line_count_correct: Number of lines matches expected ({expected_line_count})
+          4. newlines_preserved: Line breaks are maintained correctly
+
+          Return JSON test_results:
+          {{
+            "test_passed": boolean (true only if ALL criteria pass),
+            "no_read_errors": boolean,
+            "exact_match": boolean,
+            "line_count_correct": boolean,
+            "newlines_preserved": boolean,
+            "actual_line_count": number,
+            "content_length_expected": number (length of expected content),
+            "content_length_actual": number (length of read content),
+            "error": string | null
+          }}
+
+          Return ONLY the JSON object.
+    model: gpt-4o-2024-11-20
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END

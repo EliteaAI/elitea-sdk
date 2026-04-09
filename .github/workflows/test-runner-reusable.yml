@@ -1,0 +1,1058 @@
+name: Test Runner Reusable
+run-name: Executing test for ${{ inputs.test_cases_dir }} on ${{ inputs.environment }} 
+
+on:
+  workflow_call:
+    inputs:
+      test_cases_dir:
+        description: 'Test cases directory (e.g., github, ado, confluence)'
+        required: true
+        type: string
+      tests_to_run:
+        description: 'Specific tests to run (comma-separated IDs like GH01,GH02) or "all" for entire suite'
+        required: false
+        type: string
+        default: 'all'
+      environment:
+        description: 'Environment to run tests in (local or other)'
+        required: false
+        type: string
+        default: 'local'
+      enable_parallel:
+        description: 'Enable parallel test execution (uses value from pipeline.yaml when enabled)'
+        required: false
+        type: boolean
+        default: false
+      enable_bug_reporting:
+        description: 'Enable automatic bug report creation on GitHub (disable for testing)'
+        required: false
+        type: boolean
+        default: true
+      enable_rp_reporting:
+        description: 'Enable ReportPortal/OneTest reporting (sends test results to TMS)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test-execution:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
+
+    env:
+      GIT_TOOL_ACCESS_TOKEN: ${{ secrets.GIT_TOOL_ACCESS_TOKEN }}
+      CONFLUENCE_API_KEY: ${{ secrets.CONFLUENCE_API_KEY }}
+      CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+      CONFLUENCE_USERNAME: ${{ secrets.CONFLUENCE_USERNAME }}
+      ADO_TOKEN: ${{ secrets.ADO_TOKEN }}
+      ADO_REPOSITORY_ID: ${{ secrets.ADO_REPOSITORY_ID }}
+      ADO_ORGANIZATION_URL: ${{ secrets.ADO_ORGANIZATION_URL }}
+      ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
+      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+      JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      FIGMA_API_TOKEN: ${{ secrets.FIGMA_API_TOKEN }}
+      BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_TOKEN }}
+      XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
+      XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
+      ZEPHYR_ESENTIALS_KEY: ${{ secrets.ZEPHYR_ESENTIALS_KEY }}
+      GITLAB_PRIVATE_TOKEN: ${{ secrets.GITLAB_PRIVATE_TOKEN }}
+      POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+      SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+      QTEST_API_TOKEN: ${{ secrets.QTEST_API_TOKEN }}
+      RP_ENABLED: ${{ inputs.enable_rp_reporting }}
+      RP_PROJECT: ${{ secrets.RP_PROJECT }}
+      RP_ENDPOINT: ${{ secrets.RP_ENDPOINT }}
+      RP_API_KEY: ${{ secrets.RP_API_KEY }}
+      TESTRAIL_PASSWORD: ${{ secrets.TESTRAIL_PASSWORD }}
+      JIRA_PROJECT: "EL"
+      TEST_CASES_DIR: ${{ inputs.test_cases_dir }}
+      DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+      DEFAULT_LLM_MODEL: ${{ secrets.DEFAULT_LLM_MODEL }}
+
+    container:
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      env:
+        SANDBOX_BASE: ${{ github.workspace }}/.elitea/tests/test_pipelines
+        DENO_DIR: ${{ github.workspace }}/.elitea/tests/test_pipelines/node_modules
+        PYODIDE_SANDBOX_PKG: /app/data/sandbox/main.ts
+        PYTHONPATH: /app
+        PYTHONDONTWRITEBYTECODE: "1"
+        PYTHONUNBUFFERED: "1"
+        PGVECTOR_CONNECTION_STRING: postgresql+psycopg://postgres:yourpassword@pgvector-db:5432/postgres
+
+    services:
+      pgvector-db:
+        image: ankane/pgvector
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: yourpassword
+          POSTGRES_DB: postgres
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Resolve environment secrets
+        run: |
+          if [ "${{ inputs.environment }}" = "local" ]; then
+            ENV_UPPER="STAGE"
+          else
+            ENV_UPPER=$(echo "${{ inputs.environment }}" | tr '[:lower:]' '[:upper:]')
+          fi
+          echo "ENV_UPPER=${ENV_UPPER}" >> $GITHUB_ENV
+      
+      - name: Setup test environment
+        uses: ./.github/actions/setup-test-environment
+        with:
+          deployment-url: ${{ secrets[format('DEPLOYMENT_URL_{0}', env.ENV_UPPER)] }}
+          api-token: ${{ secrets[format('ELITEA_API_KEY_{0}', env.ENV_UPPER)] }}
+          project-id: ${{ secrets[format('PROJECT_ID_{0}', env.ENV_UPPER)] }}
+          sandbox-subdir: '.elitea/tests/test_pipelines'
+
+      - name: Setup gh CLI
+        uses: dev-hanz-ops/install-gh-cli-action@v0.1.0
+
+      - name: Ensure jq and yq are available
+        run: |
+          # jq and yq are included in the base image; this step installs them
+          # as a fallback if the image was built before they were added.
+          if ! command -v jq &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq jq
+          fi
+          if ! command -v yq &>/dev/null; then
+            curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+              -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+          fi
+          echo "jq: $(jq --version)  |  yq: $(yq --version)  |  gh: $(gh --version | head -1)"
+
+      - name: Calculate and run test command
+        run: |
+          ENV_FLAG=$([ "${{ inputs.environment }}" = "local" ] && echo "--local" || echo "")
+          PARALLEL_FLAG=$([ "${{ inputs.enable_parallel }}" = "true" ] && echo "--parallel" || echo "--no-parallel")
+          TESTS_TO_RUN="${{ inputs.tests_to_run }}"
+          
+          # Determine which script to use based on tests_to_run
+          if [ "$TESTS_TO_RUN" = "all" ] || [ -z "$TESTS_TO_RUN" ]; then
+            # Run all tests in suite using run_all_suites.sh
+            TEST_COMMAND="$GITHUB_WORKSPACE/.elitea/tests/test_pipelines/run_all_suites.sh $ENV_FLAG $PARALLEL_FLAG -v suites/${{ inputs.test_cases_dir }}"
+          else
+            # Run specific tests using run_test.sh
+            # Convert comma-separated list to space-separated for run_test.sh
+            TEST_PATTERNS=$(echo "$TESTS_TO_RUN" | tr ',' ' ')
+            if [ "${{ inputs.environment }}" = "local" ]; then
+              TEST_COMMAND="$GITHUB_WORKSPACE/.elitea/tests/test_pipelines/run_test.sh --local --setup --timeout 180 -v suites/${{ inputs.test_cases_dir }} $TEST_PATTERNS"
+            else
+              TEST_COMMAND="$GITHUB_WORKSPACE/.elitea/tests/test_pipelines/run_test.sh --all --timeout 180 -v suites/${{ inputs.test_cases_dir }} $TEST_PATTERNS"
+            fi
+          fi
+          
+          echo "DOCKER_COMMAND_COMPOSED=$TEST_COMMAND" >> $GITHUB_ENV  
+          echo "Running test command: $TEST_COMMAND"
+          echo "::notice::Tests to run: $TESTS_TO_RUN"         
+
+      - name: Run tests
+        id: wait_tests
+        timeout-minutes: 30
+        run: |
+          echo "::notice::Running tests with command: ${{ env.DOCKER_COMMAND_COMPOSED }}"
+          echo "::notice::On environment: ${{ env.ENV_UPPER }}"
+          
+          set +e
+          ${{ env.DOCKER_COMMAND_COMPOSED }}
+          EXIT_CODE=$?
+          set -e
+          
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "✅ Tests completed successfully"
+            echo "tests_failed=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Tests exited with code $EXIT_CODE"
+            echo "tests_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate test report
+        if: always()
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          echo "Generating test report..."
+          python .elitea/tests/test_pipelines/scripts/generate_report.py "${RESULTS_DIR}/results.json"
+
+      - name: Print execution summary
+        if: always()
+        id: test_summary
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          RESULTS_FILE="${RESULTS_DIR}/results.json"
+          
+          if [ ! -f "${RESULTS_FILE}" ]; then
+            echo "❌ No results.json found - tests may not have completed"
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "## ❌ Test Results" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "❌ No results.json found - tests may not have completed" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi
+          
+          # Parse JSON with jq
+          SUITE=$(jq -r '.suite_name // "unknown"' "${RESULTS_FILE}")
+          PASSED=$(jq -r '.passed // 0' "${RESULTS_FILE}")
+          FAILED=$(jq -r '.failed // 0' "${RESULTS_FILE}")
+          ERRORS=$(jq -r '.errors // 0' "${RESULTS_FILE}")
+          SKIPPED=$(jq -r '.skipped // 0' "${RESULTS_FILE}")
+          
+          # Determine status based on failures, errors, and container exit code
+          TESTS_FAILED="${{ steps.wait_tests.outputs.tests_failed }}"
+          if [ "$FAILED" -gt 0 ] || [ "$ERRORS" -gt 0 ] || [ "$TESTS_FAILED" = "true" ]; then
+            STATUS_DISPLAY="❌ FAILED"
+            ALERT_TYPE="CAUTION"
+            ALERT_MSG="Tests failed for suite **${SUITE}**"
+          else
+            STATUS_DISPLAY="✅ PASSED"
+            ALERT_TYPE="TIP"
+            ALERT_MSG="All tests passed for suite **${SUITE}**"
+          fi
+                    
+          # Write to GitHub Step Summary
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo ""
+              echo "## 📊 Test Execution Summary"
+              echo ""
+              echo "> [!${ALERT_TYPE}]"
+              echo "> ${ALERT_MSG}"
+              echo ""
+              echo "| Suite | Status | Passed | Failed | Errors | Skipped |"
+              echo "|-------|--------|--------|--------|--------|--------|"
+              echo "| ${SUITE} | ${STATUS_DISPLAY} | ${PASSED} | ${FAILED} | ${ERRORS} | ${SKIPPED} |"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save test runner logs
+        if: always()
+        run: |
+          # Collect any test runner log files written to the results directory
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          if [ -d "$RESULTS_DIR" ]; then
+            find "$RESULTS_DIR" -name "*.log" -exec cat {} \; > "${RESULTS_DIR}/docker-logs.txt" 2>&1 || true
+          fi
+          touch "${RESULTS_DIR}/docker-logs.txt"
+
+      - name: Download PR change context
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-change-context
+          path: .elitea/tests/test_pipelines/
+        continue-on-error: true
+
+      - name: Do AI analysis of logs
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        run: |
+          echo "::notice::Running AI analysis of test results"
+          
+          # Check if PR change context is available
+          if [ -f ".elitea/tests/test_pipelines/pr_change_context.json" ]; then
+            echo "::notice::PR change context available - test fixer will distinguish PR regressions from pre-existing bugs"
+          else
+            echo "::notice::No PR change context - all SDK bugs will be treated as pre-existing"
+          fi
+          
+          RESULTS_PATH=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}/results.json"
+          
+          format_branch() {
+              echo "${1#refs/heads/}"
+          }
+          
+          formated_branch=$(format_branch "${{ github.head_ref || github.ref }}")
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          elitea agent run .elitea/agents/test-fixer.agent.md --dir . "Analyze ${RESULTS_PATH} on ${{ inputs.environment }} and branch ${formated_branch}" || echo "AI analysis completed with warnings"
+
+      - name: Label PR with tests_ai_healed
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          FIX_OUTPUT="${RESULTS_DIR}/fix_output.json"
+          
+          if [ ! -f "${FIX_OUTPUT}" ]; then
+            echo "No fix_output.json found, skipping PR labeling"
+            exit 0
+          fi
+          
+          # Check if fixes were committed
+          COMMITTED=$(jq -r '.committed // false' "${FIX_OUTPUT}")
+          if [ "$COMMITTED" != "true" ]; then
+            echo "No fixes committed, skipping PR labeling"
+            exit 0
+          fi
+          
+          # Get PR number from fix_output.json
+          PR_NUMBER=$(jq -r '.commit_details.pr_number // null' "${FIX_OUTPUT}")
+          if [ "$PR_NUMBER" = "null" ]; then
+            echo "No PR found for branch, skipping labeling"
+            exit 0
+          fi
+          
+          echo "Adding 'tests_ai_healed' label to PR #$PR_NUMBER"
+          
+          # Add label to PR
+          gh pr edit "$PR_NUMBER" \
+            --add-label tests_ai_healed \
+            --repo ${{ github.repository }} || echo "Failed to add label, continuing..."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post AI Analysis Summary to GitHub
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          FIX_OUTPUT="${RESULTS_DIR}/fix_output.json"
+          FIX_MILESTONE="${RESULTS_DIR}/fix_milestone.json"
+          
+          if [ ! -f "${FIX_OUTPUT}" ]; then
+            echo "::warning::No AI analysis output found"
+            exit 0
+          fi
+          
+          # Check if file is valid JSON
+          if ! jq empty "${FIX_OUTPUT}" 2>/dev/null; then
+            echo "::warning::Invalid JSON in fix_output.json"
+            exit 0
+          fi
+          
+          # Parse AI analysis results
+          FIXED_COUNT=$(jq -r '.summary.fixed // 0' "${FIX_OUTPUT}")
+          FLAKY_COUNT=$(jq -r '.summary.flaky // 0' "${FIX_OUTPUT}")
+          BLOCKED_COUNT=$(jq -r '.summary.blocked // 0' "${FIX_OUTPUT}")
+          TOTAL_ANALYZED=$(jq -r '(.summary.total_analyzed // ((.summary.fixed // 0) + (.summary.flaky // 0) + (.summary.blocked // 0)))' "${FIX_OUTPUT}")
+          
+          # Count blocked tests by blocker_type from fix_output.json
+          SDK_BUG_BLOCKED=$(jq -r '[.blocked[]? | select(.blocker_type == "sdk_bug")] | length' "${FIX_OUTPUT}")
+          AUTOMATION_BUG_BLOCKED=$(jq -r '[.blocked[]? | select(.blocker_type == "automation_bug")] | length' "${FIX_OUTPUT}")
+          MAX_ATTEMPTS_BLOCKED=$(jq -r '[.blocked[]? | select(.blocker_type == "max_attempts_exceeded")] | length' "${FIX_OUTPUT}")
+          PR_REGRESSION_BLOCKED=$(jq -r '[.blocked[]? | select(.blocker_type == "pr_regression")] | length' "${FIX_OUTPUT}")
+          PR_REGRESSION_TOP=$(jq -r '.pr_regressions // [] | length' "${FIX_OUTPUT}")
+          
+          # Count SDK bugs from intent analysis in milestone
+          SDK_BUG_COUNT=0
+          TEST_CODE_ISSUE_COUNT=0
+          AUTOMATION_BUG_INTENT_COUNT=0
+          INTENT_ANALYSIS_COUNT=0
+          if [ -f "${FIX_MILESTONE}" ] && jq empty "${FIX_MILESTONE}" 2>/dev/null; then
+            SDK_BUG_COUNT=$(jq -r '[.intent_analysis[]? | select(.classification == "sdk_bug")] | length' "${FIX_MILESTONE}")
+            TEST_CODE_ISSUE_COUNT=$(jq -r '[.intent_analysis[]? | select(.classification == "test_code_issue")] | length' "${FIX_MILESTONE}")
+            AUTOMATION_BUG_INTENT_COUNT=$(jq -r '[.intent_analysis[]? | select(.classification == "automation_bug")] | length' "${FIX_MILESTONE}")
+            INTENT_ANALYSIS_COUNT=$(jq -r '.intent_analysis // [] | length' "${FIX_MILESTONE}")
+          fi
+          
+          # Write AI Analysis Summary to GitHub Step Summary
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo ""
+              echo "## 🤖 AI Analysis Summary"
+              echo ""
+              # Show SDK bug warning banner if any SDK bugs detected
+              if [ "$SDK_BUG_BLOCKED" -gt 0 ]; then
+                echo "> [!CAUTION]"
+                echo "> **${SDK_BUG_BLOCKED} SDK bug(s) detected** — these are real product defects, not test issues. Tests were correctly blocked (not patched to hide bugs)."
+                echo ""
+              fi
+              # Show automation bug warning banner
+              if [ "$AUTOMATION_BUG_BLOCKED" -gt 0 ]; then
+                echo "> [!WARNING]"
+                echo "> **${AUTOMATION_BUG_BLOCKED} automation bug(s) detected** — environment/infrastructure issues confirmed by rerun. TA team verification required."
+                echo ""
+              fi
+              
+              echo "| Metric | Count |"
+              echo "|--------|-------|"
+              echo "| Total Analyzed | **${TOTAL_ANALYZED}** |"
+              echo "| ✅ Fixed (test code issues) | ${FIXED_COUNT} |"
+              echo "| ⚠️ Flaky | ${FLAKY_COUNT} |"
+              echo "| ❌ Blocked (total) | ${BLOCKED_COUNT} |"
+              if [ "$SDK_BUG_BLOCKED" -gt 0 ]; then
+                echo "| — 🐛 SDK Bugs | ${SDK_BUG_BLOCKED} |"
+              fi
+              if [ "$AUTOMATION_BUG_BLOCKED" -gt 0 ]; then
+                echo "| — 🔌 Automation Bugs | ${AUTOMATION_BUG_BLOCKED} |"
+              fi
+              if [ "$MAX_ATTEMPTS_BLOCKED" -gt 0 ]; then
+                echo "| — 🔄 Max Attempts Exceeded | ${MAX_ATTEMPTS_BLOCKED} |"
+              fi
+              if [ "$PR_REGRESSION_BLOCKED" -gt 0 ] || [ "$PR_REGRESSION_TOP" -gt 0 ]; then
+                PR_REG_TOTAL=$((PR_REGRESSION_BLOCKED > PR_REGRESSION_TOP ? PR_REGRESSION_BLOCKED : PR_REGRESSION_TOP))
+                echo "| — ⚠️ PR Regressions | ${PR_REG_TOTAL} |"
+              fi
+              if [ "$INTENT_ANALYSIS_COUNT" -gt 0 ]; then
+                echo "| 🔍 SDK Bugs Identified | ${SDK_BUG_COUNT} |"
+                echo "| 🔧 Test Code Issues | ${TEST_CODE_ISSUE_COUNT} |"
+                if [ "$AUTOMATION_BUG_INTENT_COUNT" -gt 0 ]; then
+                  echo "| 🔌 Automation Bugs Identified | ${AUTOMATION_BUG_INTENT_COUNT} |"
+                fi
+              fi
+              echo ""
+              
+              # Show fixed tests details
+              if [ "$FIXED_COUNT" -gt 0 ]; then
+                echo "### ✅ Fixed Tests"
+                echo ""
+                echo "**Total fixed: ${FIXED_COUNT} test(s)**"
+                echo ""
+                echo "| # | Test | Root Cause | Fix Applied |"
+                echo "|---|------|------------|-------------|"
+                COUNTER=1
+                jq -c '.fixed[]?' "${FIX_OUTPUT}" | while read -r item; do
+                  TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                  ISSUE=$(echo "$item" | jq -r '.issue // "N/A"')
+                  FIX=$(echo "$item" | jq -r '.fix // "N/A"')
+                  echo "| ${COUNTER} | ${TEST_IDS} | ${ISSUE} | ${FIX} |"
+                  COUNTER=$((COUNTER + 1))
+                done
+                echo ""
+              fi
+              
+              # Show flaky tests details
+              if [ "$FLAKY_COUNT" -gt 0 ]; then
+                echo "### ⚠️ Flaky Tests"
+                echo ""
+                echo "> [!WARNING]"
+                echo "> The following tests failed initially but passed on rerun"
+                echo ""
+                echo "**Total flaky: ${FLAKY_COUNT} test(s)**"
+                echo ""
+                echo "| # | Test | Reason |"
+                echo "|---|------|--------|"
+                COUNTER=1
+                jq -c '.flaky[]?' "${FIX_OUTPUT}" | while read -r item; do
+                  TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                  REASON=$(echo "$item" | jq -r '.reason // "N/A"')
+                  echo "| ${COUNTER} | ${TEST_IDS} | ${REASON} |"
+                  COUNTER=$((COUNTER + 1))
+                done
+                echo ""
+              fi
+              
+              # Show blocked tests details — split by blocker type
+              if [ "$BLOCKED_COUNT" -gt 0 ]; then
+                echo "**Total blocked: ${BLOCKED_COUNT} test(s)**"
+                echo ""
+                
+                # SDK Bugs
+                if [ "$SDK_BUG_BLOCKED" -gt 0 ]; then
+                  echo "### ❌ Blocked Tests — SDK Bugs (${SDK_BUG_BLOCKED})"
+                  echo ""
+                  echo "> [!IMPORTANT]"
+                  echo "> These tests were **not patched** because the failures are caused by SDK code defects, not test logic errors. Weakening assertions would hide real bugs."
+                  echo ""
+                  COUNTER=1
+                  jq -c '.blocked[]? | select(.blocker_type == "sdk_bug")' "${FIX_OUTPUT}" | while read -r item; do
+                    TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                    BUG_DESC=$(echo "$item" | jq -r '.bug_description // "N/A"')
+                    EXPECTED=$(echo "$item" | jq -r '.expected_behavior // "N/A"')
+                    ACTUAL=$(echo "$item" | jq -r '.actual_behavior // "N/A"')
+                    SDK_COMP=$(echo "$item" | jq -r '.sdk_component // "N/A"')
+                    METHODS=$(echo "$item" | jq -r '(.affected_methods // []) | join(", ")')
+                    ERROR_LOC=$(echo "$item" | jq -r '.error_location // "N/A"')
+                    BUG_NEEDED=$(echo "$item" | jq -r '.bug_report_needed // false')
+                    
+                    echo "<details>"
+                    echo "<summary><b>${COUNTER}. ${TEST_IDS}</b> — ${BUG_DESC}</summary>"
+                    echo ""
+                    echo "| Field | Detail |"
+                    echo "|-------|--------|"
+                    echo "| Bug Description | ${BUG_DESC} |"
+                    echo "| Expected Behavior | ${EXPECTED} |"
+                    echo "| Actual Behavior | ${ACTUAL} |"
+                    echo "| SDK Component | ${SDK_COMP} |"
+                    echo "| Affected Methods | ${METHODS} |"
+                    echo "| Error Location | ${ERROR_LOC} |"
+                    echo "| Bug Report Needed | ${BUG_NEEDED} |"
+                    echo ""
+                    echo "</details>"
+                    echo ""
+                    COUNTER=$((COUNTER + 1))
+                  done
+                fi
+                
+                # Automation Bugs
+                if [ "$AUTOMATION_BUG_BLOCKED" -gt 0 ]; then
+                  echo "### 🔌 Blocked Tests — Automation Bugs (${AUTOMATION_BUG_BLOCKED})"
+                  echo ""
+                  echo "> [!WARNING]"
+                  echo "> Environment/infrastructure issues confirmed by rerun. These require TA team verification, not code fixes."
+                  echo ""
+                  COUNTER=1
+                  jq -c '.blocked[]? | select(.blocker_type == "automation_bug")' "${FIX_OUTPUT}" | while read -r item; do
+                    TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                    BUG_DESC=$(echo "$item" | jq -r '.bug_description // "N/A"')
+                    TOOL_NAME=$(echo "$item" | jq -r '.tool_name // "N/A"')
+                    ERROR_TYPE=$(echo "$item" | jq -r '.error_type // "N/A"')
+                    HTTP_CODE=$(echo "$item" | jq -r '.http_status_code // "N/A"')
+                    ERROR_SUMMARY=$(echo "$item" | jq -r '.error_summary // "N/A"')
+                    TEST_NODE=$(echo "$item" | jq -r '.test_node // "N/A"')
+                    PROBABLE_CAUSE=$(echo "$item" | jq -r '.probable_cause // "N/A"')
+                    ACTION_REQUIRED=$(echo "$item" | jq -r '.action_required // "N/A"')
+                    BUG_NEEDED=$(echo "$item" | jq -r '.bug_report_needed // false')
+                    
+                    echo "<details>"
+                    echo "<summary><b>${COUNTER}. ${TEST_IDS}</b> — ${BUG_DESC}</summary>"
+                    echo ""
+                    echo "| Field | Detail |"
+                    echo "|-------|--------|"
+                    echo "| Bug Description | ${BUG_DESC} |"
+                    echo "| Tool Name | \`${TOOL_NAME}\` |"
+                    echo "| Error Type | ${ERROR_TYPE} |"
+                    echo "| HTTP Status Code | ${HTTP_CODE} |"
+                    echo "| Error Summary | ${ERROR_SUMMARY} |"
+                    echo "| Pipeline Node | \`${TEST_NODE}\` |"
+                    echo "| Probable Cause | ${PROBABLE_CAUSE} |"
+                    echo "| Action Required | ${ACTION_REQUIRED} |"
+                    echo "| Bug Report Needed | ${BUG_NEEDED} |"
+                    echo ""
+                    echo "</details>"
+                    echo ""
+                    COUNTER=$((COUNTER + 1))
+                  done
+                fi
+                
+                # Max Attempts Exceeded
+                if [ "$MAX_ATTEMPTS_BLOCKED" -gt 0 ]; then
+                  echo "### 🔄 Blocked Tests — Max Fix Attempts Exceeded (${MAX_ATTEMPTS_BLOCKED})"
+                  echo ""
+                  echo "> [!NOTE]"
+                  echo "> These tests exhausted all fix attempts (3 max) without passing."
+                  echo ""
+                  COUNTER=1
+                  jq -c '.blocked[]? | select(.blocker_type == "max_attempts_exceeded")' "${FIX_OUTPUT}" | while read -r item; do
+                    TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                    BUG_DESC=$(echo "$item" | jq -r '.bug_description // "N/A"')
+                    ATTEMPTS=$(echo "$item" | jq -r '.attempts_made // "N/A"')
+                    LAST_ERROR=$(echo "$item" | jq -r '.last_attempt_error // "N/A"')
+                    
+                    echo "<details>"
+                    echo "<summary><b>${COUNTER}. ${TEST_IDS}</b> — ${BUG_DESC}</summary>"
+                    echo ""
+                    echo "| Field | Detail |"
+                    echo "|-------|--------|"
+                    echo "| Bug Description | ${BUG_DESC} |"
+                    echo "| Attempts Made | ${ATTEMPTS} |"
+                    echo "| Last Attempt Error | ${LAST_ERROR} |"
+                    echo ""
+                    echo "</details>"
+                    echo ""
+                    COUNTER=$((COUNTER + 1))
+                  done
+                fi
+              fi
+              
+              # Show Intent Analysis from milestone (how each test was classified)
+              if [ -f "${FIX_MILESTONE}" ] && jq empty "${FIX_MILESTONE}" 2>/dev/null; then
+                INTENT_COUNT=$(jq -r '.intent_analysis // [] | length' "${FIX_MILESTONE}")
+                if [ "$INTENT_COUNT" -gt 0 ]; then
+                  echo "<details>"
+                  echo "<summary>🔍 <b>Test Intent Analysis</b> — ${INTENT_COUNT} tests classified</summary>"
+                  echo ""
+                  echo "> How the AI determined whether each failure is an SDK bug or a test code issue"
+                  echo ""
+                  echo "| Test | Type | Classification | Primary Feature | SDK Correct? | Reasoning |"
+                  echo "|------|------|----------------|-----------------|--------------|-----------|" 
+                  jq -r '.intent_analysis[]? | "| \(.test_id // "N/A") | \(.positive_or_negative // "N/A") | \(if .classification == "sdk_bug" then "🐛 SDK Bug" elif .classification == "automation_bug" then "🔌 Automation Bug" elif .classification == "pr_regression" then "⚠️ PR Regression" else "🔧 Test Issue" end) | \(.primary_feature // "N/A") | \(if .sdk_behaves_correctly then "✅" else "❌" end) | \(.reasoning // "N/A") |"' "${FIX_MILESTONE}"
+                  echo ""
+                  echo "</details>"
+                  echo ""
+                fi
+              fi
+              
+              # Add milestone summary if available (collapsible)
+              if [ -f "${FIX_MILESTONE}" ]; then
+                if jq empty "${FIX_MILESTONE}" 2>/dev/null; then
+                  # Gather milestone data
+                  MS_ENV=$(jq -r '.environment // "N/A"' "${FIX_MILESTONE}")
+                  MS_BRANCH=$(jq -r '.ci_target_branch // "N/A"' "${FIX_MILESTONE}")
+                  MS_SUITE=$(jq -r '.suite // "N/A"' "${FIX_MILESTONE}")
+                  MS_FAILED_COUNT=$(jq -r '.initial_failures // [] | length' "${FIX_MILESTONE}")
+                  FIX_ATTEMPTS_COUNT=$(jq -r '.fix_attempts // [] | length' "${FIX_MILESTONE}")
+                  RERUN_COUNT=$(jq -r '.rerun_attempts // [] | length' "${FIX_MILESTONE}")
+                  
+                  echo "<details>"
+                  echo "<summary>📋 <b>Fix Milestone</b> — ${MS_FAILED_COUNT} failures, ${FIX_ATTEMPTS_COUNT} fix attempts</summary>"
+                  echo ""
+                  echo "| Field | Value |"
+                  echo "|-------|-------|"
+                  echo "| Environment | ${MS_ENV} |"
+                  echo "| Branch | \`${MS_BRANCH}\` |"
+                  echo "| Suite | ${MS_SUITE} |"
+                  echo "| Failed Tests | ${MS_FAILED_COUNT} |"
+                  echo ""
+                  
+                  # Show error patterns as table with classification
+                  ERROR_PATTERNS_COUNT=$(jq -r '.error_patterns // [] | length' "${FIX_MILESTONE}")
+                  if [ "$ERROR_PATTERNS_COUNT" -gt 0 ]; then
+                    echo "**Error Patterns:**"
+                    echo ""
+                    echo "| Pattern | Tests | Category |"
+                    echo "|---------|-------|----------|"
+                    jq -r '.error_patterns[]? | "| \(.root_cause // "Unknown") | \((.test_ids // []) | join(", ")) | \(if .category == "sdk_bug" then "🐛 SDK Bug" elif .category == "automation_bug" then "🔌 Automation Bug" elif .category == "pr_regression" then "⚠️ PR Regression" else "🔧 Test Issue" end) |"' "${FIX_MILESTONE}"
+                    echo ""
+                  fi
+                  
+                  # Show fix attempts as table with intent preservation
+                  if [ "$FIX_ATTEMPTS_COUNT" -gt 0 ]; then
+                    echo "**Fix Attempts:**"
+                    echo ""
+                    echo "| # | Rationale | Intent Preserved |"
+                    echo "|---|-----------|------------------|"
+                    jq -r '.fix_attempts[]? | "| \(.attempt) | \(.fix_rationale // "N/A") | \(if .intent_preserved == false then "❌ No" elif .intent_preserved == true then "✅ Yes" else "N/A" end) |"' "${FIX_MILESTONE}"
+                    echo ""
+                    
+                    # Warn if any fix did not preserve intent
+                    INTENT_BROKEN=$(jq -r '[.fix_attempts[]? | select(.intent_preserved == false)] | length' "${FIX_MILESTONE}")
+                    if [ "$INTENT_BROKEN" -gt 0 ]; then
+                      echo "> [!WARNING]"
+                      echo "> **${INTENT_BROKEN} fix attempt(s) did not preserve test intent** — these fixes were reverted and tests classified as blockers to avoid hiding SDK bugs."
+                      echo ""
+                    fi
+                  fi
+                  
+                  # Show rerun attempts
+                  if [ "$RERUN_COUNT" -gt 0 ]; then
+                    echo "**Rerun Attempts:** ${RERUN_COUNT}"
+                    echo ""
+                  fi
+                  
+                  echo "</details>"
+                  echo ""
+                fi
+              fi
+              
+              # Add commit information if fixes were committed
+              COMMITTED=$(jq -r '.committed // false' "${FIX_OUTPUT}")
+              if [ "$COMMITTED" = "true" ]; then
+                COMMIT_MSG=$(jq -r '.commit_details.commit_message // null' "${FIX_OUTPUT}")
+                if [ "$COMMIT_MSG" = "null" ] && [ -f "${FIX_MILESTONE}" ]; then
+                  COMMIT_MSG=$(jq -r '.commit_info.commit_message // "N/A"' "${FIX_MILESTONE}")
+                fi
+                BRANCH=$(jq -r '.commit_details.branch // "N/A"' "${FIX_OUTPUT}")
+                FILES_COUNT=$(jq -r '.commit_details.files_count // 0' "${FIX_OUTPUT}")
+                PR_NUMBER=$(jq -r '.commit_details.pr_number // null' "${FIX_OUTPUT}")
+                
+                echo "> [!TIP]"
+                echo "> Fixes committed and pushed to branch \`${BRANCH}\`"
+                echo ""
+                echo "| Detail | Value |"
+                echo "|--------|-------|"
+                echo "| Files updated | ${FILES_COUNT} |"
+                echo "| Commit message | ${COMMIT_MSG} |"
+                
+                # Add PR info if found
+                if [ "$PR_NUMBER" != "null" ]; then
+                  echo "| PR | [#${PR_NUMBER}](https://github.com/EliteaAI/elitea-sdk/pull/${PR_NUMBER}) |"
+                  echo "| Label | \`tests_ai_healed\` (auto-applied) |"
+                else
+                  echo "| PR | _No PR found for branch_ |"
+                fi
+                echo ""
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
+      - name: Parse fix_output.json and check for blocked tests
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        id: check_blocked
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          FIX_OUTPUT="${RESULTS_DIR}/fix_output.json"
+          
+          echo "Parsing fix_output.json for blocked tests..."
+          
+          # Check if file exists and is valid JSON
+          if [ ! -f "${FIX_OUTPUT}" ]; then
+            echo "fix_output.json not found"
+            echo "bug_report_needed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Parse blocked count
+          BLOCKED_COUNT=$(jq -r '.summary.blocked // 0' "${FIX_OUTPUT}")
+          echo "Blocked tests count: $BLOCKED_COUNT"
+          
+          # Check if any blocked tests need bug reports
+          if [ "$BLOCKED_COUNT" -gt 0 ]; then
+            BUG_REPORT_NEEDED=$(jq -r '[.blocked[]? | select(.bug_report_needed == true)] | length > 0' "${FIX_OUTPUT}")
+            
+            if [ "$BUG_REPORT_NEEDED" = "true" ]; then
+              echo "::notice::Bug report needed for blocked tests"
+              echo "bug_report_needed=true" >> $GITHUB_OUTPUT
+              
+              # Export blocked tests details for bug report
+              jq -r '.blocked[]? | select(.bug_report_needed == true)' "${FIX_OUTPUT}" > blocked_tests_details.json
+              echo "Blocked tests requiring bug reports:"
+              cat blocked_tests_details.json
+            else
+              echo "bug_report_needed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No blocked tests found"
+            echo "bug_report_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Report PR regressions (bugs in new code)
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        id: check_pr_regressions
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          FIX_OUTPUT="${RESULTS_DIR}/fix_output.json"
+          
+          if [ ! -f "${FIX_OUTPUT}" ]; then
+            echo "pr_regressions_found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check for PR regressions (bugs introduced by the PR's new code)
+          PR_REGRESSION_COUNT=$(jq -r '.pr_regressions // [] | length' "${FIX_OUTPUT}")
+          echo "PR regressions count: $PR_REGRESSION_COUNT"
+
+          if [ "$PR_REGRESSION_COUNT" -gt 0 ]; then
+            echo "::warning::Found $PR_REGRESSION_COUNT test failure(s) caused by NEW code in this PR"
+            echo "pr_regressions_found=true" >> $GITHUB_OUTPUT
+
+            # Write PR Regression Summary to GitHub Step Summary
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              {
+                echo ""
+                echo "## ⚠️ PR Regressions Detected"
+                echo ""
+                echo "> [!WARNING]"
+                echo "> The following test failures are caused by **new code introduced in this PR**."
+                echo "> These are NOT pre-existing bugs — they were introduced by your changes."
+                echo "> Please fix them before merging."
+                echo ""
+                echo "| Test(s) | Component | Method(s) | Description |"
+                echo "|---------|-----------|-----------|-------------|"
+                jq -r '.pr_regressions[]? | "| \((.test_ids // []) | join(", ")) | `\(.sdk_component // "N/A")` | \((.affected_methods // []) | join(", ")) | \(.bug_description // "N/A") |"' "${FIX_OUTPUT}"
+                echo ""
+                echo "### Recommendations"
+                echo ""
+                jq -r '.pr_regressions[]? | "- **\((.test_ids // []) | join(", "))**: \(.recommendation // "Fix the regression in your PR code")"' "${FIX_OUTPUT}"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "pr_regressions_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create bug reports for blocked tests
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' && steps.check_blocked.outputs.bug_report_needed == 'true' && inputs.enable_bug_reporting }}
+        run: |
+          echo "::notice::Creating bug reports for blocked tests"
+          RESULTS_PATH=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          elitea agent run .elitea/agents/bug-reporter.agent.md --dir . "Analyze data in ${RESULTS_PATH} on ${{ inputs.environment }} environment" || echo "Bug reporter completed with warnings"
+      
+      - name: Post Bug Report Summary to GitHub
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' && steps.check_blocked.outputs.bug_report_needed == 'true' && inputs.enable_bug_reporting }}
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          BUG_REPORT="${RESULTS_DIR}/bug_report_output.json"
+          
+          if [ ! -f "${BUG_REPORT}" ]; then
+            echo "::warning::No bug report output found"
+            exit 0
+          fi
+          
+          echo "bug_report_output.json content:"
+          cat "${BUG_REPORT}"
+          
+          # Check if file is valid JSON
+          if ! jq empty "${BUG_REPORT}" 2>/dev/null; then
+            echo "::warning::Invalid JSON in bug_report_output.json"
+            exit 0
+          fi
+          
+          # Parse bug report results
+          BUGS_CREATED=$(jq -r '.summary.bugs_created // 0' "${BUG_REPORT}")
+          AUTOMATION_BUGS_CREATED=$(jq -r '.summary.automation_bugs_created // 0' "${BUG_REPORT}")
+          DUPLICATES_SKIPPED=$(jq -r '.summary.duplicates_skipped // 0' "${BUG_REPORT}")
+          PR_REGRESSIONS_SKIPPED=$(jq -r '.summary.pr_regressions_skipped // 0' "${BUG_REPORT}")
+          TEST_BUGS_SKIPPED=$(jq -r '.summary.test_bugs_skipped // 0' "${BUG_REPORT}")
+          FAILED=$(jq -r '.summary.failed // 0' "${BUG_REPORT}")
+          TOTAL=$(jq -r '.summary.total_analyzed // 0' "${BUG_REPORT}")
+          
+          # Write Bug Report Summary to GitHub Step Summary
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo ""
+              echo "## 🐛 Bug Reporter Summary"
+              echo ""
+              echo "| Metric | Count |"
+              echo "|--------|-------|"
+              echo "| Total Analyzed | **${TOTAL}** |"
+              echo "| ✅ SDK Bugs Created | ${BUGS_CREATED} |"
+              if [ "$AUTOMATION_BUGS_CREATED" -gt 0 ]; then
+                echo "| 🔌 Automation Bugs Created | ${AUTOMATION_BUGS_CREATED} |"
+              fi
+              echo "| ⏭️ Duplicates Skipped | ${DUPLICATES_SKIPPED} |"
+              echo "| 🔄 PR Regressions (not reported) | ${PR_REGRESSIONS_SKIPPED} |"
+              if [ "$TEST_BUGS_SKIPPED" -gt 0 ]; then
+                echo "| 🔧 Test Bugs Skipped | ${TEST_BUGS_SKIPPED} |"
+              fi
+              echo "| ❌ Failed to Report | ${FAILED} |"
+              echo ""
+              
+              # Show created SDK bugs
+              if [ "$BUGS_CREATED" -gt 0 ]; then
+                echo "### ✅ SDK Bugs Created on ELITEA Board"
+                echo ""
+                echo "**Total created: ${BUGS_CREATED} bug(s)**"
+                echo ""
+                echo "| # | Issue | Tests | Component | Labels |"
+                echo "|---|-------|-------|-----------|--------|"
+                COUNTER=1
+                jq -c '.bugs_created[]?' "${BUG_REPORT}" | while read -r item; do
+                  TITLE=$(echo "$item" | jq -r '.title')
+                  ISSUE_URL=$(echo "$item" | jq -r '.issue_url // ("https://github.com/EliteaAI/elitea.github.io/issues/" + (.issue_number | tostring))')
+                  TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                  COMPONENT=$(echo "$item" | jq -r '.affected_component // "N/A"')
+                  LABELS=$(echo "$item" | jq -r '(.labels // []) | join(", ")')
+                  echo "| ${COUNTER} | [${TITLE}](${ISSUE_URL}) | ${TEST_IDS} | ${COMPONENT} | ${LABELS} |"
+                  COUNTER=$((COUNTER + 1))
+                done
+                echo ""
+              fi
+              
+              # Show created automation bugs
+              if [ "$AUTOMATION_BUGS_CREATED" -gt 0 ]; then
+                echo "### 🔌 Automation Bugs Created on ELITEA Board"
+                echo ""
+                echo "**Total created: ${AUTOMATION_BUGS_CREATED} automation bug(s)**"
+                echo ""
+                echo "| # | Issue | Tests | Tool | Error Type | Labels |"
+                echo "|---|-------|-------|------|------------|--------|"
+                COUNTER=1
+                jq -c '.automation_bugs_created[]?' "${BUG_REPORT}" | while read -r item; do
+                  TITLE=$(echo "$item" | jq -r '.title')
+                  ISSUE_URL=$(echo "$item" | jq -r '.issue_url // ("https://github.com/EliteaAI/elitea.github.io/issues/" + (.issue_number | tostring))')
+                  TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
+                  TOOL_NAME=$(echo "$item" | jq -r '.tool_name // "N/A"')
+                  ERROR_TYPE=$(echo "$item" | jq -r '.error_type // "N/A"')
+                  LABELS=$(echo "$item" | jq -r '(.labels // []) | join(", ")')
+                  echo "| ${COUNTER} | [${TITLE}](${ISSUE_URL}) | ${TEST_IDS} | \`${TOOL_NAME}\` | ${ERROR_TYPE} | ${LABELS} |"
+                  COUNTER=$((COUNTER + 1))
+                done
+                echo ""
+              fi
+              
+              # Show skipped duplicates (collapsible)
+              if [ "$DUPLICATES_SKIPPED" -gt 0 ]; then
+                echo "<details>"
+                echo "<summary>⏭️ <b>Duplicates Skipped</b> (${DUPLICATES_SKIPPED})</summary>"
+                echo ""
+                echo "> [!NOTE]"
+                echo "> The following test failures matched existing bugs and were not re-reported"
+                echo ""
+                jq -r '.duplicates_skipped[]? | . as $e | (if $e.existing_issue_titles then [$e.existing_issue_titles, (if $e.existing_issue_urls then $e.existing_issue_urls else ($e.existing_issue_numbers // [] | map("https://github.com/EliteaAI/elitea.github.io/issues/" + tostring)) end)] | transpose | map("  - **Similar to:** [\(.[0])](\(.[1]))") elif $e.existing_issue_title then ["  - **Similar to:** [\($e.existing_issue_title)](\($e.existing_issue_url // ("https://github.com/EliteaAI/elitea.github.io/issues/" + ($e.existing_issue_number | tostring))))"] else ["  - **Similar to:** N/A"] end) as $links | "- **Tests:** \(($e.test_ids // []) | join(", "))\n" + ($links | join("\n")) + "\n  - **Reason:** \($e.similarity_reason // "N/A")\n"' "${BUG_REPORT}"
+                echo ""
+                echo "</details>"
+                echo ""
+              fi
+              
+              # Show failures (collapsible)
+              if [ "$FAILED" -gt 0 ]; then
+                echo "<details>"
+                echo "<summary>❌ <b>Failed to Report</b> (${FAILED})</summary>"
+                echo ""
+                echo "> [!CAUTION]"
+                echo "> The following test failures could not be automatically reported"
+                echo ""
+                echo "| Tests | Reason | Action |"
+                echo "|-------|--------|--------|"
+                jq -r '.failed[]? | "| \((.test_ids // []) | join(", ")) | \(.reason // "N/A") | \(.action_needed // "Manual review required") |"' "${BUG_REPORT}"
+                echo ""
+                echo "</details>"
+                echo ""
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Label PR with bug detection status
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' && steps.check_blocked.outputs.bug_report_needed == 'true' && inputs.enable_bug_reporting }}
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          BUG_REPORT="${RESULTS_DIR}/bug_report_output.json"
+          FIX_OUTPUT="${RESULTS_DIR}/fix_output.json"
+          
+          if [ ! -f "${BUG_REPORT}" ]; then
+            echo "No bug_report_output.json found, skipping PR labeling"
+            exit 0
+          fi
+          
+          # Check if file is valid JSON
+          if ! jq empty "${BUG_REPORT}" 2>/dev/null; then
+            echo "Invalid JSON in bug_report_output.json, skipping PR labeling"
+            exit 0
+          fi
+          
+          # Parse bug report results
+          BUGS_CREATED=$(jq -r '.summary.bugs_created // 0' "${BUG_REPORT}")
+          AUTOMATION_BUGS_CREATED=$(jq -r '.summary.automation_bugs_created // 0' "${BUG_REPORT}")
+          DUPLICATES_SKIPPED=$(jq -r '.summary.duplicates_skipped // 0' "${BUG_REPORT}")
+          
+          # Try to get PR number from various sources
+          PR_NUMBER=""
+          
+          # First try from fix_output.json
+          if [ -f "${FIX_OUTPUT}" ] && jq empty "${FIX_OUTPUT}" 2>/dev/null; then
+            PR_NUMBER=$(jq -r '.commit_details.pr_number // null' "${FIX_OUTPUT}")
+          fi
+          
+          # Fall back to GitHub context
+          if [ "$PR_NUMBER" = "null" ] || [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          fi
+          
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "No PR number found, skipping labeling"
+            exit 0
+          fi
+          
+          echo "PR Number: $PR_NUMBER"
+          echo "Bugs Created: $BUGS_CREATED"
+          echo "Automation Bugs Created: $AUTOMATION_BUGS_CREATED"
+          echo "Duplicates Skipped: $DUPLICATES_SKIPPED"
+          
+          # Add label for new SDK bugs detected
+          if [ "$BUGS_CREATED" -gt 0 ]; then
+            echo "Adding 'bug_ai_detected' label to PR #$PR_NUMBER"
+            gh pr edit "$PR_NUMBER" \
+              --add-label bug_ai_detected \
+              --repo ${{ github.repository }} || echo "Failed to add bug_ai_detected label, continuing..."
+          fi
+          
+          # Add label for automation bugs detected
+          if [ "$AUTOMATION_BUGS_CREATED" -gt 0 ]; then
+            echo "Adding 'automation_bug_ai_detected' label to PR #$PR_NUMBER"
+            gh pr edit "$PR_NUMBER" \
+              --add-label automation_bug_ai_detected \
+              --repo ${{ github.repository }} || echo "Failed to add automation_bug_ai_detected label, continuing..."
+          fi
+          
+          # Add label for existing/known bugs detected
+          if [ "$DUPLICATES_SKIPPED" -gt 0 ]; then
+            echo "Adding 'existing_bugs_ai_detected' label to PR #$PR_NUMBER"
+            gh pr edit "$PR_NUMBER" \
+              --add-label existing_bugs_ai_detected \
+              --repo ${{ github.repository }} || echo "Failed to add existing_bugs_ai_detected label, continuing..."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      # -----------------------------------------------------------------------
+      # Final status gate – must run after all AI analysis / bug reporting steps
+      # -----------------------------------------------------------------------
+      - name: Determine final job status
+        if: always()
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          FIX_OUTPUT="${RESULTS_DIR}/fix_output.json"
+          
+          TESTS_FAILED="${{ steps.wait_tests.outputs.tests_failed }}"
+          TIMED_OUT="${{ steps.wait_tests.outputs.timeout }}"
+
+          # Hard timeout → always fail
+          if [ "$TIMED_OUT" = "true" ]; then
+            echo "::error::Test container timed out – job fails"
+            exit 1
+          fi
+
+          # Tests passed cleanly → nothing more to check
+          if [ "$TESTS_FAILED" != "true" ]; then
+            echo "✅ All tests passed"
+            exit 0
+          fi
+
+          # ── Tests failed – AI analysis must provide a clear verdict ──
+
+          if [ ! -f "${FIX_OUTPUT}" ] || ! jq empty "${FIX_OUTPUT}" 2>/dev/null; then
+            echo "::error::Tests failed and AI analysis output is missing or invalid – job status is unclear"
+            exit 1
+          fi
+
+          FIXED=$(jq -r '.summary.fixed // 0' "${FIX_OUTPUT}")
+          FLAKY=$(jq -r '.summary.flaky // 0' "${FIX_OUTPUT}")
+          BLOCKED=$(jq -r '.summary.blocked // 0' "${FIX_OUTPUT}")
+          COMMITTED=$(jq -r '.committed // false' "${FIX_OUTPUT}")
+
+          # Count blocked by type
+          SDK_BUGS=$(jq -r '[.blocked[]? | select(.blocker_type == "sdk_bug")] | length' "${FIX_OUTPUT}")
+          AUTOMATION_BUGS=$(jq -r '[.blocked[]? | select(.blocker_type == "automation_bug")] | length' "${FIX_OUTPUT}")
+          PR_REGRESSIONS=$(jq -r '((.pr_regressions // []) | length) + ([.blocked[]? | select(.blocker_type == "pr_regression")] | length)' "${FIX_OUTPUT}")
+          MAX_ATTEMPTS=$(jq -r '[.blocked[]? | select(.blocker_type == "max_attempts_exceeded")] | length' "${FIX_OUTPUT}")
+
+          echo "AI verdict → fixed=$FIXED  flaky=$FLAKY  blocked=$BLOCKED  committed=$COMMITTED"
+          echo "Blocked breakdown → sdk_bugs=$SDK_BUGS  automation_bugs=$AUTOMATION_BUGS  pr_regressions=$PR_REGRESSIONS  max_attempts=$MAX_ATTEMPTS"
+
+          # PR regressions → always fail (bugs introduced by this PR)
+          if [ "$PR_REGRESSIONS" -gt 0 ]; then
+            echo "::error::$PR_REGRESSIONS PR regression(s) detected — bugs introduced by this PR's code changes. Fix before merging."
+            exit 1
+          fi
+
+          # SDK bugs blocking tests → fail
+          if [ "$SDK_BUGS" -gt 0 ]; then
+            echo "::error::$SDK_BUGS test(s) blocked by SDK bugs – job fails (see AI analysis summary)"
+            exit 1
+          fi
+
+          # Automation bugs → fail (environment/infra issues need TA team verification)
+          if [ "$AUTOMATION_BUGS" -gt 0 ]; then
+            echo "::error::$AUTOMATION_BUGS test(s) blocked by automation bugs (environment/infrastructure issues) – job fails (see AI analysis summary)"
+            exit 1
+          fi
+
+          # All failures were test-code issues that AI fixed and committed → pass
+          if [ "$FIXED" -gt 0 ] && [ "$COMMITTED" = "true" ]; then
+            echo "✅ All $FIXED failing test(s) were fixed by AI and committed – job passes"
+            exit 0
+          fi
+
+          # Max attempts exceeded → fail (tests couldn't be fixed)
+          if [ "$MAX_ATTEMPTS" -gt 0 ]; then
+            echo "::error::$MAX_ATTEMPTS test(s) exhausted max fix attempts – job fails"
+            exit 1
+          fi
+
+          # Flaky tests → fail (intermittent = unreliable infrastructure)
+          if [ "$FLAKY" -gt 0 ]; then
+            echo "::error::$FLAKY flaky test(s) detected – job fails (intermittent failures must be investigated)"
+            exit 0
+          fi
+
+          # Fallback: unclear outcome
+          echo "::error::Tests failed with unclear AI analysis outcome (fixed=$FIXED flaky=$FLAKY blocked=$BLOCKED committed=$COMMITTED) – job fails"
+          exit 1
+
+      - name: Upload test results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ inputs.test_cases_dir }}
+          path: .elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}/
+          retention-days: 1
+
+      - name: CLEAN UP WORKSPACE AFTER RUN
+        if: always()
+        run: |
+          rm -rf $GITHUB_WORKSPACE/{,.[!.],..?}*

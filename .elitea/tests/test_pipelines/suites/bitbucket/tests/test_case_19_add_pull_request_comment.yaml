@@ -1,0 +1,293 @@
+name: "BB19 - add_pull_request_comment: Add regular comment to PR"
+description: |
+  Verify the Bitbucket 'add_pull_request_comment' tool adds a regular comment.
+
+  Objective: Test adding non-inline comment to a pull request
+
+  Expected Behavior:
+  - Tool executes without crashing
+  - Comment is added when PR exists
+  - Returns appropriate error when PR doesn't exist
+  - Comment ID or confirmation is returned
+
+toolkits:
+  - id: ${BITBUCKET_TOOLKIT_ID}
+    name: ${BITBUCKET_TOOLKIT_NAME}
+
+state:
+  source_branch:
+    type: str
+  test_file_path:
+    type: str
+  branch_result:
+    type: str
+  file_result:
+    type: str
+  pr_json_data:
+    type: str
+  pr_result:
+    type: str
+  pr_id:
+    type: str
+  delete_result:
+    type: str
+  comment_content:
+    type: str
+    value: |
+      ## Test Comment from BB19
+
+      This is a test comment added by the Bitbucket test suite.
+
+      **Purpose**: Verify that regular PR comments can be added successfully.
+
+      - Test case: BB19
+      - Comment type: Regular (non-inline)
+  expected_success_indicators:
+    type: list
+    value: ["created", "added", "id", "comment", "success"]
+  acceptable_error_indicators:
+    type: list
+    value: ["not found", "does not exist", "404", "no pull request"]
+  error_indicators:
+    type: list
+    value: ["error", "failed", "exception", "unauthorized", "forbidden"]
+  comment_result:
+    type: str
+  test_results:
+    type: dict
+
+entry_point: prepare_test_data
+nodes:
+  - id: prepare_test_data
+    type: code
+    code:
+      type: fixed
+      value: |
+        import time
+        import random
+        import string
+
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+
+        source_branch = f"feature/bb19-comment-pr-{timestamp}-{random_suffix}"
+        test_file_path = f"test-files/bb19-comment-test-{timestamp}-{random_suffix}.txt"
+
+        {"source_branch": source_branch, "test_file_path": test_file_path}
+    output:
+      - source_branch
+      - test_file_path
+    structured_output: true
+    transition: create_source_branch
+
+  - id: create_source_branch
+    type: toolkit
+    input:
+      - source_branch
+    input_mapping:
+      branch_name:
+        type: variable
+        value: source_branch
+    output:
+      - branch_result
+    structured_output: true
+    tool: create_branch
+    toolkit_name: ${BITBUCKET_TOOLKIT_NAME}
+    transition: create_test_file
+
+  - id: create_test_file
+    type: toolkit
+    input:
+      - test_file_path
+      - source_branch
+    input_mapping:
+      file_path:
+        type: variable
+        value: test_file_path
+      file_contents:
+        type: fixed
+        value: "Test file for BB19 - PR comment test"
+      branch:
+        type: variable
+        value: source_branch
+    output:
+      - file_result
+    structured_output: true
+    tool: create_file
+    toolkit_name: ${BITBUCKET_TOOLKIT_NAME}
+    transition: build_pr_json
+
+  - id: build_pr_json
+    type: code
+    code:
+      type: fstring
+      value: |-
+        import json
+
+        branch = elitea_state.get('source_branch')
+
+        pr_data = {
+            "title": "BB19: Test PR for Comment",
+            "source": {
+                "branch": {
+                    "name": branch
+                }
+            },
+            "destination": {
+                "branch": {
+                    "name": "main"
+                }
+            }
+        }
+
+        json.dumps(pr_data)
+    input:
+      - source_branch
+    output:
+      - pr_json_data
+    structured_output: true
+    transition: create_pull_request
+
+  - id: create_pull_request
+    type: toolkit
+    input:
+      - pr_json_data
+    input_mapping:
+      pr_json_data:
+        type: variable
+        value: pr_json_data
+    output:
+      - pr_result
+    structured_output: true
+    tool: create_pull_request
+    toolkit_name: ${BITBUCKET_TOOLKIT_NAME}
+    transition: extract_pr_id
+
+  - id: extract_pr_id
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+
+        pr_result = elitea_state.get('pr_result', '')
+
+        pr_id = None
+        patterns = [
+            r'/pullrequests?[/](\d+)',
+            r'/pull-requests?[/](\d+)',
+            r'"id"\s*:\s*(\d+)',
+            r'#(\d+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, str(pr_result), re.IGNORECASE)
+            if match:
+                pr_id = match.group(1)
+                break
+
+        if not pr_id:
+            pr_id = "PR_ID_NOT_FOUND"
+
+        {"pr_id": pr_id}
+    input:
+      - pr_result
+    output:
+      - pr_id
+    structured_output: true
+    transition: add_regular_comment
+
+  - id: add_regular_comment
+    type: toolkit
+    input:
+      - pr_id
+      - comment_content
+    input_mapping:
+      pr_id:
+        type: variable
+        value: pr_id
+      content:
+        type: variable
+        value: comment_content
+    output:
+      - comment_result
+    structured_output: true
+    tool: add_pull_request_comment
+    toolkit_name: ${BITBUCKET_TOOLKIT_NAME}
+    transition: validate_results
+
+  - id: validate_results
+    type: llm
+    input:
+      - comment_result
+      - pr_id
+      - comment_content
+      - expected_success_indicators
+      - acceptable_error_indicators
+      - error_indicators
+    input_mapping:
+      chat_history:
+        type: fixed
+        value: []
+      system:
+        type: fixed
+        value: You are a strict quality assurance validator. Only return valid JSON.
+      task:
+        type: fstring
+        value: |
+          Analyze the output from 'add_pull_request_comment' tool execution.
+
+          PR ID: {pr_id}
+          Comment Content Attempted: {comment_content}
+          Comment Result: {comment_result}
+          Expected Success Indicators: {expected_success_indicators}
+          Acceptable Error Indicators: {acceptable_error_indicators}
+          Error Indicators: {error_indicators}
+
+          This is a POSITIVE test - we expect successful comment OR graceful "not found" error.
+
+          Validation Criteria (ALL must pass for test_passed=true):
+          1. tool_executed: Tool executed without crashing or unhandled exception
+          2. comment_added_or_acceptable_error: Comment was added OR error indicates PR not found
+          3. result_has_confirmation: If successful, result contains ID or success indicator
+          4. no_unexpected_errors: No unexpected error indicators in output
+          5. no_unhandled_exception: No 'traceback', 'stack trace', or 'unhandled' in output
+          6. response_is_informative: Response indicates what happened (success or why failed)
+
+          Return JSON test_results:
+          {{
+            "test_passed": boolean (true only if ALL criteria pass),
+            "tool_executed": boolean,
+            "comment_added_or_acceptable_error": boolean,
+            "result_has_confirmation": boolean,
+            "no_unexpected_errors": boolean,
+            "no_unhandled_exception": boolean,
+            "response_is_informative": boolean,
+            "comment_was_added": boolean,
+            "comment_id": "extracted comment ID or 'not found'",
+            "success_indicator_found": "which success indicator was found or 'none'",
+            "error": string | null
+          }}
+
+          Return ONLY the JSON object.
+    model: ${DEFAULT_LLM_MODEL}
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: cleanup_pr_branch
+
+  - id: cleanup_pr_branch
+    type: toolkit
+    continue_on_error: true
+    input:
+      - source_branch
+    input_mapping:
+      branch_name:
+        type: variable
+        value: source_branch
+    output:
+      - delete_result
+    structured_output: true
+    tool: delete_branch
+    toolkit_name: ${BITBUCKET_TOOLKIT_NAME}
+    transition: END

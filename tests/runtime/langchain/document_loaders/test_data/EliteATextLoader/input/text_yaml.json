@@ -1,0 +1,8 @@
+{
+    "file_path": "../files/text_yaml.yaml",
+    "configs": [
+        {"autodetect_encoding": true, "max_tokens": 512},
+        {"autodetect_encoding": true, "max_tokens": 256},
+        {"autodetect_encoding": true, "max_tokens": 1024}
+    ]
+}

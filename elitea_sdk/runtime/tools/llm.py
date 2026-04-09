@@ -1,0 +1,2115 @@
+import asyncio
+import contextvars
+import json
+import logging
+from traceback import format_exc
+from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING
+
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool, ToolException
+from langchain_core.callbacks import dispatch_custom_event
+from langgraph.errors import GraphBubbleUp
+from langgraph.types import interrupt as _langgraph_interrupt
+from pydantic import Field
+
+try:
+    from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD as _SCRATCHPAD_KEY
+except ImportError:
+    _SCRATCHPAD_KEY = '__pregel_scratchpad'
+
+from ..langchain.constants import ELITEA_RS
+from ..langchain.utils import create_pydantic_model, propagate_the_input_mapping
+from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
+if TYPE_CHECKING:
+    from .lazy_tools import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+SENSITIVE_TOOL_BLOCKED_RESULT_TYPE = 'sensitive_tool_blocked'
+MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS = 5
+BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER = 'This is a continuation turn after the blocked action(s):'
+
+# ContextVar used by __perform_tool_calling to expose intermediate messages
+# accumulated during the current LLMNode execution.  The sensitive-tool guard
+# middleware reads this before calling interrupt() so the messages can be
+# persisted in the checkpoint and restored on resume.
+_PENDING_TOOL_MESSAGES: contextvars.ContextVar[list] = contextvars.ContextVar(
+    '_pending_tool_messages', default=[],
+)
+
+
+# def _is_thinking_model(llm_client: Any) -> bool:
+#     """
+#     Check if a model uses extended thinking capability by reading cached metadata.
+    
+#     Thinking models require special message formatting where assistant messages
+#     must start with thinking blocks before tool_use blocks.
+    
+#     This function reads the `_supports_reasoning` attribute that should be set
+#     when the LLM client is created (by checking the model's supports_reasoning field).
+    
+#     Args:
+#         llm_client: LLM client instance with optional _supports_reasoning attribute
+        
+#     Returns:
+#         True if the model is a thinking model, False otherwise
+#     """
+#     if not llm_client:
+#         return False
+    
+#     # Check if supports_reasoning was cached on the client
+#     supports_reasoning = getattr(llm_client, '_supports_reasoning', False)
+    
+#     if supports_reasoning:
+#         model_name = getattr(llm_client, 'model_name', None) or getattr(llm_client, 'model', 'unknown')
+#         logger.debug(f"Model '{model_name}' is a thinking/reasoning model (cached from API metadata)")
+    
+#     return supports_reasoning
+
+JSON_INSTRUCTION_TEMPLATE = (
+        "\n\n**IMPORTANT: You MUST respond with ONLY a valid JSON object.**\n\n"
+        "Required JSON fields:\n{field_descriptions}\n\n"
+        "Example format:\n"
+        "{{\n{example_fields}\n}}\n\n"
+        "Rules:\n"
+        "1. Output ONLY the JSON object - no markdown, no explanations, no extra text\n"
+        "2. Ensure all required fields are present\n"
+        "3. Use proper JSON syntax with double quotes for strings\n"
+        "4. Do not wrap the JSON in code blocks or backticks"
+    )
+
+class LLMNode(BaseTool):
+    """Enhanced LLM node with chat history and tool binding support"""
+    
+    # Override BaseTool required fields
+    name: str = Field(default='LLMNode', description='Name of the LLM node')
+    description: str = Field(default='This is tool node for LLM with chat history and tool support',
+                             description='Description of the LLM node')
+
+    # LLM-specific fields
+    client: Any = Field(default=None, description='LLM client instance')
+    return_type: str = Field(default="str", description='Return type')
+    response_key: str = Field(default="messages", description='Response key')
+    structured_output_dict: Optional[Dict[str, Any]] = Field(default=None, description='Structured output dictionary')
+    output_variables: Optional[List[str]] = Field(default=None, description='Output variables')
+    input_mapping: Optional[dict[str, dict]] = Field(default=None, description='Input mapping')
+    input_variables: Optional[List[str]] = Field(default=None, description='Input variables')
+    structured_output: Optional[bool] = Field(default=False, description='Whether to use structured output')
+    available_tools: Optional[List[BaseTool]] = Field(default=None, description='Available tools for binding')
+    tool_names: Optional[List[str]] = Field(default=None, description='Specific tool names to filter')
+    steps_limit: Optional[int] = Field(default=25, description='Maximum steps for tool execution')
+    tool_execution_timeout: Optional[int] = Field(default=900, description='Timeout (seconds) for tool execution. Default is 15 minutes.')
+
+    # Lazy tools mode - reduces token usage by not binding all tools upfront
+    lazy_tools_mode: Optional[bool] = Field(
+        default=True,
+        description='Enable lazy tools mode. When True, only meta-tools (list_toolkits, get_toolkit_tools, invoke_tool) '
+                    'are bound to the LLM. The model uses these to discover and invoke any tool from the registry. '
+                    'This dramatically reduces token usage for agents with many toolkits (30-100+).'
+    )
+    tool_registry: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description='ToolRegistry instance containing all tools organized by toolkit. '
+                    'Required when lazy_tools_mode is True.'
+    )
+    always_bind_tools: Optional[List[BaseTool]] = Field(
+        default=None,
+        description='Tools that should always be bound directly to the LLM, even in lazy mode. '
+                    'Used for middleware tools like planning that need immediate access. '
+                    'These are bound alongside meta-tools, not through the registry.'
+    )
+    middleware_manager: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description='MiddlewareManager instance for before_model/after_model hooks. '
+                    'Used for context management like summarization and context editing.'
+    )
+    _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
+
+    def _prepare_structured_output_params(self) -> dict:
+        """
+        Prepare structured output parameters from structured_output_dict.
+
+        Expected self.structured_output_dict formats:
+          - {"field": "str"} / {"field": "list"} / {"field": "list[dict]"} / {"field": "any"} ...
+          - OR {"field": {"type": "...", "description": "...", "default": ...}}  (optional)
+
+        Returns:
+            Dict[str, Dict] suitable for create_pydantic_model(...)
+        """
+        struct_params: dict[str, dict] = {}
+
+        for key, value in (self.structured_output_dict or {}).items():
+            # Allow either a plain type string or a dict with details
+            if isinstance(value, dict):
+                type_str = str(value.get("type") or "any")
+                desc = value.get("description", "") or ""
+                entry: dict = {"type": type_str, "description": desc}
+                if "default" in value:
+                    entry["default"] = value["default"]
+            else:
+                # Ensure we always have a string type
+                if isinstance(value, str):
+                    type_str = value
+                else:
+                    # If it's already a type object, convert to string representation
+                    type_str = getattr(value, '__name__', 'any')
+
+                entry = {"type": type_str, "description": ""}
+
+            struct_params[key] = entry
+
+        # Add default output field for proper response to user
+        struct_params[ELITEA_RS] = {
+            "description": "final output to user (summarized output from LLM)",
+            "type": "str",
+            "default": None,
+        }
+
+        return struct_params
+
+    def _invoke_with_structured_output(self, llm_client: Any, messages: List, struct_model: Any, config: RunnableConfig):
+        """
+        Invoke LLM with structured output, handling tool calls if present.
+
+        Args:
+            llm_client: LLM client instance
+            messages: List of conversation messages
+            struct_model: Pydantic model for structured output
+            config: Runnable configuration
+
+        Returns:
+            Tuple of (completion, initial_completion, final_messages)
+        """
+        initial_completion = llm_client.invoke(messages, config=config)
+
+        if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
+            # Handle tool calls first, then apply structured output
+            new_messages, _ = self._run_async_in_sync_context(
+                self.__perform_tool_calling(initial_completion, messages, llm_client, config)
+            )
+            llm = self.__get_struct_output_model(llm_client, struct_model)
+            completion = llm.invoke(new_messages, config=config)
+            return completion, initial_completion, new_messages
+        else:
+            # Direct structured output without tool calls
+            llm = self.__get_struct_output_model(llm_client, struct_model)
+            completion = llm.invoke(messages, config=config)
+            return completion, initial_completion, messages
+
+    def _build_json_instruction(self, struct_model: Any) -> str:
+        """
+        Build JSON instruction message for fallback handling.
+
+        Args:
+            struct_model: Pydantic model with field definitions
+
+        Returns:
+            Formatted JSON instruction string
+        """
+        field_descriptions = []
+        for name, field in struct_model.model_fields.items():
+            field_type = field.annotation.__name__ if hasattr(field.annotation, '__name__') else str(field.annotation)
+            field_desc = field.description or field_type
+            field_descriptions.append(f"  - {name} ({field_type}): {field_desc}")
+
+        example_fields = ",\n".join([
+            f'  "{k}": <{field.annotation.__name__ if hasattr(field.annotation, "__name__") else "value"}>'
+            for k, field in struct_model.model_fields.items()
+        ])
+
+        return JSON_INSTRUCTION_TEMPLATE.format(
+            field_descriptions="\n".join(field_descriptions),
+            example_fields=example_fields
+        )
+
+    def _create_fallback_completion(self, content: str, struct_model: Any) -> Any:
+        """
+        Create a fallback completion object when JSON parsing fails.
+
+        Args:
+            content: Plain text content from LLM
+            struct_model: Pydantic model to construct
+
+        Returns:
+            Pydantic model instance with fallback values
+        """
+        result_dict = {}
+        for k, field in struct_model.model_fields.items():
+            if k == ELITEA_RS:
+                result_dict[k] = content
+            elif field.is_required():
+                # Set default values for required fields based on type
+                result_dict[k] = field.default if field.default is not None else None
+            else:
+                result_dict[k] = field.default
+        return struct_model.model_construct(**result_dict)
+
+    def _handle_structured_output_fallback(self, llm_client: Any, messages: List, struct_model: Any,
+                                          config: RunnableConfig, original_error: Exception) -> Any:
+        """
+        Handle structured output fallback through multiple strategies.
+
+        Tries fallback methods in order:
+        1. json_mode with explicit instructions
+        2. function_calling method
+        3. Plain text with JSON extraction
+
+        Args:
+            llm_client: LLM client instance
+            messages: Original conversation messages
+            struct_model: Pydantic model for structured output
+            config: Runnable configuration
+            original_error: The original ValueError that triggered fallback
+
+        Returns:
+            Completion with structured output (best effort)
+
+        Raises:
+            Propagates exceptions from LLM invocation
+        """
+        logger.error(f"Error invoking structured output model: {format_exc()}")
+        logger.info("Attempting to fall back to json mode")
+
+        # Build JSON instruction once
+        json_instruction = self._build_json_instruction(struct_model)
+
+        # Add instruction to messages
+        modified_messages = messages.copy()
+        if modified_messages and isinstance(modified_messages[-1], HumanMessage):
+            modified_messages[-1] = HumanMessage(
+                content=modified_messages[-1].content + json_instruction
+            )
+        else:
+            modified_messages.append(HumanMessage(content=json_instruction))
+
+        # Try json_mode with explicit instructions
+        try:
+            completion = self.__get_struct_output_model(
+                llm_client, struct_model, method="json_mode"
+            ).invoke(modified_messages, config=config)
+            return completion
+        except Exception as json_mode_error:
+            logger.warning(f"json_mode also failed: {json_mode_error}")
+            logger.info("Falling back to function_calling method")
+
+            # Try function_calling as a third fallback
+            try:
+                completion = self.__get_struct_output_model(
+                    llm_client, struct_model, method="function_calling"
+                ).invoke(modified_messages, config=config)
+                return completion
+            except Exception as function_calling_error:
+                logger.error(f"function_calling also failed: {function_calling_error}")
+                logger.info("Final fallback: using plain LLM response")
+
+                # Last resort: get plain text response and wrap in structure
+                plain_completion = llm_client.invoke(modified_messages, config=config)
+                content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
+
+                # Try to extract JSON from the response
+                import json
+                import re
+
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    try:
+                        parsed_json = json.loads(json_match.group(0))
+                        # Validate it has expected fields and wrap in pydantic model
+                        completion = struct_model(**parsed_json)
+                        return completion
+                    except (json.JSONDecodeError, Exception) as parse_error:
+                        logger.warning(f"Could not parse extracted JSON: {parse_error}")
+                        return self._create_fallback_completion(content, struct_model)
+                else:
+                    # No JSON found, create response with content in elitea_response
+                    return self._create_fallback_completion(content, struct_model)
+
+    def _format_structured_output_result(self, result: dict, messages: List, initial_completion: Any) -> dict:
+        """
+        Format structured output result with properly formatted messages.
+
+        Args:
+            result: Result dictionary from model_dump()
+            messages: Original conversation messages
+            initial_completion: Initial completion before tool calls
+
+        Returns:
+            Formatted result dictionary with messages
+        """
+        # Ensure messages are properly formatted
+        if result.get('messages') and isinstance(result['messages'], list):
+            result['messages'] = [{'role': 'assistant', 'content': '\n'.join(result['messages'])}]
+        else:
+            # Extract content from initial_completion, handling thinking blocks
+            fallback_content = result.get(ELITEA_RS, '')
+            if not fallback_content and initial_completion:
+                content_parts = self._extract_content_from_completion(initial_completion)
+                fallback_content = content_parts.get('text') or ''
+                thinking = content_parts.get('thinking')
+
+                # Log thinking if present
+                if thinking:
+                    logger.debug(f"Thinking content present in structured output: {thinking[:100]}...")
+
+                if not fallback_content:
+                    # Final fallback to raw content
+                    content = initial_completion.content
+                    fallback_content = content if isinstance(content, str) else str(content)
+
+            result['messages'] = self._strip_system_messages(messages + [AIMessage(content=fallback_content)])
+
+        return result
+
+    def get_filtered_tools(self, config: Optional[Any] = None) -> List[BaseTool]:
+        """
+        Filter available tools based on tool_names list or return meta-tools in lazy mode.
+
+        In lazy_tools_mode (default), returns only meta-tools that allow the model
+        to discover and invoke any tool from the registry. This reduces token usage
+        from potentially 100k+ tokens to ~2k tokens for agents with many toolkits.
+
+        If dynamic tool selection was performed (selected_tools in config), those
+        tools are returned directly instead of meta-tools.
+
+        Always-bind tools (e.g., middleware/planning tools) are included alongside
+        meta-tools in lazy mode, giving the model immediate access to these tools.
+
+        Args:
+            config: Optional runnable config that may contain selected_tools from
+                    dynamic tool selection
+
+        Returns:
+            List of filtered tools (or meta-tools + always-bind tools in lazy mode)
+        """
+        # Check for dynamically selected tools from pre-LLM selection
+        if config is not None:
+            configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
+            selected_tools = configurable.get('selected_tools')
+            if selected_tools:
+                logger.info(f"[DynamicToolSelection] Using {len(selected_tools)} pre-selected tools")
+                # Fix for #3290: Always include always_bind_tools (e.g., Planner tools) with
+                # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
+                # This ensures Planner tools are available even on first message when
+                # Smart Tools Selection finds matching toolkits.
+                return list(selected_tools) + list(self.always_bind_tools or [])
+
+        # Check if lazy tools mode is enabled and we have a registry
+        if self.lazy_tools_mode and self.tool_registry is not None:
+            meta_tools = self._get_meta_tools()
+            # Include always-bind tools (e.g., planning tools) alongside meta-tools
+            if self.always_bind_tools:
+                combined_tools = list(meta_tools) + list(self.always_bind_tools)
+                logger.info(
+                    f"[LazyTools] Binding {len(meta_tools)} meta-tools + "
+                    f"{len(self.always_bind_tools)} always-bind tools: "
+                    f"{[t.name for t in self.always_bind_tools]}"
+                )
+                return combined_tools
+            return meta_tools
+
+        # Traditional mode - bind actual tools
+        # Fix for #3382: Include always_bind_tools even when lazy mode is disabled
+        # This ensures agent/pipeline tools are always available to the LLM
+        base_tools = []
+
+        if self.available_tools:
+            if not self.tool_names:
+                # If no specific tool names provided, use all available tools
+                base_tools = list(self.available_tools)
+            else:
+                # Filter tools by name
+                available_tool_names = {tool.name: tool for tool in self.available_tools}
+                for tool_name in self.tool_names:
+                    if tool_name in available_tool_names:
+                        base_tools.append(available_tool_names[tool_name])
+                        logger.debug(f"Added tool '{tool_name}' to LLM node")
+                    else:
+                        logger.warning(f"Tool '{tool_name}' not found in available tools: {list(available_tool_names.keys())}")
+
+        # Always include always_bind_tools (agent/pipeline tools, planning tools)
+        # These need direct LLM access regardless of lazy mode status
+        if self.always_bind_tools:
+            # Avoid duplicates - only add tools not already in base_tools
+            existing_names = {t.name for t in base_tools}
+            additional_tools = [t for t in self.always_bind_tools if t.name not in existing_names]
+            if additional_tools:
+                logger.info(
+                    f"[DirectBinding] Including {len(additional_tools)} always-bind tools: "
+                    f"{[t.name for t in additional_tools]}"
+                )
+                base_tools.extend(additional_tools)
+
+        return base_tools
+
+    def _get_meta_tools(self) -> List[BaseTool]:
+        """
+        Get or create meta-tools for lazy loading.
+
+        Meta-tools are cached on first creation to avoid recreating them
+        on every tool access.
+
+        Returns:
+            List of meta-tools [list_toolkits, get_toolkit_tools, invoke_tool]
+        """
+        if self._meta_tools is None:
+            from .lazy_tools import create_meta_tools
+            self._meta_tools = create_meta_tools(self.tool_registry)
+            logger.info(
+                f"[LazyTools] Created {len(self._meta_tools)} meta-tools for "
+                f"{len(self.tool_registry.get_toolkit_names())} toolkits, "
+                f"{sum(len(self.tool_registry.get_toolkit_tools(t)) for t in self.tool_registry.get_toolkit_names())} tools"
+            )
+        return self._meta_tools
+
+    def get_tool_index(self) -> str:
+        """
+        Generate a compressed tool index for inclusion in system prompt.
+
+        This is only meaningful in lazy_tools_mode when a tool_registry is available.
+
+        Returns:
+            Formatted string with toolkit/tool index, or empty string if not applicable
+        """
+        if self.tool_registry is not None:
+            return self.tool_registry.generate_index()
+        return ""
+
+    def _inject_tool_index_into_messages(self, messages: List) -> List:
+        """
+        Inject tool index into the system message for chat-based interactions.
+
+        For lazy tools mode, the model needs to see what tools are available.
+        This method finds the first SystemMessage and appends the tool index.
+
+        Args:
+            messages: List of messages from state
+
+        Returns:
+            Modified messages list with tool index injected into system message
+        """
+        if not self.tool_registry:
+            return messages
+
+        tool_index = self.tool_registry.generate_index()
+
+        # Find and modify the system message
+        modified_messages = []
+        index_injected = False
+
+        for msg in messages:
+            if isinstance(msg, SystemMessage) and not index_injected:
+                # Append tool index to system message
+                new_content = f"{msg.content}\n\n{tool_index}"
+                modified_messages.append(SystemMessage(content=new_content))
+                index_injected = True
+                logger.debug("[LazyTools] Injected tool index into existing system message")
+            else:
+                modified_messages.append(msg)
+
+        # If no system message found, prepend one with just the tool index
+        if not index_injected:
+            modified_messages.insert(0, SystemMessage(content=tool_index))
+            logger.debug("[LazyTools] Added new system message with tool index")
+
+        return modified_messages
+
+    def _get_tool_truncation_suggestions(self, tool_name: Optional[str]) -> str:
+        """
+        Get context-specific suggestions for how to reduce output from a tool.
+        
+        First checks if the tool itself provides truncation suggestions via 
+        `truncation_suggestions` attribute or `get_truncation_suggestions()` method.
+        Falls back to generic suggestions if the tool doesn't provide any.
+        
+        Args:
+            tool_name: Name of the tool that caused the context overflow
+            
+        Returns:
+            Formatted string with numbered suggestions for the specific tool
+        """
+        suggestions = None
+        
+        # Try to get suggestions from the tool itself
+        if tool_name:
+            filtered_tools = self.get_filtered_tools()
+            for tool in filtered_tools:
+                if tool.name == tool_name:
+                    # Check for truncation_suggestions attribute
+                    if hasattr(tool, 'truncation_suggestions') and tool.truncation_suggestions:
+                        suggestions = tool.truncation_suggestions
+                        break
+                    # Check for get_truncation_suggestions method
+                    elif hasattr(tool, 'get_truncation_suggestions') and callable(tool.get_truncation_suggestions):
+                        suggestions = tool.get_truncation_suggestions()
+                        break
+        
+        # Fall back to generic suggestions if tool doesn't provide any
+        if not suggestions:
+            suggestions = [
+                "Check if the tool has parameters to limit output size (e.g., max_items, max_results, max_depth)",
+                "Target a more specific path or query instead of broad searches",
+                "Break the operation into smaller, focused requests",
+            ]
+        
+        # Format as numbered list
+        return "\n".join(f"{i+1}. {s}" for i, s in enumerate(suggestions))
+
+    @staticmethod
+    def _parse_sensitive_tool_blocked_result(tool_result: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(tool_result, dict) and tool_result.get('type') == SENSITIVE_TOOL_BLOCKED_RESULT_TYPE:
+            return dict(tool_result)
+
+        if isinstance(tool_result, str):
+            stripped = tool_result.strip()
+            if stripped.startswith('{') and stripped.endswith('}'):
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    return None
+                if isinstance(payload, dict) and payload.get('type') == SENSITIVE_TOOL_BLOCKED_RESULT_TYPE:
+                    return payload
+
+        return None
+
+    @staticmethod
+    def _filter_orphaned_tool_calls(messages: List) -> List:
+        """Remove AI tool calls that no longer have matching tool results in history."""
+        if not messages:
+            return messages
+
+        tool_result_ids = {
+            message.tool_call_id
+            for message in messages
+            if isinstance(message, ToolMessage) and getattr(message, 'tool_call_id', None)
+        }
+        if not tool_result_ids:
+            return messages
+
+        cleaned_messages: List = []
+        for message in messages:
+            if isinstance(message, AIMessage) and getattr(message, 'tool_calls', None):
+                valid_tool_calls = [
+                    tool_call
+                    for tool_call in message.tool_calls
+                    if tool_call.get('id', '') in tool_result_ids
+                ]
+                if not valid_tool_calls:
+                    if message.content:
+                        try:
+                            cleaned_messages.append(message.model_copy(update={"tool_calls": []}))
+                        except Exception:
+                            cleaned_messages.append(AIMessage(content=message.content))
+                    continue
+                if len(valid_tool_calls) != len(message.tool_calls):
+                    try:
+                        cleaned_messages.append(
+                            message.model_copy(update={"tool_calls": valid_tool_calls})
+                        )
+                    except Exception:
+                        cleaned_messages.append(
+                            AIMessage(content=message.content, tool_calls=valid_tool_calls)
+                        )
+                    continue
+            cleaned_messages.append(message)
+
+        return cleaned_messages
+
+    @staticmethod
+    def _is_blocked_tool_continuation_nudge(message: Any) -> bool:
+        return (
+            isinstance(message, HumanMessage)
+            and BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER in str(getattr(message, 'content', '') or '')
+        )
+
+    @classmethod
+    def _strip_blocked_tool_continuation_nudges(cls, messages: List) -> List:
+        return [message for message in messages if not cls._is_blocked_tool_continuation_nudge(message)]
+
+    @classmethod
+    def _get_current_request_message_slice(cls, messages: List) -> List:
+        last_user_request_index = -1
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, HumanMessage) and not cls._is_blocked_tool_continuation_nudge(message):
+                last_user_request_index = index
+                break
+
+        if last_user_request_index >= 0:
+            return messages[last_user_request_index + 1:]
+        return messages
+
+    def _collect_blocked_tool_payloads(self, messages: List) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for message in self._get_current_request_message_slice(messages):
+            if not isinstance(message, ToolMessage):
+                continue
+            blocked_payload = self._parse_sensitive_tool_blocked_result(message.content)
+            if blocked_payload is not None:
+                payloads.append(blocked_payload)
+        return payloads
+
+    def _collect_blocked_tool_names(self, messages: List) -> set[str]:
+        blocked_tool_names: set[str] = set()
+        for payload in self._collect_blocked_tool_payloads(messages):
+            blocked_tool_name = normalize_tool_name(
+                payload.get('blocked_tool_name')
+                or payload.get('tool_name')
+                or ''
+            )
+            if blocked_tool_name:
+                blocked_tool_names.add(blocked_tool_name)
+        return blocked_tool_names
+
+    def _collect_blocked_action_labels(self, messages: List) -> List[str]:
+        blocked_labels: List[str] = []
+        for payload in self._collect_blocked_tool_payloads(messages):
+            label = str(
+                payload.get('action_label')
+                or payload.get('blocked_tool_name')
+                or payload.get('tool_name')
+                or ''
+            ).strip()
+            if label and label not in blocked_labels:
+                blocked_labels.append(label)
+        return blocked_labels
+
+    def _get_tool_identity(self, tool: BaseTool) -> Dict[str, Optional[str]]:
+        metadata = getattr(tool, 'metadata', None) or {}
+        toolkit_name = metadata.get('toolkit_name')
+        toolkit_type = metadata.get('toolkit_type') or metadata.get('type')
+        resolved_tool_name = normalize_tool_name(metadata.get('tool_name') or tool.name)
+
+        if not toolkit_name and self.tool_registry is not None:
+            toolkit_name = self.tool_registry.get_toolkit_for_tool(tool.name)
+
+        if not toolkit_type and toolkit_name and self.tool_registry is not None:
+            toolkit_type = self.tool_registry.get_toolkit_type(toolkit_name)
+
+        return {
+            'tool_name': resolved_tool_name,
+            'toolkit_name': toolkit_name,
+            'toolkit_type': toolkit_type,
+        }
+
+    def _is_allowed_followup_tool(
+        self,
+        *,
+        candidate: BaseTool,
+        blocked_tool_names: set[str],
+    ) -> bool:
+        # Lazy meta-tools are too broad to safely force after a blocked action.
+        if candidate.name in {'invoke_tool', 'list_toolkits', 'get_toolkit_tools'}:
+            return False
+
+        identity = self._get_tool_identity(candidate)
+        resolved_tool_name = normalize_tool_name(identity.get('tool_name') or candidate.name or '')
+        normalized_blocked_names = {
+            normalize_tool_name(name)
+            for name in blocked_tool_names
+            if normalize_tool_name(name)
+        }
+        candidate_name = normalize_tool_name(candidate.name)
+
+        if candidate_name in normalized_blocked_names:
+            return False
+        if resolved_tool_name in normalized_blocked_names:
+            return False
+
+        toolkit_type = identity.get('toolkit_type')
+        if toolkit_type and is_tool_blocked(toolkit_type, resolved_tool_name):
+            return False
+
+        return True
+
+    def _get_forced_followup_tools(
+        self,
+        *,
+        config: Optional[RunnableConfig],
+        blocked_tool_names: set[str],
+    ) -> List[BaseTool]:
+        forced_tools: List[BaseTool] = []
+        seen_tool_names: set[str] = set()
+
+        # In lazy-tools mode, get_filtered_tools() returns only meta-tools
+        # (invoke_tool, list_toolkits, get_toolkit_tools) which are explicitly
+        # excluded from forced follow-up.  Access the real tool objects from
+        # available_tools / tool_registry instead so the LLM can be forced to
+        # call an actual allowed tool after a blocked action.
+        if self.lazy_tools_mode and self.tool_registry is not None:
+            candidate_tools: List[BaseTool] = list(self.available_tools or [])
+            existing_names = {t.name for t in candidate_tools}
+            for tk_name in self.tool_registry.get_toolkit_names():
+                for tool in self.tool_registry.get_toolkit_tools(tk_name).values():
+                    if tool.name not in existing_names:
+                        candidate_tools.append(tool)
+                        existing_names.add(tool.name)
+            if self.always_bind_tools:
+                for t in self.always_bind_tools:
+                    if t.name not in existing_names:
+                        candidate_tools.append(t)
+                        existing_names.add(t.name)
+            logger.info(
+                "Blocked-tool follow-up: lazy mode detected, using %d real tools as candidate pool",
+                len(candidate_tools),
+            )
+        else:
+            candidate_tools = self.get_filtered_tools(config=config)
+
+        for tool in candidate_tools:
+            if tool.name in seen_tool_names:
+                continue
+            if not self._is_allowed_followup_tool(candidate=tool, blocked_tool_names=blocked_tool_names):
+                continue
+            forced_tools.append(tool)
+            seen_tool_names.add(tool.name)
+
+        return forced_tools
+
+    def _build_forced_followup_client(self, followup_tools: List[BaseTool]) -> Any:
+        try:
+            logger.info(
+                "Blocked-tool continuation: constraining LLM to allowed tools [%s]",
+                ', '.join(tool.name for tool in followup_tools),
+            )
+            return self.client.bind_tools(
+                followup_tools,
+                parallel_tool_calls=False,
+            )
+        except TypeError:
+            logger.debug("Blocked-tool continuation: client bind_tools does not accept parallel_tool_calls")
+        except Exception as exc:
+            logger.debug("Blocked-tool continuation: constrained binding with parallel_tool_calls failed: %s", exc)
+
+        logger.info(
+            "Blocked-tool continuation: falling back to constrained binding without parallel_tool_calls [%s]",
+            ', '.join(tool.name for tool in followup_tools),
+        )
+        return self.client.bind_tools(followup_tools)
+
+    def _should_continue_after_blocked_tool(
+        self,
+        *,
+        completion: Any,
+        blocked_payloads: List[Dict[str, Any]],
+        followup_tools: List[BaseTool],
+        messages: List,
+        attempt_count: int,
+    ) -> Optional[str]:
+        if hasattr(completion, 'tool_calls') and completion.tool_calls:
+            return None
+        if not blocked_payloads or not followup_tools:
+            return None
+        if attempt_count >= MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS:
+            return None
+
+        blocked_labels = self._collect_blocked_action_labels(messages)
+        if not blocked_labels:
+            for payload in blocked_payloads:
+                label = str(
+                    payload.get('action_label')
+                    or payload.get('blocked_tool_name')
+                    or payload.get('tool_name')
+                    or ''
+                ).strip()
+                if label and label not in blocked_labels:
+                    blocked_labels.append(label)
+
+        primary_payload = blocked_payloads[0]
+        continuation_message = str(primary_payload.get('continuation_message') or '').strip()
+        continuation_hint = str(primary_payload.get('continuation_hint') or '').strip()
+        blocked_summary = ', '.join(blocked_labels[:3]) or 'the blocked action'
+        prompt_parts = []
+        if continuation_message:
+            prompt_parts.append(continuation_message)
+        if continuation_hint:
+            prompt_parts.append(continuation_hint)
+        prompt_parts.append(
+            f"This is a continuation turn after the blocked action(s): {blocked_summary}.\n"
+            "Do NOT automatically retry the same blocked tool call or switch to the user prematurely while useful tool paths remain.\n"
+            "Do NOT repeat or restate your previous answer. Pick up where you left off and continue the workflow autonomously.\n"
+            "If an allowed tool can still make meaningful progress, call it now. If the workflow is truly blocked and no allowed tool can help, then explain that clearly to the user."
+        )
+        return '\n\n'.join(prompt_parts)
+
+    @staticmethod
+    def _build_visible_blocked_tool_payload(blocked_payload: Dict[str, Any]) -> Dict[str, Any]:
+        visible_payload = {}
+        for key in (
+            'type',
+            'status',
+            'blocked_tool_name',
+            'blocked_toolkit_name',
+            'blocked_toolkit_type',
+            'action_label',
+            'message',
+            'user_feedback',
+            'retry_allowed',
+            'equivalent_action_via_other_tool_allowed',
+        ):
+            value = blocked_payload.get(key)
+            if value is None or value == '':
+                continue
+            visible_payload[key] = value
+        return visible_payload
+
+    def _enrich_blocked_tool_payload(
+        self,
+        *,
+        blocked_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        enriched_payload = dict(blocked_payload)
+        action_label = (
+            enriched_payload.get('action_label')
+            or enriched_payload.get('blocked_tool_name')
+            or enriched_payload.get('tool_name')
+            or 'the requested action'
+        )
+        enriched_payload['continuation_message'] = enriched_payload.get('continuation_message') or (
+            f"The action '{action_label}' was blocked by the user and was not executed. "
+            "Do not automatically retry this exact tool call unless the user re-authorizes it. Rethink the tool strategy, decide which allowed action or "
+            "information should be prioritized next, and continue with other allowed tool calls if they can still move the task forward. "
+            "If another tool is sensitive, it will be reviewed separately. "
+            "Only switch to a user-facing explanation when you decide there is no meaningful allowed tool path left or you truly need user input."
+        )
+        enriched_payload['continuation_hint'] = enriched_payload.get('continuation_hint') or (
+            "Continue the tool-using reasoning loop from this blocked tool result. Re-evaluate the remaining allowed tools, "
+            "pick the highest-priority next step, and execute other allowed tool calls when they can still advance the task. "
+            "If another tool is sensitive, expect a separate review for that tool call. "
+            "Do not immediately stop and ask the user for direction unless you determine that no allowed tool path can make meaningful progress."
+        )
+
+        return enriched_payload
+
+    def invoke(
+            self,
+            state: Union[str, dict],
+            config: Optional[RunnableConfig] = None,
+            **kwargs: Any,
+    ) -> dict:
+        """
+        Invoke the LLM node with proper message handling and tool binding.
+
+        Args:
+            state: The current state containing messages and other variables
+            config: Optional runnable config
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            Updated state with LLM response
+        """
+        middleware_mgr = self.middleware_manager
+        middleware_updates = []
+        original_state = None
+
+        # Run before_model hooks (may summarize messages)
+        if middleware_mgr is not None and isinstance(state, dict):
+            original_state = state.copy()
+            state, middleware_updates = middleware_mgr.run_before_model(state, config or {})
+
+        # Do LLM invocation
+        try:
+            result = self._invoke_llm_internal(state, config, middleware_updates)
+        except GraphBubbleUp:
+            # GraphInterrupt (from interrupt()) must propagate to the graph executor
+            # for proper HITL / checkpoint handling.
+            raise
+        except Exception as e:
+            model_info = getattr(self.client, 'model_name', None) or getattr(self.client, 'model', 'unknown')
+            logger.error(f"Error in LLM Node: {format_exc()}")
+            logger.error(f"Model being used: {model_info}")
+            logger.error(f"Error type: {type(e).__name__}")
+            result = {"messages": [AIMessage(content=f"Error: {e}")]}
+
+        # Run after_model hooks and add context_info
+        if middleware_mgr is not None and isinstance(result, dict) and 'messages' in result:
+            final_state = {**(original_state or state), 'messages': result['messages']}
+            middleware_mgr.run_after_model(final_state, config or {})
+            result['context_info'] = middleware_mgr.get_context_info()
+
+        return result
+
+    def _invoke_llm_internal(
+            self,
+            state: Union[str, dict],
+            config: Optional[RunnableConfig],
+            middleware_updates: list,
+    ) -> dict:
+        """
+        Internal LLM invocation logic. Separated to allow automatic after_model hooks.
+
+        Args:
+            state: The current state (possibly modified by before_model hooks)
+            config: Optional runnable config
+            middleware_updates: RemoveMessage ops from before_model hooks
+
+        Returns:
+            Result dict with 'messages' key
+        """
+
+        func_args = propagate_the_input_mapping(input_mapping=self.input_mapping, input_variables=self.input_variables,
+                                                state=state)
+
+        # Check if dynamic tool selection was performed (affects tool index injection)
+        configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
+        has_selected_tools = bool(configurable.get('selected_tools'))
+        hitl_ctx = configurable.pop('_hitl_resume_context', None)
+
+        # Guard: only honour the HITL resume context when the tool it
+        # references actually belongs to *this* LLM node.  In pipelines
+        # the HITL interrupt may have fired inside a preceding Toolkit
+        # (FunctionTool) node; that node already executed the tool on
+        # resume, but the context lingered in config and would cause this
+        # LLM node to fabricate a synthetic tool call for a tool it does
+        # not own (see #3966).
+        #
+        # When toolkit_name is present in the resume context we use
+        # qualified identity (toolkit_name + tool_name) so that two
+        # different toolkits that expose a tool with the same base name
+        # (e.g. jira.create_issue vs github.create_issue) are correctly
+        # distinguished.
+        if hitl_ctx and hitl_ctx.get('tool_name'):
+            ctx_tool = hitl_ctx['tool_name']
+            ctx_toolkit = hitl_ctx.get('toolkit_name') or ''
+            if ctx_toolkit:
+                # Qualified comparison: build qualified identities for
+                # every tool this LLM node owns and check membership.
+                own_qualified = set()
+                for t in (self.available_tools or []):
+                    identity = self._get_tool_identity(t)
+                    own_qualified.add(
+                        qualified_tool_identity(
+                            identity['tool_name'],
+                            identity.get('toolkit_name'),
+                        )
+                    )
+                ctx_qualified = qualified_tool_identity(ctx_tool, ctx_toolkit)
+                if ctx_qualified not in own_qualified:
+                    logger.info(
+                        "[HITL] Ignoring stale _hitl_resume_context for '%s' "
+                        "— not in this LLM node's tools %s",
+                        ctx_qualified,
+                        sorted(own_qualified) if own_qualified else '(none)',
+                    )
+                    hitl_ctx = None
+            else:
+                # Fallback: no toolkit info — use normalized base names so
+                # that prefixed/aliased names (e.g. github___tool) still
+                # match the base name from the HITL interrupt payload.
+                own_tool_names = {normalize_tool_name(t.name) for t in (self.available_tools or [])}
+                if ctx_tool not in own_tool_names:
+                    logger.info(
+                        "[HITL] Ignoring stale _hitl_resume_context for tool '%s' "
+                        "— not in this LLM node's tools %s",
+                        ctx_tool,
+                        sorted(own_tool_names) if own_tool_names else '(none)',
+                    )
+                    hitl_ctx = None
+
+        # there are 2 possible flows here: LLM node from pipeline (with prompt and task)
+        # or standalone LLM node for chat (with messages only)
+        if 'system' in func_args.keys():
+            # Flow for LLM node with prompt/task from pipeline
+            if func_args.get('system') is None or func_args.get('task') is None:
+                raise ToolException(f"LLMNode requires 'system' and 'task' parameters in input mapping. "
+                                    f"Actual params: {func_args}")
+            # cast to str in case user passes variable different from str
+            system_content = str(func_args.get('system'))
+
+            # Inject tool index into system prompt if lazy tools mode is enabled
+            # Skip injection if dynamic tool selection provided actual tools
+            if self.lazy_tools_mode and self.tool_registry is not None and not has_selected_tools:
+                tool_index = self.tool_registry.generate_index()
+                system_content = f"{system_content}\n\n{tool_index}"
+                logger.debug("[LazyTools] Injected tool index into system prompt")
+
+            task_content = func_args.get('task')
+            if not isinstance(task_content, (str, list)):
+                task_content = str(task_content) if task_content is not None else ""
+            messages = [SystemMessage(content=system_content), *func_args.get('chat_history', []), HumanMessage(content=task_content)]
+            # Remove pre-last item if last two messages are same type and content
+            if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
+                -2].content:
+                messages.pop(-2)
+        else:
+            # Flow for chat-based LLM node w/o prompt/task from pipeline but with messages in state
+            # verify messages structure
+            messages = state.get("messages", []) if isinstance(state, dict) else []
+            if messages:
+                # Filter out all system messages except the first one to avoid
+                # "multiple non-consecutive system messages" error from Anthropic API.
+                # In swarm mode, multiple agents may add their system messages to shared state.
+                first_system_msg = None
+                filtered_messages = []
+                for msg in messages:
+                    if isinstance(msg, SystemMessage):
+                        if first_system_msg is None:
+                            first_system_msg = msg
+                        # Skip subsequent system messages
+                    else:
+                        filtered_messages.append(msg)
+                # Prepend the first system message if found
+                if first_system_msg:
+                    messages = [first_system_msg] + filtered_messages
+                else:
+                    messages = filtered_messages
+
+                messages = self._filter_orphaned_tool_calls(messages)
+
+                if not messages:
+                    raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
+
+                # Fresh chat turns must end with a user message.
+                # HITL resumes replay a previously reviewed tool call, so the checkpoint
+                # may legitimately end in an AI tool call message instead.
+                if not hitl_ctx and not isinstance(messages[-1], HumanMessage):
+                    raise ToolException("LLMNode requires the last message to be a HumanMessage")
+
+                # Inject tool index into system message if lazy tools mode is enabled
+                # Skip injection if dynamic tool selection provided actual tools
+                if self.lazy_tools_mode and self.tool_registry is not None and not has_selected_tools:
+                    messages = self._inject_tool_index_into_messages(messages)
+            else:
+                raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
+
+        # Get the LLM client, potentially with tools bound
+        llm_client = self.client
+
+        # Bind tools when:
+        # 1. Traditional mode: specific tool_names are provided, OR
+        # 2. Lazy mode: tool_registry exists (meta-tools will be bound), OR
+        # 3. available_tools exist (covers lazy mode auto-disabled case)
+        should_bind_tools = (
+            len(self.tool_names or []) > 0 or
+            (self.lazy_tools_mode and self.tool_registry is not None) or
+            bool(self.available_tools)  # Bind available tools even when lazy mode auto-disabled
+        )
+
+        if should_bind_tools:
+            filtered_tools = self.get_filtered_tools(config=config)
+            if filtered_tools:
+                logger.info(f"Binding {len(filtered_tools)} tools to LLM: {[t.name for t in filtered_tools]}")
+                llm_client = self.client.bind_tools(filtered_tools)
+            else:
+                logger.warning("No tools to bind to LLM")
+
+        if self.structured_output and self.output_variables:
+            # Handle structured output
+            struct_params = self._prepare_structured_output_params()
+            struct_model = create_pydantic_model(f"LLMOutput", struct_params)
+
+            try:
+                completion, initial_completion, final_messages = self._invoke_with_structured_output(
+                    llm_client, messages, struct_model, config
+                )
+            except ValueError as e:
+                # Handle fallback for structured output failures
+                completion = self._handle_structured_output_fallback(
+                    llm_client, messages, struct_model, config, e
+                )
+                initial_completion = None
+                final_messages = messages
+
+            result = completion.model_dump()
+            result = self._format_structured_output_result(result, final_messages, initial_completion or completion)
+
+            # Prepend middleware updates to messages for checkpoint
+            if middleware_updates and 'messages' in result:
+                result['messages'] = list(middleware_updates) + result['messages']
+
+            return result
+
+        # Handle regular completion
+        #
+        # HITL guardrail resume: If a sensitive-tool guard paused execution via
+        # interrupt(), LangGraph re-executes this node from scratch. The LLM
+        # call is non-deterministic, so re-calling it may produce a completely
+        # different response (no tool call -> tool never runs). To avoid this,
+        # the graph-level resume path injects `_hitl_resume_context` into the
+        # config. When present, we skip the LLM call and build a synthetic
+        # AIMessage with the reviewed tool call so the normal
+        # __perform_tool_calling loop can execute it. The guard will then
+        # resolve the resume action consistently: approve executes the tool,
+        # reject returns a blocked-tool result and gives the LLM another turn.
+        if hitl_ctx and hitl_ctx.get('tool_name'):
+            # ---- Consume stale interrupt replay values ----
+            # LangGraph replays ALL previously consumed interrupt/resume
+            # values from prior resumes of this task (node execution).
+            # Each interrupt() call returns the stored value at its
+            # positional index.  Because the synthetic AIMessage below
+            # contains ONLY the current HITL tool, the guard's
+            # interrupt() would land at index 0 and receive a stale
+            # value from an earlier resume instead of the current one.
+            # Fix: advance the interrupt counter past the stale entries
+            # so the guard's interrupt() gets the correct (current)
+            # resume value.
+            scratchpad = configurable.get(_SCRATCHPAD_KEY)
+            n_prior = (
+                len(scratchpad.resume)
+                if scratchpad
+                and hasattr(scratchpad, 'resume')
+                and scratchpad.resume
+                else 0
+            )
+            if n_prior:
+                logger.info(
+                    "[HITL] Consuming %d stale interrupt replay value(s) "
+                    "before sensitive-tool resume",
+                    n_prior,
+                )
+                for _i in range(n_prior):
+                    _langgraph_interrupt({'__replay_consumer__': True})
+
+            # Create synthetic AIMessage with the reviewed tool call.
+            completion = AIMessage(
+                content='',
+                tool_calls=[{
+                    'name': hitl_ctx['tool_name'],
+                    'args': hitl_ctx.get('tool_args', {}),
+                    'id': hitl_ctx.get('tool_call_id', 'hitl_resume_call'),
+                }],
+            )
+        else:
+            completion = llm_client.invoke(messages, config=config)
+        logger.info(f"Initial completion: {completion}")
+
+        # Handle both tool-calling and regular responses
+        if hasattr(completion, 'tool_calls') and completion.tool_calls:
+            # Handle iterative tool-calling and execution
+            hitl_decisions = state.get('hitl_decisions') if isinstance(state, dict) else None
+            new_messages, current_completion = self._run_async_in_sync_context(
+                self.__perform_tool_calling(
+                    completion, messages, llm_client, config,
+                    hitl_decisions=hitl_decisions,
+                )
+            )
+
+            output_msgs = {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
+            if self.output_variables:
+                if self.output_variables[0] == 'messages':
+                    return output_msgs
+                # Extract content properly from thinking-enabled responses
+                if current_completion:
+                    content_parts = self._extract_content_from_completion(current_completion)
+                    text_content = content_parts.get('text')
+                    thinking = content_parts.get('thinking')
+
+                    # Dispatch thinking event if present
+                    if thinking:
+                        try:
+                            model_name = getattr(llm_client, 'model_name', None) or getattr(llm_client, 'model', 'LLM')
+                            dispatch_custom_event(
+                                name="thinking_step",
+                                data={
+                                    "message": thinking,
+                                    "tool_name": f"LLM ({model_name})",
+                                    "toolkit": "reasoning",
+                                },
+                                config=config,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to dispatch thinking event: {e}")
+
+                    if text_content:
+                        output_msgs[self.output_variables[0]] = text_content
+                    else:
+                        # Fallback to raw content
+                        content = current_completion.content
+                        output_msgs[self.output_variables[0]] = content if isinstance(content, str) else str(content)
+                else:
+                    output_msgs[self.output_variables[0]] = None
+
+            return output_msgs
+
+        # Regular text response - handle both simple strings and thinking-enabled responses
+        content_parts = self._extract_content_from_completion(completion)
+        thinking = content_parts.get('thinking')
+        text_content = content_parts.get('text') or ''
+
+        # Fallback to string representation if no content extracted
+        if not text_content:
+            if hasattr(completion, 'content'):
+                content = completion.content
+                text_content = content.strip() if isinstance(content, str) else str(content)
+            else:
+                text_content = str(completion)
+
+        # Dispatch thinking step event to chat if present
+        if thinking:
+            logger.info(f"Model thinking: {thinking[:200]}..." if len(thinking) > 200 else f"Model thinking: {thinking}")
+
+            # Dispatch custom event for thinking step to be displayed in chat
+            try:
+                model_name = getattr(llm_client, 'model_name', None) or getattr(llm_client, 'model', 'LLM')
+                dispatch_custom_event(
+                    name="thinking_step",
+                    data={
+                        "message": thinking,
+                        "tool_name": f"LLM ({model_name})",
+                        "toolkit": "reasoning",
+                    },
+                    config=config,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to dispatch thinking event: {e}")
+
+        # Build the AI message with both thinking and text
+        # Store thinking in additional_kwargs for potential future use
+        ai_message_kwargs = {'content': text_content}
+        if thinking:
+            ai_message_kwargs['additional_kwargs'] = {'thinking': thinking}
+        ai_message = AIMessage(**ai_message_kwargs)
+
+        # Try to extract JSON if output variables are specified (but exclude 'messages' which is handled separately)
+        json_output_vars = [var for var in (self.output_variables or []) if var != 'messages']
+        if json_output_vars:
+            # set response to be the first output variable for non-structured output
+            response_data = {json_output_vars[0]: text_content}
+            new_messages = messages + [ai_message]
+            response_data['messages'] = self._prepare_output_messages(new_messages, middleware_updates)
+            return response_data
+
+        # Simple text response (either no output variables or JSON parsing failed)
+        new_messages = messages + [ai_message]
+        return {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
+
+    @staticmethod
+    def _strip_system_messages(messages: list) -> list:
+        """Strip SystemMessage objects from a message list before returning to graph state.
+
+        The LLMNode constructs SystemMessage on-the-fly from its input_mapping['system']
+        for each invocation. Storing SystemMessages in the graph state would cause them
+        to accumulate in checkpoints, leading to "multiple non-consecutive system messages"
+        errors on subsequent turns (especially with Anthropic models).
+
+        Args:
+            messages: List of messages to process
+
+        Returns:
+            Filtered message list without SystemMessage objects
+        """
+        return [m for m in messages if not isinstance(m, SystemMessage)]
+
+    @staticmethod
+    def _prepare_output_messages(messages: list, middleware_updates: list = None) -> list:
+        """Prepare messages for output, stripping system messages and prepending middleware updates.
+
+        Args:
+            messages: List of messages to process
+            middleware_updates: Optional list of RemoveMessage operations from middleware.
+                               These are prepended so LangGraph's reducer processes deletions
+                               before adding new messages (e.g., for summarization).
+
+        Returns:
+            Filtered message list with RemoveMessage ops prepended
+        """
+        filtered = [m for m in messages if not isinstance(m, SystemMessage)]
+        if middleware_updates:
+            return list(middleware_updates) + filtered
+        return filtered
+
+    def _run(self, *args, **kwargs):
+        # Legacy support for old interface
+        return self.invoke(kwargs, **kwargs)
+    
+    @staticmethod
+    def _extract_content_from_completion(completion) -> dict:
+        """Extract thinking and text content from LLM completion.
+        
+        Handles Anthropic's extended thinking format where content is a list
+        of blocks with types: 'thinking' and 'text'.
+        
+        Args:
+            completion: LLM completion object with content attribute
+            
+        Returns:
+            dict with 'thinking' and 'text' keys
+        """
+        result = {'thinking': None, 'text': None}
+        
+        if not hasattr(completion, 'content'):
+            return result
+            
+        content = completion.content
+        
+        # Handle list of content blocks (Anthropic extended thinking format)
+        if isinstance(content, list):
+            thinking_blocks = []
+            text_blocks = []
+            
+            for block in content:
+                if isinstance(block, dict):
+                    block_type = block.get('type', '')
+                    if block_type == 'thinking':
+                        thinking_blocks.append(block.get('thinking', ''))
+                    elif block_type == 'text':
+                        text_blocks.append(block.get('text', ''))
+                elif hasattr(block, 'type'):
+                    # Handle object format
+                    if block.type == 'thinking':
+                        thinking_blocks.append(getattr(block, 'thinking', ''))
+                    elif block.type == 'text':
+                        text_blocks.append(getattr(block, 'text', ''))
+            
+            if thinking_blocks:
+                result['thinking'] = '\n\n'.join(thinking_blocks)
+            if text_blocks:
+                result['text'] = '\n\n'.join(text_blocks)
+        
+        # Handle simple string content
+        elif isinstance(content, str):
+            result['text'] = content
+        
+        return result
+    
+    def _run_async_in_sync_context(self, coro):
+        """Run async coroutine from sync context.
+        
+        For MCP tools with persistent sessions, we reuse the same event loop
+        that was used to create the MCP client and sessions (set by CLI).
+
+        When called from within a running event loop (e.g., nested LLM nodes),
+        we need to handle this carefully to avoid "event loop already running" errors.
+
+        This method handles three scenarios:
+        1. Called from async context (event loop running) - creates new thread with new loop
+        2. Called from sync context with persistent loop - reuses persistent loop
+        3. Called from sync context without loop - creates new persistent loop
+        """
+        import threading
+
+        # Check if there's a running loop
+        try:
+            running_loop = asyncio.get_running_loop()
+            loop_is_running = True
+            logger.debug(f"Detected running event loop (id: {id(running_loop)}), executing tool calls in separate thread")
+        except RuntimeError:
+            loop_is_running = False
+
+        # Scenario 1: Loop is currently running - MUST use thread
+        if loop_is_running:
+            result_container = []
+            exception_container = []
+
+            # Try to capture Streamlit context from current thread for propagation
+            streamlit_ctx = None
+            try:
+                from streamlit.runtime.scriptrunner import get_script_run_ctx, add_script_run_ctx
+                streamlit_ctx = get_script_run_ctx()
+                if streamlit_ctx:
+                    logger.debug("Captured Streamlit context for propagation to worker thread")
+            except (ImportError, Exception) as e:
+                logger.debug(f"Streamlit context not available or failed to capture: {e}")
+
+            def run_in_thread():
+                """Run coroutine in a new thread with its own event loop."""
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    result = new_loop.run_until_complete(coro)
+                    result_container.append(result)
+                except Exception as e:
+                    logger.debug(f"Exception in async thread: {e}")
+                    exception_container.append(e)
+                finally:
+                    new_loop.close()
+                    asyncio.set_event_loop(None)
+
+            thread = threading.Thread(target=run_in_thread, daemon=False)
+
+            # Propagate Streamlit context to the worker thread if available
+            if streamlit_ctx is not None:
+                try:
+                    add_script_run_ctx(thread, streamlit_ctx)
+                    logger.debug("Successfully propagated Streamlit context to worker thread")
+                except Exception as e:
+                    logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
+
+            thread.start()
+            thread.join(timeout=self.tool_execution_timeout)  # 15 minute timeout for safety
+
+            if thread.is_alive():
+                logger.error("Async operation timed out after 5 minutes")
+                raise TimeoutError("Async operation in thread timed out")
+
+            # Re-raise exception if one occurred
+            if exception_container:
+                raise exception_container[0]
+
+            return result_container[0] if result_container else None
+
+        # Scenario 2 & 3: No loop running - use or create persistent loop
+        else:
+            # Get or create persistent loop
+            if not hasattr(self.__class__, '_persistent_loop') or \
+               self.__class__._persistent_loop is None or \
+               self.__class__._persistent_loop.is_closed():
+                self.__class__._persistent_loop = asyncio.new_event_loop()
+                logger.debug("Created persistent event loop for async tools")
+
+            loop = self.__class__._persistent_loop
+
+            # Double-check the loop is not running (safety check)
+            if loop.is_running():
+                logger.debug("Persistent loop is unexpectedly running, using thread execution")
+
+                result_container = []
+                exception_container = []
+
+                # Try to capture Streamlit context from current thread for propagation
+                streamlit_ctx = None
+                try:
+                    from streamlit.runtime.scriptrunner import get_script_run_ctx, add_script_run_ctx
+                    streamlit_ctx = get_script_run_ctx()
+                    if streamlit_ctx:
+                        logger.debug("Captured Streamlit context for propagation to worker thread")
+                except (ImportError, Exception) as e:
+                    logger.debug(f"Streamlit context not available or failed to capture: {e}")
+
+                def run_in_thread():
+                    """Run coroutine in a new thread with its own event loop."""
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        result = new_loop.run_until_complete(coro)
+                        result_container.append(result)
+                    except GraphBubbleUp as gb:
+                        # GraphInterrupt must propagate — store and re-raise
+                        # from the calling thread via exception_container.
+                        exception_container.append(gb)
+                    except Exception as ex:
+                        logger.debug(f"Exception in async thread: {ex}")
+                        exception_container.append(ex)
+                    finally:
+                        new_loop.close()
+                        asyncio.set_event_loop(None)
+
+                thread = threading.Thread(target=run_in_thread, daemon=False)
+
+                # Propagate Streamlit context to the worker thread if available
+                if streamlit_ctx is not None:
+                    try:
+                        add_script_run_ctx(thread, streamlit_ctx)
+                        logger.debug("Successfully propagated Streamlit context to worker thread")
+                    except Exception as e:
+                        logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
+
+                thread.start()
+                thread.join(timeout=self.tool_execution_timeout)
+
+                if thread.is_alive():
+                    logger.error("Async operation timed out after 15 minutes")
+                    raise TimeoutError("Async operation in thread timed out")
+
+                if exception_container:
+                    raise exception_container[0]
+
+                return result_container[0] if result_container else None
+            else:
+                # Loop exists but not running - safe to use run_until_complete
+                logger.debug(f"Using persistent loop (id: {id(loop)}) with run_until_complete")
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(coro)
+
+    async def _arun(self, *args, **kwargs):
+        # Legacy async support
+        return self.invoke(kwargs, **kwargs)
+
+    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None):
+        # Handle iterative tool-calling and execution
+        logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
+
+        # Lazy import to avoid circular dependency (sensitive_tool_guard -> tools.application)
+        from ..middleware.sensitive_tool_guard import (
+            set_hitl_approved_tools,
+            reset_hitl_approved_tools,
+        )
+
+        # Extract historically blocked tools from state-persisted HITL decisions.
+        # These survive across checkpoint resumes and prevent the LLM from
+        # re-offering a tool the user already blocked.
+        _historically_blocked: set[str] = set()
+        for decision in (hitl_decisions or []):
+            if decision.get('action') == 'reject' and decision.get('tool_name'):
+                _historically_blocked.add(normalize_tool_name(decision['tool_name']))
+        if _historically_blocked:
+            logger.info(
+                "[HITL] Tools blocked by prior decisions (from state): %s",
+                ', '.join(sorted(_historically_blocked)),
+            )
+
+        # Build set of tool names previously approved by the user.
+        # Used to auto-approve tools in the guard on iterations *after*
+        # the first one (the first must consume the checkpoint replay value).
+        # Uses qualified identity (toolkit_name.tool_name) so that approving
+        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
+        _approved_tool_names: set[str] = set()
+        for decision in (hitl_decisions or []):
+            if decision.get('action') == 'approve' and decision.get('tool_name'):
+                _approved_tool_names.add(qualified_tool_identity(
+                    decision['tool_name'], decision.get('toolkit_name'),
+                ))
+        _approved_token = None
+
+        new_messages = messages + [completion]
+        iteration = 0
+
+        # Track the number of input messages so we can compute intermediate
+        # messages produced during this execution (for HITL checkpoint restore).
+        _input_msg_count = len(messages)
+
+        # Reset the pending-messages contextvar at the start of each execution.
+        _PENDING_TOOL_MESSAGES.set([])
+
+        # Extra tool lookup table populated after a blocked-tool continuation turn.
+        # In lazy-tools mode the regular get_filtered_tools() returns only
+        # meta-tools, so direct continuation tool calls would fail to resolve.
+        # This dict maps tool-name -> BaseTool for the next iteration only.
+        _forced_followup_lookup: Dict[str, BaseTool] = {}
+
+        # Continue executing tools until no more tool calls or max iterations reached
+        current_completion = completion
+        while (hasattr(current_completion, 'tool_calls') and
+               current_completion.tool_calls and
+               iteration < self.steps_limit):
+
+            iteration += 1
+            logger.info(f"Tool execution iteration {iteration}/{self.steps_limit}")
+
+            # Execute each tool call in the current completion
+            tool_calls = current_completion.tool_calls if hasattr(current_completion.tool_calls,
+                                                                  '__iter__') else []
+            blocked_tool_names: set[str] = set()
+            blocked_payloads_this_iter: List[Dict[str, Any]] = []
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call,
+                                                                                                  'name',
+                                                                                                  '')
+                tool_args = tool_call.get('args', {}) if isinstance(tool_call, dict) else getattr(tool_call,
+                                                                                                  'args',
+                                                                                                  {})
+                tool_call_id = tool_call.get('id', '') if isinstance(tool_call, dict) else getattr(
+                    tool_call, 'id', '')
+
+                # Find the tool in filtered tools
+                # Pass config to ensure dynamically selected tools are available
+                filtered_tools = self.get_filtered_tools(config=config)
+                tool_to_execute = None
+                for tool in filtered_tools:
+                    if tool.name == tool_name:
+                        tool_to_execute = tool
+                        break
+
+                # Fallback: check forced follow-up lookup (lazy mode).
+                # After a blocked-tool forced follow-up the LLM calls a real
+                # tool directly, but get_filtered_tools only returns meta-tools.
+                if tool_to_execute is None and tool_name in _forced_followup_lookup:
+                    tool_to_execute = _forced_followup_lookup[tool_name]
+                    logger.info("Resolved tool '%s' via forced-followup lookup", tool_name)
+
+                # Fallback: in lazy mode (and HITL resume) the tool may not appear
+                # in get_filtered_tools because that returns only meta-tools.
+                # Search available_tools and tool_registry for a direct match.
+                if tool_to_execute is None:
+                    for tool in (self.available_tools or []):
+                        if tool.name == tool_name:
+                            tool_to_execute = tool
+                            logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
+                            break
+                if tool_to_execute is None and self.tool_registry is not None:
+                    registry_tool = self.tool_registry.get_tool_by_name(tool_name)
+                    if registry_tool is not None:
+                        tool_to_execute = registry_tool
+                        logger.info("Resolved tool '%s' via tool_registry fallback", tool_name)
+
+                if tool_to_execute:
+                    try:
+                        logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
+
+                        # Expose accumulated intermediate messages BEFORE invoking
+                        # the tool.  If the tool triggers a sensitive-tool interrupt,
+                        # the guard reads this contextvar so the messages survive the
+                        # checkpoint and can be restored on resume.
+                        _PENDING_TOOL_MESSAGES.set(list(new_messages[_input_msg_count:]))
+
+                        # Try async invoke first (for MCP tools), fallback to sync
+                        tool_result = None
+                        if hasattr(tool_to_execute, 'ainvoke'):
+                            try:
+                                tool_result = await tool_to_execute.ainvoke(tool_args, config=config)
+                            except (NotImplementedError, AttributeError):
+                                logger.debug(f"Tool '{tool_name}' ainvoke failed, falling back to sync invoke")
+                                tool_result = tool_to_execute.invoke(tool_args, config=config)
+                        else:
+                            # Sync-only tool
+                            tool_result = tool_to_execute.invoke(tool_args, config=config)
+
+                        # Create tool message with result - preserve structured content
+                        from langchain_core.messages import ToolMessage
+
+                        blocked_payload = self._parse_sensitive_tool_blocked_result(tool_result)
+                        if blocked_payload is not None:
+                            blocked_tool_name = normalize_tool_name(
+                                blocked_payload.get('blocked_tool_name')
+                                or blocked_payload.get('tool_name')
+                                or tool_name
+                                or ''
+                            )
+                            if blocked_tool_name:
+                                blocked_tool_names.add(blocked_tool_name)
+                            enriched_payload = self._enrich_blocked_tool_payload(
+                                blocked_payload=blocked_payload,
+                            )
+                            blocked_payloads_this_iter.append(enriched_payload)
+                            tool_message = ToolMessage(
+                                content=json.dumps(
+                                    self._build_visible_blocked_tool_payload(blocked_payload),
+                                    ensure_ascii=True,
+                                    separators=(',', ':'),
+                                ),
+                                tool_call_id=tool_call_id,
+                            )
+                            new_messages.append(tool_message)
+                            continue
+
+                        # Check if tool_result is structured content (list of dicts)
+                        # Only use the structured fast-path when every item has an
+                        # LLM-standard content block type AND no bytes values are
+                        # present (bytes are not JSON-serializable and would cause
+                        # a 400 from the LLM API).
+                        _STANDARD_CONTENT_TYPES = {"text", "image", "image_url", "document", "search_result"}
+
+                        def _is_llm_safe_content_block(item: dict) -> bool:
+                            if not isinstance(item, dict):
+                                return False
+                            if item.get('type') not in _STANDARD_CONTENT_TYPES:
+                                return False
+                            return not any(isinstance(v, bytes) for v in item.values())
+
+                        if isinstance(tool_result, list) and tool_result and all(
+                                _is_llm_safe_content_block(item) for item in tool_result
+                        ):
+                            # Use structured content directly for multimodal support
+                            tool_message = ToolMessage(
+                                content=tool_result,
+                                tool_call_id=tool_call_id
+                            )
+                        else:
+                            # Fallback to string conversion for other tool results
+                            tool_message = ToolMessage(
+                                content=str(tool_result),
+                                tool_call_id=tool_call_id
+                            )
+                        new_messages.append(tool_message)
+
+                    except GraphBubbleUp:
+                        # GraphInterrupt (from interrupt()) and other graph-level
+                        # signals must propagate to the graph executor.
+                        # Reset auto-approve context before propagating.
+                        # NOTE: _PENDING_TOOL_MESSAGES was set right before invoke
+                        # and already consumed by the middleware's interrupt() call.
+                        if _approved_token is not None:
+                            reset_hitl_approved_tools(_approved_token)
+                        _PENDING_TOOL_MESSAGES.set([])
+                        raise
+                    except Exception as e:
+                        import traceback
+                        error_details = traceback.format_exc()
+                        # Use debug level to avoid duplicate output when CLI callbacks are active
+                        logger.debug(f"Error executing tool '{tool_name}': {e}\n{error_details}")
+                        # Create error tool message
+                        from langchain_core.messages import ToolMessage
+                        tool_message = ToolMessage(
+                            content=f"Error executing {tool_name}: {str(e)}",
+                            tool_call_id=tool_call_id
+                        )
+                        new_messages.append(tool_message)
+                else:
+                    logger.warning(f"Tool '{tool_name}' not found in available tools")
+                    # Create error tool message for missing tool
+                    from langchain_core.messages import ToolMessage
+                    tool_message = ToolMessage(
+                        content=f"Tool '{tool_name}' not available",
+                        tool_call_id=tool_call_id
+                    )
+                    new_messages.append(tool_message)
+
+            # After the first iteration's tool calls are processed, activate
+            # auto-approve for tools the user already authorized.  We wait
+            # until now so the guard's interrupt() in the first iteration can
+            # consume the checkpoint replay value correctly.
+            if _approved_tool_names and _approved_token is None:
+                _approved_token = set_hitl_approved_tools(_approved_tool_names)
+
+            # Call LLM again with tool results to get next response
+            try:
+                sanitized_messages = self._filter_orphaned_tool_calls(new_messages)
+                if len(sanitized_messages) != len(new_messages):
+                    logger.info(
+                        "Filtered %s orphaned tool-call message(s) before follow-up LLM invoke",
+                        len(new_messages) - len(sanitized_messages),
+                    )
+                new_messages = sanitized_messages
+                # Reset forced-followup lookup at the start of each LLM re-invoke.
+                _forced_followup_lookup = {}
+
+                # Accumulate current-iteration blocks into history so
+                # future iterations also exclude them.
+                _historically_blocked.update(blocked_tool_names)
+
+                # Merge current-iteration blocks with historical blocks
+                # (from state-persisted HITL decisions + earlier iterations).
+                all_blocked = blocked_tool_names | _historically_blocked
+
+                if blocked_tool_names:
+                    # Current iteration had tool(s) blocked — full
+                    # continuation: nudge LLM to try alternatives.
+                    new_messages = self._strip_blocked_tool_continuation_nudges(new_messages)
+                    blocked_tool_history = self._collect_blocked_tool_names(new_messages) | _historically_blocked
+                    forced_followup_tools = self._get_forced_followup_tools(
+                        config=config,
+                        blocked_tool_names=blocked_tool_history,
+                    )
+                    continuation_client = llm_client
+                    if forced_followup_tools:
+                        # Store for next iteration so the tool call can be resolved.
+                        _forced_followup_lookup = {t.name: t for t in forced_followup_tools}
+                        continuation_client = self._build_forced_followup_client(forced_followup_tools)
+                        current_completion = continuation_client.invoke(
+                            new_messages,
+                            config=config,
+                        )
+                    else:
+                        logger.info(
+                            "Blocked-tool follow-up: no allowed tools remain after excluding [%s]",
+                            ', '.join(sorted(all_blocked)),
+                        )
+                        current_completion = llm_client.invoke(new_messages, config=config)
+
+                    new_messages.append(current_completion)
+                    blocked_tool_continuation_attempts = 0
+                    while True:
+                        continuation_message = self._should_continue_after_blocked_tool(
+                            completion=current_completion,
+                            blocked_payloads=blocked_payloads_this_iter,
+                            followup_tools=forced_followup_tools,
+                            messages=new_messages,
+                            attempt_count=blocked_tool_continuation_attempts,
+                        )
+                        if continuation_message is None:
+                            break
+
+                        blocked_tool_continuation_attempts += 1
+                        logger.info(
+                            "Blocked-tool continuation: nudging LLM to keep working (attempt %s/%s)",
+                            blocked_tool_continuation_attempts,
+                            MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS,
+                        )
+                        new_messages = self._strip_blocked_tool_continuation_nudges(new_messages)
+                        new_messages.append(HumanMessage(content=continuation_message))
+                        current_completion = continuation_client.invoke(new_messages, config=config)
+                        new_messages.append(current_completion)
+                elif _historically_blocked:
+                    # No current-iteration blocks but historically blocked
+                    # tools exist — exclude them from the LLM's tool
+                    # binding so it cannot re-call a previously blocked tool.
+                    forced_followup_tools = self._get_forced_followup_tools(
+                        config=config,
+                        blocked_tool_names=_historically_blocked,
+                    )
+                    if forced_followup_tools:
+                        _forced_followup_lookup = {t.name: t for t in forced_followup_tools}
+                        current_completion = self._build_forced_followup_client(
+                            forced_followup_tools,
+                        ).invoke(new_messages, config=config)
+                    else:
+                        logger.info(
+                            "Historical blocked-tool follow-up: no allowed tools remain "
+                            "after excluding [%s]",
+                            ', '.join(sorted(_historically_blocked)),
+                        )
+                        current_completion = llm_client.invoke(new_messages, config=config)
+                    new_messages.append(current_completion)
+                else:
+                    current_completion = llm_client.invoke(new_messages, config=config)
+                    new_messages.append(current_completion)
+
+                # Check if we still have tool calls
+                if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:
+                    logger.info(f"LLM requested {len(current_completion.tool_calls)} more tool calls")
+                else:
+                    logger.info("LLM completed without requesting more tools")
+                    break
+
+            except GraphBubbleUp:
+                # Preserve GraphInterrupt and related graph-level signals raised
+                # anywhere in the tool iteration, including async-to-sync fallback.
+                # Reset auto-approve context before propagating.
+                if _approved_token is not None:
+                    reset_hitl_approved_tools(_approved_token)
+                _PENDING_TOOL_MESSAGES.set([])
+                raise
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # Check for thinking model message format errors
+                is_thinking_format_error = any(indicator in error_str for indicator in [
+                    'expected `thinking`',
+                    'expected `redacted_thinking`',
+                    'thinking block',
+                    'must start with a thinking block',
+                    'when `thinking` is enabled'
+                ])
+                
+                # Check for non-recoverable errors that should fail immediately
+                # These indicate configuration or permission issues, not content size issues
+                is_non_recoverable = any(indicator in error_str for indicator in [
+                    'model identifier is invalid',
+                    'authentication',
+                    'unauthorized',
+                    'access denied',
+                    'permission denied',
+                    'invalid credentials',
+                    'api key',
+                    'quota exceeded',
+                    'rate limit'
+                ])
+                
+                # Check for context window / token limit errors
+                is_context_error = any(indicator in error_str for indicator in [
+                    'context window', 'context_window', 'token limit', 'too long',
+                    'maximum context length', 'input is too long', 'exceeds the limit',
+                    'contextwindowexceedederror', 'max_tokens', 'content too large'
+                ])
+                
+                # Check for Bedrock/Claude output limit errors (recoverable by truncation)
+                is_output_limit_error = any(indicator in error_str for indicator in [
+                    'output token',
+                    'response too large',
+                    'max_tokens_to_sample',
+                    'output_token_limit',
+                    'output exceeds'
+                ])
+                
+                # Handle thinking model format errors
+                if is_thinking_format_error:
+                    model_info = getattr(llm_client, 'model_name', None) or getattr(llm_client, 'model', 'unknown')
+                    logger.error(f"Thinking model message format error during tool execution iteration {iteration}")
+                    logger.error(f"Model: {model_info}")
+                    logger.error(f"Error details: {e}")
+                    
+                    error_msg = (
+                        f"⚠️ THINKING MODEL FORMAT ERROR\n\n"
+                        f"The model '{model_info}' uses extended thinking and requires specific message formatting.\n\n"
+                        f"**Issue**: When 'thinking' is enabled, assistant messages must start with thinking blocks "
+                        f"before any tool_use blocks. This framework cannot preserve thinking_blocks during iterative "
+                        f"tool execution.\n\n"
+                        f"**Root Cause**: Anthropic's Messages API is stateless - clients must manually preserve and "
+                        f"resend thinking_blocks with every tool response. LangChain's message abstraction doesn't "
+                        f"include thinking_blocks, so they are lost between turns.\n\n"
+                        f"**Solutions**:\n"
+                        f"1. **Recommended**: Use non-thinking model variants:\n"
+                        f"   - claude-3-5-sonnet-20241022-v2:0 (instead of thinking variants)\n"
+                        f"   - anthropic.claude-3-5-sonnet-20241022-v2:0 (Bedrock)\n"
+                        f"2. Disable extended thinking: Set reasoning_effort=None or remove thinking config\n"
+                        f"3. Use LiteLLM directly with modify_params=True (handles thinking_blocks automatically)\n"
+                        f"4. Avoid tool calling with thinking models (use for reasoning tasks only)\n\n"
+                        f"**Technical Context**: {str(e)}\n\n"
+                        f"References:\n"
+                        f"- https://docs.claude.com/en/docs/build-with-claude/extended-thinking\n"
+                        f"- https://docs.litellm.ai/docs/reasoning_content (See 'Tool Calling with thinking' section)"
+                    )
+                    new_messages.append(AIMessage(content=error_msg))
+                    raise ValueError(error_msg)
+                
+                # Handle non-recoverable errors immediately
+                if is_non_recoverable:
+                    # Enhanced error logging with model information for better diagnostics
+                    model_info = getattr(llm_client, 'model_name', None) or getattr(llm_client, 'model', 'unknown')
+                    logger.error(f"Non-recoverable error during tool execution iteration {iteration}")
+                    logger.error(f"Model: {model_info}")
+                    logger.error(f"Error details: {e}")
+                    logger.error(f"Error type: {type(e).__name__}")
+                    
+                    # Provide detailed error message for debugging
+                    error_details = []
+                    error_details.append(f"Model configuration error: {str(e)}")
+                    error_details.append(f"Model identifier: {model_info}")
+                    
+                    # Check for common Bedrock model ID issues
+                    if 'model identifier is invalid' in error_str:
+                        error_details.append("\nPossible causes:")
+                        error_details.append("1. Model not available in the configured AWS region")
+                        error_details.append("2. Model not enabled in your AWS Bedrock account")
+                        error_details.append("3. LiteLLM model group prefix not stripped (check for prefixes like '1_')")
+                        error_details.append("4. Incorrect model version or typo in model name")
+                        error_details.append("\nPlease verify:")
+                        error_details.append("- AWS Bedrock console shows this model as available")
+                        error_details.append("- LiteLLM router configuration is correct")
+                        error_details.append("- Model ID doesn't contain unexpected prefixes")
+                    
+                    error_msg = "\n".join(error_details)
+                    new_messages.append(AIMessage(content=error_msg))
+                    break
+                
+                if is_context_error or is_output_limit_error:
+                    error_type = "output limit" if is_output_limit_error else "context window"
+                    logger.warning(f"{error_type.title()} exceeded during tool execution iteration {iteration}")
+                    
+                    # Find the last tool message and its associated tool name
+                    last_tool_msg_idx = None
+                    last_tool_name = None
+                    last_tool_call_id = None
+                    
+                    # First, find the last tool message
+                    for i in range(len(new_messages) - 1, -1, -1):
+                        msg = new_messages[i]
+                        if hasattr(msg, 'tool_call_id') or (hasattr(msg, 'type') and getattr(msg, 'type', None) == 'tool'):
+                            last_tool_msg_idx = i
+                            last_tool_call_id = getattr(msg, 'tool_call_id', None)
+                            break
+                    
+                    # Find the tool name from the AIMessage that requested this tool call
+                    if last_tool_call_id:
+                        for i in range(last_tool_msg_idx - 1, -1, -1):
+                            msg = new_messages[i]
+                            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    tc_id = tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')
+                                    if tc_id == last_tool_call_id:
+                                        last_tool_name = tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')
+                                        break
+                                if last_tool_name:
+                                    break
+                    
+                    # Build dynamic suggestion based on the tool that caused the overflow
+                    tool_suggestions = self._get_tool_truncation_suggestions(last_tool_name)
+                    
+                    # Truncate the problematic tool result if found
+                    if last_tool_msg_idx is not None:
+                        from langchain_core.messages import ToolMessage
+                        original_msg = new_messages[last_tool_msg_idx]
+                        tool_call_id = getattr(original_msg, 'tool_call_id', 'unknown')
+                        
+                        # Build error-specific guidance
+                        if is_output_limit_error:
+                            truncated_content = (
+                                f"⚠️ MODEL OUTPUT LIMIT EXCEEDED\n\n"
+                                f"The tool '{last_tool_name or 'unknown'}' returned data, but the model's response was too large.\n\n"
+                                f"IMPORTANT: You must provide a SMALLER, more focused response.\n"
+                                f"- Break down your response into smaller chunks\n"
+                                f"- Summarize instead of listing everything\n"
+                                f"- Focus on the most relevant information first\n"
+                                f"- If listing items, show only top 5-10 most important\n\n"
+                                f"Tool-specific tips:\n{tool_suggestions}\n\n"
+                                f"Please retry with a more concise response."
+                            )
+                        else:
+                            truncated_content = (
+                                f"⚠️ TOOL OUTPUT TRUNCATED - Context window exceeded\n\n"
+                                f"The tool '{last_tool_name or 'unknown'}' returned too much data for the model's context window.\n\n"
+                                f"To fix this:\n{tool_suggestions}\n\n"
+                                f"Please retry with more restrictive parameters."
+                            )
+                        
+                        truncated_msg = ToolMessage(
+                            content=truncated_content,
+                            tool_call_id=tool_call_id
+                        )
+                        new_messages[last_tool_msg_idx] = truncated_msg
+                        
+                        logger.info(f"Truncated large tool result from '{last_tool_name}' and retrying LLM call")
+                        
+                        # CRITICAL FIX: Call LLM again with truncated message to get fresh completion
+                        # This prevents duplicate tool_call_ids that occur when we continue with
+                        # the same current_completion that still has the original tool_calls
+                        try:
+                            current_completion = llm_client.invoke(new_messages, config=config)
+                            new_messages.append(current_completion)
+                            
+                            # Continue to process any new tool calls in the fresh completion
+                            if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:
+                                logger.info(f"LLM requested {len(current_completion.tool_calls)} more tool calls after truncation")
+                                continue
+                            else:
+                                logger.info("LLM completed after truncation without requesting more tools")
+                                break
+                        except Exception as retry_error:
+                            logger.error(f"Error retrying LLM after truncation: {retry_error}")
+                            error_msg = f"Failed to retry after truncation: {str(retry_error)}"
+                            new_messages.append(AIMessage(content=error_msg))
+                            break
+                    else:
+                        # Couldn't find tool message, add error and break
+                        if is_output_limit_error:
+                            error_msg = (
+                                "Model output limit exceeded. Please provide a more concise response. "
+                                "Break down your answer into smaller parts and summarize where possible."
+                            )
+                        else:
+                            error_msg = (
+                                "Context window exceeded. The conversation or tool results are too large. "
+                                "Try using tools with smaller output limits (e.g., max_items, max_depth parameters)."
+                            )
+                        new_messages.append(AIMessage(content=error_msg))
+                        break
+                else:
+                    logger.error(f"Error in LLM call during iteration {iteration}: {e}")
+                    # Add error message and break the loop
+                    error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
+                    new_messages.append(AIMessage(content=error_msg))
+                    break
+
+        # Reset auto-approve context on normal loop exit.
+        # GraphBubbleUp paths handle their own cleanup above.
+        if _approved_token is not None:
+            reset_hitl_approved_tools(_approved_token)
+
+        # Handle max iterations
+        if iteration >= self.steps_limit:
+            logger.warning(f"Reached maximum iterations ({self.steps_limit}) for tool execution")
+            
+            # CRITICAL: Check if the last message is an AIMessage with pending tool_calls
+            # that were not processed. If so, we need to add placeholder ToolMessages to prevent
+            # the "assistant message with 'tool_calls' must be followed by tool messages" error
+            # when the conversation continues.
+            if new_messages:
+                last_msg = new_messages[-1]
+                if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                    from langchain_core.messages import ToolMessage
+                    pending_tool_calls = last_msg.tool_calls if hasattr(last_msg.tool_calls, '__iter__') else []
+                    
+                    # Check which tool_call_ids already have responses
+                    existing_tool_call_ids = set()
+                    for msg in new_messages:
+                        if hasattr(msg, 'tool_call_id'):
+                            existing_tool_call_ids.add(msg.tool_call_id)
+                    
+                    # Add placeholder responses for any tool calls without responses
+                    for tool_call in pending_tool_calls:
+                        tool_call_id = tool_call.get('id', '') if isinstance(tool_call, dict) else getattr(tool_call, 'id', '')
+                        tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+                        
+                        if tool_call_id and tool_call_id not in existing_tool_call_ids:
+                            logger.info(f"Adding placeholder ToolMessage for interrupted tool call: {tool_name} ({tool_call_id})")
+                            placeholder_msg = ToolMessage(
+                                content=f"[Tool execution interrupted - step limit ({self.steps_limit}) reached before {tool_name} could be executed]",
+                                tool_call_id=tool_call_id
+                            )
+                            new_messages.append(placeholder_msg)
+            
+            # Add warning message - CLI or calling code can detect this and prompt user
+            warning_msg = f"Maximum tool execution iterations ({self.steps_limit}) reached. Stopping tool execution."
+            new_messages.append(AIMessage(content=warning_msg))
+        else:
+            logger.info(f"Tool execution completed after {iteration} iterations")
+
+        # Clear the pending-messages contextvar on normal completion.
+        _PENDING_TOOL_MESSAGES.set([])
+        return new_messages, current_completion
+
+    def __get_struct_output_model(self, llm_client, pydantic_model, method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling"):
+        return llm_client.with_structured_output(pydantic_model, method=method)
