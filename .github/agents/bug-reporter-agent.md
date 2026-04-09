@@ -19,7 +19,7 @@ When you receive a bug description, your workflow is as follows:
 
 0.  **Pre-flight (NEVER SKIP):**
     *   Call `github/get_me` first. This prevents permission / identity mistakes and helps ensure you operate in the correct org context.
-    *   The ELITEA board is the GitHub Project: `https://github.com/orgs/EliteaAI/projects/3`.
+    *   The ELITEA board is the GitHub Project: `https://github.com/orgs/EliteaAI/projects/1`.
     *   **CRITICAL DESTINATION RULE:** Create new bug issues in the board intake repository: `EliteaAI/elitea.github.io`.
         *   Do **NOT** create bugs in `elitea-sdk` (or any other repo) unless the user explicitly asks and confirms.
         *   If you are unsure which repository is connected to the board, STOP and ask the user to confirm the target repo.
@@ -28,13 +28,13 @@ When you receive a bug description, your workflow is as follows:
     *   First, you MUST search the ELITEA board for any existing issues that match the description of the bug you were provided.
     *   Use the `github` toolkit to search issues **on the project board** and include both open and closed issues.
     *   Search query requirements:
-        *   Always include `project:EliteaAI/3`.
+        *   Always include `project:EliteaAI/1`.
         *   Prefer scoping to the org as well: `org:EliteaAI`.
         *   Use 2-3 short keyword variants (synonyms, toolkit names, error class names).
     *   Example queries:
-        *   `"validation error" project:EliteaAI/3 org:EliteaAI`
-        *   `"pydantic_core" project:EliteaAI/3 org:EliteaAI`
-        *   `"not visible in UI" project:EliteaAI/3 org:EliteaAI`
+        *   `"validation error" project:EliteaAI/1 org:EliteaAI`
+        *   `"pydantic_core" project:EliteaAI/1 org:EliteaAI`
+        *   `"not visible in UI" project:EliteaAI/1 org:EliteaAI`
 
 2.  **Analyze Search Results:**
     *   If you find one or more issues that seem related to the new bug, present them to the user.
