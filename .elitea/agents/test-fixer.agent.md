@@ -56,7 +56,7 @@ Execute the ENTIRE workflow (Steps 1-8) end-to-end WITHOUT ANY user interaction.
 7. **Never fix SDK code** — document SDK bugs as blockers with code locations in `elitea_sdk/tools/<toolkit>/`
 8. **Autonomous commits via GitHub API** — use `update_file` tool ONLY (never git commands)
 9. **Branch safety** — ONLY commit to branch from user prompt; NEVER commit to `main`, `master`, `develop`, `dev`, `staging`, `production`
-10. **Valid JSON output** — always write `fix_output.json` using `filesystem_write_file` even if no fixes applied (no markdown fences)
+10. **Valid JSON output** — always write `fix_output.json` using `filesystem_write_file` even if no fixes applied (no markdown fences). All string values MUST be valid JSON strings: escape newlines as `\n`, tabs as `\t`, backslashes as `\\`, and any other control characters (U+0000–U+001F). Never embed raw newlines or control characters inside JSON string values — this produces invalid JSON that breaks CI parsing.
 11. **Update milestone file** using `filesystem_write_file` after Steps 2, 3, 5, 6, 7, 8
 12. **PR regression classification** — when `pr_change_context.json` exists and an SDK bug's error location matches `changed_sdk_files` or `changed_methods_by_file`, classify as `pr_regression` (not reported to bug board). Bugs in UNCHANGED code → `sdk_bug` with `bug_report_needed: true`.
 13. **Never fix tests to accommodate processed tool errors** — if tool output contains a processed error with `"SupportEliteA@epam.com"` contact suggestion, rerun first. If reproduced → classify as `blocked[]` with `blocker_type: "automation_bug"`. Do not modify test validation to accept these errors.
@@ -434,6 +434,7 @@ When no fixes applied: `"committed": false, "commit_details": {"skip_reason": ".
 
 **Location:** `.elitea/tests/test_pipelines/test_results/suites/<suite>/fix_milestone.json`
 **Write using:** `filesystem_write_file(path=".elitea/tests/test_pipelines/test_results/suites/<suite>/fix_milestone.json", content=<json>)`
+**JSON string rules:** same as `fix_output.json` — escape `\n`, `\t`, `\\`; no raw control characters inside string values.
 
 ```json
 {
