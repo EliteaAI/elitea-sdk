@@ -3,7 +3,7 @@
   "branch": "main",
   "gitlab_configuration": {
     "private": false,
-    "elitea_title": "gitlab"
+    "alita_title": "gitlab"
   },
   "selected_tools": [
     "list_branches_in_repo",

@@ -19,7 +19,7 @@ setup:
     type: configuration
     config:
       config_type: gitlab
-      elitea_title: ${GITLAB_SECRET_NAME:gitlab}
+      alita_title: ${GITLAB_SECRET_NAME:gitlab}
       data:
         private_token: ${GITLAB_PRIVATE_TOKEN}
         url: ${GITLAB_URL:https://githyd.epam.com}
@@ -34,7 +34,7 @@ setup:
       overrides:
         gitlab_configuration:
           private: false
-          elitea_title: ${GITLAB_SECRET_NAME:gitlab}
+          alita_title: ${GITLAB_SECRET_NAME:gitlab}
         repository: ${GITLAB_TEST_REPO:Aliaksei_Breilian/elitea-automation}
         branch: ${GITLAB_BASE_BRANCH:main}
       toolkit_name: ${GITLAB_TOOLKIT_NAME:testing-gitlab}

@@ -8,7 +8,7 @@ FROM ghcr.io/eliteaai/elitea-sdk:pyodide
 WORKDIR /app
 
 # Install cosmic-ray and pytest (not in the base image)
-RUN pip install --no-cache-dir cosmic-ray pytest
+RUN pip install --no-cache-dir cosmic-ray pytest deepeval pytest-dotenv
 
 # Copy source + tests into the container.
 # The coordinator mutates files inside the container, so each worker has its
