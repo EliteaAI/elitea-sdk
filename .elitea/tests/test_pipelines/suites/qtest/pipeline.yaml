@@ -21,7 +21,7 @@ setup:
     type: configuration
     config:
       config_type: qtest
-      elitea_title: ${QTEST_SECRET_NAME:qtest}
+      alita_title: ${QTEST_SECRET_NAME:qtest}
       data:
         base_url: ${QTEST_BASE_URL:https://elitea.qtestnet.com}
         qtest_api_token: ${QTEST_API_TOKEN}
@@ -36,7 +36,7 @@ setup:
       overrides:
         qtest_configuration:
           private: false
-          elitea_title: ${QTEST_SECRET_NAME:qtest}
+          alita_title: ${QTEST_SECRET_NAME:qtest}
         qtest_project_id: ${QTEST_PROJECT_ID:154314}
     save_to_env:
       - key: QTEST_TOOLKIT_ID

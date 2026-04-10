@@ -3,7 +3,7 @@
   "toolkit_name": "qtest",
   "id": 1,
   "qtest_configuration": {
-    "elitea_title": "qtest",
+    "alita_title": "qtest",
     "private": false
   },
   "qtest_project_id": 1,

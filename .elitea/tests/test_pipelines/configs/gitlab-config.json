@@ -1,9 +1,9 @@
 {
-  "repository": "Aliaksei_Breilian/elitea-automation",
+  "repository": "Aliaksei_Breilian/alita-automation",
   "branch": "main",
   "gitlab_configuration": {
     "private": false,
-    "elitea_title": "gitlab"
+    "alita_title": "gitlab"
   },
   "selected_tools": [
     "list_branches_in_repo",
