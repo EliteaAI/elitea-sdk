@@ -5,7 +5,7 @@ from typing import Any, Optional
 from jinja2 import Environment, DebugUndefined
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import BaseTool, ToolException
 
 from .langraph_agent import create_graph
@@ -157,6 +157,7 @@ class Assistant:
             elitea_client=elitea,
             llm=self.client,
             memory_store=self.store,
+            memory=self.memory,
             debug_mode=debug_mode,
             mcp_tokens=mcp_tokens,
             conversation_id=conversation_id,
@@ -355,6 +356,8 @@ class Assistant:
             else:
                 logger.info("Swarm mode enabled but no agent tools found, using standard agent")
 
+        agent_tools = [t for t in simple_tools if self._is_agent_tool(t)]
+
         # Set up memory/checkpointer if available
         checkpointer = None
         if self.memory is not None:
@@ -427,6 +430,18 @@ class Assistant:
                 file_handling_instructions=FILE_HANDLING_INSTRUCTIONS
             )
 
+        if agent_tools:
+            logger.info(
+                "Using ToolNode react runtime for %d application tool(s): %s",
+                len(agent_tools),
+                [tool.name for tool in agent_tools],
+            )
+            return self._create_toolnode_react_agent(
+                simple_tools=simple_tools,
+                system_prompt=escaped_prompt,
+                checkpointer=checkpointer,
+            )
+
         # Properly setup the prompt for YAML
         import yaml
 
@@ -487,7 +502,7 @@ class Assistant:
             memory=checkpointer,
             store=self.store,
             debug=False,
-            for_subgraph=False,
+            for_subgraph=self.is_subgraph,
             lazy_tools_mode=self.lazy_tools_mode,
             elitea_client=self.elitea_client,
             steps_limit=self.max_iterations,
@@ -541,6 +556,98 @@ class Assistant:
         if hasattr(original, 'application') and original.application is not None:
             return True
         return False
+
+    def _create_toolnode_react_agent(self, simple_tools: list, system_prompt: str, checkpointer: Any):
+        """Build a simpler model -> ToolNode -> model loop for agents with Application tools."""
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.prebuilt import ToolNode
+
+        from .langraph_agent import prepare_output_schema
+        from .utils import create_state
+
+        toolnode_tools = [tool for tool in simple_tools if isinstance(tool, BaseTool)]
+        if len(toolnode_tools) != len(simple_tools):
+            logger.info(
+                "Ignoring %d non-BaseTool entries in ToolNode runtime: %s",
+                len(simple_tools) - len(toolnode_tools),
+                [type(tool).__name__ for tool in simple_tools if not isinstance(tool, BaseTool)],
+            )
+
+        if self.lazy_tools_mode:
+            logger.warning(
+                "ToolNode react runtime bypasses lazy tools optimization; binding %d tools directly",
+                len(toolnode_tools),
+            )
+
+        if not toolnode_tools:
+            raise ToolException("ToolNode react runtime requires at least one BaseTool.")
+
+        state_class = create_state({
+            'input': {'type': 'str'},
+            'messages': {'type': 'list'},
+        })
+        builder = StateGraph(state_class)
+
+        def filter_orphaned_tool_calls(messages: list) -> list:
+            if not messages:
+                return messages
+
+            tool_result_ids = set()
+            for msg in messages:
+                if hasattr(msg, 'tool_call_id') and getattr(msg, 'tool_call_id', None):
+                    tool_result_ids.add(msg.tool_call_id)
+
+            cleaned_messages = []
+            for msg in messages:
+                if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
+                    valid_calls = [tc for tc in msg.tool_calls if tc.get('id') in tool_result_ids]
+                    if valid_calls:
+                        cleaned_messages.append(AIMessage(content=msg.content, tool_calls=valid_calls))
+                    elif msg.content:
+                        cleaned_messages.append(AIMessage(content=msg.content))
+                else:
+                    cleaned_messages.append(msg)
+
+            return cleaned_messages
+
+        model_with_tools = self.client.bind_tools(toolnode_tools)
+
+        def model_node(state, config=None):
+            messages = state.get('messages', [])
+            filtered_messages = [msg for msg in messages if not isinstance(msg, SystemMessage)]
+            filtered_messages = filter_orphaned_tool_calls(filtered_messages)
+            response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + filtered_messages, config)
+            return {'messages': [response]}
+
+        def should_continue(state):
+            messages = state.get('messages', [])
+            if messages:
+                last = messages[-1]
+                if isinstance(last, AIMessage) and getattr(last, 'tool_calls', None):
+                    return 'tools'
+            return END
+
+        builder.add_node('model', model_node)
+        builder.add_node('tools', ToolNode(toolnode_tools))
+        builder.add_edge(START, 'model')
+        builder.add_conditional_edges('model', should_continue, {'tools': 'tools', END: END})
+        builder.add_edge('tools', 'model')
+
+        if self.is_subgraph:
+            return builder.compile(checkpointer=True, store=self.store, debug=False)
+
+        return prepare_output_schema(
+            builder,
+            checkpointer,
+            self.store,
+            debug=False,
+            interrupt_before=[],
+            interrupt_after=[],
+            interrupt_after_successors=set(),
+            state_class={state_class: None},
+            output_variables=['messages'],
+            tool_registry=None,
+        )
 
 
     def _create_swarm_agent(self, all_tools: list, agent_tools: list):
