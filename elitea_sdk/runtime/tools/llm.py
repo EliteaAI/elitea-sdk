@@ -1716,6 +1716,14 @@ class LLMNode(BaseTool):
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
                     except Exception as e:
+                        from ..utils.mcp_oauth import McpAuthorizationRequired
+                        if isinstance(e, McpAuthorizationRequired):
+                            # Re-raise so the parent agent's on_tool_error callback
+                            # can emit the mcp_authorization_required socket event,
+                            # which triggers the Login button in the Chat UI.
+                            # Without this, the exception is swallowed into a ToolMessage
+                            # and the nested agent silently fails to show the login prompt.
+                            raise
                         import traceback
                         error_details = traceback.format_exc()
                         # Use debug level to avoid duplicate output when CLI callbacks are active

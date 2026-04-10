@@ -4,6 +4,15 @@ import re
 from enum import Enum
 from typing import Any
 
+
+def mask_secret(secret: str, visible_chars: int = 4) -> str:
+    """Mask a secret string, showing only the last N characters."""
+    if not secret:
+        return '****'
+    if len(secret) <= visible_chars:
+        return '****'
+    return '*' * 4 + secret[-visible_chars:]
+
 # DEPRECATED: Tool names no longer use prefixes
 # Kept for backward compatibility only
 TOOLKIT_SPLITTER = "___"
