@@ -93,9 +93,13 @@ nodes:
     tool: create_file
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     input:
+      - target_branch
       - file_path
       - file_contents
     input_mapping:
+      branch:
+        type: variable
+        value: target_branch
       file_path:
         type: variable
         value: file_path
@@ -153,9 +157,13 @@ nodes:
     tool: apply_git_patch
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     input:
+      - target_branch
       - patch_content
       - commit_message
     input_mapping:
+      branch:
+        type: variable
+        value: target_branch
       patch_content:
         type: variable
         value: patch_content
@@ -237,8 +245,12 @@ nodes:
     tool: delete_file
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     input:
+      - target_branch
       - file_path
     input_mapping:
+      branch:
+        type: variable
+        value: target_branch
       file_path:
         type: variable
         value: file_path

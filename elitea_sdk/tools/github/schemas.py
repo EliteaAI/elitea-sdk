@@ -62,6 +62,7 @@ ReadFile = create_model(
 UpdateFile = create_model(
     "UpdateFile",
     file_query=(str, Field(description=UPDATE_FILE_PROMPT_WITH_PATH, json_schema_extra={'multiline': True})),
+    branch=(Optional[str], Field(default=None, description="The branch to commit the update to. If None, uses the current active branch.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
     commit_message=(Optional[str], Field(default=None, description="Commit message for the update operation")),
 )
@@ -69,6 +70,7 @@ UpdateFile = create_model(
 CreateFile = create_model(
     "CreateFile",
     file_path=(str, Field(description="The path of the file to create in the repository, e.g. `src/new_file.py` or `images/photo.png`")),
+    branch=(Optional[str], Field(default=None, description="The branch to create the file on. If None, uses the current active branch.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
     file_contents=(Optional[str], Field(
         default=None,
@@ -83,6 +85,7 @@ CreateFile = create_model(
 DeleteFile = create_model(
     "DeleteFile",
     file_path=(str, Field(description="The path of the file to delete, e.g. `src/old_file.py`")),
+    branch=(Optional[str], Field(default=None, description="The branch to delete the file from. If None, uses the current active branch.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
 )
 
@@ -263,6 +266,7 @@ ApplyGitPatch = create_model(
     "ApplyGitPatch",
     patch_content=(str, Field(description="The git patch content in unified diff format")),
     commit_message=(Optional[str], Field(description="Commit message for the patch application", default="Apply git patch")),
+    branch=(Optional[str], Field(default=None, description="The branch to apply the patch to. If None, uses the current active branch.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
 )
 
@@ -271,6 +275,7 @@ ApplyGitPatchFromArtifact = create_model(
     bucket_name=(str, Field(description="Name of the artifact bucket containing the patch file")),
     file_name=(str, Field(description="Name of the patch file to download and apply")),
     commit_message=(Optional[str], Field(description="Commit message for the patch application", default="Apply git patch from artifact")),
+    branch=(Optional[str], Field(default=None, description="The branch to apply the patch to. If None, uses the current active branch.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
 )
 
