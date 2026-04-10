@@ -6,11 +6,11 @@ description: GitLab toolkit integration tests
 
 # Environment variable mappings
 env_mapping:
-  toolkit_config: ${GITLAB_CONFIG_PATH:../../../tool_configs/gitlab-config.json}
+  toolkit_config: ${GITLAB_CONFIG_PATH:../../configs/gitlab-config.json}
   private_token: ${GITLAB_PRIVATE_TOKEN}
-  repository: ${GITLAB_TEST_REPO:Aliaksei_Breilian/elitea-automation}
+  repository: ${GITLAB_TEST_REPO:Aliaksei_Breilian/alita-automation}
   base_branch: ${GITLAB_BASE_BRANCH:main}
-  url: ${GITLAB_URL:https://githyd.epam.com}
+  gitlab_url: ${GITLAB_URL:https://githyd.epam.com}
 
 # Setup steps executed before running tests
 setup:
@@ -35,7 +35,7 @@ setup:
         gitlab_configuration:
           private: false
           alita_title: ${GITLAB_SECRET_NAME:gitlab}
-        repository: ${GITLAB_TEST_REPO:Aliaksei_Breilian/elitea-automation}
+        repository: ${GITLAB_TEST_REPO:Aliaksei_Breilian/alita-automation}
         branch: ${GITLAB_BASE_BRANCH:main}
       toolkit_name: ${GITLAB_TOOLKIT_NAME:testing-gitlab}
     save_to_env:
