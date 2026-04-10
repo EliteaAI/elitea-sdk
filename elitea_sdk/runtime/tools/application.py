@@ -3,6 +3,7 @@ import json
 from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from typing import Any, Type, Optional
 from pydantic import create_model, model_validator, BaseModel
 from pydantic.fields import FieldInfo
@@ -107,7 +108,12 @@ class Application(BaseTool):
                 if key not in config['metadata']:
                     config['metadata'][key] = value
 
-        result = self._run(**all_kwargs, _invoke_config=config)
+        # super().invoke() → BaseTool.run() fires on_tool_start/on_tool_end callbacks
+        # (agent_tool_start chip event) and passes config to _run() via the RunnableConfig
+        # type annotation on _run's `config` parameter.
+        # NOTE: since we already unwrapped the ToolCall above, BaseTool sees a plain dict
+        # input (no tool_call_id in _prep_run_args), so we must wrap the result ourselves.
+        result = super().invoke(all_kwargs, config=config)
 
         # When invoked from LangGraph's ToolNode, wrap plain str/dict results in a ToolMessage.
         # ToolNode (langgraph >= 0.3) rejects any return type that is not ToolMessage or Command,
@@ -133,10 +139,15 @@ class Application(BaseTool):
 
         return result
 
-    def _run(self, *args, **kwargs):
-        # Pop the config forwarded from invoke() — kept separate to avoid polluting kwargs
-        # that are passed to formulate_query() / the nested agent's input.
-        invoke_config = kwargs.pop('_invoke_config', None)
+    def _run(self, *args, config: RunnableConfig = None, **kwargs):
+        # `config` is injected by BaseTool.run() because of the RunnableConfig type annotation
+        # (via _get_runnable_config_param). It carries the parent's metadata (toolkit_name,
+        # agent_type, etc.) that we need to build nested_config, but NOT callbacks/checkpoints
+        # — those are already stripped by BaseTool.run() (it passes child_config to _run, not
+        # the full parent config) which prevents double-firing and checkpoint corruption.
+        invoke_config = config
+        # Also consume legacy _invoke_config kwarg in case called directly in tests.
+        invoke_config = kwargs.pop('_invoke_config', invoke_config)
 
         if self.client and self.args_runnable:
             # Recreate new LanggraphAgentRunnable in order to reflect the current input_mapping (it can be dynamic for pipelines).
