@@ -10,6 +10,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ...configurations.pgvector import PgVectorConfiguration
 from ...configurations.sharepoint import SharepointConfiguration
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
+from ...runtime.utils.utils import mask_secret
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ class SharepointToolkit(BaseToolkit):
         # prompt instead of failing deep inside a tool call with a cryptic error.
         if sp_config.get('oauth_discovery_endpoint') and not wrapper_payload.get('token'):
             logger.debug("SharePoint OAuth mode active but no token found — raising McpAuthorizationRequired.")
-            raise SharepointConfiguration._build_mcp_authorization_required(
+            exc = SharepointConfiguration._build_mcp_authorization_required(
                 message=(
                     f"SharePoint site {sp_config.get('site_url', '')} requires OAuth authorization. "
                     "Please log in to continue."
@@ -117,6 +118,27 @@ class SharepointToolkit(BaseToolkit):
                 scopes=sp_config.get('scopes'),
                 configuration_uuid=sp_config.get('configuration_uuid'),
             )
+            # Embed provided_settings so the login modal knows credentials are already
+            # configured and does not ask the user to re-enter client_id / client_secret.
+            # The real (unmasked) client_secret is required because the frontend sends it
+            # to the backend OAuth proxy for the token exchange (confidential-client flow).
+            if exc.resource_metadata is not None:
+                provided_settings = {}
+                client_id = sp_config.get('client_id')
+                if client_id:
+                    provided_settings['mcp_client_id'] = client_id
+                client_secret = sp_config.get('client_secret')
+                if client_secret:
+                    if hasattr(client_secret, 'get_secret_value'):
+                        client_secret = client_secret.get_secret_value()
+                    if client_secret:
+                        # Mask the secret so it is never exposed to the frontend.
+                        # The backend OAuth proxy retrieves the real secret via
+                        # configuration_uuid which is already in resource_metadata.
+                        provided_settings['mcp_client_secret'] = mask_secret(client_secret)
+                if provided_settings:
+                    exc.resource_metadata['provided_settings'] = provided_settings
+            raise exc
 
         sharepoint_api_wrapper = SharepointApiWrapper(**wrapper_payload)
         available_tools = sharepoint_api_wrapper.get_available_tools()
