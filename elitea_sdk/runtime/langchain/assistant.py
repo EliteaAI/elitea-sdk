@@ -824,7 +824,7 @@ class Assistant:
 
                 # Invoke the Application tool directly
                 try:
-                    result = application_tool.invoke({"task": task, "chat_history": []})
+                    result = application_tool.invoke({"task": task, "chat_history": []}, config=config)
                     if isinstance(result, dict):
                         content = result.get("output", str(result))
                     elif isinstance(result, str):
