@@ -610,11 +610,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
             self, pull_requests: Union[GitPullRequest, List[GitPullRequest]]
     ) -> List[dict]:
         """
-        Extracts title and number from each Pull Request and puts them in a dictionary
+        Extracts title, description and number from each Pull Request and puts them in a dictionary
         Parameters:
             issues(List[GitPullRequest]): A list of ADO Repos  GitPullRequest objects
         Returns:
-            List[dict]: A dictionary of Pull Request titles and numbers
+            List[dict]: A dictionary of Pull Request titles, descriptions, and numbers
         """
         if not isinstance(pull_requests, list):
             pull_requests = [pull_requests]
@@ -644,6 +644,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 parsed.append(
                     {
                         "title": pull_request.title,
+                        "description": pull_request.description or "",
                         "pull_request_id": pull_request.pull_request_id,
                         "commits": commit_details,
                         "comments": self.parse_pull_request_comments(comment_threads),

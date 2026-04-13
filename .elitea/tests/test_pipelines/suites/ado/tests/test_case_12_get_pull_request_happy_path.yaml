@@ -22,7 +22,7 @@ state:
     value: "PR FOR AI TEST"
   expected_fields:
     type: list
-    value: ["pull_request_id", "title", "commits", "comments", "source_branch", "target_branch"]
+    value: ["pull_request_id", "title", "description", "commits", "comments", "source_branch", "target_branch"]
   tool_result:
     type: str
   test_results:
