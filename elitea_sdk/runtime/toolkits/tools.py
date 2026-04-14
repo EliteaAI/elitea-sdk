@@ -59,7 +59,7 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
-def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None) -> list:
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None) -> list:
     """
     Process tool configurations and return instantiated tools.
 
@@ -174,8 +174,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
         try:
             if tool['type'] == 'application':
                 tool_handled = True
-                # Check if this is a pipeline to enable PrinterNode filtering
-                is_pipeline_subgraph = tool.get('agent_type', '') == 'pipeline'
+                is_application_subgraph = True
                 # Get project_id from top level (injected by BE for all data paths)
                 app_project_id = tool.get('project_id')
                 # Get agent_type for metadata
@@ -194,13 +193,17 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         application_version_id=int(tool['settings']['application_version_id']),
                         selected_tools=[],
                         ignored_mcp_servers=ignored_mcp_servers,
-                        is_subgraph=is_pipeline_subgraph,  # Pass is_subgraph for pipelines
+                        is_subgraph=is_application_subgraph,
                         mcp_tokens=mcp_tokens,
                         project_id=app_project_id,  # Use agent's project, not conversation's
                         conversation_id=conversation_id,
                         agent_type=agent_type,  # Pass agent_type for metadata
+                        memory=memory,
                         fallback_llm=llm,  # Fallback for embedded sub-agents with null llm_settings
                     ).get_tools())
+                except McpAuthorizationRequired:
+                    # OAuth required by a nested agent's toolkit — propagate so user is prompted
+                    raise
                 except Exception as app_err:
                     # Gracefully skip application tools that fail to load (e.g., deleted agents)
                     # This is common for conversation participants that reference stale agents

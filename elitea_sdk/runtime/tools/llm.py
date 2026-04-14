@@ -21,6 +21,7 @@ except ImportError:
 from ..langchain.constants import ELITEA_RS
 from ..langchain.utils import create_pydantic_model, propagate_the_input_mapping
 from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
+from ..utils.mcp_oauth import McpAuthorizationRequired
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
 
@@ -1074,6 +1075,23 @@ class LLMNode(BaseTool):
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
 
+        if hitl_ctx and hitl_ctx.get('pending_messages'):
+            from langchain_core.messages.utils import messages_from_dict
+
+            try:
+                restored_messages = messages_from_dict(hitl_ctx['pending_messages'])
+                messages = list(messages) + list(restored_messages)
+                messages = self._filter_orphaned_tool_calls(messages)
+                logger.info(
+                    "[HITL] Restored %d intermediate messages into LLM node history",
+                    len(restored_messages),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[HITL] Failed to restore intermediate messages into LLM node history: %s",
+                    exc,
+                )
+
         # Get the LLM client, potentially with tools bound
         llm_client = self.client
 
@@ -1714,6 +1732,13 @@ class LLMNode(BaseTool):
                         if _approved_token is not None:
                             reset_hitl_approved_tools(_approved_token)
                         _PENDING_TOOL_MESSAGES.set([])
+                        raise
+                    except McpAuthorizationRequired:
+                        # Re-raise so the parent agent's on_tool_error callback
+                        # can emit the mcp_authorization_required socket event,
+                        # which triggers the Login button in the Chat UI.
+                        # Without this, the exception is swallowed into a ToolMessage
+                        # and the nested agent silently fails to show the login prompt.
                         raise
                     except Exception as e:
                         import traceback

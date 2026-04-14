@@ -952,8 +952,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             parsed_data_row = {
                 'Id': item['pid'],
                 'Name': item['name'],
-                'Description': html.unescape(strip_tags(item['description'])),
-                'Precondition': html.unescape(strip_tags(item['precondition'])),
+                'Description': self._clean_html_content(item['description'], extract_images, prompt),
+                'Precondition': self._clean_html_content(item['precondition'], extract_images, prompt),
                 QTEST_ID: item['id'],
                 'Steps': list(map(lambda step: {
                     'Test Step Number': step[0] + 1,
