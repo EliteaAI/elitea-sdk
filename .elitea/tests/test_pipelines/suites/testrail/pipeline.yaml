@@ -12,7 +12,7 @@ setup:
     type: configuration
     config:
       config_type: testrail
-      elitea_title: ${TESTRAIL_SECRET_NAME:testrail}
+      alita_title: ${TESTRAIL_SECRET_NAME:testrail}
       data:
         url: ${TESTRAIL_URL:https://epamelitea.testrail.io}
         email: ${TESTRAIL_EMAIL:Vladyslav_Variushkin@epam.com}
@@ -31,7 +31,7 @@ setup:
         # Credentials must use secret reference format (platform requirement)
         testrail_configuration:
           private: false
-          elitea_title: ${TESTRAIL_SECRET_NAME:testrail}
+          alita_title: ${TESTRAIL_SECRET_NAME:testrail}
       # Name for the toolkit on platform
       toolkit_name: ${TESTRAIL_TOOLKIT_NAME:testrail-testing}
     # Save created toolkit ID to environment for pipeline substitution

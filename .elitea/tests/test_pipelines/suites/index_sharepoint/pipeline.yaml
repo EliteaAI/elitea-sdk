@@ -28,7 +28,7 @@ setup:
     type: configuration
     config:
       config_type: sharepoint
-      elitea_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
+      alita_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
       data:
         site_url: ${SHAREPOINT_SITE_URL:https://5clkvm.sharepoint.com/sites/ELITEA}
         client_id: ${SHAREPOINT_CLIENT_ID:84c01a1e-1ebc-40c0-b55a-8b3fae194e41}
@@ -43,10 +43,10 @@ setup:
       overrides:
         sharepoint_configuration:
           private: false
-          elitea_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
+          alita_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
         pgvector_configuration:
           private: false
-          elitea_title: ${PGVECTOR_SECRET_NAME:elitea-pgvector}
+          alita_title: ${PGVECTOR_SECRET_NAME:elitea-pgvector}
         embedding_model: ${EMBEDDING_MODEL:text-embedding-ada-002}
       toolkit_name: ${ISP_TOOLKIT_NAME:sp-index-test}
     save_to_env:

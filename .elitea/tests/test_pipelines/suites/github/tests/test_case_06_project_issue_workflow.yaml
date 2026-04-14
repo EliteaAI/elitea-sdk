@@ -8,7 +8,7 @@ toolkits:
 state:
   board_repo:
     type: str
-    value: EliteaAI/elitea-testing
+    value: ${repository}
   input:
     type: str
   issue_body:

@@ -19,7 +19,7 @@ setup:
     type: configuration
     config:
       config_type: ado
-      elitea_title: ${ADO_SECRET_NAME:ado}
+      alita_title: ${ADO_SECRET_NAME:ado}
       data:
         token: ${ADO_TOKEN}
         organization_url: ${ADO_ORGANIZATION_URL}

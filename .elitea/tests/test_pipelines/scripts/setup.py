@@ -372,7 +372,7 @@ def find_configuration_by_title(ctx: SetupContext, elitea_title: str, type_filte
     """Find a configuration by its elitea_title."""
     configs = get_configurations(ctx, type_filter)
     for config in configs:
-        if config.get("elitea_title") == elitea_title:
+        if config.get("alita_title") == elitea_title or config.get("elitea_title") == elitea_title:
             return config
     return None
 
@@ -495,7 +495,7 @@ def handle_configuration(step: dict, ctx: SetupContext) -> dict:
     config = resolve_env_value(step.get("config", {}), ctx.env_vars, env_loader=load_from_env)
 
     config_type = config.get("config_type")
-    elitea_title = config.get("elitea_title")
+    elitea_title = config.get("alita_title") or config.get("elitea_title")
     data = config.get("data", {})
 
     if not config_type:
@@ -503,8 +503,8 @@ def handle_configuration(step: dict, ctx: SetupContext) -> dict:
         return {"success": True, "skipped": True, "reason": "no config_type"}
 
     if not elitea_title:
-        ctx.log("No elitea_title provided", "warning")
-        return {"success": True, "skipped": True, "reason": "no elitea_title"}
+        ctx.log("No alita_title provided", "warning")
+        return {"success": True, "skipped": True, "reason": "no alita_title"}
 
     ctx.log(f"Ensuring configuration '{elitea_title}' of type '{config_type}'")
 

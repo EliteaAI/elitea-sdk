@@ -282,6 +282,20 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           elitea agent run .elitea/agents/test-fixer.agent.md --dir . "Analyze ${RESULTS_PATH} on ${{ inputs.environment }} and branch ${formated_branch}" || echo "AI analysis completed with warnings"
 
+      - name: Sanitize AI output JSON files
+        if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
+        run: |
+          RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
+          # Strip control characters U+0001-U+001F (except tab/LF/CR) that the LLM
+          # can embed in string values, producing JSON that breaks jq.
+          for f in "${RESULTS_DIR}/fix_output.json" "${RESULTS_DIR}/fix_milestone.json"; do
+            if [ -f "$f" ]; then
+              tmp=$(mktemp)
+              tr -d '\001-\010\013\014\016-\037' < "$f" > "$tmp" && mv "$tmp" "$f" || rm -f "$tmp"
+              echo "Sanitized $f"
+            fi
+          done
+
       - name: Label PR with tests_ai_healed
         if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
         run: |
@@ -333,7 +347,7 @@ jobs:
             echo "::warning::Invalid JSON in fix_output.json"
             exit 0
           fi
-          
+
           # Parse AI analysis results
           FIXED_COUNT=$(jq -r '.summary.fixed // 0' "${FIX_OUTPUT}")
           FLAKY_COUNT=$(jq -r '.summary.flaky // 0' "${FIX_OUTPUT}")

@@ -365,53 +365,59 @@ class LocalSetupStrategy(SetupStrategy):
         logger.info(f"[MERGE DEBUG] toolkit_type: {toolkit_type}, config_key: {config_key}")
         logger.info(f"[MERGE DEBUG] toolkit_config: {toolkit_config}")
         logger.info(f"[MERGE DEBUG] _configuration_data keys: {list(self._configuration_data.keys())}")
-        logger.info(f"[MERGE DEBUG] 'elitea_title' in toolkit_config: {'elitea_title' in toolkit_config}")
-        if 'elitea_title' in toolkit_config:
-            logger.info(f"[MERGE DEBUG] toolkit_config['elitea_title']: {toolkit_config['elitea_title']}")
-            logger.info(f"[MERGE DEBUG] elitea_title in _configuration_data: {toolkit_config['elitea_title'] in self._configuration_data}")
-        
-        # If toolkit_config has an elitea_title, try to load stored configuration data
-        if 'elitea_title' in toolkit_config and toolkit_config['elitea_title'] in self._configuration_data:
-            stored_data = self._configuration_data[toolkit_config['elitea_title']]
-            # DEBUG: Log what we're merging
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"[LOCAL DEBUG] Found elitea_title: {toolkit_config['elitea_title']}")
+
+        # Support both 'elitea_title' (pipeline.yaml) and legacy 'alita_title' (config files)
+        _title_value = toolkit_config.get('elitea_title') or toolkit_config.get('alita_title')
+        logger.info(f"[MERGE DEBUG] resolved title value: {_title_value}")
+        logger.info(f"[MERGE DEBUG] title in _configuration_data: {_title_value in self._configuration_data if _title_value else False}")
+
+        # If toolkit_config has a title key, try to load stored configuration data
+        if _title_value and _title_value in self._configuration_data:
+            stored_data = self._configuration_data[_title_value]
+            logger.info(f"[LOCAL DEBUG] Found title: {_title_value}")
             logger.info(f"[LOCAL DEBUG] Stored data keys: {list(stored_data.keys())}")
             logger.info(f"[LOCAL DEBUG] Stored data: {stored_data}")
             logger.info(f"[LOCAL DEBUG] toolkit_config BEFORE merge: {toolkit_config}")
             # Merge stored configuration data (credentials) into toolkit_config
-            # When elitea_title is present, stored data takes PRECEDENCE over config file values
+            # When a title key is present, stored data takes PRECEDENCE over config file values
             # This allows credentials to come from the configuration step while keeping
             # config file placeholders for remote mode compatibility
             for key, value in stored_data.items():
-                # Skip elitea_title and private fields - they're metadata, not credentials
-                if key in ('elitea_title', 'private'):
+                # Skip title and private fields - they're metadata, not credentials
+                if key in ('elitea_title', 'alita_title', 'private'):
                     continue
-                # Always overwrite with stored credentials when elitea_title is used  
+                # Always overwrite with stored credentials when title key is used
                 toolkit_config[key] = value
                 logger.info(f"[LOCAL DEBUG] Merged {key} into toolkit_config (overwrite)")
             logger.info(f"[LOCAL DEBUG] toolkit_config AFTER merge: {toolkit_config}")
-        
+
         # Programmatically populate toolkit_configuration from environment variables using Pydantic model
         try:
+            from pydantic_core import PydanticUndefinedType
+        except ImportError:
+            PydanticUndefinedType = type(None)  # fallback: no sentinel to skip
+
+        try:
             from elitea_sdk.configurations import get_class_configurations
-            
+
             config_classes = get_class_configurations()
-            
+
             if toolkit_type in config_classes:
                 config_class = config_classes[toolkit_type]
                 model_fields = config_class.model_fields
-                
+
                 for field_name, field_info in model_fields.items():
                     # Only set default if field is completely missing
                     if field_name not in toolkit_config or toolkit_config[field_name] is None:
-                        if field_info.default is not None:
-                            toolkit_config[field_name] = field_info.default
-        
+                        default = field_info.default
+                        # Skip required fields (Pydantic marks them as PydanticUndefined)
+                        # and fields with no default (None)
+                        if default is None or isinstance(default, PydanticUndefinedType):
+                            continue
+                        toolkit_config[field_name] = default
+
         except Exception as e:
             # If configuration class not available, just use what we have
-            # logger.warning(f"[LOCAL DEBUG] Could not auto-populate toolkit_configuration: {e}")
             pass
         
         # Store the configuration in settings
@@ -437,11 +443,12 @@ class LocalSetupStrategy(SetupStrategy):
                 if 'pgvector_configuration' in config:
                     pgvector_config = config['pgvector_configuration'].copy() if isinstance(config['pgvector_configuration'], dict) else {}
                 
-                # If elitea_title is present in pgvector_configuration, merge stored data
-                if 'elitea_title' in pgvector_config and pgvector_config['elitea_title'] in self._configuration_data:
-                    stored_data = self._configuration_data[pgvector_config['elitea_title']]
+                # If elitea_title/alita_title is present in pgvector_configuration, merge stored data
+                _pgvec_title = pgvector_config.get('elitea_title') or pgvector_config.get('alita_title')
+                if _pgvec_title and _pgvec_title in self._configuration_data:
+                    stored_data = self._configuration_data[_pgvec_title]
                     for key, value in stored_data.items():
-                        if key not in ('elitea_title', 'private'):
+                        if key not in ('elitea_title', 'alita_title', 'private'):
                             pgvector_config[key] = value
                 
                 # Otherwise, load from PGVECTOR_CONNECTION_STRING environment variable
@@ -709,7 +716,7 @@ class LocalSetupStrategy(SetupStrategy):
         config = resolve_env_value(step.get("config", {}), ctx.env_vars, env_loader=load_from_env)
         
         config_type = config.get("config_type")
-        elitea_title = config.get("elitea_title")
+        elitea_title = config.get("alita_title") or config.get("elitea_title")
         data = config.get("data", {})
         
         # DEBUG: Log configuration data
