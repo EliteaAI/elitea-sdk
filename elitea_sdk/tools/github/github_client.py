@@ -591,7 +591,7 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain text
             return {"error": str(e), "message": f"Unable to retrieve diff between commits due to error: {str(e)}"}
         
-    def apply_git_patch_from_file(self, bucket_name: str, file_name: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None) -> str:
+    def apply_git_patch_from_file(self, bucket_name: str, file_name: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None, branch: Optional[str] = None) -> str:
         """Applies a git patch from a file stored in a specified bucket.
 
         Args:
@@ -616,11 +616,11 @@ class GitHubClient(BaseModel):
                 return {"error": "Invalid patch content", "message": f"Patch file '{file_name}' contains invalid content type."}
             
             # Apply the git patch using the content
-            return self.apply_git_patch(patch_content, commit_message, repo_name)
+            return self.apply_git_patch(patch_content, commit_message, repo_name, branch)
         except Exception as e:
             return {"error": str(e), "message": f"Unable to download patch file: {str(e)}"}
 
-    def apply_git_patch(self, patch_content: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None) -> str:
+    def apply_git_patch(self, patch_content: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None, branch: Optional[str] = None) -> str:
         """
         Applies a git patch to the repository by parsing the unified diff format and updating files accordingly.
 
@@ -636,7 +636,7 @@ class GitHubClient(BaseModel):
         
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
-            branch = self.active_branch
+            branch = branch or self.active_branch
 
             if branch == self.github_base_branch:
                 return {
@@ -1229,7 +1229,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to delete branch '{branch_name}': {str(e)}"
 
-    def create_file(self, file_path: str, repo_name: Optional[str] = None, file_contents: str = None, filepath: str = None) -> str:
+    def create_file(self, file_path: str, repo_name: Optional[str] = None, file_contents: str = None, filepath: str = None, branch: Optional[str] = None) -> str:
         """
         Creates a new file on the GitHub repo from new content or by copying an existing artifact.
         
@@ -1260,7 +1260,7 @@ class GitHubClient(BaseModel):
         
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
-            branch = self.active_branch
+            branch = branch or self.active_branch
 
             if branch == self.github_base_branch:
                 return (
@@ -1299,7 +1299,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             raise ToolException(f"Unable to create file due to error:\n{str(e)}")
 
-    def update_file(self, file_query: str, repo_name: Optional[str] = None, commit_message: Optional[str] = None) -> str:
+    def update_file(self, file_query: str, repo_name: Optional[str] = None, commit_message: Optional[str] = None, branch: Optional[str] = None) -> str:
         """Updates a file with new content using OLD/NEW markers and edit_file.
 
         Parameters:
@@ -1320,7 +1320,7 @@ class GitHubClient(BaseModel):
             A success or failure message
         """
         try:
-            branch = self.active_branch
+            branch = branch or self.active_branch
 
             if branch == self.github_base_branch:
                 return (
@@ -1361,7 +1361,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Unable to update file due to error:\n{str(e)}"
 
-    def delete_file(self, file_path: str, repo_name: Optional[str] = None) -> str:
+    def delete_file(self, file_path: str, repo_name: Optional[str] = None, branch: Optional[str] = None) -> str:
         """
         Deletes a file from the repository.
 
@@ -1374,7 +1374,7 @@ class GitHubClient(BaseModel):
         """
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
-            branch = self.active_branch
+            branch = branch or self.active_branch
 
             if branch == self.github_base_branch:
                 return (

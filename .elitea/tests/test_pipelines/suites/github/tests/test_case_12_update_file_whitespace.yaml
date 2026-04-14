@@ -98,9 +98,13 @@ nodes:
     tool: create_file
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     input:
+      - target_branch
       - file_path
       - original_content
     input_mapping:
+      branch:
+        type: variable
+        value: target_branch
       file_path:
         type: variable
         value: file_path
@@ -154,8 +158,12 @@ nodes:
     tool: update_file
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     input:
+      - target_branch
       - file_query
     input_mapping:
+      branch:
+        type: variable
+        value: target_branch
       file_query:
         type: variable
         value: file_query
