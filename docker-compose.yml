@@ -12,7 +12,7 @@ services:
       - ./.git:/app/.git
       - ./github:/app/.github
     command: >
-      sh -c "$${DOCKER_COMMAND:-.elitea/tests/test_pipelines/run_test.sh --local --setup -v suites/ado ADO01}"
+      sh -c "$${DOCKER_COMMAND:-.elitea/tests/test_pipelines/run_all_suites.sh --local suites/github}"
 
   pgvector-db:
     image: ankane/pgvector
