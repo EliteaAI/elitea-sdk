@@ -201,6 +201,9 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         agent_type=agent_type,  # Pass agent_type for metadata
                         fallback_llm=llm,  # Fallback for embedded sub-agents with null llm_settings
                     ).get_tools())
+                except McpAuthorizationRequired:
+                    # OAuth required by a nested agent's toolkit — propagate so user is prompted
+                    raise
                 except Exception as app_err:
                     # Gracefully skip application tools that fail to load (e.g., deleted agents)
                     # This is common for conversation participants that reference stale agents
