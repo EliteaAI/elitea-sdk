@@ -220,11 +220,6 @@ class Application(BaseTool):
             formulate_query(kwargs, is_subgraph=self.is_subgraph),
             config=nested_config,
         )
-        if self.is_subgraph:
-            if isinstance(response, dict) and not response.get('output'):
-                response = dict(response)
-                response['output'] = extract_application_response_output(response)
-            return response
         if self.return_type == "str":
             return response["output"]
         else:
