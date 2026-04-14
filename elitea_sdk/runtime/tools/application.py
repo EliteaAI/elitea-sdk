@@ -1,5 +1,7 @@
 import json
 
+from ..langchain.constants import ELITEA_RS
+from ..langchain.utils import extract_text_from_completion
 from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
@@ -43,6 +45,32 @@ def formulate_query(kwargs, is_subgraph=False):
         if key not in ("task", "chat_history"):
             result[key] = value
     return result
+
+
+def extract_application_response_output(response: Any) -> str:
+    """Extract a usable final output string from a nested application response."""
+    if isinstance(response, str):
+        return response
+
+    if not isinstance(response, dict):
+        return str(response)
+
+    output = response.get('output')
+    if isinstance(output, str) and output.strip():
+        return output
+
+    elitea_response = response.get(ELITEA_RS)
+    if isinstance(elitea_response, str) and elitea_response.strip():
+        return elitea_response
+
+    messages = response.get('messages') or []
+    for message in reversed(messages):
+        if isinstance(message, BaseMessage):
+            content = extract_text_from_completion(message)
+            if isinstance(content, str) and content.strip():
+                return content
+
+    return str(response)
 
 
 class Application(BaseTool):
@@ -171,27 +199,31 @@ class Application(BaseTool):
             logger.debug(f"[APP_RUN] Merged variables: {list(merged_vars.keys())}")
 
             self.application = self.client.application(**self.args_runnable, application_variables=application_variables)
-        # Build nested_config carrying only the metadata portion of the parent config.
-        # We must NOT pass the full config — it contains the parent's configurable keys
-        # (thread_id, checkpoint_ns, checkpoint_id) and callbacks, which would cause the
-        # nested agent to run inside the parent's checkpoint thread (state corruption) and
-        # double-fire callbacks (already inherited via LangChain context variables).
-        #
-        # Inject parent_agent_name so every tool inside the nested graph — Application tools,
-        # internal tools, MCP tools, etc. — receives it in their LangGraph per-step config
-        # metadata (preserved by LangGraph's merge_configs) and can report it in on_tool_start.
-        # Using a dedicated key avoids collisions with tool.metadata fields that would be
-        # overwritten by tool_metadata.update(serialized_metadata) in the callback handler.
+        # Forward checkpoint-bearing config to the nested application so child
+        # applications participate in the same durable execution tree.
+        # Keep callbacks and other non-essential runtime baggage stripped to
+        # avoid duplicate events and accidental parent-side config leakage.
         _parent_name = self.metadata.get('original_name') or self.metadata.get('display_name')
         nested_metadata = dict(invoke_config['metadata']) if invoke_config and invoke_config.get('metadata') else {}
         if _parent_name:
             nested_metadata['parent_agent_name'] = _parent_name
-        nested_config = {'metadata': nested_metadata} if nested_metadata else None
+        nested_config = {}
+        if invoke_config and invoke_config.get('configurable'):
+            nested_config['configurable'] = dict(invoke_config['configurable'])
+            nested_config['configurable'].pop('selected_tools', None)
+            nested_config['configurable'].pop('selected_toolkits', None)
+        if nested_metadata:
+            nested_config['metadata'] = nested_metadata
+        if not nested_config:
+            nested_config = None
         response = self.application.invoke(
             formulate_query(kwargs, is_subgraph=self.is_subgraph),
             config=nested_config,
         )
         if self.is_subgraph:
+            if isinstance(response, dict) and not response.get('output'):
+                response = dict(response)
+                response['output'] = extract_application_response_output(response)
             return response
         if self.return_type == "str":
             return response["output"]

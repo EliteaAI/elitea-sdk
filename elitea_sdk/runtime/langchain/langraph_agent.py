@@ -1657,21 +1657,20 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             # Remove the trailing AIMessage that triggered the
                             # sensitive tool — it will be replaced by the
                             # synthetic AIMessage from _hitl_resume_context.
+                            #
+                            # Keep these messages in the resume context rather
+                            # than mutating graph state here. In nested-agent
+                            # flows the pending messages belong to the child
+                            # LLM node, and updating the parent graph state with
+                            # them can cause the parent to terminate on child
+                            # tool output before the child resumes.
                             trimmed = self._trim_pending_messages(pending_msgs_dicts)
                             if trimmed:
-                                from langchain_core.messages.utils import messages_from_dict
-                                try:
-                                    restored_messages = messages_from_dict(trimmed)
-                                    self.update_state(config, {'messages': restored_messages})
-                                    logger.info(
-                                        "[HITL] Restored %d intermediate messages to graph state",
-                                        len(restored_messages),
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "[HITL] Failed to restore intermediate messages: %s",
-                                        exc,
-                                    )
+                                resume_ctx['pending_messages'] = trimmed
+                                logger.info(
+                                    "[HITL] Prepared %d intermediate messages for LLM-local restore",
+                                    len(trimmed),
+                                )
 
                     result = super().invoke(
                         Command(resume=hitl_resume_value),

@@ -1075,6 +1075,23 @@ class LLMNode(BaseTool):
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
 
+        if hitl_ctx and hitl_ctx.get('pending_messages'):
+            from langchain_core.messages.utils import messages_from_dict
+
+            try:
+                restored_messages = messages_from_dict(hitl_ctx['pending_messages'])
+                messages = list(messages) + list(restored_messages)
+                messages = self._filter_orphaned_tool_calls(messages)
+                logger.info(
+                    "[HITL] Restored %d intermediate messages into LLM node history",
+                    len(restored_messages),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[HITL] Failed to restore intermediate messages into LLM node history: %s",
+                    exc,
+                )
+
         # Get the LLM client, potentially with tools bound
         llm_client = self.client
 

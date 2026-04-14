@@ -88,6 +88,7 @@ class ApplicationToolkit(BaseToolkit):
                     ignored_mcp_servers: Optional[list] = None, is_subgraph: bool = False,
                     mcp_tokens: Optional[dict] = None, project_id: int = None,
                     conversation_id: Optional[str] = None, agent_type: str = 'agent',
+                    memory: Optional[Any] = None,
                     fallback_llm=None):
         """
         Get toolkit for an application.
@@ -139,7 +140,9 @@ class ApplicationToolkit(BaseToolkit):
 
         app = client.application(application_id, application_version_id, store=store,
                                  llm=resolved_llm,
+                                 memory=memory,
                                  ignored_mcp_servers=ignored_mcp_servers,
+                                 is_subgraph=is_subgraph,
                                  mcp_tokens=mcp_tokens,
                                  conversation_id=conversation_id,
                                  version_details=version_details)  # Pass version_details to avoid re-fetching
@@ -187,6 +190,7 @@ class ApplicationToolkit(BaseToolkit):
                                           "application_version_id": application_version_id,
                                           "store": store,
                                           "llm": resolved_llm,
+                                          "memory": memory,
                                           "ignored_mcp_servers": ignored_mcp_servers,
                                           "is_subgraph": is_subgraph,  # Pass is_subgraph flag
                                           "mcp_tokens": mcp_tokens,
