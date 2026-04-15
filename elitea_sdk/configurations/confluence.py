@@ -1,8 +1,59 @@
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse, urlunparse
 
-from atlassian import Confluence
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from .utils import _hosting_to_cloud, _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP  # re-exported for back-compat
+
+__all__ = ['ConfluenceConfiguration', '_hosting_to_cloud']
+
+# Tooltip descriptions for Confluence credential fields
+_CONFLUENCE_HOSTING_TOOLTIP = (
+    "Select the hosting type of your Confluence instance.\n\n"
+    "• **Auto** (default) — detects automatically from the Base URL\n"
+    "• **Cloud** — for Atlassian-hosted instances (*.atlassian.net/wiki)\n"
+    "• **Server** — for self-hosted deployments"
+)
+
+_CONFLUENCE_BASE_URL_TOOLTIP = (
+    "Enter the base URL of your Confluence instance.\n\n"
+    "• Cloud example: `https://yourcompany.atlassian.net/wiki`\n"
+    "• Server example: `https://confluence.yourcompany.com`\n\n"
+    "**⚠️ Experiencing \"Permission Denied\" errors on your company's self-hosted Confluence?**\n\n"
+    "If your organization uses a shared Confluence Server with floating license management "
+    "(common in large enterprises), your API token may stop working after a period of "
+    "inactivity (~30 min). Idle licenses get automatically reassigned to other active users "
+    "— this is not an ELITEA bug.\n\n"
+    "**How to fix it:** Open your Confluence instance in a browser and log in to reclaim your "
+    "active license. The toolkit should work again immediately after.\n\n"
+    "**For stable automation:** Ask your Confluence administrator to assign a dedicated service "
+    "account with a permanent license for automation use."
+)
+
+_CONFLUENCE_API_KEY_TOOLTIP = (
+    "The value to enter here depends on your selected Auth method:\n\n"
+    "**Basic auth** → enter your API Token\n"
+    "• Generate one at: https://id.atlassian.com/manage-profile/security/api-tokens (Confluence Cloud)\n"
+    "• Or generate a Personal Access Token in your Confluence profile settings (Confluence Server/DC)\n\n"
+    "**Bearer auth** → enter your Personal Access Token (PAT) directly\n"
+    "• Generate in Confluence: Profile → Personal Access Tokens\n"
+    "• Username field is not required when using Bearer.\n\n"
+    "⚠️ Treat this value as a password — never share it."
+)
+
+_CONFLUENCE_TOKEN_TOOLTIP = (
+    "Enter your Personal Access Token (PAT) for Bearer authentication.\n\n"
+    "• Generate in Confluence: Profile → Personal Access Tokens\n"
+    "• Username field is not required when using Bearer.\n\n"
+    "⚠️ Treat this value as a password — never share it."
+)
+
+_CONFLUENCE_USERNAME_TOOLTIP = (
+    "Your Confluence account email or username. Required for Basic authentication only.\n\n"
+    "• **Cloud:** use your full email (e.g., john.smith@yourcompany.com)\n"
+    "• **Server:** use your Confluence login username (e.g., john_smith)\n\n"
+    "Not required when using Bearer token authentication."
+)
 
 
 class ConfluenceConfiguration(BaseModel):
@@ -33,10 +84,26 @@ class ConfluenceConfiguration(BaseModel):
             }
         }
     )
-    base_url: str = Field(description="Confluence URL")
-    username: Optional[str] = Field(description="Confluence Username", default=None)
-    api_key: Optional[SecretStr] = Field(description="Confluence API Key", default=None)
-    token: Optional[SecretStr] = Field(description="Confluence Token", default=None)
+    hosting: Optional[Literal['Auto', 'Cloud', 'Server']] = Field(
+        description=_CONFLUENCE_HOSTING_TOOLTIP,
+        default='Auto'
+    )
+    base_url: str = Field(
+        description=_CONFLUENCE_BASE_URL_TOOLTIP,
+        default="e.g. https://yourcompany.atlassian.net/wiki or https://confluence.yourcompany.com"
+    )
+    username: Optional[str] = Field(
+        description=_CONFLUENCE_USERNAME_TOOLTIP,
+        default="e.g. john.smith@yourcompany.com"
+    )
+    api_key: Optional[SecretStr] = Field(
+        description=_CONFLUENCE_API_KEY_TOOLTIP,
+        default=None
+    )
+    token: Optional[SecretStr] = Field(
+        description=_CONFLUENCE_TOKEN_TOOLTIP,
+        default=None
+    )
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:

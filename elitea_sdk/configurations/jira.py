@@ -1,7 +1,59 @@
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from .utils import _hosting_to_cloud, _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP  # re-exported for back-compat
+
+__all__ = ['JiraConfiguration', '_hosting_to_cloud']
+
+# Tooltip descriptions for Jira credential fields
+_JIRA_HOSTING_TOOLTIP = (
+    "Select the hosting type of your Jira instance.\n\n"
+    "• **Auto** (default) — detects automatically from the Base URL\n"
+    "• **Cloud** — for Atlassian-hosted instances (*.atlassian.net)\n"
+    "• **Server** — for self-hosted or Data Center deployments"
+)
+
+_JIRA_BASE_URL_TOOLTIP = (
+    "Enter the base URL of your Jira instance without the /jira suffix.\n\n"
+    "• Cloud example: `https://yourcompany.atlassian.net`\n"
+    "• Server example: `https://jira.yourcompany.com`\n\n"
+    "**⚠️ Experiencing \"Permission Denied\" errors on your company's self-hosted Jira?**\n\n"
+    "If your organization uses a shared Jira Server with floating license management "
+    "(common in large enterprises), your API token may stop working after a period of "
+    "inactivity (~30 min). This happens because idle licenses get automatically reassigned "
+    "to other active users — it is not an ELITEA bug.\n\n"
+    "**How to fix it:** Open your Jira instance in a browser and log in to reclaim your "
+    "active license. The toolkit should work again immediately after.\n\n"
+    "**For stable automation:** Ask your Jira administrator to assign a dedicated service "
+    "account with a permanent license for automation use."
+)
+
+_JIRA_API_KEY_TOOLTIP = (
+    "The value to enter here depends on your selected Auth method:\n\n"
+    "**Basic auth** → enter your API Token\n"
+    "• Generate one at: https://id.atlassian.com/manage-profile/security/api-tokens (Jira Cloud)\n"
+    "• Or generate a Personal Access Token in your Jira profile settings (Jira Server/DC)\n\n"
+    "**Bearer auth** → enter your Personal Access Token (PAT) directly\n"
+    "• Generate in Jira: Profile → Personal Access Tokens\n"
+    "• Username field is not required when using Bearer.\n\n"
+    "⚠️ Treat this value as a password — never share it."
+)
+
+_JIRA_TOKEN_TOOLTIP = (
+    "Enter your Personal Access Token (PAT) for Bearer authentication.\n\n"
+    "• Generate in Jira: Profile → Personal Access Tokens\n"
+    "• Username field is not required when using Bearer.\n\n"
+    "⚠️ Treat this value as a password — never share it."
+)
+
+_JIRA_USERNAME_TOOLTIP = (
+    "Your Jira account email or username. Required for Basic authentication only.\n\n"
+    "• **Cloud:** use your full email (e.g., john.smith@yourcompany.com)\n"
+    "• **Server:** use your Jira login username (e.g., john_smith)\n\n"
+    "Not required when using Bearer token authentication."
+)
 
 
 class JiraConfiguration(BaseModel):
@@ -32,10 +84,26 @@ class JiraConfiguration(BaseModel):
             }
         }
     )
-    base_url: str = Field(description="Jira URL")
-    username: Optional[str] = Field(description="Jira Username", default=None)
-    api_key: Optional[SecretStr] = Field(description="Jira API Key", default=None)
-    token: Optional[SecretStr] = Field(description="Jira Token", default=None)
+    hosting: Optional[Literal['Auto', 'Cloud', 'Server']] = Field(
+        description=_JIRA_HOSTING_TOOLTIP,
+        default='Auto'
+    )
+    base_url: str = Field(
+        description=_JIRA_BASE_URL_TOOLTIP,
+        default="e.g. https://yourcompany.atlassian.net or https://jira.yourcompany.com"
+    )
+    username: Optional[str] = Field(
+        description=_JIRA_USERNAME_TOOLTIP,
+        default="e.g. john.smith@yourcompany.com"
+    )
+    api_key: Optional[SecretStr] = Field(
+        description=_JIRA_API_KEY_TOOLTIP,
+        default=None
+    )
+    token: Optional[SecretStr] = Field(
+        description=_JIRA_TOKEN_TOOLTIP,
+        default=None
+    )
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
