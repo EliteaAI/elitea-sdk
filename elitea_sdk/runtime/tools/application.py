@@ -83,7 +83,7 @@ def extract_application_response_output(response: Any) -> str:
 
             if has_only_tool_blocks and not text_parts:
                 return ''
-            return ''.join(text_parts)
+            return '\n\n'.join(text_parts)
 
         if isinstance(content, dict):
             return json.dumps(content, ensure_ascii=False)

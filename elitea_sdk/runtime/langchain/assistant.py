@@ -631,11 +631,16 @@ class Assistant:
                         continue
                     break
 
-                filtered_messages = (
-                    filtered_messages[:insert_at]
-                    + [current_user_message]
-                    + filtered_messages[insert_at:]
-                )
+                boundary_message = filtered_messages[insert_at - 1] if insert_at > 0 else None
+                if not (
+                    isinstance(boundary_message, HumanMessage)
+                    and boundary_message.content == current_user_message.content
+                ):
+                    filtered_messages = (
+                        filtered_messages[:insert_at]
+                        + [current_user_message]
+                        + filtered_messages[insert_at:]
+                    )
 
             response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + filtered_messages, config)
             return {'messages': [response]}

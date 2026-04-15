@@ -36,3 +36,15 @@ def test_extract_application_response_output_returns_empty_string_for_tool_only_
     }
 
     assert extract_application_response_output(response) == ''
+
+
+def test_extract_application_response_output_preserves_multiblock_text_boundaries():
+    response = {
+        'output': [
+            {'type': 'text', 'text': 'First paragraph.'},
+            {'type': 'thinking', 'thinking': 'hidden chain of thought'},
+            {'type': 'text', 'text': 'Second paragraph.'},
+        ]
+    }
+
+    assert extract_application_response_output(response) == 'First paragraph.\n\nSecond paragraph.'

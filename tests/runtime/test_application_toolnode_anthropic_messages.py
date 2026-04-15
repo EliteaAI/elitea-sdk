@@ -108,3 +108,29 @@ def test_application_toolnode_runtime_preserves_current_user_message_for_anthrop
     assert llm.calls[1][1].content == 'Delegate this task'
     assert llm.calls[1][2].tool_calls[0]['name'] == 'child_app'
     assert llm.calls[1][3].tool_call_id == 'call-child-app'
+
+
+def test_application_toolnode_runtime_does_not_duplicate_matching_input_and_messages():
+    child_tool = Application(
+        name='child_app',
+        description='Nested child app',
+        application=StaticApplication(output='child-complete'),
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+    )
+    llm = StrictAnthropicParentLLM(target_tool_name='child_app')
+    runnable = _build_parent_runnable(MemorySaver(), llm, [child_tool])
+
+    result = runnable.invoke(
+        {
+            'input': 'Delegate this task',
+            'messages': [HumanMessage(content='Delegate this task')],
+        },
+        config={'configurable': {'thread_id': 'anthropic-toolnode-no-duplicate-thread'}},
+    )
+
+    assert result['execution_finished'] is True
+    assert result['output'] == 'parent-complete'
+    assert [type(message).__name__ for message in llm.calls[0]] == ['SystemMessage', 'HumanMessage']
+    assert [message.content for message in llm.calls[0] if isinstance(message, HumanMessage)] == ['Delegate this task']
