@@ -4,8 +4,44 @@ services:
     image: ghcr.io/eliteaai/elitea-sdk:pyodide
     platform: linux/amd64
     container_name: elitea-sdk-dev
-    env_file:
-      - .env
+    environment:
+      - GIT_TOOL_ACCESS_TOKEN=${GIT_TOOL_ACCESS_TOKEN:-}
+      - ELITEA_DEPLOYMENT_URL=${ELITEA_DEPLOYMENT_URL:-}
+      - ELITEA_TOKEN=${ELITEA_TOKEN:-}
+      - ELITEA_PROJECT_ID=${ELITEA_PROJECT_ID:-}
+      - TEST_CASES_DIR=${TEST_CASES_DIR:-github}
+      - DOCKER_COMMAND=${DOCKER_COMMAND:-}
+      - CONFLUENCE_API_KEY=${CONFLUENCE_API_KEY:-}
+      - CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL:-}
+      - CONFLUENCE_USERNAME=${CONFLUENCE_USERNAME:-}
+      - ADO_TOKEN=${ADO_TOKEN:-}
+      - ADO_REPOSITORY_ID=${ADO_REPOSITORY_ID:-}
+      - ADO_ORGANIZATION_URL=${ADO_ORGANIZATION_URL:-}
+      - ADO_ORG=${ADO_ORG:-epameliteatest}
+      - ADO_PROJECT=${ADO_PROJECT:-}
+      - ENV_NAME=${ENV_NAME:-local}
+      - FIGMA_API_TOKEN=${FIGMA_API_TOKEN:-}
+      - BITBUCKET_TOKEN=${BITBUCKET_TOKEN:-}
+      - XRAY_CLIENT_SECRET=${XRAY_CLIENT_SECRET:-}
+      - XRAY_CLIENT_ID=${XRAY_CLIENT_ID:-}
+      - ZEPHYR_ESENTIALS_KEY=${ZEPHYR_ESENTIALS_KEY:-}
+      - GITLAB_PRIVATE_TOKEN=${GITLAB_PRIVATE_TOKEN:-}
+      - POSTMAN_API_KEY=${POSTMAN_API_KEY:-}
+      - SHAREPOINT_CLIENT_SECRET=${SHAREPOINT_CLIENT_SECRET:-}
+      - QTEST_API_TOKEN=${QTEST_API_TOKEN:-}
+      - TESTRAIL_PASSWORD=${TESTRAIL_PASSWORD:-}
+      - PGVECTOR_CONNECTION_STRING=postgresql://postgres:yourpassword@pgvector-db:5432/postgres
+      - DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL:-gpt-5-mini}
+      - DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS=${DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS:-eu.anthropic.claude-sonnet-4-6}
+      - SANDBOX_BASE=/app/
+      - DENO_DIR=/app/
+      - PYTHONPATH=/app
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - RP_ENABLED=${RP_ENABLED:-false}                             
+      - RP_ENDPOINT=${RP_ENDPOINT:-https://tms.onetest.ai/api/receiver}
+      - RP_PROJECT=${RP_PROJECT:-}
+      - RP_API_KEY=${RP_API_KEY:-}
     volumes:
       - ./.elitea:/app/.elitea
       - ./elitea_sdk:/app/elitea_sdk
