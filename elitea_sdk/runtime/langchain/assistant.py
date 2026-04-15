@@ -5,7 +5,7 @@ from typing import Any, Optional
 from jinja2 import Environment, DebugUndefined
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, ToolException
 
 from .langraph_agent import create_graph
@@ -616,6 +616,32 @@ class Assistant:
             messages = state.get('messages', [])
             filtered_messages = [msg for msg in messages if not isinstance(msg, SystemMessage)]
             filtered_messages = filter_orphaned_tool_calls(filtered_messages)
+            current_input = state.get('input')
+            if current_input not in (None, ''):
+                current_user_message = HumanMessage(content=current_input)
+
+                insert_at = len(filtered_messages)
+                while insert_at > 0:
+                    previous_message = filtered_messages[insert_at - 1]
+                    if isinstance(previous_message, ToolMessage):
+                        insert_at -= 1
+                        continue
+                    if isinstance(previous_message, AIMessage) and getattr(previous_message, 'tool_calls', None):
+                        insert_at -= 1
+                        continue
+                    break
+
+                boundary_message = filtered_messages[insert_at - 1] if insert_at > 0 else None
+                if not (
+                    isinstance(boundary_message, HumanMessage)
+                    and boundary_message.content == current_user_message.content
+                ):
+                    filtered_messages = (
+                        filtered_messages[:insert_at]
+                        + [current_user_message]
+                        + filtered_messages[insert_at:]
+                    )
+
             response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + filtered_messages, config)
             return {'messages': [response]}
 

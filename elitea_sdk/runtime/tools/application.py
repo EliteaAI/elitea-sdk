@@ -1,7 +1,6 @@
 import json
 
-from ..langchain.constants import ELITEA_RS
-from ..langchain.utils import extract_text_from_completion
+from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
@@ -49,28 +48,79 @@ def formulate_query(kwargs, is_subgraph=False):
 
 def extract_application_response_output(response: Any) -> str:
     """Extract a usable final output string from a nested application response."""
+
+    def normalize_content(content: Any) -> str:
+        if content is None:
+            return ''
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            text_parts = []
+            has_only_tool_blocks = True
+
+            for block in content:
+                if isinstance(block, dict):
+                    block_type = block.get('type')
+                    if block_type == 'text':
+                        text_parts.append(block.get('text', ''))
+                        has_only_tool_blocks = False
+                    elif 'text' in block and 'type' not in block:
+                        text_parts.append(block.get('text', ''))
+                        has_only_tool_blocks = False
+                    elif block_type in ('tool_use', 'tool_result', 'thinking', 'reasoning'):
+                        continue
+                    else:
+                        text_parts.append(json.dumps(block, ensure_ascii=False))
+                        has_only_tool_blocks = False
+                elif isinstance(block, str):
+                    text_parts.append(block)
+                    has_only_tool_blocks = False
+                else:
+                    text_parts.append(str(block))
+                    has_only_tool_blocks = False
+
+            if has_only_tool_blocks and not text_parts:
+                return ''
+            return '\n\n'.join(text_parts)
+
+        if isinstance(content, dict):
+            return json.dumps(content, ensure_ascii=False)
+
+        return str(content)
+
+    if isinstance(response, BaseMessage):
+        return normalize_content(response.content)
+
     if isinstance(response, str):
-        return response
+        return normalize_content(response)
 
     if not isinstance(response, dict):
-        return str(response)
+        return normalize_content(response)
 
-    output = response.get('output')
-    if isinstance(output, str) and output.strip():
-        return output
-
-    elitea_response = response.get(ELITEA_RS)
-    if isinstance(elitea_response, str) and elitea_response.strip():
-        return elitea_response
+    for key in ('output', ELITEA_RS, PRINTER_NODE_RS):
+        normalized = normalize_content(response.get(key))
+        if normalized.strip():
+            return normalized
 
     messages = response.get('messages') or []
     for message in reversed(messages):
         if isinstance(message, BaseMessage):
-            content = extract_text_from_completion(message)
-            if isinstance(content, str) and content.strip():
-                return content
+            if isinstance(message, HumanMessage):
+                continue
+            normalized = normalize_content(message.content)
+            if normalized.strip():
+                return normalized
+        elif isinstance(message, dict):
+            role = str(message.get('role') or '').lower()
+            if role in ('user', 'human'):
+                continue
+            normalized = normalize_content(message.get('content'))
+            if normalized.strip():
+                return normalized
 
-    return str(response)
+    return ''
 
 
 class Application(BaseTool):
@@ -220,8 +270,9 @@ class Application(BaseTool):
             formulate_query(kwargs, is_subgraph=self.is_subgraph),
             config=nested_config,
         )
+        normalized_output = extract_application_response_output(response)
         if self.return_type == "str":
-            return response["output"]
+            return normalized_output
         else:
-            return {"messages": [{"role": "assistant", "content": response["output"]}]}
+            return {"messages": [{"role": "assistant", "content": normalized_output}]}
     
