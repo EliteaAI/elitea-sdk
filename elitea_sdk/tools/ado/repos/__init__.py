@@ -8,6 +8,7 @@ import requests
 from ...elitea_base import filter_missconfigured_index_tools
 from ....configurations.ado import AdoConfiguration
 from ....configurations.pgvector import PgVectorConfiguration
+from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...base.tool import BaseAction
 from .repos_wrapper import ReposApiWrapper
 from ...utils import check_connection_response
@@ -43,16 +44,16 @@ class AzureDevOpsReposToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in ReposApiWrapper.model_construct().get_available_tools()}
         m = create_model(
             name,
-            ado_configuration=(AdoConfiguration, Field(description="ADO configuration", default=None,
+            ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), default=None,
                                                        json_schema_extra={'configuration_types': ['ado']})),
             repository_id=(str, Field(description="ADO repository ID or name")),
             base_branch=(Optional[str], Field(default="main", title="Base branch", description="ADO base branch (e.g., main)")),
             active_branch=(Optional[str], Field(default="main", title="Active branch", description="ADO active branch (e.g., main)")),
 
             # indexer settings
-            pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None, description="PgVector Configuration", json_schema_extra={'configuration_types': ['pgvector']})),
+            pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None, description=PGVECTOR_CONFIGURATION_TOOLTIP, json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
 
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             __config__={

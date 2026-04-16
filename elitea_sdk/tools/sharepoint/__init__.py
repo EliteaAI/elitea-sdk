@@ -9,6 +9,7 @@ from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
 from ...configurations.pgvector import PgVectorConfiguration
 from ...configurations.sharepoint import SharepointConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 from ...runtime.utils.utils import mask_secret
 
@@ -42,14 +43,14 @@ class SharepointToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in SharepointApiWrapper.model_construct().get_available_tools()}
         return create_model(
             name,
-            sharepoint_configuration=(SharepointConfiguration, Field(description="SharePoint Configuration", json_schema_extra={'configuration_types': ['sharepoint']})),
+            sharepoint_configuration=(SharepointConfiguration, Field(description=get_credentials_tooltip("SharePoint"), json_schema_extra={'configuration_types': ['sharepoint']})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None,
-                                                                           description="PgVector Configuration",
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             __config__=ConfigDict(json_schema_extra={
                 'metadata': {
                     "label": "Sharepoint", "icon_url": "sharepoint.svg",

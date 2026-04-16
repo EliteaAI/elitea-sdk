@@ -9,6 +9,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length
 from ...configurations.gitlab import GitlabConfiguration
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
+from ..common_tooltips import get_credentials_tooltip
 
 name = "gitlab_org"
 
@@ -29,7 +30,7 @@ class EliteAGitlabSpaceToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in GitLabWorkspaceAPIWrapper.model_construct().get_available_tools()}
         return create_model(
             name,
-            gitlab_configuration=(GitlabConfiguration, Field(description="GitLab configuration",
+            gitlab_configuration=(GitlabConfiguration, Field(description=get_credentials_tooltip("GitLab"),
                                                                        json_schema_extra={
                                                                            'configuration_types': ['gitlab']})),
             repositories=(str, Field(

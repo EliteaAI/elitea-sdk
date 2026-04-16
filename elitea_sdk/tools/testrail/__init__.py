@@ -10,6 +10,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length, check_connection_response
 from ...configurations.testrail import TestRailConfiguration
 from ...configurations.pgvector import PgVectorConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "testrail"
@@ -38,11 +39,11 @@ class TestrailToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in TestrailAPIWrapper.model_construct().get_available_tools()}
         m = create_model(
             name,
-            testrail_configuration=(Optional[TestRailConfiguration], Field(description="TestRail Configuration", json_schema_extra={'configuration_types': ['testrail']})),
+            testrail_configuration=(Optional[TestRailConfiguration], Field(description=get_credentials_tooltip("TestRail"), json_schema_extra={'configuration_types': ['testrail']})),
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default = None,
-                                                                           description="PgVector Configuration", json_schema_extra={'configuration_types': ['pgvector']})),
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP, json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             __config__=ConfigDict(json_schema_extra={'metadata':
                                                          {"label": "Testrail", "icon_url": "testrail-icon.svg",

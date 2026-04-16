@@ -10,6 +10,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length
 from ...configurations.pgvector import PgVectorConfiguration
 from ...configurations.zephyr import ZephyrConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "zephyr_scale"
@@ -40,13 +41,13 @@ class ZephyrScaleToolkit(BaseToolkit):
         return create_model(
             name,
             max_results=(int, Field(default=100, description="Results count to show", gt=0)),
-            zephyr_configuration=(ZephyrConfiguration, Field(description="Zephyr Configuration",
+            zephyr_configuration=(ZephyrConfiguration, Field(description=get_credentials_tooltip("Zephyr Scale"),
                                                                        json_schema_extra={'configuration_types': ['zephyr']})),
-            pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None, description="PgVector Configuration",
+            pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None, description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={
                                                                                'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.",
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP,
                                                      json_schema_extra={'configuration_model': 'embedding'})),
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools})),

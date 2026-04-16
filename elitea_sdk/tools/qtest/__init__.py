@@ -11,6 +11,7 @@ from ..utils import clean_string, get_max_toolkit_length, check_connection_respo
 from ...configurations.qtest import QtestConfiguration
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 from ...configurations.pgvector import PgVectorConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 
 name = "qtest"
 
@@ -42,7 +43,7 @@ class QtestToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in QtestApiWrapper.model_construct().get_available_tools()}
         m = create_model(
             name,
-            qtest_configuration=(QtestConfiguration, Field(description="QTest API token", json_schema_extra={
+            qtest_configuration=(QtestConfiguration, Field(description=get_credentials_tooltip("QTest"), json_schema_extra={
                 'configuration_types': ['qtest']})),
             qtest_project_id=(int, Field(description="QTest project id")),
             no_of_tests_shown_in_dql_search=(Optional[int], Field(description="Max number of items returned by dql search",
@@ -50,11 +51,11 @@ class QtestToolkit(BaseToolkit):
             # indexer configuration
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(
                 default=None,
-                description="PgVector Configuration for indexing",
+                description=PGVECTOR_CONFIGURATION_TOOLTIP,
                 json_schema_extra={'configuration_types': ['pgvector']})),
             embedding_model=(Optional[str], Field(
                 default=None,
-                description="Embedding model configuration for indexing",
+                description=EMBEDDING_MODEL_TOOLTIP,
                 json_schema_extra={'configuration_model': 'embedding'})),
 
         selected_tools=(List[Literal[tuple(selected_tools)]],

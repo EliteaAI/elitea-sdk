@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import create_model, BaseModel, ConfigDict, Field
 
 from elitea_sdk.configurations.pgvector import PgVectorConfiguration
+from elitea_sdk.tools.common_tooltips import PGVECTOR_CONFIGURATION_TOOLTIP
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +180,7 @@ class MemoryToolkit(BaseToolkit):
             'memory',
             namespace=(str, Field(description="Memory namespace for organizing memories")),
             pgvector_configuration=(PgVectorConfiguration, Field(
-                description="PgVector Configuration for PostgresStore",
+                description=PGVECTOR_CONFIGURATION_TOOLTIP,
                 json_schema_extra={'configuration_types': ['pgvector']}
             )),
             selected_tools=(

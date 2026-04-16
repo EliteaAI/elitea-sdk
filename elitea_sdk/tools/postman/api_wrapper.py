@@ -1271,9 +1271,14 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             # Update description
             collection_data["info"]["description"] = description
 
-            response = self._make_request('PUT', f'/collections/{coll_id}',
-                                          json={"collection": collection_data})
-            return json.dumps(response, indent=2)
+            self._make_request('PUT', f'/collections/{coll_id}',
+                               json={"collection": collection_data})
+            updated = self._make_request('GET', f'/collections/{coll_id}')
+            updated_data = updated["collection"]
+            return json.dumps({
+                "collection": {"id": updated_data["info"]["_postman_id"], "name": updated_data["info"]["name"]},
+                "description": updated_data["info"].get("description")
+            }, indent=2)
         except Exception as e:
             stacktrace = format_exc()
             logger.error(f"Exception when updating collection description: {stacktrace}")
@@ -1291,9 +1296,14 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             # Update variables
             collection_data["variable"] = variables
 
-            response = self._make_request('PUT', f'/collections/{self.collection_id}',
-                                          json={"collection": collection_data})
-            return json.dumps(response, indent=2)
+            self._make_request('PUT', f'/collections/{self.collection_id}',
+                               json={"collection": collection_data})
+            updated = self._make_request('GET', f'/collections/{self.collection_id}')
+            updated_data = updated["collection"]
+            return json.dumps({
+                "collection": {"id": updated_data["info"]["_postman_id"], "name": updated_data["info"]["name"]},
+                "variable": updated_data.get("variable", [])
+            }, indent=2)
         except Exception as e:
             stacktrace = format_exc()
             logger.error(f"Exception when updating collection variables: {stacktrace}")
@@ -1311,9 +1321,14 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             # Update auth
             collection_data["auth"] = auth
 
-            response = self._make_request('PUT', f'/collections/{self.collection_id}',
-                                          json={"collection": collection_data})
-            return json.dumps(response, indent=2)
+            self._make_request('PUT', f'/collections/{self.collection_id}',
+                               json={"collection": collection_data})
+            updated = self._make_request('GET', f'/collections/{self.collection_id}')
+            updated_data = updated["collection"]
+            return json.dumps({
+                "collection": {"id": updated_data["info"]["_postman_id"], "name": updated_data["info"]["name"]},
+                "auth": updated_data.get("auth")
+            }, indent=2)
         except Exception as e:
             stacktrace = format_exc()
             logger.error(f"Exception when updating collection auth: {stacktrace}")

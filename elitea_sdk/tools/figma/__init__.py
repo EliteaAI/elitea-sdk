@@ -14,6 +14,7 @@ from .api_wrapper import (
 from ..elitea_base import filter_missconfigured_index_tools
 from ...configurations.figma import FigmaConfiguration
 from ...configurations.pgvector import PgVectorConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "figma"
@@ -98,13 +99,13 @@ class FigmaToolkit(BaseToolkit):
                 Field(default=[], json_schema_extra={"args_schemas": selected_tools}),
             ),
             # Figma configuration
-            figma_configuration=(FigmaConfiguration, Field(description="Figma configuration", json_schema_extra={'configuration_types': ['figma']})),
+            figma_configuration=(FigmaConfiguration, Field(description=get_credentials_tooltip("Figma"), json_schema_extra={'configuration_types': ['figma']})),
 
             # indexer settings
-            pgvector_configuration=(Optional[PgVectorConfiguration], Field(description="PgVector Configuration", json_schema_extra={'configuration_types': ['pgvector']})),
+            pgvector_configuration=(Optional[PgVectorConfiguration], Field(description=PGVECTOR_CONFIGURATION_TOOLTIP, json_schema_extra={'configuration_types': ['pgvector']})),
 
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             __config__=ConfigDict(
                 json_schema_extra={
                      "metadata": {
