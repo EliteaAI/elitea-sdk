@@ -209,7 +209,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         # Artifact-specific schemas with bucket_name instead of branch
         ArtifactReadMultipleFilesInput = create_model(
             "ArtifactReadMultipleFilesInput",
-            file_paths=(List[str], Field(description="List of file paths to read", min_length=1)),
+            file_paths=(List[str], Field(description="List of file paths to read. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'", min_length=1)),
             bucket_name=(Optional[str], Field(
                 description="Bucket name. If not provided, uses toolkit-configured default bucket.",
                 default=None
@@ -232,7 +232,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
 
         ArtifactSearchFileInput = create_model(
             "ArtifactSearchFileInput",
-            file_path=(str, Field(description="Path to the file to search")),
+            file_path=(str, Field(description="Path to the file to search. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
             pattern=(str, Field(description="Search pattern. Treated as regex by default unless is_regex=False.")),
             bucket_name=(Optional[str], Field(
                 description="Bucket name. If not provided, uses toolkit-configured default bucket.",
@@ -252,7 +252,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         ArtifactEditFileInput = create_model(
             "ArtifactEditFileInput",
             file_path=(str, Field(
-                description="Path to the file to edit. Must be a text file (markdown, txt, csv, json, xml, html, yaml, etc.)"
+                description="Path to the file to edit. Must be a text file (markdown, txt, csv, json, xml, html, yaml, etc.). Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'"
             )),
             file_query=(str, Field(description="""Edit instructions with OLD/NEW markers. Format:
 OLD <<<<
@@ -849,7 +849,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 ),
                 "args_schema": create_model(
                     "createFile", 
-                    filename=(str, Field(description="Target filename in destination bucket")),
+                    filename=(str, Field(description="Target filename in destination bucket. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
                     bucket_name=bucket_name,
                     filedata=(Optional[str], Field(
                         description=self._build_filedata_description(
@@ -873,7 +873,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 "args_schema": create_model(
                     "readFile", 
                     filename=(Optional[str], Field(
-                        description="Filename (required if filepath not provided)",
+                        description="Filename (required if filepath not provided). Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'",
                         default=None)),
                     filepath=(Optional[str], Field(
                         description="Full path in /{bucket}/{filename} format. Use this when filepath is provided in attachment descriptions. Alternative to filename+bucket_name.",
@@ -916,7 +916,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 "description": "Delete a file in the artifact",
                 "args_schema": create_model(
                     "deleteFile", 
-                    filename=(str, Field(description="Filename")),
+                    filename=(str, Field(description="Filename to delete. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
                     bucket_name=bucket_name
                 )
             },
@@ -929,7 +929,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 ),
                 "args_schema": create_model(
                     "appendData", 
-                    filename=(str, Field(description="Filename of the file to append to")),
+                    filename=(str, Field(description="Filename of the file to append to. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
                     filedata=(str, Field(description=self._build_filedata_description(
                         BASIC_APPEND_FILEDATA_DESCRIPTION,
                         get_param_description_blocks('append'),
