@@ -11,6 +11,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length
 from ...configurations.gitlab import GitlabConfiguration
 from ...configurations.pgvector import PgVectorConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "gitlab"
@@ -46,13 +47,13 @@ class EliteAGitlabToolkit(BaseToolkit):
         return create_model(
             name,
             repository=(str, Field(description="GitLab repository")),
-            gitlab_configuration=(GitlabConfiguration, Field(description="GitLab configuration", json_schema_extra={'configuration_types': ['gitlab']})),
+            gitlab_configuration=(GitlabConfiguration, Field(description=get_credentials_tooltip("GitLab"), json_schema_extra={'configuration_types': ['gitlab']})),
             branch=(str, Field(description="Main branch", default="main")),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default = None,
-                                                                           description="PgVector Configuration", json_schema_extra={'configuration_types': ['pgvector']})),
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP, json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.",
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP,
                                                   json_schema_extra={'configuration_model': 'embedding'})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             __config__=ConfigDict(json_schema_extra={

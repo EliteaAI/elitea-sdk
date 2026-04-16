@@ -10,6 +10,7 @@ from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import parse_list, check_connection_response
 from ...configurations.confluence import ConfluenceConfiguration, _hosting_to_cloud
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...configurations.pgvector import PgVectorConfiguration
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
@@ -158,12 +159,12 @@ class ConfluenceToolkit(BaseToolkit):
                             "(Optional — leave empty if not required)",
                 default={}
             )),
-            confluence_configuration=(ConfluenceConfiguration, Field(description="Confluence Configuration", json_schema_extra={'configuration_types': ['confluence']})),
+            confluence_configuration=(ConfluenceConfiguration, Field(description=get_credentials_tooltip("Confluence"), json_schema_extra={'configuration_types': ['confluence']})),
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default = None,
-                                                                           description="PgVector Configuration",
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
 
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
