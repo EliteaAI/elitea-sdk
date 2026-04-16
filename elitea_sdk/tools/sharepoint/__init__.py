@@ -60,9 +60,13 @@ class SharepointToolkit(BaseToolkit):
 
     @classmethod
     @filter_missconfigured_index_tools
-    def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, toolkit_id: Optional[int] = None, **kwargs):
+    def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, **kwargs):
         if selected_tools is None:
             selected_tools = []
+
+        # Extract toolkit_id from kwargs before constructing wrapper_payload
+        toolkit_id = kwargs.get('toolkit_id')
+
         wrapper_payload = {
             **kwargs,
             **kwargs.get('sharepoint_configuration', {}),
