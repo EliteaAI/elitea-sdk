@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import Field
 
-from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit
+from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit, IndexingStats
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +39,28 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             whitelist: Optional[List[str]] = None,
             blacklist: Optional[List[str]] = None,
             chunking_config: Optional[dict] = None,
+            skip_unsupported_extensions: bool = True,
             **kwargs) -> Generator[Document, None, None]:
         """Index repository files in the vector store using code parsing."""
         yield from self.loader(
             branch=branch,
             whitelist=whitelist,
             blacklist=blacklist,
-            chunking_config=chunking_config
+            chunking_config=chunking_config,
+            skip_unsupported_extensions=skip_unsupported_extensions
         )
 
     def _extend_data(self, documents: Generator[Document, None, None]):
         yield from documents
+
+    def get_indexing_stats(self) -> Optional[IndexingStats]:
+        """Get the indexing statistics from the last loader run."""
+        return getattr(self, '_indexing_stats', None)
+
+    def get_indexing_stats_summary(self) -> str:
+        """Get a human-readable summary of skipped files."""
+        stats = self.get_indexing_stats()
+        return stats.get_summary() if stats else ""
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
@@ -63,6 +74,9 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             "blacklist": (Optional[List[str]], Field(
                 description='File extensions or paths to exclude. Defaults to no exclusions if None. Example: ["*.md", "*.java"]',
                 default=None)),
+            "skip_unsupported_extensions": (Optional[bool], Field(
+                description='Skip files with unsupported extensions (default: True). Supported: .py, .js, .ts, .java, .go, .rs, .md, .json, etc.',
+                default=True)),
         }
 
     def loader(self,
@@ -70,10 +84,11 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                whitelist: Optional[List[str]] = None,
                blacklist: Optional[List[str]] = None,
                chunked: bool = True,
-               chunking_config: Optional[dict] = None) -> Generator[Document, None, None]:
+               chunking_config: Optional[dict] = None,
+               skip_unsupported_extensions: bool = True) -> Generator[Document, None, None]:
         """
         Generates Documents from files in a branch, respecting whitelist and blacklist patterns.
-    
+
         Parameters:
         - branch (Optional[str]): Branch for listing files. Defaults to the current branch if None.
         - whitelist (Optional[List[str]]): File extensions or paths to include. Defaults to all files if None.
@@ -81,17 +96,19 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         - chunked (bool): If True (default), applies universal chunker based on file type.
                          If False, returns raw Documents without chunking.
         - chunking_config (Optional[dict]): Chunking configuration by file extension
-    
+        - skip_unsupported_extensions (bool): If True (default), skip files with unsupported extensions
+                                              and report them. If False, process them with text chunker.
+
         Returns:
         - generator: Yields Documents from files matching the whitelist but not the blacklist.
                     Each document has exactly the key 'filename' in metadata, which is used as an ID
                     for further operations (indexing, deduplication, and retrieval).
-    
+
         Example:
         # Use 'feature-branch', include '.py' files, exclude 'test_' files
         for doc in loader(branch='feature-branch', whitelist=['*.py'], blacklist=['*test_*']):
             print(doc.page_content)
-    
+
         Notes:
         - Whitelist and blacklist use Unix shell-style wildcards.
         - Files must match the whitelist and not the blacklist to be included.
@@ -101,10 +118,21 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
           - .md files → markdown chunker (header-based splitting)
           - .py/.js/.ts/etc → code parser (TreeSitter-based)
           - .json files → JSON chunker
-          - other files → default text chunker
+          - other files → skipped (with skip_unsupported_extensions=True) or text chunker
         """
         import hashlib
-    
+        import os
+        from .chunkers.universal_chunker import MARKDOWN_EXTENSIONS, JSON_EXTENSIONS, CODE_EXTENSIONS
+
+        # Combined supported extensions
+        SUPPORTED_EXTENSIONS = MARKDOWN_EXTENSIONS | JSON_EXTENSIONS | CODE_EXTENSIONS
+
+        # Initialize or reset indexing stats
+        if not hasattr(self, '_indexing_stats'):
+            self._indexing_stats = IndexingStats()
+        else:
+            self._indexing_stats = IndexingStats()
+
         # Auto-include extensions from chunking_config if whitelist is specified
         # This allows chunking config to work without manually adding extensions to whitelist
         if chunking_config and whitelist:
@@ -117,7 +145,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                         message=f"Auto-included extension '{normalized}' from chunking_config",
                         tool_name="loader"
                     )
-    
+
         _files = self.__handle_get_files("", self.__get_branch(branch))
 
         def is_whitelisted(file_path: str) -> bool:
@@ -132,22 +160,41 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                         or any(file_path.endswith(f'.{pattern}') for pattern in blacklist))
             return False
 
+        def has_supported_extension(file_path: str) -> bool:
+            """Check if file has a supported extension for indexing."""
+            ext = os.path.splitext(file_path)[-1].lower()
+            return ext in SUPPORTED_EXTENSIONS
+
         def raw_document_generator() -> Generator[Document, None, None]:
             """Yields raw Documents without chunking - pure generator, no pre-filtering."""
             processed = 0
+            stats = self._indexing_stats
 
             for file in _files:
-                # Skip non-matching files
-                if not is_whitelisted(file) or is_blacklisted(file):
+                # Check whitelist first
+                if whitelist and not is_whitelisted(file):
+                    stats.files_skipped_whitelist.append(file)
+                    continue
+
+                # Check blacklist
+                if is_blacklisted(file):
+                    stats.files_skipped_blacklist.append(file)
+                    continue
+
+                # Check for supported extensions (only when skip_unsupported_extensions is True)
+                if skip_unsupported_extensions and not has_supported_extension(file):
+                    stats.files_unsupported_extension.append(file)
                     continue
 
                 try:
                     file_content = self._read_file(file, self.__get_branch(branch))
                 except Exception as e:
                     logger.error(f"Failed to read file {file}: {e}")
+                    stats.files_skipped_read_error.append(file)
                     continue
 
                 if not file_content:
+                    stats.files_skipped_empty.append(file)
                     continue
 
                 # Ensure file content is a string
@@ -161,6 +208,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 # Hash the file content for uniqueness tracking
                 file_hash = hashlib.sha256(file_content.encode("utf-8")).hexdigest()
                 processed += 1
+                stats.items_processed = processed
 
                 yield Document(
                     page_content=file_content,
@@ -177,10 +225,15 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
             self._log_tool_event(message=f"{processed} files loaded", tool_name="loader")
 
+            # Log skipped files summary
+            summary = stats.get_summary()
+            if summary:
+                self._log_tool_event(message=summary, tool_name="loader")
+
         if not chunked:
             # Return raw documents without chunking
             return raw_document_generator()
-        
+
         # Apply universal chunker based on file type
         from .chunkers.universal_chunker import universal_chunker
         return universal_chunker(raw_document_generator())

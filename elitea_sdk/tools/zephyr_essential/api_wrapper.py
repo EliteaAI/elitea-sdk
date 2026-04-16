@@ -291,6 +291,7 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
         }
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
+        self._init_indexing_stats()
         self._chunking_tool = kwargs.get('chunking_tool', None)
         try:
             test_cases = self.list_test_cases()
@@ -298,6 +299,7 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Unable to extract test cases: {e}")
 
         for case in test_cases:
+            self._track_processed_item()
             metadata = {
                 k: v for k, v in case.items()
                 if isinstance(v, (str, int, float, bool, list, dict))

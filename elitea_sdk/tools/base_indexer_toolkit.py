@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, List, Dict, Generator
 
@@ -16,6 +17,142 @@ from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from ..runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class IndexingStats:
+    """
+    Tracks statistics during indexing process.
+    Used by both CodeIndexerToolkit and NonCodeIndexerToolkit.
+    """
+    # Common counters
+    items_processed: int = 0
+
+    # For code toolkits (files)
+    files_skipped_whitelist: List[str] = field(default_factory=list)
+    files_skipped_blacklist: List[str] = field(default_factory=list)
+    files_skipped_read_error: List[str] = field(default_factory=list)
+    files_skipped_empty: List[str] = field(default_factory=list)
+    files_unsupported_extension: List[str] = field(default_factory=list)
+
+    # For non-code toolkits (documents/runtime)
+    documents_skipped_error: List[str] = field(default_factory=list)
+    runtime_skipped_extension: List[str] = field(default_factory=list)
+    runtime_skipped_error: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        """Convert stats to dictionary for reporting."""
+        # Calculate counts for each category
+        files_skipped_count = (
+            len(self.files_skipped_whitelist) +
+            len(self.files_skipped_blacklist) +
+            len(self.files_skipped_read_error) +
+            len(self.files_skipped_empty) +
+            len(self.files_unsupported_extension)
+        )
+        documents_skipped_count = len(self.documents_skipped_error)
+        runtime_skipped_count = (
+            len(self.runtime_skipped_extension) +
+            len(self.runtime_skipped_error)
+        )
+        total_skipped = files_skipped_count + documents_skipped_count + runtime_skipped_count
+
+        return {
+            "items_processed": self.items_processed,
+            "total_skipped": total_skipped,
+            "files_skipped": {
+                "count": files_skipped_count,
+                "whitelist_filtered": self.files_skipped_whitelist,
+                "whitelist_filtered_count": len(self.files_skipped_whitelist),
+                "blacklist_filtered": self.files_skipped_blacklist,
+                "blacklist_filtered_count": len(self.files_skipped_blacklist),
+                "read_error": self.files_skipped_read_error,
+                "read_error_count": len(self.files_skipped_read_error),
+                "empty_content": self.files_skipped_empty,
+                "empty_content_count": len(self.files_skipped_empty),
+                "unsupported_extension": self.files_unsupported_extension,
+                "unsupported_extension_count": len(self.files_unsupported_extension),
+            },
+            "documents_skipped": {
+                "count": documents_skipped_count,
+                "error": self.documents_skipped_error,
+                "error_count": len(self.documents_skipped_error),
+            },
+            "runtime_skipped": {
+                "count": runtime_skipped_count,
+                "extension_filtered": self.runtime_skipped_extension,
+                "extension_filtered_count": len(self.runtime_skipped_extension),
+                "error": self.runtime_skipped_error,
+                "error_count": len(self.runtime_skipped_error),
+            }
+        }
+
+    def get_summary(self) -> str:
+        """Generate human-readable summary of skipped items."""
+        lines = []
+
+        # Count file-related skips
+        file_skips = (len(self.files_skipped_whitelist) +
+                     len(self.files_skipped_blacklist) +
+                     len(self.files_skipped_read_error) +
+                     len(self.files_skipped_empty) +
+                     len(self.files_unsupported_extension))
+
+        # Count document/runtime-related skips
+        doc_skips = (len(self.documents_skipped_error) +
+                    len(self.runtime_skipped_extension) +
+                    len(self.runtime_skipped_error))
+
+        total_skipped = file_skips + doc_skips
+
+        if total_skipped == 0:
+            return ""
+
+        lines.append(f"\nSkipped items ({total_skipped} total):")
+
+        # File-related skips (for code toolkits)
+        if self.files_skipped_whitelist:
+            lines.append(f"  - Files not in whitelist ({len(self.files_skipped_whitelist)}): {', '.join(self.files_skipped_whitelist[:5])}")
+            if len(self.files_skipped_whitelist) > 5:
+                lines.append(f"    ... and {len(self.files_skipped_whitelist) - 5} more")
+
+        if self.files_skipped_blacklist:
+            lines.append(f"  - Files blacklisted ({len(self.files_skipped_blacklist)}): {', '.join(self.files_skipped_blacklist[:5])}")
+            if len(self.files_skipped_blacklist) > 5:
+                lines.append(f"    ... and {len(self.files_skipped_blacklist) - 5} more")
+
+        if self.files_skipped_read_error:
+            lines.append(f"  - Files with read errors ({len(self.files_skipped_read_error)}): {', '.join(self.files_skipped_read_error[:5])}")
+            if len(self.files_skipped_read_error) > 5:
+                lines.append(f"    ... and {len(self.files_skipped_read_error) - 5} more")
+
+        if self.files_skipped_empty:
+            lines.append(f"  - Files with empty content ({len(self.files_skipped_empty)}): {', '.join(self.files_skipped_empty[:5])}")
+            if len(self.files_skipped_empty) > 5:
+                lines.append(f"    ... and {len(self.files_skipped_empty) - 5} more")
+
+        if self.files_unsupported_extension:
+            lines.append(f"  - Files with unsupported extension ({len(self.files_unsupported_extension)}): {', '.join(self.files_unsupported_extension[:5])}")
+            if len(self.files_unsupported_extension) > 5:
+                lines.append(f"    ... and {len(self.files_unsupported_extension) - 5} more")
+
+        # Document/attachment-related skips (for non-code toolkits)
+        if self.documents_skipped_error:
+            lines.append(f"  - Documents with errors ({len(self.documents_skipped_error)}): {', '.join(self.documents_skipped_error[:5])}")
+            if len(self.documents_skipped_error) > 5:
+                lines.append(f"    ... and {len(self.documents_skipped_error) - 5} more")
+
+        if self.runtime_skipped_extension:
+            lines.append(f"  - Runtime skipped (extension) ({len(self.runtime_skipped_extension)}): {', '.join(self.runtime_skipped_extension[:5])}")
+            if len(self.runtime_skipped_extension) > 5:
+                lines.append(f"    ... and {len(self.runtime_skipped_extension) - 5} more")
+
+        if self.runtime_skipped_error:
+            lines.append(f"  - Runtime skipped (errors) ({len(self.runtime_skipped_error)}): {', '.join(self.runtime_skipped_error[:5])}")
+            if len(self.runtime_skipped_error) > 5:
+                lines.append(f"    ... and {len(self.runtime_skipped_error) - 5} more")
+
+        return "\n".join(lines)
 
 DEFAULT_CUT_OFF = 0.1
 INDEX_META_UPDATE_INTERVAL = 600.0
@@ -205,27 +342,37 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             errors = result.get("errors", [])
             issues_detail = ("\nIssues: " + "; ".join(errors)) if errors else ""
 
+            # Get skipped files summary and data if available
+            skipped_summary = ""
+            skipped_data = None
+            if hasattr(self, 'get_indexing_stats_summary') and callable(self.get_indexing_stats_summary):
+                skipped_summary = self.get_indexing_stats_summary()
+            if hasattr(self, 'get_indexing_stats') and callable(self.get_indexing_stats):
+                stats = self.get_indexing_stats()
+                if stats:
+                    skipped_data = stats.to_dict()
+
             if failed_count > 0 and succeeded_count > 0:
                 final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
                 status = "partly_indexed"
                 message = (f"Successfully indexed {succeeded_count} documents. "
-                           f"Failed to index {failed_count} documents.{issues_detail}")
+                           f"Failed to index {failed_count} documents.{issues_detail}{skipped_summary}")
             elif failed_count > 0 >= succeeded_count:
                 final_state = IndexerKeywords.INDEX_META_FAILED.value
                 status = "error"
-                message = f"Failed to index all {failed_count} documents.{issues_detail}"
+                message = f"Failed to index all {failed_count} documents.{issues_detail}{skipped_summary}"
             elif succeeded_count > 0:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = "ok"
-                message = f"Successfully indexed {succeeded_count} documents."
+                message = f"Successfully indexed {succeeded_count} documents.{skipped_summary}"
             else:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = "ok"
-                message = "No new documents to index."
+                message = f"No new documents to index.{skipped_summary}"
 
             # Final update should always be forced
             self.index_meta_update(index_name, final_state, succeeded_count, update_force=True,
-                                   error=message if status != "ok" else None)
+                                   error=message if status != "ok" else None, skipped=skipped_data)
             self._emit_index_event(index_name)
             #
             return {"status": status, "message": message}
@@ -323,14 +470,36 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['embedding'] = self.embeddings
         chunking_config['llm'] = self.llm
 
+        def _filter_parsing_errors(docs_generator, source_name: str):
+            """Filter out documents with parsing errors and track them as skipped."""
+            for doc in docs_generator:
+                if doc.page_content and doc.page_content.startswith("Unsupported extension for file"):
+                    # Track as skipped due to unsupported extension
+                    if hasattr(self, '_track_skipped_file_unsupported'):
+                        self._track_skipped_file_unsupported(source_name)
+                    # Skip this document - don't add to vector store
+                    continue
+                if doc.page_content and doc.page_content.startswith("Error during content parsing for file"):
+                    # Track as skipped due to parsing error
+                    if hasattr(self, '_track_runtime_skipped'):
+                        self._track_runtime_skipped(source_name, reason="error")
+                    elif hasattr(self, '_track_skipped_document'):
+                        self._track_skipped_document(source_name, reason="error")
+                    # Skip this document - don't add to vector store
+                    continue
+                yield doc
+
         for document in documents:
             if content_type := document.metadata.get(IndexerKeywords.CONTENT_FILE_NAME.value, None):
                 # apply parsing based on content type and chunk if chunker was applied to parent doc
                 content = document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)
-                yield from process_document_by_type(
-                    document=document,
-                    content=content,
-                    extension_source=content_type, llm=self.llm, chunking_config=chunking_config)
+                yield from _filter_parsing_errors(
+                    process_document_by_type(
+                        document=document,
+                        content=content,
+                        extension_source=content_type, llm=self.llm, chunking_config=chunking_config),
+                    source_name=content_type
+                )
             elif chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
                     # content is empty, yield as is
@@ -338,10 +507,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     continue
                 # apply parsing based on content type resolved from chunking_tool
                 content_type = file_extension_by_chunker(chunking_tool)
-                yield from process_document_by_type(
-                    document=document,
-                    content=content_in_bytes,
-                    extension_source=content_type, llm=self.llm, chunking_config=chunking_config)
+                source_name = document.metadata.get('id') or document.metadata.get('name') or content_type
+                yield from _filter_parsing_errors(
+                    process_document_by_type(
+                        document=document,
+                        content=content_in_bytes,
+                        extension_source=content_type, llm=self.llm, chunking_config=chunking_config),
+                    source_name=source_name
+                )
             elif chunking_tool:
                 # apply default chunker from toolkit config. No parsing.
                 chunker = chunkers.get(chunking_tool)
@@ -563,7 +736,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             index_meta_doc = Document(page_content=f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}", metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc])
 
-    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None):
+    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None):
         """Update `index_meta` document with optional time-based throttling.
 
         Args:
@@ -576,6 +749,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                       If `None`, falls back to the value stored in `self._index_meta_config["update_interval"]`
                       if present, otherwise uses `INDEX_META_UPDATE_INTERVAL`.
             error: Optional error message to record when the state represents a failed index.
+            skipped: Optional dictionary containing skipped items data from indexing stats.
         """
         self._ensure_vectorstore_initialized()
         if not hasattr(self, "_index_meta_last_update_time"):
@@ -620,6 +794,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             elif state == IndexerKeywords.INDEX_META_COMPLETED.value:
                 # Clear previous error on successful completion
                 metadata["error"] = None
+            # Attach skipped items data if provided
+            if skipped is not None:
+                metadata["skipped"] = json.dumps(skipped)
             #
             history_raw = metadata.pop("history", "[]")
             try:

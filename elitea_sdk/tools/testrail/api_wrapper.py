@@ -827,6 +827,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                      chunking_tool: str = None,
                      **kwargs: Any
                      ) -> Generator[Document, None, None]:
+        self._init_indexing_stats()
         self._include_attachments = kwargs.get('include_attachments', False)
         self._skip_attachment_extensions = kwargs.get('skip_attachment_extensions', [])
 
@@ -843,6 +844,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             cases = [case for case in cases if title_keyword.lower() in case.get('title', '').lower()]
 
         for case in cases:
+            self._track_processed_item()
             metadata = {
                 'project_id': project_id,
                 'title': case.get('title', ''),
@@ -913,6 +915,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 
                 if get_file_extension(attachment_name) in self._skip_attachment_extensions:
                     logger.info(f"Skipping attachment {attachment['filename']} with unsupported extension.")
+                    self._track_skipped_attachment(attachment['filename'], reason="extension")
                     continue
 
                 attachment_id = f"attach_{attachment['id']}"

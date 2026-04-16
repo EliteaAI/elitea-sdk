@@ -397,6 +397,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             number_of_threads: Optional override for number of worker threads to use when
                 processing images.
         """
+        self._init_indexing_stats()
         if not urls_or_file_keys:
             raise ValueError("You must provide urls_or_file_keys with at least one URL or file key.")
 
@@ -456,6 +457,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             if metadata_threads_override is not None:
                 metadata['number_of_threads_override'] = metadata_threads_override
 
+            self._track_processed_item()
             yield Document(page_content=json.dumps(metadata), metadata=metadata)
 
     def has_image_representation(self, node):

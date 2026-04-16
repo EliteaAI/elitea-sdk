@@ -2476,6 +2476,7 @@ Examples:
         - module: Index specific module/folder by name (most deterministic)
         - full: Full project traversal with pagination
         """
+        self._init_indexing_stats()
         self._chunking_tool = kwargs.get('chunking_tool', 'markdown')
         self._extract_images = kwargs.get('extract_images', False)
         self._image_prompt = kwargs.get('image_prompt', None)
@@ -2542,8 +2543,9 @@ Examples:
                     break
                     
                 for item in items:
+                    self._track_processed_item()
                     yield self._create_test_case_document(item)
-                
+
                 # Check for next page
                 links = response.get('links', [])
                 has_next = any(link.get('rel') == 'next' for link in links)
@@ -2582,12 +2584,13 @@ Examples:
                     break
                     
                 for item in items:
+                    self._track_processed_item()
                     yield self._create_test_case_document(item)
-                
+
                 if len(items) < self.no_of_items_per_page:
                     break
                 page += 1
-                
+
             except ApiException as e:
                 stacktrace = format_exc()
                 logger.error(f"Error loading test cases from module: {stacktrace}")
@@ -2618,12 +2621,13 @@ Examples:
                     break
                     
                 for item in items:
+                    self._track_processed_item()
                     yield self._create_test_case_document(item)
-                
+
                 if len(items) < self.no_of_items_per_page:
                     break
                 page += 1
-                
+
             except ApiException as e:
                 stacktrace = format_exc()
                 logger.error(f"Error loading test cases: {stacktrace}")
