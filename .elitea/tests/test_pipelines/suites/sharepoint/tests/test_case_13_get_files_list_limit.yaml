@@ -18,7 +18,7 @@ toolkits:
 state:
   folder_name:
     type: str
-    value: ${SERVER_RELATIVE_PATH}
+    value: "${DOCUMENT_RELATIVE_PATH}"
   limit_small:
     type: int
     value: 2
