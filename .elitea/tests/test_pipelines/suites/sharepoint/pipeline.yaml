@@ -9,12 +9,12 @@ description: |
 
 env_mapping:
   SHAREPOINT_CONFIG_PATH: ${SHAREPOINT_CONFIG_PATH:../../configs/sharepoint-config.json}
-  SHAREPOINT_SITE_URL: ${SHAREPOINT_SITE_URL:https://5clkvm.sharepoint.com/sites/ELITEA}
+  SHAREPOINT_SITE_URL: ${SHAREPOINT_SITE_URL:https://5clkvm.sharepoint.com/sites/ALITA}
   SHAREPOINT_CLIENT_ID: ${SHAREPOINT_CLIENT_ID:84c01a1e-1ebc-40c0-b55a-8b3fae194e41}
   SHAREPOINT_CLIENT_SECRET: ${SHAREPOINT_CLIENT_SECRET}
-  TEST_LIST_NAME: ${TEST_LIST_NAME:DO_NOT_DELETE_EliteATestList}
-  TEST_FOLDER: ${TEST_FOLDER:Shared Documents/DO_NOT_DELETE_EliteATestFiles}
-  SERVER_RELATIVE_PATH: ${SERVER_RELATIVE_PATH:/sites/ELITEA/Shared Documents/DO_NOT_DELETE_EliteATestFiles}
+  TEST_LIST_NAME: ${TEST_LIST_NAME:DO_NOT_DELETE_AlitaTestList}
+  TEST_FOLDER: ${TEST_FOLDER:Shared Documents/DO_NOT_DELETE_AlitaTestList}
+  SERVER_RELATIVE_PATH: ${SERVER_RELATIVE_PATH:/sites/ALITA/Shared Documents/DO_NOT_DELETE_AlitaTestList}
   TEST_FILE_NAME: ${TEST_FILE_NAME:DO_NOT_DELETE_test-document.txt}
 
 setup:
@@ -24,7 +24,7 @@ setup:
       config_type: sharepoint
       alita_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
       data:
-        site_url: ${SHAREPOINT_SITE_URL:https://5clkvm.sharepoint.com/sites/ELITEA}
+        site_url: ${SHAREPOINT_SITE_URL:https://5clkvm.sharepoint.com/sites/ALITA}
         client_id: ${SHAREPOINT_CLIENT_ID:84c01a1e-1ebc-40c0-b55a-8b3fae194e41}
         client_secret: ${SHAREPOINT_CLIENT_SECRET}
 
@@ -55,9 +55,9 @@ execution:
   substitutions:
     SHAREPOINT_TOOLKIT_ID: ${SHAREPOINT_TOOLKIT_ID}
     SHAREPOINT_TOOLKIT_NAME: ${SHAREPOINT_TOOLKIT_NAME}
-    TEST_LIST_NAME: ${TEST_LIST_NAME:DO_NOT_DELETE_EliteATestList}
-    TEST_FOLDER: ${TEST_FOLDER:Shared Documents/DO_NOT_DELETE_EliteATestFiles}
-    SERVER_RELATIVE_PATH: ${SERVER_RELATIVE_PATH:/sites/ELITEA/Shared Documents/DO_NOT_DELETE_EliteATestFiles}
+    TEST_LIST_NAME: ${TEST_LIST_NAME:DO_NOT_DELETE_AlitaTestList}
+    TEST_FOLDER: ${TEST_FOLDER:Shared Documents/DO_NOT_DELETE_AlitaTestList}
+    SERVER_RELATIVE_PATH: ${SERVER_RELATIVE_PATH:/sites/ALITA/Shared Documents/DO_NOT_DELETE_AlitaTestList}
     TEST_FILE_NAME: ${TEST_FILE_NAME:DO_NOT_DELETE_test-document.txt}
     TIMESTAMP: ${TIMESTAMP}
     DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:gpt-4o-2024-11-20}

@@ -33,7 +33,7 @@ toolkits:
 state:
   file_path:
     type: str
-    value: "/sites/ELITEA/Shared Documents/DO_NOT_DELETE_EliteATestFiles/NonExistent_File_12345.txt"
+    value: "/sites/ALITA/Shared Documents/DO_NOT_DELETE_AlitaTestList/NonExistent_File_12345.txt"
   document_content:
     type: dict
   test_results:

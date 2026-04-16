@@ -19,7 +19,7 @@ toolkits:
 state:
   file_path:
     type: str
-    value: "/sites/ELITEA/Shared Documents/DO_NOT_DELETE_EliteATestFiles/${TEST_FILE_NAME}"
+    value: "/sites/ALITA/Shared Documents/DO_NOT_DELETE_AlitaTestList/${TEST_FILE_NAME}"
   document_content:
     type: dict
   error_indicators:
