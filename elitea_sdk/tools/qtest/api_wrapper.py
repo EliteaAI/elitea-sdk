@@ -1,4 +1,5 @@
 import base64
+import binascii
 import html
 import json
 import logging
@@ -157,8 +158,8 @@ logger = logging.getLogger(__name__)
 QtestDataQuerySearch = create_model(
     "QtestDataQuerySearch",
     dql=(str, Field(description="Qtest Data Query Language (DQL) query string")),
-    extract_images=(Optional[bool], Field(description="Should images be processed by llm", default=False)),
-    prompt=(Optional[str], Field(description="Prompt for image processing", default=None)),
+    extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled without a prompt, image tags are stripped and only surrounding text is returned.", default=False)),
+    prompt=(Optional[str], Field(description="Prompt for image processing. Required to analyze embedded images; if omitted, image tags are stripped instead.", default=None)),
     max_results=(Optional[int], Field(description="Maximum total results to fetch across all pages. Set to 0 or negative for unlimited. Default: 20", default=20))
 )
 
@@ -196,8 +197,8 @@ UpdateTestCase = create_model(
 FindTestCaseById = create_model(
     "FindTestCaseById",
     test_id=(str, Field(description="Test case ID e.g. TC-1234")),
-    extract_images=(Optional[bool], Field(description="Should images be processed by llm", default=False)),
-    prompt=(Optional[str], Field(description="Prompt for image processing", default=None))
+    extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled without a prompt, image tags are stripped and only surrounding text is returned.", default=False)),
+    prompt=(Optional[str], Field(description="Prompt for image processing. Required to analyze embedded images; if omitted, image tags are stripped instead.", default=None))
 )
 
 DeleteTestCase = create_model(
@@ -979,8 +980,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         
         IMPORTANT: This method must be called BEFORE strip_tags() because it needs
         the HTML <img> tags to extract base64-encoded images.
+
+        If extract=True but no prompt is provided, embedded images are stripped
+        instead of being sent for multimodal analysis.
         """
-        img_tag_regex = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+        img_tag_regex = re.compile(r'<img\b[^>]*>|&lt;img\b.*?&gt;', re.IGNORECASE)
         base64_src_regex = re.compile(
             r'\bsrc\s*=\s*["\']data:image/(?P<image_type>[^;]+);base64,(?P<base64_content>[^"\']+)["\']',
             re.IGNORECASE,
@@ -992,21 +996,26 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
         def replace_image(match):
             img_tag = match.group(0)
-            src_match = base64_src_regex.search(img_tag)
+            normalized_img_tag = html.unescape(img_tag)
+            src_match = base64_src_regex.search(normalized_img_tag)
             if not src_match:
                 return img_tag
 
+            if not (extract and prompt):
+                return ""
+
             base64_content = src_match.group('base64_content')
             image_type = src_match.group('image_type')
-            filename_match = filename_regex.search(img_tag)
+            filename_match = filename_regex.search(normalized_img_tag)
             file_name = filename_match.group('file_name') if filename_match else f'embedded_image.{image_type}'
 
-            file_content = base64.b64decode(base64_content)
+            try:
+                file_content = base64.b64decode(base64_content, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                logger.warning("Failed to decode embedded qTest image; stripping tag instead: %s", exc)
+                return ""
 
-            if extract:
-                description = f"<img description=\"{parse_file_content(file_content=file_content, file_name=file_name, prompt=prompt, llm=self.llm)}\">"
-            else:
-                description = ""
+            description = f"<img description=\"{parse_file_content(file_content=file_content, file_name=file_name, prompt=prompt, llm=self.llm)}\">"
 
             return description
 
@@ -1014,12 +1023,12 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return content
 
     def _clean_html_content(self, content: str, extract_images: bool = False, image_prompt: str = None) -> str:
-        """Clean HTML content with proper order of operations.
-        
-        The correct order is:
-        1. Process images first (extracts from <img> tags - needs HTML intact)
-        2. Strip remaining HTML tags
-        3. Unescape HTML entities
+        """Clean HTML content with a simple safe order of operations.
+
+        The order is:
+        1. Unescape HTML entities once so escaped qTest HTML becomes real tags
+        2. Process images first (extracts from <img> tags - needs HTML intact)
+        3. Strip remaining HTML tags
         
         Args:
             content: Raw HTML content from QTest
@@ -1040,8 +1049,6 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         content = self._process_image(content, extract_images, image_prompt)
         # Step 2: Strip remaining HTML tags
         content = strip_tags(content)
-        # Step 3: Unescape HTML entities
-        content = html.unescape(content)
         return content
 
     def __perform_search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None) -> list:
