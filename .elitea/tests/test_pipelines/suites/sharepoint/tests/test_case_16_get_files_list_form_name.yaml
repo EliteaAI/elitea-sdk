@@ -18,7 +18,7 @@ toolkits:
 state:
   form_name_shared:
     type: str
-    value: "Shared Documents"
+    value: "${DOCUMENT_LIBRARY}"
   limit_files:
     type: int
     value: 50
