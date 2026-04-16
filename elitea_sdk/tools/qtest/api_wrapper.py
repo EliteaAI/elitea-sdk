@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import logging
 import os
@@ -957,8 +958,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 QTEST_ID: item['id'],
                 'Steps': list(map(lambda step: {
                     'Test Step Number': step[0] + 1,
-                    'Test Step Description': self._process_image(step[1]['description'], extract_images, prompt),
-                    'Test Step Expected Result':  self._process_image(step[1]['expected'], extract_images, prompt)
+                    'Test Step Description': self._clean_html_content(step[1]['description'], extract_images, prompt),
+                    'Test Step Expected Result': self._clean_html_content(step[1]['expected'], extract_images, prompt)
                 }, enumerate(item['test_steps']))),
             }
             
@@ -979,12 +980,26 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         IMPORTANT: This method must be called BEFORE strip_tags() because it needs
         the HTML <img> tags to extract base64-encoded images.
         """
-        #extract image by regex
-        img_regex = r'<img\s+src="data:image\/[^;]+;base64,([^"]+)"\s+[^>]*data-filename="([^"]+)"[^>]*>'
+        img_tag_regex = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+        base64_src_regex = re.compile(
+            r'\bsrc\s*=\s*["\']data:image/(?P<image_type>[^;]+);base64,(?P<base64_content>[^"\']+)["\']',
+            re.IGNORECASE,
+        )
+        filename_regex = re.compile(
+            r'\bdata-filename\s*=\s*["\'](?P<file_name>[^"\']+)["\']',
+            re.IGNORECASE,
+        )
 
         def replace_image(match):
-            base64_content = match.group(1)
-            file_name = match.group(2)
+            img_tag = match.group(0)
+            src_match = base64_src_regex.search(img_tag)
+            if not src_match:
+                return img_tag
+
+            base64_content = src_match.group('base64_content')
+            image_type = src_match.group('image_type')
+            filename_match = filename_regex.search(img_tag)
+            file_name = filename_match.group('file_name') if filename_match else f'embedded_image.{image_type}'
 
             file_content = base64.b64decode(base64_content)
 
@@ -994,8 +1009,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 description = ""
 
             return description
-        #replace image tag by description
-        content = re.sub(img_regex, replace_image, content)
+
+        content = img_tag_regex.sub(replace_image, content)
         return content
 
     def _clean_html_content(self, content: str, extract_images: bool = False, image_prompt: str = None) -> str:
@@ -1014,9 +1029,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         Returns:
             Cleaned text content with optional image descriptions
         """
-        import html
         if not content:
             return ''
+
+        # Normalize once up front so escaped qTest HTML (&lt;img ...&gt;) becomes
+        # real tags before image extraction and stripping.
+        content = html.unescape(content)
+
         # Step 1: Process images FIRST (needs HTML <img> tags intact)
         content = self._process_image(content, extract_images, image_prompt)
         # Step 2: Strip remaining HTML tags
@@ -1858,8 +1877,6 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         Returns:
             dict with parsed entity data
         """
-        import html
-        
         result = {
             'Id': item.get('pid'),
             'QTest Id': item.get('id'),
@@ -1869,20 +1886,20 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         if item.get('name'):
             result['Name'] = item.get('name')
         if item.get('description'):
-            result['Description'] = html.unescape(strip_tags(item.get('description', '') or ''))
+            result['Description'] = self._clean_html_content(item.get('description', '') or '')
         if item.get('web_url'):
             result['Web URL'] = item.get('web_url')
         
         # Test-case specific fields
         if object_type == 'test-cases':
             if item.get('precondition'):
-                result['Precondition'] = html.unescape(strip_tags(item.get('precondition', '') or ''))
+                result['Precondition'] = self._clean_html_content(item.get('precondition', '') or '')
             if item.get('test_steps'):
                 result['Steps'] = [
                     {
                         'Test Step Number': idx + 1,
-                        'Test Step Description': html.unescape(strip_tags(step.get('description', '') or '')),
-                        'Test Step Expected Result': html.unescape(strip_tags(step.get('expected', '') or ''))
+                        'Test Step Description': self._clean_html_content(step.get('description', '') or ''),
+                        'Test Step Expected Result': self._clean_html_content(step.get('expected', '') or '')
                     }
                     for idx, step in enumerate(item.get('test_steps', []))
                 ]

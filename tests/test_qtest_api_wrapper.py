@@ -1,3 +1,5 @@
+import html
+
 from pydantic import SecretStr
 
 from elitea_sdk.tools.qtest.api_wrapper import QTEST_ID, QtestApiWrapper
@@ -56,7 +58,137 @@ def test_parse_data_filters_base64_images_from_description_and_precondition():
     assert parsed_row['Precondition'].replace('  ', ' ').strip() == 'Before after'
 
 
-def test_parse_data_uses_clean_html_content_for_description_and_precondition(monkeypatch):
+def test_parse_data_filters_base64_images_when_data_filename_precedes_src():
+    wrapper = _make_wrapper()
+    parsed_data = []
+    base64_content = 'QUJD'
+    html_content = (
+        f'Before <img data-filename="proof.png" '
+        f'src="data:image/png;base64,{base64_content}" /> after'
+    )
+
+    wrapper._QtestApiWrapper__parse_data(
+        {
+            'items': [
+                {
+                    'pid': 'TC-70391',
+                    'name': 'Embedded image attribute order case',
+                    'description': html_content,
+                    'precondition': html_content,
+                    'id': 4627001,
+                    'test_steps': [
+                        {
+                            'description': html_content,
+                            'expected': html_content,
+                        }
+                    ],
+                    'properties': [],
+                }
+            ]
+        },
+        parsed_data,
+        extract_images=False,
+        prompt=None,
+    )
+
+    parsed_row = parsed_data[0]
+    parsed_step = parsed_row['Steps'][0]
+
+    assert base64_content not in parsed_row['Description']
+    assert base64_content not in parsed_row['Precondition']
+    assert base64_content not in parsed_step['Test Step Description']
+    assert base64_content not in parsed_step['Test Step Expected Result']
+    assert '<img' not in parsed_row['Description']
+    assert '<img' not in parsed_row['Precondition']
+    assert '<img' not in parsed_step['Test Step Description']
+    assert '<img' not in parsed_step['Test Step Expected Result']
+
+
+def test_parse_data_filters_escaped_base64_images_from_all_test_case_fields():
+    wrapper = _make_wrapper()
+    parsed_data = []
+    base64_content = 'QUJD'
+    raw_html = (
+        f'Before <img src="data:image/png;base64,{base64_content}" '
+        'data-filename="image.png" style="width: 460px;"> after'
+    )
+    escaped_html = html.escape(raw_html)
+
+    wrapper._QtestApiWrapper__parse_data(
+        {
+            'items': [
+                {
+                    'pid': 'TC-70392',
+                    'name': 'Escaped embedded image case',
+                    'description': escaped_html,
+                    'precondition': escaped_html,
+                    'id': 4627002,
+                    'test_steps': [
+                        {
+                            'description': escaped_html,
+                            'expected': escaped_html,
+                        }
+                    ],
+                    'properties': [],
+                }
+            ]
+        },
+        parsed_data,
+        extract_images=False,
+        prompt=None,
+    )
+
+    parsed_row = parsed_data[0]
+    parsed_step = parsed_row['Steps'][0]
+
+    assert base64_content not in parsed_row['Description']
+    assert base64_content not in parsed_row['Precondition']
+    assert base64_content not in parsed_step['Test Step Description']
+    assert base64_content not in parsed_step['Test Step Expected Result']
+    assert '<img' not in parsed_row['Description']
+    assert '<img' not in parsed_row['Precondition']
+    assert '<img' not in parsed_step['Test Step Description']
+    assert '<img' not in parsed_step['Test Step Expected Result']
+    assert parsed_row['Description'].replace('  ', ' ').strip() == 'Before after'
+    assert parsed_step['Test Step Description'].replace('  ', ' ').strip() == 'Before after'
+
+
+def test_parse_entity_item_filters_escaped_base64_images_from_test_case_fields():
+    wrapper = _make_wrapper()
+    base64_content = 'QUJD'
+    raw_html = (
+        f'Before <img src="data:image/png;base64,{base64_content}" '
+        'data-filename="image.png" style="width: 460px;"> after'
+    )
+    escaped_html = html.escape(raw_html)
+
+    parsed = wrapper._QtestApiWrapper__parse_entity_item(
+        'test-cases',
+        {
+            'pid': 'TC-70393',
+            'id': 4627003,
+            'name': 'Escaped entity item image case',
+            'description': escaped_html,
+            'precondition': escaped_html,
+            'test_steps': [
+                {
+                    'description': escaped_html,
+                    'expected': escaped_html,
+                }
+            ],
+            'properties': [],
+        },
+    )
+
+    assert base64_content not in parsed['Description']
+    assert base64_content not in parsed['Precondition']
+    assert base64_content not in parsed['Steps'][0]['Test Step Description']
+    assert base64_content not in parsed['Steps'][0]['Test Step Expected Result']
+    assert '<img' not in parsed['Description']
+    assert '<img' not in parsed['Steps'][0]['Test Step Description']
+
+
+def test_parse_data_uses_clean_html_content_for_all_test_case_fields(monkeypatch):
     wrapper = _make_wrapper()
     parsed_data = []
     calls = []
@@ -94,6 +226,10 @@ def test_parse_data_uses_clean_html_content_for_description_and_precondition(mon
     assert calls == [
         ('<p>description</p>', True, 'describe images'),
         ('<p>precondition</p>', True, 'describe images'),
+        ('step description', True, 'describe images'),
+        ('step expected', True, 'describe images'),
     ]
     assert parsed_row['Description'] == 'clean:<p>description</p>'
     assert parsed_row['Precondition'] == 'clean:<p>precondition</p>'
+    assert parsed_row['Steps'][0]['Test Step Description'] == 'clean:step description'
+    assert parsed_row['Steps'][0]['Test Step Expected Result'] == 'clean:step expected'
