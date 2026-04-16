@@ -11,6 +11,33 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Import PydanticUndefined for handling unset field defaults
+# This is needed to prevent serialization errors in LangGraph checkpoints
+try:
+    from pydantic_core import PydanticUndefined
+    _PYDANTIC_UNDEFINED = PydanticUndefined
+except ImportError:
+    _PYDANTIC_UNDEFINED = None
+
+
+def _is_pydantic_undefined(obj: Any) -> bool:
+    """
+    Check if an object is PydanticUndefined (Pydantic's sentinel for unset defaults).
+
+    This handles the case where PydanticUndefined ends up in state and causes
+    serialization errors in LangGraph checkpoint system (msgpack).
+
+    Args:
+        obj: Any object to check
+
+    Returns:
+        True if the object is PydanticUndefined, False otherwise
+    """
+    if _PYDANTIC_UNDEFINED is not None and obj is _PYDANTIC_UNDEFINED:
+        return True
+    # Fallback check by type name for edge cases
+    return type(obj).__name__ == 'PydanticUndefinedType'
+
 
 def _convert_to_serializable(obj: Any, _seen: set = None) -> Any:
     """
@@ -38,6 +65,11 @@ def _convert_to_serializable(obj: Any, _seen: set = None) -> Any:
     # Primitives - return as-is
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
+
+    # Handle PydanticUndefined - convert to None to prevent serialization errors
+    # This fixes TypeError in LangGraph checkpoint serialization (msgpack)
+    if _is_pydantic_undefined(obj):
+        return None
 
     # Add to seen set for mutable containers
     if isinstance(obj, (dict, list, set)):
@@ -120,6 +152,70 @@ def _convert_to_serializable(obj: Any, _seen: set = None) -> Any:
         return str(obj)
     except Exception:
         return f"<non-serializable: {type(obj).__name__}>"
+
+
+def patch_langgraph_msgpack_serializer() -> bool:
+    """
+    Patch LangGraph's msgpack serializer to handle PydanticUndefined.
+
+    This fixes TypeError: Type is not msgpack serializable: PydanticUndefinedType
+    that occurs when LangGraph checkpoint system tries to serialize state containing
+    Pydantic model fields with undefined default values.
+
+    Should be called once during SDK initialization.
+
+    Returns:
+        True if patch was applied successfully, False otherwise
+    """
+    try:
+        from langgraph.checkpoint.serde import jsonplus
+        import ormsgpack
+
+        # Store reference to original function
+        original_msgpack_default = jsonplus._msgpack_default
+
+        def patched_msgpack_default(obj):
+            """
+            Enhanced msgpack default serializer that handles PydanticUndefined.
+            """
+            # Handle PydanticUndefined first
+            if _is_pydantic_undefined(obj):
+                return None
+
+            # Handle Pydantic FieldInfo objects that may contain PydanticUndefined
+            if type(obj).__name__ == 'FieldInfo':
+                try:
+                    # Convert FieldInfo to a serializable dict, replacing PydanticUndefined
+                    field_dict = {}
+                    for attr in ['default', 'default_factory', 'description', 'title']:
+                        if hasattr(obj, attr):
+                            val = getattr(obj, attr)
+                            if _is_pydantic_undefined(val):
+                                field_dict[attr] = None
+                            elif val is not None:
+                                field_dict[attr] = str(val) if not isinstance(val, (str, int, float, bool, type(None))) else val
+                    return field_dict
+                except Exception:
+                    return str(obj)
+
+            # Fall back to original function
+            return original_msgpack_default(obj)
+
+        # Apply the patch
+        jsonplus._msgpack_default = patched_msgpack_default
+        logger.debug("Successfully patched LangGraph msgpack serializer for PydanticUndefined handling")
+        return True
+
+    except ImportError as e:
+        logger.debug(f"LangGraph not available for patching: {e}")
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to patch LangGraph msgpack serializer: {e}")
+        return False
+
+
+# Apply the patch when this module is imported
+_langgraph_patch_applied = patch_langgraph_msgpack_serializer()
 
 
 def safe_serialize(obj: Any, **kwargs) -> str:
