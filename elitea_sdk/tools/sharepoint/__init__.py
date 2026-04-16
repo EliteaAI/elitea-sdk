@@ -143,7 +143,7 @@ class SharepointToolkit(BaseToolkit):
                     if client_secret:
                         # Mask the secret so it is never exposed to the frontend.
                         # The backend OAuth proxy retrieves the real secret via
-                        # toolkit_id which is already in resource_metadata.
+                        # configuration_uuid and toolkit_id which are already in resource_metadata.
                         provided_settings['mcp_client_secret'] = mask_secret(client_secret)
                 if provided_settings:
                     exc.resource_metadata['provided_settings'] = provided_settings
