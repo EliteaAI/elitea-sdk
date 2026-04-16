@@ -318,7 +318,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
             # Using GraphQL
             graphql = 'query { getTests(jql: "project = \\"CALC\\"") { results { issueId jira(fields: ["key"]) steps { action result } } } }'
         """
-
+        self._init_indexing_stats()
         self._skipped_attachment_extensions = skip_attachment_extensions if skip_attachment_extensions else []
         self._include_attachments = include_attachments
 
@@ -354,6 +354,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
                     raise ToolException("No test data found in GraphQL response")
 
             for test in tests_data:
+                self._track_processed_item()
                 page_content = ""
                 content_structure = {}
                 test_type_name = test.get("testType", {}).get("name", "").lower()
@@ -469,6 +470,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
 
                 if hasattr(self, '_skipped_attachment_extensions') and ext in self._skipped_attachment_extensions:
                     logger.debug(f"Skipping attachment {filename} due to extension filter: {ext}")
+                    self._track_skipped_attachment(filename, reason="extension")
                     continue
                 
                 attachment_id = f"attach_{attachment['id']}"
@@ -495,6 +497,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
                     yield from self._process_attachment(attachment, attachment_metadata)
                 except Exception as e:
                     logger.error(f"Failed to process attachment {filename}: {str(e)}")
+                    self._track_skipped_attachment(filename, reason="error")
                     continue
             
             if "_attachments_data" in document.metadata:

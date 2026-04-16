@@ -1413,7 +1413,8 @@ class EliteAClient:
                 toolkit_config_parsed_json['settings'] = toolkit_config_validated_settings
             else:
                 logger.warning(f"Toolkit type '{toolkit_config_type}' is skipping model validation")
-                toolkit_config_parsed_json['settings'] = None
+                # Keep original settings for runtime toolkits not in AVAILABLE_TOOLS
+                toolkit_config_parsed_json['settings'] = toolkit_config.get('settings', {})
         except Exception as toolkit_config_error:
             logger.error(f"Failed to validate toolkit configuration: {str(toolkit_config_error)}")
             return {

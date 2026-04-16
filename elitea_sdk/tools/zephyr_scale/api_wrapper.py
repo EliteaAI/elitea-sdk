@@ -1220,10 +1220,13 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         }
 
     def _base_loader(self, project_key: str, jql: str, **kwargs) -> Generator[Document, None, None]:
+        self._init_indexing_stats()
         self._chunking_tool = kwargs.get('chunking_tool', None)
         for test_case_doc in self._get_test_cases_docs(project_key, jql):
+            self._track_processed_item()
             yield test_case_doc
         for folder_doc in self._get_folders_docs(project_key):
+            self._track_processed_item()
             yield folder_doc
 
     def _get_all_folders(self, project_key: str, folder_type:str, step: int = 10):

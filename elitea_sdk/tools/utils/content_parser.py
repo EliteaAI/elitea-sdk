@@ -304,6 +304,13 @@ def process_document_by_type(content, extension_source: str, document: Document 
                 page_content=sanitize_for_postgres(chunk.page_content),
                 metadata=metadata
             )
+    except UnsupportedExtensionError as e:
+        msg = f"Unsupported extension for file {extension_source}:\n{e}"
+        logger.warning(msg)
+        yield Document(
+            page_content=msg,
+            metadata={**document.metadata, 'chunk_id': 1}
+        )
     except Exception as e:
         msg = f"Error during content parsing for file {extension_source}:\n{e}"
         logger.warning(msg)
@@ -311,6 +318,11 @@ def process_document_by_type(content, extension_source: str, document: Document 
             page_content=msg,
             metadata={**document.metadata, 'chunk_id': 1}
         )
+
+
+class UnsupportedExtensionError(Exception):
+    """Raised when a file has an unsupported extension for content parsing."""
+    pass
 
 
 def process_content_by_type(content, filename: str, llm=None, chunking_config=None, fallback_extensions=None) -> \
@@ -333,14 +345,14 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                     logger.warning(
                         f"'{IndexerKeywords.CONTENT_IN_BYTES.value}' ie expected but not found in document metadata.")
                     return []
-    
+
                 temp_file.write(content)
                 temp_file.flush()
-    
+
                 loader_config = loaders_map.get(extension)
                 if not loader_config:
                     logger.warning(f"No loader found for file extension: {extension}. File: {temp_file_path}")
-                    return []
+                    raise UnsupportedExtensionError(f"Unsupported file extension: {extension}")
     
                 loader_cls = loader_config['class']
                 # Copy kwargs — the dict in loaders_map is shared across all calls;

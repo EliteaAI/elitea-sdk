@@ -726,6 +726,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         }
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
+        self._init_indexing_stats()
         self._log_tool_event(message=f"Loading the files from artifact's bucket. {kwargs=}", tool_name="loader")
         try:
             all_files = self.list_files(self.bucket, return_as_string=False, recursive=True)['rows']
@@ -764,14 +765,17 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             # Check if file should be skipped based on skip_extensions
             if any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', file_name, re.IGNORECASE)
                    for pattern in skip_extensions):
+                self._track_skipped_attachment(file_name, reason="extension")
                 continue
 
             # Check if file should be included based on include_extensions
             # If include_extensions is empty, process all files (that weren't skipped)
             if include_extensions and not (any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', file_name, re.IGNORECASE)
                                                for pattern in include_extensions)):
+                self._track_skipped_attachment(file_name, reason="extension")
                 continue
 
+            self._track_processed_item()
             metadata = {
                 ("updated_on" if k == "modified" else k): str(v)
                 for k, v in file.items()

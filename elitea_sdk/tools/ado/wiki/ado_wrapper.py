@@ -669,10 +669,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Unable to modify wiki page: {str(e)}")
 
     def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None, title_contains: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
+        self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
         pages = self._client.get_pages_batch(pages_batch_request={}, project=self.project, wiki_identifier=wiki_identifier)
         #
         for page in pages:
+            self._track_processed_item()
             content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_identifier, id=page.id, include_content=True).page.content
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
             title = page.path.rsplit("/", 1)[-1]

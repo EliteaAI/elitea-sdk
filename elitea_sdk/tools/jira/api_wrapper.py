@@ -1722,6 +1722,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         Base loader for Jira issues, used to load issues as documents.
         Uses the existing Jira client instance to fetch and process issues.
         """
+        # Initialize indexing stats for this run
+        self._init_indexing_stats()
+
         # Extract parameters from kwargs
         jql = kwargs.get('jql')
         fields_to_extract = kwargs.get('fields_to_extract')
@@ -1765,12 +1768,18 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             # Process each batch of issues
             for issues_batch in issue_generator:
                 for issue in issues_batch:
-                    issue_doc = self._process_issue_for_indexing(
-                        issue,
-                        fields_to_index
-                    )
-                    if issue_doc:
-                        yield issue_doc
+                    try:
+                        issue_doc = self._process_issue_for_indexing(
+                            issue,
+                            fields_to_index
+                        )
+                        if issue_doc:
+                            self._track_processed_item()
+                            yield issue_doc
+                    except Exception as e:
+                        issue_key = issue.get('key', 'unknown')
+                        logger.error(f"Failed to process issue {issue_key}: {str(e)}")
+                        self._track_skipped_document(issue_key, reason="error")
 
         except Exception as e:
             logger.error(f"Error loading Jira issues: {str(e)}")
@@ -1802,14 +1811,23 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             for attachment in attachments:
                 # get extension
                 ext = f".{attachment['filename'].split('.')[-1].lower()}"
-                if ext not in self._skipped_attachment_extensions:
-                    attachment_id = f"attach_{attachment['id']}"
-                    base_document.metadata.setdefault(IndexerKeywords.DEPENDENT_DOCS.value, []).append(attachment_id)
+                if ext in self._skipped_attachment_extensions:
+                    # Track skipped attachment due to extension filter
+                    self._track_skipped_attachment(attachment['filename'], reason="extension")
+                    continue
+
+                attachment_id = f"attach_{attachment['id']}"
+                base_document.metadata.setdefault(IndexerKeywords.DEPENDENT_DOCS.value, []).append(attachment_id)
+                try:
+                    attachment_content = self._client.get_attachment_content(attachment['id'])
+                except Exception as e:
+                    logger.error(f"Failed to download attachment {attachment['filename']} for issue {issue_key}: {str(e)}")
                     try:
-                        attachment_content = self._client.get_attachment_content(attachment['id'])
-                    except Exception as e:
-                        logger.error(f"Failed to download attachment {attachment['filename']} for issue {issue_key}: {str(e)}")
                         attachment_content = self._client.get(path=f"secure/attachment/{attachment['id']}/{attachment['filename']}", not_json_response=True)
+                    except Exception as e2:
+                        logger.error(f"Fallback also failed for attachment {attachment['filename']}: {str(e2)}")
+                        self._track_skipped_attachment(attachment['filename'], reason="error")
+                        continue
 
                     yield Document(page_content='',
                                    metadata={
