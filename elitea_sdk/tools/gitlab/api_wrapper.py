@@ -336,7 +336,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         Returns a dict with title, body, and comments as a list of {body, user} dicts.
         """
         issue = self.repo_instance.issues.get(issue_number)
-        page = 0
+        page = 1
         comments: List[dict] = []
         while len(comments) <= 10:
             comments_page = issue.notes.list(page=page)
