@@ -9,6 +9,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length
 from ...configurations.pgvector import PgVectorConfiguration
 from ...configurations.zephyr_essential import ZephyrEssentialConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "zephyr_essential"
@@ -36,14 +37,14 @@ class ZephyrEssentialToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in ZephyrEssentialApiWrapper.model_construct().get_available_tools()}
         return create_model(
             name,
-            zephyr_essential_configuration=(ZephyrEssentialConfiguration, Field(description="Zephyr Essential Configuration", json_schema_extra={'configuration_types': ['zephyr_essential']})),
+            zephyr_essential_configuration=(ZephyrEssentialConfiguration, Field(description=get_credentials_tooltip("Zephyr Essential"), json_schema_extra={'configuration_types': ['zephyr_essential']})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None,
-                                                                           description="PgVector Configuration",
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={
                                                                                'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             __config__={'json_schema_extra': {'metadata': {"label": "Zephyr Essential", "icon_url": "zephyr.svg",
                             "categories": ["test management"],
                             "extra_categories": ["test automation", "test case management", "test planning"]

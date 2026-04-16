@@ -1,38 +1,54 @@
 from typing import List, Literal, Optional
+
+import requests
 from langchain_community.agent_toolkits.base import BaseToolkit
-from .api_wrapper import ConfluenceAPIWrapper
 from langchain_core.tools import BaseTool
-from ..base.tool import BaseAction
 from pydantic import create_model, BaseModel, ConfigDict, Field
 
+from .api_wrapper import ConfluenceAPIWrapper
+from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
-from ..utils import clean_string, get_max_toolkit_length, parse_list, check_connection_response
-from ...configurations.confluence import ConfluenceConfiguration
+from ..utils import parse_list, check_connection_response
+from ...configurations.confluence import ConfluenceConfiguration, _hosting_to_cloud
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...configurations.pgvector import PgVectorConfiguration
-import requests
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "confluence"
 
 def get_toolkit(tool):
+    settings = tool['settings']
+    confluence_configuration = settings['confluence_configuration']
+
+    # Resolve cloud from credential hosting first, then fall back to toolkit-level cloud
+    # (toolkit-level cloud takes precedence during the transition period)
+    toolkit_cloud = settings.get('cloud')
+    if toolkit_cloud is not None:
+        cloud = toolkit_cloud
+    else:
+        hosting = confluence_configuration.get('hosting', 'Auto') if isinstance(confluence_configuration, dict) else getattr(confluence_configuration, 'hosting', 'Auto')
+        base_url = confluence_configuration.get('base_url') if isinstance(confluence_configuration, dict) else getattr(confluence_configuration, 'base_url', None)
+        cloud = _hosting_to_cloud(hosting, base_url)
+
     return ConfluenceToolkit().get_toolkit(
-        selected_tools=tool['settings'].get('selected_tools', []),
-        space=tool['settings'].get('space', None),
-        cloud=tool['settings'].get('cloud', True),
-        confluence_configuration=tool['settings']['confluence_configuration'],
-        limit=tool['settings'].get('limit', 5),
-        labels=parse_list(tool['settings'].get('labels', None)),
-        custom_headers=tool['settings'].get('custom_headers', {}),
-        additional_fields=tool['settings'].get('additional_fields', []),
-        verify_ssl=tool['settings'].get('verify_ssl', True),
-        elitea=tool['settings'].get('elitea'),
-        llm=tool['settings'].get('llm', None),
+        selected_tools=settings.get('selected_tools', []),
+        space=settings.get('space', None),
+        cloud=cloud,
+        api_version=settings.get('api_version', 'Auto'),
+        confluence_configuration=confluence_configuration,
+        limit=settings.get('limit', 5),
+        labels=parse_list(settings.get('labels', None)),
+        custom_headers=settings.get('custom_headers', {}),
+        additional_fields=settings.get('additional_fields', []),
+        verify_ssl=settings.get('verify_ssl', True),
+        elitea=settings.get('elitea'),
+        llm=settings.get('llm', None),
         toolkit_name=tool.get('toolkit_name'),
         # indexer settings
-        pgvector_configuration=tool['settings'].get('pgvector_configuration', {}),
+        pgvector_configuration=settings.get('pgvector_configuration', {}),
         collection_name=str(tool['toolkit_name']),
         doctype='doc',
-        embedding_model=tool['settings'].get('embedding_model'),
+        embedding_model=settings.get('embedding_model'),
         vectorstore_type="PGVector"
     )
 
@@ -85,25 +101,70 @@ class ConfluenceToolkit(BaseToolkit):
         model = create_model(
             name,
             space=(str, Field(description="Space")),
-            cloud=(bool, Field(description="Hosting Option", json_schema_extra={'configuration': True})),
-            limit=(int, Field(description="Pages limit per request", default=5, gt=0)),
+            api_version=(Literal['Auto', '2', '3'], Field(
+                description="REST API version used for all Confluence operations.\n\n"
+                        "• **Auto** (default) — automatically selected based on the Hosting setting "
+                        "in the linked credential (Cloud → V3, Server → V2)\n"
+                        "• **V3** — for Confluence Cloud (*.atlassian.net). Uses ADF for rich text content\n"
+                        "• **V2** — for Confluence Server / Data Center. Uses plain text and wiki markup\n\n"
+                        "⚠️ Using the wrong version may cause content formatting issues in pages and comments.",
+                default="Auto"
+            )),
+            limit=(int, Field(
+                description="Maximum number of pages to retrieve per individual API request.\n"
+                            "Controls the page size of each call — does not limit the total number of pages retrieved.\n"
+                            "(Default: 5)",
+                default=5, gt=0
+            )),
             labels=(Optional[str], Field(
-                description="List of comma separated labels used for labeling of agent's created or updated entities",
+                description="Filter content retrieval to pages that have specific Confluence labels.\n"
+                            "Comma-separated list, no spaces around commas.\n"
+                            "Example: `meeting-notes,documentation,project-alpha`\n"
+                            "(Optional — leave empty to retrieve all content without label filtering)",
                 default=None,
                 examples="elitea,elitea;another-label"
             )),
-            max_pages=(int, Field(description="Max total pages", default=10, gt=0)),
-            number_of_retries=(int, Field(description="Number of retries", default=2, ge=0)),
-            min_retry_seconds=(int, Field(description="Min retry, sec", default=10, ge=0)),
-            max_retry_seconds=(int, Field(description="Max retry, sec", default=60, ge=0)),
+            max_pages=(int, Field(
+                description="Maximum total number of pages to retrieve across all paginated requests.\n"
+                            "Prevents excessive data retrieval for large Confluence spaces.\n"
+                            "(Default: 10)",
+                default=10, gt=0
+            )),
+            number_of_retries=(int, Field(
+                description="How many times the toolkit should automatically retry a failed API request "
+                            "before reporting an error.\n"
+                            "Useful for handling transient network issues or temporary Confluence unavailability.\n"
+                            "(Default: 2)",
+                default=2, ge=0
+            )),
+            min_retry_seconds=(int, Field(
+                description="Minimum number of seconds to wait before attempting a retry after a failure.\n"
+                            "Acts as the lower bound of the retry backoff interval.\n"
+                            "(Default: 10)",
+                default=10, ge=0
+            )),
+            max_retry_seconds=(int, Field(
+                description="Maximum number of seconds to wait between retry attempts.\n"
+                            "Acts as the upper bound of the retry backoff interval.\n"
+                            "Retries will not wait longer than this value regardless of attempt number.\n"
+                            "(Default: 60)",
+                default=60, ge=0
+            )),
             # optional field for custom headers as dictionary
-            custom_headers=(Optional[dict], Field(description="Custom headers for API requests", default={})),
-            confluence_configuration=(ConfluenceConfiguration, Field(description="Confluence Configuration", json_schema_extra={'configuration_types': ['confluence']})),
+            custom_headers=(Optional[dict], Field(
+                description="Optional additional HTTP headers to include with every API request.\n"
+                            "Useful for custom authentication, routing, or proxy requirements.\n"
+                            "Must be valid JSON format.\n"
+                            "Example: `{\"X-Custom-Header\": \"value\", \"X-Tenant-ID\": \"my-org\"}`\n"
+                            "(Optional — leave empty if not required)",
+                default={}
+            )),
+            confluence_configuration=(ConfluenceConfiguration, Field(description=get_credentials_tooltip("Confluence"), json_schema_extra={'configuration_types': ['confluence']})),
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default = None,
-                                                                           description="PgVector Configuration",
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
 
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools})),

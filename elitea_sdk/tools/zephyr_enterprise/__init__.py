@@ -8,6 +8,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length
 from ...configurations.pgvector import PgVectorConfiguration
 from ...configurations.zephyr_enterprise import ZephyrEnterpriseConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "zephyr_enterprise"
@@ -36,13 +37,13 @@ class ZephyrEnterpriseToolkit(BaseToolkit):
                           ZephyrApiWrapper.model_construct().get_available_tools()}
         return create_model(
             name,
-            zephyr_configuration=(ZephyrEnterpriseConfiguration, Field(description="Zephyr Configuration", json_schema_extra={'configuration_types': ['zephyr_enterprise']})),
-            pgvector_configuration=(Optional[PgVectorConfiguration], Field(description="PgVector Configuration",
+            zephyr_configuration=(ZephyrEnterpriseConfiguration, Field(description=get_credentials_tooltip("Zephyr Enterprise"), json_schema_extra={'configuration_types': ['zephyr_enterprise']})),
+            pgvector_configuration=(Optional[PgVectorConfiguration], Field(description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={
                                                                                'configuration_types': ['pgvector']},
                                                                            default=None)),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             __config__=ConfigDict(json_schema_extra={

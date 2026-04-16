@@ -49,11 +49,21 @@ class SharepointRestWrapper(BaseSharepointWrapper):
 
     def _graph_helper(self):
         """Return a :class:`SharepointAuthorizationHelper` for fallback calls."""
+        from urllib.parse import urlparse
         from .authorization_helper import SharepointAuthorizationHelper
+
+        # Extract tenant from site_url (e.g., "tenant" from "https://tenant.sharepoint.com/...")
+        tenant = ""
+        if self.site_url:
+            parsed = urlparse(self.site_url)
+            if parsed.hostname:
+                # Extract first segment: tenant.sharepoint.com → tenant
+                tenant = parsed.hostname.split('.')[0]
+
         return SharepointAuthorizationHelper(
             client_id=self._client_id,
             client_secret=self._client_secret,
-            tenant="",
+            tenant=tenant,
             scope="",
             token_json="",
         )

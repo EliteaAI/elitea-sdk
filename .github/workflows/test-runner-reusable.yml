@@ -286,15 +286,13 @@ jobs:
         if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}
         run: |
           RESULTS_DIR=".elitea/tests/test_pipelines/test_results/suites/${{ inputs.test_cases_dir }}"
-          # Strip control characters U+0001-U+001F (except tab/LF/CR) that the LLM
-          # can embed in string values, producing JSON that breaks jq.
-          for f in "${RESULTS_DIR}/fix_output.json" "${RESULTS_DIR}/fix_milestone.json"; do
-            if [ -f "$f" ]; then
-              tmp=$(mktemp)
-              tr -d '\001-\010\013\014\016-\037' < "$f" > "$tmp" && mv "$tmp" "$f" || rm -f "$tmp"
-              echo "Sanitized $f"
-            fi
-          done
+          # Escape control characters (U+0000-U+001F) inside JSON string values.
+          # The LLM can write raw newlines/tabs inside strings instead of \n/\t escapes,
+          # which produces invalid JSON that breaks jq. This script properly escapes them.
+          python3 .elitea/tests/test_pipelines/scripts/sanitize_json.py \
+            "${RESULTS_DIR}/fix_output.json" \
+            "${RESULTS_DIR}/fix_milestone.json" \
+            2>/dev/null || echo "JSON sanitization skipped (files may not exist)"
 
       - name: Label PR with tests_ai_healed
         if: ${{ always() && steps.wait_tests.outputs.tests_failed == 'true' }}

@@ -8,6 +8,7 @@ import requests
 from ...elitea_base import filter_missconfigured_index_tools
 from ....configurations.ado import AdoConfiguration
 from ....configurations.pgvector import PgVectorConfiguration
+from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...base.tool import BaseAction
 from ...utils import clean_string, get_max_toolkit_length, check_connection_response
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
@@ -37,15 +38,15 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
         selected_tools = {x['name']: x['args_schema'].schema() for x in AzureDevOpsApiWrapper.model_construct().get_available_tools()}
         m = create_model(
             name,
-            ado_configuration=(AdoConfiguration, Field(description="Ado Work Item configuration", json_schema_extra={'configuration_types': ['ado']})),
+            ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), json_schema_extra={'configuration_types': ['ado']})),
             limit=(Optional[int], Field(description="Default ADO boards result limit (can be overridden by agent instructions)", default=5, gt=0)),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default = None,
-                                                                           description="PgVector Configuration",
+                                                                           description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             __config__={
                 'json_schema_extra': {
                     'metadata': {

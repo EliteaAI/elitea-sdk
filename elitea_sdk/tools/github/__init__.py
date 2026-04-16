@@ -10,6 +10,7 @@ from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length
 from ...configurations.github import GithubConfiguration
 from ...configurations.pgvector import PgVectorConfiguration
+from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "github"
@@ -54,15 +55,15 @@ class EliteAGitHubToolkit(BaseToolkit):
                     },
                 }
             ),
-            github_configuration=(GithubConfiguration, Field(description="Github configuration",
+            github_configuration=(GithubConfiguration, Field(description=get_credentials_tooltip("GitHub"),
                                                              json_schema_extra={'configuration_types': ['github']})),
-            pgvector_configuration=(Optional[PgVectorConfiguration], Field(description="PgVector configuration", default=None,
+            pgvector_configuration=(Optional[PgVectorConfiguration], Field(description=PGVECTOR_CONFIGURATION_TOOLTIP, default=None,
                                                                      json_schema_extra={'configuration_types': ['pgvector']})),
             repository=(str, Field(description="Github repository")),
             active_branch=(Optional[str], Field(description="Active branch", default="main")),
             base_branch=(Optional[str], Field(description="Github Base branch", default="main")),
             # embedder settings
-            embedding_model=(Optional[str], Field(default=None, description="Embedding configuration.", json_schema_extra={'configuration_model': 'embedding'})),
+            embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools}))
         )
