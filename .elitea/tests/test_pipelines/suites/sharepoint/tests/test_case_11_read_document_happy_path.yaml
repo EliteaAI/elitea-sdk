@@ -19,7 +19,7 @@ toolkits:
 state:
   file_path:
     type: str
-    value: "/sites/ALITA/Shared Documents/DO_NOT_DELETE_AlitaTestList/${TEST_FILE_NAME}"
+    value: "${DOCUMENT_RELATIVE_PATH}/${TEST_FILE_NAME}"
   document_content:
     type: dict
   error_indicators:

@@ -19,10 +19,10 @@ toolkits:
 state:
   form_name:
     type: str
-    value: "Shared Documents"
+    value: "${DOCUMENT_LIBRARY}"
   folder_name:
     type: str
-    value: "DO_NOT_DELETE_EliteATestFiles"
+    value: "${TEST_FILES_FOLDER}"
   include_extensions:
     type: list
     value: ["txt", "pdf", "docx"]
