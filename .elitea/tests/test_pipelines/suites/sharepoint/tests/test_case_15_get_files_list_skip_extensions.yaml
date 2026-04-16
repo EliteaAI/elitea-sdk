@@ -19,7 +19,7 @@ toolkits:
 state:
   folder_name:
     type: str
-    value: ${SERVER_RELATIVE_PATH}
+    value: "/sites/ALITA/Shared Documents/DO_NOT_DELETE_AlitaTestFiles"
   limit_files:
     type: int
     value: 50

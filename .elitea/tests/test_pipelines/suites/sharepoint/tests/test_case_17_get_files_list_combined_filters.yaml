@@ -22,7 +22,7 @@ state:
     value: "${DOCUMENT_LIBRARY}"
   folder_name:
     type: str
-    value: "${TEST_FILES_FOLDER}"
+    value: "DO_NOT_DELETE_AlitaTestFiles"
   include_extensions:
     type: list
     value: ["txt", "pdf", "docx"]
