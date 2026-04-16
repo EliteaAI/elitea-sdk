@@ -23,6 +23,7 @@ def get_tools(tool):
         sharepoint_configuration=tool['settings']['sharepoint_configuration'],
         tokens = tool['settings'].get('tokens', {}),
         toolkit_name=tool.get('toolkit_name'),
+        toolkit_id=tool.get('id'),
         llm=tool['settings'].get('llm'),
         elitea=tool['settings'].get('elitea', None),
         # indexer settings
@@ -59,7 +60,7 @@ class SharepointToolkit(BaseToolkit):
 
     @classmethod
     @filter_missconfigured_index_tools
-    def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, **kwargs):
+    def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, toolkit_id: Optional[int] = None, **kwargs):
         if selected_tools is None:
             selected_tools = []
         wrapper_payload = {
@@ -123,6 +124,10 @@ class SharepointToolkit(BaseToolkit):
             # The real (unmasked) client_secret is required because the frontend sends it
             # to the backend OAuth proxy for the token exchange (confidential-client flow).
             if exc.resource_metadata is not None:
+                # Add toolkit_id to resource_metadata so backend can fetch credentials
+                if toolkit_id is not None:
+                    exc.resource_metadata['toolkit_id'] = toolkit_id
+
                 provided_settings = {}
                 client_id = sp_config.get('client_id')
                 if client_id:
@@ -134,7 +139,7 @@ class SharepointToolkit(BaseToolkit):
                     if client_secret:
                         # Mask the secret so it is never exposed to the frontend.
                         # The backend OAuth proxy retrieves the real secret via
-                        # configuration_uuid which is already in resource_metadata.
+                        # toolkit_id which is already in resource_metadata.
                         provided_settings['mcp_client_secret'] = mask_secret(client_secret)
                 if provided_settings:
                     exc.resource_metadata['provided_settings'] = provided_settings
