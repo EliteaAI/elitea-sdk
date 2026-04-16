@@ -1019,7 +1019,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 logger.warning("Failed to decode embedded qTest image; stripping tag instead: %s", exc)
                 return ""
 
-            description = f"<img description=\"{parse_file_content(file_content=file_content, file_name=file_name, prompt=prompt, llm=self.llm)}\">"
+            description = f"<img description=\"Image Transcript: {parse_file_content(file_content=file_content, file_name=file_name, prompt=prompt, llm=self.llm)}\">"
 
             return description
 
