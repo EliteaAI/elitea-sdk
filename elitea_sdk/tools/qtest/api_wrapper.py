@@ -969,6 +969,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 field_name = prop.get('field_name')
                 if not field_name:
                     continue
+                # Do not override already present in the parsed_data_row key values
+                # Continue if the key already present in the parsed_data_row
+                if field_name in parsed_data_row:
+                    continue
                 
                 # Format value based on field type (multi-select as array, etc.)
                 parsed_data_row[field_name] = self.__format_property_value(prop)
@@ -1932,6 +1936,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         for prop in item.get('properties', []):
             field_name = prop.get('field_name')
             if not field_name:
+                continue
+
+            # Do not override already present in the parsed_data_row key values
+            # Continue if the key already present in the parsed_data_row
+            if field_name in result:
                 continue
             
             # Format value based on field type (multi-select as array, etc.)
