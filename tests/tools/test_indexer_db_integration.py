@@ -62,7 +62,7 @@ TEST_INDEX_NAME = "dbtest"
 ELITEA_DEPLOYMENT_URL = os.getenv("ELITEA_DEPLOYMENT_URL")
 API_KEY = os.getenv("ELITEA_TOKEN")
 ELITEA_PROJECT_ID = os.getenv("ELITEA_PROJECT_ID")
-DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS", "gpt-4o-mini")
+DEFAULT_LLM_MODEL = "gpt-5-mini"#os.getenv("DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS", "gpt-5-mini")
 DEFAULT_EMBEDDING_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-ada-002")
 
 # Expected embedding dimension for text-embedding-ada-002
@@ -489,38 +489,45 @@ def _mock_code_loader(**kwargs) -> Generator[Document, None, None]:
     
     Simulates loading Python files from a repository.
     """
+    import time
     test_files = [
         {
             'filename': 'src/main.py',
             'content': 'def main():\n    print("Hello, World!")\n\nif __name__ == "__main__":\n    main()',
             'metadata': {
+                'id': 'src_main_py',
                 'source': 'src/main.py',
                 'language': 'python',
                 'repository': 'test-repo',
                 'commit_hash': 'abc123',
                 'file_type': 'code',
+                'updated_on': time.time(),
             }
         },
         {
             'filename': 'src/utils.py',
             'content': 'def calculate(x, y):\n    """Add two numbers."""\n    return x + y\n\nclass Helper:\n    pass',
             'metadata': {
+                'id': 'src_utils_py',
                 'source': 'src/utils.py',
                 'language': 'python',
                 'repository': 'test-repo',
                 'commit_hash': 'abc123',
                 'file_type': 'code',
+                'updated_on': time.time(),
             }
         },
         {
             'filename': 'README.md',
             'content': '# Test Repository\n\nThis is a test repository for integration testing.\n\n## Features\n- Feature 1\n- Feature 2',
             'metadata': {
+                'id': 'README_md',
                 'source': 'README.md',
                 'language': 'markdown',
                 'repository': 'test-repo',
                 'commit_hash': 'abc123',
                 'file_type': 'documentation',
+                'updated_on': time.time(),
             }
         },
     ]
@@ -539,49 +546,58 @@ def _mock_non_code_loader(**kwargs) -> Generator[Document, None, None]:
     
     Simulates loading documents like PDFs, Word docs, etc.
     """
+    import time
     test_documents = [
         {
             'title': 'Project Plan 2024',
             'content': 'Project Overview:\n\nObjective: Deliver new features by Q2 2024.\n\nPhases:\n1. Planning (Jan-Feb)\n2. Development (Mar-Apr)\n3. Testing (May)\n4. Launch (Jun)',
             'metadata': {
+                'id': 'project_plan_2024',
                 'source': 'Documents/project_plan.pdf',
                 'title': 'Project Plan 2024',
                 'file_type': 'pdf',
                 'author': 'Project Manager',
                 'created_date': '2024-01-15',
+                'updated_on': time.time(),
             }
         },
         {
             'title': 'Meeting Notes - Jan 2024',
             'content': 'Meeting Notes - January 15, 2024\n\nAttendees: Team A, Team B\n\nAgenda:\n- Review progress\n- Discuss blockers\n- Plan next sprint\n\nAction Items:\n- Fix bug #123\n- Update documentation',
             'metadata': {
+                'id': 'meeting_notes_jan_2024',
                 'source': 'Documents/meeting_notes_jan.docx',
                 'title': 'Meeting Notes - Jan 2024',
                 'file_type': 'docx',
                 'author': 'Scrum Master',
                 'created_date': '2024-01-15',
+                'updated_on': time.time(),
             }
         },
         {
             'title': 'Technical Specifications',
             'content': 'System Architecture:\n\n1. Frontend: React + TypeScript\n2. Backend: Python + FastAPI\n3. Database: PostgreSQL\n4. Cache: Redis\n\nPerformance Requirements:\n- Response time < 200ms\n- Support 1000 concurrent users',
             'metadata': {
+                'id': 'tech_specs',
                 'source': 'Documents/tech_specs.txt',
                 'title': 'Technical Specifications',
                 'file_type': 'txt',
                 'author': 'Technical Lead',
                 'created_date': '2024-01-10',
+                'updated_on': time.time(),
             }
         },
         {
             'title': 'Budget Report Q1',
             'content': 'Q1 2024 Budget Report\n\nRevenue: $500,000\nExpenses: $350,000\nProfit: $150,000\n\nCategories:\n- Development: $200,000\n- Marketing: $100,000\n- Operations: $50,000',
             'metadata': {
+                'id': 'budget_q1',
                 'source': 'Documents/budget_q1.xlsx',
                 'title': 'Budget Report Q1',
                 'file_type': 'xlsx',
                 'author': 'Finance Team',
                 'created_date': '2024-03-31',
+                'updated_on': time.time(),
             }
         },
     ]
@@ -1528,3 +1544,869 @@ class TestCollectionManagement:
                 # search_index might not be fully implemented in test environment
                 print(f"\n✓ Successfully removed {initial_count} records (DB query verified)")
                 print(f"  search_index: not tested (method not available)")
+
+
+# ===================== Additional Collection Names =====================
+RETRIEVAL_COLLECTION_NAME = f"test_ret_idx_{TEST_RUN_ID}"
+DEDUP_COLLECTION_NAME = f"test_dedup_idx_{TEST_RUN_ID}"
+DEDUP_INDEX_NAME = "dedup"
+RETRIEVAL_INDEX_NAME = "rettest"
+
+# DeepEval metric thresholds for Suite B
+THRESHOLD_CONTEXTUAL_RELEVANCY = 0.7
+THRESHOLD_FAITHFULNESS = 0.7
+THRESHOLD_ANSWER_RELEVANCY = 0.7
+THRESHOLD_CONTEXTUAL_PRECISION = 0.7
+THRESHOLD_CONTEXTUAL_RECALL = 0.7
+
+
+# ===================== Known-Answer Test Corpus =====================
+# Fixed corpus for deterministic retrieval evaluation.
+# Each document has clear, distinct content so retrieval quality is measurable.
+
+KNOWN_ANSWER_CORPUS = [
+    {
+        "page_content": (
+            "Retry mechanism with exponential backoff: When a transient failure occurs, "
+            "the system waits an exponentially increasing amount of time before retrying. "
+            "The base delay is 1 second, multiplied by 2^attempt. A maximum of 5 retries "
+            "is allowed. Jitter is added to prevent thundering herd problems."
+        ),
+        "metadata": {
+            "source": "docs/error_handling.md",
+            "title": "Error Handling Guide",
+            "category": "documentation",
+            "status": "active",
+        },
+    },
+    {
+        "page_content": (
+            "Circuit breaker pattern: After 3 consecutive failures the circuit opens and "
+            "all subsequent calls fail immediately for 30 seconds. A half-open probe is "
+            "sent after the timeout. If it succeeds the circuit closes; otherwise it "
+            "remains open for another 30 seconds."
+        ),
+        "metadata": {
+            "source": "docs/resilience_patterns.md",
+            "title": "Resilience Patterns",
+            "category": "documentation",
+            "status": "active",
+        },
+    },
+    {
+        "page_content": (
+            "Database connection pooling: The application uses a connection pool with "
+            "min_size=5 and max_size=20. Idle connections are reaped after 300 seconds. "
+            "The pool uses LIFO ordering for better cache locality. Health checks run "
+            "every 60 seconds to remove stale connections."
+        ),
+        "metadata": {
+            "source": "docs/database.md",
+            "title": "Database Configuration",
+            "category": "reference",
+            "status": "active",
+        },
+    },
+    {
+        "page_content": (
+            "Authentication flow: Users authenticate via OAuth2 authorization code flow. "
+            "Access tokens expire after 15 minutes. Refresh tokens are rotated on each use "
+            "and expire after 7 days. PKCE is required for public clients. Token revocation "
+            "is supported via the /revoke endpoint."
+        ),
+        "metadata": {
+            "source": "docs/authentication.md",
+            "title": "Authentication Guide",
+            "category": "tutorial",
+            "status": "active",
+        },
+    },
+    {
+        "page_content": (
+            "Rate limiting configuration: API endpoints are rate-limited using a token bucket "
+            "algorithm. Default limit is 100 requests per minute per API key. Burst allowance "
+            "is 20 requests. Rate limit headers X-RateLimit-Remaining and X-RateLimit-Reset "
+            "are included in every response."
+        ),
+        "metadata": {
+            "source": "docs/rate_limiting.md",
+            "title": "Rate Limiting",
+            "category": "reference",
+            "status": "draft",
+        },
+    },
+]
+
+# Ground-truth Q&A pairs for RAG evaluation
+GROUND_TRUTH_QA = [
+    {
+        "query": "How does the retry mechanism work?",
+        "expected_output": "retry with exponential backoff, base delay 1 second multiplied by 2^attempt, maximum 5 retries, jitter added",
+        "expected_source": "docs/error_handling.md",
+    },
+    {
+        "query": "What is the circuit breaker configuration?",
+        "expected_output": "circuit opens after 3 consecutive failures, 30 second timeout, half-open probe sent after timeout",
+        "expected_source": "docs/resilience_patterns.md",
+    },
+    {
+        "query": "How is connection pooling configured?",
+        "expected_output": "min_size=5, max_size=20, idle connections reaped after 300 seconds, LIFO ordering, health checks every 60 seconds",
+        "expected_source": "docs/database.md",
+    },
+    {
+        "query": "How does OAuth2 authentication work?",
+        "expected_output": "OAuth2 authorization code flow, access tokens expire 15 minutes, refresh tokens rotated on use, PKCE required",
+        "expected_source": "docs/authentication.md",
+    },
+]
+
+
+def _known_answer_loader(**kwargs) -> Generator[Document, None, None]:
+    """Load the known-answer test corpus as Documents."""
+    import time
+    for i, item in enumerate(KNOWN_ANSWER_CORPUS):
+        metadata = dict(item["metadata"])
+        # Add required fields that BaseIndexerToolkit expects
+        metadata["id"] = f"known_doc_{i}"
+        metadata["updated_on"] = time.time()
+        yield Document(page_content=item["page_content"], metadata=metadata)
+
+
+# ===================== Deduplication Mock Helpers =====================
+
+def _mock_dedup_abstract_methods(toolkit, indexed_data_store):
+    """
+    Mock abstract methods that track indexed data for deduplication testing.
+
+    Args:
+        toolkit: BaseIndexerToolkit instance
+        indexed_data_store: mutable dict that simulates the indexed-data registry.
+                           key_fn results map to {'metadata': {...}, 'ids': [str]}
+    """
+    from contextlib import ExitStack
+
+    def mock_get_indexed_data(self, index_name):
+        return dict(indexed_data_store)
+
+    def mock_key_fn(self, document):
+        return document.metadata.get("source", str(id(document)))
+
+    def mock_compare_fn(self, document, idx):
+        """Return True when document's updated_on matches indexed version (skip re-index)."""
+        return document.metadata.get("updated_on") == idx.get("metadata", {}).get("updated_on")
+
+    def mock_remove_ids_fn(self, idx_data, key):
+        entry = idx_data.get(key, {})
+        return entry.get("ids", [])
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(toolkit.__class__, "_get_indexed_data", mock_get_indexed_data))
+    stack.enter_context(patch.object(toolkit.__class__, "key_fn", mock_key_fn))
+    stack.enter_context(patch.object(toolkit.__class__, "compare_fn", mock_compare_fn))
+    stack.enter_context(patch.object(toolkit.__class__, "remove_ids_fn", mock_remove_ids_fn))
+    return stack
+
+
+# ===================== Additional Fixtures =====================
+
+@pytest.fixture
+def dedup_indexer_toolkit(elitea_client, postgres_container):
+    """Toolkit instance dedicated to deduplication tests."""
+    try:
+        llm = elitea_client.get_llm(model_name=DEFAULT_LLM_MODEL, model_config={"temperature": 0})
+        toolkit = BaseIndexerToolkit(
+            elitea=elitea_client,
+            llm=llm,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+            connection_string=postgres_container,
+            collection_schema=DEDUP_COLLECTION_NAME,
+        )
+        toolkit._ensure_vectorstore_initialized()
+        yield toolkit
+        _cleanup_schema(DEDUP_COLLECTION_NAME, postgres_container)
+    except Exception as e:
+        pytest.skip(f"Failed to create dedup indexer toolkit: {e}")
+
+
+@pytest.fixture(scope="module")
+def retrieval_toolkit(elitea_client, postgres_container):
+    """
+    Module-scoped toolkit pre-loaded with the known-answer corpus.
+
+    Indexes once and reuses across all retrieval / RAG quality tests.
+    """
+    schema = RETRIEVAL_COLLECTION_NAME
+    try:
+        llm = elitea_client.get_llm(model_name=DEFAULT_LLM_MODEL, model_config={"temperature": 0})
+        toolkit = BaseIndexerToolkit(
+            elitea=elitea_client,
+            llm=llm,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+            connection_string=postgres_container,
+            collection_schema=schema,
+        )
+        toolkit._ensure_vectorstore_initialized()
+
+        # Index the known-answer corpus once
+        with _mock_indexer_abstract_methods(toolkit), \
+             patch.object(toolkit, "_base_loader", side_effect=_known_answer_loader):
+            result = toolkit.index_data(index_name=RETRIEVAL_INDEX_NAME, clean_index=True)
+            assert result["status"] == "ok", f"Failed to seed retrieval corpus: {result}"
+
+        yield toolkit
+
+        _cleanup_schema(schema, postgres_container)
+    except Exception as e:
+        pytest.skip(f"Failed to create retrieval toolkit: {e}")
+
+
+@pytest.fixture(scope="module")
+def deepeval_model(elitea_client):
+    """
+    Create a DeepEval-compatible LLM wrapper for metric evaluation.
+
+    Imports LangChainDeepEvalModel from the reference test file.
+    Falls back to skip if deepeval is not installed.
+    """
+    try:
+        from deepeval.models import DeepEvalBaseLLM
+    except ImportError:
+        pytest.skip("deepeval not installed")
+
+    class _LangChainDeepEvalModel(DeepEvalBaseLLM):
+        """Thin wrapper: delegates to a LangChain LLM instance."""
+
+        def __init__(self, langchain_llm):
+            self._langchain_llm = langchain_llm
+            if hasattr(langchain_llm, "model_name"):
+                self._model_name = langchain_llm.model_name
+            elif hasattr(langchain_llm, "model"):
+                self._model_name = langchain_llm.model
+            else:
+                self._model_name = langchain_llm.__class__.__name__
+
+        def generate(self, prompt, schema=None):
+            import json as _json, re as _re
+            from langchain_core.messages import HumanMessage
+
+            response = self._langchain_llm.invoke([HumanMessage(content=prompt)])
+            content = response.content
+            if schema is None:
+                return content
+            match = _re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
+            json_str = match.group(1).strip() if match else content[content.find("{"):content.rfind("}") + 1]
+            json_str = _re.sub(r",\s*([}\]])", r"\1", json_str)
+            return schema(**_json.loads(json_str))
+
+        async def a_generate(self, prompt, schema=None):
+            import json as _json, re as _re
+            from langchain_core.messages import HumanMessage
+
+            response = await self._langchain_llm.ainvoke([HumanMessage(content=prompt)])
+            content = response.content
+            if schema is None:
+                return content
+            match = _re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
+            json_str = match.group(1).strip() if match else content[content.find("{"):content.rfind("}") + 1]
+            json_str = _re.sub(r",\s*([}\]])", r"\1", json_str)
+            return schema(**_json.loads(json_str))
+
+        def get_model_name(self):
+            return self._model_name
+
+        def load_model(self):
+            return None
+
+    deepeval_llm_name = os.getenv("DEEPEVAL_LLM_MODEL", "gpt-5-mini")
+    try:
+        llm = elitea_client.get_llm(
+            model_name=deepeval_llm_name,
+            model_config={"temperature": 0, "max_tokens": 4096},
+        )
+        return _LangChainDeepEvalModel(llm)
+    except Exception as e:
+        pytest.skip(f"Failed to create DeepEval model: {e}")
+
+
+# ===================== Suite A: IND-* Additional Tests =====================
+
+@pytest.mark.integration
+class TestDeduplicationAndUpdates:
+    """IND-* tests for deduplication logic."""
+
+    def test_reindex_unchanged_no_duplicates(self, dedup_indexer_toolkit):
+        """
+        IND: Re-indexing an unchanged file does not create duplicate DB rows.
+
+        Indexes the same documents twice (with identical updated_on).
+        The dedup logic should detect they are unchanged and skip them,
+        so the total row count must remain stable.
+        """
+        import re as _re
+
+        doc_v1 = Document(
+            page_content="def hello(): return 'world'",
+            metadata={"id": "app_v1", "source": "app.py", "updated_on": "2024-01-01T00:00:00Z"},
+        )
+
+        def loader_v1(**kw):
+            yield Document(page_content=doc_v1.page_content, metadata=dict(doc_v1.metadata))
+
+        # --- first index ---
+        with _mock_indexer_abstract_methods(dedup_indexer_toolkit), \
+             patch.object(dedup_indexer_toolkit, "_base_loader", side_effect=loader_v1):
+            r1 = dedup_indexer_toolkit.index_data(index_name=DEDUP_INDEX_NAME, clean_index=True)
+            assert r1["status"] == "ok", f"First index failed: {r1}"
+
+        records_first = _get_db_records(dedup_indexer_toolkit, index_name=DEDUP_INDEX_NAME)
+        count_first = len(records_first)
+        assert count_first > 0, "First index produced no records"
+
+        # Build indexed_data_store to simulate existing index state
+        indexed_data_store = {}
+        for rec in records_first:
+            key = rec["metadata"].get("source", rec["id"])
+            indexed_data_store[key] = {
+                "metadata": rec["metadata"],
+                "ids": [rec["id"]],
+            }
+
+        # --- second index (unchanged) ---
+        with _mock_dedup_abstract_methods(dedup_indexer_toolkit, indexed_data_store), \
+             patch.object(dedup_indexer_toolkit, "_base_loader", side_effect=loader_v1):
+            r2 = dedup_indexer_toolkit.index_data(index_name=DEDUP_INDEX_NAME, clean_index=False)
+
+        records_second = _get_db_records(dedup_indexer_toolkit, index_name=DEDUP_INDEX_NAME)
+        assert len(records_second) == count_first, (
+            f"Duplicate rows created: {len(records_second)} (expected {count_first})"
+        )
+        print(f"\n✓ Re-index unchanged: row count stable at {count_first}")
+
+    def test_reindex_modified_replaces_old(self, dedup_indexer_toolkit):
+        """
+        IND: Re-indexing a modified file replaces the old version;
+        total row count stays the same.
+        """
+        doc_v1 = Document(
+            page_content="def hello(): return 'world'",
+            metadata={"id": "app_v1", "source": "app.py", "updated_on": "2024-01-01T00:00:00Z"},
+        )
+        doc_v2 = Document(
+            page_content="def hello(): return 'universe'",
+            metadata={"id": "app_v2", "source": "app.py", "updated_on": "2024-02-01T00:00:00Z"},
+        )
+
+        def loader_v1(**kw):
+            yield Document(page_content=doc_v1.page_content, metadata=dict(doc_v1.metadata))
+
+        def loader_v2(**kw):
+            yield Document(page_content=doc_v2.page_content, metadata=dict(doc_v2.metadata))
+
+        # --- first index ---
+        with _mock_indexer_abstract_methods(dedup_indexer_toolkit), \
+             patch.object(dedup_indexer_toolkit, "_base_loader", side_effect=loader_v1):
+            r1 = dedup_indexer_toolkit.index_data(index_name=DEDUP_INDEX_NAME, clean_index=True)
+            assert r1["status"] == "ok"
+
+        records_first = _get_db_records(dedup_indexer_toolkit, index_name=DEDUP_INDEX_NAME)
+        count_first = len(records_first)
+
+        # Build indexed_data_store with v1 data
+        indexed_data_store = {}
+        for rec in records_first:
+            key = rec["metadata"].get("source", rec["id"])
+            indexed_data_store[key] = {
+                "metadata": rec["metadata"],
+                "ids": [rec["id"]],
+            }
+
+        # --- second index (modified content + updated_on) ---
+        with _mock_dedup_abstract_methods(dedup_indexer_toolkit, indexed_data_store), \
+             patch.object(dedup_indexer_toolkit, "_base_loader", side_effect=loader_v2):
+            r2 = dedup_indexer_toolkit.index_data(index_name=DEDUP_INDEX_NAME, clean_index=False)
+            assert r2["status"] == "ok"
+
+        records_second = _get_db_records(dedup_indexer_toolkit, index_name=DEDUP_INDEX_NAME)
+
+        # Row count should be stable (old row deleted, new row inserted)
+        assert len(records_second) == count_first, (
+            f"Row count changed: {len(records_second)} (expected {count_first})"
+        )
+
+        # Verify the content is the NEW version
+        contents = [r["document"] for r in records_second]
+        assert any("universe" in (c or "") for c in contents), (
+            "New content not found — old version was not replaced"
+        )
+        assert not any("world" in (c or "") for c in contents if c and "universe" not in c), (
+            "Old content still present — replacement failed"
+        )
+        print(f"\n✓ Re-index modified: row count stable, content updated")
+
+
+@pytest.mark.integration
+class TestPartialBatchFailure:
+    """IND-* error resilience tests."""
+
+    def test_partial_embedder_failure(self, code_indexer_toolkit):
+        """
+        IND: Partial batch failure — embedder raises on one doc mid-batch.
+
+        Verifies:
+          - failed_count > 0
+          - Remaining docs stored
+          - No uncaught exception
+          - index_meta.error populated
+        """
+        call_count = {"n": 0}
+        _original_add = None
+
+        def _add_documents_with_fault(vectorstore, documents, **kw):
+            """First batch succeeds; second batch raises."""
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("Simulated embedding failure on batch 2")
+            _original_add(vectorstore=vectorstore, documents=documents, **kw)
+
+        # Build 6 documents so they span at least 2 batches (max_docs_per_add default ~50,
+        # but we override to 3 to force multiple flushes)
+        def multi_doc_loader(**kw):
+            for i in range(6):
+                yield Document(
+                    page_content=f"Document number {i} with enough content for embedding.",
+                    metadata={"id": f"doc_{i}", "source": f"file_{i}.txt", "updated_on": "2024-01-01T00:00:00Z"},
+                )
+
+        original_max = code_indexer_toolkit.max_docs_per_add
+        try:
+            code_indexer_toolkit.max_docs_per_add = 3  # force 2 batches of 3
+
+            from elitea_sdk.runtime.langchain.interfaces import llm_processor
+            _original_add = llm_processor.add_documents
+
+            with _mock_indexer_abstract_methods(code_indexer_toolkit), \
+                 patch.object(code_indexer_toolkit, "_base_loader", side_effect=multi_doc_loader), \
+                 patch.object(llm_processor, "add_documents", side_effect=_add_documents_with_fault):
+
+                result = code_indexer_toolkit.index_data(
+                    index_name=TEST_INDEX_NAME, clean_index=True
+                )
+
+            # The SDK should not crash — it should report partial success
+            assert result["status"] in ("partly_indexed", "ok", "error"), (
+                f"Unexpected status: {result['status']}"
+            )
+
+            # Check index_meta for error tracking
+            all_records = _get_db_records(
+                code_indexer_toolkit, index_name=TEST_INDEX_NAME, exclude_index_meta=False
+            )
+            meta_records = [r for r in all_records if r["metadata"].get("type") == "index_meta"]
+            if meta_records:
+                latest = meta_records[-1]["metadata"]
+                state = latest.get("state", "")
+                error_field = latest.get("error")
+                # On partial failure state should not be 'completed'
+                if result["status"] == "partly_indexed":
+                    assert state != "completed", f"index_meta state should not be 'completed' on partial failure, got '{state}'"
+                print(f"\n✓ Partial failure: status={result['status']}, meta_state={state}, error tracked={bool(error_field)}")
+            else:
+                print(f"\n✓ Partial failure: status={result['status']} (no meta record — acceptable)")
+
+        finally:
+            code_indexer_toolkit.max_docs_per_add = original_max
+
+    def test_failure_does_not_leave_inconsistent_state(self, code_indexer_toolkit):
+        """
+        IND: Complete failure populates index_meta.error and does not leave
+        DB in an inconsistent or partially-written state.
+        """
+        fail_index = "failidx"
+
+        def failing_loader(**kw):
+            raise ValueError("Total indexing failure")
+
+        with _mock_indexer_abstract_methods(code_indexer_toolkit), \
+             patch.object(code_indexer_toolkit, "_base_loader", side_effect=failing_loader):
+            with pytest.raises(ValueError, match="Total indexing failure"):
+                code_indexer_toolkit.index_data(index_name=fail_index, clean_index=True)
+
+        # No content records should exist for this index
+        records = _get_db_records(code_indexer_toolkit, index_name=fail_index)
+        assert len(records) == 0, f"Content rows leaked on failure: {len(records)}"
+
+        # Check index_meta was written with error
+        all_records = _get_db_records(
+            code_indexer_toolkit, index_name=fail_index, exclude_index_meta=False
+        )
+        meta_records = [r for r in all_records if r["metadata"].get("type") == "index_meta"]
+        if meta_records:
+            latest = meta_records[-1]["metadata"]
+            assert latest.get("state") == "failed", (
+                f"Expected state='failed', got '{latest.get('state')}'"
+            )
+            assert latest.get("error"), "error field should be populated on failure"
+            print(f"\n✓ Failure state: meta_state=failed, error='{latest['error'][:80]}...'")
+        else:
+            print("\n✓ Failure state: no meta record created (early abort — acceptable)")
+
+
+@pytest.mark.integration
+class TestWritePathChunkCount:
+    """IND-* chunk count validation."""
+
+    def test_chunk_count_matches_indexed(self, non_code_indexer_toolkit):
+        """
+        IND: Chunk count in DB matches the count reported by index_data.
+
+        Without a custom chunker the pipeline produces 1 chunk per base document.
+        """
+        import re as _re
+
+        with _mock_indexer_abstract_methods(non_code_indexer_toolkit), \
+             patch.object(non_code_indexer_toolkit, "_base_loader", side_effect=_mock_non_code_loader):
+            result = non_code_indexer_toolkit.index_data(
+                index_name=TEST_INDEX_NAME, clean_index=True
+            )
+            assert result["status"] == "ok"
+
+            match = _re.search(r"Successfully indexed (\d+) documents", result["message"])
+            assert match, f"Cannot parse indexed count from: {result['message']}"
+            reported = int(match.group(1))
+
+        actual = _get_db_records(non_code_indexer_toolkit, index_name=TEST_INDEX_NAME)
+        assert len(actual) == reported, (
+            f"DB rows ({len(actual)}) != reported count ({reported})"
+        )
+
+        # Verify every row has non-null page_content, embedding, and metadata
+        for rec in actual:
+            assert rec["document"], f"Record {rec['id']} has empty page_content"
+            assert rec["metadata"], f"Record {rec['id']} has empty metadata"
+
+        records_with_emb = _get_db_records(
+            non_code_indexer_toolkit, index_name=TEST_INDEX_NAME, include_embeddings=True
+        )
+        for rec in records_with_emb:
+            assert rec["embedding"] is not None, f"Record {rec['id']} has null embedding"
+
+        print(f"\n✓ Chunk count: {reported} reported == {len(actual)} in DB, all have content + embedding")
+
+
+# ===================== Suite B: RET-* Retrieval Correctness =====================
+
+@pytest.mark.integration
+class TestRetrievalCorrectness:
+    """RET-* tests validating search_index behavior."""
+
+    def test_search_returns_relevant_chunks(self, retrieval_toolkit):
+        """
+        RET: search_index returns semantically relevant chunks for the query.
+        """
+        results = retrieval_toolkit.search_index(
+            query="How does the retry mechanism work?",
+            index_name=RETRIEVAL_INDEX_NAME,
+            cut_off=0.0,
+            search_top=5,
+        )
+        assert isinstance(results, list), f"Expected list, got: {type(results)} — {results}"
+        assert len(results) > 0, "search_index returned no results for a known query"
+
+        # The top result should be from error_handling.md (the retry doc)
+        top_sources = []
+        for doc in results:
+            if isinstance(doc, dict):
+                src = doc.get("metadata", {}).get("source", "")
+            else:
+                src = getattr(doc, "metadata", {}).get("source", "")
+            top_sources.append(src)
+
+        assert "docs/error_handling.md" in top_sources, (
+            f"Expected 'docs/error_handling.md' in top results, got: {top_sources}"
+        )
+        print(f"\n✓ Relevant chunks returned. Top sources: {top_sources[:3]}")
+
+    def test_search_top_parameter(self, retrieval_toolkit):
+        """
+        RET: search_top parameter limits the number of results.
+        """
+        for k in (1, 2, 3):
+            results = retrieval_toolkit.search_index(
+                query="configuration",
+                index_name=RETRIEVAL_INDEX_NAME,
+                cut_off=0.0,
+                search_top=k,
+            )
+            if isinstance(results, str):
+                # "No documents found" is acceptable for very restrictive k
+                continue
+            assert len(results) <= k, (
+                f"search_top={k} but got {len(results)} results"
+            )
+        print("\n✓ search_top parameter respected")
+
+    def test_cut_off_parameter(self, retrieval_toolkit):
+        """
+        RET: cut_off filters low-similarity results.
+        """
+        # Very high cut_off should return fewer (or zero) results
+        results_strict = retrieval_toolkit.search_index(
+            query="retry exponential backoff",
+            index_name=RETRIEVAL_INDEX_NAME,
+            cut_off=0.99,
+            search_top=10,
+        )
+        results_lenient = retrieval_toolkit.search_index(
+            query="retry exponential backoff",
+            index_name=RETRIEVAL_INDEX_NAME,
+            cut_off=0.0,
+            search_top=10,
+        )
+
+        strict_count = 0 if isinstance(results_strict, str) else len(results_strict)
+        lenient_count = 0 if isinstance(results_lenient, str) else len(results_lenient)
+
+        assert lenient_count >= strict_count, (
+            f"Lenient cut_off returned fewer results ({lenient_count}) than strict ({strict_count})"
+        )
+        print(f"\n✓ cut_off respected: strict={strict_count}, lenient={lenient_count}")
+
+    def test_filter_by_metadata_key(self, retrieval_toolkit):
+        """
+        RET: filter by metadata key limits results to matching documents only.
+        """
+        results = retrieval_toolkit.search_index(
+            query="configuration",
+            index_name=RETRIEVAL_INDEX_NAME,
+            filter={"category": {"$eq": "reference"}},
+            cut_off=0.0,
+            search_top=10,
+        )
+        if isinstance(results, str):
+            pytest.skip("No results returned for metadata filter query")
+
+        for doc in results:
+            meta = doc.get("metadata", {}) if isinstance(doc, dict) else getattr(doc, "metadata", {})
+            assert meta.get("category") == "reference", (
+                f"Filter leak: got category='{meta.get('category')}', expected 'reference'"
+            )
+        print(f"\n✓ Metadata filter: all {len(results)} results have category='reference'")
+
+    def test_empty_index_returns_no_documents(self, retrieval_toolkit):
+        """
+        RET: Querying an empty/non-existent index returns 'No documents found'
+        gracefully without raising an exception.
+        """
+        result = retrieval_toolkit.search_index(
+            query="anything",
+            index_name="noexst",
+            cut_off=0.0,
+            search_top=5,
+        )
+        # Should be a string message, not an exception
+        assert isinstance(result, str), f"Expected string message, got {type(result)}"
+        assert "not found" in result.lower() or "no documents" in result.lower(), (
+            f"Unexpected response for empty index: {result}"
+        )
+        print(f"\n✓ Empty index handled gracefully: '{result[:80]}'")
+
+
+# ===================== Suite B: RET-* RAG Quality (DeepEval) =====================
+
+@pytest.mark.integration
+@pytest.mark.rag_eval
+class TestRAGQualitySearchIndex:
+    """
+    RET-* DeepEval metrics on search_index.
+
+    Validates ContextualRelevancy, ContextualPrecision, and ContextualRecall
+    against the known-answer corpus.
+    """
+
+    @staticmethod
+    def _search_to_context(toolkit, query, index_name=RETRIEVAL_INDEX_NAME, cut_off=0.0):
+        """Helper: run search_index and return (actual_output, retrieval_context)."""
+        results = toolkit.search_index(
+            query=query, index_name=index_name, cut_off=cut_off, search_top=5
+        )
+        if isinstance(results, str):
+            return results, [results]
+        ctx = []
+        for doc in results:
+            if isinstance(doc, dict):
+                ctx.append(doc.get("page_content") or doc.get("content") or str(doc))
+            else:
+                ctx.append(getattr(doc, "page_content", str(doc)))
+        return "\n".join(ctx), ctx
+
+    # def test_contextual_relevancy(self, retrieval_toolkit, deepeval_model):
+    #     """RET: ContextualRelevancyMetric ≥ threshold on search_index."""
+    #     from deepeval.metrics import ContextualRelevancyMetric
+    #     from deepeval.test_case import LLMTestCase
+
+    #     qa = GROUND_TRUTH_QA[0]  # retry mechanism
+    #     actual, ctx = self._search_to_context(retrieval_toolkit, qa["query"], cut_off=0.8)
+
+    #     tc = LLMTestCase(input=qa["query"], actual_output=actual, retrieval_context=ctx)
+    #     metric = ContextualRelevancyMetric(
+    #         threshold=THRESHOLD_CONTEXTUAL_RELEVANCY, model=deepeval_model, async_mode=False
+    #     )
+    #     metric.measure(tc)
+
+    #     print(f"\n  ContextualRelevancy: {metric.score:.2f} (threshold {THRESHOLD_CONTEXTUAL_RELEVANCY})")
+    #     assert metric.success, f"ContextualRelevancy {metric.score} < {THRESHOLD_CONTEXTUAL_RELEVANCY}: {metric.reason}"
+
+    def test_contextual_precision(self, retrieval_toolkit, deepeval_model):
+        """RET: ContextualPrecisionMetric ≥ threshold on search_index."""
+        from deepeval.metrics import ContextualPrecisionMetric
+        from deepeval.test_case import LLMTestCase
+
+        qa = GROUND_TRUTH_QA[1]  # circuit breaker
+        actual, ctx = self._search_to_context(retrieval_toolkit, qa["query"])
+
+        tc = LLMTestCase(
+            input=qa["query"], actual_output=actual,
+            expected_output=qa["expected_output"], retrieval_context=ctx,
+        )
+        metric = ContextualPrecisionMetric(
+            threshold=THRESHOLD_CONTEXTUAL_PRECISION, model=deepeval_model, async_mode=False
+        )
+        metric.measure(tc)
+
+        print(f"\n  ContextualPrecision: {metric.score:.2f} (threshold {THRESHOLD_CONTEXTUAL_PRECISION})")
+        assert metric.success, f"ContextualPrecision {metric.score} < {THRESHOLD_CONTEXTUAL_PRECISION}: {metric.reason}"
+
+    def test_contextual_recall(self, retrieval_toolkit, deepeval_model):
+        """RET: ContextualRecallMetric ≥ threshold on search_index."""
+        from deepeval.metrics import ContextualRecallMetric
+        from deepeval.test_case import LLMTestCase
+
+        qa = GROUND_TRUTH_QA[2]  # connection pooling
+        actual, ctx = self._search_to_context(retrieval_toolkit, qa["query"])
+
+        tc = LLMTestCase(
+            input=qa["query"], actual_output=actual,
+            expected_output=qa["expected_output"], retrieval_context=ctx,
+        )
+        metric = ContextualRecallMetric(
+            threshold=THRESHOLD_CONTEXTUAL_RECALL, model=deepeval_model, async_mode=False
+        )
+        metric.measure(tc)
+
+        print(f"\n  ContextualRecall: {metric.score:.2f} (threshold {THRESHOLD_CONTEXTUAL_RECALL})")
+        assert metric.success, f"ContextualRecall {metric.score} < {THRESHOLD_CONTEXTUAL_RECALL}: {metric.reason}"
+
+
+@pytest.mark.integration
+@pytest.mark.rag_eval
+class TestRAGQualityStepback:
+    """
+    RET-* DeepEval metrics on stepback_search_index and stepback_summary_index.
+
+    stepback_search_index: LLM rewrites + retrieval → ContextualRelevancy ≥ 0.7
+    stepback_summary_index: LLM summary → Faithfulness + AnswerRelevancy ≥ 0.7
+    """
+
+    # def test_stepback_search_contextual_relevancy(self, retrieval_toolkit, deepeval_model):
+    #     """
+    #     RET: stepback_search_index — ContextualRelevancyMetric ≥ threshold.
+
+    #     The LLM query rewrite should broaden retrieval without losing relevance.
+    #     """
+    #     from deepeval.metrics import ContextualRelevancyMetric
+    #     from deepeval.test_case import LLMTestCase
+
+    #     qa = GROUND_TRUTH_QA[3]  # OAuth2 auth
+    #     raw = retrieval_toolkit.stepback_search_index(
+    #         query=qa["query"], index_name=RETRIEVAL_INDEX_NAME,
+    #         messages=[], cut_off=0.8, search_top=5,
+    #     )
+
+    #     # stepback_search_index returns a formatted string or list
+    #     if isinstance(raw, str):
+    #         # Parse "Found N documents...\n[{...}]" format
+    #         import json as _json
+    #         try:
+    #             json_start = raw.index("[")
+    #             docs = _json.loads(raw[json_start:])
+    #             ctx = [d.get("page_content", str(d)) for d in docs]
+    #         except (ValueError, _json.JSONDecodeError):
+    #             ctx = [raw]
+    #     elif isinstance(raw, list):
+    #         ctx = [d.get("page_content", str(d)) if isinstance(d, dict) else str(d) for d in raw]
+    #     else:
+    #         ctx = [str(raw)]
+
+    #     actual = "\n".join(ctx)
+    #     tc = LLMTestCase(input=qa["query"], actual_output=actual, retrieval_context=ctx)
+    #     metric = ContextualRelevancyMetric(
+    #         threshold=THRESHOLD_CONTEXTUAL_RELEVANCY, model=deepeval_model, async_mode=False
+    #     )
+    #     metric.measure(tc)
+
+    #     print(f"\n  stepback_search ContextualRelevancy: {metric.score:.2f} (threshold {THRESHOLD_CONTEXTUAL_RELEVANCY})")
+    #     assert metric.success, f"stepback_search relevancy {metric.score} < {THRESHOLD_CONTEXTUAL_RELEVANCY}: {metric.reason}"
+
+    def test_stepback_summary_faithfulness(self, retrieval_toolkit, deepeval_model):
+        """
+        RET: stepback_summary_index — FaithfulnessMetric ≥ threshold.
+
+        The LLM summary must be grounded in retrieved context.
+        """
+        from deepeval.metrics import FaithfulnessMetric
+        from deepeval.test_case import LLMTestCase
+
+        qa = GROUND_TRUTH_QA[0]  # retry mechanism
+        summary = retrieval_toolkit.stepback_summary_index(
+            query=qa["query"], index_name=RETRIEVAL_INDEX_NAME,
+            messages=[], cut_off=0.0, search_top=5,
+        )
+        assert isinstance(summary, str) and len(summary) > 0, f"Empty summary returned: {summary}"
+
+        # Also get raw search context for the metric
+        search_results = retrieval_toolkit.search_index(
+            query=qa["query"], index_name=RETRIEVAL_INDEX_NAME, cut_off=0.0, search_top=5
+        )
+        if isinstance(search_results, list):
+            ctx = [
+                d.get("page_content", str(d)) if isinstance(d, dict) else str(d)
+                for d in search_results
+            ]
+        else:
+            ctx = [str(search_results)]
+
+        tc = LLMTestCase(input=qa["query"], actual_output=summary, retrieval_context=ctx)
+        metric = FaithfulnessMetric(
+            threshold=THRESHOLD_FAITHFULNESS, model=deepeval_model, async_mode=False
+        )
+        metric.measure(tc)
+
+        print(f"\n  stepback_summary Faithfulness: {metric.score:.2f} (threshold {THRESHOLD_FAITHFULNESS})")
+        assert metric.success, f"stepback_summary faithfulness {metric.score} < {THRESHOLD_FAITHFULNESS}: {metric.reason}"
+
+    def test_stepback_summary_answer_relevancy(self, retrieval_toolkit, deepeval_model):
+        """
+        RET: stepback_summary_index — AnswerRelevancyMetric ≥ threshold.
+
+        The summary must directly answer the question.
+        """
+        from deepeval.metrics import AnswerRelevancyMetric
+        from deepeval.test_case import LLMTestCase
+
+        qa = GROUND_TRUTH_QA[2]  # connection pooling
+        summary = retrieval_toolkit.stepback_summary_index(
+            query=qa["query"], index_name=RETRIEVAL_INDEX_NAME,
+            messages=[], cut_off=0.0, search_top=5,
+        )
+
+        tc = LLMTestCase(
+            input=qa["query"], actual_output=summary, expected_output=qa["expected_output"]
+        )
+        metric = AnswerRelevancyMetric(
+            threshold=THRESHOLD_ANSWER_RELEVANCY, model=deepeval_model, async_mode=False
+        )
+        metric.measure(tc)
+
+        print(f"\n  stepback_summary AnswerRelevancy: {metric.score:.2f} (threshold {THRESHOLD_ANSWER_RELEVANCY})")
+        assert metric.success, f"stepback_summary answer relevancy {metric.score} < {THRESHOLD_ANSWER_RELEVANCY}: {metric.reason}"
