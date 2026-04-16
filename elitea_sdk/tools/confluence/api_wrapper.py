@@ -979,6 +979,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         """
         from .loader import EliteAConfluenceLoader
         from copy import copy
+
+        # Initialize indexing stats for this run
+        self._init_indexing_stats()
+
         content_format = kwargs.get('content_format', 'view').lower()
 
         self._index_include_attachments = kwargs.get('include_attachments', False)
@@ -1012,6 +1016,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         for document in loader._lazy_load(kwargs={}):
             if 'updated_on' not in document.metadata and 'when' in document.metadata:
                 document.metadata['updated_on'] = document.metadata['when']
+            self._track_processed_item()
             yield document
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
@@ -1041,6 +1046,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     # Check if file should be skipped based on skip_extensions
                     if any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', title, re.IGNORECASE)
                            for pattern in self._skip_extensions):
+                        self._track_skipped_attachment(title, reason="extension")
                         continue
 
                     # Check if file should be included based on include_extensions
@@ -1048,6 +1054,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     if self._include_extensions and not (
                     any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', title, re.IGNORECASE)
                         for pattern in self._include_extensions)):
+                        self._track_skipped_attachment(title, reason="extension")
                         continue
 
                     media_type = attachment.get('metadata', {}).get('mediaType', '')

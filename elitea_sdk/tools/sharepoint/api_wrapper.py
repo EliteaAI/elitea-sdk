@@ -883,6 +883,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._sync_backend_context()
+
+        # Initialize indexing stats for this run
+        self._init_indexing_stats()
+
         # Normalise onenote_filter (already a dict or None) and inject top-level
         # extension filters so include_extensions / skip_extensions apply uniformly
         # to both SharePoint files and OneNote attachments.
@@ -922,6 +926,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     ("updated_on" if k == "Modified" else k): str(v)
                     for k, v in file.items()
                 }
+                self._track_processed_item()
                 yield Document(page_content="", metadata=metadata)
 
         # ── OneNote pages ─────────────────────────────────────────────

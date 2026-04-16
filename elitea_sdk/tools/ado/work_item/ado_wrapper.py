@@ -725,8 +725,10 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"An unexpected error occurred while unlinking work items from wiki page '{page_name}': {str(e)}")
 
     def _base_loader(self, wiql: str, **kwargs) -> Generator[Document, None, None]:
+        self._init_indexing_stats()
         ref_items = self._client.query_by_wiql(Wiql(query=wiql)).work_items
         for ref in ref_items:
+            self._track_processed_item()
             wi = self._client.get_work_item(id=ref.id, project=self.project, expand='all')
             yield Document(page_content=json.dumps(wi.fields), metadata={
                 'id': str(wi.id),
