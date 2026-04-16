@@ -19,6 +19,7 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import is_cookie_token, parse_cookie_string, get_file_bytes_from_artifact, detect_mime_type
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker, process_content_by_type
+from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
@@ -421,9 +422,11 @@ def process_search_response(jira_url, response, payload_params: Dict[str, Any] =
 
     return str(processed_issues)
 
+
+
 class JiraApiWrapper(NonCodeIndexerToolkit):
     base_url: str
-    api_version: Optional[str] = "2",
+    api_version: Optional[str] = "auto"
     api_key: Optional[SecretStr] = None,
     username: Optional[str] = None
     token: Optional[SecretStr] = None
@@ -452,6 +455,19 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         additional_fields = values.get('additional_fields')
         if isinstance(additional_fields, str):
             values['additional_fields'] = [i.strip() for i in additional_fields.split(',')]
+
+        # Resolve cloud from 'hosting' field when toolkit-level cloud is not explicitly set
+        # (the 'hosting' field comes from the credential configuration)
+        if values.get('cloud') is None and 'hosting' in values:
+            from ...configurations.utils import _hosting_to_cloud
+            values['cloud'] = _hosting_to_cloud(values.get('hosting'), values.get('base_url'))
+
+        # Resolve 'auto' api_version to concrete '2' or '3'
+        values['api_version'] = _resolve_api_version(
+            values.get('api_version', 'auto'),
+            values.get('cloud'),
+            values.get('base_url'),
+        )
 
         cls.llm = values.get('llm')
         return super().validate_toolkit(values)

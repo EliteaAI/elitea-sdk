@@ -23,9 +23,11 @@ from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from elitea_sdk.tools.utils.available_tools_decorator import extend_with_parent_available_tools
 from ..llm.img_utils import ImageDescriptionCache
 from ..utils import is_cookie_token, parse_cookie_string
+from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
 
 createPage = create_model(
     "createPage",
@@ -193,6 +195,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     username: Optional[str] = None
     token: Optional[SecretStr] = None
     cloud: Optional[bool] = True
+    api_version: Optional[str] = "auto"
     limit: Optional[int] = 5
     labels: Optional[List[str]] = []
     space: Optional[str] = None
@@ -226,6 +229,12 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         if not (values.get('token') or (values.get('api_key') and values.get('username'))):
             raise ValueError("Either 'token' or both 'api_key' and 'username' must be provided for authentication.")
 
+        # Resolve cloud from 'hosting' field when toolkit-level cloud is not explicitly set
+        # (the 'hosting' field comes from the credential configuration, merged into the payload)
+        if values.get('cloud') is None and 'hosting' in values:
+            from ...configurations.utils import _hosting_to_cloud
+            values['cloud'] = _hosting_to_cloud(values.get('hosting'), values.get('base_url') or url)
+
         # Normalize base_url: For Atlassian Cloud, strip /wiki suffix to prevent duplication
         # The _build_page_url method will add /wiki as needed
         cloud = values.get('cloud', True)
@@ -235,6 +244,13 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             url = url.rstrip('/')[:-5]  # Remove '/wiki'
             values['base_url'] = url
             logger.info(f"Normalized Confluence base_url by removing /wiki suffix: {url}")
+
+        # Resolve 'auto' api_version to concrete '2' or '3'
+        values['api_version'] = _resolve_api_version(
+            values.get('api_version', 'auto'),
+            cloud,
+            url,
+        )
 
         api_key = values.get('api_key')
         username = values.get('username')
