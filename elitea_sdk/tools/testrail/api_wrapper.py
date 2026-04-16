@@ -386,19 +386,33 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         cls._client = TestRailAPI(url, email, password)
         return super().validate_toolkit(values)
 
+    @staticmethod
+    def _format_status_error(e: StatusCodeError) -> str:
+        """Extracts a human-readable message from StatusCodeError."""
+        try:
+            status_code = e.args[0] if e.args else 'Unknown'
+            content = e.args[3] if len(e.args) > 3 else b''
+            if isinstance(content, bytes):
+                content = content.decode('utf-8', errors='replace')
+            error_data = json.loads(content)
+            detail = error_data.get('error', content)
+        except (json.JSONDecodeError, IndexError, TypeError):
+            detail = str(e)
+            status_code = ''
+        if status_code:
+            return f"TestRail API error {status_code}: {detail}"
+        return f"TestRail API error: {detail}"
+
     def _is_suite_id_required(self, project_id: str) -> bool:
         """
         Returns True if project requires suite_id (multiple suite or baselines mode), otherwise False.
         Args:
             project_id: The TestRail project ID to check
         """
-        try:
-            project = self._client.projects.get_project(project_id=project_id)
-            # 1 for single suite mode, 2 for single suite + baselines, 3 for multiple suites
-            suite_mode = project.get('suite_mode', 1)
-            return suite_mode == 2 or suite_mode == 3
-        except StatusCodeError:
-            return False
+        project = self._client.projects.get_project(project_id=project_id)
+        # 1 for single suite mode, 2 for single suite + baselines, 3 for multiple suites
+        suite_mode = project.get('suite_mode', 1)
+        return suite_mode == 2 or suite_mode == 3
 
     def _fetch_cases_with_suite_handling(
         self, 
@@ -554,15 +568,9 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             # Use unified suite handling method
             cases = self._fetch_cases_with_suite_handling(project_id=project_id, suite_id=suite_id)
 
-            if not cases:
-                return ToolException("No test cases found in the extracted data.")
-
             extracted_cases_data = [
                 {key: case.get(key, "N/A") for key in keys} for case in cases
             ]
-
-            if not extracted_cases_data:
-                return ToolException("No valid test case data found to format.")
 
             result = self._to_markup(extracted_cases_data, output_format)
 
@@ -571,7 +579,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
             return result
         except StatusCodeError as e:
-            return ToolException(f"Unable to extract testcases {e}")
+            return ToolException(self._format_status_error(e))
 
     def get_cases_by_filter(
         self,
@@ -621,9 +629,6 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
             self._log_tool_event(message="Test cases were extracted", tool_name='get_cases_by_filter')
 
-            if not cases:
-                return ToolException("No test cases found in the extracted data.")
-
             if keys is None:
                 return self._to_markup(cases, output_format)
 
@@ -636,9 +641,6 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 if case_dict:
                     extracted_cases_data.append(case_dict)
 
-            if not extracted_cases_data:
-                return ToolException("No valid test case data found to format.")
-
             result = self._to_markup(extracted_cases_data, output_format)
 
             if invalid_keys:
@@ -646,7 +648,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
             return result
         except StatusCodeError as e:
-            return ToolException(f"Unable to extract test cases: {e}")
+            return ToolException(self._format_status_error(e))
         except (ValueError, json.JSONDecodeError) as e:
             return ToolException(f"Invalid parameter for json_case_arguments: {e}")
 
