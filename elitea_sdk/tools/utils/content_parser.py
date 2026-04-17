@@ -369,9 +369,38 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                     for key in set(users_config_for_extension.keys()) & set(allowed_to_override.keys()):
                         if users_config_for_extension[key] != allowed_to_override[key]:
                             loader_kwargs[key] = users_config_for_extension[key]
-                if LoaderProperties.LLM.value in loader_kwargs and loader_kwargs.pop(LoaderProperties.LLM.value):
+                # Determine use_llm: check user config first, then allowed_to_override defaults
+                use_llm_key = LoaderProperties.LLM.value
+                use_llm = False
+                if use_llm_key in loader_kwargs:
+                    use_llm = loader_kwargs.pop(use_llm_key)
+                elif chunking_config:
+                    users_config = chunking_config.get(extension, {})
+                    if use_llm_key in users_config:
+                        use_llm = users_config[use_llm_key]
+                    elif use_llm_key in allowed_to_override:
+                        use_llm = allowed_to_override[use_llm_key]
+                elif use_llm_key in allowed_to_override:
+                    use_llm = allowed_to_override[use_llm_key]
+                if use_llm and llm:
                     loader_kwargs['llm'] = llm
-                if LoaderProperties.PROMPT_DEFAULT.value in loader_kwargs and loader_kwargs.pop(LoaderProperties.PROMPT_DEFAULT.value):
+                    logger.debug(f"LLM enabled for {extension} via use_llm={use_llm}")
+                elif use_llm and not llm:
+                    logger.warning(f"use_llm=True for {extension} but llm instance is None - falling back to OCR")
+                # Determine use_default_prompt: check user config first, then allowed_to_override defaults
+                use_prompt_key = LoaderProperties.PROMPT_DEFAULT.value
+                use_default_prompt = False
+                if use_prompt_key in loader_kwargs:
+                    use_default_prompt = loader_kwargs.pop(use_prompt_key)
+                elif chunking_config:
+                    users_config = chunking_config.get(extension, {})
+                    if use_prompt_key in users_config:
+                        use_default_prompt = users_config[use_prompt_key]
+                    elif use_prompt_key in allowed_to_override:
+                        use_default_prompt = allowed_to_override[use_prompt_key]
+                elif use_prompt_key in allowed_to_override:
+                    use_default_prompt = allowed_to_override[use_prompt_key]
+                if use_default_prompt:
                     loader_kwargs[LoaderProperties.PROMPT.value] = image_processing_prompt
                 loader = loader_cls(file_path=temp_file_path, **loader_kwargs)
                 yield from loader.load()

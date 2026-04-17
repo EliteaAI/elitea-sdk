@@ -257,13 +257,15 @@ def propagate_the_input_mapping(input_mapping: dict[str, dict], input_variables:
         if value['type'] == 'fstring':
             try:
                 input_data[key] = value['value'].format(**var_dict)
-            except KeyError as e:
-                logger.error(f"KeyError in fstring formatting for key '{key}'. Attempt to find proper data in state.\n{e}")
+            except (KeyError, IndexError) as e:
+                # KeyError: named placeholder not found in var_dict
+                # IndexError: positional placeholder {0} or {} used but no positional args provided
+                logger.warning(f"Format error in fstring for key '{key}': {type(e).__name__}: {e}. Attempting safe_format with state.")
                 try:
                     # search for variables in state if not found in var_dict
                     input_data[key] = safe_format(value['value'], state)
-                except KeyError as no_var_exception:
-                    logger.error(f"KeyError in fstring formatting for key '{key}' with state data.\n{no_var_exception}")
+                except (KeyError, IndexError) as no_var_exception:
+                    logger.warning(f"Format error in fstring for key '{key}' with state data: {no_var_exception}. Using original value.")
                     # leave value as is if still not found (could be a constant string marked as fstring by mistake)
                     input_data[key] = value['value']
         elif value['type'] == 'fixed':
