@@ -313,6 +313,28 @@ code_extensions = [
     '.dart',  # Dart
     '.groovy',  # Groovy
     '.sql',  # SQL
+    '.yml',  # YAML
+    '.yaml',  # YAML
+    '.jsx',  # React JSX
+    '.tsx',  # React TypeScript
+    '.mjs',  # ES Module JavaScript
+    '.cjs',  # CommonJS JavaScript
+    '.hs',  # Haskell
+    '.bash',  # Bash
+    '.zsh',  # Zsh
+    '.pm',  # Perl module
+    '.toml',  # TOML config
+    '.ini',  # INI config
+    '.cfg',  # Config files
+    '.conf',  # Config files
+    '.env',  # Environment files
+]
+
+# Text-based documentation files common in repositories
+text_extensions = [
+    '.txt',  # Plain text (README, LICENSE, etc.)
+    '.xml',  # XML (pom.xml, web.xml, configs)
+    '.csv',  # CSV data files
 ]
 
 default_loader_config = {
@@ -324,13 +346,15 @@ default_loader_config = {
 }
 
 code_loaders_map = {ext: default_loader_config for ext in code_extensions}
+text_loaders_map = {ext: default_loader_config for ext in text_extensions}
 
 # Combined mapping for backward compatibility
 loaders_map = {
     **image_loaders_map,
     **image_loaders_map_converted,
     **document_loaders_map,
-    **code_loaders_map
+    **code_loaders_map,
+    **text_loaders_map
 }
 
 loaders_allowed_to_override = {

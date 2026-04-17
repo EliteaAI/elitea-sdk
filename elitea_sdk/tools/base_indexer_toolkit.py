@@ -24,9 +24,17 @@ class IndexingStats:
     """
     Tracks statistics during indexing process.
     Used by both CodeIndexerToolkit and NonCodeIndexerToolkit.
+
+    Terminology:
+    - total_fetched: All items initially fetched/considered from source
+    - items_processed: Items successfully processed and yielded (after filtering)
+    - total_skipped: Items that were filtered out or failed
+
+    Invariant: total_fetched = items_processed + total_skipped
     """
     # Common counters
     items_processed: int = 0
+    total_fetched: int = 0  # All items from source before any filtering
 
     # For code toolkits (files)
     files_skipped_whitelist: List[str] = field(default_factory=list)
@@ -59,6 +67,7 @@ class IndexingStats:
 
         return {
             "items_processed": self.items_processed,
+            "total_fetched": self.total_fetched,
             "total_skipped": total_skipped,
             "files_skipped": {
                 "count": files_skipped_count,
@@ -807,12 +816,29 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Attach skipped items data if provided
             if skipped is not None:
                 metadata["skipped"] = json.dumps(skipped)
-                # total = total number of items initially passed for indexing
-                # indexed = number of successfully processed documents (items_processed - total_skipped)
                 items_processed = skipped.get("items_processed", 0)
                 total_skipped = skipped.get("total_skipped", 0)
-                metadata["total"] = items_processed
-                metadata["indexed"] = items_processed - total_skipped
+                total_fetched = skipped.get("total_fetched", 0)
+
+                # Consistent formula for both code and non-code indexers:
+                # - total = all items initially fetched/considered from source
+                # - indexed = items successfully processed (total - skipped)
+                #
+                # If total_fetched is set, use it. Otherwise fall back to heuristic:
+                # - If total_skipped > items_processed, they're disjoint (code indexer)
+                # - Otherwise items_processed includes all fetched items (non-code indexer)
+                if total_fetched > 0:
+                    # Explicit total_fetched provided
+                    metadata["total"] = total_fetched
+                    metadata["indexed"] = total_fetched - total_skipped
+                elif total_skipped > items_processed:
+                    # Code indexer: items_processed and total_skipped are disjoint
+                    metadata["total"] = items_processed + total_skipped
+                    metadata["indexed"] = items_processed
+                else:
+                    # Non-code indexer: items_processed is all fetched, skipped is subset
+                    metadata["total"] = items_processed
+                    metadata["indexed"] = items_processed - total_skipped
             else:
                 # Fallback: if no skipped data, use chunks count for backward compatibility
                 metadata["indexed"] = metadata["indexed_chunks"]
