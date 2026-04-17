@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Iterator
+from io import StringIO
+from typing import List, Optional, Iterator, Any
 from charset_normalizer import from_path, from_bytes
 from csv import DictReader
 from .EliteATableLoader import EliteATableLoader
-from typing import Any
 
 class EliteACSVLoader(EliteATableLoader):
     def __init__(self,
@@ -41,7 +41,9 @@ class EliteACSVLoader(EliteATableLoader):
     def read_lazy(self) -> Iterator[dict]:
         with open(self.file_path, 'r', encoding=self.encoding) as fd:
             if self.raw_content:
-                yield fd.read()
+                content = fd.read()
+                if content:
+                    yield content
                 return
             for row in DictReader(fd):
                 yield row
@@ -50,8 +52,11 @@ class EliteACSVLoader(EliteATableLoader):
         if self.file_path:
             with open(self.file_path, 'r', encoding=self.encoding) as fd:
                 if self.raw_content:
-                    return [fd.read()]
+                    content = fd.read()
+                    return [content] if content else []
                 return list(DictReader(fd))
         else:
-            super.row_content = True
-            return self.file_content
+            decoded = self.file_content.decode(self.encoding)
+            if self.raw_content:
+                return [decoded] if decoded else []
+            return list(DictReader(StringIO(decoded)))
