@@ -131,7 +131,7 @@ Use this flowchart to categorize any toolkit directory:
 
 ### Step 2: Inspect Directory Structure
 
-List contents of `elitea_sdk/tools/{toolkit}/`:
+List contents of `alita_sdk/tools/{toolkit}/`:
 
 ```
 Case A: Has subdirectories (cloud/, ado/, google/, etc.)
@@ -195,7 +195,7 @@ Provide classification in this format:
   "toolkit": "github",
   "category": "user-facing",
   "domain": "Version Control",
-  "location": "elitea_sdk/tools/github/",
+  "location": "alita_sdk/tools/github/",
   "reason": "Has api_wrapper.py with 15 tools in get_available_tools()",
   "requires_tests": true,
   "wrapper_file": "api_wrapper.py",
@@ -208,7 +208,7 @@ Provide classification in this format:
 {
   "toolkit": "chunkers",
   "category": "framework-utility",
-  "location": "elitea_sdk/tools/chunkers/",
+  "location": "alita_sdk/tools/chunkers/",
   "reason": "Provides document chunking utilities, no user-facing tools",
   "requires_tests": false,
   "purpose": "Document chunking strategies for vector indexing"
@@ -220,7 +220,7 @@ Provide classification in this format:
 {
   "toolkit": "cloud",
   "category": "container",
-  "location": "elitea_sdk/tools/cloud/",
+  "location": "alita_sdk/tools/cloud/",
   "reason": "Container directory for cloud provider toolkits",
   "sub_toolkits": ["aws", "azure", "gcp", "k8s"],
   "action": "Analyze each sub-toolkit separately"
@@ -245,7 +245,7 @@ tools/browser/
 
 **Example**: `cloud/aws/` or `ado/repos/`
 
-**Path**: `elitea_sdk/tools/cloud/aws/`
+**Path**: `alita_sdk/tools/cloud/aws/`
 
 **Classification**: User-Facing (treat as independent toolkit)
 
