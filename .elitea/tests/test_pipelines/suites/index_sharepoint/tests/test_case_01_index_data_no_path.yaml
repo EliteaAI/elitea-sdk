@@ -21,8 +21,6 @@ state:
     type: dict
   search_result:
     type: dict
-  truncated_search_result:
-    type: dict
   test_results:
     type: dict
 
@@ -67,33 +65,6 @@ nodes:
     output:
       - search_result
     structured_output: true
-    transition: truncate_content
-
-  - id: truncate_content
-    type: code
-    code:
-      type: fixed
-      value: |
-        import copy
-        
-        # Get the original search result
-        search_result = elitea_state.get('search_result', [])
-        
-        # Deep copy to avoid modifying original
-        truncated = copy.deepcopy(search_result)
-        
-        # Truncate page_content in each document to 10 chars
-        for doc in truncated:
-            if 'page_content' in doc:
-                original_length = len(doc['page_content'])
-                doc['page_content'] = doc['page_content'][:10]
-        
-        {"truncated_search_result": truncated}
-    input:
-      - search_result
-    output:
-      - truncated_search_result
-    structured_output: true
     transition: validate_result
 
   - id: validate_result
@@ -101,21 +72,19 @@ nodes:
     model: gpt-4o-2024-11-20
     input:
       - index_result
-      - truncated_search_result
+      - search_result
     input_mapping:
       system:
         type: fixed
-        value: "You are a quality assurance validator."
+        value: "You are a quality assurance validator. Be concise. Do NOT echo or repeat the full tool output in your response."
       task:
         type: fstring
         value: |
           Analyze the output from the 'index_data' tool and search results.
-          
-          Note: page_content has been truncated to 10 chars to reduce token usage.
-          The original content length is stored in metadata.original_content_length.
+          Do NOT echo or repeat the full content of search_result in your response.
 
           Index Result: {index_result}
-          Search Result: {truncated_search_result}
+          Search Result (first 3 items only for reference): {search_result}
 
           Expected behavior:
           1. Indexing completed successfully (status: ok)
@@ -125,19 +94,13 @@ nodes:
           Validation rules:
           1. Check index_result has "status": "ok"
           2. Check index_result message indicates successful indexing
-          3. Verify truncated_search_result is not empty and contains document list
+          3. Verify search_result is not empty and contains document list
           4. Confirm at least one document was indexed and is searchable
-          5. Verify documents have not empty metadata (Name, Path, etc.)
+          5. Verify documents have non-empty metadata (Name, Path, etc.)
           6. All validations must pass for test to pass
 
-          return a json object with:
-          {{
-            "test_passed": true/false,
-            "summary": "brief description including number of documents found",
-            "error": "error details if failed, null if passed"
-          }}
-
-          return **only** the json object. no markdown formatting, no additional text.
+          Return ONLY a compact JSON object (no markdown, no extra text, keep response under 200 tokens):
+          {{"test_passed": true/false, "summary": "brief 1-sentence description", "error": "error details if failed, null if passed"}}
       chat_history:
         type: fixed
         value: []
