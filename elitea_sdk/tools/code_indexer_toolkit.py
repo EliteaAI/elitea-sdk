@@ -133,19 +133,6 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         else:
             self._indexing_stats = IndexingStats()
 
-        # Auto-include extensions from chunking_config if whitelist is specified
-        # This allows chunking config to work without manually adding extensions to whitelist
-        if chunking_config and whitelist:
-            for ext_pattern in chunking_config.keys():
-                # Normalize extension pattern (both ".cbl" and "*.cbl" should work)
-                normalized = ext_pattern if ext_pattern.startswith('*') else f'*{ext_pattern}'
-                if normalized not in whitelist:
-                    whitelist.append(normalized)
-                    self._log_tool_event(
-                        message=f"Auto-included extension '{normalized}' from chunking_config",
-                        tool_name="loader"
-                    )
-
         _files = self.__handle_get_files("", self.__get_branch(branch))
 
         def is_whitelisted(file_path: str) -> bool:
