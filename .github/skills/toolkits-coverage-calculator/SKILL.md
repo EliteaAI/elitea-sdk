@@ -1,11 +1,11 @@
 ---
-name: "coverage-calculator"
-description: "Calculate which toolkit API-wrapper tools have YAML test cases in .elitea/tests/test_pipelines/suites/, update test_coverage.md, and identify untested tools. Use ONLY for toolkit-level tool coverage (counting tools vs test cases). Do NOT use for running coverage.py or measuring Python code execution — use pytest-coverage for that."
+name: "toolkits-coverage-calculator"
+description: "Calculate which toolkit API-wrapper tools have YAML test cases in .alita/tests/test_pipelines/suites/, update test_coverage.md, and identify untested tools. Use ONLY for toolkit-level tool coverage (counting tools vs test cases). Do NOT use for running coverage.py or measuring Python code execution — use pytest-coverage for that."
 ---
 
 # Coverage Calculator Skill
 
-This skill analyzes test coverage for ELITEA SDK toolkits by examining source code and test suites. It provides accurate metrics based on actual file system state.
+This skill analyzes test coverage for ALITA SDK toolkits by examining source code and test suites. It provides accurate metrics based on actual file system state.
 
 ## When to Use This Skill
 
@@ -19,10 +19,10 @@ This skill analyzes test coverage for ELITEA SDK toolkits by examining source co
 
 | Path | Purpose |
 |------|----------|
-| `elitea_sdk/tools/` | Toolkit source code (tool definitions) |
-| `.elitea/tests/test_pipelines/suites/` | Test suites (YAML test cases) |
-| `.elitea/tests/test_pipelines/test_coverage.md` | Coverage report (output) |
-| `elitea_sdk/runtime/tools/` | Runtime framework tools (excluded from coverage) |
+| `alita_sdk/tools/` | Toolkit source code (tool definitions) |
+| `.alita/tests/test_pipelines/suites/` | Test suites (YAML test cases) |
+| `.alita/tests/test_pipelines/test_coverage.md` | Coverage report (output) |
+| `alita_sdk/runtime/tools/` | Runtime framework tools (excluded from coverage) |
 
 ## Core Procedures
 
@@ -101,7 +101,7 @@ Overall Coverage % = (Toolkits with Tests / Total User-Facing Toolkits) × 100
 ## Report Output Format
 
 The coverage report should be updated at:  
-`.elitea/tests/test_pipelines/test_coverage.md`
+`.alita/tests/test_pipelines/test_coverage.md`
 
 **Required Sections**:
 1. **Executive Summary**: High-level metrics table
@@ -122,7 +122,7 @@ The coverage report should be updated at:
 
 ## Example Workflow
 
-1. **Scan** `elitea_sdk/tools/` for all toolkit directories
+1. **Scan** `alita_sdk/tools/` for all toolkit directories
 2. **Categorize** each toolkit using [categorize-toolkit.md](./categorize-toolkit.md)
 3. **Count tools** for each user-facing toolkit using [count-tools.md](./count-tools.md)
 4. **Count tests** for each test suite using [count-tests.md](./count-tests.md)

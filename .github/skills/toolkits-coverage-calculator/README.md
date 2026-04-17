@@ -1,6 +1,6 @@
 # Coverage Calculator Skills
 
-This directory contains VS Code Copilot agent skills for analyzing test coverage in the ELITEA SDK.
+This directory contains VS Code Copilot agent skills for analyzing test coverage in the ALITA SDK.
 
 ## Overview
 
@@ -29,7 +29,7 @@ Three specialized procedures that break down the coverage analysis process:
 **Output**: Tool count, tool list, disabled tools
 
 **Key Steps**:
-- Locate toolkit directory in `elitea_sdk/tools/`
+- Locate toolkit directory in `alita_sdk/tools/`
 - Find wrapper file (`api_wrapper.py` or similar)
 - Parse `get_available_tools()` method
 - Count active (non-commented) tools
@@ -42,7 +42,7 @@ Three specialized procedures that break down the coverage analysis process:
 **Output**: Test count, test file list
 
 **Key Steps**:
-- Locate suite directory in `.elitea/tests/test_pipelines/suites/`
+- Locate suite directory in `.alita/tests/test_pipelines/suites/`
 - List files in `tests/` subdirectory
 - Filter for `test_case_*.yaml` pattern
 - Count matching files (actual count, not estimated)
@@ -104,11 +104,11 @@ Overall Coverage % = (Toolkits with Tests / Total User-Facing Toolkits) × 100
 
 | Path | Purpose |
 |------|----------|
-| `elitea_sdk/tools/` | Toolkit source code |
-| `elitea_sdk/tools/{toolkit}/api_wrapper.py` | Tool definitions |
-| `.elitea/tests/test_pipelines/suites/` | Test suites |
-| `.elitea/tests/test_pipelines/suites/{suite}/tests/` | Test case YAML files |
-| `.elitea/tests/test_pipelines/test_coverage.md` | Coverage report output |
+| `alita_sdk/tools/` | Toolkit source code |
+| `alita_sdk/tools/{toolkit}/api_wrapper.py` | Tool definitions |
+| `.alita/tests/test_pipelines/suites/` | Test suites |
+| `.alita/tests/test_pipelines/suites/{suite}/tests/` | Test case YAML files |
+| `.alita/tests/test_pipelines/test_coverage.md` | Coverage report output |
 
 ## Skills Best Practices
 
@@ -135,8 +135,8 @@ Overall Coverage % = (Toolkits with Tests / Total User-Facing Toolkits) × 100
 ## Related Documentation
 
 - **Agent Definition**: `.github/agents/test-coverage-analyzer.agent.md`
-- **Test Framework**: `.elitea/tests/test_pipelines/README.md`
-- **Coverage Report**: `.elitea/tests/test_pipelines/test_coverage.md`
+- **Test Framework**: `.alita/tests/test_pipelines/README.md`
+- **Coverage Report**: `.alita/tests/test_pipelines/test_coverage.md`
 - **VS Code Copilot Skills**: https://code.visualstudio.com/docs/copilot/customization/agent-skills
 
 ## Usage Examples
@@ -159,8 +159,8 @@ Overall Coverage % = (Toolkits with Tests / Total User-Facing Toolkits) × 100
 **Command**: "Show coverage details for postman toolkit"
 
 **Process**:
-1. Uses [count-tools.md](./count-tools.md) on `elitea_sdk/tools/postman/`
-2. Uses [count-tests.md](./count-tests.md) on `.elitea/tests/test_pipelines/suites/postman_toolkit/`
+1. Uses [count-tools.md](./count-tools.md) on `alita_sdk/tools/postman/`
+2. Uses [count-tests.md](./count-tests.md) on `.alita/tests/test_pipelines/suites/postman_toolkit/`
 3. Calculates coverage percentage
 4. Identifies which tools are tested/untested
 

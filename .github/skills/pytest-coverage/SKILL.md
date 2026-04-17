@@ -5,7 +5,7 @@ description: "Run coverage.py with pytest to measure Python source code executio
 
 # Pytest Coverage Skill
 
-This skill covers running **branch coverage** with `coverage.py` against any Python source module in the EliteA SDK. It tells you which lines and branches are never executed.
+This skill covers running **branch coverage** with `coverage.py` against any Python source module in the Alita SDK. It tells you which lines and branches are never executed.
 
 ---
 
@@ -30,7 +30,7 @@ source venv/Scripts/activate
 pip install coverage pytest
 ```
 
-> **Do NOT use `pytest --cov=`** — it triggers circular import errors on import of `elitea_sdk`. Always use the `coverage run` wrapper instead.
+> **Do NOT use `pytest --cov=`** — it triggers circular import errors on import of `alita_sdk`. Always use the `coverage run` wrapper instead.
 
 ---
 
@@ -40,7 +40,7 @@ pip install coverage pytest
 
 ```bash
 source venv/Scripts/activate && \
-python -m coverage run --branch --source=elitea_sdk \
+python -m coverage run --branch --source=alita_sdk \
   -m pytest <test_file> -q --no-header --no-cov 2>&1; \
 python -m coverage report --include="*/path/to/source.py" -m 2>&1
 ```
@@ -51,7 +51,7 @@ Replace `*/path/to/source.py` with a glob matching only the source file(s) under
 > **Key rules:**
 > - Use `;` (not `&&`) between `coverage run` and `coverage report` so the report runs even when tests fail.
 > - **Do NOT** run `pytest` separately before coverage — the coverage run IS the test run.
-> - **Do NOT** use `pytest --cov=`** — it triggers circular import errors on import of `elitea_sdk`.
+> - **Do NOT** use `pytest --cov=`** — it triggers circular import errors on import of `alita_sdk`.
 > - Always pass `--include` to filter the report to only the files you care about.
 
 ---
@@ -65,14 +65,14 @@ python -m coverage report \
   --include="*/path/to/source1.py,*/path/to/source2.py" -m
 ```
 
-Use `--include` to filter to only the module(s) you care about. Without it the report covers all of `elitea_sdk`.
+Use `--include` to filter to only the module(s) you care about. Without it the report covers all of `alita_sdk`.
 
 ### Report columns explained
 
 ```
 Name                          Stmts   Miss Branch BrPart  Cover   Missing
 -------------------------------------------------------------------------
-elitea_sdk/.../security.py      156     71     56      9    50%   84-91, 113-134, ...
+alita_sdk/.../security.py      156     71     56      9    50%   84-91, 113-134, ...
 ```
 
 | Column | Meaning |
@@ -128,9 +128,9 @@ After writing new tests, re-run the same two commands from Steps 1 and 2 to conf
 |---|---|
 | Running pytest separately before coverage to "check if tests pass" | Don't — `coverage run` IS the test run. Combine with `;` and let it run regardless of failures |
 | Using `&&` between `coverage run` and `coverage report` | Use `;` so `coverage report` always runs even when tests fail |
-| Using `pytest --cov=elitea_sdk` | Use `coverage run --branch --source=elitea_sdk -m pytest ...` instead |
+| Using `pytest --cov=alita_sdk` | Use `coverage run --branch --source=alita_sdk -m pytest ...` instead |
 | Forgetting `--branch` | Without it, only statement coverage is measured; partial branches are invisible |
-| Reporting without `--include` | The full `elitea_sdk` report is noisy; filter to the specific files under test |
+| Reporting without `--include` | The full `alita_sdk` report is noisy; filter to the specific files under test |
 | Treating 100% coverage as "done" | Coverage only proves paths were executed, not that the assertions are correct |
 
 ---
@@ -140,7 +140,7 @@ After writing new tests, re-run the same two commands from Steps 1 and 2 to conf
 ```bash
 # Run coverage
 source venv/Scripts/activate
-python -m coverage run --branch --source=elitea_sdk \
+python -m coverage run --branch --source=alita_sdk \
   -m pytest tests/path/to/test_module.py -q --no-header --no-cov
 
 # Terminal report (with missing line numbers)

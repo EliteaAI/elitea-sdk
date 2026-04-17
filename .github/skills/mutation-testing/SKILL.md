@@ -5,7 +5,7 @@ description: "Set up, run, and interpret cosmic-ray mutation tests against Pytho
 
 # Mutation Testing Skill
 
-This skill covers setting up and running mutation testing with **cosmic-ray** against any Python source module in the EliteA SDK, using Docker workers for parallel execution. It captures the exact workflow, pitfalls, and fixes discovered during the initial setup.
+This skill covers setting up and running mutation testing with **cosmic-ray** against any Python source module in the Alita SDK, using Docker workers for parallel execution. It captures the exact workflow, pitfalls, and fixes discovered during the initial setup.
 
 ---
 
@@ -66,7 +66,7 @@ pip install cosmic-ray
 
 ### One-Time Windows Fix (REQUIRED before first run)
 
-`cosmic-ray`'s HTTP distributor serializes module paths with `str(mutation.module_path)`. On Windows this produces `WindowsPath` backslashes (`elitea_sdk\runtime\...\module.py`). Linux Docker workers receive that string, wrap it in `Path()`, and fail with `FileNotFoundError` because on Linux `\` is not a path separator.
+`cosmic-ray`'s HTTP distributor serializes module paths with `str(mutation.module_path)`. On Windows this produces `WindowsPath` backslashes (`alita_sdk\runtime\...\module.py`). Linux Docker workers receive that string, wrap it in `Path()`, and fail with `FileNotFoundError` because on Linux `\` is not a path separator.
 
 **Fix**: patch one line in the installed venv package — do this once after installing cosmic-ray:
 
@@ -105,7 +105,7 @@ Create `cosmic-ray-<module>.toml` (not committed to git — create per module as
 
 ```toml
 [cosmic-ray]
-module-path = "elitea_sdk/path/to/module.py"
+module-path = "alita_sdk/path/to/module.py"
 timeout = 90.0
 excluded-modules = []
 
@@ -311,7 +311,7 @@ Writing tests that assert the *current broken behaviour* purely to boost kill ra
 Caused by listing no-arg operators in `[cosmic-ray.operators]` with any value (even `[]` or `[{}]`).
 **Fix**: Remove the `[cosmic-ray.operators]` section entirely. No-arg operators run automatically.
 
-### `EXCEPTION/INCOMPETENT: N` — all mutations fail with `FileNotFoundError: elitea_sdk\runtime\...\module.py`
+### `EXCEPTION/INCOMPETENT: N` — all mutations fail with `FileNotFoundError: alita_sdk\runtime\...\module.py`
 
 This is the Windows backslash path bug. See **Prerequisites → One-Time Windows Fix** for the root cause and the one-line patch to apply to `venv/Lib/site-packages/cosmic_ray/distribution/http.py`.
 

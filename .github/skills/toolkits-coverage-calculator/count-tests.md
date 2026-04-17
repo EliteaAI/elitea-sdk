@@ -10,12 +10,12 @@ Determine how many test cases exist for a given toolkit to calculate test covera
 
 ### Step 1: Locate Test Suite Directory
 
-Navigate to: `.elitea/tests/test_pipelines/suites/{suite_name}/tests/`
+Navigate to: `.alita/tests/test_pipelines/suites/{suite_name}/tests/`
 
 **Examples**:
-- GitHub tests: `.elitea/tests/test_pipelines/suites/github_toolkit/tests/`
-- JIRA tests: `.elitea/tests/test_pipelines/suites/jira_toolkit/tests/`
-- Postman tests: `.elitea/tests/test_pipelines/suites/postman_toolkit/tests/`
+- GitHub tests: `.alita/tests/test_pipelines/suites/github_toolkit/tests/`
+- JIRA tests: `.alita/tests/test_pipelines/suites/jira_toolkit/tests/`
+- Postman tests: `.alita/tests/test_pipelines/suites/postman_toolkit/tests/`
 
 **Suite Naming Convention**:
 - Format: `{toolkit_name}_toolkit`
@@ -96,7 +96,7 @@ Provide results in this format:
 ```json
 {
   "suite": "github_toolkit",
-  "location": ".elitea/tests/test_pipelines/suites/github_toolkit/tests/",
+  "location": ".alita/tests/test_pipelines/suites/github_toolkit/tests/",
   "test_count": 12,
   "test_files": [
     "test_case_01_get_issue.yaml",
