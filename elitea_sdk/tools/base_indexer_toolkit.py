@@ -362,6 +362,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 if stats:
                     skipped_data = stats.to_dict()
 
+            # For code indexer: chunking happens inside _base_loader via universal_chunker,
+            # so docs_count counts chunks instead of files. Use items_processed from stats
+            # which tracks actual file count.
+            # Detection: if docs_count equals chunks and items_processed differs, it's code indexer.
+            if (skipped_data and skipped_data.get("items_processed", 0) > 0
+                    and docs_count == succeeded_chunks_count
+                    and docs_count != skipped_data["items_processed"]):
+                docs_count = skipped_data["items_processed"]
+
             # Use docs_count for user-facing messages (number of documents)
             # Use succeeded_chunks_count for internal tracking (number of chunks in vector store)
             if failed_chunks_count > 0 and succeeded_chunks_count > 0:
