@@ -19,10 +19,11 @@ loaders_map mutation guard — regression for the dict-copy fix.
 import types
 from unittest.mock import MagicMock
 
+import pytest
 from langchain_core.documents import Document
 
 from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
-from elitea_sdk.tools.utils.content_parser import process_content_by_type
+from elitea_sdk.tools.utils.content_parser import process_content_by_type, UnsupportedExtensionError
 from helpers import _TEST_DATA, read_bytes as _read_bytes, page_contents as _page_contents
 
 # ---------------------------------------------------------------------------
@@ -47,8 +48,10 @@ class TestSmokeTxt:
     def test_none_content_returns_empty(self):
         assert list(process_content_by_type(None, "file.txt")) == []
 
-    def test_unknown_extension_returns_empty(self):
-        assert list(process_content_by_type(b"data", "file.unknownxyz")) == []
+    def test_unknown_extension_raises_error(self):
+        """Unknown extensions raise UnsupportedExtensionError for proper tracking."""
+        with pytest.raises(UnsupportedExtensionError):
+            list(process_content_by_type(b"data", "file.unknownxyz"))
 
     def test_returns_generator(self):
         assert isinstance(process_content_by_type(b"hi", "f.txt"), types.GeneratorType)
