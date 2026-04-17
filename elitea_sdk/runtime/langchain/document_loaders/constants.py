@@ -46,6 +46,14 @@ DEFAULT_ALLOWED_WITH_LLM = {
     LoaderProperties.PROMPT.value: "",
 }
 
+# Default for image loaders - use LLM by default to properly analyze visual content
+DEFAULT_ALLOWED_IMAGE_LLM = {
+    **DEFAULT_ALLOWED_BASE,
+    LoaderProperties.LLM.value: True,
+    LoaderProperties.PROMPT_DEFAULT.value: True,
+    LoaderProperties.PROMPT.value: "",
+}
+
 DEFAULT_ALLOWED_EXCEL = {**DEFAULT_ALLOWED_WITH_LLM, 'add_header_to_chunks': False, 'header_row_number': 1, 'max_tokens': -1, 'sheet_name': ''}
 
 # Image file loaders mapping - directly supported by LLM with image_url
@@ -55,35 +63,35 @@ image_loaders_map = {
         'mime_type': 'image/png',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM,
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM,
     },
     '.jpg': {
         'class': EliteAImageLoader,
         'mime_type': 'image/jpeg',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM
     },
     '.jpeg': {
         'class': EliteAImageLoader,
         'mime_type': 'image/jpeg',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM
     },
     '.gif': {
         'class': EliteAImageLoader,
         'mime_type': 'image/gif',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM
     },
     '.webp': {
         'class': EliteAImageLoader,
         'mime_type': 'image/webp',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM
     }
 }
 
@@ -94,14 +102,14 @@ image_loaders_map_converted = {
         'mime_type': 'image/bmp',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM
     },
     '.svg': {
         'class': EliteAImageLoader,
         'mime_type': 'image/svg+xml',
         'is_multimodal_processing': True,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': DEFAULT_ALLOWED_IMAGE_LLM
     }
 }
 
