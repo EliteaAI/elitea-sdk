@@ -1,141 +1,104 @@
 ---
-name: "toolkits-coverage-calculator"
-description: "Calculate which toolkit API-wrapper tools have YAML test cases in .alita/tests/test_pipelines/suites/, update test_coverage.md, and identify untested tools. Use ONLY for toolkit-level tool coverage (counting tools vs test cases). Do NOT use for running coverage.py or measuring Python code execution — use pytest-coverage for that."
+name: toolkits-coverage-calculator
+description: Calculate which toolkit API-wrapper tools have YAML test cases in .elitea/tests/test_pipelines/suites/, update test_coverage.md, and identify untested tools. Use ONLY for toolkit-level tool coverage (counting tools vs test cases). Do NOT use for running coverage.py or measuring Python code execution - use pytest-coverage for that.
+license: Apache-2.0
+compatibility: Requires access to elitea_sdk/tools/ and .elitea/tests/test_pipelines/
+metadata:
+  author: elitea-sdk
+  version: "2.0"
 ---
 
-# Coverage Calculator Skill
+# Coverage Calculator
 
-This skill analyzes test coverage for ALITA SDK toolkits by examining source code and test suites. It provides accurate metrics based on actual file system state.
+Analyze test coverage for ELITEA SDK toolkits by counting tools vs test cases.
 
-## When to Use This Skill
+## When to Use
 
-- Analyzing overall test coverage across all toolkits
 - Calculating coverage metrics for specific toolkits
 - Updating the test coverage report
-- Identifying coverage gaps and prioritization
+- Identifying coverage gaps and untested tools
 - Tracking coverage trends over time
+
+**NOT for:** Python code execution coverage (use pytest-coverage skill instead)
+
+---
 
 ## Key Paths
 
 | Path | Purpose |
-|------|----------|
-| `alita_sdk/tools/` | Toolkit source code (tool definitions) |
-| `.alita/tests/test_pipelines/suites/` | Test suites (YAML test cases) |
-| `.alita/tests/test_pipelines/test_coverage.md` | Coverage report (output) |
-| `alita_sdk/runtime/tools/` | Runtime framework tools (excluded from coverage) |
+|------|---------|
+| `elitea_sdk/tools/` | Toolkit source code |
+| `.elitea/tests/test_pipelines/suites/` | Test suites (YAML) |
+| `.elitea/tests/test_pipelines/test_coverage.md` | Coverage report |
 
-## Core Procedures
+---
 
-This skill consists of three main procedures. See individual files for detailed instructions:
+## Quick Workflow
 
-### 1. Count Tools in Toolkit
+1. **Scan** `elitea_sdk/tools/` for toolkit directories
+2. **Categorize** each toolkit (user-facing vs framework utility)
+3. **Count tools** from `get_available_tools()` in each wrapper
+4. **Count tests** from YAML files in test suites
+5. **Calculate** coverage percentages
+6. **Update** report with timestamp
 
-See: [count-tools.md](./count-tools.md)
+---
 
-**What**: Extract tool count from `get_available_tools()` method  
-**Input**: Toolkit name (e.g., "github", "jira")  
-**Output**: List of tool names and total count
+## Coverage Formulas
 
-### 2. Count Test Cases
-
-See: [count-tests.md](./count-tests.md)
-
-**What**: Count YAML test files in test suite  
-**Input**: Test suite name (e.g., "github_toolkit")  
-**Output**: Test case count and file list
-
-### 3. Categorize Toolkit
-
-See: [categorize-toolkit.md](./categorize-toolkit.md)
-
-**What**: Determine if toolkit is user-facing or framework utility  
-**Input**: Toolkit directory name  
-**Output**: Category classification and reasoning
-
-## Coverage Calculation Formulas
-
-### Toolkit-Level Coverage
-
+**Toolkit Coverage:**
 ```
-Coverage % = (Tested Tools / Total Tools) × 100
+Coverage % = (Tested Tools / Total Tools) x 100
 ```
 
-- **Tested Tools**: Count of tools with at least one test case
-- **Total Tools**: Count from `get_available_tools()` in wrapper
-
-### Overall Coverage
-
+**Overall Coverage:**
 ```
-Overall Coverage % = (Toolkits with Tests / Total User-Facing Toolkits) × 100
+Overall Coverage % = (Toolkits with Tests / Total User-Facing Toolkits) x 100
 ```
 
-- **Toolkits with Tests**: User-facing toolkits that have test suites
-- **Total User-Facing Toolkits**: All toolkits excluding framework utilities
+---
 
-## Toolkit Categories
+## Procedures
 
-### User-Facing Toolkits (Require Test Coverage)
+| Task | Reference |
+|------|-----------|
+| Count tools in a toolkit | [references/count-tools.md](references/count-tools.md) |
+| Count test cases in a suite | [references/count-tests.md](references/count-tests.md) |
+| Categorize a toolkit | [references/categorize-toolkit.md](references/categorize-toolkit.md) |
+| Toolkit category lists | [references/toolkit-categories.md](references/toolkit-categories.md) |
 
-**Version Control**: github, gitlab, gitlab_org, bitbucket, localgit, ado  
-**Issue Tracking**: jira, advanced_jira_mining, rally  
-**Documentation**: confluence, sharepoint  
-**Test Management**: xray, qtest, testrail, testio, zephyr*, report_portal  
-**API Tools**: postman, openapi, custom_open_api  
-**Communication**: slack, gmail, yagmail  
-**CRM/ITSM**: salesforce, servicenow, keycloak, carrier  
-**Data**: sql, pandas, elastic, bigquery, delta_lake  
-**Cloud**: aws, azure, gcp, k8s  
-**Design**: figma  
-**Other**: ocr, pptx, memory, google_places, azure_search
+---
 
-### Framework Utilities (No Tests Required)
+## Report Sections
 
-**base**: BaseAction class for all toolkits  
-**browser**: Browser automation support (empty)  
-**chunkers**: Document chunking strategies  
-**llm**: LLM integration utilities  
-**utils**: Decorators and helper functions  
-**vector_adapters**: Vector storage adapters  
-**code**: Code analysis utilities (linter, sonar)
+The coverage report at `.elitea/tests/test_pipelines/test_coverage.md` should contain:
 
-## Report Output Format
+1. **Executive Summary** - High-level metrics table
+2. **Toolkits With Tests** - Detailed coverage with status indicators
+3. **Toolkits Without Tests** - Organized by priority
+4. **Framework Utilities** - List (no coverage expected)
+5. **Coverage Trend** - Historical data with dates
+6. **Recommendations** - Next steps
 
-The coverage report should be updated at:  
-`.alita/tests/test_pipelines/test_coverage.md`
-
-**Required Sections**:
-1. **Executive Summary**: High-level metrics table
-2. **Toolkits With Tests**: Detailed coverage table with status indicators
-3. **Toolkits Without Tests**: Organized by priority (Critical/High/Medium/Low)
-4. **Framework Utilities**: List with no coverage expectations
-5. **Coverage Trend**: Historical data with dates
-6. **Recommendations**: Next steps for improving coverage
+---
 
 ## Key Principles
 
-✅ **Accuracy**: All counts must match actual files (never estimate)  
-✅ **Verification**: Cross-check source code against test suites  
-✅ **Separation**: Keep user-facing toolkits separate from framework utilities  
-✅ **Traceability**: Document all counting methods  
-✅ **Consistency**: Use same methodology every time  
-✅ **Timestamp**: Include date on all report updates
+- **Accuracy**: All counts must match actual files (never estimate)
+- **Verification**: Cross-check source against test suites
+- **Separation**: Keep user-facing toolkits separate from utilities
+- **Timestamp**: Include date on all report updates
 
-## Example Workflow
+---
 
-1. **Scan** `alita_sdk/tools/` for all toolkit directories
-2. **Categorize** each toolkit using [categorize-toolkit.md](./categorize-toolkit.md)
-3. **Count tools** for each user-facing toolkit using [count-tools.md](./count-tools.md)
-4. **Count tests** for each test suite using [count-tests.md](./count-tests.md)
-5. **Match** test suites to toolkits (by naming convention)
-6. **Calculate** coverage percentages using formulas above
-7. **Update** coverage report with new data and timestamp
-8. **Append** new data point to coverage trend section
+## Example Output
 
-## Success Criteria
-
-- All tool counts derived from actual `get_available_tools()` methods
-- All test counts match YAML files on disk
-- Coverage percentages are mathematically correct
-- Report reflects current state of repository
-- Framework utilities clearly separated from user-facing toolkits
-- Trend data shows progression over time
+```json
+{
+  "toolkit": "github",
+  "tool_count": 15,
+  "test_count": 12,
+  "coverage": "80.0%",
+  "untested_tools": ["create_gist", "delete_gist", "fork_repo"]
+}
+```
