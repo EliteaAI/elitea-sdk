@@ -175,7 +175,6 @@ jobs:
 
   unit-tests:
     runs-on: ubuntu-latest
-    if: github.actor != 'eln1nxl'
     permissions:
       contents: read
       packages: read
@@ -225,6 +224,12 @@ jobs:
         if: always()
         with:
           report_paths: 'tests/reports/unit-test-results.xml'
+
+      - name: PUBLISH TEST RESULTS
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: |
+            tests/reports/unit-test-results.xml
 
   summarize-and-comment:
     needs: [configure-matrix, toolkit-tests]
