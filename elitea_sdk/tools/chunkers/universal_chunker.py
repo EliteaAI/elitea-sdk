@@ -33,11 +33,23 @@ logger = logging.getLogger(__name__)
 # File extension mappings
 MARKDOWN_EXTENSIONS = {'.md', '.markdown', '.mdown', '.mkd', '.mdx'}
 JSON_EXTENSIONS = {'.json', '.jsonl', '.jsonc'}
+CONFIG_EXTENSIONS = {'.yml', '.yaml', '.toml', '.ini', '.cfg', '.conf', '.env'}
 CODE_EXTENSIONS = {
     '.py', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
-    '.java', '.kt', '.rs', '.go', '.cpp', '.c', '.cs', 
-    '.hs', '.rb', '.scala', '.lua'
+    '.java', '.kt', '.rs', '.go', '.cpp', '.c', '.cs',
+    '.hs', '.rb', '.scala', '.lua', '.sh', '.bash', '.zsh',
+    '.sql', '.r', '.swift', '.php', '.pl', '.pm',
+    # Additional code extensions
+    '.h', '.hpp',  # C/C++ headers
+    '.m',  # Objective-C
+    '.bat',  # Batch scripts
+    '.pas',  # Pascal
+    '.asm',  # Assembly
+    '.dart',  # Dart
+    '.groovy',  # Groovy
 }
+# Text-based documentation and data files common in repositories
+TEXT_EXTENSIONS = {'.txt', '.xml', '.html', '.htm', '.csv'}
 
 
 def get_file_extension(file_path: str) -> str:
@@ -48,16 +60,18 @@ def get_file_extension(file_path: str) -> str:
 def get_file_type(file_path: str) -> str:
     """
     Determine the file type category for chunking.
-    
+
     Returns:
-        'markdown', 'json', 'code', or 'text'
+        'markdown', 'json', 'config', 'code', or 'text'
     """
     ext = get_file_extension(file_path)
-    
+
     if ext in MARKDOWN_EXTENSIONS:
         return 'markdown'
     elif ext in JSON_EXTENSIONS:
         return 'json'
+    elif ext in CONFIG_EXTENSIONS:
+        return 'config'
     elif ext in CODE_EXTENSIONS:
         return 'code'
     else:

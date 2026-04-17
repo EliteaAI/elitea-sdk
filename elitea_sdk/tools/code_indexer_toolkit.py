@@ -122,10 +122,16 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         """
         import hashlib
         import os
-        from .chunkers.universal_chunker import MARKDOWN_EXTENSIONS, JSON_EXTENSIONS, CODE_EXTENSIONS
+        from .chunkers.universal_chunker import (
+            MARKDOWN_EXTENSIONS, JSON_EXTENSIONS, CODE_EXTENSIONS,
+            CONFIG_EXTENSIONS, TEXT_EXTENSIONS
+        )
 
         # Combined supported extensions
-        SUPPORTED_EXTENSIONS = MARKDOWN_EXTENSIONS | JSON_EXTENSIONS | CODE_EXTENSIONS
+        SUPPORTED_EXTENSIONS = (
+            MARKDOWN_EXTENSIONS | JSON_EXTENSIONS | CODE_EXTENSIONS |
+            CONFIG_EXTENSIONS | TEXT_EXTENSIONS
+        )
 
         # Initialize or reset indexing stats
         if not hasattr(self, '_indexing_stats'):
@@ -155,9 +161,12 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         def raw_document_generator() -> Generator[Document, None, None]:
             """Yields raw Documents without chunking - pure generator, no pre-filtering."""
             processed = 0
+            total_files = 0
             stats = self._indexing_stats
 
             for file in _files:
+                total_files += 1
+                stats.total_fetched = total_files
                 # Check whitelist first
                 if whitelist and not is_whitelisted(file):
                     stats.files_skipped_whitelist.append(file)
