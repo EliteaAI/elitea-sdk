@@ -323,7 +323,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             INDEX_META_UPDATE_INTERVAL,
         )
 
-        result = {"count": 0, "failed_count": 0}
+        result = {"count": 0, "failed_count": 0, "docs_count": 0}
         #
         try:
             if clean_index:
@@ -345,9 +345,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                                  f"Processing documents to collect dependencies and prepare them for indexing...")
             self._save_index_generator(documents, documents_count, chunking_tool, chunking_config, index_name=index_name, result=result)
             #
-            results_count = result["count"]
-            failed_count = result.get("failed_count", 0)
-            succeeded_count = results_count - failed_count
+            chunks_count = result["count"]
+            failed_chunks_count = result.get("failed_count", 0)
+            succeeded_chunks_count = chunks_count - failed_chunks_count
+            docs_count = result.get("docs_count", 0)
             errors = result.get("errors", [])
             issues_detail = ("\nIssues: " + "; ".join(errors)) if errors else ""
 
@@ -361,26 +362,28 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 if stats:
                     skipped_data = stats.to_dict()
 
-            if failed_count > 0 and succeeded_count > 0:
+            # Use docs_count for user-facing messages (number of documents)
+            # Use succeeded_chunks_count for internal tracking (number of chunks in vector store)
+            if failed_chunks_count > 0 and succeeded_chunks_count > 0:
                 final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
                 status = "partly_indexed"
-                message = (f"Successfully indexed {succeeded_count} documents. "
-                           f"Failed to index {failed_count} documents.{issues_detail}{skipped_summary}")
-            elif failed_count > 0 >= succeeded_count:
+                message = (f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks). "
+                           f"Failed to index {failed_chunks_count} chunks.{issues_detail}{skipped_summary}")
+            elif failed_chunks_count > 0 >= succeeded_chunks_count:
                 final_state = IndexerKeywords.INDEX_META_FAILED.value
                 status = "error"
-                message = f"Failed to index all {failed_count} documents.{issues_detail}{skipped_summary}"
-            elif succeeded_count > 0:
+                message = f"Failed to index documents ({failed_chunks_count} chunks failed).{issues_detail}{skipped_summary}"
+            elif docs_count > 0:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = "ok"
-                message = f"Successfully indexed {succeeded_count} documents.{skipped_summary}"
+                message = f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks).{skipped_summary}"
             else:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = "ok"
                 message = f"No new documents to index.{skipped_summary}"
 
-            # Final update should always be forced
-            self.index_meta_update(index_name, final_state, succeeded_count, update_force=True,
+            # Final update should always be forced (pass chunks count for indexed_chunks field)
+            self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
                                    error=message if status != "ok" else None, skipped=skipped_data)
             self._emit_index_event(index_name)
             #
@@ -459,10 +462,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     _flush_chunk(pg_vector_add_docs_chunk)
                     pg_vector_add_docs_chunk = []
 
-            msg = f"Indexed base document #{base_doc_counter} out of {base_total} (with {dependent_docs_counter} dependencies)."
+            msg = f"Indexed base document #{base_doc_counter} out of {base_total} (with {dependent_docs_counter} chunks)."
             logger.debug(msg)
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
+            # Track successfully processed documents (base documents that produced at least one chunk)
+            if dependent_docs_counter > 0:
+                result["docs_count"] += 1
             # After each base document, try a non-forced meta update; throttling handled inside index_meta_update
             try:
                 self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, result["count"], update_force=False)
