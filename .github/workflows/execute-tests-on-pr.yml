@@ -179,6 +179,7 @@ jobs:
       contents: read
       packages: read
       checks: write
+      pull-requests: write
     container:
       image: ghcr.io/eliteaai/elitea-sdk:pyodide
       credentials:
