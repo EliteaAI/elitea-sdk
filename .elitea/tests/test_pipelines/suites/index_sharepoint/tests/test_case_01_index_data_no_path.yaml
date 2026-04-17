@@ -21,6 +21,8 @@ state:
     type: dict
   search_result:
     type: dict
+  truncated_search_result:
+    type: dict
   test_results:
     type: dict
 
@@ -61,9 +63,36 @@ nodes:
         value: "idx01"
       search_top:
         type: fixed
-        value: 100
+        value: 10
     output:
       - search_result
+    structured_output: true
+    transition: truncate_content
+
+  - id: truncate_content
+    type: code
+    code:
+      type: fixed
+      value: |
+        import copy
+        
+        # Get the original search result
+        search_result = elitea_state.get('search_result', [])
+        
+        # Deep copy to avoid modifying original
+        truncated = copy.deepcopy(search_result)
+        
+        # Truncate page_content in each document to 10 chars
+        for doc in truncated:
+            if 'page_content' in doc:
+                original_length = len(doc['page_content'])
+                doc['page_content'] = doc['page_content'][:10]
+        
+        {"truncated_search_result": truncated}
+    input:
+      - search_result
+    output:
+      - truncated_search_result
     structured_output: true
     transition: validate_result
 
@@ -72,7 +101,7 @@ nodes:
     model: gpt-4o-2024-11-20
     input:
       - index_result
-      - search_result
+      - truncated_search_result
     input_mapping:
       system:
         type: fixed
@@ -81,9 +110,12 @@ nodes:
         type: fstring
         value: |
           Analyze the output from the 'index_data' tool and search results.
+          
+          Note: page_content has been truncated to 10 chars to reduce token usage.
+          The original content length is stored in metadata.original_content_length.
 
           Index Result: {index_result}
-          Search Result: {search_result}
+          Search Result: {truncated_search_result}
 
           Expected behavior:
           1. Indexing completed successfully (status: ok)
@@ -93,9 +125,10 @@ nodes:
           Validation rules:
           1. Check index_result has "status": "ok"
           2. Check index_result message indicates successful indexing
-          3. Verify search_result is not empty and contains document list
+          3. Verify truncated_search_result is not empty and contains document list
           4. Confirm at least one document was indexed and is searchable
-          5. All validations must pass for test to pass
+          5. Verify documents have not empty metadata (Name, Path, etc.)
+          6. All validations must pass for test to pass
 
           return a json object with:
           {{
