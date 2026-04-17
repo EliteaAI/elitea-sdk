@@ -10,12 +10,12 @@ Extract an accurate tool count for calculating test coverage metrics. The count 
 
 ### Step 1: Locate Toolkit Directory
 
-Navigate to: `elitea_sdk/tools/{toolkit_name}/`
+Navigate to: `alita_sdk/tools/{toolkit_name}/`
 
 **Example**:
-- GitHub toolkit: `elitea_sdk/tools/github/`
-- JIRA toolkit: `elitea_sdk/tools/jira/`
-- Postman toolkit: `elitea_sdk/tools/postman/`
+- GitHub toolkit: `alita_sdk/tools/github/`
+- JIRA toolkit: `alita_sdk/tools/jira/`
+- Postman toolkit: `alita_sdk/tools/postman/`
 
 ### Step 2: Find Wrapper File
 
@@ -100,7 +100,7 @@ Provide results in this format:
 {
   "toolkit": "github",
   "wrapper_file": "api_wrapper.py",
-  "location": "elitea_sdk/tools/github/api_wrapper.py",
+  "location": "alita_sdk/tools/github/api_wrapper.py",
   "tool_count": 15,
   "tools": [
     {"name": "get_issue", "description": "Fetch issue details"},
