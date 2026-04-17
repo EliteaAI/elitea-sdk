@@ -471,7 +471,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['llm'] = self.llm
 
         def _filter_parsing_errors(docs_generator, source_name: str):
-            """Filter out documents with parsing errors and track them as skipped."""
+            """Filter out documents with parsing errors or empty content and track them as skipped."""
             for doc in docs_generator:
                 if doc.page_content and doc.page_content.startswith("Unsupported extension for file"):
                     # Track as skipped due to unsupported extension
@@ -486,6 +486,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     elif hasattr(self, '_track_skipped_document'):
                         self._track_skipped_document(source_name, reason="error")
                     # Skip this document - don't add to vector store
+                    continue
+                # Check for empty content (e.g., OCR returned nothing for image)
+                if not doc.page_content or not doc.page_content.strip():
+                    # Track as skipped due to empty content
+                    if hasattr(self, '_track_skipped_file_empty'):
+                        self._track_skipped_file_empty(source_name)
+                    elif hasattr(self, '_track_runtime_skipped'):
+                        self._track_runtime_skipped(source_name, reason="error")
+                    # Skip this document - don't add to vector store with empty content
                     continue
                 yield doc
 
@@ -784,7 +793,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         #
         if index_meta_raw:
             metadata = copy.deepcopy(index_meta_raw.get("metadata", {}))
-            metadata["indexed"] = self.get_indexed_count(index_name)
+            # indexed_chunks = number of chunks stored in vector store
+            metadata["indexed_chunks"] = self.get_indexed_count(index_name)
             metadata["updated"] = result
             metadata["state"] = state
             metadata["updated_on"] = time.time()
@@ -797,6 +807,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Attach skipped items data if provided
             if skipped is not None:
                 metadata["skipped"] = json.dumps(skipped)
+                # total = total number of items initially passed for indexing
+                # indexed = number of successfully processed documents (items_processed - total_skipped)
+                items_processed = skipped.get("items_processed", 0)
+                total_skipped = skipped.get("total_skipped", 0)
+                metadata["total"] = items_processed
+                metadata["indexed"] = items_processed - total_skipped
+            else:
+                # Fallback: if no skipped data, use chunks count for backward compatibility
+                metadata["indexed"] = metadata["indexed_chunks"]
             #
             history_raw = metadata.pop("history", "[]")
             try:
