@@ -61,7 +61,7 @@ nodes:
         value: "idx01"
       search_top:
         type: fixed
-        value: 100
+        value: 10
     output:
       - search_result
     structured_output: true
@@ -76,14 +76,15 @@ nodes:
     input_mapping:
       system:
         type: fixed
-        value: "You are a quality assurance validator."
+        value: "You are a quality assurance validator. Be concise. Do NOT echo or repeat the full tool output in your response."
       task:
         type: fstring
         value: |
           Analyze the output from the 'index_data' tool and search results.
+          Do NOT echo or repeat the full content of search_result in your response.
 
           Index Result: {index_result}
-          Search Result: {search_result}
+          Search Result (first 3 items only for reference): {search_result}
 
           Expected behavior:
           1. Indexing completed successfully (status: ok)
@@ -95,16 +96,11 @@ nodes:
           2. Check index_result message indicates successful indexing
           3. Verify search_result is not empty and contains document list
           4. Confirm at least one document was indexed and is searchable
-          5. All validations must pass for test to pass
+          5. Verify documents have non-empty metadata (Name, Path, etc.)
+          6. All validations must pass for test to pass
 
-          return a json object with:
-          {{
-            "test_passed": true/false,
-            "summary": "brief description including number of documents found",
-            "error": "error details if failed, null if passed"
-          }}
-
-          return **only** the json object. no markdown formatting, no additional text.
+          Return ONLY a compact JSON object (no markdown, no extra text, keep response under 200 tokens):
+          {{"test_passed": true/false, "summary": "brief 1-sentence description", "error": "error details if failed, null if passed"}}
       chat_history:
         type: fixed
         value: []
