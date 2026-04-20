@@ -18,8 +18,9 @@ This test suite validates the functionality of the TestRail toolkit, which provi
 | update_case | test_case_11, test_case_12 | Critical, High | ✅ Created |
 | add_file_to_case | test_case_13, test_case_14 | High | ✅ Created (Critical test moved to Artifact suite) |
 | get_suites | test_case_15, test_case_16 | Critical, High | ✅ Created |
+| empty-result regression coverage | test_case_17, test_case_18, test_case_19, test_case_20 | Critical, High | ✅ Created |
 
-**Total:** 8 tools covered, 15 test files (Critical file attachment test migrated to Artifact suite as ART22)
+**Total:** 8 tools covered, 19 test files (Critical file attachment test migrated to Artifact suite as ART22)
 
 ## Test Scenarios
 
@@ -55,6 +56,12 @@ This test suite validates the functionality of the TestRail toolkit, which provi
 - **TR15** (Critical): Retrieve test suites for a project in JSON format
 - **TR16** (High): Test multiple output formats (Markdown)
 
+### TR17-TR20: empty-project regression verification for issue #4126
+- **TR17** (Critical): `get_cases` returns `Extracted data:\n[]` for empty project `11`
+- **TR18** (High): `get_cases` returns empty CSV payload instead of `ToolException` for empty project `11`
+- **TR19** (Critical): `get_cases_by_filter` returns `Extracted data:\n[]` for empty project `11`
+- **TR20** (High): `get_cases_by_filter` with `keys` returns `Extracted data:\n[]` for empty project `11`
+
 ## Setup Artifacts
 
 The pipeline.yaml setup stage creates the following artifacts before tests run:
@@ -73,6 +80,7 @@ Required variables (set in `.elitea/tests/test_pipelines/.env`):
 
 ### Project Configuration (Required)
 - `TESTRAIL_PROJECT_ID`: TestRail project ID for testing
+- `TESTRAIL_EMPTY_PROJECT_ID`: Empty TestRail project ID for regression verification (default: `11`)
 - `TESTRAIL_SECTION_ID`: Section ID where test cases will be created
 
 ### Optional Configuration
@@ -128,7 +136,7 @@ All tests are designed to be independent:
 
 - **Request**: Create tests for testrail toolkit using ado, bitbucket, github as examples
 - **Tools discovered**: 8 (get_case, get_cases, get_cases_by_filter, add_case, add_cases, update_case, add_file_to_case, get_suites)
-- **Test files created**: 16 (2 per tool: Critical + High)
+- **Test files created**: 20 total including 4 empty-project regression tests for issue #4126
 - **Test files skipped**: 0 (no duplicates)
 - **Config created**: Yes (testrail-config.json, pipeline.yaml)
 - **Suite structure**: New suite created from scratch

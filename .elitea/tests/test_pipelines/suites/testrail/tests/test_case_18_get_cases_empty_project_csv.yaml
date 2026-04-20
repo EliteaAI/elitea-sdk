@@ -1,0 +1,95 @@
+name: "TR18 get cases empty project csv"
+priority: High
+description: |
+  Verify the get_cases tool returns an empty CSV result gracefully for a project with no test cases.
+  
+  Objective: Confirm CSV output no longer raises ToolException for an empty TestRail project.
+  
+  Expected Behavior:
+  - Tool executes successfully with csv output format
+  - Returns an empty CSV payload instead of raising ToolException
+  - Output is blank or newline-only CSV content for an empty dataset
+  - No errors or exceptions are returned
+
+toolkits:
+  - id: ${TESTRAIL_TOOLKIT_ID}
+    name: ${TESTRAIL_TOOLKIT_NAME}
+
+state:
+  project_id:
+    type: str
+    value: ${TESTRAIL_EMPTY_PROJECT_ID}
+  output_format:
+    type: str
+    value: "csv"
+  tool_result:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_cases
+
+nodes:
+  - id: invoke_get_cases
+    type: toolkit
+    tool: get_cases
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+      - output_format
+    input_mapping:
+      project_id:
+        type: variable
+        value: project_id
+      output_format:
+        type: variable
+        value: output_format
+    output:
+      - tool_result
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - tool_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the tool execution results and determine if the test passed.
+
+          tool executed: get_cases
+          results: {tool_result}
+
+          expected behavior:
+          - tool executed successfully with csv output format for a project with no test cases
+          - result is empty CSV output (blank or newline-only content is acceptable)
+          - no ToolException is raised
+          - no text like "No test cases found" appears
+
+          Evaluate:
+          1. did the tool execute successfully?
+          2. does the output represent an empty CSV result instead of an exception?
+          3. is the result blank, newline-only, or otherwise an empty CSV payload with no case rows?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

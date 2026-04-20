@@ -49,6 +49,8 @@ Issues = "https://github.com/EliteaAI/elitea-sdk/issues"
 
 [tool.pytest.ini_options]
 addopts = "-v -s --junit-xml=tests/reports/test-results.xml"
+log_cli = true
+log_cli_level = "INFO"
 testpaths = [ "tests",]
 env_files = [ ".env",]
 filterwarnings = [ "ignore::DeprecationWarning", "ignore::PendingDeprecationWarning", "ignore::UserWarning", "ignore::cryptography.utils.CryptographyDeprecationWarning",]

@@ -67,12 +67,17 @@ execution:
     - test_case_14_*.yaml  # TR14 - Add File To Case Error Handling
     - test_case_15_*.yaml  # TR15 - Get Suites Happy Path
     - test_case_16_*.yaml  # TR16 - Get Suites Output Formats
+    - test_case_17_*.yaml  # TR17 - Get Cases Empty Project JSON
+    - test_case_18_*.yaml  # TR18 - Get Cases Empty Project CSV
+    - test_case_19_*.yaml  # TR19 - Get Cases By Filter Empty Project
+    - test_case_20_*.yaml  # TR20 - Get Cases By Filter Empty Project With Keys
 
   # Variables to substitute in test YAML files
   substitutions:
     TESTRAIL_TOOLKIT_ID: ${TESTRAIL_TOOLKIT_ID}
     TESTRAIL_TOOLKIT_NAME: ${TESTRAIL_TOOLKIT_NAME}
     TESTRAIL_PROJECT_ID: ${TESTRAIL_PROJECT_ID:"10"}
+    TESTRAIL_EMPTY_PROJECT_ID: ${TESTRAIL_EMPTY_PROJECT_ID:"11"}
     TESTRAIL_SECTION_ID: ${TESTRAIL_SECTION_ID:"652"}
     # TESTRAIL_TEST_CASE_ID: ${TESTRAIL_TEST_CASE_ID}
     # TIMESTAMP: ${TIMESTAMP}
