@@ -264,7 +264,6 @@ class UnifiedMcpClient:
 
                 async with session.post(self.url, json=init_request, headers=headers) as response:
                     if response.status == 401:
-                        logger.info(f"[Unified MCP] Server requires OAuth authorization (401)")
                         # Extract OAuth metadata and raise McpAuthorizationRequired
                         try:
                             await self._handle_401_response(response)
@@ -284,21 +283,53 @@ class UnifiedMcpClient:
                             "Your API token may be invalid or malformed. "
                             "Please check the credentials in the toolkit settings."
                         )
+                    elif response.status == 404:
+                        # MCP endpoint not found - wrong URL
+                        logger.warning(f"[Unified MCP] MCP endpoint not found (404): {self.url}")
+                        raise ValueError(
+                            f"MCP server endpoint not found (404). "
+                            f"Please verify the server URL is correct: {self.url}"
+                        )
+                    elif response.status == 403:
+                        # Forbidden - authentication succeeded but authorization failed
+                        logger.warning(f"[Unified MCP] Access forbidden (403): {self.url}")
+                        raise ValueError(
+                            "Access forbidden (403). Your credentials are valid but you don't have "
+                            "permission to access this MCP server. Please check with your administrator."
+                        )
+                    elif response.status == 500:
+                        # Internal server error
+                        logger.warning(f"[Unified MCP] MCP server error (500): {self.url}")
+                        raise ValueError(
+                            "The MCP server encountered an internal error (500). "
+                            "Please try again later or contact the server administrator."
+                        )
+                    elif response.status == 502 or response.status == 503:
+                        # Bad gateway or service unavailable
+                        logger.warning(f"[Unified MCP] MCP server unavailable ({response.status}): {self.url}")
+                        raise ValueError(
+                            f"The MCP server is unavailable ({response.status}). "
+                            "It may be down for maintenance. Please try again later."
+                        )
+                    elif response.status >= 400:
+                        # Other HTTP errors
+                        logger.warning(f"[Unified MCP] MCP server error ({response.status}): {self.url}")
+                        raise ValueError(
+                            f"The MCP server returned an error ({response.status}). "
+                            "Please verify the server URL and try again."
+                        )
                     # Not a 401/400 auth error, auth check passed (or server will handle auth differently)
 
         except (McpAuthorizationRequired, ValueError):
-            # Re-raise auth-related exceptions so callers can handle them properly:
+            # Re-raise auth-related exceptions and HTTP errors so callers can handle them properly:
             # - McpAuthorizationRequired: triggers the OAuth flow
-            # - ValueError: configured credentials are invalid (user must fix them)
+            # - ValueError: HTTP errors (404, 403, 500, etc.) or invalid credentials
             raise
         except Exception as e:
-            # If pre-flight check fails for non-auth reasons, log but don't block
+            # If pre-flight check fails for OTHER reasons (network, DNS, timeout), log but don't block
             # Let langchain-mcp-adapters try and it will fail with proper error
-            error_str = str(e).lower()
-            if '401' in error_str or 'unauthorized' in error_str:
-                # This is still an auth error, but we couldn't extract details
-                logger.warning(f"[Unified MCP] Pre-flight auth check failed with possible 401: {e}")
-            # Non-auth errors are ignored - langchain-mcp-adapters will handle them
+            logger.warning(f"[Unified MCP] Pre-flight check failed (non-HTTP error): {type(e).__name__}: {e}")
+            # Only network/DNS errors are ignored - langchain-mcp-adapters will handle them
 
     async def _handle_401_response(self, response):
         """
