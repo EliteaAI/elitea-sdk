@@ -25,7 +25,7 @@ setup:
     type: configuration
     config:
       config_type: figma
-      alita_title: ${FIGMA_SECRET_NAME:figma}
+      elitea_title: ${FIGMA_SECRET_NAME:figma}
       data:
         token: ${FIGMA_API_TOKEN}
 
@@ -42,7 +42,7 @@ setup:
         # Credentials must use secret reference format (platform requirement)
         figma_configuration:
           private: false
-          alita_title: ${FIGMA_SECRET_NAME:figma}
+          elitea_title: ${FIGMA_SECRET_NAME:figma}
       # Name for the toolkit on platform
       toolkit_name: ${FIGMA_TOOLKIT_NAME:figma-testing}
     # Save created toolkit ID to environment for pipeline substitution

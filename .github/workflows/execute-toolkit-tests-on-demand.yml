@@ -35,6 +35,7 @@ on:
           - zephyr_essential
           - xray
           - sharepoint
+          - index_sharepoint
           - state_retrieval
           - structured_output
       custom_suites:

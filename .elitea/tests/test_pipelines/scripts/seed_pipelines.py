@@ -197,8 +197,8 @@ def seed_composable_pipelines(
         # Parse and seed the pipeline
         pipeline_data = parse_pipeline_yaml(yaml_path, env_substitutions=cp_env)
         
-        # Apply session ID prefix to composable pipeline name
-        pipeline_data["name"] = apply_session_to_pipeline_name(pipeline_data["name"], session_id)
+        # Apply session ID prefix to composable pipeline name, then enforce 32-char API limit
+        pipeline_data["name"] = apply_session_to_pipeline_name(pipeline_data["name"], session_id)[:32]
         
         if logger:
             logger.info(f"[composable] {pipeline_data['name']}")
@@ -759,8 +759,8 @@ def run(
     for yaml_file in yaml_files:
         pipeline_data = parse_pipeline_yaml(yaml_file, env_substitutions=env_substitutions)
         
-        # Apply session ID prefix to pipeline name for parallel execution isolation
-        pipeline_data["name"] = apply_session_to_pipeline_name(pipeline_data["name"], session_id)
+        # Apply session ID prefix to pipeline name, then enforce 32-char API limit
+        pipeline_data["name"] = apply_session_to_pipeline_name(pipeline_data["name"], session_id)[:32]
         
         if logger:
             logger.info(f"[{yaml_file.name}] {pipeline_data['name']}")

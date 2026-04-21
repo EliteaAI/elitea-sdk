@@ -22,7 +22,7 @@ setup:
     type: configuration
     config:
       config_type: bitbucket
-      alita_title: ${BITBUCKET_SECRET_NAME:bitbucket}
+      elitea_title: ${BITBUCKET_SECRET_NAME:bitbucket}
       data:
         url: ${BITBUCKET_URL:https://api.bitbucket.org}
         username: ${BITBUCKET_USERNAME:vvaryushkin@gmail.com}

@@ -3,7 +3,7 @@
   "toolkit_name": "bitbucket-cloud",
   "id": 1,
   "bitbucket_configuration": {
-    "alita_title": "bitbucket",
+    "elitea_title": "bitbucket",
     "private": false
   },
   "project": "${BITBUCKET_PROJECT:elitea-automation}",
