@@ -23,7 +23,7 @@ setup:
     type: configuration
     config:
       config_type: zephyr_essential
-      alita_title: ${ZEPHYR_ESSENTIAL_SECRET_NAME:zephyr_essential}
+      elitea_title: ${ZEPHYR_ESSENTIAL_SECRET_NAME:zephyr_essential}
       data:
         base_url: ${ZEPHYR_ESSENTIAL_BASE_URL:https://prod-api.zephyr4jiracloud.com/v2}
         token: ${ZEPHYR_ESENTIALS_KEY}
