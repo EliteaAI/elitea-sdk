@@ -1966,11 +1966,20 @@ class EliteAClient:
             # Re-raise to allow proper handling upstream
             raise
         except Exception as e:
+            # Unwrap TaskGroup/ExceptionGroup (Python 3.11+) to get the actual error
+            # When asyncio.run() encounters errors, it may wrap them in ExceptionGroup
+            actual_exception = e
+            if hasattr(e, '__class__') and e.__class__.__name__ in ('ExceptionGroup', 'TaskGroup'):
+                if hasattr(e, 'exceptions') and e.exceptions:
+                    actual_exception = e.exceptions[0]
+                    logger.debug(f"[MCP Auth Check] Unwrapped {e.__class__.__name__} to: {type(actual_exception).__name__}")
+
             execution_time = time.time() - start_time
-            logger.error(f"[MCP Auth Check] Connection failed to '{toolkit_name}': {str(e)}")
+            error_message = str(actual_exception)
+            logger.error(f"[MCP Auth Check] Connection failed to '{toolkit_name}': {error_message}")
             return {
                 "success": False,
-                "error": str(e),
+                "error": error_message,
                 "toolkit_config": toolkit_config,
                 "tools": [],
                 "tools_count": 0,
