@@ -19,7 +19,7 @@ setup:
     type: configuration
     config:
       config_type: postman
-      alita_title: ${POSTMAN_SECRET_NAME:postman}
+      elitea_title: ${POSTMAN_SECRET_NAME:postman}
       data:
         api_key: ${POSTMAN_API_KEY}
         base_url: ${POSTMAN_BASE_URL:https://api.getpostman.com}

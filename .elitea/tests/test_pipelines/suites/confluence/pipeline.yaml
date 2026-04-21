@@ -24,7 +24,7 @@ setup:
     type: configuration
     config:
       config_type: confluence
-      alita_title: ${CONFLUENCE_SECRET_NAME:confluence}
+      elitea_title: ${CONFLUENCE_SECRET_NAME:confluence}
       data:
         api_key: ${confluence_api_key}
         base_url: ${confluence_base_url}
@@ -43,7 +43,7 @@ setup:
         # Credentials must use secret reference format (platform requirement)
         confluence_configuration:
           private: false
-          alita_title: ${CONFLUENCE_SECRET_NAME:confluence}
+          elitea_title: ${CONFLUENCE_SECRET_NAME:confluence}
         space: ${CONFLUENCE_SPACE:AT}
         cloud: true
       # Name for the toolkit on platform

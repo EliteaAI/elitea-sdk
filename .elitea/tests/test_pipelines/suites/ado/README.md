@@ -178,7 +178,7 @@ Located at `.elitea/tests/test_pipelines/configs/ado-config.json`:
   "toolkit_name": "ado",
   "id": 1,
   "ado_configuration": {
-    "alita_title": "ado",
+    "elitea_title": "ado",
     "private": false,
     "organization_url": "https://dev.azure.com/${ADO_ORG}",
     "project": "${ADO_PROJECT}",

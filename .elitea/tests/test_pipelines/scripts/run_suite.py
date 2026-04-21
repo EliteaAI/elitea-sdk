@@ -500,8 +500,8 @@ def get_pipelines_from_folder(
             with open(yaml_file) as f:
                 data = yaml.safe_load(f)
                 if data and "name" in data:
-                    # Apply session prefix to match session-scoped pipelines on platform
-                    pipeline_names.append(apply_session_to_pipeline_name(data["name"], session_id))
+                    # Apply session prefix and enforce 32-char limit to match seeded names
+                    pipeline_names.append(apply_session_to_pipeline_name(data["name"], session_id)[:32])
         except Exception:
             continue
 
@@ -1241,8 +1241,8 @@ def main():
                             with open(yaml_file) as f:
                                 data = yaml.safe_load(f)
                                 if data and "name" in data:
-                                    # Apply session prefix to match session-scoped pipelines
-                                    names.append(apply_session_to_pipeline_name(data["name"], session_id))
+                                    # Apply session prefix and enforce 32-char limit to match seeded names
+                                    names.append(apply_session_to_pipeline_name(data["name"], session_id)[:32])
                         except Exception:
                             continue
 

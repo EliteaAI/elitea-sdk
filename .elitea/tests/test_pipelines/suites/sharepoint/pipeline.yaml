@@ -26,7 +26,7 @@ setup:
     type: configuration
     config:
       config_type: sharepoint
-      alita_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
+      elitea_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
       data:
         site_url: ${SHAREPOINT_SITE_URL:https://5clkvm.sharepoint.com/sites/ALITA}
         client_id: ${SHAREPOINT_CLIENT_ID:84c01a1e-1ebc-40c0-b55a-8b3fae194e41}
@@ -41,7 +41,7 @@ setup:
       overrides:
         sharepoint_configuration:
           private: false
-          alita_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
+          elitea_title: ${SHAREPOINT_SECRET_NAME:sharepoint}
       toolkit_name: ${SHAREPOINT_TOOLKIT_NAME:sharepoint-testing}
     save_to_env:
       - key: SHAREPOINT_TOOLKIT_ID
