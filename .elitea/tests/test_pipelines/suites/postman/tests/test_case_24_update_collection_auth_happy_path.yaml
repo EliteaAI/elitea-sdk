@@ -7,18 +7,28 @@ description: |
   Objective: Verify collection authentication update functionality
   
   Expected Behavior:
-  - Tool executes successfully
+  - Duplicate collection is created for testing
+  - Tool executes successfully on the duplicate
   - Collection authentication is updated
   - Auth settings include type and credentials
   - Returns confirmation of the update
+  - Duplicate collection is cleaned up successfully
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
+  duplicate_name:
+    type: str
+  duplicate_result:
+    type: str
+  duplicate_id:
+    type: str
   tool_result:
     type: dict
+  delete_result:
+    type: str
   test_results:
     type: dict
   auth:
@@ -30,22 +40,109 @@ state:
           value: "test_token"
           type: "string"
 
-entry_point: invoke_update_collection_auth
+entry_point: prepare_test_data
 
 nodes:
+  - id: prepare_test_data
+    type: code
+    code:
+      type: fixed
+      value: |
+        import time
+        import random
+        import string
+        
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        duplicate_name = f"PST24_UpdateAuth_{timestamp}_{random_suffix}"
+        
+        {"duplicate_name": duplicate_name}
+    output:
+      - duplicate_name
+    structured_output: true
+    transition: duplicate_collection
+
+  - id: duplicate_collection
+    type: toolkit
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: duplicate_collection
+    input:
+      - duplicate_name
+    input_mapping:
+      new_name:
+        type: variable
+        value: duplicate_name
+    output:
+      - duplicate_result
+    structured_output: true
+    transition: extract_duplicate_id
+
+  - id: extract_duplicate_id
+    type: code
+    code:
+      type: fstring
+      value: |
+        import json
+        import re
+        
+        result_str = elitea_state.get('duplicate_result', '')
+        duplicate_id = None
+        
+        try:
+            result_data = json.loads(result_str)
+            if isinstance(result_data, dict) and 'collection' in result_data:
+                coll = result_data['collection']
+                duplicate_id = coll.get('id') or coll.get('uid')
+                if not duplicate_id and 'info' in coll:
+                    duplicate_id = coll['info'].get('_postman_id') or coll['info'].get('uid')
+        except:
+            pass
+        
+        if not duplicate_id:
+            id_match = re.search(r'"(?:id|uid|_postman_id)"\s*:\s*"([^"]+)"', result_str)
+            if id_match:
+                duplicate_id = id_match.group(1)
+        
+        duplicate_id or "ID_NOT_FOUND"
+    input:
+      - duplicate_result
+    output:
+      - duplicate_id
+    structured_output: true
+    transition: invoke_update_collection_auth
+
   - id: invoke_update_collection_auth
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: update_collection_auth
     input:
+      - duplicate_id
       - auth
     input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
       auth:
         type: variable
         value: auth
     output:
-
       - tool_result
+    structured_output: true
+    transition: cleanup_delete_collection
+
+  - id: cleanup_delete_collection
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: delete_collection
+    input:
+      - duplicate_id
+    input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
+    output:
+      - delete_result
     structured_output: true
     transition: process_results
 
@@ -53,7 +150,10 @@ nodes:
     type: llm
     model: gpt-4o-2024-11-20
     input:
+      - duplicate_result
+      - duplicate_id
       - tool_result
+      - delete_result
     input_mapping:
       system:
         type: fixed
@@ -63,20 +163,30 @@ nodes:
         value: |
           Analyze the output from the 'update_collection_auth' tool.
           
+          Duplicate Result: {duplicate_result}
+          Duplicate ID: {duplicate_id}
           Tool Result: {tool_result}
+          Delete Result: {delete_result}
           
-          This test validates that update_collection_auth updates authentication settings.
+          This test validates that update_collection_auth updates authentication settings on a duplicate collection.
           
           Perform the following checks:
-          1. Confirm the tool executed successfully without raising an error.
-          2. Verify the result contains a collection object with id, name, and uid fields.
-          3. Note: The Postman API PUT response only returns minimal collection metadata (id, name, uid) - this is the expected success response format.
-          4. Validate no error message is present in the result.
+          1. Confirm duplicate collection was created successfully.
+          2. Confirm the update tool executed successfully without raising an error.
+          3. Verify the result contains a collection object with id and name fields.
+          4. Verify the result contains an 'auth' object.
+          5. Verify the auth object has type="bearer" and contains bearer token configuration.
+          6. Validate no error message is present in the result.
+          7. Confirm the duplicate collection was deleted successfully (delete_result should not contain errors).
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if tool returned a collection object with id/name/uid and no error),
+            "test_passed": boolean (true if all checks pass),
+            "duplicate_created": boolean,
+            "update_succeeded": boolean,
+            "auth_updated": boolean,
+            "cleanup_succeeded": boolean,
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}

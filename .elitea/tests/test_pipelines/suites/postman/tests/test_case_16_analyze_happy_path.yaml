@@ -13,8 +13,8 @@ description: |
   - Identifies potential issues or improvements
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -29,7 +29,7 @@ entry_point: invoke_analyze
 nodes:
   - id: invoke_analyze
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: analyze
     input:
       - scope

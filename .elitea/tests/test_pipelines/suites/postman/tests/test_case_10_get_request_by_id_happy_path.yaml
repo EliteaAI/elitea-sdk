@@ -204,7 +204,7 @@ nodes:
     output:
       - get_request_result
     structured_output: true
-    transition: validate_results
+    transition: cleanup_delete_request
 
   - id: validate_results
     type: llm
@@ -217,6 +217,8 @@ nodes:
       - get_request_result
       - request_name
       - request_method
+      - delete_request_result
+      - delete_folder_result
     input_mapping:
       chat_history:
         type: fixed
@@ -235,6 +237,8 @@ nodes:
           Get Request Result: {get_request_result}
           Expected Request Name: {request_name}
           Expected Method: {request_method}
+          Delete Request Result: {delete_request_result}
+          Delete Folder Result: {delete_folder_result}
           
           This is a POSITIVE test - we expect successful ID-based request retrieval.
           
@@ -246,6 +250,7 @@ nodes:
           5. correct_name: Request name matches expected
           6. correct_method: Request method matches expected
           7. no_errors: No error indicators in any output
+          8. cleanup_succeeded: Request and folder were deleted successfully (no errors in delete results)
           
           Return JSON test_results:
           {{
@@ -257,6 +262,7 @@ nodes:
             "correct_name": boolean,
             "correct_method": boolean,
             "no_errors": boolean,
+            "cleanup_succeeded": boolean,
             "extracted_id": "the request ID or null",
             "summary": "brief description of outcome",
             "error": string | null
@@ -267,7 +273,7 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: cleanup_delete_request
+    transition: END
 
   - id: cleanup_delete_request
     type: toolkit
@@ -299,4 +305,4 @@ nodes:
     output:
       - delete_folder_result
     structured_output: true
-    transition: END
+    transition: validate_results
