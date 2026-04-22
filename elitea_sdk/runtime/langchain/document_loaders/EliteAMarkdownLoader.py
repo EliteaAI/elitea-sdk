@@ -13,27 +13,29 @@ class EliteAMarkdownLoader(UnstructuredFileLoader):
         self,
         file_path: Union[str, Path],
         mode: str = "elements",
-        chunker_config: dict = None,
-        **unstructured_kwargs: Any,
+        **kwargs: Any,
     ):
         """
         Args:
             file_path: The path to the Markdown file to load.
             mode: The mode to use when loading the file. Can be one of "single",
                 "multi", or "all". Default is "single".
-            chunker_config: Configuration dictionary for the markdown chunker.
-            **unstructured_kwargs: Any kwargs to pass to the unstructured.
+            **kwargs: Accepts ``max_tokens`` (default 512) and
+                ``token_overlap`` (default 10) for chunking configuration.
+                Any remaining kwargs are forwarded to UnstructuredFileLoader.
         """
         file_path = str(file_path)
         validate_unstructured_version("0.4.16")
-        self.chunker_config = chunker_config or {
+        max_tokens = kwargs.pop("max_tokens", 512)
+        token_overlap = kwargs.pop("token_overlap", 10)
+        self.chunker_config = {
             "strip_header": False,
             "return_each_line": False,
             "headers_to_split_on": [],
-            "max_tokens": 512,
-            "token_overlap": 10,
+            "max_tokens": max_tokens,
+            "token_overlap": token_overlap,
         }
-        super().__init__(file_path=file_path, mode=mode, **unstructured_kwargs)
+        super().__init__(file_path=file_path, mode=mode, **kwargs)
 
     def _file_content_generator(self) -> Generator[Document, None, None]:
         """
