@@ -11,6 +11,7 @@ def json_chunker(file_content_generator: Generator[Document, None, None], config
             data_dict = json.loads(doc.page_content)
             chunks = RecursiveJsonSplitter(max_chunk_size=max_tokens).split_json(json_data=data_dict, convert_lists=True)
             if len(chunks) == 1:
+                doc.metadata['chunk_id'] = 1
                 yield doc
                 continue
             chunk_id = 1
@@ -22,4 +23,5 @@ def json_chunker(file_content_generator: Generator[Document, None, None], config
                 yield Document(page_content=json.dumps(chunk), metadata=metadata)
         except Exception as e:
             logging.error(f"Failed to chunk document: {e}")
+            doc.metadata['chunk_id'] = 1
             yield doc
