@@ -1,16 +1,16 @@
-name: "PST24 update collection auth"
+name: "PST20 update collection"
 priority: Critical
 description: |
-  Validates that the update_collection_auth tool successfully updates
-  collection-level authentication settings.
+  Validates that the update_collection_description tool successfully updates
+  the description of a Postman collection.
   
-  Objective: Verify collection authentication update functionality
+  Objective: Verify collection description update functionality
   
   Expected Behavior:
   - Tool executes successfully
-  - Collection authentication is updated
-  - Auth settings include type and credentials
+  - Collection description is updated
   - Returns confirmation of the update
+  - Updated description is persisted
 
 toolkits:
   - id: ${TOOLKIT_ID}
@@ -21,28 +21,22 @@ state:
     type: dict
   test_results:
     type: dict
-  auth:
-    type: dict
-    value:
-      type: "bearer"
-      bearer:
-        - key: "token"
-          value: "test_token"
-          type: "string"
-
-entry_point: invoke_update_collection_auth
+  new_description:
+    type: str
+    value: "Updated collection description for testing"
+entry_point: invoke_update_collection_description
 
 nodes:
-  - id: invoke_update_collection_auth
+  - id: invoke_update_collection_description
     type: toolkit
     toolkit_name: ${TOOLKIT_NAME}
-    tool: update_collection_auth
+    tool: update_collection_description
     input:
-      - auth
+      - new_description
     input_mapping:
-      auth:
+      description:
         type: variable
-        value: auth
+        value: new_description
     output:
 
       - tool_result
@@ -61,22 +55,23 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the output from the 'update_collection_auth' tool.
+          Analyze the output from the 'update_collection_description' tool.
           
           Tool Result: {tool_result}
           
-          This test validates that update_collection_auth updates authentication settings.
+          This test validates that update_collection_description updates the description.
           
           Perform the following checks:
           1. Confirm the tool executed successfully without raising an error.
-          2. Verify the result contains a collection object with id, name, and uid fields.
-          3. Note: The Postman API PUT response only returns minimal collection metadata (id, name, uid) - this is the expected success response format.
-          4. Validate no error message is present in the result.
+          2. Verify the result contains a collection object with id and name fields.
+          3. Verify the result contains a 'description' field.
+          4. Verify the description matches the expected value: "Updated collection description for testing".
+          5. Validate no error message is present in the result.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if tool returned a collection object with id/name/uid and no error),
+            "test_passed": boolean (true if all checks pass),
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}

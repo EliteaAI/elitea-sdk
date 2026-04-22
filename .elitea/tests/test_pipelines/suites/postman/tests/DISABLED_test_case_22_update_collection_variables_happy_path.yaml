@@ -1,16 +1,16 @@
-name: "PST23 update collection"
-priority: High
+name: "PST22 update collection"
+priority: Critical
 description: |
-  Validates that the update_collection_variables tool properly handles clearing
-  all collection variables by passing null or empty array.
+  Validates that the update_collection_variables tool successfully updates
+  collection-level variables.
   
-  Objective: Verify clearing collection variables
+  Objective: Verify collection variables update functionality
   
   Expected Behavior:
   - Tool executes successfully
-  - All collection variables are cleared
+  - Collection variables are updated
+  - Variable structure includes key, value, type, enabled
   - Returns confirmation of the update
-  - Collection has no variables after operation
 
 toolkits:
   - id: ${TOOLKIT_ID}
@@ -23,7 +23,12 @@ state:
     type: dict
   variables:
     type: list
-    value: []
+    value:
+      - key: "test_var"
+        value: "test_value"
+        type: "string"
+        enabled: true
+
 entry_point: invoke_update_collection_variables
 
 nodes:
@@ -55,22 +60,23 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the output from the 'update_collection_variables' tool when clearing variables.
+          Analyze the output from the 'update_collection_variables' tool.
           
           Tool Result: {tool_result}
           
-          This test validates that update_collection_variables clears all variables by passing an empty list.
+          This test validates that update_collection_variables updates variables.
           
           Perform the following checks:
           1. Confirm the tool executed successfully without raising an error.
-          2. Verify the result contains a collection object with id, name, and uid fields.
-          3. Note: The Postman API PUT response only returns minimal collection metadata (id, name, uid) - this is the expected success response format.
-          4. Validate no error message is present in the result.
+          2. Verify the result contains a collection object with id and name fields.
+          3. Verify the result contains a 'variable' array.
+          4. Verify the variable array has at least one entry with key="test_var", value="test_value", and type="string".
+          5. Validate no error message is present in the result.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if tool returned a collection object with id/name/uid and no error),
+            "test_passed": boolean (true if all checks pass),
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}

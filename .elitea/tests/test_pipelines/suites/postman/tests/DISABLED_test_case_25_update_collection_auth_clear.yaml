@@ -1,16 +1,16 @@
-name: "PST22 update collection"
-priority: Critical
+name: "PST25 update collection auth"
+priority: High
 description: |
-  Validates that the update_collection_variables tool successfully updates
-  collection-level variables.
+  Validates that the update_collection_auth tool properly handles clearing
+  collection authentication by passing null.
   
-  Objective: Verify collection variables update functionality
+  Objective: Verify clearing collection authentication
   
   Expected Behavior:
   - Tool executes successfully
-  - Collection variables are updated
-  - Variable structure includes key, value, type, enabled
+  - Collection authentication is cleared
   - Returns confirmation of the update
+  - Collection has no authentication after operation
 
 toolkits:
   - id: ${TOOLKIT_ID}
@@ -21,27 +21,22 @@ state:
     type: dict
   test_results:
     type: dict
-  variables:
-    type: list
-    value:
-      - key: "test_var"
-        value: "test_value"
-        type: "string"
-        enabled: true
-
-entry_point: invoke_update_collection_variables
+  auth:
+    type: dict
+    value: null
+entry_point: invoke_update_collection_auth
 
 nodes:
-  - id: invoke_update_collection_variables
+  - id: invoke_update_collection_auth
     type: toolkit
     toolkit_name: ${TOOLKIT_NAME}
-    tool: update_collection_variables
+    tool: update_collection_auth
     input:
-      - variables
+      - auth
     input_mapping:
-      variables:
+      auth:
         type: variable
-        value: variables
+        value: auth
     output:
 
       - tool_result
@@ -60,22 +55,23 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the output from the 'update_collection_variables' tool.
+          Analyze the output from the 'update_collection_auth' tool when clearing auth.
           
           Tool Result: {tool_result}
           
-          This test validates that update_collection_variables updates variables.
+          This test validates that update_collection_auth clears authentication by passing null.
           
           Perform the following checks:
           1. Confirm the tool executed successfully without raising an error.
-          2. Verify the result contains a collection object with id, name, and uid fields.
-          3. Note: The Postman API PUT response only returns minimal collection metadata (id, name, uid) - this is the expected success response format.
-          4. Validate no error message is present in the result.
+          2. Verify the result contains a collection object with id and name fields.
+          3. Verify the result contains an 'auth' field that is null or empty.
+          4. Verify the auth field is cleared (null or empty dict {}) indicating authentication was cleared.
+          5. Validate no error message is present in the result.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if tool returned a collection object with id/name/uid and no error),
+            "test_passed": boolean (true if all checks pass),
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
