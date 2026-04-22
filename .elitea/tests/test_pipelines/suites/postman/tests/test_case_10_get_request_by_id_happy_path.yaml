@@ -200,7 +200,7 @@ nodes:
     output:
       - get_request_result
     structured_output: true
-    transition: validate_results
+    transition: cleanup_delete_request
 
   - id: validate_results
     type: llm
@@ -269,7 +269,7 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: cleanup_delete_request
+    transition: END
 
   - id: cleanup_delete_request
     type: toolkit
@@ -301,4 +301,4 @@ nodes:
     output:
       - delete_folder_result
     structured_output: true
-    transition: END
+    transition: validate_results
