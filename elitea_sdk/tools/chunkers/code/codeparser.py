@@ -36,6 +36,7 @@ def parse_code_files_for_db(file_content_generator: Generator[str, None, None], 
         if file_extension in image_extensions:
             logger.debug(f"Skipping image file: {file_name} as it is image")
             continue
+        chunk_id = 0
         if programming_language == Language.UNKNOWN:
             documents = TokenTextSplitter(encoding_name="gpt2", chunk_size=256, chunk_overlap=30).split_text(file_content)
             for document in documents:
@@ -47,6 +48,8 @@ def parse_code_files_for_db(file_content_generator: Generator[str, None, None], 
                 commit_hash = data.get("commit_hash")
                 if commit_hash is not None:
                     metadata["commit_hash"] = commit_hash
+                chunk_id += 1
+                metadata["chunk_id"] = chunk_id
                 document = Document(
                     page_content=document,
                     metadata=metadata,
@@ -85,6 +88,8 @@ def parse_code_files_for_db(file_content_generator: Generator[str, None, None], 
                         commit_hash = data.get("commit_hash")
                         if commit_hash is not None:
                             metadata["commit_hash"] = commit_hash
+                        chunk_id += 1
+                        metadata["chunk_id"] = chunk_id
                         document = Document(
                             page_content=splitted_document,
                             metadata=metadata,

@@ -287,7 +287,6 @@ class TestUC09_UnknownFallbackToText:
 
 class TestUC10_ChunkIdOnAllRoutes:
 
-    @pytest.mark.xfail(reason="Missing `chunk_id` in universal_chunker for code and JSON files. See: https://github.com/EliteaAI/elitea.github.io/issues/3998")
     @pytest.mark.parametrize("file_path,content", [
         ("readme.md", MARKDOWN_CONTENT),
         ("data.json", JSON_CONTENT),
