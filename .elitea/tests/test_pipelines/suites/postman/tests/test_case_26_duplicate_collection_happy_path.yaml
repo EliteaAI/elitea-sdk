@@ -13,23 +13,45 @@ description: |
   - Returns new collection ID and details
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
     type: dict
   test_results:
     type: dict
+  duplicate_id:
+    type: str
+  delete_result:
+    type: str
   new_name:
     type: str
-    value: "Test Collection Copy"
-entry_point: invoke_duplicate_collection
+entry_point: prepare_test_data
 
 nodes:
+  - id: prepare_test_data
+    type: code
+    code:
+      type: fixed
+      value: |
+        import time
+        import random
+        import string
+        
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        new_name = f"PST26_TestCopy_{timestamp}_{random_suffix}"
+        
+        {"new_name": new_name}
+    output:
+      - new_name
+    structured_output: true
+    transition: invoke_duplicate_collection
+
   - id: invoke_duplicate_collection
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: duplicate_collection
     input:
       - new_name
@@ -38,8 +60,58 @@ nodes:
         type: variable
         value: new_name
     output:
-
       - tool_result
+    structured_output: true
+    transition: extract_duplicate_id
+
+  - id: extract_duplicate_id
+    type: code
+    code:
+      type: fstring
+      value: |
+        import json
+        import re
+        
+        result_str = elitea_state.get('tool_result', '')
+        duplicate_id = None
+        
+        try:
+            result_data = json.loads(str(result_str))
+            if isinstance(result_data, dict) and 'collection' in result_data:
+                coll = result_data['collection']
+                duplicate_id = coll.get('id') or coll.get('uid')
+                if not duplicate_id and 'info' in coll:
+                    duplicate_id = coll['info'].get('_postman_id') or coll['info'].get('uid')
+        except:
+            pass
+        
+        if not duplicate_id:
+            result_str_conv = str(result_str)
+            id_match = re.search(r'"(?:id|uid|_postman_id)"\s*:\s*"([^"]+)"', result_str_conv)
+            if id_match:
+                duplicate_id = id_match.group(1)
+        
+        duplicate_id or "ID_NOT_FOUND"
+    input:
+      - tool_result
+    output:
+      - duplicate_id
+    structured_output: true
+    transition: cleanup_delete_collection
+
+  - id: cleanup_delete_collection
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: delete_collection
+    input:
+      - duplicate_id
+    input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
+    output:
+      - delete_result
     structured_output: true
     transition: process_results
 
@@ -48,6 +120,8 @@ nodes:
     model: gpt-4o-2024-11-20
     input:
       - tool_result
+      - duplicate_id
+      - delete_result
     input_mapping:
       system:
         type: fixed
@@ -58,19 +132,24 @@ nodes:
           Analyze the output from the 'duplicate_collection' tool.
           
           Tool Result: {tool_result}
+          Duplicate ID: {duplicate_id}
+          Delete Result: {delete_result}
           
-          This test validates that duplicate_collection creates a collection copy.
+          This test validates that duplicate_collection creates a collection copy and cleanup works.
           
           Perform the following checks:
           1. Confirm the tool executed successfully.
           2. Verify the result indicates a new collection was created.
           3. Check for new collection ID or confirmation.
           4. Validate the duplicate has the specified new name.
+          5. Confirm the duplicate was deleted successfully (delete_result should not contain errors).
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if collection was duplicated successfully),
+            "test_passed": boolean (true if collection was duplicated and deleted successfully),
+            "duplication_succeeded": boolean,
+            "cleanup_succeeded": boolean,
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
