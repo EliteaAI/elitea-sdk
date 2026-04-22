@@ -60,33 +60,33 @@ class TestChunkingConfigCsv:
     UI sends {".csv": {"max_tokens": <value>}} from the chunking panel.
     """
 
-    def test_max_tokens_512_equals_default_is_noop(self):
+    def test_max_tokens_512_forwarded_and_produces_docs(self):
         """
         UI sends {".csv": {"max_tokens": 512}}.
-        512 == LOADER_MAX_TOKENS_DEFAULT → != guard fires → NOT forwarded.
-        EliteACSVLoader ignores the kwarg anyway; output count must be unchanged.
+        512 != default (-1 in DEFAULT_ALLOWED_CSV) → forwarded to EliteACSVLoader.
+        Must produce valid documents without error.
         """
         content = _read_bytes(_CSV_SIMPLE)
-        docs_no_config = list(process_content_by_type(content, "f.csv"))
         docs_ui_config = list(process_content_by_type(
             content, "f.csv",
             chunking_config={".csv": {"max_tokens": LOADER_MAX_TOKENS_DEFAULT}},
         ))
-        assert len(docs_ui_config) == len(docs_no_config)
+        assert len(docs_ui_config) >= 1
+        assert all(isinstance(d, Document) for d in docs_ui_config)
 
     def test_non_default_max_tokens_does_not_raise(self):
         """
         UI sends {".csv": {"max_tokens": 256}}.
-        EliteACSVLoader silently ignores the extra kwarg; must not raise and must
-        return the same documents as without a config.
+        EliteACSVLoader uses max_tokens for row-grouping chunking.
+        Must not raise and must return valid documents.
         """
         content = _read_bytes(_CSV_SIMPLE)
-        docs_no_config = list(process_content_by_type(content, "f.csv"))
         docs_ui = list(process_content_by_type(
             content, "data.csv",
             chunking_config={".csv": {"max_tokens": 256}},
         ))
-        assert len(docs_ui) == len(docs_no_config)
+        assert len(docs_ui) >= 1
+        assert all(isinstance(d, Document) for d in docs_ui)
 
     def test_disallowed_key_encoding_silently_ignored(self):
         """
