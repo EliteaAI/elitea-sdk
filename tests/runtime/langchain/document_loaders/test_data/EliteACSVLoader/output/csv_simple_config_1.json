@@ -1,10 +1,10 @@
 [
   {
-    "page_content": "name,age,city\nAlice,30,New York\nBob,25,San Francisco\nCharlie,35,Boston\n",
+    "page_content": "name,age,city\nAlice,30,New York\nBob,25,San Francisco\nCharlie,35,Boston",
     "metadata": {
       "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:1",
-      "chunk_id": 1,
-      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv"
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv",
+      "chunk_id": 1
     }
   }
 ]
