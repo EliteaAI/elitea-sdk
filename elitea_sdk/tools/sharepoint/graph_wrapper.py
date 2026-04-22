@@ -288,7 +288,11 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             return ToolException(f"Cannot read list '{list_title}': {e}")
 
     def get_lists(self):
-        """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions."""
+        """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions.
+
+        Note: Document Libraries are excluded from results.
+        Use get_files() to access document library contents.
+        """
         try:
             data = self._get(
                 f"{_GRAPH_BASE}/sites/{self._resolve_site_id()}/lists",
@@ -297,6 +301,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             for lst in data.get('value', []):
                 list_info = lst.get('list', {})
                 if list_info.get('hidden', False):
+                    continue
+                # Skip Document Libraries - users expect only true lists
+                if list_info.get('template', '') == 'documentLibrary':
                     continue
                 result.append({
                     'Title': lst.get('displayName', ''),

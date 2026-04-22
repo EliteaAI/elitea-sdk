@@ -101,12 +101,19 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                     f"Check list name and permissions: {base_e} | {graph_e}")
 
     def get_lists(self):
-        """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions."""
+        """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions.
+
+        Note: Document Libraries (BaseTemplate=101) are excluded from results.
+        Use get_files() to access document library contents.
+        """
         try:
             lists = self._client.web.lists.get().execute_query()
             result = []
             for lst in lists:
                 if lst.properties.get('Hidden', False):
+                    continue
+                # Skip Document Libraries (BaseTemplate=101) - users expect only true lists
+                if lst.properties.get('BaseTemplate', 0) == 101:
                     continue
                 result.append({
                     'Title': lst.properties.get('Title', ''),
