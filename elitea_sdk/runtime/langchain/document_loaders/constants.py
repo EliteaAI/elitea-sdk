@@ -54,6 +54,8 @@ DEFAULT_ALLOWED_IMAGE_LLM = {
     LoaderProperties.PROMPT.value: "",
 }
 
+DEFAULT_ALLOWED_CSV = {**DEFAULT_ALLOWED_BASE, 'add_header_to_chunks': False, 'header_row_number': 1, 'max_tokens': -1}
+
 DEFAULT_ALLOWED_EXCEL = {**DEFAULT_ALLOWED_WITH_LLM, 'add_header_to_chunks': False, 'header_row_number': 1, 'max_tokens': -1, 'sheet_name': ''}
 
 # Image file loaders mapping - directly supported by LLM with image_url
@@ -165,9 +167,12 @@ document_loaders_map = {
         'kwargs': {
             'encoding': 'utf-8',
             'raw_content': True,
-            'cleanse': False
+            'cleanse': False,
+            'max_tokens': -1,
+            'add_header_to_chunks': False,
+            'header_row_number': 1,
         },
-        'allowed_to_override': DEFAULT_ALLOWED_BASE
+        'allowed_to_override': DEFAULT_ALLOWED_CSV
     },
     '.xlsx': {
         'class': EliteAExcelLoader,
@@ -348,13 +353,14 @@ default_loader_config = {
 code_loaders_map = {ext: default_loader_config for ext in code_extensions}
 text_loaders_map = {ext: default_loader_config for ext in text_extensions}
 
-# Combined mapping for backward compatibility
+# Combined mapping — document_loaders_map is merged last so dedicated loaders
+# (e.g. EliteACSVLoader for .csv) take precedence over generic text/code fallbacks.
 loaders_map = {
     **image_loaders_map,
     **image_loaders_map_converted,
-    **document_loaders_map,
     **code_loaders_map,
-    **text_loaders_map
+    **text_loaders_map,
+    **document_loaders_map,
 }
 
 loaders_allowed_to_override = {
