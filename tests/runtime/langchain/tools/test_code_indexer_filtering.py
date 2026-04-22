@@ -292,16 +292,6 @@ class TestCIL_CHK_ChunkingConfig:
         docs = load(tk, chunked=True, chunking_config=None)
         assert len(docs) >= 1
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "EliteaAI/elitea_issues#4722 — "
-            "chunking_config is accepted by loader() (line 88) but never forwarded "
-            "to universal_chunker (line 235). "
-            "Fix: change `return universal_chunker(raw_document_generator())` "
-            "to `return universal_chunker(raw_document_generator(), config=chunking_config)`."
-        )
-    )
     def test_CHK05_text_chunking_config_chunk_size_is_honoured(self):
         """
         When chunking_config={'text_config': {'chunk_size': 30, 'chunk_overlap': 0}}
@@ -323,14 +313,6 @@ class TestCIL_CHK_ChunkingConfig:
                 f"Chunk too large ({len(doc.page_content)} chars); config was not forwarded"
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "EliteaAI/elitea_issues#4722 — "
-            "same root cause as CHK05: chunking_config not forwarded to universal_chunker. "
-            "markdown_config max_tokens override has no effect."
-        )
-    )
     def test_CHK06_markdown_chunking_config_max_tokens_is_honoured(self):
         """
         When chunking_config={'markdown_config': {'max_tokens': 5}} is passed,
