@@ -232,7 +232,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
         # Apply universal chunker based on file type
         from .chunkers.universal_chunker import universal_chunker
-        return universal_chunker(raw_document_generator())
+        return universal_chunker(raw_document_generator(), config=chunking_config)
 
     def __handle_get_files(self, path: str, branch: str):
         """
