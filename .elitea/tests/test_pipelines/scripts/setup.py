@@ -905,14 +905,6 @@ def run(
         session_id=session_id,
     )
     
-    # Load env_mapping values before setup
-    if config:
-        for key, value in config.get("env_mapping", {}).items():
-            resolved_value = resolve_env_value(value, ctx.env_vars, env_loader=load_from_env)
-            ctx.env_vars[key] = resolved_value
-            if verbose or dry_run:
-                logger.debug(f"Loaded env_mapping: {key}={resolved_value}")
-    
     logger.section(f"Setup: {config.get('name', folder)}")
     logger.info(f"Target: {base_url} (Project: {project_id})")
     if dry_run:
@@ -995,12 +987,6 @@ def main():
             logger.info(f"{status} {step['name']}")
             if step.get("error"):
                 logger.error(f"  Error: {step['error'][:100]}")
-
-        logger.info("\nEnvironment Variables:")
-        for key, value in results["env_vars"].items():
-            # Mask sensitive values
-            display_value = value if "TOKEN" not in key.upper() else f"{str(value)[:4]}***"
-            logger.info(f"{key}={display_value}")
         
         if args.output_env:
              logger.success(f"Environment written to: {args.output_env}")
