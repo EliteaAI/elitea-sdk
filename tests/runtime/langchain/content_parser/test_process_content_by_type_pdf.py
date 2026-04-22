@@ -123,22 +123,12 @@ class TestChunkingConfigPdf:
         ))
         assert _page_contents(docs_ui_config) == _page_contents(docs_no_config)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="max_tokens is not consumed by EliteAPDFLoader — load() always returns "
-               "one Document per page regardless of token budget — tracked in "
-               "https://github.com/EliteaAI/elitea.github.io/issues/4081",
-    )
     def test_smaller_max_tokens_should_produce_more_chunks(self):
         """
         UI sends {".pdf": {"max_tokens": 10}}.
         pdf_text_only.pdf has ~50 words per page; with a 10-token budget the
         text on each page must be split into multiple chunks, producing
         significantly more than 3 total documents.
-
-        FAILS because of known bug: EliteAPDFLoader ignores max_tokens.
-        load() → PyPDFium2Loader → always 1 doc/page regardless of budget.
-        Fix: wire max_tokens through to a text splitter after extraction.
         """
         content = _read_bytes(_PDF_TEXT_ONLY)
         docs_default = list(process_content_by_type(content, "doc.pdf"))
@@ -148,8 +138,7 @@ class TestChunkingConfigPdf:
         ))
         assert len(docs_small_tokens) > len(docs_default), (
             f"max_tokens=10 must split page text into more chunks than the default "
-            f"{len(docs_default)} (one-per-page). Got {len(docs_small_tokens)}. "
-            "EliteAPDFLoader never reads max_tokens — chunking is not implemented."
+            f"{len(docs_default)} (one-per-page). Got {len(docs_small_tokens)}."
         )
 
     def test_config_for_other_extension_not_applied(self):
@@ -429,3 +418,35 @@ class TestLoadersMapNotMutatedPdf:
             chunking_config={".pdf": {"max_tokens": 128, "use_llm": False}},
         ))
         assert loaders_map[".pdf"]["kwargs"] == original
+
+
+# ===========================================================================
+# ImageParser not created when extract_images=False
+# ===========================================================================
+
+class TestImageParserNotCreatedWhenDisabled:
+    """Verify ImageParser is not instantiated when extract_images=False."""
+
+    def test_extract_images_false_does_not_create_image_parser(self):
+        """When use_llm=False (default), ImageParser must not be instantiated."""
+        content = _read_bytes(_PDF_WITH_IMAGE)
+        with pytest.MonkeyPatch.context() as mp:
+            calls = []
+            original_init = __import__(
+                'elitea_sdk.runtime.langchain.document_loaders.ImageParser',
+                fromlist=['ImageParser']
+            ).ImageParser.__init__
+
+            def tracking_init(self, **kwargs):
+                calls.append(kwargs)
+                return original_init(self, **kwargs)
+
+            mp.setattr(
+                'elitea_sdk.runtime.langchain.document_loaders.EliteAPDFLoader.ImageParser.__init__',
+                tracking_init,
+            )
+            list(process_content_by_type(content, "img.pdf"))
+            assert len(calls) == 0, (
+                f"ImageParser.__init__ was called {len(calls)} time(s) "
+                "but extract_images=False — should not be instantiated."
+            )
