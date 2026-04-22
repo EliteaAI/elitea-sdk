@@ -1,10 +1,10 @@
 [
   {
-    "page_content": "name,emoji,language\nAlice,😀,English\nBob,🎉,Español\nCharlie,🌟,中文\nمريم,🌙,العربية\n",
+    "page_content": "name,emoji,language\nAlice,😀,English\nBob,🎉,Español\nCharlie,🌟,中文\nمريم,🌙,العربية",
     "metadata": {
       "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_unicode.csv:1",
-      "chunk_id": 1,
-      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_unicode.csv"
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_unicode.csv",
+      "chunk_id": 1
     }
   }
 ]
