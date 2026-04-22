@@ -93,6 +93,7 @@ import zlib
 compressed_state = base64.b64decode('{encoded}')
 state_json = zlib.decompress(compressed_state).decode('utf-8')
 elitea_state = json.loads(state_json)
+alita_state = elitea_state.copy()
 '''
         return pyodide_predata
 
