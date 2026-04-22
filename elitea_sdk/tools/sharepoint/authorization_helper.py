@@ -275,8 +275,11 @@ class SharepointAuthorizationHelper:
 
     def get_lists(self, site_url: str):
         """Get all SharePoint lists on a site using Graph API.
-        
+
         Returns a list of dictionaries with list metadata (Title, Id, Description, ItemCount).
+
+        Note: Document Libraries are excluded from results.
+        Use get_file_content() to access document library contents.
         """
         if not site_url or not site_url.startswith("https://"):
             raise ValueError(f"Invalid site_url format: {site_url}")
@@ -297,7 +300,10 @@ class SharepointAuthorizationHelper:
                 # Skip hidden system lists
                 if lst.get('list', {}).get('hidden', False):
                     continue
-                    
+                # Skip Document Libraries - users expect only true lists
+                if lst.get('list', {}).get('template', '') == 'documentLibrary':
+                    continue
+
                 result.append({
                     'Title': lst.get('displayName', lst.get('name', '')),
                     'Id': lst.get('id', ''),
