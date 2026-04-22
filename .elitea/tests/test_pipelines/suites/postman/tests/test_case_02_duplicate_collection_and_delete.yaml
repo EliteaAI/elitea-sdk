@@ -135,6 +135,7 @@ nodes:
       - get_duplicate_result
       - duplicate_name
       - source_collection_id
+      - delete_result
     input_mapping:
       chat_history:
         type: fixed
@@ -152,6 +153,7 @@ nodes:
           Get Duplicate Result: {get_duplicate_result}
           Expected Name: {duplicate_name}
           Source Collection ID: {source_collection_id}
+          Delete Result: {delete_result}
           
           This is a POSITIVE test - we expect successful collection duplication.
           
@@ -162,6 +164,7 @@ nodes:
           4. duplicate_retrieved: get_collection successfully retrieved the duplicate
           5. correct_name: Duplicate has the expected name
           6. no_errors: No error indicators in any output
+          7. cleanup_succeeded: Duplicate was deleted successfully (no errors in delete_result)
           
           Return JSON test_results:
           {{
@@ -172,6 +175,7 @@ nodes:
             "duplicate_retrieved": boolean,
             "correct_name": boolean,
             "no_errors": boolean,
+            "cleanup_succeeded": boolean,
             "duplicate_id": "extracted ID or null",
             "summary": "brief description of outcome",
             "error": string | null

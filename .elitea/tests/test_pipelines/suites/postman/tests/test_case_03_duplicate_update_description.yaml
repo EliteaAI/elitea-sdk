@@ -151,6 +151,7 @@ nodes:
       - update_result
       - get_updated_result
       - new_description
+      - delete_result
     input_mapping:
       chat_history:
         type: fixed
@@ -168,6 +169,7 @@ nodes:
           Update Result: {update_result}
           Get Updated Collection: {get_updated_result}
           Expected Description: {new_description}
+          Delete Result: {delete_result}
           
           Validation Criteria (ALL must pass for test_passed=true):
           1. duplication_succeeded: Collection was duplicated successfully
@@ -176,6 +178,7 @@ nodes:
           4. collection_retrieved: Updated collection was retrieved
           5. description_updated: Collection description matches expected value
           6. no_errors: No error indicators in outputs
+          7. cleanup_succeeded: Duplicate was deleted successfully (no errors in delete_result)
           
           Return JSON test_results:
           {{
@@ -186,6 +189,7 @@ nodes:
             "collection_retrieved": boolean,
             "description_updated": boolean,
             "no_errors": boolean,
+            "cleanup_succeeded": boolean,
             "summary": "brief description of outcome",
             "error": string | null
           }}
