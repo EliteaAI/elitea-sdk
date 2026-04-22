@@ -79,12 +79,6 @@ class TestChunkingConfigMd:
         ))
         assert _page_contents(docs_ui_config) == _page_contents(docs_no_config)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="max_tokens override is not propagated to EliteAMarkdownLoader's "
-               "chunker_config — tracked in "
-               "https://github.com/EliteaAI/elitea.github.io/issues/3823",
-    )
     def test_smaller_max_tokens_produces_more_chunks(self):
         """
         UI sends {".md": {"max_tokens": 50}} (< default 512).
@@ -108,12 +102,6 @@ class TestChunkingConfigMd:
             f"got {len(docs_ui)} vs {len(docs_default)}"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="max_tokens override is not propagated to EliteAMarkdownLoader's "
-               "chunker_config — tracked in "
-               "https://github.com/EliteaAI/elitea.github.io/issues/3823",
-    )
     def test_larger_max_tokens_produces_fewer_chunks(self):
         """
         UI sends {".md": {"max_tokens": 700}} (> default 512, > content size).
