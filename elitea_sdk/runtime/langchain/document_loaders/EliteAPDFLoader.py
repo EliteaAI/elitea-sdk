@@ -1,6 +1,7 @@
 import pymupdf
 import fitz
 from langchain_community.document_loaders import PyPDFium2Loader
+from langchain_text_splitters import TokenTextSplitter
 
 from .ImageParser import ImageParser
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
@@ -23,7 +24,7 @@ class EliteAPDFLoader:
         self.headers = kwargs.get('headers', None)
         self.extraction_mode = kwargs.get('extraction_mode', "plain")
         self.extraction_kwargs = kwargs.get('extraction_kwargs', None)
-        self.images_parser=ImageParser(llm=self.llm, prompt=self.prompt)
+        self.max_tokens = kwargs.get('max_tokens', None)
 
     def get_content(self):
         if hasattr(self, 'file_path'):
@@ -120,13 +121,20 @@ class EliteAPDFLoader:
             return self._load_docs()
 
     def _load_docs(self):
+        """Load PDF pages as Documents, optionally extracting images and splitting by token budget."""
+        images_parser = ImageParser(llm=self.llm, prompt=self.prompt) if self.extract_images else None
         docs = PyPDFium2Loader(
                 file_path = self.file_path,
                 password=self.password,
                 headers=self.headers,
                 extract_images = self.extract_images,
-                images_parser = ImageParser(llm=self.llm, prompt=self.prompt),
+                images_parser = images_parser,
             ).load()
         for doc in docs:
             doc.metadata['chunk_id'] = doc.metadata['page']
+        if self.max_tokens and self.max_tokens > 0:
+            splitter = TokenTextSplitter(encoding_name="cl100k_base", chunk_size=self.max_tokens, chunk_overlap=0)
+            docs = splitter.split_documents(docs)
+            for idx, doc in enumerate(docs):
+                doc.metadata['chunk_id'] = idx
         return docs
