@@ -5,6 +5,7 @@ on:
      types: [opened, synchronize]
      branches:
        - main
+       - 'release/*'
   workflow_dispatch:
     inputs:
       pr_number:
