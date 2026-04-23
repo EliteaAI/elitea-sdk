@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elitea_sdk"
-version = "0.5.41"
+version = "0.5.42"
 description = "SDK for building langchain agents using resources from EliteA"
 readme = "README.md"
 requires-python = ">=3.10"
