@@ -146,6 +146,9 @@ class ConfluenceConfiguration(BaseModel):
         # Confluence Cloud REST API is typically under /wiki. Users often paste
         # https://<site>.atlassian.net and shouldn't be forced to know about /wiki.
         parsed = urlparse(base_url)
+        if not parsed.netloc:
+            return "Confluence URL is invalid"
+
         host = (parsed.hostname or "").lower()
         path = parsed.path or ""
 

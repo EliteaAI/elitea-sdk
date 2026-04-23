@@ -13,13 +13,15 @@ _ATLASSIAN_HOSTING_TOOLTIP = (
 
 
 def _hosting_to_cloud(hosting: Optional[str], base_url: Optional[str]) -> bool:
-    """Resolve a hosting string (``'auto'`` | ``'cloud'`` | ``'server'``) to a
-    boolean *cloud* flag used by the ``atlassian-python-api`` client.
+    """Resolve a hosting string to the boolean cloud flag used by Atlassian clients.
+
+    Accepted values are case-insensitive UI literals such as ``'Auto'``,
+    ``'Cloud'``, and ``'Server'`` (lower-case forms are also accepted).
 
     Resolution order:
-    1. ``'cloud'``  → ``True``
-    2. ``'server'`` → ``False``
-    3. ``'auto'`` / ``None`` — auto-detect from *base_url*:
+    1. ``'Cloud'`` / ``'cloud'``  → ``True``
+    2. ``'Server'`` / ``'server'`` → ``False``
+    3. ``'Auto'`` / ``'auto'`` / ``None`` — auto-detect from *base_url*:
        - URL contains ``.atlassian.net`` → ``True`` (Cloud)
        - Otherwise → ``False`` (Server / Data Center)
     """
@@ -50,6 +52,9 @@ def _validate_atlassian_hosting_selection(
         return None
 
     parsed = urlparse((base_url or '').strip())
+    if not parsed.hostname:
+        return None
+
     host = (parsed.hostname or '').lower()
     is_cloud_url = host.endswith('.atlassian.net')
 

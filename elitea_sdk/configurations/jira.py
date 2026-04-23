@@ -124,7 +124,8 @@ class JiraConfiguration(BaseModel):
         from requests.auth import HTTPBasicAuth
 
         # Extract and validate settings
-        base_url = settings.get('base_url', '').strip().rstrip('/')
+        base_url_input = settings.get('base_url', '')
+        base_url = base_url_input.strip() if isinstance(base_url_input, str) else ''
         username = settings.get('username')
         api_key = settings.get('api_key')
         token = settings.get('token')
@@ -139,6 +140,8 @@ class JiraConfiguration(BaseModel):
         parsed = urlparse(base_url)
         if not parsed.netloc:
             return "Jira URL is invalid"
+
+        base_url = base_url.rstrip('/')
 
         host = (parsed.hostname or '').lower()
         path = (parsed.path or '').rstrip('/')

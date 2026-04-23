@@ -88,6 +88,47 @@ def test_confluence_check_connection_rejects_hosting_url_mismatch(monkeypatch, s
     assert '.atlassian.net' in error
 
 
+@pytest.mark.parametrize(
+    ('check_connection', 'settings', 'expected_message'),
+    [
+        (
+            JiraConfiguration.check_connection,
+            {
+                'hosting': 'Cloud',
+                'base_url': 'https://',
+                'username': 'user@example.com',
+                'api_key': 'token',
+            },
+            'Jira URL is invalid',
+        ),
+        (
+            ConfluenceConfiguration.check_connection,
+            {
+                'hosting': 'Cloud',
+                'base_url': 'https://',
+                'username': 'user@example.com',
+                'api_key': 'token',
+            },
+            'Confluence URL is invalid',
+        ),
+    ],
+)
+def test_check_connection_rejects_malformed_urls_before_hosting_validation(
+    monkeypatch,
+    check_connection,
+    settings,
+    expected_message,
+):
+    def fail_get(*args, **kwargs):
+        raise AssertionError('requests.get should not be called when URL is malformed')
+
+    monkeypatch.setattr('requests.get', fail_get)
+
+    error = check_connection(settings)
+
+    assert error == expected_message
+
+
 def test_jira_check_connection_auto_keeps_existing_url_inference(monkeypatch):
     class Response:
         status_code = 200
