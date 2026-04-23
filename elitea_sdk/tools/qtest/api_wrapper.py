@@ -158,8 +158,8 @@ logger = logging.getLogger(__name__)
 QtestDataQuerySearch = create_model(
     "QtestDataQuerySearch",
     dql=(str, Field(description="Qtest Data Query Language (DQL) query string")),
-    extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled without a prompt, image tags are stripped and only surrounding text is returned.", default=False)),
-    prompt=(Optional[str], Field(description="Prompt for image processing. Required to analyze embedded images; if omitted, image tags are stripped instead.", default=None)),
+    extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled and no custom prompt is provided, the repository default image-processing prompt is used.", default=False)),
+    prompt=(Optional[str], Field(description="Optional override prompt for image processing. If omitted or empty, the repository default image-processing prompt is used.", default=None)),
     max_results=(Optional[int], Field(description="Maximum total results to fetch across all pages. Set to 0 or negative for unlimited. Default: 20", default=20))
 )
 
@@ -197,8 +197,8 @@ UpdateTestCase = create_model(
 FindTestCaseById = create_model(
     "FindTestCaseById",
     test_id=(str, Field(description="Test case ID e.g. TC-1234")),
-    extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled without a prompt, image tags are stripped and only surrounding text is returned.", default=False)),
-    prompt=(Optional[str], Field(description="Prompt for image processing. Required to analyze embedded images; if omitted, image tags are stripped instead.", default=None))
+    extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled and no custom prompt is provided, the repository default image-processing prompt is used.", default=False)),
+    prompt=(Optional[str], Field(description="Optional override prompt for image processing. If omitted or empty, the repository default image-processing prompt is used.", default=None))
 )
 
 DeleteTestCase = create_model(
@@ -985,8 +985,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         IMPORTANT: This method must be called BEFORE strip_tags() because it needs
         the HTML <img> tags to extract base64-encoded images.
 
-        If extract=True but no prompt is provided, embedded images are stripped
-        instead of being sent for multimodal analysis.
+        If extract=True and no prompt is provided, the shared parser applies the
+        repository default image-processing prompt.
         """
         img_tag_regex = re.compile(r'<img\b[^>]*>|&lt;img\b.*?&gt;', re.IGNORECASE)
         base64_src_regex = re.compile(
@@ -1005,8 +1005,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             if not src_match:
                 return img_tag
 
-            if not (extract and prompt):
+            if not extract:
                 return ""
+
+            effective_prompt = prompt if prompt else None
 
             base64_content = src_match.group('base64_content')
             image_type = src_match.group('image_type')
@@ -1019,7 +1021,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 logger.warning("Failed to decode embedded qTest image; stripping tag instead: %s", exc)
                 return ""
 
-            description = f"<img description=\"Image Transcript: {parse_file_content(file_content=file_content, file_name=file_name, prompt=prompt, llm=self.llm)}\">"
+            description = (
+                "\n\n"
+                f"Image Transcript: {parse_file_content(file_content=file_content, file_name=file_name, prompt=effective_prompt, llm=self.llm)}"
+                "\n\n"
+            )
 
             return description
 
