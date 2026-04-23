@@ -3,7 +3,8 @@
     "page_content": "[No readable text detected by OCR]",
     "metadata": {
       "source": "/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/image_regular.jpg",
-      "processing_method": "ocr"
+      "processing_method": "ocr",
+      "original_dimensions": [500, 500]
     }
   }
 ]

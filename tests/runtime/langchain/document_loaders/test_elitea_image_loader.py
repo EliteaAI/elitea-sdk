@@ -26,9 +26,7 @@ from loader_test_runner import _get_llm_for_tests
 
 _LOADER_NAME = "EliteAImageLoader"
 
-_SKIP = {
-    ("wrench_svg", 1),
-}
+_SKIP = set()
 
 
 @pytest.fixture(scope="module")
@@ -52,6 +50,8 @@ def test_loader(
 ) -> None:
     if (input_name, config_index) in _SKIP:
         pytest.skip(f"{input_name} config{config_index}: known failure — pending fix")
+    if config.get("_use_llm") and llm_instance is None:
+        pytest.skip(f"{input_name} config{config_index}: requires LLM (set ELITEA_* env vars)")
     run_loader_assert(
         _LOADER_NAME, tmp_path, input_name, config_index, config, file_path, baseline_path, llm=llm_instance
     )

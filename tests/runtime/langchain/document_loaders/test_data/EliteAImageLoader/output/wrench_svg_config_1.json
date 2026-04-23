@@ -1,9 +1,11 @@
 [
   {
-    "page_content": "This is an illustration of a wrench tool. The image shows a simple, stylized wrench icon in gray or silver color. It appears to be a vector graphic or digital illustration rather than a photograph. The wrench is shown at an angle, with the adjustable jaw visible on one end. The design is clean and minimalist, typical of icons used in software interfaces or toolkits.",
+    "page_content": "This is a simple black and white icon depicting a wrench (spanner) tool with a plus (+) symbol in the bottom-right corner. The wrench is rendered in a clean, minimalist style typical of UI icons. The plus sign suggests an 'add tool' or 'add configuration' action. The icon has a transparent background and uses solid black fill for the shapes.",
     "metadata": {
       "source": "/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/wrench.svg",
-      "processing_method": "llm"
+      "processing_method": "llm",
+      "original_dimensions": [17, 16],
+      "scaled": true
     }
   }
 ]
