@@ -76,6 +76,10 @@ class EliteAImageLoader(BaseLoader):
         except Exception as e:
             raise ValueError(f"Error opening image or processing SVG: {e}")
 
+        if not text_content or not text_content.strip():
+            method = "LLM" if self.llm else "OCR"
+            text_content = f"[No readable text detected by {method}]"
+
         return text_content
 
     def _process_svg(self, svg_source):
@@ -151,5 +155,8 @@ class EliteAImageLoader(BaseLoader):
         """Load text from image using OCR or LLM if llm is provided, supports SVG."""
         text_content = self.get_content()
 
-        metadata = {"source": str(self.file_path if hasattr(self, 'file_path') else self.file_name)}  # Ensure source is always a string for metadata
+        metadata = {
+            "source": str(self.file_path if hasattr(self, 'file_path') else self.file_name),
+            "processing_method": "llm" if self.llm else "ocr",
+        }
         return [Document(page_content=text_content, metadata=metadata)]

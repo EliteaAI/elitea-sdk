@@ -1,8 +1,9 @@
 [
   {
-    "page_content": "",
+    "page_content": "[No readable text detected by OCR]",
     "metadata": {
-      "source": "/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/snail.bmp"
+      "source": "/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/snail.bmp",
+      "processing_method": "ocr"
     }
   }
 ]
