@@ -75,7 +75,6 @@ nodes:
           Validate the output from 'comment_on_pull_request' and verify the comment appears in the PR details.
 
           Expected Comment: {generated_comment}
-          Comment Query (full): {comment_query}
           Comment Tool Result: {tool_result}
           PR Details: {pr_details}
 
