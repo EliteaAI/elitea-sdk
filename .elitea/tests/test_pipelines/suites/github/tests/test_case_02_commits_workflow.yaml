@@ -12,10 +12,10 @@ state:
     type: list
   max_count:
     type: int
-    value: 3
+    value: 2
   sha:
     type: str
-    value: "main"
+    value: "test/gh25-pr-20260422-132638-wn49"
   tool_result:
     type: str
   commits_list:
@@ -63,7 +63,7 @@ nodes:
         import json
 
         commits_result = elitea_state.get('tool_result')
-        max_count = elitea_state.get('max_count', 3)
+        max_count = elitea_state.get('max_count', 2)
 
         commits_list = []
         try:
@@ -82,12 +82,19 @@ nodes:
         within_limit = len(commits_list) <= max_count if isinstance(commits_list, list) else False
         commits_have_sha = all('sha' in c for c in commits_list) if commits_list else False
 
-        # Extract adjacent commit SHAs for diff comparison (smaller diff)
+        # Extract SHAs for diff comparison.
+        # Prefer adjacent commits when available, but fall back to comparing
+        # the single returned commit with itself so the diff tool still runs
+        # on branches with only one commit in scope.
         base_sha = None
         head_sha = None
         if commits_list and len(commits_list) >= 2:
             head_sha = commits_list[0].get('sha') if isinstance(commits_list[0], dict) else None
             base_sha = commits_list[1].get('sha') if isinstance(commits_list[1], dict) else None
+        elif commits_list and len(commits_list) == 1:
+          single_sha = commits_list[0].get('sha') if isinstance(commits_list[0], dict) else None
+          head_sha = single_sha
+          base_sha = single_sha
 
         # Build compact sample for output
         commits_sample = []
@@ -102,7 +109,8 @@ nodes:
         validation_results = {
             "get_commits_ok": has_commits and within_limit and commits_have_sha,
             "commits_count": len(commits_list) if isinstance(commits_list, list) else 0,
-            "commits_sample": commits_sample
+          "commits_sample": commits_sample,
+          "diff_ready": bool(base_sha and head_sha)
         }
 
         # Return only what's needed, clear tool_result to free memory

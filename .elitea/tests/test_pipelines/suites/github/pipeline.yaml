@@ -12,7 +12,7 @@ description: GitHub toolkit integration tests
 env_mapping:
   toolkit_config: ${GIT_CONFIG_PATH:../../../tool_configs/git-config.json}
   access_token: ${GIT_TOOL_ACCESS_TOKEN}
-  repository: ${GITHUB_TEST_REPO:ProjectAlita/elitea-testing}
+  repository: ${GITHUB_TEST_REPO:EliteaAI/elitea-testing}
   base_branch: ${GITHUB_BASE_BRANCH:main}
 
 # Setup steps executed before running tests
@@ -42,7 +42,7 @@ setup:
         github_configuration:
           private: false
           elitea_title: ${GITHUB_SECRET_NAME:github}
-        repository: ${GITHUB_TEST_REPO:ProjectAlita/elitea-testing}
+        repository: ${GITHUB_TEST_REPO:EliteaAI/elitea-testing}
         active_branch: ${GITHUB_BASE_BRANCH:main}
         base_branch: ${GITHUB_BASE_BRANCH:main}
       # Name for the toolkit on platform
