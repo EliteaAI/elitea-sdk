@@ -73,20 +73,29 @@ nodes:
     output:
       - tool_result
     structured_output: true
-    transition: set_active_branch
+    transition: resolve_target_branch
 
-  - id: set_active_branch
-    type: toolkit
-    tool: set_active_branch
-    toolkit_name: ${GITHUB_TOOLKIT_NAME}
+  - id: resolve_target_branch
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+
+        target_branch = elitea_state.get('target_branch')
+        tool_result = elitea_state.get('tool_result', '')
+
+        if isinstance(tool_result, str):
+            match = re.search(r"Branch '([^']+)' created successfully", tool_result)
+            if match:
+                target_branch = match.group(1)
+
+        {"target_branch": target_branch}
     input:
       - target_branch
-    input_mapping:
-      branch_name:
-        type: variable
-        value: target_branch
-    output:
       - tool_result
+    output:
+      - target_branch
     structured_output: true
     transition: create_file
 
@@ -95,9 +104,13 @@ nodes:
     tool: create_file
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     input:
+      - target_branch
       - file_path
       - file_contents
     input_mapping:
+      branch:
+        type: variable
+        value: target_branch
       file_path:
         type: variable
         value: file_path
