@@ -1,0 +1,11 @@
+[
+  {
+    "page_content": "This is a small pixel art icon showing a red octagonal or circular shape on a white background. The shape has a darker red or maroon border and bright red fill. Due to the low resolution, the edges appear jagged and pixelated with visible stair-step artifacts. The design resembles a stop sign icon, game asset, or simple UI indicator button.",
+    "metadata": {
+      "source": "/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/small_icon.png",
+      "processing_method": "llm",
+      "original_dimensions": [20, 20],
+      "scaled": true
+    }
+  }
+]
