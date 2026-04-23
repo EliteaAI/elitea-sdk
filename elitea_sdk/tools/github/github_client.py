@@ -967,30 +967,36 @@ class GitHubClient(BaseModel):
         current_line = 0
         
         for hunk in sorted_hunks:
-            # Add lines before this hunk
-            while current_line < hunk['old_start'] - 1:
-                if current_line < len(lines):
-                    result_lines.append(lines[current_line])
-                current_line += 1
-                
-            # Apply hunk changes
-            old_line_in_hunk = 0
-            
-            for patch_line in hunk['lines']:
-                if patch_line.startswith(' '):
-                    # Context line - should match original
-                    context_line = patch_line[1:]
+            if hunk.get('old_count', 1) == 0:
+                # Pure addition hunk: old_start is the line after which to insert
+                while current_line < hunk['old_start']:
                     if current_line < len(lines):
                         result_lines.append(lines[current_line])
-                        current_line += 1
-                    old_line_in_hunk += 1
-                elif patch_line.startswith('-'):
-                    # Deletion - skip original line
                     current_line += 1
-                    old_line_in_hunk += 1
-                elif patch_line.startswith('+'):
-                    # Addition - add new line
-                    result_lines.append(patch_line[1:])
+                
+                for patch_line in hunk['lines']:
+                    if patch_line.startswith('+'):
+                        result_lines.append(patch_line[1:])
+            else:
+                # Add lines before this hunk
+                while current_line < hunk['old_start'] - 1:
+                    if current_line < len(lines):
+                        result_lines.append(lines[current_line])
+                    current_line += 1
+                
+                # Apply hunk changes
+                for patch_line in hunk['lines']:
+                    if patch_line.startswith(' '):
+                        # Context line
+                        if current_line < len(lines):
+                            result_lines.append(lines[current_line])
+                            current_line += 1
+                    elif patch_line.startswith('-'):
+                        # Deletion - skip original line
+                        current_line += 1
+                    elif patch_line.startswith('+'):
+                        # Addition - add new line
+                        result_lines.append(patch_line[1:])
                     
         # Add remaining lines
         while current_line < len(lines):
