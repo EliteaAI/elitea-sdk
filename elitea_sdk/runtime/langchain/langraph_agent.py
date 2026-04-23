@@ -1680,10 +1680,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     )
                 elif should_continue:
                     # Explicitly continuing interrupted execution.
-                    # For static (compile-time) interrupts, LangGraph requires
-                    # invoke(None) to resume from the interrupt point.
-                    # Passing input would restart the graph from the beginning.
-                    if self._is_at_static_interrupt(checkpoint_state):
+                    # Use update_state + invoke(None) for static interrupts or
+                    # non-pipeline agents (predict), where passing input would
+                    # restart the graph and regenerate the same response.
+                    # Pipelines not at a static interrupt use invoke(input) to
+                    # preserve their execution flow.
+                    is_pipeline = bool(self._interrupt_after_successors or self.interrupt_before_nodes)
+                    if self._is_at_static_interrupt(checkpoint_state) or not is_pipeline:
                         logger.info(
                             "[CHECKPOINT] Resuming static interrupt via invoke(None) "
                             "for thread %s (next=%s)",
