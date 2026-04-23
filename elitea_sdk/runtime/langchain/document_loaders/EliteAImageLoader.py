@@ -9,7 +9,7 @@ from langchain_core.documents import Document
 from reportlab.graphics import renderPM
 from svglib.svglib import svg2rlg
 
-from .utils import perform_llm_prediction_for_image_bytes
+from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size, scale_svg_drawing, preprocess_svg_for_rendering
 from ..constants import DEFAULT_MULTIMODAL_PROMPT
 from ..tools.utils import image_to_byte_array, bytes_to_base64
 
@@ -35,6 +35,8 @@ class EliteAImageLoader(BaseLoader):
         self.ocr_language = kwargs.get('ocr_language', None)
         self.prompt = kwargs.get('prompt') if kwargs.get(
             'prompt') is not None else DEFAULT_MULTIMODAL_PROMPT  # Use provided prompt or default
+        self._original_dimensions = None
+        self._was_scaled = False
 
     def get_content(self):
         """
@@ -83,51 +85,28 @@ class EliteAImageLoader(BaseLoader):
         return text_content
 
     def _process_svg(self, svg_source):
-        """
-        Processes an SVG file or in-memory SVG content.
+        """Processes an SVG file or in-memory SVG content with automatic upscaling for small SVGs."""
+        if isinstance(svg_source, (str, Path)):
+            with open(svg_source, 'rb') as f:
+                svg_content = f.read()
+        else:
+            svg_content = svg_source.read()
+        svg_content = preprocess_svg_for_rendering(svg_content)
 
-        If an LLM is available, the SVG is processed using LLM. Otherwise, the SVG
-        is converted to PNG and processed using OCR.
-
-        Args:
-            svg_source (str, Path, or BytesIO): The SVG file path or in-memory content.
-
-        Returns:
-            str: Extracted text content from the SVG.
-        """
         if self.llm:
-            if isinstance(svg_source, (str, Path)):
-                with open(svg_source, 'rb') as f:
-                    svg_content = f.read()
-            else:
-                svg_content = svg_source.read()
             return self.__process_svg_with_llm(svg_content, self.llm, self.prompt)
         else:
-            # For OCR on SVG, convert SVG to PNG and then use OCR
-            if isinstance(svg_source, (str, Path)):
-                drawing = svg2rlg(str(svg_source))  # svglib requires path as a string
-            else:
-                drawing = svg2rlg(svg_source)  # svglib supports BytesIO
-            img_data = BytesIO()
-            renderPM.drawToFile(drawing, img_data, fmt="PNG")
-            img_data.seek(0)
-            image = Image.open(img_data)
+            drawing = svg2rlg(BytesIO(svg_content))
+            self._original_dimensions = (int(drawing.width), int(drawing.height))
+            drawing, self._was_scaled = scale_svg_drawing(drawing)
+            image = self.__render_svg_drawing(drawing)
             return pytesseract.image_to_string(image, lang=self.ocr_language)
 
     def _process_raster_image(self, image_source):
-        """
-        Processes a raster image (e.g., PNG, JPG).
-
-        If an LLM is available, the image is processed using LLM. Otherwise, OCR is used
-        to extract text content from the image.
-
-        Args:
-            image_source (str, Path, or BytesIO): The image file path or in-memory content.
-
-        Returns:
-            str: Extracted text content from the raster image.
-        """
+        """Processes a raster image with automatic upscaling for small images."""
         image = Image.open(image_source)
+        self._original_dimensions = image.size
+        image, self._was_scaled = ensure_min_image_size(image)
         if self.llm:
             try:
                 return self.__perform_llm_prediction_for_image(image, self.llm, self.prompt)
@@ -143,13 +122,20 @@ class EliteAImageLoader(BaseLoader):
         return perform_llm_prediction_for_image_bytes(byte_array, llm, prompt)
 
     def __process_svg_with_llm(self, svg_content: bytes, llm, prompt: str) -> str:
-        """Processes SVG content using LLM."""
+        """Processes SVG content using LLM with automatic upscaling for small SVGs."""
         drawing = svg2rlg(BytesIO(svg_content))
+        self._original_dimensions = (int(drawing.width), int(drawing.height))
+        drawing, self._was_scaled = scale_svg_drawing(drawing)
+        image = self.__render_svg_drawing(drawing)
+        return self.__perform_llm_prediction_for_image(image, llm, prompt)
+
+    @staticmethod
+    def __render_svg_drawing(drawing):
+        """Render an svglib drawing to a PIL RGBA Image."""
         img_data = BytesIO()
         renderPM.drawToFile(drawing, img_data, fmt="PNG")
         img_data.seek(0)
-        image = Image.open(img_data)
-        return self.__perform_llm_prediction_for_image(image, llm, prompt)
+        return Image.open(img_data).convert("RGBA")
 
     def load(self) -> List[Document]:
         """Load text from image using OCR or LLM if llm is provided, supports SVG."""
@@ -159,4 +145,8 @@ class EliteAImageLoader(BaseLoader):
             "source": str(self.file_path if hasattr(self, 'file_path') else self.file_name),
             "processing_method": "llm" if self.llm else "ocr",
         }
+        if self._original_dimensions is not None:
+            metadata["original_dimensions"] = list(self._original_dimensions)
+        if self._was_scaled:
+            metadata["scaled"] = True
         return [Document(page_content=text_content, metadata=metadata)]
