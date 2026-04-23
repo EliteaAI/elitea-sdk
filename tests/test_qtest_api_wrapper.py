@@ -3,6 +3,7 @@ import html
 from pydantic import SecretStr
 
 from elitea_sdk.tools.qtest.api_wrapper import QTEST_ID, QtestApiWrapper
+from elitea_sdk.tools.utils.content_parser import image_processing_prompt
 
 
 def _make_wrapper():
@@ -284,57 +285,58 @@ def test_parse_data_uses_clean_html_content_for_all_test_case_fields(monkeypatch
     assert parsed_row['Steps'][0]['Test Step Expected Result'] == 'clean:step expected'
 
 
-def test_parse_data_strips_images_when_extract_enabled_without_prompt(monkeypatch):
+def test_parse_data_uses_default_prompt_when_prompt_is_missing_or_empty(monkeypatch):
     wrapper = _make_wrapper()
-    parsed_data = []
     base64_content = 'QUJD'
     html_content = (
         f'Before <img src="data:image/png;base64,{base64_content}" '
         'data-filename="image.png" style="width: 460px;"> after'
     )
 
-    def fail_parse_file_content(**kwargs):
-        raise AssertionError('parse_file_content should not be called without an explicit prompt')
+    for provided_prompt in (None, ''):
+        parsed_data = []
+        forwarded_prompts = []
 
-    def fail_decode(*args, **kwargs):
-        raise AssertionError('base64 decode should not be called when prompt is missing')
+        class FakeLoader:
+            def __init__(self, prompt):
+                self.prompt = prompt
 
-    monkeypatch.setattr('elitea_sdk.tools.qtest.api_wrapper.parse_file_content', fail_parse_file_content)
-    monkeypatch.setattr('elitea_sdk.tools.qtest.api_wrapper.base64.b64decode', fail_decode)
+            def get_content(self):
+                return f'default-prompt-analysis:{self.prompt[:24]}'
 
-    wrapper._QtestApiWrapper__parse_data(
-        {
-            'items': [
-                {
-                    'pid': 'TC-70394',
-                    'name': 'No prompt image stripping case',
-                    'description': html_content,
-                    'precondition': html_content,
-                    'id': 4627004,
-                    'test_steps': [
-                        {
-                            'description': html_content,
-                            'expected': html_content,
-                        }
-                    ],
-                    'properties': [],
-                }
-            ]
-        },
-        parsed_data,
-        extract_images=True,
-        prompt=None,
-    )
+        def fake_prepare_loader(**kwargs):
+            forwarded_prompts.append(kwargs['prompt'])
+            return FakeLoader(kwargs['prompt'])
 
-    parsed_row = parsed_data[0]
-    parsed_step = parsed_row['Steps'][0]
+        monkeypatch.setattr('elitea_sdk.tools.utils.content_parser.prepare_loader', fake_prepare_loader)
 
-    assert base64_content not in parsed_row['Description']
-    assert base64_content not in parsed_row['Precondition']
-    assert base64_content not in parsed_step['Test Step Description']
-    assert base64_content not in parsed_step['Test Step Expected Result']
-    assert parsed_row['Description'].replace('  ', ' ').strip() == 'Before after'
-    assert parsed_step['Test Step Description'].replace('  ', ' ').strip() == 'Before after'
+        wrapper._QtestApiWrapper__parse_data(
+            {
+                'items': [
+                    {
+                        'pid': 'TC-70394',
+                        'name': 'Default prompt image analysis case',
+                        'description': html_content,
+                        'precondition': '',
+                        'id': 4627004,
+                        'test_steps': [],
+                        'properties': [],
+                    }
+                ]
+            },
+            parsed_data,
+            extract_images=True,
+            prompt=provided_prompt,
+        )
+
+        description = parsed_data[0]['Description']
+
+        assert forwarded_prompts == [image_processing_prompt]
+        assert base64_content not in description
+        assert 'Image Transcript:' in description
+        assert 'default-prompt-analysis:' in description
+        assert description.index('Before') < description.index('Image Transcript:')
+        assert description.index('Image Transcript:') < description.index('after')
 
 
 def test_parse_data_strips_images_without_decoding_when_extract_disabled(monkeypatch):
@@ -384,3 +386,54 @@ def test_parse_data_strips_images_without_decoding_when_extract_disabled(monkeyp
     assert base64_content not in parsed_step['Test Step Expected Result']
     assert parsed_row['Description'].replace('  ', ' ').strip() == 'Before after'
     assert parsed_step['Test Step Description'].replace('  ', ' ').strip() == 'Before after'
+
+
+def test_parse_data_extracts_multiple_images_in_order(monkeypatch):
+    wrapper = _make_wrapper()
+    parsed_data = []
+    base64_content = 'QUJD'
+    html_content = (
+        'Start '
+        f'<img src="data:image/png;base64,{base64_content}" data-filename="one.png"> '
+        'Middle '
+        f'<img src="data:image/png;base64,{base64_content}" data-filename="two.png"> '
+        'End'
+    )
+
+    def fake_parse_file_content(**kwargs):
+        file_name = kwargs['file_name']
+        return {
+            'one.png': 'first image transcript',
+            'two.png': 'second image transcript',
+        }[file_name]
+
+    monkeypatch.setattr('elitea_sdk.tools.qtest.api_wrapper.parse_file_content', fake_parse_file_content)
+
+    wrapper._QtestApiWrapper__parse_data(
+        {
+            'items': [
+                {
+                    'pid': 'TC-70397',
+                    'name': 'Multiple images in one field',
+                    'description': html_content,
+                    'precondition': '',
+                    'id': 4627007,
+                    'test_steps': [],
+                    'properties': [],
+                }
+            ]
+        },
+        parsed_data,
+        extract_images=True,
+        prompt='describe images',
+    )
+
+    description = parsed_data[0]['Description']
+
+    assert description.count('Image Transcript:') == 2
+    assert 'Image Transcript: first image transcript' in description
+    assert 'Image Transcript: second image transcript' in description
+    assert description.index('Start') < description.index('Image Transcript: first image transcript')
+    assert description.index('Image Transcript: first image transcript') < description.index('Middle')
+    assert description.index('Middle') < description.index('Image Transcript: second image transcript')
+    assert description.index('Image Transcript: second image transcript') < description.index('End')
