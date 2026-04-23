@@ -2028,8 +2028,6 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         create_graph). This prevents misclassifying a crashed run as a
         static interrupt just because interrupt_after is configured.
         """
-        if not checkpoint_state.next:
-            return False
         if any(n in self.interrupt_before_nodes for n in checkpoint_state.next):
             return True
         if self._interrupt_after_successors and any(
