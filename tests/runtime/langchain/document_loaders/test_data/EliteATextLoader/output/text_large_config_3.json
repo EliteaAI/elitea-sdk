@@ -6,7 +6,7 @@
       "headers": "",
       "chunk_id": 1,
       "chunk_type": "document",
-      "method_name": "markdown"
+      "method_name": "text"
     }
   },
   {
@@ -16,7 +16,7 @@
       "headers": "",
       "chunk_id": 2,
       "chunk_type": "document",
-      "method_name": "markdown"
+      "method_name": "text"
     }
   },
   {
@@ -26,7 +26,7 @@
       "headers": "",
       "chunk_id": 3,
       "chunk_type": "document",
-      "method_name": "markdown"
+      "method_name": "text"
     }
   },
   {
@@ -36,7 +36,7 @@
       "headers": "",
       "chunk_id": 4,
       "chunk_type": "document",
-      "method_name": "markdown"
+      "method_name": "text"
     }
   }
 ]

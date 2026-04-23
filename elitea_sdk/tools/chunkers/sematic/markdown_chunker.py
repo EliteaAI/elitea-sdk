@@ -43,8 +43,12 @@ def markdown_chunker(file_content_generator: Generator[Document, None, None], co
         )
         md_header_splits = markdown_splitter.split_text(doc_content)
         
-        # Merge small chunks with the next one
-        merged_chunks = _merge_small_chunks(md_header_splits, min_chunk_chars)
+        # Merge small chunks with the next one (skip when return_each_line
+        # is True so that per-line splitting is not undone by re-merging)
+        if return_each_line:
+            merged_chunks = md_header_splits
+        else:
+            merged_chunks = _merge_small_chunks(md_header_splits, min_chunk_chars)
         
         for chunk in merged_chunks:
             if tiktoken_length(chunk.page_content) > max_tokens:
@@ -60,7 +64,7 @@ def markdown_chunker(file_content_generator: Generator[Document, None, None], co
                     docmeta.update({"headers": "; ".join(headers_meta)})
                     docmeta['chunk_id'] = chunk_id
                     docmeta['chunk_type'] = "document"
-                    docmeta['method_name'] = 'markdown'
+                    docmeta['method_name'] = 'text'
                     yield Document(
                         page_content=subchunk,
                         metadata=docmeta
@@ -72,7 +76,7 @@ def markdown_chunker(file_content_generator: Generator[Document, None, None], co
                 docmeta.update({"headers": "; ".join(headers_meta)})
                 docmeta['chunk_id'] = chunk_id
                 docmeta['chunk_type'] = "document"
-                docmeta['method_name'] = 'text'
+                docmeta['method_name'] = 'markdown'
                 yield Document(
                     page_content=chunk.page_content,
                     metadata=docmeta
@@ -165,6 +169,7 @@ def markdown_by_headers_chunker(file_content_generator: Generator[Document, None
             docmeta.update({"headers": "; ".join(headers_meta)})
             docmeta['chunk_id'] = chunk_id
             docmeta['chunk_type'] = "document"
+            docmeta['method_name'] = 'markdown'
             yield Document(
                 page_content=chunk.page_content,
                 metadata=docmeta
