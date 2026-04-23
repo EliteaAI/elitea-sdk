@@ -287,10 +287,14 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             logging.error("Graph read_list failed: %s", e)
             return ToolException(f"Cannot read list '{list_title}': {e}")
 
+    # Graph API template names to exclude from get_lists results
+    # documentLibrary = Document Libraries, webPageLibrary = Site Pages
+    EXCLUDED_LIST_TEMPLATES = {'documentLibrary', 'webPageLibrary'}
+
     def get_lists(self):
         """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions.
 
-        Note: Document Libraries are excluded from results.
+        Note: Document Libraries and Site Pages are excluded from results.
         Use get_files() to access document library contents.
         """
         try:
@@ -302,8 +306,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 list_info = lst.get('list', {})
                 if list_info.get('hidden', False):
                     continue
-                # Skip Document Libraries - users expect only true lists
-                if list_info.get('template', '') == 'documentLibrary':
+                # Skip non-list templates (Document Libraries, Site Pages, etc.)
+                if list_info.get('template', '') in self.EXCLUDED_LIST_TEMPLATES:
                     continue
                 result.append({
                     'Title': lst.get('displayName', ''),
