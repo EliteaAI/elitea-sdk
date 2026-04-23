@@ -1680,22 +1680,25 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     )
                 elif should_continue:
                     # Explicitly continuing interrupted execution.
-                    # Use update_state + invoke(None) for static interrupts or
-                    # non-pipeline agents (predict), where passing input would
-                    # restart the graph and regenerate the same response.
-                    # Pipelines not at a static interrupt use invoke(input) to
-                    # preserve their execution flow.
-                    is_pipeline = bool(self._interrupt_after_successors or self.interrupt_before_nodes)
-                    if self._is_at_static_interrupt(checkpoint_state) or not is_pipeline:
+                    # Static interrupts (PrinterNode breakpoints) require update_state()
+                    # + invoke(None) — LangGraph must be told the new input before
+                    # restarting from the compile-time breakpoint.
+                    # All other cases resume via invoke(None) directly from the current
+                    # checkpoint without replaying input (avoids duplicate LLM responses).
+                    if self._is_at_static_interrupt(checkpoint_state):
                         logger.info(
-                            "[CHECKPOINT] Resuming static interrupt via invoke(None) "
+                            "[CHECKPOINT] Resuming static interrupt via update_state+invoke(None) "
                             "for thread %s (next=%s)",
                             thread_id, checkpoint_state.next,
                         )
                         self.update_state(config, input)
-                        result = super().invoke(None, config=config, *args, **kwargs)
                     else:
-                        result = super().invoke(input, config=config, *args, **kwargs)
+                        logger.info(
+                            "[CHECKPOINT] Resuming via invoke(None) for thread %s (next=%s)",
+                            thread_id, checkpoint_state.next,
+                        )
+                    result = super().invoke(None, config=config, *args, **kwargs)
+                    logger.info(f'>>> [CONTINUE] Result: {result}')
                 elif is_at_end:
                     # Previous run completed - start fresh run with new input
                     logger.info(
