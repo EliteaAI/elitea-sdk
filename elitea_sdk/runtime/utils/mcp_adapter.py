@@ -100,6 +100,15 @@ class UnifiedMcpClient:
                 "Install with: pip install langchain-mcp-adapters"
             )
 
+        # Validate URL scheme before attempting any connection.
+        # aiohttp raises InvalidURL(url) with just the URL as the message,
+        # which would surface as a cryptic content like "ttttt" instead of a helpful error.
+        if not (self.url.startswith('http://') or self.url.startswith('https://')):
+            raise ValueError(
+                f"Invalid MCP server URL '{self.url}': URL must start with 'http://' or 'https://'. "
+                "Please check the URL in your toolkit settings."
+            )
+
         # Detect transport if auto
         detected_transport = self._detect_transport()
 
