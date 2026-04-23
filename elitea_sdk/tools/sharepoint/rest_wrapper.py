@@ -100,10 +100,14 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                     f"Cannot read list '{list_title}'. "
                     f"Check list name and permissions: {base_e} | {graph_e}")
 
+    # BaseTemplate values to exclude from get_lists results
+    # 101 = Document Library, 119 = Site Pages
+    EXCLUDED_LIST_TEMPLATES = {101, 119}
+
     def get_lists(self):
         """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions.
 
-        Note: Document Libraries (BaseTemplate=101) are excluded from results.
+        Note: Document Libraries (BaseTemplate=101) and Site Pages (BaseTemplate=119) are excluded.
         Use get_files() to access document library contents.
         """
         try:
@@ -112,8 +116,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             for lst in lists:
                 if lst.properties.get('Hidden', False):
                     continue
-                # Skip Document Libraries (BaseTemplate=101) - users expect only true lists
-                if lst.properties.get('BaseTemplate', 0) == 101:
+                # Skip non-list templates (Document Libraries, Site Pages, etc.)
+                if lst.properties.get('BaseTemplate', 0) in self.EXCLUDED_LIST_TEMPLATES:
                     continue
                 result.append({
                     'Title': lst.properties.get('Title', ''),
