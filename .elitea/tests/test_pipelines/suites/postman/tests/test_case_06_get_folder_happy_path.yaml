@@ -18,6 +18,12 @@ toolkits:
     name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
+  duplicate_name:
+    type: str
+  duplicate_result:
+    type: str
+  duplicate_id:
+    type: str
   folder_name:
     type: str
   folder_description:
@@ -46,15 +52,70 @@ nodes:
         import random
         import string
         
-        # Generate unique folder name
+        # Generate unique names
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        duplicate_name = f"PST06_Collection_{timestamp}_{random_suffix}"
         folder_name = f"PST06_TestFolder_{timestamp}_{random_suffix}"
         
-        {"folder_name": folder_name, "folder_path": folder_name}
+        {
+          "duplicate_name": duplicate_name,
+          "folder_name": folder_name,
+          "folder_path": folder_name
+        }
     output:
+      - duplicate_name
       - folder_name
       - folder_path
+    structured_output: true
+    transition: duplicate_collection
+
+  - id: duplicate_collection
+    type: toolkit
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: duplicate_collection
+    input:
+      - duplicate_name
+    input_mapping:
+      new_name:
+        type: variable
+        value: duplicate_name
+    output:
+      - duplicate_result
+    structured_output: true
+    transition: extract_duplicate_id
+
+  - id: extract_duplicate_id
+    type: code
+    code:
+      type: fstring
+      value: |
+        import json
+        import re
+        
+        result_str = elitea_state.get('duplicate_result', '')
+        duplicate_id = None
+        
+        try:
+            result_data = json.loads(result_str)
+            if isinstance(result_data, dict) and 'collection' in result_data:
+                coll = result_data['collection']
+                duplicate_id = coll.get('id') or coll.get('uid')
+                if not duplicate_id and 'info' in coll:
+                    duplicate_id = coll['info'].get('_postman_id') or coll['info'].get('uid')
+        except:
+            pass
+        
+        if not duplicate_id:
+            id_match = re.search(r'"(?:id|uid|_postman_id)"\s*:\s*"([^"]+)"', result_str)
+            if id_match:
+                duplicate_id = id_match.group(1)
+        
+        duplicate_id or "ID_NOT_FOUND"
+    input:
+      - duplicate_result
+    output:
+      - duplicate_id
     structured_output: true
     transition: create_test_folder
 
@@ -63,9 +124,13 @@ nodes:
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_folder
     input:
+      - duplicate_id
       - folder_name
       - folder_description
     input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
       name:
         type: variable
         value: folder_name
@@ -82,13 +147,33 @@ nodes:
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: get_folder
     input:
+      - duplicate_id
       - folder_path
     input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
       folder_path:
         type: variable
         value: folder_path
     output:
       - get_result
+    structured_output: true
+    transition: cleanup_delete_collection
+
+  - id: cleanup_delete_collection
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: delete_collection
+    input:
+      - duplicate_id
+    input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
+    output:
+      - delete_result
     structured_output: true
     transition: validate_results
 
@@ -96,10 +181,13 @@ nodes:
     type: llm
     model: ${DEFAULT_LLM_MODEL}
     input:
+      - duplicate_result
+      - duplicate_id
       - create_result
       - get_result
       - folder_name
       - folder_description
+      - delete_result
     input_mapping:
       chat_history:
         type: fixed
@@ -112,30 +200,39 @@ nodes:
         value: |
           Analyze the output from Postman folder operations.
           
+          Duplicate Result: {duplicate_result}
+          Duplicate ID: {duplicate_id}
           Folder Creation Result: {create_result}
           Get Folder Result: {get_result}
           Expected Folder Name: {folder_name}
           Expected Description: {folder_description}
+          Delete Result: {delete_result}
           
           This is a POSITIVE test - we expect successful folder creation and retrieval.
           
           Validation Criteria (ALL must pass for test_passed=true):
-          1. folder_created: Folder was created successfully (no errors in create_result)
-          2. folder_retrieved: get_folder returned folder details successfully
-          3. correct_name: Folder name matches expected name
-          4. has_description: Folder description is present
-          5. flattened_format: Result is in flattened format (contains path information)
-          6. no_errors: No error indicators in any output
+          1. duplicate_created: Collection was duplicated successfully
+          2. id_extracted_from_duplicate: Duplicate collection ID was extracted
+          3. folder_created: Folder was created successfully in duplicate
+          4. folder_retrieved: get_folder returned folder details successfully
+          5. correct_name: Folder name matches expected name
+          6. has_description: Folder description is present
+          7. flattened_format: Result is in flattened format (contains path information)
+          8. no_errors: No error indicators in any output
+          9. cleanup_succeeded: Duplicate collection was deleted successfully
           
           Return JSON test_results:
           {{
             "test_passed": boolean (true only if ALL criteria pass),
+            "duplicate_created": boolean,
+            "id_extracted_from_duplicate": boolean,
             "folder_created": boolean,
             "folder_retrieved": boolean,
             "correct_name": boolean,
             "has_description": boolean,
             "flattened_format": boolean,
             "no_errors": boolean,
+            "cleanup_succeeded": boolean,
             "summary": "brief description of outcome",
             "error": string | null
           }}
@@ -145,20 +242,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: cleanup_delete_folder
-
-  - id: cleanup_delete_folder
-    type: toolkit
-    continue_on_error: true
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: delete_folder
-    input:
-      - folder_path
-    input_mapping:
-      folder_path:
-        type: variable
-        value: folder_path
-    output:
-      - delete_result
-    structured_output: true
     transition: END
