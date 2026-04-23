@@ -3,7 +3,11 @@ from urllib.parse import urlparse, urlunparse
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from .utils import _hosting_to_cloud, _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP  # re-exported for back-compat
+from .utils import (
+    _hosting_to_cloud,
+    _validate_atlassian_hosting_selection,
+    _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP,
+)  # re-exported for back-compat
 
 __all__ = ['ConfluenceConfiguration', '_hosting_to_cloud']
 
@@ -144,6 +148,14 @@ class ConfluenceConfiguration(BaseModel):
         parsed = urlparse(base_url)
         host = (parsed.hostname or "").lower()
         path = parsed.path or ""
+
+        hosting_validation_error = _validate_atlassian_hosting_selection(
+            settings.get('hosting'),
+            base_url,
+            'Confluence',
+        )
+        if hosting_validation_error:
+            return hosting_validation_error
 
         def with_wiki_path(url: str) -> str:
             p = urlparse(url)
