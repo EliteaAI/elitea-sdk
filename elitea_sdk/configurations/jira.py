@@ -3,7 +3,11 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from .utils import _hosting_to_cloud, _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP  # re-exported for back-compat
+from .utils import (
+    _hosting_to_cloud,
+    _validate_atlassian_hosting_selection,
+    _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP,
+)  # re-exported for back-compat
 
 __all__ = ['JiraConfiguration', '_hosting_to_cloud']
 
@@ -120,7 +124,8 @@ class JiraConfiguration(BaseModel):
         from requests.auth import HTTPBasicAuth
 
         # Extract and validate settings
-        base_url = settings.get('base_url', '').strip().rstrip('/')
+        base_url_input = settings.get('base_url', '')
+        base_url = base_url_input.strip() if isinstance(base_url_input, str) else ''
         username = settings.get('username')
         api_key = settings.get('api_key')
         token = settings.get('token')
@@ -136,8 +141,18 @@ class JiraConfiguration(BaseModel):
         if not parsed.netloc:
             return "Jira URL is invalid"
 
+        base_url = base_url.rstrip('/')
+
         host = (parsed.hostname or '').lower()
         path = (parsed.path or '').rstrip('/')
+
+        hosting_validation_error = _validate_atlassian_hosting_selection(
+            settings.get('hosting'),
+            base_url,
+            'Jira',
+        )
+        if hosting_validation_error:
+            return hosting_validation_error
 
         # Normalised base URL: exactly what the user typed, minus trailing slash
         base_url = f"{parsed.scheme}://{parsed.netloc}{path}" if path and path != '/' \
