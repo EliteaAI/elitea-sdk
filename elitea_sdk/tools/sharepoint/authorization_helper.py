@@ -273,12 +273,16 @@ class SharepointAuthorizationHelper:
         except Exception as e:
             raise RuntimeError(f"Error in get_file_content: {e}")
 
+    # Graph API template names to exclude from get_lists results
+    # documentLibrary = Document Libraries, webPageLibrary = Site Pages
+    EXCLUDED_LIST_TEMPLATES = {'documentLibrary', 'webPageLibrary'}
+
     def get_lists(self, site_url: str):
         """Get all SharePoint lists on a site using Graph API.
 
         Returns a list of dictionaries with list metadata (Title, Id, Description, ItemCount).
 
-        Note: Document Libraries are excluded from results.
+        Note: Document Libraries and Site Pages are excluded from results.
         Use get_file_content() to access document library contents.
         """
         if not site_url or not site_url.startswith("https://"):
@@ -288,20 +292,20 @@ class SharepointAuthorizationHelper:
             headers = {"Authorization": f"Bearer {access_token}"}
             lists_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists"
             response = requests.get(lists_url, headers=headers)
-            
+
             if response.status_code != 200:
                 raise RuntimeError(f"Lists request failed: {response.status_code} {response.text}")
-            
+
             lists_json = response.json()
             lists = lists_json.get("value", [])
-            
+
             result = []
             for lst in lists:
                 # Skip hidden system lists
                 if lst.get('list', {}).get('hidden', False):
                     continue
-                # Skip Document Libraries - users expect only true lists
-                if lst.get('list', {}).get('template', '') == 'documentLibrary':
+                # Skip non-list templates (Document Libraries, Site Pages, etc.)
+                if lst.get('list', {}).get('template', '') in self.EXCLUDED_LIST_TEMPLATES:
                     continue
 
                 result.append({
