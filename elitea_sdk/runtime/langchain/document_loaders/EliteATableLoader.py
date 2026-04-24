@@ -59,12 +59,17 @@ class EliteATableLoader(BaseLoader):
     def load(self) -> List[Document]:
         docs = []
         for idx, row in enumerate(self.read()):
+            # When a header row is emitted as its own document (non-raw mode),
+            # it occupies physical row 1; data rows then start at physical row 2.
+            # For raw_content mode we stream content as-is (1-based).
+            row_number = idx + 1 if self.raw_content else idx + 2
             metadata = {
-                "source": f'{self.file_path}:{idx+1}',
+                "source": f'{self.file_path}:{row_number}',
                 "table_source": self.file_path,
             }
             if len(docs) == 0 and not self.raw_content:
                 header_metadata = metadata.copy()
+                header_metadata["source"] = f'{self.file_path}:1'
                 header_metadata["header"] = "true"
                 header = "\t".join([str(value) for value in row.keys()])
                 docs.append(Document(page_content=header, metadata=header_metadata))
@@ -83,8 +88,9 @@ class EliteATableLoader(BaseLoader):
     def lazy_load(self) -> Iterator[Document]:
         data = self.read_lazy()
         for idx, row in enumerate(data):
+            row_number = idx + 1 if self.raw_content else idx + 2
             metadata = {
-                "source": f'{self.file_path}:{idx+1}',
+                "source": f'{self.file_path}:{row_number}',
                 "table_source": self.file_path,
             }
             if self.raw_content:
