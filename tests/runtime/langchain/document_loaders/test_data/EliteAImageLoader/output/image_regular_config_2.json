@@ -1,10 +1,13 @@
 [
   {
-    "page_content": "{\"subject\": \"Children's bicycle with basket\",\"color\": \"pink\", \"text_content\": [\"BSA\", \"CHAMP\", \"HONEY\"], \"estimated_age_group\": \"2-6 years\", \"brand_visible\": \"BSA\"}",
+    "page_content": "```json\n{\n  \"subject\": \"Children's bicycle with training wheels, rear seat, and front basket\",\n  \"colors\": [\n    \"hot pink\",\n    \"magenta\",\n    \"black\",\n    \"silver\",\n    \"yellow\",\n    \"white\"\n  ],\n  \"text_content\": [\n    \"BSA\",\n    \"CHAMP\",\n    \"HONNY\"\n  ],\n  \"estimated_age_group\": \"Toddlers to young children (ages 2-6 years)\",\n  \"brand_visible\": \"BSA\"\n}\n```",
     "metadata": {
-      "source": "/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/image_regular.jpg",
+      "source": "/srv/extra_space/elitea/alita-sdk/tests/runtime/langchain/document_loaders/test_data/EliteAImageLoader/files/image_regular.jpg",
       "processing_method": "llm",
-      "original_dimensions": [500, 500]
+      "original_dimensions": [
+        500,
+        500
+      ]
     }
   }
 ]
