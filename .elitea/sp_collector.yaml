@@ -1,0 +1,603 @@
+state:
+  baseline_filename:
+    type: str
+    value: ''
+  baseline_json:
+    type: str
+    value: ''
+  context_filename:
+    type: str
+    value: ''
+  current_file:
+    type: dict
+    value: {}
+  current_file_path:
+    type: str
+    value: ''
+  error:
+    type: str
+    value: ''
+  failures:
+    type: list
+    value: []
+  feature_files:
+    type: list
+    value: []
+  feature_id:
+    type: int
+    value: 0
+  file_content:
+    type: str
+    value: ''
+  input:
+    type: str
+  messages:
+    type: list
+  report:
+    type: str
+    value: ''
+  save_result:
+    type: str
+    value: ''
+  section_content:
+    type: str
+    value: ''
+  sp_files_raw:
+    type: str
+    value: ''
+  successes:
+    type: list
+    value: []
+  user_name:
+    type: str
+    value: ''
+entry_point: ValidateInput
+nodes:
+  - id: ValidateInput
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+        raw = alita_state.get('input', '').strip()
+        if not raw:
+            result = {"error": "No input provided. Expected JSON: {\"feature_id\": 188133}"}
+        else:
+            try:
+                data = json.loads(raw)
+                fid = int(data['feature_id'])
+                if fid <= 0:
+                    raise ValueError("feature_id must be positive")
+                result = {"error": "", "feature_id": fid}
+            except Exception as e:
+                result = {"error": f"Invalid input: {e}. Expected: {{\"feature_id\": 188133}}"}
+        result
+    input: []
+    output: []
+    structured_output: true
+    transition: ValidationRouter
+  - id: ValidationRouter
+    type: router
+    condition: |
+      {% if not error %}
+      FetchUserInfo
+      {% endif %}
+    default_output: HandleError
+    input:
+      - error
+    routes:
+      - FetchUserInfo
+  - id: HandleError
+    type: code
+    code:
+      type: fixed
+      value: |-
+        error = alita_state.get('error', 'Unknown error')
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({"role": "assistant", "content": f"❌ SharePoint Collector failed.\n\n**Error:** {error}"})
+        {"messages": msgs}
+    input:
+      - error
+      - messages
+    output:
+      - messages
+    structured_output: true
+    transition: END
+  - id: FetchUserInfo
+    type: code
+    code:
+      type: fixed
+      value: |-
+        try:
+            user_data = alita_client.get_user_data()
+            user_name = user_data.get('name', '') if isinstance(user_data, dict) else ''
+        except Exception:
+            user_name = ''
+        user_name = str(user_name).strip().replace(' ', '_') if user_name else ''
+        feature_id = alita_state.get('feature_id', 0)
+        context_fn = f"{feature_id}_sp_context__{user_name}.md" if user_name else f"{feature_id}_sp_context.md"
+        baseline_fn = f"{feature_id}_sp_baseline__{user_name}.json" if user_name else f"{feature_id}_sp_baseline.json"
+        {'user_name': user_name, 'context_filename': context_fn, 'baseline_filename': baseline_fn}
+    input:
+      - feature_id
+    output:
+      - user_name
+      - context_filename
+      - baseline_filename
+    structured_output: true
+    transition: ListFiles
+  - id: ListFiles
+    type: toolkit
+    input:
+      - feature_id
+    input_mapping:
+      folder_name:
+        type: fixed
+        value: General/LFA Cloud EPAM Delivery Scope - Features
+      form_name:
+        type: fixed
+        value: null
+      include_extensions:
+        type: fixed
+        value: null
+      limit_files:
+        type: fixed
+        value: 100
+      skip_extensions:
+        type: fixed
+        value: null
+    output:
+      - sp_files_raw
+    structured_output: false
+    tool: get_files_list
+    toolkit_name: LFAInternalSharePoint
+    transition: FindFeatureFolder
+  - id: FindFeatureFolder
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json, datetime
+
+        # Recover state: toolkit returns datetime objects which corrupt
+        # the platform state serialization (repr instead of JSON).
+        _s = alita_state
+        if isinstance(_s, str):
+            try:
+                _s = eval(_s)
+            except Exception:
+                _s = {}
+
+        feature_id = str(_s.get('feature_id', ''))
+        raw = _s.get('sp_files_raw', '')
+
+        # raw may arrive as a Python list (direct from toolkit) or a JSON string
+        if isinstance(raw, list):
+            files_data = raw
+        elif isinstance(raw, str):
+            try:
+                files_data = json.loads(raw.strip()) if raw.strip() else []
+            except Exception:
+                files_data = []
+        else:
+            files_data = list(raw) if raw else []
+
+        if isinstance(files_data, dict):
+            for k in ('value', 'items', 'data', 'files', 'results'):
+                if k in files_data and isinstance(files_data[k], list):
+                    files_data = files_data[k]
+                    break
+            else:
+                files_data = []
+
+        if not isinstance(files_data, list):
+            files_data = []
+
+        # Clean sp_files_raw to a JSON string so subsequent nodes
+        # serialize state without datetime corruption.
+        cleaned_raw = json.dumps(files_data, default=str, ensure_ascii=False)
+
+        print(f'[SP Collector] Scanning {len(files_data)} items for feature {feature_id}')
+
+        feature_files = []
+        supported_ext = ('.docx', '.doc', '.pdf', '.pptx', '.ppt', '.xlsx', '.xls', '.txt', '.md', '.csv', '.vtt')
+
+        for item in files_data:
+            if not isinstance(item, dict):
+                continue
+            path = item.get('Path', '') or item.get('path', '') or item.get('Name', '') or item.get('name', '') or ''
+            folder = path.rsplit('/', 1)[0] if '/' in path else ''
+            if feature_id in folder:
+                name_lower = path.lower()
+                if any(name_lower.endswith(ext) for ext in supported_ext):
+                    feature_files.append({
+                        'path': path,
+                        'name': path.rsplit('/', 1)[-1] if '/' in path else path,
+                        'size': item.get('size', 0),
+                        'last_modified': str(item.get('Modified', item.get('lastModifiedDateTime', item.get('last_modified', ''))))
+                    })
+
+        if not feature_files:
+            error = f'No SharePoint documents found for feature ID {feature_id}. Scanned {len(files_data)} items.'
+        else:
+            error = ''
+
+        print(f'[SP Collector] Found {len(feature_files)} files for feature {feature_id}')
+        {'feature_files': feature_files, 'error': error, 'sp_files_raw': cleaned_raw}
+    input:
+      - feature_id
+      - sp_files_raw
+    output:
+      - feature_files
+      - error
+      - sp_files_raw
+    structured_output: true
+    transition: CheckFilesFound
+  - id: CheckFilesFound
+    type: router
+    condition: |
+      {% if not error and feature_files and feature_files|length > 0 %}
+      InitContextFile
+      {% endif %}
+    default_output: HandleError
+    input:
+      - error
+      - feature_files
+    routes:
+      - InitContextFile
+  - id: InitContextFile
+    type: toolkit
+    input:
+      - context_filename
+    input_mapping:
+      bucket_name:
+        type: fixed
+        value: null
+      filedata:
+        type: fixed
+        value: ''
+      filename:
+        type: variable
+        value: context_filename
+      filepath:
+        type: fixed
+        value: null
+    output:
+      - save_result
+    structured_output: false
+    tool: createFile
+    toolkit_name: ADOartifactstorage
+    transition: GetNextFile
+  - id: GetNextFile
+    type: code
+    code:
+      type: fixed
+      value: |-
+        feature_files = alita_state.get('feature_files', [])
+        current_file = feature_files[0] if feature_files else {}
+        if not isinstance(current_file, dict):
+            current_file = {}
+        current_file_path = current_file.get('path', '')
+        file_name = current_file.get('name', '?')
+        print(f'Reading: {file_name} ({len(feature_files)} remaining)')
+        {'current_file': current_file, 'current_file_path': current_file_path}
+    input:
+      - feature_files
+    output:
+      - current_file
+      - current_file_path
+    structured_output: true
+    transition: ReadDocument
+  - id: ReadDocument
+    type: toolkit
+    input:
+      - current_file
+      - current_file_path
+    input_mapping:
+      is_capture_image:
+        type: fixed
+        value: false
+      page_number:
+        type: fixed
+        value: null
+      path:
+        type: variable
+        value: current_file_path
+      sheet_name:
+        type: fixed
+        value: null
+    output:
+      - file_content
+    structured_output: false
+    tool: read_document
+    toolkit_name: LFAInternalSharePoint
+    transition: CleanVttContent
+  - id: CleanVttContent
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import re
+
+        file_content = alita_state.get('file_content', '')
+        current_file = alita_state.get('current_file', {})
+        file_path = current_file.get('path', '') if isinstance(current_file, dict) else ''
+
+        cleaned = file_content  # default: pass through unchanged
+
+        if file_path.lower().endswith('.vtt') and file_content:
+            speaker_open_re = re.compile(r'<v\s+([^>]+)>')
+            tag_re = re.compile(r'<[^>]+>')
+            lines = file_content.splitlines()
+
+            entries = []
+            i = 0
+            # Skip WEBVTT header and leading blank lines
+            while i < len(lines) and (not lines[i].strip() or lines[i].strip() == 'WEBVTT'):
+                i += 1
+
+            while i < len(lines):
+                line = lines[i].strip()
+
+                if not line:
+                    i += 1
+                    continue
+
+                # Skip cue IDs: UUID-based or plain integer
+                if re.match(r'^[0-9a-f]{8}-[0-9a-f\-]+/\d+', line, re.IGNORECASE) or re.match(r'^\d+$', line):
+                    i += 1
+                    continue
+
+                # Timestamp line — collect the following payload block
+                if '-->' in line:
+                    i += 1
+                    payload_parts = []
+                    while i < len(lines) and lines[i].strip():
+                        payload_parts.append(lines[i].strip())
+                        i += 1
+                    full_payload = ' '.join(payload_parts)
+                    speaker_match = speaker_open_re.search(full_payload)
+                    speaker = speaker_match.group(1).strip() if speaker_match else None
+                    text = tag_re.sub('', full_payload).strip()
+                    text = ' '.join(text.split())
+                    if text:
+                        entries.append((speaker, text))
+                    continue
+
+                i += 1
+
+            # Merge consecutive utterances from the same speaker
+            merged = []
+            for speaker, text in entries:
+                if merged and merged[-1][0] == speaker:
+                    merged[-1][1] += ' ' + text
+                else:
+                    merged.append([speaker, text])
+
+            cleaned = '\n'.join(f'{s}: {t}' if s else t for s, t in merged)
+            print(f'[VTT] {file_path.rsplit("/", 1)[-1]}: {len(entries)} cues → {len(merged)} lines, {len(file_content)} → {len(cleaned)} chars')
+
+        {'file_content': cleaned}
+    input:
+      - file_content
+      - current_file
+    output:
+      - file_content
+    structured_output: true
+    transition: PrepareSection
+  - id: PrepareSection
+    type: code
+    code:
+      type: fixed
+      value: |-
+        current_file = alita_state.get('current_file', {})
+        file_content = alita_state.get('file_content', '')
+        feature_files = list(alita_state.get('feature_files', []))
+        successes = list(alita_state.get('successes', []))
+        failures = list(alita_state.get('failures', []))
+
+        file_name = current_file.get('name', 'unknown') if isinstance(current_file, dict) else 'unknown'
+        file_path = current_file.get('path', '') if isinstance(current_file, dict) else ''
+
+        if file_content and 'error' not in str(file_content).lower()[:50]:
+            section_content = f'\n\n---\n## Source: {file_name}\n**Path:** {file_path}\n\n{file_content}'
+            successes.append(file_name)
+        else:
+            section_content = ''
+            failures.append({'name': file_name, 'reason': str(file_content)[:200] if file_content else 'empty result'})
+
+        filtered = [f for f in feature_files if (f.get('path') if isinstance(f, dict) else None) != file_path]
+
+        {'section_content': section_content, 'feature_files': filtered, 'successes': successes, 'failures': failures}
+    input:
+      - current_file
+      - file_content
+      - feature_files
+      - successes
+      - failures
+    output:
+      - section_content
+      - feature_files
+      - successes
+      - failures
+    structured_output: true
+    transition: SectionRouter
+  - id: SectionRouter
+    type: router
+    condition: |
+      {% if section_content %}
+      AppendToFile
+      {% endif %}
+    default_output: CheckMoreFiles
+    input:
+      - section_content
+    routes:
+      - AppendToFile
+  - id: AppendToFile
+    type: toolkit
+    input:
+      - section_content
+      - context_filename
+    input_mapping:
+      bucket_name:
+        type: fixed
+        value: null
+      create_if_missing:
+        type: fixed
+        value: true
+      filedata:
+        type: variable
+        value: section_content
+      filename:
+        type: variable
+        value: context_filename
+    output:
+      - save_result
+    structured_output: false
+    tool: appendData
+    toolkit_name: ADOartifactstorage
+    transition: CheckMoreFiles
+  - id: CheckMoreFiles
+    type: router
+    condition: |
+      {% if feature_files and feature_files|length > 0 %}
+      GetNextFile
+      {% endif %}
+    default_output: BuildBaseline
+    input:
+      - feature_files
+    routes:
+      - GetNextFile
+  - id: BuildBaseline
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+        successes = alita_state.get('successes', [])
+        failures = alita_state.get('failures', [])
+        feature_id = alita_state.get('feature_id', 0)
+        sp_files_raw = alita_state.get('sp_files_raw', '')
+
+        # sp_files_raw was cleaned to a JSON string by FindFeatureFolder
+        try:
+            if isinstance(sp_files_raw, list):
+                files_data = sp_files_raw
+            elif isinstance(sp_files_raw, str):
+                files_data = json.loads(sp_files_raw) if sp_files_raw else []
+            else:
+                files_data = []
+        except Exception:
+            files_data = []
+
+        fid = str(feature_id)
+        baseline_entries = []
+        for f in (files_data if isinstance(files_data, list) else []):
+            if not isinstance(f, dict):
+                continue
+            path = f.get('Path', '') or f.get('path', '') or f.get('Name', '') or f.get('name', '') or ''
+            folder = path.rsplit('/', 1)[0] if '/' in path else ''
+            if fid in folder:
+                baseline_entries.append({
+                    'path': path,
+                    'name': path.rsplit('/', 1)[-1] if '/' in path else path,
+                    'size': f.get('size', 0),
+                    'last_modified': str(f.get('Modified', f.get('lastModifiedDateTime', f.get('last_modified', ''))))
+                })
+
+        baseline = {
+            'feature_id': feature_id,
+            'file_count': len(baseline_entries),
+            'files': baseline_entries
+        }
+
+        {'baseline_json': json.dumps(baseline, indent=2, ensure_ascii=False)}
+    input:
+      - successes
+      - failures
+      - feature_id
+      - sp_files_raw
+    output:
+      - baseline_json
+    structured_output: true
+    transition: SaveBaseline
+  - id: SaveBaseline
+    type: toolkit
+    input:
+      - baseline_json
+      - baseline_filename
+    input_mapping:
+      bucket_name:
+        type: fixed
+        value: null
+      filedata:
+        type: variable
+        value: baseline_json
+      filename:
+        type: variable
+        value: baseline_filename
+      filepath:
+        type: fixed
+        value: null
+    output:
+      - save_result
+    structured_output: false
+    tool: createFile
+    toolkit_name: ADOartifactstorage
+    transition: BuildReport
+  - id: BuildReport
+    type: state_modifier
+    input:
+      - feature_id
+      - successes
+      - failures
+      - context_filename
+      - baseline_filename
+    output:
+      - report
+    template: |
+      ## 📊 SharePoint Collector — Feature {{ feature_id }}
+
+      | Step | Status |
+      |------|--------|
+      | Validate input | ✅ Done |
+      | List SharePoint files | ✅ Done |
+      | Find feature folder | ✅ Found |
+      | Read documents | ✅ {{ successes|length }} read{% if failures|length > 0 %}, ❌ {{ failures|length }} failed{% endif %} |
+      | Save context artifact | ✅ Done |
+      | Save baseline snapshot | ✅ Done |
+
+      {% if successes %}
+      **✅ Documents read:**
+      {% for item in successes %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      {% if failures %}
+      **❌ Failed (skipped):**
+      {% for item in failures %}
+      - {{ item.name }} — {{ item.reason }}
+      {% endfor %}
+      {% endif %}
+
+      📄 **Context file:** `{{ context_filename }}`
+      📄 **Baseline file:** `{{ baseline_filename }}`
+    transition: PrintReport
+    variables_to_clean: []
+  - id: PrintReport
+    type: code
+    code:
+      type: fixed
+      value: |-
+        report = alita_state.get('report', '')
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({"role": "assistant", "content": report})
+        {"messages": msgs}
+    input:
+      - report
+      - messages
+    output:
+      - messages
+    structured_output: true
+    transition: END

@@ -1,0 +1,1319 @@
+state:
+  all_files:
+    type: list
+    value: []
+  bucket_name:
+    type: str
+    value: sp-log
+  changed_files:
+    type: list
+    value: []
+  changes_filename:
+    type: str
+    value: ''
+  current_archive_index:
+    type: int
+    value: 0
+  current_deletion_index:
+    type: int
+    value: 0
+  current_diff_index:
+    type: int
+    value: 0
+  current_file_path:
+    type: str
+    value: ''
+  current_retrieval_date:
+    type: str
+    value: ''
+  current_snapshot:
+    type: dict
+    value: {}
+  current_version_index:
+    type: int
+    value: 0
+  downloaded_content:
+    type: str
+    value: ''
+  error_message:
+    type: str
+    value: ''
+  files_to_archive:
+    type: list
+    value: []
+  files_to_delete:
+    type: list
+    value: []
+  files_to_diff:
+    type: list
+    value: []
+  files_to_version:
+    type: list
+    value: []
+  folder_path:
+    type: str
+    value: ''
+  input:
+    type: str
+  input_bucket_name:
+    type: str
+    value: ''
+  is_first_run:
+    type: bool
+    value: false
+  last_retrieval_date:
+    type: str
+    value: ''
+  messages:
+    type: list
+  new_files:
+    type: list
+    value: []
+  previous_snapshot:
+    type: dict
+    value: {}
+  removed_files:
+    type: list
+    value: []
+  unchanged_count:
+    type: int
+    value: 0
+  validation_passed:
+    type: bool
+    value: false
+entry_point: ParseInput
+nodes:
+  - id: ParseInput
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+        import re
+        from datetime import datetime
+
+        input_str = alita_state.get('input', '').strip()
+
+        if not input_str:
+            result = {
+                "validation_passed": False,
+                "error_message": "Input required. Provide JSON: {\"folder_path\": \"/sites/MySite/Shared Documents\", \"bucket_name\": \"optional-bucket\"}",
+                "folder_path": "",
+                "input_bucket_name": "",
+                "current_retrieval_date": datetime.now().isoformat()
+            }
+        else:
+            parse_failed = False
+            try:
+                input_data = json.loads(input_str)
+            except json.JSONDecodeError:
+                # Try to fix Python-style booleans
+                fixed = re.sub(r':\s*True\b', ': true', input_str)
+                fixed = re.sub(r':\s*False\b', ': false', fixed)
+                try:
+                    input_data = json.loads(fixed)
+                except json.JSONDecodeError:
+                    parse_failed = True
+                    result = {
+                        "validation_passed": False,
+                        "error_message": f"Invalid JSON. Expected: {{\"folder_path\": \"/sites/MySite/Shared Documents\", \"bucket_name\": \"optional-bucket\"}}\nReceived: \"{input_str}\"",
+                        "folder_path": "",
+                        "input_bucket_name": "",
+                        "current_retrieval_date": datetime.now().isoformat()
+                    }
+
+            if not parse_failed:
+                if not isinstance(input_data, dict):
+                    result = {
+                        "validation_passed": False,
+                        "error_message": "Input must be a JSON object.",
+                        "folder_path": "",
+                        "input_bucket_name": "",
+                        "current_retrieval_date": datetime.now().isoformat()
+                    }
+                elif 'folder_path' not in input_data:
+                    result = {
+                        "validation_passed": False,
+                        "error_message": "Missing required field 'folder_path'. Expected: {\"folder_path\": \"/sites/...\", \"bucket_name\": \"optional\"}",
+                        "folder_path": "",
+                        "input_bucket_name": "",
+                        "current_retrieval_date": datetime.now().isoformat()
+                    }
+                elif 'bucket_name' in input_data and not input_data['bucket_name']:
+                    result = {
+                        "validation_passed": False,
+                        "error_message": "Field 'bucket_name' cannot be empty if provided. Either omit it or provide a valid bucket name.",
+                        "folder_path": "",
+                        "input_bucket_name": "",
+                        "current_retrieval_date": datetime.now().isoformat()
+                    }
+                else:
+                    result = {
+                        "validation_passed": True,
+                        "error_message": "",
+                        "folder_path": input_data['folder_path'],
+                        "input_bucket_name": input_data.get('bucket_name'),
+                        "current_retrieval_date": datetime.now().isoformat()
+                    }
+
+        result
+    input: []
+    output:
+      - input_bucket_name
+    structured_output: true
+    transition: ValidationRouter
+  - id: ValidationRouter
+    type: router
+    condition: |
+      {% if validation_passed %}
+        LoadState
+      {% else %}
+        FormatError
+      {% endif %}
+    default_output: FormatError
+    input:
+      - validation_passed
+    routes:
+      - LoadState
+      - FormatError
+  - id: FormatError
+    type: code
+    code:
+      type: fixed
+      value: |-
+        error_message = alita_state.get('error_message', '')
+
+        report = f"❌ Failed to process request.\n\n**Error:** {error_message}\n\nPlease check the input and try again."
+
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({"role": "assistant", "content": report})
+        result = {"messages": msgs}
+        result
+    input:
+      - error_message
+    output:
+      - messages
+    structured_output: true
+    transition: END
+  - id: LoadState
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+
+        # Use input bucket_name if provided, otherwise use default from state
+        input_bucket_name = alita_state.get('input_bucket_name', '').strip()
+        default_bucket_name = alita_state.get('bucket_name')
+        bucket_name = input_bucket_name if input_bucket_name else default_bucket_name
+
+        store = alita_client.artifact(bucket_name)
+
+        # Load retrieval log
+        is_first_run = False
+        last_retrieval_date = '1900-01-01T00:00:00'
+        log_raw = store.get('retrieval_log.txt')
+        if log_raw and not any(err in str(log_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+            lines = str(log_raw).strip().split('\n')
+            if lines:
+                last_retrieval_date = lines[-1].strip()
+        else:
+            is_first_run = True
+
+        # Load snapshot
+        previous_snapshot = {}
+        snap_raw = store.get('snapshot.json')
+        if snap_raw and not any(err in str(snap_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+            try:
+                previous_snapshot = json.loads(str(snap_raw))
+            except json.JSONDecodeError:
+                pass
+
+        {
+            'bucket_name': bucket_name,
+            'last_retrieval_date': last_retrieval_date,
+            'is_first_run': is_first_run,
+            'previous_snapshot': previous_snapshot
+        }
+    input:
+      - input_bucket_name
+    output:
+      - bucket_name
+      - last_retrieval_date
+      - is_first_run
+      - previous_snapshot
+    structured_output: true
+    transition: GetFilesFromSharepoint
+  - id: GetFilesFromSharepoint
+    type: toolkit
+    input:
+      - folder_path
+    input_mapping:
+      folder_name:
+        type: variable
+        value: folder_path
+      form_name:
+        type: fixed
+        value: null
+      include_extensions:
+        type: fixed
+        value: null
+      limit_files:
+        type: fixed
+        value: 10000
+      skip_extensions:
+        type: fixed
+        value: null
+    output:
+      - all_files
+    structured_output: true
+    tool: get_files_list
+    toolkit_name: LFAInternalSharePoint
+    transition: NormalizeFiles
+  - id: NormalizeFiles
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import re
+        import ast
+        import json
+        from datetime import datetime
+
+        debug_info = {
+            'alita_state_type': type(alita_state).__name__,
+            'recovery_used': False
+        }
+
+        # ── Recover state if it arrived as a string ──
+        # This happens when object_to_dict lets datetime objects through,
+        # safe_serialize falls back to json.dumps(str(state)),
+        # and json.loads returns a str instead of a dict.
+        state = alita_state
+        if isinstance(state, str):
+            debug_info['recovery_used'] = True
+            debug_info['raw_state_preview'] = state[:500]
+            # Replace datetime.datetime(...) with ISO strings
+            fixed = re.sub(
+                r'datetime\.datetime\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(\d+))?(?:,\s*(\d+))?\)',
+                lambda m: "'{}-{}-{}T{}:{}:{}'".format(
+                    m.group(1).zfill(4), m.group(2).zfill(2), m.group(3).zfill(2),
+                    (m.group(4) or '0').zfill(2), (m.group(5) or '0').zfill(2), (m.group(6) or '0').zfill(2)
+                ),
+                state
+            )
+            debug_info['datetime_replacements'] = len(re.findall(r'datetime\.datetime\(', state))
+            try:
+                state = ast.literal_eval(fixed)
+                debug_info['recovery_method'] = 'ast.literal_eval'
+            except Exception as e:
+                debug_info['recovery_error'] = str(e)
+                debug_info['fixed_preview'] = fixed[:500]
+                # Last resort: try json.loads in case it's valid JSON
+                try:
+                    state = json.loads(state)
+                    debug_info['recovery_method'] = 'json.loads_raw'
+                except Exception:
+                    state = {}
+                    debug_info['recovery_method'] = 'failed'
+
+        # ── Normalize files ──
+        all_files = state.get('all_files', []) if isinstance(state, dict) else []
+
+        # If all_files is a JSON string, parse it
+        if isinstance(all_files, str):
+            debug_info['all_files_was_string'] = True
+            try:
+                all_files = json.loads(all_files)
+            except Exception:
+                all_files = []
+
+        converted_count = 0
+        normalized = []
+        for file in (all_files if isinstance(all_files, list) else []):
+            if not isinstance(file, dict):
+                normalized.append(file)
+                continue
+            norm_file = {}
+            for key, val in file.items():
+                if isinstance(val, datetime):
+                    norm_file[key] = val.isoformat()
+                    converted_count += 1
+                else:
+                    norm_file[key] = val
+            normalized.append(norm_file)
+
+        debug_info['files_count'] = len(normalized)
+        debug_info['datetime_fields_converted'] = converted_count
+        if normalized:
+            debug_info['sample_file'] = str(normalized[0])[:300]
+
+        result = {
+            'all_files': normalized,
+            'debug_info': debug_info
+        }
+        result
+    input:
+      - all_files
+    output:
+      - all_files
+      - debug_info
+    structured_output: true
+    transition: CompareSnapshots
+  - id: CompareSnapshots
+    type: code
+    code:
+      type: fixed
+      value: |-
+        from datetime import datetime
+
+        all_files = alita_state.get('all_files', [])
+        previous_snapshot = alita_state.get('previous_snapshot', {})
+        last_retrieval_date = alita_state.get('last_retrieval_date', '')
+
+        # Create current snapshot: {path: {metadata}}
+        # Try multiple possible path field names
+        current_snapshot = {}
+        for file in all_files:
+            if isinstance(file, dict):
+                # Try different possible path field names
+                path = (file.get('Path', '') or 
+                       file.get('ServerRelativeUrl', '') or
+                       file.get('FileRef', '') or
+                       file.get('FileSystemObjectType', '') or
+                       file.get('Url', ''))
+                
+                if path:
+                    current_snapshot[path] = {
+                        'Name': file.get('Name', ''),
+                        'Modified': file.get('Modified', ''),
+                        'Created': file.get('Created', ''),
+                        'Link': file.get('Link', ''),
+                        'id': file.get('id', '')
+                    }
+
+        # Parse last retrieval date
+        try:
+            last_date = datetime.fromisoformat(last_retrieval_date.replace('Z', ''))
+        except:
+            last_date = datetime(1900, 1, 1)
+
+        # Identify changes
+        new_files = []
+        removed_files = []
+        changed_files = []
+        unchanged_count = 0
+
+        current_paths = set(current_snapshot.keys())
+        previous_paths = set(previous_snapshot.keys())
+
+        # New files
+        for path in current_paths - previous_paths:
+            new_files.append({
+                'Path': path,
+                **current_snapshot[path]
+            })
+
+        # Removed files
+        for path in previous_paths - current_paths:
+            removed_files.append({
+                'Path': path,
+                **previous_snapshot[path]
+            })
+
+        # Changed or unchanged files
+        for path in current_paths & previous_paths:
+            current_modified = current_snapshot[path].get('Modified', '')
+            previous_modified = previous_snapshot[path].get('Modified', '')
+            
+            # Compare modification dates
+            if current_modified != previous_modified:
+                # File was modified
+                try:
+                    current_mod_dt = datetime.fromisoformat(current_modified.replace('Z', '').split('+')[0].split('.')[0])
+                    if current_mod_dt > last_date:
+                        changed_files.append({
+                            'Path': path,
+                            'PreviousModified': previous_modified,
+                            'CurrentModified': current_modified,
+                            **current_snapshot[path]
+                        })
+                    else:
+                        unchanged_count += 1
+                except:
+                    unchanged_count += 1
+            else:
+                unchanged_count += 1
+
+        {
+            'current_snapshot': current_snapshot,
+            'new_files': new_files,
+            'removed_files': removed_files,
+            'changed_files': changed_files,
+            'unchanged_count': unchanged_count
+        }
+    input:
+      - all_files
+      - previous_snapshot
+      - last_retrieval_date
+    output:
+      - current_snapshot
+      - new_files
+      - removed_files
+      - changed_files
+      - unchanged_count
+    structured_output: true
+    transition: SaveState
+  - id: SaveState
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+        import re
+        from datetime import datetime
+
+        bucket_name = alita_state.get('bucket_name')
+        store = alita_client.artifact(bucket_name)
+
+        current_retrieval_date_raw = alita_state.get('current_retrieval_date', '')
+        last_retrieval_date = alita_state.get('last_retrieval_date', '')
+        current_snapshot = alita_state.get('current_snapshot', {})
+        new_files = alita_state.get('new_files', [])
+        removed_files = alita_state.get('removed_files', [])
+        changed_files = alita_state.get('changed_files', [])
+
+        # Truncate microseconds from current_retrieval_date for consistency
+        # This ensures retrieval_log timestamps match changes_*.json filenames
+        dt = datetime.fromisoformat(current_retrieval_date_raw.replace('Z', ''))
+        current_retrieval_date = dt.strftime('%Y-%m-%dT%H:%M:%S')
+
+        # 1. Load existing retrieval log to track removals
+        old_log_lines = []
+        log_raw = store.get('retrieval_log.txt')
+        if log_raw and not any(err in str(log_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+            old_log_lines = [line.strip() for line in str(log_raw).strip().split('\n') if line.strip()]
+
+        # 2. Build new log (keep last 5 entries)
+        # Start with all existing log lines, append new date, then keep last 5
+        log_lines = old_log_lines.copy()
+        log_lines.append(current_retrieval_date)
+        log_lines = log_lines[-5:]
+
+        # 3. Identify dates being removed (dates in old_log but not in new log)
+        dates_to_remove = set(old_log_lines) - set(log_lines)
+
+        # 4. Delete corresponding changes_*.json files for removed dates
+        for removed_date in dates_to_remove:
+            # Parse ISO date and convert to changes_*.json filename format
+            dt_removed = datetime.fromisoformat(removed_date.replace('Z', ''))
+            changes_filename_to_delete = f"changes_{dt_removed.strftime('%Y%m%d_%H%M%S')}.json"
+            
+            # Delete the file (check_exists=False for idempotent S3-style delete)
+            # Note: delete() may return JsNull which causes errors when accessing, but deletion succeeds
+            try:
+                store.delete(changes_filename_to_delete, check_exists=False)
+                # If we get here without exception, file was deleted successfully
+                # Don't try to access the result object - it may be JsNull
+            except Exception as e:
+                # Only log if actual deletion failed (not result parsing)
+                if 'getReader' not in str(e):  # Skip JsNull result parsing errors
+                    error_log = f"[DELETION FAILED]\nTarget: {changes_filename_to_delete}\nTimestamp: {removed_date}\nError: {str(e)}\nCurrent time: {current_retrieval_date}"
+                    try:
+                        store.create(f"error_deletion_{dt_removed.strftime('%Y%m%d_%H%M%S')}.txt", error_log)
+                    except:
+                        pass
+
+        # 5. Save updated retrieval log
+        r = store.create('retrieval_log.txt', '\n'.join(log_lines))
+
+        # 6. Save snapshot
+        r = store.create('snapshot.json', json.dumps(current_snapshot, indent=2, ensure_ascii=False))
+
+        # 7. Enhance file entries with artifact storage filenames
+        def add_artifact_filenames(files, file_type):
+            enhanced_files = []
+            for file in files:
+                file_id = file.get('id', '')
+                file_name = file.get('Name', '')
+                enhanced_file = dict(file)
+                
+                if file_id and file_name:
+                    # Sanitize: spaces to hyphens, special chars to underscores
+                    safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                    enhanced_file['artifact_storage'] = {
+                        'current': f"file_{file_id}_{safe_name}.txt"
+                    }
+                    
+                    if file_type == 'changed':
+                        enhanced_file['artifact_storage']['previous'] = f"file_prev_{file_id}_{safe_name}.txt"
+                        enhanced_file['artifact_storage']['diff'] = f"file_diff_{file_id}_{safe_name}.txt"
+                    elif file_type == 'removed':
+                        enhanced_file['artifact_storage']['deleted'] = f"file_del_{file_id}_{safe_name}.txt"
+                
+                enhanced_files.append(enhanced_file)
+            return enhanced_files
+
+        enhanced_new_files = add_artifact_filenames(new_files, 'new')
+        enhanced_removed_files = add_artifact_filenames(removed_files, 'removed')
+        enhanced_changed_files = add_artifact_filenames(changed_files, 'changed')
+
+        # 8. Save changes report with artifact filenames
+        # Use truncated timestamp (already parsed from current_retrieval_date) to match retrieval_log
+        timestamp = dt.strftime('%Y%m%d_%H%M%S')
+        changes_filename = f"changes_{timestamp}.json"
+        changes_data = {
+            'retrieval_date': current_retrieval_date,
+            'summary': {
+                'new_files_count': len(new_files),
+                'removed_files_count': len(removed_files),
+                'changed_files_count': len(changed_files)
+            },
+            'new_files': enhanced_new_files,
+            'removed_files': enhanced_removed_files,
+            'changed_files': enhanced_changed_files
+        }
+        r = store.create(changes_filename, json.dumps(changes_data, indent=2, ensure_ascii=False))
+
+        {'changes_filename': changes_filename}
+    input:
+      - bucket_name
+      - current_retrieval_date
+      - last_retrieval_date
+      - current_snapshot
+      - new_files
+      - removed_files
+      - changed_files
+    output:
+      - changes_filename
+    structured_output: true
+    transition: PrepareVersioning
+  - id: PrepareVersioning
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import re
+
+        changed_files = alita_state.get('changed_files', [])
+        removed_files = alita_state.get('removed_files', [])
+        new_files = alita_state.get('new_files', [])
+
+        # Prepare list of changed files that need previous version saved
+        files_to_version = []
+
+        for file in changed_files:
+            file_id = file.get('id', '')
+            file_name = file.get('Name', '')
+            
+            if file_id and file_name:
+                # Sanitize: spaces to hyphens, special chars to underscores
+                safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                files_to_version.append({
+                    'id': file_id,
+                    'name': safe_name,
+                    'type': 'changed'
+                })
+
+        # Prepare list of removed files for cleanup
+        files_to_delete = []
+
+        for file in removed_files:
+            file_id = file.get('id', '')
+            file_name = file.get('Name', '')
+            
+            if file_id and file_name:
+                # Sanitize: spaces to hyphens, special chars to underscores
+                safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                files_to_delete.append({
+                    'id': file_id,
+                    'name': safe_name,
+                    'type': 'removed'
+                })
+
+        # Prepare list of files to download (new + changed)
+        files_to_download = []
+
+        for file in new_files + changed_files:
+            file_id = file.get('id', '')
+            file_name = file.get('Name', '')
+            file_path = file.get('Path', '')
+            
+            if not file_id or not file_name or not file_path:
+                continue
+            
+            # Sanitize: spaces to hyphens, special chars to underscores
+            safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+            files_to_download.append({
+                'id': file_id,
+                'name': safe_name,
+                'path': file_path,
+                'type': 'new' if file in new_files else 'changed'
+            })
+
+        {
+            'files_to_version': files_to_version,
+            'files_to_delete': files_to_delete,
+            'files_to_archive': files_to_download,
+            'current_version_index': 0,
+            'current_deletion_index': 0,
+            'current_archive_index': 0
+        }
+    input:
+      - changed_files
+      - removed_files
+      - new_files
+    output:
+      - files_to_version
+      - files_to_delete
+      - files_to_archive
+      - current_version_index
+      - current_deletion_index
+      - current_archive_index
+    structured_output: true
+    transition: CheckVersioningNeeded
+  - id: CheckVersioningNeeded
+    type: router
+    condition: |
+      {% if current_version_index|int < files_to_version|length %}
+        VersionFileAndAdvance
+      {% else %}
+        CheckRemovalNeeded
+      {% endif %}
+    default_output: CheckRemovalNeeded
+    input:
+      - current_version_index
+      - files_to_version
+    routes:
+      - VersionFileAndAdvance
+      - CheckRemovalNeeded
+  - id: VersionFileAndAdvance
+    type: code
+    code:
+      type: fixed
+      value: |-
+        files_to_version = alita_state.get('files_to_version', [])
+        idx_raw = alita_state.get('current_version_index', 0)
+
+        # Defensive: ensure idx is valid integer
+        try:
+            idx = int(idx_raw)
+        except (ValueError, TypeError):
+            idx = 0
+
+        # Defensive: validate index and process file
+        if idx >= 0 and idx < len(files_to_version):
+            f = files_to_version[idx]
+            file_id = f.get('id', '')
+            file_name = f.get('name', 'unknown')
+            file_type = f.get('type', 'unknown')
+
+            bucket_name = alita_state.get('bucket_name')
+            store = alita_client.artifact(bucket_name)
+            src = f"file_{file_id}_{file_name}.txt"
+            dst = f"file_prev_{file_id}_{file_name}.txt"
+
+            # Try to get existing file content
+            content = store.get(src)
+            
+            # More specific error detection to avoid false positives in file content
+            def is_error_response(content):
+                if not content:
+                    return True
+                if isinstance(content, dict) and 'error' in content:
+                    return True
+                content_str = str(content).strip()
+                # Only check short responses for error patterns at the start
+                if len(content_str) < 500:
+                    content_lower = content_str.lower()
+                    if content_lower.startswith('error') or content_lower.startswith('file not found') or content_lower.startswith('does not exist'):
+                        return True
+                return False
+            
+            if not is_error_response(content):
+                # Save previous version
+                try:
+                    store.create(dst, content)
+                except Exception as e:
+                    # Log error but continue - create marker file
+                    error_msg = f"[ERROR CREATING PREVIOUS VERSION]\nSource: {src}\nError: {str(e)}\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
+                    try:
+                        store.create(f"error_prev_{file_id}_{file_name}.txt", error_msg)
+                    except:
+                        pass
+            else:
+                # File doesn't exist yet - this might be first run after file was added
+                # Create a placeholder to indicate versioning was attempted
+                placeholder = f"[NO PREVIOUS VERSION]\nFile: {file_name}\nID: {file_id}\nReason: Source file '{src}' not found in artifact storage.\nThis is expected for newly tracked files.\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
+                try:
+                    store.create(dst, placeholder)
+                except:
+                    pass
+
+        {'current_version_index': idx + 1}
+    input:
+      - bucket_name
+      - files_to_version
+      - current_version_index
+    output:
+      - current_version_index
+    structured_output: true
+    transition: CheckVersioningNeeded
+  - id: CheckRemovalNeeded
+    type: router
+    condition: |
+      {% if current_deletion_index|int < files_to_delete|length %}
+        CleanupRemovedFileAndAdvance
+      {% else %}
+        CheckDownloadNeeded
+      {% endif %}
+    default_output: CheckDownloadNeeded
+    input:
+      - current_deletion_index
+      - files_to_delete
+    routes:
+      - CleanupRemovedFileAndAdvance
+      - CheckDownloadNeeded
+  - id: CleanupRemovedFileAndAdvance
+    type: code
+    code:
+      type: fixed
+      value: |-
+        files_to_delete = alita_state.get('files_to_delete', [])
+        idx_raw = alita_state.get('current_deletion_index', 0)
+
+        # Defensive: ensure idx is valid integer
+        try:
+            idx = int(idx_raw)
+        except (ValueError, TypeError):
+            idx = 0
+
+        # Defensive: validate index and process file cleanup
+        if idx >= 0 and idx < len(files_to_delete):
+            f = files_to_delete[idx]
+            file_id = f.get('id', '')
+            file_name = f.get('name', 'unknown')
+
+            bucket_name = alita_state.get('bucket_name')
+            store = alita_client.artifact(bucket_name)
+            
+            # More specific error detection
+            def is_error_response(content):
+                if not content:
+                    return True
+                if isinstance(content, dict) and 'error' in content:
+                    return True
+                content_str = str(content).strip()
+                if len(content_str) < 500:
+                    content_lower = content_str.lower()
+                    if content_lower.startswith('error') or content_lower.startswith('file not found') or content_lower.startswith('does not exist'):
+                        return True
+                return False
+            
+            # 1. Rename file_* to file_del_* (preserve last known state)
+            src = f"file_{file_id}_{file_name}.txt"
+            dst = f"file_del_{file_id}_{file_name}.txt"
+            content = store.get(src)
+            if not is_error_response(content):
+                # Create the archived version
+                store.create(dst, content)
+                # Delete the original file_* (now that it's preserved as file_del_*)
+                try:
+                    store.delete(src, check_exists=False)
+                except:
+                    pass  # Ignore JsNull errors - deletion likely succeeded
+            
+            # 2. Delete file_prev_* (no longer needed)
+            prev_file = f"file_prev_{file_id}_{file_name}.txt"
+            try:
+                store.delete(prev_file, check_exists=False)
+            except:
+                pass  # Ignore if doesn't exist or JsNull errors
+            
+            # 3. Delete file_diff_* (no longer needed)
+            diff_file = f"file_diff_{file_id}_{file_name}.txt"
+            try:
+                store.delete(diff_file, check_exists=False)
+            except:
+                pass  # Ignore if doesn't exist or JsNull errors
+
+        {'current_deletion_index': idx + 1}
+    input:
+      - bucket_name
+      - files_to_delete
+      - current_deletion_index
+    output:
+      - current_deletion_index
+    structured_output: true
+    transition: CheckRemovalNeeded
+  - id: CheckDownloadNeeded
+    type: router
+    condition: |
+      {% if current_archive_index|int < files_to_archive|length %}
+        PrepareDownload
+      {% else %}
+        PrepareDiffComputation
+      {% endif %}
+    default_output: PrepareDiffComputation
+    input:
+      - current_archive_index
+      - files_to_archive
+    routes:
+      - PrepareDownload
+      - PrepareDiffComputation
+  - id: PrepareDownload
+    type: code
+    code:
+      type: fixed
+      value: |-
+        files_to_archive = alita_state.get('files_to_archive', [])
+        idx_raw = alita_state.get('current_archive_index', 0)
+
+        # Defensive: ensure idx is valid integer
+        try:
+            idx = int(idx_raw)
+        except (ValueError, TypeError):
+            idx = 0
+
+        # Defensive: ensure idx is within bounds
+        if idx < 0 or idx >= len(files_to_archive):
+            idx = 0
+
+        # Get file path
+        file_path = ''
+        if files_to_archive and idx < len(files_to_archive):
+            file_path = files_to_archive[idx].get('path', '')
+
+        {'current_file_path': file_path}
+    input:
+      - files_to_archive
+      - current_archive_index
+    output:
+      - current_file_path
+    structured_output: true
+    transition: DownloadFileContent
+  - id: DownloadFileContent
+    type: toolkit
+    input:
+      - current_file_path
+    input_mapping:
+      is_capture_image:
+        type: fixed
+        value: false
+      page_number:
+        type: fixed
+        value: null
+      path:
+        type: variable
+        value: current_file_path
+      sheet_name:
+        type: fixed
+        value: null
+    output:
+      - downloaded_content
+    structured_output: true
+    tool: read_document
+    toolkit_name: LFAInternalSharePoint
+    transition: SaveFileAndAdvance
+  - id: SaveFileAndAdvance
+    type: code
+    code:
+      type: fixed
+      value: |-
+        files_to_archive = alita_state.get('files_to_archive', [])
+        idx_raw = alita_state.get('current_archive_index', 0)
+        content = alita_state.get('downloaded_content', '')
+
+        # Defensive: ensure idx is valid integer
+        try:
+            idx = int(idx_raw)
+        except (ValueError, TypeError):
+            idx = 0
+
+        # Defensive: validate index bounds
+        if idx >= 0 and idx < len(files_to_archive):
+            current_file = files_to_archive[idx]
+            file_id = current_file.get('id', 'unknown')
+            file_name = current_file.get('name', 'unknown')
+            file_type = current_file.get('type', 'unknown')
+            
+            filename = f"file_{file_id}_{file_name}.txt"
+            
+            # Convert content to string and validate
+            content_str = str(content) if content else ''
+            
+            # Save file with error handling
+            bucket_name = alita_state.get('bucket_name')
+            try:
+                alita_client.artifact(bucket_name).create(filename, content_str)
+            except Exception as e:
+                # Create error marker file
+                error_msg = f"[ERROR SAVING FILE]\nFilename: {file_name}\nID: {file_id}\nType: {file_type}\nError: {str(e)}\nContent length: {len(content_str)}\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
+                try:
+                    alita_client.artifact(bucket_name).create(f"error_download_{file_id}_{file_name}.txt", error_msg)
+                except:
+                    pass
+
+        {'current_archive_index': idx + 1}
+    input:
+      - bucket_name
+      - files_to_archive
+      - current_archive_index
+      - downloaded_content
+    output:
+      - current_archive_index
+    structured_output: true
+    transition: CheckDownloadNeeded
+  - id: PrepareDiffComputation
+    type: code
+    code:
+      type: fixed
+      value: |-
+        changed_files = alita_state.get('changed_files', [])
+
+        # Prepare list of changed files for diff computation
+        files_to_diff = []
+        for file in changed_files:
+            file_id = file.get('id', '')
+            file_name = file.get('Name', '')
+            if file_id and file_name:
+                import re
+                # Sanitize: spaces to hyphens, special chars to underscores
+                safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                files_to_diff.append({
+                    'id': file_id,
+                    'name': safe_name,
+                    'original_name': file_name
+                })
+
+        {
+            'files_to_diff': files_to_diff,
+            'current_diff_index': 0
+        }
+    input:
+      - changed_files
+    output:
+      - files_to_diff
+      - current_diff_index
+    structured_output: true
+    transition: CheckDiffNeeded
+  - id: CheckDiffNeeded
+    type: router
+    condition: |
+      {% if current_diff_index|int < files_to_diff|length %}
+        ComputeDiffAndAdvance
+      {% else %}
+        FormatEnhancedOutput
+      {% endif %}
+    default_output: FormatEnhancedOutput
+    input:
+      - current_diff_index
+      - files_to_diff
+    routes:
+      - ComputeDiffAndAdvance
+      - FormatEnhancedOutput
+  - id: ComputeDiffAndAdvance
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import difflib
+        from datetime import datetime
+
+        files_to_diff = alita_state.get('files_to_diff', [])
+        idx_raw = alita_state.get('current_diff_index', 0)
+
+        # Defensive: ensure idx is valid integer
+        try:
+            idx = int(idx_raw)
+        except (ValueError, TypeError):
+            idx = 0
+
+        # Defensive: validate index and process diff
+        if idx >= 0 and idx < len(files_to_diff):
+            current_file = files_to_diff[idx]
+
+            file_id = current_file.get('id', '')
+            file_name = current_file.get('name', '')
+            original_name = current_file.get('original_name', '')
+            
+            bucket_name = alita_state.get('bucket_name')
+            store = alita_client.artifact(bucket_name)
+            
+            # Read current and previous versions
+            current_file_path = f"file_{file_id}_{file_name}.txt"
+            previous_file_path = f"file_prev_{file_id}_{file_name}.txt"
+            
+            current_content = store.get(current_file_path)
+            previous_content = store.get(previous_file_path)
+            
+            # Handle errors and missing content
+            # More specific error detection: check if it's a dict with 'error' key or starts with common error patterns
+            def is_error_response(content):
+                if not content:
+                    return True
+                if isinstance(content, dict) and 'error' in content:
+                    return True
+                content_str = str(content).strip()
+                # Check if response starts with error markers (shorter check to avoid false positives in file content)
+                if len(content_str) < 500:  # Only check short responses for error patterns
+                    content_lower = content_str.lower()
+                    if content_lower.startswith('error') or content_lower.startswith('file not found') or content_lower.startswith('does not exist'):
+                        return True
+                return False
+            
+            if is_error_response(current_content):
+                current_content = ''
+            else:
+                current_content = str(current_content)
+            
+            if is_error_response(previous_content):
+                previous_content = ''
+            else:
+                previous_content = str(previous_content)
+            
+            # Only compute diff if both files exist and are not placeholders
+            if current_content and previous_content and '[NO PREVIOUS VERSION]' not in previous_content:
+                # Compute unified diff
+                previous_lines = previous_content.splitlines(keepends=True)
+                current_lines = current_content.splitlines(keepends=True)
+                
+                diff = difflib.unified_diff(
+                    previous_lines,
+                    current_lines,
+                    fromfile=f'{original_name} (previous)',
+                    tofile=f'{original_name} (current)',
+                    lineterm='\n'
+                )
+                
+                diff_text = ''.join(diff)
+                
+                # Add metadata header
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                lines_changed = len([line for line in diff_text.split('\n') if line.startswith('+') or line.startswith('-')])
+                diff_header = (
+                    f"# Diff Report for {original_name}\n"
+                    f"# Generated: {timestamp}\n"
+                    f"# Previous: {previous_file_path}\n"
+                    f"# Current: {current_file_path}\n"
+                    f"# Total lines changed: {lines_changed}\n"
+                    f"\n"
+                    f"{diff_text}\n"
+                )
+                
+                # Save diff
+                diff_file_path = f"file_diff_{file_id}_{file_name}.txt"
+                try:
+                    store.create(diff_file_path, diff_header)
+                except Exception as e:
+                    # Create error marker
+                    error_msg = f"[ERROR CREATING DIFF]\nFile: {original_name}\nError: {str(e)}\nTimestamp: {timestamp}"
+                    try:
+                        store.create(f"error_diff_{file_id}_{file_name}.txt", error_msg)
+                    except:
+                        pass
+            else:
+                # Can't create diff - create placeholder
+                timestamp = datetime.now().isoformat()
+                placeholder = f"[NO DIFF COMPUTED]\nFile: {original_name}\nReason: "
+                if not current_content:
+                    placeholder += "Current file not found."
+                elif not previous_content:
+                    placeholder += "Previous file not found."
+                elif '[NO PREVIOUS VERSION]' in previous_content:
+                    placeholder += "No previous version available (newly tracked file)."
+                placeholder += f"\nTimestamp: {timestamp}"
+                
+                diff_file_path = f"file_diff_{file_id}_{file_name}.txt"
+                try:
+                    store.create(diff_file_path, placeholder)
+                except:
+                    pass
+
+        {'current_diff_index': idx + 1}
+    input:
+      - bucket_name
+      - files_to_diff
+      - current_diff_index
+    output:
+      - current_diff_index
+    structured_output: true
+    transition: CheckDiffNeeded
+  - id: FormatEnhancedOutput
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+        import re
+        from datetime import datetime
+
+        folder_path = alita_state.get('folder_path', '')
+        current_retrieval_date = alita_state.get('current_retrieval_date', '')
+        last_retrieval_date = alita_state.get('last_retrieval_date', '')
+        changes_filename = alita_state.get('changes_filename', '')
+
+        new_files = alita_state.get('new_files', [])
+        removed_files = alita_state.get('removed_files', [])
+        changed_files = alita_state.get('changed_files', [])
+        unchanged_count = alita_state.get('unchanged_count', 0)
+        files_to_version = alita_state.get('files_to_version', [])
+        files_to_delete = alita_state.get('files_to_delete', [])
+        files_to_archive = alita_state.get('files_to_archive', [])
+        files_to_diff = alita_state.get('files_to_diff', [])
+
+        # Build comprehensive report
+        report_lines = [
+            "# 📊 SharePoint Change Tracker Report",
+            "",
+            f"**Folder:** `{folder_path}`",
+            f"**Current Retrieval:** `{current_retrieval_date}`",
+            f"**Last Retrieval:** `{last_retrieval_date}`",
+            "",
+            "## 📈 Summary",
+            "",
+            f"- **New Files:** {len(new_files)}",
+            f"- **Removed Files:** {len(removed_files)}",
+            f"- **Changed Files:** {len(changed_files)}",
+            f"- **Unchanged Files:** {unchanged_count}",
+            f"- **Total Files:** {len(new_files) + len(changed_files) + unchanged_count}",
+            f"- **Files Versioned (prev saved):** {len(files_to_version)}",
+            f"- **Files Cleaned Up (deleted):** {len(files_to_delete)}",
+            f"- **Files Downloaded (new + changed):** {len(files_to_archive)}",
+            f"- **Diffs Computed:** {len(files_to_diff)}",
+            "",
+        ]
+
+        # New Files Section
+        if new_files:
+            report_lines.append("## ✨ New Files")
+            report_lines.append("")
+            report_lines.append(f"**📥 Downloaded & Stored:** {len([f for f in files_to_archive if f.get('type') == 'new'])} files")
+            report_lines.append("")
+            
+            for idx, file in enumerate(sorted(new_files, key=lambda x: x.get('Modified', ''), reverse=True), 1):
+                name = file.get('Name', 'Unknown')
+                file_id = file.get('id', 'unknown')
+                path = file.get('Path', '')
+                modified = file.get('Modified', '')
+                link = file.get('Link', '')
+                
+                # Sanitize: spaces to hyphens, special chars to underscores
+                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                
+                report_lines.append(f"### {idx}. {name}")
+                report_lines.append(f"- **Path:** `{path}`")
+                report_lines.append(f"- **Created:** `{modified}`")
+                report_lines.append(f"- **Stored as:** `file_{file_id}_{safe_name}.txt`")
+                if link:
+                    report_lines.append(f"- **Link:** {link}")
+                report_lines.append("")
+
+        # Removed Files Section
+        if removed_files:
+            report_lines.append("## 🗑️ Removed Files")
+            report_lines.append("")
+            report_lines.append(f"**💾 Last State Preserved:** {len(files_to_delete)} files (renamed to file_del_*)")
+            report_lines.append("**🧹 Cleanup:** Previous versions and diffs marked as deleted")
+            report_lines.append("")
+            
+            for idx, file in enumerate(sorted(removed_files, key=lambda x: x.get('Modified', ''), reverse=True), 1):
+                name = file.get('Name', 'Unknown')
+                file_id = file.get('id', 'unknown')
+                path = file.get('Path', '')
+                modified = file.get('Modified', '')
+                
+                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                
+                report_lines.append(f"### {idx}. {name}")
+                report_lines.append(f"- **Path:** `{path}`")
+                report_lines.append(f"- **Last Modified:** `{modified}`")
+                report_lines.append(f"- **Archived as:** `file_del_{file_id}_{safe_name}.txt`")
+                report_lines.append("")
+
+        # Changed Files Section
+        if changed_files:
+            report_lines.append("## 🔄 Changed Files")
+            report_lines.append("")
+            report_lines.append(f"**📦 Both Versions Stored:** {len([f for f in files_to_version if f.get('type') == 'changed'])} files (current + previous)")
+            report_lines.append("")
+            
+            for idx, file in enumerate(sorted(changed_files, key=lambda x: x.get('CurrentModified', ''), reverse=True), 1):
+                name = file.get('Name', 'Unknown')
+                file_id = file.get('id', 'unknown')
+                path = file.get('Path', '')
+                prev_modified = file.get('PreviousModified', '')
+                curr_modified = file.get('CurrentModified', '')
+                link = file.get('Link', '')
+                
+                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                
+                report_lines.append(f"### {idx}. {name}")
+                report_lines.append(f"- **Path:** `{path}`")
+                report_lines.append(f"- **Previous Modified:** `{prev_modified}`")
+                report_lines.append(f"- **Current Modified:** `{curr_modified}`")
+                report_lines.append(f"- **Current version:** `file_{file_id}_{safe_name}.txt`")
+                report_lines.append(f"- **Previous version:** `file_prev_{file_id}_{safe_name}.txt`")
+                report_lines.append(f"- **Diff:** `file_diff_{file_id}_{safe_name}.txt`")
+                if link:
+                    report_lines.append(f"- **Link:** {link}")
+                report_lines.append("")
+
+        # No changes
+        if not new_files and not removed_files and not changed_files:
+            is_first_run = alita_state.get('is_first_run', False)
+            if is_first_run:
+                report_lines.append("ℹ️ **First run** - Baseline snapshot created in artifact storage.")
+            else:
+                report_lines.append("✅ **No changes detected** since last retrieval.")
+
+        # Footer
+        bucket_name = alita_state.get('bucket_name', 'sp-log')
+        report_lines.extend([
+            "",
+            "---",
+            "",
+            "## 📂 Artifact Storage",
+            f"**Bucket:** `{bucket_name}`",
+            "",
+            "- `retrieval_log.txt` — run history (last 5, auto-cleanup)",
+            "- `snapshot.json` — current file state",
+        ])
+
+        if changes_filename:
+            report_lines.append(f"- `{changes_filename}` — this run's change report (with artifact filenames)")
+        else:
+            report_lines.append("- `changes_YYYYMMDD_HHMMSS.json` — per-run change report (last 5 kept, auto-cleanup)")
+
+        report_lines.extend([
+            "- `file_[Id]_[name].txt` — current file versions",
+            "- `file_prev_[Id]_[name].txt` — previous versions of changed files",
+            "- `file_diff_[Id]_[name].txt` — unified diffs for changed files",
+            "- `file_del_[Id]_[name].txt` — last known state of removed files",
+        ])
+
+        report = "\n".join(report_lines)
+
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({"role": "assistant", "content": report})
+
+        {'messages': msgs}
+    input:
+      - bucket_name
+      - folder_path
+      - current_retrieval_date
+      - last_retrieval_date
+      - changes_filename
+      - new_files
+      - removed_files
+      - changed_files
+      - unchanged_count
+      - is_first_run
+      - files_to_version
+      - files_to_delete
+      - files_to_archive
+      - files_to_diff
+    output:
+      - messages
+    structured_output: true
+    transition: END
