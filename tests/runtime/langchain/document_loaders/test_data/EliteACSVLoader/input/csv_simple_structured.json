@@ -1,0 +1,8 @@
+{
+    "tags": ["loader:csv", "content:simple", "feature:structured"],
+    "file_path": "../files/csv_simple.csv",
+    "configs": [
+        {"encoding": "utf-8", "raw_content": false, "cleanse": false},
+        {"encoding": "utf-8", "raw_content": false, "cleanse": false, "json_documents": false}
+    ]
+}

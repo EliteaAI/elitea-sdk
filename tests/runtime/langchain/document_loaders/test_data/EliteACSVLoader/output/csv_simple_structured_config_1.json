@@ -1,0 +1,31 @@
+[
+  {
+    "page_content": "name\tage\tcity",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:1",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv",
+      "header": "true"
+    }
+  },
+  {
+    "page_content": "Alice\t30\tNew York",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:2",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv"
+    }
+  },
+  {
+    "page_content": "Bob\t25\tSan Francisco",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:3",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv"
+    }
+  },
+  {
+    "page_content": "Charlie\t35\tBoston",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:4",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv"
+    }
+  }
+]
