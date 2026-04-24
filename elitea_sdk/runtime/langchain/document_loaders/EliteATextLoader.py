@@ -6,7 +6,7 @@ from langchain_community.document_loaders.base import BaseLoader
 from langchain_community.document_loaders.helpers import detect_file_encodings
 from langchain_core.tools import ToolException
 
-from elitea_sdk.tools.chunkers import markdown_chunker
+from elitea_sdk.tools.chunkers import text_chunker
 
 
 class EliteATextLoader(BaseLoader):
@@ -74,9 +74,9 @@ class EliteATextLoader(BaseLoader):
         """Load from file path."""
         text = self.get_content()
         metadata = {"source": str(self.file_path) if hasattr(self, 'file_path') else self.file_name}
-        chunks = markdown_chunker(file_content_generator=self.generate_document(text, metadata),
-                                  config={
-                                      "max_tokens": self.max_tokens,
-                                      "token_overlap": self.token_overlap
-                                  })
+        chunks = text_chunker(file_content_generator=self.generate_document(text, metadata),
+                              config={
+                                  "max_tokens": self.max_tokens,
+                                  "token_overlap": self.token_overlap
+                              })
         yield from chunks
