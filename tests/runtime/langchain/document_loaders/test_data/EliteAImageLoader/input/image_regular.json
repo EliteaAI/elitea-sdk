@@ -22,6 +22,7 @@
       "_name": "llm_default_prompt_minimal_tokens",
       "_use_llm": true,
       "prompt": "Provide description (just general descriptions) of this image in around 1000 tokens.",
+      "max_tokens": 4096,
       "_max_tokens": 256
     }
   ]
