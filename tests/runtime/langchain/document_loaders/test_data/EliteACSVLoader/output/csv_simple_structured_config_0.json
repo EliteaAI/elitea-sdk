@@ -1,0 +1,37 @@
+[
+  {
+    "page_content": "name\tage\tcity",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:1",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv",
+      "header": "true"
+    }
+  },
+  {
+    "page_content": "Alice\n30\nNew York",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:2",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv",
+      "columns": ["name", "age", "city"],
+      "og_data": "{\"name\": \"Alice\", \"age\": \"30\", \"city\": \"New York\"}"
+    }
+  },
+  {
+    "page_content": "Bob\n25\nSan Francisco",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:3",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv",
+      "columns": ["name", "age", "city"],
+      "og_data": "{\"name\": \"Bob\", \"age\": \"25\", \"city\": \"San Francisco\"}"
+    }
+  },
+  {
+    "page_content": "Charlie\n35\nBoston",
+    "metadata": {
+      "source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv:4",
+      "table_source": "tests/runtime/langchain/document_loaders/test_data/EliteACSVLoader/files/csv_simple.csv",
+      "columns": ["name", "age", "city"],
+      "og_data": "{\"name\": \"Charlie\", \"age\": \"35\", \"city\": \"Boston\"}"
+    }
+  }
+]
