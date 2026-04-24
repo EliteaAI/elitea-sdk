@@ -1,21 +1,21 @@
 [
   {
-    "page_content": "# Configuration file for testing YAML content loading\n# EliteATextLoader should load this as raw text, preserving YAML structure  \napplication:\nname: TestApp\nversion: 1.0.0\nenvironment: development  \ndatabase:\nhost: localhost\nport: 5432\nname: testdb\ncredentials:\nusername: admin\npassword: ${DB_PASSWORD}  \nfeatures:\n- feature_flags\n- logging\n- monitoring\n- authentication  \nsettings:\nmax_connections: 100\ntimeout: 30\nretry_attempts: 3\ncache:\nenabled: true\nttl: 3600\nsize: 1024  \nlogging:\nlevel: INFO\nformat: \"%(asctime)s - %(name)s - %(levelname)s - %(message)s\"\nhandlers:\n- type: console\nlevel: DEBUG\n- type: file\nlevel: INFO\nfilename: app.log\nmax_bytes: 10485760\nbackup_count: 5  \n# Nested structure test\nservices:\nweb:\nimage: nginx:latest\nports:\n- \"80:80\"\n- \"443:443\"\nenvironment:\n- ENV=production\n- DEBUG=false  \napi:\nimage: python:3.9\ncommand: [\"python\", \"app.py\"]\nvolumes:\n- ./code",
+    "page_content": "# Configuration file for testing YAML content loading\n# EliteATextLoader should load this as raw text, preserving YAML structure\n\napplication:\n  name: TestApp\n  version: 1.0.0\n  environment: development\n\ndatabase:\n  host: localhost\n  port: 5432\n  name: testdb\n  credentials:\n    username: admin\n    password: ${DB_PASSWORD}\n\nfeatures:\n  - feature_flags\n  - logging\n  - monitoring\n  - authentication\n\nsettings:\n  max_connections: 100\n  timeout: 30\n  retry_attempts: 3\n  cache:\n    enabled: true\n    ttl: 3600\n    size: 1024\n\nlogging:\n  level: INFO\n  format: \"%(asctime)s - %(name)s - %(levelname)s - %(message)s\"\n  handlers:\n    - type: console\n      level: DEBUG\n    - type: file\n      level: INFO\n      filename: app.log\n      max_bytes: 10485760\n      backup_count: 5\n\n# Nested structure test\nservices:\n  web:\n    image: nginx:latest\n    ports:\n      - \"80:80\"\n      - \"443:443\"\n    environment",
     "metadata": {
       "source": "tests/runtime/langchain/document_loaders/test_data/EliteATextLoader/files/text_yaml.yaml",
+      "headers": "",
       "chunk_id": 1,
       "chunk_type": "document",
-      "headers": "",
       "method_name": "text"
     }
   },
   {
-    "page_content": " \"app.py\"]\nvolumes:\n- ./code:/app\n- ./logs:/logs\ndepends_on:\n- database\n- cache  \n# Unicode and special characters in YAML\nmetadata:\ndescription: \"Test file with émojis 🚀 and spëcial çharacters\"\ntags: [testing, yaml, unicode, 数据, テスト]\nnotes: |\nMulti-line string with various content:\n- Line 1: Normal text\n- Line 2: Special chars: © ® ™ € £\n- Line 3: Math symbols: ∀ ∃ ∈ ≈ ≠\n",
+    "page_content": "\"\n      - \"443:443\"\n    environment:\n      - ENV=production\n      - DEBUG=false\n  \n  api:\n    image: python:3.9\n    command: [\"python\", \"app.py\"]\n    volumes:\n      - ./code:/app\n      - ./logs:/logs\n    depends_on:\n      - database\n      - cache\n\n# Unicode and special characters in YAML\nmetadata:\n  description: \"Test file with émojis 🚀 and spëcial çharacters\"\n  tags: [testing, yaml, unicode, 数据, テスト]\n  notes: |\n    Multi-line string with various content:\n    - Line 1: Normal text\n    - Line 2: Special chars: © ® ™ € £\n    - Line 3: Math symbols: ∀ ∃ ∈ ≈ ≠\n",
     "metadata": {
       "source": "tests/runtime/langchain/document_loaders/test_data/EliteATextLoader/files/text_yaml.yaml",
+      "headers": "",
       "chunk_id": 2,
       "chunk_type": "document",
-      "headers": "",
       "method_name": "text"
     }
   }
