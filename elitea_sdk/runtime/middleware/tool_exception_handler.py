@@ -294,6 +294,26 @@ When a tool fails with an error:
                 return_direct=getattr(tool, 'return_direct', False),
             )
 
+            # Route pydantic ValidationError through the same strategy pipeline
+            # as runtime exceptions. Without this, ValidationError fires during
+            # BaseTool.run() input parsing — before error_handled_func — and
+            # crashes the pipeline instead of being handled gracefully.
+            def _route_validation_error(e):
+                context = ExceptionContext(
+                    tool=tool,
+                    error=e,
+                    args=(),
+                    kwargs={}
+                )
+                try:
+                    for strategy in self.strategies:
+                        context = strategy.handle_exception(context)
+                except ToolException:
+                    raise
+                return context.error_message or str(e)
+
+            wrapped_tool.handle_validation_error = _route_validation_error
+
             # Preserve metadata if present
             if hasattr(tool, 'metadata'):
                 wrapped_tool.metadata = tool.metadata
