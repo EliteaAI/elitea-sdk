@@ -9,6 +9,7 @@ from langchain_core.documents import Document
 from reportlab.graphics import renderPM
 from svglib.svglib import svg2rlg
 
+from elitea_sdk.tools.chunkers import markdown_chunker
 from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size, scale_svg_drawing, preprocess_svg_for_rendering
 from ..constants import DEFAULT_MULTIMODAL_PROMPT
 from ..tools.utils import image_to_byte_array, bytes_to_base64
@@ -35,6 +36,8 @@ class EliteAImageLoader(BaseLoader):
         self.ocr_language = kwargs.get('ocr_language', None)
         self.prompt = kwargs.get('prompt') if kwargs.get(
             'prompt') is not None else DEFAULT_MULTIMODAL_PROMPT  # Use provided prompt or default
+        self.max_tokens = kwargs.get('max_tokens', 512)
+        self.token_overlap = kwargs.get('token_overlap', 10)
         self._original_dimensions = None
         self._was_scaled = False
 
@@ -138,7 +141,7 @@ class EliteAImageLoader(BaseLoader):
         return Image.open(img_data).convert("RGBA")
 
     def load(self) -> List[Document]:
-        """Load text from image using OCR or LLM if llm is provided, supports SVG."""
+        """Load text from image using OCR or LLM if llm is provided, supports SVG. Applies token-based chunking when max_tokens > 0."""
         text_content = self.get_content()
 
         metadata = {
@@ -149,4 +152,15 @@ class EliteAImageLoader(BaseLoader):
             metadata["original_dimensions"] = list(self._original_dimensions)
         if self._was_scaled:
             metadata["scaled"] = True
-        return [Document(page_content=text_content, metadata=metadata)]
+
+        base_doc = Document(page_content=text_content, metadata=metadata)
+        if not self.max_tokens or self.max_tokens <= 0:
+            return [base_doc]
+        chunks = list(markdown_chunker(
+            iter([base_doc]),
+            config={"max_tokens": self.max_tokens, "token_overlap": self.token_overlap},
+        ))
+        # If chunking didn't actually split, return the original doc to preserve clean metadata.
+        if len(chunks) <= 1:
+            return [base_doc]
+        return chunks
