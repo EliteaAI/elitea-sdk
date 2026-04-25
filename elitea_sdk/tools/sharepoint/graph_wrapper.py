@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import time
 from typing import Optional, List, Tuple
 from urllib.parse import quote, unquote
 
@@ -106,7 +107,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         hostname = match.group(1)
         site_path = (match.group(2) or '').strip('/')
         url = f"{_GRAPH_BASE}/sites/{hostname}:/{site_path}"
+        _t = time.perf_counter()
         data = self._get(url)
+        logging.debug("[SP-Graph][_resolve_site_id] %.3fs → %s", time.perf_counter() - _t, data.get('id', '?'))
         self.__site_id = data['id']
         return self.__site_id
 
@@ -114,7 +117,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """Return the id of the site's default document library drive."""
         if self.__drive_id:
             return self.__drive_id
+        _t = time.perf_counter()
         data = self._get(f"{_GRAPH_BASE}/sites/{self._resolve_site_id()}/drive")
+        logging.debug("[SP-Graph][_resolve_drive_id] %.3fs → %s", time.perf_counter() - _t, data.get('id', '?'))
         self.__drive_id = data['id']
         return self.__drive_id
 
@@ -126,11 +131,17 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """
         if self.__drives_cache is not None:
             return self.__drives_cache
+        _t = time.perf_counter()
         data = self._get(
             f"{_GRAPH_BASE}/sites/{self._resolve_site_id()}/drives",
             params={"$select": "id,name,webUrl"},
         )
         self.__drives_cache = data.get('value', [])
+        logging.debug(
+            "[SP-Graph][_list_drives] %.3fs → %d drives: %s",
+            time.perf_counter() - _t,
+            len(self.__drives_cache),
+            [d.get('name', '?') for d in self.__drives_cache])
         return self.__drives_cache
 
     def _resolve_drive_and_folder(self, folder_path: str) -> List[Tuple[str, str]]:
@@ -211,6 +222,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         # This happens when folder_clean is a bare subfolder name (e.g. "test")
         # that exists inside one or more non-default libraries.
         # Probe ALL drives to find every one that contains the folder.
+        logging.debug(
+            "[SP-Graph][_resolve_drive_and_folder] No direct match for %r — "
+            "probing %d drives one by one (this makes 1 HTTP request per drive).",
+            folder_path, len(self._list_drives()))
         encoded = quote(folder_clean, safe='/')
         probed: List[Tuple[str, str]] = []
         for drive in self._list_drives():
@@ -218,12 +233,18 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             if not did:
                 continue
             probe_url = f"{_GRAPH_BASE}/drives/{did}/root:/{encoded}"
+            _t_probe = time.perf_counter()
             resp = requests.get(
                 probe_url,
                 headers=self._auth_headers(),
                 params={"$select": "id,folder"},
                 timeout=15,
             )
+            logging.debug(
+                "[SP-Graph][_resolve_drive_and_folder] probe drive %s (%s) → "
+                "status=%d  %.3fs",
+                drive.get('name', '?'), did, resp.status_code,
+                time.perf_counter() - _t_probe)
             if resp.status_code == 200:
                 item = resp.json()
                 if 'folder' in item or 'id' in item:
@@ -536,6 +557,12 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         from .base_wrapper import _normalize_extensions, _matches_extension
         from urllib.parse import unquote as _unquote
         try:
+            _t_start = time.perf_counter()
+            logging.debug(
+                "[SP-Graph][get_files_list] START — folder_name=%r form_name=%r "
+                "limit_files=%d include_extensions=%r skip_extensions=%r",
+                folder_name, form_name, limit_files, include_extensions, skip_extensions)
+
             norm_include = _normalize_extensions(include_extensions)
             norm_skip = _normalize_extensions(skip_extensions)
 
@@ -603,10 +630,18 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             while typed_queue and len(result) < limit_files:
                 drive_id, url = typed_queue.pop(0)
                 next_link: Optional[str] = url
+                _page_num = 0
                 while next_link and len(result) < limit_files:
+                    _t_req = time.perf_counter()
                     data = self._get(
                         next_link,
                         params=params if next_link == url else None)
+                    _page_num += 1
+                    logging.debug(
+                        "[SP-Graph][get_files_list] page %d fetched in %.3fs — "
+                        "items_in_page=%d result_so_far=%d drive_id=%s",
+                        _page_num, time.perf_counter() - _t_req,
+                        len(data.get('value', [])), len(result), drive_id)
                     for item in data.get('value', []):
                         if 'folder' in item:
                             # Enqueue subfolder for processing (same drive)
@@ -635,6 +670,19 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         if len(result) >= limit_files:
                             break
                     next_link = data.get('@odata.nextLink')
+
+            _t_total = time.perf_counter() - _t_start
+            _result_size = len(str(result))
+            logging.info(
+                "[SP-Graph][get_files_list] DONE — files_returned=%d "
+                "response_size_chars=%d total_time=%.3fs",
+                len(result), _result_size, _t_total)
+            if _result_size > 50_000:
+                logging.warning(
+                    "[SP-Graph][get_files_list] Response is large (%d chars). "
+                    "Consider reducing limit_files (current=%d) or applying "
+                    "include_extensions / skip_extensions filters.",
+                    _result_size, limit_files)
 
             return result if result else ToolException(
                 "Can not get files or folder is empty. "

@@ -8,6 +8,7 @@ when the primary REST call fails.
 from __future__ import annotations
 
 import logging
+import time
 from io import BytesIO
 from typing import List, Optional
 
@@ -67,6 +68,58 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             scope="",
             token_json="",
         )
+
+    def _rest_bfs_files(self, root_folder_url: str, limit_files: int) -> list:
+        """Enumerate files using parallel BFS with non-recursive per-folder REST calls."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        MAX_WORKERS = 16
+        raw_files: list = []
+        files_lock = threading.Lock()
+        folders_visited = 0
+        visited_lock = threading.Lock()
+        _t_start = time.perf_counter()
+
+        def fetch_folder(folder_url: str):
+            folder_ref = self._client.web.get_folder_by_server_relative_path(folder_url)
+            files = folder_ref.files.get().execute_query()
+            subfolders = folder_ref.folders.get().execute_query()
+            sub_urls = [
+                sf.properties.get('ServerRelativeUrl', '')
+                for sf in subfolders
+                if sf.properties.get('ServerRelativeUrl', '').rstrip('/').split('/')[-1] != 'Forms'
+            ]
+            return list(files), [u for u in sub_urls if u]
+
+        queue = [root_folder_url]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            while queue:
+                with files_lock:
+                    if len(raw_files) >= limit_files:
+                        break
+                wave, queue = queue[:MAX_WORKERS], queue[MAX_WORKERS:]
+                futures = {executor.submit(fetch_folder, url): url for url in wave}
+                for future in as_completed(futures):
+                    with visited_lock:
+                        folders_visited += 1
+                    try:
+                        files, sub_urls = future.result()
+                        with files_lock:
+                            raw_files.extend(files)
+                            current_count = len(raw_files)
+                        if current_count < limit_files:
+                            queue.extend(sub_urls)
+                    except Exception as e:
+                        logging.warning(
+                            "[SP-REST][BFS] skipping %r — %s: %s",
+                            futures[future], type(e).__name__, e)
+
+        _total = time.perf_counter() - _t_start
+        logging.info(
+            "[SP-REST][BFS] folders_visited=%d files_found=%d total_time=%.3fs",
+            folders_visited, len(raw_files), _total)
+        return raw_files[:limit_files]
 
     # ------------------------------------------------------------------ #
     #  Lists                                                               #
@@ -265,12 +318,35 @@ class SharepointRestWrapper(BaseSharepointWrapper):
         """
         from .base_wrapper import _normalize_extensions, _matches_extension
         try:
+            _t_start = time.perf_counter()
+
+            # Fast path: Graph API (avoids slow REST recursive call)
+            if folder_name:
+                try:
+                    _t_graph = time.perf_counter()
+                    graph_result = self._graph_helper().get_files_list(
+                        self.site_url, folder_name, limit_files,
+                        include_extensions=include_extensions,
+                        skip_extensions=skip_extensions,
+                        form_name=form_name)
+                    logging.info(
+                        "[SP-REST][get_files_list] Graph fast path — files=%d time=%.3fs",
+                        len(graph_result), time.perf_counter() - _t_graph)
+                    return graph_result
+                except Exception as graph_fast_e:
+                    logging.warning(
+                        "[SP-REST][get_files_list] Graph fast path failed (%.3fs): %s — "
+                        "falling back to REST BFS.",
+                        time.perf_counter() - _t_start, graph_fast_e)
+
+            # Slow path: REST parallel BFS
             all_libraries = (
                 self._client.web.lists
                 .filter("BaseTemplate eq 101 and Title ne 'Form Templates' "
                         "and Title ne 'Site Assets' and Title ne 'Style Library'")
                 .get().execute_query()
             )
+
             result = []
             limit_files = limit_files or 100
             norm_include = _normalize_extensions(include_extensions)
@@ -279,8 +355,6 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             site_segments = [s for s in self.site_url.strip('/').split('/') if s][-2:]
             full_path_prefix = '/'.join(site_segments)
 
-            # Track REST access failures per library so we can fall back to Graph
-            # API when all libraries fail (e.g. under App-Only access restrictions).
             lib_access_failures = 0
             lib_attempted = 0
 
@@ -296,8 +370,6 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                 target_folder_url = library_type
                 if folder_name:
                     if form_name:
-                        # form_name already pins the library; treat folder_name as a
-                        # subfolder path relative to that library's root.
                         target_folder_url = f"{library_type}/{folder_name.strip('/')}"
                     else:
                         folder_path = folder_name.strip('/')
@@ -313,15 +385,13 @@ class SharepointRestWrapper(BaseSharepointWrapper):
 
                 lib_attempted += 1
                 try:
-                    files = (
-                        self._client.web
-                        .get_folder_by_server_relative_path(target_folder_url)
-                        .get_files(True).execute_query()
-                    )
+                    _t_lib = time.perf_counter()
+                    files = self._rest_bfs_files(target_folder_url, limit_files - len(result))
+                    logging.info(
+                        "[SP-REST][get_files_list] library '%s' — files=%d time=%.3fs",
+                        library_type, len(files), time.perf_counter() - _t_lib)
                 except Exception as lib_e:
-                    logging.warning(
-                        "Skipping library '%s' — REST access failed: %s",
-                        library_type, lib_e)
+                    logging.warning("Skipping library '%s' — %s", library_type, lib_e)
                     lib_access_failures += 1
                     continue
 
@@ -344,40 +414,57 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         'id': file.properties['UniqueId'],
                     })
 
-            # If REST returned no results AND all (or all attempted) library accesses
-            # failed, fall back to the Graph API helper.  This handles the common
-            # App-Only scenario where the office365 client can enumerate lists but
-            # cannot recursively fetch files via get_files(True).
             if not result and lib_attempted > 0 and lib_access_failures == lib_attempted:
-                logging.info(
-                    "All %d REST library access(es) failed; falling back to Graph API.",
-                    lib_access_failures)
+                logging.warning(
+                    "[SP-REST][get_files_list] All %d REST libraries failed — "
+                    "falling back to Graph API.", lib_access_failures)
                 try:
-                    return self._graph_helper().get_files_list(
+                    _t_graph = time.perf_counter()
+                    graph_result = self._graph_helper().get_files_list(
                         self.site_url, folder_name, limit_files,
                         include_extensions=include_extensions,
                         skip_extensions=skip_extensions,
                         form_name=form_name)
+                    logging.info(
+                        "[SP-REST][get_files_list] Graph fallback — files=%d time=%.3fs",
+                        len(graph_result), time.perf_counter() - _t_graph)
+                    return graph_result
                 except Exception as graph_e:
                     logging.error("Graph API fallback also failed: %s", graph_e)
                     raise ToolException(
                         f"Can not get files via REST or Graph API. "
                         f"Please, double check folder name and read permissions: {graph_e}")
 
+            _t_total = time.perf_counter() - _t_start
+            logging.info(
+                "[SP-REST][get_files_list] DONE — files=%d size=%d chars time=%.3fs",
+                len(result), len(str(result)), _t_total)
+            if len(str(result)) > 50_000:
+                logging.warning(
+                    "[SP-REST][get_files_list] Large response (%d chars) — "
+                    "consider reducing limit_files or adding extension filters.",
+                    len(str(result)))
+
             return result
         except ToolException:
             raise
         except Exception as e:
+            logging.warning(
+                "[SP-REST][get_files_list] Exception after %.3fs (%s) — "
+                "trying Graph API fallback.", time.perf_counter() - _t_start, e)
             try:
+                _t_graph = time.perf_counter()
                 files = self._graph_helper().get_files_list(
                     self.site_url, folder_name, limit_files,
                     include_extensions=include_extensions,
                     skip_extensions=skip_extensions,
                     form_name=form_name)
+                logging.info(
+                    "[SP-REST][get_files_list] Graph fallback — files=%d time=%.3fs",
+                    len(files), time.perf_counter() - _t_graph)
                 return files
             except Exception as graph_e:
-                logging.error("Failed to load files via REST: %s", e)
-                logging.error("Failed to load files via Graph API: %s", graph_e)
+                logging.error("REST failed: %s | Graph failed: %s", e, graph_e)
                 raise ToolException(
                     f"Can not get files. Please, double check folder name and "
                     f"read permissions: {e} and {graph_e}")
