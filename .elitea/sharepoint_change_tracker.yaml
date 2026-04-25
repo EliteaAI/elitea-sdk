@@ -4,7 +4,7 @@ state:
     value: []
   bucket_name:
     type: str
-    value: sp-log
+    value: ''
   changed_files:
     type: list
     value: []
@@ -32,6 +32,15 @@ state:
   current_version_index:
     type: int
     value: 0
+  debug_info:
+    type: dict
+    value: {}
+  debug_info_1:
+    type: dict
+    value: {}
+  debug_info_2:
+    type: dict
+    value: {}
   downloaded_content:
     type: str
     value: ''
@@ -53,9 +62,21 @@ state:
   folder_path:
     type: str
     value: ''
+  found_folders:
+    type: list
+    value: []
   input:
     type: str
   input_bucket_name:
+    type: str
+    value: ''
+  input_folder_path:
+    type: str
+    value: ''
+  input_id:
+    type: str
+    value: ''
+  search_base_path:
     type: str
     value: ''
   is_first_run:
@@ -97,9 +118,12 @@ nodes:
         if not input_str:
             result = {
                 "validation_passed": False,
-                "error_message": "Input required. Provide JSON: {\"folder_path\": \"/sites/MySite/Shared Documents\", \"bucket_name\": \"optional-bucket\"}",
+                "error_message": "Input required. Provide JSON with 'id':\n{\"id\": \"12345\", \"folder_path\": \"optional-search-base\", \"bucket_name\": \"optional-bucket\"}",
                 "folder_path": "",
                 "input_bucket_name": "",
+                "input_id": "",
+                "input_folder_path": "",
+                "search_base_path": "",
                 "current_retrieval_date": datetime.now().isoformat()
             }
         else:
@@ -116,9 +140,12 @@ nodes:
                     parse_failed = True
                     result = {
                         "validation_passed": False,
-                        "error_message": f"Invalid JSON. Expected: {{\"folder_path\": \"/sites/MySite/Shared Documents\", \"bucket_name\": \"optional-bucket\"}}\nReceived: \"{input_str}\"",
+                        "error_message": f"Invalid JSON. Expected: {{\"id\": \"12345\"}}\nReceived: \"{input_str}\"",
                         "folder_path": "",
                         "input_bucket_name": "",
+                        "input_id": "",
+                        "input_folder_path": "",
+                        "search_base_path": "",
                         "current_retrieval_date": datetime.now().isoformat()
                     }
 
@@ -129,44 +156,65 @@ nodes:
                         "error_message": "Input must be a JSON object.",
                         "folder_path": "",
                         "input_bucket_name": "",
+                        "input_id": "",
+                        "input_folder_path": "",
+                        "search_base_path": "",
                         "current_retrieval_date": datetime.now().isoformat()
                     }
-                elif 'folder_path' not in input_data:
+                elif 'id' not in input_data:
                     result = {
                         "validation_passed": False,
-                        "error_message": "Missing required field 'folder_path'. Expected: {\"folder_path\": \"/sites/...\", \"bucket_name\": \"optional\"}",
+                        "error_message": "Field 'id' is required. Provide: {\"id\": \"12345\", \"folder_path\": \"optional\", \"bucket_name\": \"optional\"}",
                         "folder_path": "",
                         "input_bucket_name": "",
-                        "current_retrieval_date": datetime.now().isoformat()
-                    }
-                elif 'bucket_name' in input_data and not input_data['bucket_name']:
-                    result = {
-                        "validation_passed": False,
-                        "error_message": "Field 'bucket_name' cannot be empty if provided. Either omit it or provide a valid bucket name.",
-                        "folder_path": "",
-                        "input_bucket_name": "",
+                        "input_id": "",
+                        "input_folder_path": "",
+                        "search_base_path": "",
                         "current_retrieval_date": datetime.now().isoformat()
                     }
                 else:
-                    result = {
-                        "validation_passed": True,
-                        "error_message": "",
-                        "folder_path": input_data['folder_path'],
-                        "input_bucket_name": input_data.get('bucket_name'),
-                        "current_retrieval_date": datetime.now().isoformat()
-                    }
+                    feature_id = str(input_data['id']).strip()
+                    if not feature_id:
+                        result = {
+                            "validation_passed": False,
+                            "error_message": "Field 'id' cannot be empty.",
+                            "folder_path": "",
+                            "input_bucket_name": "",
+                            "input_id": "",
+                            "input_folder_path": "",
+                            "search_base_path": "",
+                            "current_retrieval_date": datetime.now().isoformat()
+                        }
+                    else:
+                        # Get optional parameters with defaults
+                        search_base = input_data.get('folder_path', 'Shared Documents/General')
+                        bucket = input_data.get('bucket_name', f'feature-{feature_id}')
+                        result = {
+                            "validation_passed": True,
+                            "error_message": "",
+                            "folder_path": "",  # Will be set after finding the folder
+                            "input_bucket_name": bucket,
+                            "input_id": feature_id,
+                            "input_folder_path": search_base,
+                            "search_base_path": search_base,
+                            "current_retrieval_date": datetime.now().isoformat()
+                        }
 
         result
     input: []
     output:
       - input_bucket_name
+      - input_id
+      - input_folder_path
+      - search_base_path
+      - folder_path
     structured_output: true
     transition: ValidationRouter
   - id: ValidationRouter
     type: router
     condition: |
       {% if validation_passed %}
-        LoadState
+        FindFeatureFolder
       {% else %}
         FormatError
       {% endif %}
@@ -174,8 +222,271 @@ nodes:
     input:
       - validation_passed
     routes:
-      - LoadState
       - FormatError
+      - FindFeatureFolder
+  - id: FindFeatureFolder
+    type: code
+    code:
+      type: fixed
+      value: |-
+        # Prepare to search for folder containing the feature ID in its name
+        input_id = alita_state.get('input_id', '').strip()
+        search_base_path = alita_state.get('search_base_path', '').strip()
+        
+        # Just pass through - actual search happens in SearchFolders toolkit node
+        result = {
+            "found_folders": []
+        }
+        
+        result
+    input:
+      - input_id
+      - search_base_path
+    output:
+      - found_folders
+    structured_output: true
+    transition: SearchFolders
+  - id: SearchFolders
+    type: toolkit
+    input:
+      - search_base_path
+    input_mapping:
+      folder_name:
+        type: variable
+        value: search_base_path
+      form_name:
+        type: fixed
+        value: null
+      include_extensions:
+        type: fixed
+        value: null
+      limit_files:
+        type: fixed
+        value: 10000
+      skip_extensions:
+        type: fixed
+        value: null
+    output:
+      - all_files
+    structured_output: true
+    tool: get_files_list
+    toolkit_name: LFAInternalSharePoint
+    transition: FilterFoldersByID
+  - id: FilterFoldersByID
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import re
+        import json
+        import ast
+        
+        # ── Recover state if it arrived as a string (datetime serialization bug) ──
+        state = alita_state
+        if isinstance(state, str):
+            # Replace datetime.datetime(...) with ISO strings
+            fixed = re.sub(
+                r'datetime\.datetime\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(\d+))?(?:,\s*(\d+))?\)',
+                lambda m: "'{}-{}-{}T{}:{}:{}'".format(
+                    m.group(1).zfill(4), m.group(2).zfill(2), m.group(3).zfill(2),
+                    (m.group(4) or '0').zfill(2), (m.group(5) or '0').zfill(2), (m.group(6) or '0').zfill(2)
+                ),
+                state
+            )
+            try:
+                state = ast.literal_eval(fixed)
+            except Exception:
+                try:
+                    state = json.loads(state)
+                except Exception:
+                    state = {}
+        
+        input_id = state.get('input_id', '').strip() if isinstance(state, dict) else ''
+        all_files_raw = state.get('all_files', []) if isinstance(state, dict) else []
+        
+        # Capture debug info about what we received
+        debug_info_1 = {
+            'state_type': type(alita_state).__name__,
+            'state_recovery_used': isinstance(alita_state, str),
+            'raw_type': type(all_files_raw).__name__,
+            'raw_is_str': isinstance(all_files_raw, str),
+            'raw_is_list': isinstance(all_files_raw, list),
+            'raw_preview': str(all_files_raw)[:500] if all_files_raw else 'None/Empty'
+        }
+        
+        all_files = all_files_raw
+        
+        # Parse all_files if it's a JSON string
+        if isinstance(all_files, str):
+            debug_info_1['parse_attempted'] = True
+            try:
+                all_files = json.loads(all_files)
+                debug_info_1['parse_success'] = True
+                debug_info_1['parsed_type'] = type(all_files).__name__
+            except (json.JSONDecodeError, ValueError) as e:
+                debug_info_1['parse_success'] = False
+                debug_info_1['parse_error'] = str(e)
+                all_files = []
+        else:
+            debug_info_1['parse_attempted'] = False
+        
+        # Ensure all_files is a list
+        if not isinstance(all_files, list):
+            debug_info_1['converted_to_list'] = True
+            all_files = []
+        else:
+            debug_info_1['is_valid_list'] = True
+            debug_info_1['list_length'] = len(all_files)
+            if all_files:
+                debug_info_1['first_item_type'] = type(all_files[0]).__name__
+                debug_info_1['first_item_preview'] = str(all_files[0])[:200]
+        
+        # Extract first-level subfolders that contain the ID
+        # Only look at direct children of search_base_path, not nested subfolders
+        search_base_path = state.get('search_base_path', '').strip() if isinstance(state, dict) else ''
+        base_depth = len([p for p in search_base_path.split('/') if p])  # Count path segments
+        
+        found_folders = []
+        found_folder_paths = set()  # Track unique folders
+        item_types_seen = []
+        
+        debug_info_1['search_base_path'] = search_base_path
+        debug_info_1['base_depth'] = base_depth
+        
+        for idx, item in enumerate(all_files):
+            item_type = type(item).__name__
+            if idx < 3:  # Track first 3 item types
+                item_types_seen.append({'index': idx, 'type': item_type, 'preview': str(item)[:100]})
+            
+            # Skip non-dict items
+            if not isinstance(item, dict):
+                continue
+            
+            # Try to extract first-level folder from file path
+            try:
+                item_path = item.get('Path', '') or item.get('ServerRelativeUrl', '')
+                
+                if not item_path or not item_path.startswith(search_base_path):
+                    continue
+                
+                # Get the relative path after the base
+                relative_path = item_path[len(search_base_path):].lstrip('/')
+                path_parts = [p for p in relative_path.split('/') if p]
+                
+                # Only look at first segment (direct subfolder)
+                if len(path_parts) > 0:
+                    first_folder = path_parts[0]
+                    
+                    # Check if this first-level folder contains the ID
+                    if input_id.lower() in first_folder.lower():
+                        folder_path = f"{search_base_path}/{first_folder}"
+                        
+                        # Only add if not already tracked
+                        if folder_path not in found_folder_paths:
+                            found_folder_paths.add(folder_path)
+                            found_folders.append({
+                                'Name': first_folder,
+                                'Path': folder_path,
+                                'Modified': item.get('Modified', ''),
+                                'Created': item.get('Created', ''),
+                                'Link': '',
+                                'id': ''
+                            })
+                
+            except Exception as e:
+                debug_info_1['item_error'] = {'index': idx, 'error': str(e), 'item_type': item_type}
+        
+        debug_info_1['found_folders_count'] = len(found_folders)
+        debug_info_1['item_types_seen'] = item_types_seen
+        
+        result = {
+            'found_folders': found_folders,
+            'debug_info_1': debug_info_1
+        }
+        result
+    input:
+      - input_id
+      - all_files
+      - search_base_path
+    output:
+      - found_folders
+      - debug_info_1
+    structured_output: true
+    transition: ValidateFolderSearch
+  - id: ValidateFolderSearch
+    type: router
+    condition: |
+      {% if found_folders|length == 0 %}
+        FolderSearchError
+      {% elif found_folders|length > 1 %}
+        FolderSearchError
+      {% else %}
+        UpdateFolderPath
+      {% endif %}
+    default_output: FolderSearchError
+    input:
+      - found_folders
+    routes:
+      - FolderSearchError
+      - UpdateFolderPath
+  - id: FolderSearchError
+    type: code
+    code:
+      type: fixed
+      value: |-
+        input_id = alita_state.get('input_id', '')
+        search_base_path = alita_state.get('search_base_path', '')
+        found_folders = alita_state.get('found_folders', [])
+        
+        if len(found_folders) == 0:
+            error_message = f"No folder found containing ID '{input_id}' in base path '{search_base_path}'."
+        elif len(found_folders) > 1:
+            folder_names = [f['Name'] for f in found_folders]
+            error_message = f"Multiple folders found containing ID '{input_id}' in base path '{search_base_path}':\n" + "\n".join([f"  - {name}" for name in folder_names]) + "\n\nPlease provide a more specific ID or use direct folder_path."
+        else:
+            error_message = f"Internal error in folder search validation."
+        
+        report = f"❌ Failed to locate unique feature folder.\n\n**Error:** {error_message}\n\nPlease check the input and try again."
+        
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({"role": "assistant", "content": report})
+        result = {"messages": msgs}
+        result
+    input:
+      - input_id
+      - search_base_path
+      - found_folders
+    output:
+      - messages
+    structured_output: true
+    transition: END
+  - id: UpdateFolderPath
+    type: code
+    code:
+      type: fixed
+      value: |-
+        # Extract the path from the single found folder
+        found_folders = alita_state.get('found_folders', [])
+        
+        if len(found_folders) == 1:
+            folder = found_folders[0]
+            folder_path = folder.get('Path', '')
+            result = {
+                'folder_path': folder_path
+            }
+        else:
+            # Should not reach here due to router validation, but defensive
+            result = {
+                'folder_path': ''
+            }
+        
+        result
+    input:
+      - found_folders
+    output:
+      - folder_path
+    structured_output: true
+    transition: LoadState
   - id: FormatError
     type: code
     code:
@@ -213,6 +524,7 @@ nodes:
         is_first_run = False
         last_retrieval_date = '1900-01-01T00:00:00'
         log_raw = store.get('retrieval_log.txt')
+        
         if log_raw and not any(err in str(log_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
             lines = str(log_raw).strip().split('\n')
             if lines:
@@ -923,12 +1235,25 @@ nodes:
         files_to_archive = alita_state.get('files_to_archive', [])
         idx_raw = alita_state.get('current_archive_index', 0)
         content = alita_state.get('downloaded_content', '')
+        bucket_name = alita_state.get('bucket_name')
+
+        # Debug info
+        debug_info_2 = {
+            'idx': idx_raw,
+            'files_to_archive_count': len(files_to_archive),
+            'bucket_name': bucket_name,
+            'create_attempted': False,
+            'create_success': False
+        }
 
         # Defensive: ensure idx is valid integer
         try:
             idx = int(idx_raw)
         except (ValueError, TypeError):
             idx = 0
+            debug_info_2['idx_conversion_failed'] = True
+
+        debug_info_2['idx_validated'] = idx
 
         # Defensive: validate index bounds
         if idx >= 0 and idx < len(files_to_archive):
@@ -942,19 +1267,59 @@ nodes:
             # Convert content to string and validate
             content_str = str(content) if content else ''
             
+            debug_info_2['filename'] = filename
+            debug_info_2['content_length'] = len(content_str)
+            debug_info_2['content_preview'] = content_str[:200] if content_str else 'EMPTY'
+            
             # Save file with error handling
-            bucket_name = alita_state.get('bucket_name')
+            debug_info_2['create_attempted'] = True
             try:
-                alita_client.artifact(bucket_name).create(filename, content_str)
+                store = alita_client.artifact(bucket_name)
+                result = store.create(filename, content_str)
+                
+                # Check if result contains an error (bucket doesn't exist)
+                if isinstance(result, dict) and 'error' in result:
+                    error_msg = result.get('error', '')
+                    debug_info_2['first_attempt_error'] = error_msg
+                    
+                    # If bucket doesn't exist, create it and retry
+                    if 'does not exist' in error_msg.lower():
+                        debug_info_2['bucket_creation_attempted'] = True
+                        # Create bucket by creating a placeholder file
+                        init_result = store.create('.bucket_init', f'Bucket initialized: {bucket_name}')
+                        debug_info_2['bucket_creation_result'] = str(init_result)[:200] if init_result else 'None'
+                        
+                        # Retry file creation
+                        result = store.create(filename, content_str)
+                        debug_info_2['retry_result'] = str(result)[:200] if result else 'None'
+                
+                # Final success check
+                if isinstance(result, dict) and 'error' in result:
+                    debug_info_2['create_success'] = False
+                    debug_info_2['final_error'] = result.get('error', '')
+                else:
+                    debug_info_2['create_success'] = True
+                    debug_info_2['create_result_type'] = type(result).__name__
+                    debug_info_2['create_result'] = str(result)[:200] if result else 'None'
             except Exception as e:
+                debug_info_2['create_success'] = False
+                debug_info_2['create_error'] = str(e)
+                debug_info_2['create_error_type'] = type(e).__name__
+                
                 # Create error marker file
                 error_msg = f"[ERROR SAVING FILE]\nFilename: {file_name}\nID: {file_id}\nType: {file_type}\nError: {str(e)}\nContent length: {len(content_str)}\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
                 try:
                     alita_client.artifact(bucket_name).create(f"error_download_{file_id}_{file_name}.txt", error_msg)
-                except:
-                    pass
+                    debug_info_2['error_marker_created'] = True
+                except Exception as e2:
+                    debug_info_2['error_marker_failed'] = str(e2)
+        else:
+            debug_info_2['index_out_of_bounds'] = True
 
-        {'current_archive_index': idx + 1}
+        {
+            'current_archive_index': idx + 1,
+            'debug_info_2': debug_info_2
+        }
     input:
       - bucket_name
       - files_to_archive
@@ -1268,7 +1633,7 @@ nodes:
                 report_lines.append("✅ **No changes detected** since last retrieval.")
 
         # Footer
-        bucket_name = alita_state.get('bucket_name', 'sp-log')
+        bucket_name = alita_state.get('bucket_name', '')
         report_lines.extend([
             "",
             "---",
