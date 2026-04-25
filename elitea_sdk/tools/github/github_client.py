@@ -2146,8 +2146,7 @@ class GitHubClient(BaseModel):
                 return f"API method '{method}' was called successfully, but 'raw_data' attribute is missing in the response."
 
         except Exception as e:
-            import traceback
-            return f"API call failed: {traceback.format_exc()}"
+            raise ToolException(str(e))
 
     def get_me(self) -> str:
         """
