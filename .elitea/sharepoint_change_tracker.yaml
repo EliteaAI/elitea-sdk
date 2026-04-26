@@ -76,12 +76,12 @@ state:
   input_id:
     type: str
     value: ''
-  search_base_path:
-    type: str
-    value: ''
   is_first_run:
     type: bool
     value: false
+  join:
+    type: bool
+    value: true
   last_retrieval_date:
     type: str
     value: ''
@@ -96,6 +96,9 @@ state:
   removed_files:
     type: list
     value: []
+  search_base_path:
+    type: str
+    value: ''
   unchanged_count:
     type: int
     value: 0
@@ -189,6 +192,7 @@ nodes:
                         # Get optional parameters with defaults
                         search_base = input_data.get('folder_path', 'Shared Documents/General')
                         bucket = input_data.get('bucket_name', f'feature-{feature_id}')
+                        join = input_data.get('join', True)  # Default true
                         result = {
                             "validation_passed": True,
                             "error_message": "",
@@ -197,6 +201,7 @@ nodes:
                             "input_id": feature_id,
                             "input_folder_path": search_base,
                             "search_base_path": search_base,
+                            "join": join,
                             "current_retrieval_date": datetime.now().isoformat()
                         }
 
@@ -208,6 +213,7 @@ nodes:
       - input_folder_path
       - search_base_path
       - folder_path
+      - join
     structured_output: true
     transition: ValidationRouter
   - id: ValidationRouter
@@ -232,12 +238,12 @@ nodes:
         # Prepare to search for folder containing the feature ID in its name
         input_id = alita_state.get('input_id', '').strip()
         search_base_path = alita_state.get('search_base_path', '').strip()
-        
+
         # Just pass through - actual search happens in SearchFolders toolkit node
         result = {
             "found_folders": []
         }
-        
+
         result
     input:
       - input_id
@@ -280,7 +286,7 @@ nodes:
         import re
         import json
         import ast
-        
+
         # ── Recover state if it arrived as a string (datetime serialization bug) ──
         state = alita_state
         if isinstance(state, str):
@@ -300,10 +306,10 @@ nodes:
                     state = json.loads(state)
                 except Exception:
                     state = {}
-        
+
         input_id = state.get('input_id', '').strip() if isinstance(state, dict) else ''
         all_files_raw = state.get('all_files', []) if isinstance(state, dict) else []
-        
+
         # Capture debug info about what we received
         debug_info_1 = {
             'state_type': type(alita_state).__name__,
@@ -313,9 +319,9 @@ nodes:
             'raw_is_list': isinstance(all_files_raw, list),
             'raw_preview': str(all_files_raw)[:500] if all_files_raw else 'None/Empty'
         }
-        
+
         all_files = all_files_raw
-        
+
         # Parse all_files if it's a JSON string
         if isinstance(all_files, str):
             debug_info_1['parse_attempted'] = True
@@ -329,7 +335,7 @@ nodes:
                 all_files = []
         else:
             debug_info_1['parse_attempted'] = False
-        
+
         # Ensure all_files is a list
         if not isinstance(all_files, list):
             debug_info_1['converted_to_list'] = True
@@ -340,19 +346,19 @@ nodes:
             if all_files:
                 debug_info_1['first_item_type'] = type(all_files[0]).__name__
                 debug_info_1['first_item_preview'] = str(all_files[0])[:200]
-        
+
         # Extract first-level subfolders that contain the ID
         # Only look at direct children of search_base_path, not nested subfolders
         search_base_path = state.get('search_base_path', '').strip() if isinstance(state, dict) else ''
         base_depth = len([p for p in search_base_path.split('/') if p])  # Count path segments
-        
+
         found_folders = []
         found_folder_paths = set()  # Track unique folders
         item_types_seen = []
-        
+
         debug_info_1['search_base_path'] = search_base_path
         debug_info_1['base_depth'] = base_depth
-        
+
         for idx, item in enumerate(all_files):
             item_type = type(item).__name__
             if idx < 3:  # Track first 3 item types
@@ -395,10 +401,10 @@ nodes:
                 
             except Exception as e:
                 debug_info_1['item_error'] = {'index': idx, 'error': str(e), 'item_type': item_type}
-        
+
         debug_info_1['found_folders_count'] = len(found_folders)
         debug_info_1['item_types_seen'] = item_types_seen
-        
+
         result = {
             'found_folders': found_folders,
             'debug_info_1': debug_info_1
@@ -437,7 +443,7 @@ nodes:
         input_id = alita_state.get('input_id', '')
         search_base_path = alita_state.get('search_base_path', '')
         found_folders = alita_state.get('found_folders', [])
-        
+
         if len(found_folders) == 0:
             error_message = f"No folder found containing ID '{input_id}' in base path '{search_base_path}'."
         elif len(found_folders) > 1:
@@ -445,9 +451,9 @@ nodes:
             error_message = f"Multiple folders found containing ID '{input_id}' in base path '{search_base_path}':\n" + "\n".join([f"  - {name}" for name in folder_names]) + "\n\nPlease provide a more specific ID or use direct folder_path."
         else:
             error_message = f"Internal error in folder search validation."
-        
+
         report = f"❌ Failed to locate unique feature folder.\n\n**Error:** {error_message}\n\nPlease check the input and try again."
-        
+
         msgs = list(alita_state.get('messages', []))
         msgs.append({"role": "assistant", "content": report})
         result = {"messages": msgs}
@@ -467,7 +473,7 @@ nodes:
       value: |-
         # Extract the path from the single found folder
         found_folders = alita_state.get('found_folders', [])
-        
+
         if len(found_folders) == 1:
             folder = found_folders[0]
             folder_path = folder.get('Path', '')
@@ -479,7 +485,7 @@ nodes:
             result = {
                 'folder_path': ''
             }
-        
+
         result
     input:
       - found_folders
@@ -524,7 +530,7 @@ nodes:
         is_first_run = False
         last_retrieval_date = '1900-01-01T00:00:00'
         log_raw = store.get('retrieval_log.txt')
-        
+
         if log_raw and not any(err in str(log_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
             lines = str(log_raw).strip().split('\n')
             if lines:
@@ -853,6 +859,7 @@ nodes:
                 if file_id and file_name:
                     # Sanitize: spaces to hyphens, special chars to underscores
                     safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                    safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                     enhanced_file['artifact_storage'] = {
                         'current': f"file_{file_id}_{safe_name}.txt"
                     }
@@ -921,6 +928,7 @@ nodes:
             if file_id and file_name:
                 # Sanitize: spaces to hyphens, special chars to underscores
                 safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                 files_to_version.append({
                     'id': file_id,
                     'name': safe_name,
@@ -937,6 +945,7 @@ nodes:
             if file_id and file_name:
                 # Sanitize: spaces to hyphens, special chars to underscores
                 safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                 files_to_delete.append({
                     'id': file_id,
                     'name': safe_name,
@@ -956,6 +965,7 @@ nodes:
             
             # Sanitize: spaces to hyphens, special chars to underscores
             safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+            safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
             files_to_download.append({
                 'id': file_id,
                 'name': safe_name,
@@ -1345,6 +1355,7 @@ nodes:
                 import re
                 # Sanitize: spaces to hyphens, special chars to underscores
                 safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                 files_to_diff.append({
                     'id': file_id,
                     'name': safe_name,
@@ -1565,6 +1576,7 @@ nodes:
                 
                 # Sanitize: spaces to hyphens, special chars to underscores
                 safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                 
                 report_lines.append(f"### {idx}. {name}")
                 report_lines.append(f"- **Path:** `{path}`")
@@ -1589,6 +1601,7 @@ nodes:
                 modified = file.get('Modified', '')
                 
                 safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                 
                 report_lines.append(f"### {idx}. {name}")
                 report_lines.append(f"- **Path:** `{path}`")
@@ -1612,6 +1625,7 @@ nodes:
                 link = file.get('Link', '')
                 
                 safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                 
                 report_lines.append(f"### {idx}. {name}")
                 report_lines.append(f"- **Path:** `{path}`")
@@ -1678,6 +1692,166 @@ nodes:
       - files_to_delete
       - files_to_archive
       - files_to_diff
+    output:
+      - messages
+    structured_output: true
+    transition: CheckJoinNeeded
+  - id: CheckJoinNeeded
+    type: router
+    condition: |
+      {% if join %}
+        CreateJoinedFile
+      {% else %}
+        END
+      {% endif %}
+    default_output: END
+    input:
+      - join
+      - messages
+    output:
+      - messages
+    routes:
+      - CreateJoinedFile
+  - id: CreateJoinedFile
+    type: code
+    code:
+      type: fixed
+      value: |-
+        import json
+        import re
+        from datetime import datetime
+
+        bucket_name = alita_state.get('bucket_name')
+        store = alita_client.artifact(bucket_name)
+
+        new_files = alita_state.get('new_files', [])
+        changed_files = alita_state.get('changed_files', [])
+        current_retrieval_date = alita_state.get('current_retrieval_date', '')
+
+        # Parse retrieval date for filename
+        dt = datetime.fromisoformat(current_retrieval_date.replace('Z', ''))
+        timestamp = dt.strftime('%Y%m%d_%H%M%S')
+
+        joined_filename = f"joined_files_{timestamp}.txt"
+
+        # Build joined content
+        sections = []
+        sections.append("=" * 80)
+        sections.append(f"SharePoint Combined Files Report")
+        sections.append(f"Generated: {current_retrieval_date}")
+        sections.append("=" * 80)
+        sections.append("")
+
+        # Add new files (full content)
+        if new_files:
+            sections.append("\n" + "=" * 80)
+            sections.append(f"NEW FILES ({len(new_files)} files)")
+            sections.append("=" * 80 + "\n")
+            
+            for file in new_files:
+                name = file.get('Name', 'Unknown')
+                file_id = file.get('id', 'unknown')
+                path = file.get('Path', '')
+                modified = file.get('Modified', '')
+                
+                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
+                artifact_filename = f"file_{file_id}_{safe_name}.txt"
+                
+                sections.append("\n" + "-" * 80)
+                sections.append(f"File: {name}")
+                sections.append(f"Path: {path}")
+                sections.append(f"Modified: {modified}")
+                sections.append(f"Artifact: {artifact_filename}")
+                sections.append("-" * 80)
+                
+                # Fetch file content from artifact storage
+                try:
+                    content = store.get(artifact_filename)
+                    if content and not any(err in str(content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+                        sections.append(str(content))
+                    else:
+                        sections.append(f"[Content not available: {content}]")
+                except Exception as e:
+                    sections.append(f"[Error reading content: {e}]")
+                
+                sections.append("")
+
+        # Add changed files (diff only)
+        if changed_files:
+            sections.append("\n" + "=" * 80)
+            sections.append(f"CHANGED FILES ({len(changed_files)} files) - DIFFS ONLY")
+            sections.append("=" * 80 + "\n")
+            
+            for file in changed_files:
+                name = file.get('Name', 'Unknown')
+                file_id = file.get('id', 'unknown')
+                path = file.get('Path', '')
+                prev_modified = file.get('PreviousModified', '')
+                curr_modified = file.get('CurrentModified', '')
+                
+                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
+                diff_filename = f"file_diff_{file_id}_{safe_name}.txt"
+                
+                sections.append("\n" + "-" * 80)
+                sections.append(f"File: {name}")
+                sections.append(f"Path: {path}")
+                sections.append(f"Previous Modified: {prev_modified}")
+                sections.append(f"Current Modified: {curr_modified}")
+                sections.append(f"Diff Artifact: {diff_filename}")
+                sections.append("-" * 80)
+                
+                # Fetch diff content from artifact storage
+                try:
+                    diff_content = store.get(diff_filename)
+                    if diff_content and not any(err in str(diff_content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+                        sections.append(str(diff_content))
+                    else:
+                        sections.append(f"[Diff not available: {diff_content}]")
+                except Exception as e:
+                    sections.append(f"[Error reading diff: {e}]")
+                
+                sections.append("")
+
+        # Add footer
+        sections.append("\n" + "=" * 80)
+        sections.append("END OF REPORT")
+        sections.append("=" * 80)
+
+        # Join all sections
+        joined_content = "\n".join(sections)
+
+        # Save to artifact storage
+        try:
+            store.create(joined_filename, joined_content)
+            result_msg = f"\n\n📄 **Joined file created:** `{joined_filename}` ({len(joined_content)} bytes)"
+            success = True
+        except Exception as e:
+            result_msg = f"\n\n❌ **Error creating joined file:** {e}"
+            success = False
+
+        # Append to messages
+        msgs = list(alita_state.get('messages', []))
+        if msgs and len(msgs) > 0:
+            # Append to last message
+            last_msg = msgs[-1]
+            if isinstance(last_msg, dict) and 'content' in last_msg:
+                last_msg['content'] += result_msg
+            else:
+                # Last message isn't properly formatted, add new one
+                msgs.append({"role": "assistant", "content": result_msg})
+        else:
+            # No messages exist, create one
+            msgs = [{"role": "assistant", "content": f"Joined file generation: {result_msg}"}]
+
+        {'messages': msgs}
+    input:
+      - bucket_name
+      - new_files
+      - changed_files
+      - current_retrieval_date
+      - messages
     output:
       - messages
     structured_output: true
