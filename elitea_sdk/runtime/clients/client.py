@@ -793,7 +793,7 @@ class EliteAClient:
                 strategies=[
                     TransformErrorStrategy(
                         llm=self.get_low_tier_llm() or llm,
-                        return_detailed_errors=True
+                        return_detailed_errors=False
                     ),
                     LoggingStrategy(callbacks=[])
                 ],
@@ -1292,7 +1292,7 @@ class EliteAClient:
                 strategies=[
                     TransformErrorStrategy(
                         llm=self.get_low_tier_llm() or llm,
-                        return_detailed_errors=True
+                        return_detailed_errors=False
                     ),
                     LoggingStrategy(callbacks=[])
                 ],
