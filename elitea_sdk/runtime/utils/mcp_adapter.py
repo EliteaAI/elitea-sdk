@@ -100,6 +100,27 @@ class UnifiedMcpClient:
                 "Install with: pip install langchain-mcp-adapters"
             )
 
+        # Validate URL scheme before attempting any connection.
+        # aiohttp raises InvalidURL(url) with just the URL string as the message,
+        # which would surface as a cryptic error like "ttttt" instead of a helpful message.
+        # Use urlparse so we can distinguish "no scheme" from "unsupported scheme" and
+        # handle case-insensitive schemes (HTTP:// is valid per RFC 3986).
+        from urllib.parse import urlparse as _urlparse
+        _supported_schemes = {'http', 'https'}
+        _parsed = _urlparse(self.url)
+        if not _parsed.scheme:
+            raise ValueError(
+                f"Invalid MCP server URL '{self.url}': URL must include a scheme "
+                f"(e.g., 'https://{self.url}'). "
+                "Please check the URL in your toolkit settings."
+            )
+        if _parsed.scheme.lower() not in _supported_schemes:
+            raise ValueError(
+                f"Unsupported URL scheme '{_parsed.scheme}://' in MCP server URL '{self.url}'. "
+                f"Supported schemes: {', '.join(sorted(_supported_schemes))}. "
+                "Please check the URL in your toolkit settings."
+            )
+
         # Detect transport if auto
         detected_transport = self._detect_transport()
 
@@ -163,11 +184,13 @@ class UnifiedMcpClient:
             logger.debug("[Unified MCP] URL ends with /sse, using SSE transport")
             return "sse"
 
-        # Default to streamable_http for HTTP URLs
+        # Default to streamable_http for HTTP URLs.
+        # URL scheme is already validated in _connect(), so the fallback below is unreachable
+        # for auto-detected transport — kept for defensive completeness only.
         if self.url.startswith('http://') or self.url.startswith('https://'):
             return "streamable_http"
 
-        # Fallback to streamable_http
+        # Fallback (unreachable when called from _connect() — scheme validated upstream)
         return "streamable_http"
 
     def _build_server_config(self, transport: str) -> Dict[str, Any]:
