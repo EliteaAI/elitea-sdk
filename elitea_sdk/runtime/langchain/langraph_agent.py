@@ -1716,6 +1716,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         result = super().invoke(None, config=config, *args, **kwargs)
                     else:
                         result = super().invoke(input, config=config, *args, **kwargs)
+
+                    # Clearing it ensures get_state (called below) reads the LATEST checkpoint
+                    # (created by the continuation run), not the stale pre-continuation state.
+                    # Without this, result_with_state['messages'] would contain old messages,
+                    # causing extract_response_content to return the previous response content.
+                    config.get('configurable', {}).pop('checkpoint_id', None)
                 elif is_at_end:
                     # Previous run completed - start fresh run with new input
                     logger.info(
