@@ -1672,6 +1672,29 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     len(trimmed),
                                 )
 
+                            # ── Preserve original AIMessage shape across resume ──
+                            # Anthropic tool-calling turns can carry provider-
+                            # specific content blocks such as thinking or later
+                            # text blocks before tool_use. The synthetic
+                            # AIMessage built by LLMNode (content='', tool_calls=…)
+                            # strips that original assistant message shape and
+                            # can make resumed runs lose continuity.
+                            # Capture the original AIMessage that triggered the
+                            # sensitive tool so the LLM node can reuse it as the
+                            # completion when its tool_call matches the resume.
+                            original_ai_dict = self._extract_original_ai_message(
+                                pending_msgs_dicts,
+                                tool_name=hitl_interrupt.get('tool_name', ''),
+                                tool_args=tool_args if isinstance(tool_args, dict) else {},
+                            )
+                            if original_ai_dict is not None:
+                                resume_ctx['original_ai_message'] = original_ai_dict
+                                logger.info(
+                                    "[HITL] Captured original AIMessage for resume "
+                                    "preservation (tool=%s)",
+                                    hitl_interrupt.get('tool_name', ''),
+                                )
+
                     result = super().invoke(
                         Command(resume=hitl_resume_value),
                         config=config,
@@ -1971,6 +1994,56 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             result.extend(sibling_tool_msgs)
 
         return result
+
+    @staticmethod
+    def _extract_original_ai_message(
+        pending_msgs_dicts: list[dict],
+        tool_name: str,
+        tool_args: dict,
+    ) -> dict | None:
+        """Find the AIMessage dict that triggered the sensitive tool.
+
+        Anthropic Extended Thinking responses carry signed ``thinking`` blocks
+        in the AIMessage ``content``. The trim/synthesize path drops these
+        blocks, breaking Anthropic's stateless reasoning continuity contract
+        on resume. Return the matching AIMessage dict so the LLM node can
+        reuse it as the completion (preserving thinking blocks) instead of
+        constructing an empty synthetic AIMessage.
+
+        Returns None when no AIMessage with a matching tool_call is found.
+        """
+        if not pending_msgs_dicts or not tool_name:
+            return None
+
+        target_args = tool_args if isinstance(tool_args, dict) else {}
+
+        def _msg_type(d: dict) -> str:
+            if not isinstance(d, dict):
+                return ''
+            return d.get('type', '')
+
+        def _msg_data(d: dict) -> dict:
+            data = d.get('data') if isinstance(d, dict) else None
+            return data if isinstance(data, dict) else (d if isinstance(d, dict) else {})
+
+        for i in range(len(pending_msgs_dicts) - 1, -1, -1):
+            msg_dict = pending_msgs_dicts[i]
+            if _msg_type(msg_dict) != 'ai':
+                continue
+            data = _msg_data(msg_dict)
+            tool_calls = data.get('tool_calls') or []
+            if not isinstance(tool_calls, list):
+                continue
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_name = tc.get('name', '')
+                tc_args = tc.get('args', {}) if isinstance(tc.get('args'), dict) else {}
+                if tc_name == tool_name and tc_args == target_args:
+                    return msg_dict
+            # Stop walking past the last AIMessage; earlier AIs are not relevant.
+            return None
+        return None
 
     @staticmethod
     def _is_hitl_resume(input_data: dict) -> bool:
