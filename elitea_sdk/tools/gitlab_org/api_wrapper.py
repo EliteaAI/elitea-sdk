@@ -204,6 +204,14 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
                     return list(self.repo_instances.items())[0][1]
             # Defined repo flow
             if repository_name not in self.repo_instances:
+                # If repositories were configured, only allow access to those repositories
+                if len(self.repo_instances) > 0:
+                    configured_repos = list(self.repo_instances.keys())
+                    raise ToolException(
+                        f"Repository '{repository_name}' is not in the configured repositories list. "
+                        f"Allowed repositories: {configured_repos}"
+                    )
+                # No repositories configured - allow fetching any repository
                 self.repo_instances[repository_name] = self._get_repo_instance(repository_name)
             return self.repo_instances.get(repository_name)
         except Exception as e:
