@@ -1349,20 +1349,20 @@ class LLMNode(BaseTool):
     def _build_resume_completion(hitl_ctx: dict, messages: list) -> Optional[AIMessage]:
         """Reuse the original tool-calling AIMessage as the resume completion.
 
-                Anthropic tool-calling turns can carry list-shaped ``content`` with
-                provider-specific blocks such as ``thinking``, ``redacted_thinking``,
-                and plain ``text`` immediately before ``tool_use``. Replacing that
-                original AIMessage with a synthetic ``AIMessage(content='',
-                tool_calls=[...])`` strips the original assistant message shape and can
-                make resumed runs lose continuity.
+        Anthropic tool-calling turns can carry list-shaped ``content`` with
+        provider-specific blocks such as ``thinking``, ``redacted_thinking``,
+        and plain ``text`` immediately before ``tool_use``. Replacing that
+        original AIMessage with a synthetic ``AIMessage(content='',
+        tool_calls=[...])`` strips the original assistant message shape and can
+        make resumed runs lose continuity.
 
-                This helper deserializes ``hitl_ctx['original_ai_message']`` (captured at
-                interrupt time by the graph-level resume handler) and returns it when:
-          * a tool_call on the message matches the approved tool name + args, AND
-                    * the original AIMessage carries meaningful assistant content that
-                        would otherwise be lost (structured list content, or a non-empty
-                        string), AND
-          * the same message is not already present in ``messages`` (which would
+        This helper deserializes ``hitl_ctx['original_ai_message']`` (captured at
+        interrupt time by the graph-level resume handler) and returns it when:
+            * a tool_call on the message matches the approved tool name + args, AND
+            * the original AIMessage carries meaningful assistant content that
+            would otherwise be lost (structured list content, or a non-empty
+            string), AND
+            * the same message is not already present in ``messages`` (which would
             duplicate it for the multi-tool sibling case where ``_trim`` keeps
             the AI in the restored history).
 
