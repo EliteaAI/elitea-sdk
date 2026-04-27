@@ -47,6 +47,9 @@ state:
   error_message:
     type: str
     value: ''
+  file_prefix:
+    type: str
+    value: ''
   files_to_archive:
     type: list
     value: []
@@ -197,7 +200,7 @@ nodes:
                     else:
                         # Get optional parameters with defaults
                         search_base = input_data.get('folder_path', 'Shared Documents/General')
-                        bucket = input_data.get('bucket_name', f'feature-{feature_id}')
+                        bucket = input_data.get('bucket_name', 'sp-repo')
                         
                         # Get username from alita_client or input
                         username = input_data.get('username', '')
@@ -543,11 +546,15 @@ nodes:
         bucket_name = input_bucket_name if input_bucket_name else default_bucket_name
 
         store = alita_client.artifact(bucket_name)
+        
+        # Get input_id for file prefixing
+        input_id = alita_state.get('input_id', '')
+        file_prefix = f"{input_id}/" if input_id else ''
 
         # Load retrieval log
         is_first_run = False
         last_retrieval_date = '1900-01-01T00:00:00'
-        log_raw = store.get('retrieval_log.txt')
+        log_raw = store.get(f'{file_prefix}retrieval_log.txt')
 
         if log_raw and not any(err in str(log_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
             lines = str(log_raw).strip().split('\n')
@@ -561,7 +568,7 @@ nodes:
 
         # Load snapshot
         previous_snapshot = {}
-        snap_raw = store.get('snapshot.json')
+        snap_raw = store.get(f'{file_prefix}snapshot.json')
         if snap_raw and not any(err in str(snap_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
             try:
                 previous_snapshot = json.loads(str(snap_raw))
@@ -572,15 +579,18 @@ nodes:
             'bucket_name': bucket_name,
             'last_retrieval_date': last_retrieval_date,
             'is_first_run': is_first_run,
-            'previous_snapshot': previous_snapshot
+            'previous_snapshot': previous_snapshot,
+            'file_prefix': file_prefix
         }
     input:
       - input_bucket_name
+      - input_id
     output:
       - bucket_name
       - last_retrieval_date
       - is_first_run
       - previous_snapshot
+      - file_prefix
     structured_output: true
     transition: GetFilesFromSharepoint
   - id: GetFilesFromSharepoint
@@ -814,6 +824,7 @@ nodes:
 
         bucket_name = alita_state.get('bucket_name')
         store = alita_client.artifact(bucket_name)
+        file_prefix = alita_state.get('file_prefix', '')
 
         current_retrieval_date_raw = alita_state.get('current_retrieval_date', '')
         last_retrieval_date = alita_state.get('last_retrieval_date', '')
@@ -822,6 +833,7 @@ nodes:
         removed_files = alita_state.get('removed_files', [])
         changed_files = alita_state.get('changed_files', [])
         username = alita_state.get('username', 'unknown')
+        input_id = alita_state.get('input_id', '')
 
         # Truncate microseconds from current_retrieval_date for consistency
         # This ensures retrieval_log timestamps match changes_*.json filenames
@@ -830,7 +842,7 @@ nodes:
 
         # 1. Load existing retrieval log to track removals
         old_log_lines = []
-        log_raw = store.get('retrieval_log.txt')
+        log_raw = store.get(f'{file_prefix}retrieval_log.txt')
         if log_raw and not any(err in str(log_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
             old_log_lines = [line.strip() for line in str(log_raw).strip().split('\n') if line.strip()]
 
@@ -859,9 +871,9 @@ nodes:
             
             # Delete changes file
             if removed_user:
-                changes_filename_to_delete = f"changes_{timestamp_str}_{removed_user}.json"
+                changes_filename_to_delete = f"{file_prefix}changes_{timestamp_str}_{removed_user}.json"
             else:
-                changes_filename_to_delete = f"changes_{timestamp_str}.json"
+                changes_filename_to_delete = f"{file_prefix}changes_{timestamp_str}.json"
             
             try:
                 store.delete(changes_filename_to_delete, check_exists=False)
@@ -869,21 +881,20 @@ nodes:
                 if 'getReader' not in str(e):
                     error_log = f"[DELETION FAILED]\nTarget: {changes_filename_to_delete}\nLog Entry: {removed_entry}\nError: {str(e)}\nCurrent time: {current_retrieval_date}"
                     try:
-                        store.create(f"error_deletion_{timestamp_str}_{removed_user if removed_user else 'unknown'}.txt", error_log)
+                        store.create(f"{file_prefix}error_deletion_{timestamp_str}_{removed_user if removed_user else 'unknown'}.txt", error_log)
                     except:
                         pass
             
             # Joined file cleanup removed - file is overwritten each run (not timestamp-based)
 
         # 5. Save updated retrieval log
-        r = store.create('retrieval_log.txt', '\n'.join(log_lines))
+        r = store.create(f'{file_prefix}retrieval_log.txt', '\n'.join(log_lines))
 
         # 6. Save snapshot to main bucket
         snapshot_json = json.dumps(current_snapshot, indent=2, ensure_ascii=False)
-        r = store.create('snapshot.json', snapshot_json)
+        r = store.create(f'{file_prefix}snapshot.json', snapshot_json)
         
         # Also save snapshot as baseline to ba-user-stories bucket
-        input_id = alita_state.get('input_id', '')
         baseline_filename = f"{input_id}_sp_baseline__{username}.json" if username else f"{input_id}_sp_baseline.json"
         try:
             ba_store = alita_client.artifact('ba-user-stories')
@@ -904,14 +915,14 @@ nodes:
                     safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
                     safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
                     enhanced_file['artifact_storage'] = {
-                        'current': f"file_{file_id}_{safe_name}.txt"
+                        'current': f"{file_prefix}file_{file_id}_{safe_name}.txt"
                     }
                     
                     if file_type == 'changed':
-                        enhanced_file['artifact_storage']['previous'] = f"file_prev_{file_id}_{safe_name}.txt"
-                        enhanced_file['artifact_storage']['diff'] = f"file_diff_{file_id}_{safe_name}.txt"
+                        enhanced_file['artifact_storage']['previous'] = f"{file_prefix}file_prev_{file_id}_{safe_name}.txt"
+                        enhanced_file['artifact_storage']['diff'] = f"{file_prefix}file_diff_{file_id}_{safe_name}.txt"
                     elif file_type == 'removed':
-                        enhanced_file['artifact_storage']['deleted'] = f"file_del_{file_id}_{safe_name}.txt"
+                        enhanced_file['artifact_storage']['deleted'] = f"{file_prefix}file_del_{file_id}_{safe_name}.txt"
                 
                 enhanced_files.append(enhanced_file)
             return enhanced_files
@@ -924,7 +935,7 @@ nodes:
         # Use truncated timestamp (already parsed from current_retrieval_date) to match retrieval_log
         # Include username in filename: changes_YYYYMMDD_HHMMSS_username.json
         timestamp = dt.strftime('%Y%m%d_%H%M%S')
-        changes_filename = f"changes_{timestamp}_{username}.json"
+        changes_filename = f"{file_prefix}changes_{timestamp}_{username}.json"
         changes_data = {
             'retrieval_date': current_retrieval_date,
             'username': username,
@@ -949,6 +960,7 @@ nodes:
       - removed_files
       - changed_files
       - username
+      - file_prefix
       - input_id
     output:
       - changes_filename
@@ -1078,9 +1090,10 @@ nodes:
             file_type = f.get('type', 'unknown')
 
             bucket_name = alita_state.get('bucket_name')
+            file_prefix = alita_state.get('file_prefix', '')
             store = alita_client.artifact(bucket_name)
-            src = f"file_{file_id}_{file_name}.txt"
-            dst = f"file_prev_{file_id}_{file_name}.txt"
+            src = f"{file_prefix}file_{file_id}_{file_name}.txt"
+            dst = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
 
             # Try to get existing file content
             content = store.get(src)
@@ -1107,7 +1120,7 @@ nodes:
                     # Log error but continue - create marker file
                     error_msg = f"[ERROR CREATING PREVIOUS VERSION]\nSource: {src}\nError: {str(e)}\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
                     try:
-                        store.create(f"error_prev_{file_id}_{file_name}.txt", error_msg)
+                        store.create(f"{file_prefix}error_prev_{file_id}_{file_name}.txt", error_msg)
                     except:
                         pass
             else:
@@ -1124,6 +1137,7 @@ nodes:
       - bucket_name
       - files_to_version
       - current_version_index
+      - file_prefix
     output:
       - current_version_index
     structured_output: true
@@ -1164,6 +1178,7 @@ nodes:
             file_name = f.get('name', 'unknown')
 
             bucket_name = alita_state.get('bucket_name')
+            file_prefix = alita_state.get('file_prefix', '')
             store = alita_client.artifact(bucket_name)
             
             # More specific error detection
@@ -1180,8 +1195,8 @@ nodes:
                 return False
             
             # 1. Rename file_* to file_del_* (preserve last known state)
-            src = f"file_{file_id}_{file_name}.txt"
-            dst = f"file_del_{file_id}_{file_name}.txt"
+            src = f"{file_prefix}file_{file_id}_{file_name}.txt"
+            dst = f"{file_prefix}file_del_{file_id}_{file_name}.txt"
             content = store.get(src)
             if not is_error_response(content):
                 # Create the archived version
@@ -1193,14 +1208,14 @@ nodes:
                     pass  # Ignore JsNull errors - deletion likely succeeded
             
             # 2. Delete file_prev_* (no longer needed)
-            prev_file = f"file_prev_{file_id}_{file_name}.txt"
+            prev_file = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
             try:
                 store.delete(prev_file, check_exists=False)
             except:
                 pass  # Ignore if doesn't exist or JsNull errors
             
             # 3. Delete file_diff_* (no longer needed)
-            diff_file = f"file_diff_{file_id}_{file_name}.txt"
+            diff_file = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
             try:
                 store.delete(diff_file, check_exists=False)
             except:
@@ -1211,6 +1226,7 @@ nodes:
       - bucket_name
       - files_to_delete
       - current_deletion_index
+      - file_prefix
     output:
       - current_deletion_index
     structured_output: true
@@ -1318,8 +1334,9 @@ nodes:
             file_id = current_file.get('id', 'unknown')
             file_name = current_file.get('name', 'unknown')
             file_type = current_file.get('type', 'unknown')
+            file_prefix = alita_state.get('file_prefix', '')
             
-            filename = f"file_{file_id}_{file_name}.txt"
+            filename = f"{file_prefix}file_{file_id}_{file_name}.txt"
             
             # Convert content to string and validate
             content_str = str(content) if content else ''
@@ -1366,7 +1383,7 @@ nodes:
                 # Create error marker file
                 error_msg = f"[ERROR SAVING FILE]\nFilename: {file_name}\nID: {file_id}\nType: {file_type}\nError: {str(e)}\nContent length: {len(content_str)}\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
                 try:
-                    alita_client.artifact(bucket_name).create(f"error_download_{file_id}_{file_name}.txt", error_msg)
+                    alita_client.artifact(bucket_name).create(f"{file_prefix}error_download_{file_id}_{file_name}.txt", error_msg)
                     debug_info_2['error_marker_created'] = True
                 except Exception as e2:
                     debug_info_2['error_marker_failed'] = str(e2)
@@ -1382,6 +1399,7 @@ nodes:
       - files_to_archive
       - current_archive_index
       - downloaded_content
+      - file_prefix
     output:
       - current_archive_index
     structured_output: true
@@ -1461,11 +1479,12 @@ nodes:
             original_name = current_file.get('original_name', '')
             
             bucket_name = alita_state.get('bucket_name')
+            file_prefix = alita_state.get('file_prefix', '')
             store = alita_client.artifact(bucket_name)
             
             # Read current and previous versions
-            current_file_path = f"file_{file_id}_{file_name}.txt"
-            previous_file_path = f"file_prev_{file_id}_{file_name}.txt"
+            current_file_path = f"{file_prefix}file_{file_id}_{file_name}.txt"
+            previous_file_path = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
             
             current_content = store.get(current_file_path)
             previous_content = store.get(previous_file_path)
@@ -1525,14 +1544,14 @@ nodes:
                 )
                 
                 # Save diff
-                diff_file_path = f"file_diff_{file_id}_{file_name}.txt"
+                diff_file_path = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
                 try:
                     store.create(diff_file_path, diff_header)
                 except Exception as e:
                     # Create error marker
                     error_msg = f"[ERROR CREATING DIFF]\nFile: {original_name}\nError: {str(e)}\nTimestamp: {timestamp}"
                     try:
-                        store.create(f"error_diff_{file_id}_{file_name}.txt", error_msg)
+                        store.create(f"{file_prefix}error_diff_{file_id}_{file_name}.txt", error_msg)
                     except:
                         pass
             else:
@@ -1547,7 +1566,7 @@ nodes:
                     placeholder += "No previous version available (newly tracked file)."
                 placeholder += f"\nTimestamp: {timestamp}"
                 
-                diff_file_path = f"file_diff_{file_id}_{file_name}.txt"
+                diff_file_path = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
                 try:
                     store.create(diff_file_path, placeholder)
                 except:
@@ -1558,6 +1577,7 @@ nodes:
       - bucket_name
       - files_to_diff
       - current_diff_index
+      - file_prefix
     output:
       - current_diff_index
     structured_output: true
@@ -1749,6 +1769,7 @@ nodes:
       - last_retrieval_date
       - changes_filename
       - username
+      - input_id
       - new_files
       - removed_files
       - changed_files
@@ -1775,6 +1796,7 @@ nodes:
 
         bucket_name = alita_state.get('bucket_name')
         store = alita_client.artifact(bucket_name)
+        file_prefix = alita_state.get('file_prefix', '')
 
         new_files = alita_state.get('new_files', [])
         changed_files = alita_state.get('changed_files', [])
@@ -1807,7 +1829,7 @@ nodes:
                 
                 safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
                 safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                artifact_filename = f"file_{file_id}_{safe_name}.txt"
+                artifact_filename = f"{file_prefix}file_{file_id}_{safe_name}.txt"
                 
                 sections.append("\n" + "-" * 80)
                 sections.append(f"File: {name}")
@@ -1843,7 +1865,7 @@ nodes:
                 
                 safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
                 safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                diff_filename = f"file_diff_{file_id}_{safe_name}.txt"
+                diff_filename = f"{file_prefix}file_diff_{file_id}_{safe_name}.txt"
                 
                 sections.append("\n" + "-" * 80)
                 sections.append(f"File: {name}")
@@ -1873,21 +1895,22 @@ nodes:
         # Join all sections
         joined_content = "\n".join(sections)
 
-        # Save to main bucket artifact storage
+        # Save to main bucket artifact storage with prefix (subfolder structure)
         joined_status = ''
         try:
-            store.create(joined_filename, joined_content)
-            joined_status = f"✅ Created `{joined_filename}` ({len(joined_content)} bytes)"
+            sp_repo_filename = f"{file_prefix}{joined_filename}"
+            store.create(sp_repo_filename, joined_content)
+            joined_status = f"✅ Created `{sp_repo_filename}` in sp-repo ({len(joined_content)} bytes)"
             
-            # Also save to ba-user-stories bucket
+            # Also save to ba-user-stories bucket (no prefix, root level)
             ba_store = alita_client.artifact('ba-user-stories')
             ba_store.create(joined_filename, joined_content)
-            joined_status += f" + saved to ba-user-stories"
+            joined_status += f" + `{joined_filename}` in ba-user-stories"
         except Exception as e:
             joined_status = f"❌ Error: {str(e)}"
             joined_filename = f"error_{joined_filename}"
 
-        {'joined_filename': joined_filename, 'joined_status': joined_status}
+        {'joined_filename': sp_repo_filename if 'sp_repo_filename' in locals() else joined_filename, 'joined_status': joined_status}
     input:
       - bucket_name
       - new_files
@@ -1895,6 +1918,7 @@ nodes:
       - current_retrieval_date
       - username
       - input_id
+      - file_prefix
     output:
       - joined_filename
       - joined_status
