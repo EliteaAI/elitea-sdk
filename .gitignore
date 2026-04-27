@@ -179,7 +179,8 @@ node_modules/
 .elitea/plans/*
 .elitea/**/.env.*
 .elitea/**/test_results
-elitea_sdk/docs/
+elitea_sdk/docs/*
+!elitea_sdk/docs/prompts/
 .playwright-mcp
 .claude
 .octo
