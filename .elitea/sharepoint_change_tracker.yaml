@@ -79,9 +79,12 @@ state:
   is_first_run:
     type: bool
     value: false
-  join:
-    type: bool
-    value: true
+  joined_filename:
+    type: str
+    value: ''
+  joined_status:
+    type: str
+    value: ''
   last_retrieval_date:
     type: str
     value: ''
@@ -195,7 +198,6 @@ nodes:
                         # Get optional parameters with defaults
                         search_base = input_data.get('folder_path', 'Shared Documents/General')
                         bucket = input_data.get('bucket_name', f'feature-{feature_id}')
-                        join = input_data.get('join', True)  # Default true
                         
                         # Get username from alita_client or input
                         username = input_data.get('username', '')
@@ -218,7 +220,6 @@ nodes:
                             "input_id": feature_id,
                             "input_folder_path": search_base,
                             "search_base_path": search_base,
-                            "join": join,
                             "current_retrieval_date": datetime.now().isoformat()
                         }
 
@@ -230,7 +231,6 @@ nodes:
       - input_folder_path
       - search_base_path
       - folder_path
-      - join
       - username
     structured_output: true
     transition: ValidationRouter
@@ -846,43 +846,50 @@ nodes:
         # 4. Identify dates being removed (dates in old_log but not in new log)
         dates_to_remove = set(old_log_lines) - set(log_lines)
 
-        # 5. Delete corresponding changes_*.json files for removed dates
+        # 5. Delete corresponding changes_*.json and joined_files_*.txt files for removed dates
         for removed_entry in dates_to_remove:
             # Parse entry: "date" or "date|username"
             parts = removed_entry.split('|', 1)
             removed_date = parts[0]
             removed_user = parts[1] if len(parts) > 1 else ''
             
-            # Parse ISO date and convert to changes_*.json filename format
+            # Parse ISO date and convert to filename format
             dt_removed = datetime.fromisoformat(removed_date.replace('Z', ''))
             timestamp_str = dt_removed.strftime('%Y%m%d_%H%M%S')
             
-            # Try deleting with username suffix first, then without (backward compatibility)
+            # Delete changes file
             if removed_user:
                 changes_filename_to_delete = f"changes_{timestamp_str}_{removed_user}.json"
             else:
                 changes_filename_to_delete = f"changes_{timestamp_str}.json"
             
-            # Delete the file (check_exists=False for idempotent S3-style delete)
-            # Note: delete() may return JsNull which causes errors when accessing, but deletion succeeds
             try:
                 store.delete(changes_filename_to_delete, check_exists=False)
-                # If we get here without exception, file was deleted successfully
-                # Don't try to access the result object - it may be JsNull
             except Exception as e:
-                # Only log if actual deletion failed (not result parsing)
-                if 'getReader' not in str(e):  # Skip JsNull result parsing errors
+                if 'getReader' not in str(e):
                     error_log = f"[DELETION FAILED]\nTarget: {changes_filename_to_delete}\nLog Entry: {removed_entry}\nError: {str(e)}\nCurrent time: {current_retrieval_date}"
                     try:
                         store.create(f"error_deletion_{timestamp_str}_{removed_user if removed_user else 'unknown'}.txt", error_log)
                     except:
                         pass
+            
+            # Joined file cleanup removed - file is overwritten each run (not timestamp-based)
 
         # 5. Save updated retrieval log
         r = store.create('retrieval_log.txt', '\n'.join(log_lines))
 
-        # 6. Save snapshot
-        r = store.create('snapshot.json', json.dumps(current_snapshot, indent=2, ensure_ascii=False))
+        # 6. Save snapshot to main bucket
+        snapshot_json = json.dumps(current_snapshot, indent=2, ensure_ascii=False)
+        r = store.create('snapshot.json', snapshot_json)
+        
+        # Also save snapshot as baseline to ba-user-stories bucket
+        input_id = alita_state.get('input_id', '')
+        baseline_filename = f"{input_id}_sp_baseline__{username}.json" if username else f"{input_id}_sp_baseline.json"
+        try:
+            ba_store = alita_client.artifact('ba-user-stories')
+            ba_store.create(baseline_filename, snapshot_json)
+        except Exception:
+            pass  # Don't fail if ba-user-stories bucket save fails
 
         # 7. Enhance file entries with artifact storage filenames
         def add_artifact_filenames(files, file_type):
@@ -942,6 +949,7 @@ nodes:
       - removed_files
       - changed_files
       - username
+      - input_id
     output:
       - changes_filename
     structured_output: true
@@ -1418,15 +1426,15 @@ nodes:
       {% if current_diff_index|int < files_to_diff|length %}
         ComputeDiffAndAdvance
       {% else %}
-        FormatEnhancedOutput
+        CreateJoinedFile
       {% endif %}
-    default_output: FormatEnhancedOutput
+    default_output: CreateJoinedFile
     input:
       - current_diff_index
       - files_to_diff
     routes:
       - ComputeDiffAndAdvance
-      - FormatEnhancedOutput
+      - CreateJoinedFile
   - id: ComputeDiffAndAdvance
     type: code
     code:
@@ -1689,6 +1697,9 @@ nodes:
 
         # Footer
         bucket_name = alita_state.get('bucket_name', '')
+        joined_filename = alita_state.get('joined_filename', '')
+        joined_status = alita_state.get('joined_status', '')
+        
         report_lines.extend([
             "",
             "---",
@@ -1705,13 +1716,25 @@ nodes:
         else:
             report_lines.append("- `changes_YYYYMMDD_HHMMSS_username.json` — per-run change report (last 5 kept, auto-cleanup)")
 
+        if joined_filename:
+            report_lines.append(f"- `{joined_filename}` — combined file report (new + changed files, overwritten each run)")
+        else:
+            report_lines.append("- `{input_id}_sp_context__{username}.md` — combined file report (overwritten each run)")
+
         report_lines.extend([
-            "- `joined_files_YYYYMMDD_HHMMSS_username.txt` — combined file report (if join enabled)",
             "- `file_[Id]_[name].txt` — current file versions",
             "- `file_prev_[Id]_[name].txt` — previous versions of changed files",
             "- `file_diff_[Id]_[name].txt` — unified diffs for changed files",
             "- `file_del_[Id]_[name].txt` — last known state of removed files",
         ])
+        
+        # Add joined file status
+        if joined_status:
+            report_lines.extend([
+                "",
+                "### 📄 Joined File",
+                f"{joined_status}",
+            ])
 
         report = "\n".join(report_lines)
 
@@ -1735,26 +1758,12 @@ nodes:
       - files_to_delete
       - files_to_archive
       - files_to_diff
+      - joined_filename
+      - joined_status
     output:
       - messages
     structured_output: true
-    transition: CheckJoinNeeded
-  - id: CheckJoinNeeded
-    type: router
-    condition: |
-      {% if join %}
-        CreateJoinedFile
-      {% else %}
-        END
-      {% endif %}
-    default_output: END
-    input:
-      - join
-      - messages
-    output:
-      - messages
-    routes:
-      - CreateJoinedFile
+    transition: END
   - id: CreateJoinedFile
     type: code
     code:
@@ -1771,13 +1780,10 @@ nodes:
         changed_files = alita_state.get('changed_files', [])
         current_retrieval_date = alita_state.get('current_retrieval_date', '')
         username = alita_state.get('username', 'unknown')
+        input_id = alita_state.get('input_id', '')
 
-        # Parse retrieval date for filename
-        dt = datetime.fromisoformat(current_retrieval_date.replace('Z', ''))
-        timestamp = dt.strftime('%Y%m%d_%H%M%S')
-
-        # Include username in filename: joined_files_YYYYMMDD_HHMMSS_username.txt
-        joined_filename = f"joined_files_{timestamp}_{username}.txt"
+        # Filename pattern matches sp_collector: {feature_id}_sp_context__{username}.md
+        joined_filename = f"{input_id}_sp_context__{username}.md" if username else f"{input_id}_sp_context.md"
 
         # Build joined content
         sections = []
@@ -1867,38 +1873,30 @@ nodes:
         # Join all sections
         joined_content = "\n".join(sections)
 
-        # Save to artifact storage
+        # Save to main bucket artifact storage
+        joined_status = ''
         try:
             store.create(joined_filename, joined_content)
-            result_msg = f"\n\n📄 **Joined file created:** `{joined_filename}` ({len(joined_content)} bytes)"
-            success = True
+            joined_status = f"✅ Created `{joined_filename}` ({len(joined_content)} bytes)"
+            
+            # Also save to ba-user-stories bucket
+            ba_store = alita_client.artifact('ba-user-stories')
+            ba_store.create(joined_filename, joined_content)
+            joined_status += f" + saved to ba-user-stories"
         except Exception as e:
-            result_msg = f"\n\n❌ **Error creating joined file:** {e}"
-            success = False
+            joined_status = f"❌ Error: {str(e)}"
+            joined_filename = f"error_{joined_filename}"
 
-        # Append to messages
-        msgs = list(alita_state.get('messages', []))
-        if msgs and len(msgs) > 0:
-            # Append to last message
-            last_msg = msgs[-1]
-            if isinstance(last_msg, dict) and 'content' in last_msg:
-                last_msg['content'] += result_msg
-            else:
-                # Last message isn't properly formatted, add new one
-                msgs.append({"role": "assistant", "content": result_msg})
-        else:
-            # No messages exist, create one
-            msgs = [{"role": "assistant", "content": f"Joined file generation: {result_msg}"}]
-
-        {'messages': msgs}
+        {'joined_filename': joined_filename, 'joined_status': joined_status}
     input:
       - bucket_name
       - new_files
       - changed_files
       - current_retrieval_date
       - username
-      - messages
+      - input_id
     output:
-      - messages
+      - joined_filename
+      - joined_status
     structured_output: true
-    transition: END
+    transition: FormatEnhancedOutput
