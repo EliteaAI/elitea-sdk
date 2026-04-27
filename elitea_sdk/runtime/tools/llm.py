@@ -1181,14 +1181,27 @@ class LLMNode(BaseTool):
                     _langgraph_interrupt({'__replay_consumer__': True})
 
             # Create synthetic AIMessage with the reviewed tool call.
-            completion = AIMessage(
-                content='',
-                tool_calls=[{
-                    'name': hitl_ctx['tool_name'],
-                    'args': hitl_ctx.get('tool_args', {}),
-                    'id': hitl_ctx.get('tool_call_id', 'hitl_resume_call'),
-                }],
-            )
+            #
+            # Anthropic tool-calling turns can carry provider-specific content
+            # blocks (for example thinking, redacted_thinking, or later text
+            # blocks preceding tool_use). Replacing the original tool-calling
+            # AIMessage with ``content=''`` strips that context and can cause
+            # resumed runs to lose continuity. The graph-level resume handler
+            # captures the original AIMessage into
+            # ``hitl_ctx['original_ai_message']``. When its tool_call matches
+            # the resumed tool, reuse it as the completion so the full original
+            # assistant message shape survives the resume. Only fall back to the
+            # empty synthetic AIMessage when the original cannot be reused.
+            completion = self._build_resume_completion(hitl_ctx, messages)
+            if completion is None:
+                completion = AIMessage(
+                    content='',
+                    tool_calls=[{
+                        'name': hitl_ctx['tool_name'],
+                        'args': hitl_ctx.get('tool_args', {}),
+                        'id': hitl_ctx.get('tool_call_id', 'hitl_resume_call'),
+                    }],
+                )
         else:
             completion = llm_client.invoke(messages, config=config)
         logger.info(f"Initial completion: {completion}")
@@ -1331,7 +1344,116 @@ class LLMNode(BaseTool):
     def _run(self, *args, **kwargs):
         # Legacy support for old interface
         return self.invoke(kwargs, **kwargs)
-    
+
+    @staticmethod
+    def _build_resume_completion(hitl_ctx: dict, messages: list) -> Optional[AIMessage]:
+        """Reuse the original tool-calling AIMessage as the resume completion.
+
+                Anthropic tool-calling turns can carry list-shaped ``content`` with
+                provider-specific blocks such as ``thinking``, ``redacted_thinking``,
+                and plain ``text`` immediately before ``tool_use``. Replacing that
+                original AIMessage with a synthetic ``AIMessage(content='',
+                tool_calls=[...])`` strips the original assistant message shape and can
+                make resumed runs lose continuity.
+
+                This helper deserializes ``hitl_ctx['original_ai_message']`` (captured at
+                interrupt time by the graph-level resume handler) and returns it when:
+          * a tool_call on the message matches the approved tool name + args, AND
+                    * the original AIMessage carries meaningful assistant content that
+                        would otherwise be lost (structured list content, or a non-empty
+                        string), AND
+          * the same message is not already present in ``messages`` (which would
+            duplicate it for the multi-tool sibling case where ``_trim`` keeps
+            the AI in the restored history).
+
+        It also rewrites ``hitl_ctx['tool_call_id']`` to the original tool_call id
+        so the downstream ``ToolMessage`` uses a matching id.
+
+        Returns ``None`` to indicate that the caller should fall back to the
+        empty synthetic AIMessage (current behavior).
+        """
+        if not isinstance(hitl_ctx, dict):
+            return None
+        original_dict = hitl_ctx.get('original_ai_message')
+        if not isinstance(original_dict, dict):
+            return None
+
+        try:
+            from langchain_core.messages.utils import messages_from_dict
+            restored = messages_from_dict([original_dict])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[HITL] Failed to deserialize original AIMessage for resume: %s", exc,
+            )
+            return None
+        if not restored or not isinstance(restored[0], AIMessage):
+            return None
+
+        original_ai: AIMessage = restored[0]
+        content = original_ai.content
+        has_reusable_content = isinstance(content, list) or (
+            isinstance(content, str) and bool(content.strip())
+        )
+        if not has_reusable_content:
+            return None
+
+        target_tool = hitl_ctx.get('tool_name', '')
+        target_args = hitl_ctx.get('tool_args', {}) or {}
+        matching_tc = None
+        for tc in (original_ai.tool_calls or []):
+            tc_name = tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')
+            tc_args = tc.get('args', {}) if isinstance(tc, dict) else getattr(tc, 'args', {})
+            if tc_name == target_tool and tc_args == target_args:
+                matching_tc = tc
+                break
+        if matching_tc is None:
+            return None
+
+        original_tc_id = (
+            matching_tc.get('id', '') if isinstance(matching_tc, dict)
+            else getattr(matching_tc, 'id', '')
+        )
+
+        # Skip reuse if the same AIMessage is already in `messages` (multi-tool
+        # sibling case where _trim_pending_messages keeps the AI in restored
+        # history). Detect by tool_call id collision.
+        if original_tc_id:
+            for m in messages:
+                if isinstance(m, AIMessage):
+                    for tc in (m.tool_calls or []):
+                        existing_id = (
+                            tc.get('id', '') if isinstance(tc, dict)
+                            else getattr(tc, 'id', '')
+                        )
+                        if existing_id and existing_id == original_tc_id:
+                            return None
+
+        if original_tc_id:
+            hitl_ctx['tool_call_id'] = original_tc_id
+
+        if isinstance(content, list):
+            content_kinds = []
+            for block in content:
+                if isinstance(block, dict):
+                    content_kinds.append(str(block.get('type', '<missing>')))
+                elif hasattr(block, 'type'):
+                    content_kinds.append(str(getattr(block, 'type', '<missing>')))
+                else:
+                    content_kinds.append(type(block).__name__)
+            content_shape = '[' + ','.join(content_kinds) + ']'
+        else:
+            content_shape = type(content).__name__
+
+        logger.info(
+            "[HITL] Reusing original AIMessage as resume completion "
+            "(tool=%s, tool_call_id=%s, content_shape=%s) — preserves the "
+            "original assistant message across resume",
+            target_tool,
+            original_tc_id or '<missing>',
+            content_shape,
+        )
+        return original_ai
+
     @staticmethod
     def _extract_content_from_completion(completion) -> dict:
         """Extract thinking and text content from LLM completion.
