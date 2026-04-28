@@ -636,6 +636,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         except ApiException as e:
             stacktrace = format_exc()
             logger.error(f"Failed to find test case for properties API: {stacktrace}")
+            # Check if permission denied (403) - surface the actual error
+            if e.status == 403:
+                raise ToolException(
+                    f"Permission denied (HTTP 403) accessing test-cases in project {self.qtest_project_id}. "
+                    f"Ensure the API token has READ permission on test-cases. "
+                    f"Original error: {e.body}"
+                ) from e
+            # For other errors, use the generic message
             raise ValueError(
                 f"Cannot find any test case to query field definitions. "
                 f"Please create at least one test case in project {self.qtest_project_id}"
