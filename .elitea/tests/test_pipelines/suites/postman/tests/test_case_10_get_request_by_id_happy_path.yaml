@@ -150,26 +150,29 @@ nodes:
         import json
         import re
 
-        result_str = elitea_state.get('get_by_path_result', '')
-
-        # Try to extract ID from result
         request_id = None
 
-        # Pattern 1: Look for "id": "..."
-        id_match = re.search(r'"id"\s*:\s*"([^"]+)"', result_str)
-        if id_match:
-            request_id = id_match.group(1)
+        # First try: extract ID from create_request_result (preferred)
+        create_str = elitea_state.get('create_request_result', '')
+        for src_str in [create_str, elitea_state.get('get_by_path_result', '')]:
+            if request_id:
+                break
 
-        # Pattern 2: Look for "uid": "..."
-        if not request_id:
-            uid_match = re.search(r'"uid"\s*:\s*"([^"]+)"', result_str)
+            # Pattern 1: Look for "id": "..."
+            id_match = re.search(r'"id"\s*:\s*"([^"]+)"', src_str)
+            if id_match:
+                request_id = id_match.group(1)
+                continue
+
+            # Pattern 2: Look for "uid": "..."
+            uid_match = re.search(r'"uid"\s*:\s*"([^"]+)"', src_str)
             if uid_match:
                 request_id = uid_match.group(1)
+                continue
 
-        # Pattern 3: Try JSON parse
-        if not request_id:
+            # Pattern 3: Try JSON parse
             try:
-                result_data = json.loads(result_str)
+                result_data = json.loads(src_str)
                 if isinstance(result_data, dict):
                     request_id = result_data.get('id') or result_data.get('uid')
                     if not request_id and 'request' in result_data:
@@ -181,6 +184,7 @@ nodes:
 
         request_id or "ID_NOT_FOUND"
     input:
+      - create_request_result
       - get_by_path_result
     output:
       - request_id

@@ -1607,7 +1607,38 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             # Update collection
             response = self._make_request('PUT', f'/collections/{self.collection_id}',
                                           json={"collection": collection_data})
-            return json.dumps({"message": f"Request '{name}' created successfully"}, indent=2)
+
+            # Try to extract the created request's ID
+            result = {"message": f"Request '{name}' created successfully"}
+            try:
+                # First try: check PUT response for the full collection with IDs
+                resp_collection = response.get("collection", {})
+                resp_items = resp_collection.get("item") or resp_collection.get("items")
+                if resp_items:
+                    request_path = f"{folder_path}/{name}" if folder_path else name
+                    created_item = self.analyzer.find_request_by_path(resp_items, request_path)
+                    if created_item:
+                        if created_item.get("id"):
+                            result["id"] = created_item["id"]
+                        if created_item.get("uid"):
+                            result["uid"] = created_item["uid"]
+
+                # Fallback: re-fetch collection if ID not found in PUT response
+                if "id" not in result:
+                    updated = self._make_request('GET', f'/collections/{self.collection_id}')
+                    updated_data = updated["collection"]
+                    request_path = f"{folder_path}/{name}" if folder_path else name
+                    created_item = self.analyzer.find_request_by_path(
+                        updated_data["item"], request_path)
+                    if created_item:
+                        if created_item.get("id"):
+                            result["id"] = created_item["id"]
+                        if created_item.get("uid"):
+                            result["uid"] = created_item["uid"]
+            except Exception:
+                logger.warning(f"Could not retrieve ID for created request '{name}'")
+
+            return json.dumps(result, indent=2)
         except Exception as e:
             stacktrace = format_exc()
             logger.error(f"Exception when creating request: {stacktrace}")
