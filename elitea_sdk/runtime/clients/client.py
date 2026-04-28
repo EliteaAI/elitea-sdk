@@ -664,9 +664,7 @@ class EliteAClient:
         if not context_settings.get('enabled', True):
             return
 
-        # Check if summarization specifically is enabled
-        if not context_settings.get('enable_summarization', True):
-            return
+        enable_summarization = context_settings.get('enable_summarization', True)
 
         max_context_tokens = context_settings.get('max_context_tokens')
         preserve_recent = context_settings.get('preserve_recent_messages', 5)
@@ -693,7 +691,8 @@ class EliteAClient:
                 keep=("messages", preserve_recent),
                 summary_prompt=context_settings.get('summary_instructions'),
                 conversation_id=conversation_id,
-                callbacks=callbacks if callbacks else None
+                callbacks=callbacks if callbacks else None,
+                summarization_enabled=enable_summarization,
             )
             middleware_list.append(summarization_middleware)
         except Exception as e:

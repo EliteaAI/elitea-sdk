@@ -126,6 +126,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         trim_tokens_to_summarize: Optional[int] = 4000,
         conversation_id: Optional[str] = None,
         callbacks: Optional[Dict[str, Callable]] = None,
+        summarization_enabled: bool = True,
         **kwargs
     ):
         # Use DEFAULT_SUMMARY_PROMPT when None or empty string is passed
@@ -146,10 +147,11 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         self.callbacks = callbacks or {}
         self.last_context_info = None
         self._last_fitting_count = 0
+        self.summarization_enabled = summarization_enabled
 
         logger.info(
             f"SummarizationMiddleware initialized "
-            f"(trigger={self.trigger}, keep={self.keep})"
+            f"(trigger={self.trigger}, keep={self.keep}, summarization_enabled={self.summarization_enabled})"
         )
 
     def get_tools(self) -> List[BaseTool]:
@@ -313,7 +315,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             'summarized': False,
         }
 
-        if not self._should_summarize(messages_since_summary, total_tokens):
+        if not self.summarization_enabled or not self._should_summarize(messages_since_summary, total_tokens):
             return None
 
         cutoff_index = self._determine_cutoff_index(messages_since_summary)
