@@ -99,6 +99,9 @@ state:
   previous_snapshot:
     type: dict
     value: {}
+  reload:
+    type: bool
+    value: false
   removed_files:
     type: list
     value: []
@@ -192,7 +195,7 @@ nodes:
                             "error_message": "Field 'id' cannot be empty.",
                             "folder_path": "",
                             "input_bucket_name": "",
-                            "input_id": "",
+                            "input_id": "", 
                             "input_folder_path": "",
                             "search_base_path": "",
                             "current_retrieval_date": datetime.now().isoformat()
@@ -201,6 +204,7 @@ nodes:
                         # Get optional parameters with defaults
                         search_base = input_data.get('folder_path', 'Shared Documents/General')
                         bucket = input_data.get('bucket_name', 'sp-repo')
+                        reload = input_data.get('reload', False)
                         
                         # Get username from alita_client or input
                         username = input_data.get('username', '')
@@ -220,6 +224,7 @@ nodes:
                             "folder_path": "",  # Will be set after finding the folder
                             "input_bucket_name": bucket,
                             "username": username,
+                            "reload": reload,
                             "input_id": feature_id,
                             "input_folder_path": search_base,
                             "search_base_path": search_base,
@@ -235,6 +240,7 @@ nodes:
       - search_base_path
       - folder_path
       - username
+      - reload
     structured_output: true
     transition: ValidationRouter
   - id: ValidationRouter
@@ -550,6 +556,9 @@ nodes:
         # Get input_id for file prefixing
         input_id = alita_state.get('input_id', '')
         file_prefix = f"{input_id}/" if input_id else ''
+        
+        # Check if reload is requested (force full content)
+        reload = alita_state.get('reload', False)
 
         # Load retrieval log
         is_first_run = False
@@ -566,14 +575,15 @@ nodes:
         else:
             is_first_run = True
 
-        # Load snapshot
+        # Load snapshot (skip if reload=true to force full content)
         previous_snapshot = {}
-        snap_raw = store.get(f'{file_prefix}snapshot.json')
-        if snap_raw and not any(err in str(snap_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
-            try:
-                previous_snapshot = json.loads(str(snap_raw))
-            except json.JSONDecodeError:
-                pass
+        if not reload:
+            snap_raw = store.get(f'{file_prefix}snapshot.json')
+            if snap_raw and not any(err in str(snap_raw).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+                try:
+                    previous_snapshot = json.loads(str(snap_raw))
+                except json.JSONDecodeError:
+                    pass
 
         {
             'bucket_name': bucket_name,
@@ -585,6 +595,7 @@ nodes:
     input:
       - input_bucket_name
       - input_id
+      - reload
     output:
       - bucket_name
       - last_retrieval_date
