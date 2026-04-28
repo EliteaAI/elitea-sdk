@@ -237,15 +237,19 @@ class LLMNode(BaseTool):
         Returns:
             Pydantic model instance with fallback values
         """
+        from pydantic_core import PydanticUndefined
         result_dict = {}
         for k, field in struct_model.model_fields.items():
             if k == ELITEA_RS:
                 result_dict[k] = content
             elif field.is_required():
-                # Set default values for required fields based on type
-                result_dict[k] = field.default if field.default is not None else None
+                # Required fields have PydanticUndefined as default - use None instead
+                # to avoid serialization errors in LangGraph checkpoints
+                result_dict[k] = None
             else:
-                result_dict[k] = field.default
+                # Optional fields: use actual default, but guard against PydanticUndefined
+                field_default = field.default
+                result_dict[k] = None if field_default is PydanticUndefined else field_default
         return struct_model.model_construct(**result_dict)
 
     def _handle_structured_output_fallback(self, llm_client: Any, messages: List, struct_model: Any,
