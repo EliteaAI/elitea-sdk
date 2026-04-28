@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, TypeVar
+
 from urllib.parse import quote
 
 from atlassian.bitbucket import Bitbucket, Cloud
@@ -13,6 +16,92 @@ from ..utils.text_operations import parse_old_new_markers
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
+
+# Type variable for generic return type
+T = TypeVar('T')
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """Check if the exception is a rate limit (429) error.
+
+    Args:
+        error: The exception to check
+
+    Returns:
+        True if this is a rate limit error, False otherwise
+    """
+    error_str = str(error).lower()
+    return (
+        "429" in error_str or
+        "too many requests" in error_str or
+        "rate limit" in error_str
+    )
+
+
+def retry_on_rate_limit(
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator to retry API calls on 429 rate limit errors with exponential backoff.
+
+    When Bitbucket API returns HTTP 429 (Too Many Requests), the decorated function
+    will automatically retry with exponential backoff delays.
+
+    Args:
+        max_retries: Maximum number of retry attempts (default: 5)
+        base_delay: Initial delay in seconds before first retry (default: 1.0)
+        max_delay: Maximum delay between retries in seconds (default: 60.0)
+
+    Returns:
+        Decorated function with retry logic
+
+    Example:
+        @retry_on_rate_limit(max_retries=3, base_delay=2.0)
+        def list_branches(self):
+            return self.api_client.get_branches()
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            last_exception = None
+
+            for attempt in range(max_retries + 1):  # +1 for initial attempt
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+
+                    if not is_rate_limit_error(e):
+                        # Not a rate limit error - re-raise immediately
+                        raise
+
+                    if attempt < max_retries:
+                        # Calculate delay with exponential backoff
+                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        logger.warning(
+                            f"Rate limit hit (429) in {func.__name__}, "
+                            f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(delay)
+                    else:
+                        # Max retries exceeded
+                        logger.error(
+                            f"Max retries ({max_retries}) exceeded for {func.__name__} "
+                            f"due to rate limiting"
+                        )
+                        raise ToolException(
+                            f"Bitbucket API rate limit exceeded after {max_retries} retries. "
+                            f"Please wait a few minutes before trying again. "
+                            f"Original error: {str(e)}"
+                        ) from e
+
+            # Should not reach here, but handle edge case
+            if last_exception:
+                raise last_exception
+
+        return wrapper
+    return decorator
 
 if TYPE_CHECKING:
     pass
@@ -95,10 +184,12 @@ class BitbucketServerApi(BitbucketApiAbstract):
         self.password = password
         self.api_client = Bitbucket(url=url, username=username, password=password)
 
+    @retry_on_rate_limit()
     def list_branches(self) -> List[str]:
         branches = self.api_client.get_branches(project_key=self.project, repository_slug=self.repository)
         return [branch['displayId'] for branch in branches]
 
+    @retry_on_rate_limit()
     def create_branch(self, branch_name: str, branch_from: str) -> Response:
         return self.api_client.create_branch(
             self.project,
@@ -107,10 +198,11 @@ class BitbucketServerApi(BitbucketApiAbstract):
             branch_from
         )
 
+    @retry_on_rate_limit()
     def delete_branch(self, branch_name: str) -> None:
         """
         Delete a branch from Bitbucket Server.
-        
+
         Parameters:
             branch_name (str): The name of the branch to delete
         """
@@ -120,6 +212,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
             name=branch_name
         )
 
+    @retry_on_rate_limit()
     def create_pull_request(self, pr_json_data: str) -> Any:
         return self.api_client.create_pull_request(project_key=self.project,
                                                    repository_slug=self.repository,
@@ -127,6 +220,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
                                                    )
 
     # TODO: review this method, it may not work as expected
+    @retry_on_rate_limit()
     def get_file_commit_hash(self, file_path: str, branch: str):
         """
         Get the commit hash of a file in a specific branch.
@@ -142,10 +236,12 @@ class BitbucketServerApi(BitbucketApiAbstract):
             return commits[0]['id']
         return None
 
+    @retry_on_rate_limit()
     def get_file(self, file_path: str, branch: str) -> str:
         return self.api_client.get_content_of_file(project_key=self.project, repository_slug=self.repository, at=branch,
                                                    filename=file_path).decode('utf-8')
 
+    @retry_on_rate_limit()
     def get_files_list(self, file_path: str, branch: str, recursive: bool = True) -> list:
         """Get list of files from a specific path and branch.
 
@@ -200,6 +296,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
 
         return filtered
 
+    @retry_on_rate_limit()
     def create_file(self, file_path: str, file_contents: str, branch: str) -> str:
         return self.api_client.upload_file(
             project_key=self.project,
@@ -210,6 +307,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
             filename=file_path
         )
 
+    @retry_on_rate_limit()
     def _write_file(self, file_path: str, content: str, branch: str, commit_message: str) -> str:
         """Write updated file content to Bitbucket Server.
 
@@ -234,6 +332,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
             source_commit_id=source_commit['id'],
         )
 
+    @retry_on_rate_limit()
     def get_pull_request_commits(self, pr_id: str) -> List[Dict[str, Any]]:
         """
         Get commits from a pull request
@@ -245,6 +344,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
         return self.api_client.get_pull_requests_commits(project_key=self.project, repository_slug=self.repository,
                                                          pull_request_id=pr_id)
 
+    @retry_on_rate_limit()
     def get_pull_request(self, pr_id):
         """ Get details of a pull request
         Parameters:
@@ -256,6 +356,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
                                                     pull_request_id=pr_id)
         return normalize_response(response)
 
+    @retry_on_rate_limit()
     def get_pull_requests_changes(self, pr_id: str) -> Dict[str, Any]:
         """
         Get changes of a pull request
@@ -268,6 +369,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
                                                              pull_request_id=pr_id)
         return normalize_response(response)
 
+    @retry_on_rate_limit()
     def add_pull_request_comment(self, pr_id, content, inline=None):
         """
         Add a comment to a pull request. Supports multiple content types and inline comments.
@@ -304,6 +406,7 @@ class BitbucketServerApi(BitbucketApiAbstract):
             **comment_data
         )
 
+    @retry_on_rate_limit()
     def close_pull_request(self, pr_id: str, message: str = None) -> Any:
         """
         Decline (close) a pull request without merging it.
@@ -320,11 +423,11 @@ class BitbucketServerApi(BitbucketApiAbstract):
             pull_request_id=pr_id,
             version=None  # Use latest version
         )
-        
+
         # If a message is provided, add it as a comment
         if message:
             self.add_pull_request_comment(pr_id=pr_id, content=message)
-        
+
         return normalize_response(response)
 
 
@@ -344,11 +447,13 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         except Exception as e:
             raise ToolException(f"Unable to connect to the repository '{self.repository_name}' due to error:\n{str(e)}")
 
+    @retry_on_rate_limit()
     def list_branches(self) -> List[str]:
         branches = self.repository.branches.each()
         branch_names = [branch.name for branch in branches]
         return branch_names
 
+    @retry_on_rate_limit()
     def _get_branch(self, branch_name: str) -> Response:
         """Get branch details by name.
 
@@ -358,6 +463,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         encoded_branch = quote(branch_name, safe='')
         return self.repository.branches.get(encoded_branch)
 
+    @retry_on_rate_limit()
     def create_branch(self, branch_name: str, branch_from: str) -> Response:
         """
         Creates new branch from last commit branch
@@ -367,10 +473,11 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         # create new branch from last commit
         return self.repository.branches.create(branch_name, commits_name)
 
+    @retry_on_rate_limit()
     def delete_branch(self, branch_name: str) -> None:
         """
         Delete a branch from Bitbucket Cloud.
-        
+
         Parameters:
             branch_name (str): The name of the branch to delete
         """
@@ -378,11 +485,13 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         encoded_branch = quote(branch_name, safe='')
         self.repository.branches.delete(encoded_branch)
 
+    @retry_on_rate_limit()
     def create_pull_request(self, pr_json_data: str) -> Any:
         response = self.repository.pullrequests.post(None, data=json.loads(pr_json_data))
         return response['links']['self']['href']
 
     # TODO: review this method, it may not work as expected
+    @retry_on_rate_limit()
     def get_file_commit_hash(self, file_path: str, branch: str):
         """
         Get the commit hash of a file in a specific branch.
@@ -397,6 +506,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
             return commits['values'][0]['hash']
         return None
 
+    @retry_on_rate_limit()
     def get_file(self, file_path: str, branch: str) -> str:
         """Fetch a file's content from Bitbucket Cloud and return it as text.
 
@@ -434,6 +544,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
                 f"Failed to retrieve text from file '{file_path}' from branch '{branch}': {e}"
             )
 
+    @retry_on_rate_limit()
     def get_files_list(self, file_path: str, branch: str, recursive: bool = True) -> list:
         """Get list of files from a specific path and branch.
 
@@ -534,6 +645,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
 
         return filtered
 
+    @retry_on_rate_limit()
     def create_file(self, file_path: str, file_contents: str, branch: str) -> str:
         form_data = {
             'branch': f'{branch}',
@@ -542,11 +654,13 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         return self.repository.post(path='src', data=form_data, files={},
                                     headers={'Content-Type': 'application/x-www-form-urlencoded'})
 
+    @retry_on_rate_limit()
     def _write_file(self, file_path: str, content: str, branch: str, commit_message: str) -> str:
         """Write updated file content to Bitbucket Cloud.
         """
         return self.create_file(file_path=file_path, file_contents=content, branch=branch)
 
+    @retry_on_rate_limit()
     def get_pull_request_commits(self, pr_id: str) -> List[Dict[str, Any]]:
         """
         Get commits from a pull request
@@ -557,6 +671,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         """
         return self.repository.pullrequests.get(pr_id).get('commits', {}).get('values', [])
 
+    @retry_on_rate_limit()
     def get_pull_request(self, pr_id: str) -> Dict[str, Any]:
         """ Get details of a pull request
         Parameters:
@@ -567,6 +682,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         response = self.repository.pullrequests.get(pr_id)
         return normalize_response(response)
 
+    @retry_on_rate_limit()
     def get_pull_requests_changes(self, pr_id: str) -> Dict[str, Any]:
         """
         Get changes of a pull request
@@ -578,6 +694,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         response = self.repository.pullrequests.get(pr_id).get('diff', {})
         return normalize_response(response)
 
+    @retry_on_rate_limit()
     def add_pull_request_comment(self, pr_id: str, content, inline=None) -> str:
         """
         Add a comment to a pull request. Supports multiple content types and inline comments.
@@ -606,6 +723,7 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         response = self.repository.pullrequests.get(pr_id).post("comments", data)
         return response['links']['html']['href']
 
+    @retry_on_rate_limit()
     def close_pull_request(self, pr_id: str, message: str = None) -> Any:
         """
         Decline (close) a pull request without merging it.

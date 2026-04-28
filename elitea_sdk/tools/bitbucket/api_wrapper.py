@@ -250,7 +250,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
 
             return "Found branches: " + ", ".join(branches)
         except Exception as e:
-            return f"Failed to list branches: {str(e)}"
+            raise ToolException(f"Failed to list branches: {str(e)}")
 
     def create_branch(self, branch_name: str) -> None:
         """Create a new branch in the repository."""
