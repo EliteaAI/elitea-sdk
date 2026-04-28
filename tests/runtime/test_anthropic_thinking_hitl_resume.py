@@ -238,8 +238,10 @@ def test_build_resume_completion_returns_none_when_no_original_in_ctx():
 
 def test_build_resume_completion_skips_reuse_when_already_in_messages():
     """Multi-tool sibling case: _trim_pending_messages keeps the AIMessage in
-    the restored ``messages`` list. Reusing it as ``completion`` would duplicate
-    the tool_call. Detect by tool_call id collision and fall back to synthetic."""
+    the restored ``messages`` list. When the AIMessage is already present,
+    _build_resume_completion returns it (not None) with a sentinel flag
+    ``_completion_already_in_messages`` set in hitl_ctx so the caller can
+    skip duplication and proceed directly to tool execution."""
     original = _make_anthropic_thinking_ai_message()
     hitl_ctx = {
         "tool_name": "danger",
@@ -252,7 +254,13 @@ def test_build_resume_completion_skips_reuse_when_already_in_messages():
         hitl_ctx, messages=[original]  # same id already present
     )
 
-    assert completion is None
+    # The fix returns the existing message (not None) so the caller can
+    # detect the duplicate via the sentinel flag and skip insertion.
+    assert completion is not None
+    assert isinstance(completion, AIMessage)
+    assert hitl_ctx.get('_completion_already_in_messages') is True
+    # tool_call_id should be updated to the original's id
+    assert hitl_ctx['tool_call_id'] == 'toolu_01ABC'
 
 
 # ───────────────────────────────────────────────────────────────────────────────

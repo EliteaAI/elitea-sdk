@@ -40,6 +40,33 @@ _PENDING_TOOL_MESSAGES: contextvars.ContextVar[list] = contextvars.ContextVar(
 )
 
 
+def _args_match_normalized(args_a: dict, args_b: dict) -> bool:
+    """Compare tool args with JSON-normalized equality.
+
+    Handles type differences from JSON round-trip through LangGraph checkpoints:
+    - int vs float (e.g., 1 vs 1.0)
+    - dict key ordering differences
+    - None vs missing keys
+    - str coercion differences
+
+    This is critical for the HITL resume path where tool_args are serialized
+    into the interrupt payload, stored in the checkpoint, and deserialized on
+    resume.  The round-trip can introduce subtle type changes that break
+    strict Python dict equality.
+    """
+    if args_a == args_b:
+        return True
+    # Normalize both to None/empty
+    if not args_a and not args_b:
+        return True
+    try:
+        norm_a = json.dumps(args_a, sort_keys=True, default=str)
+        norm_b = json.dumps(args_b, sort_keys=True, default=str)
+        return norm_a == norm_b
+    except (TypeError, ValueError):
+        return False
+
+
 # def _is_thinking_model(llm_client: Any) -> bool:
 #     """
 #     Check if a model uses extended thinking capability by reading cached metadata.
@@ -1182,7 +1209,16 @@ class LLMNode(BaseTool):
                     n_prior,
                 )
                 for _i in range(n_prior):
-                    _langgraph_interrupt({'__replay_consumer__': True})
+                    try:
+                        _langgraph_interrupt({'__replay_consumer__': True})
+                    except Exception as exc:
+                        logger.warning(
+                            "[HITL] Replay consumer #%d raised %s — stopping "
+                            "replay consumption early (may indicate misaligned "
+                            "checkpoint state)",
+                            _i, exc,
+                        )
+                        break
 
             # Create synthetic AIMessage with the reviewed tool call.
             #
@@ -1198,8 +1234,15 @@ class LLMNode(BaseTool):
             # empty synthetic AIMessage when the original cannot be reused.
             completion = self._build_resume_completion(hitl_ctx, messages)
             if completion is None:
+                # Fallback: preserve content from the original AIMessage when
+                # available.  For Anthropic thinking models, the original
+                # AIMessage carries thinking/redacted_thinking blocks that MUST
+                # be present in the content for the follow-up LLM call to
+                # succeed.  Using content='' causes the API to reject the
+                # request or the LLM to lose context and re-invoke all tools.
+                resume_content = self._extract_original_content_for_resume(hitl_ctx)
                 completion = AIMessage(
-                    content='',
+                    content=resume_content,
                     tool_calls=[{
                         'name': hitl_ctx['tool_name'],
                         'args': hitl_ctx.get('tool_args', {}),
@@ -1214,9 +1257,21 @@ class LLMNode(BaseTool):
         if hasattr(completion, 'tool_calls') and completion.tool_calls:
             # Handle iterative tool-calling and execution
             hitl_decisions = state.get('hitl_decisions') if isinstance(state, dict) else None
+
+            # When the completion is already part of 'messages' (restored from
+            # pending_messages during HITL resume), pass it with messages=messages
+            # directly so __perform_tool_calling doesn't duplicate the AIMessage.
+            tool_calling_messages = messages
+            if hitl_ctx and hitl_ctx.get('_completion_already_in_messages'):
+                # The AIMessage with tool_calls is already the last message in
+                # `messages` — pass messages[:-1] as the base so
+                # __perform_tool_calling's `messages + [completion]` reconstructs
+                # the correct sequence without duplication.
+                tool_calling_messages = messages[:-1] if messages and messages[-1] is completion else messages
+
             new_messages, current_completion = self._run_async_in_sync_context(
                 self.__perform_tool_calling(
-                    completion, messages, llm_client, config,
+                    completion, tool_calling_messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
                 )
             )
@@ -1407,20 +1462,39 @@ class LLMNode(BaseTool):
         for tc in (original_ai.tool_calls or []):
             tc_name = tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')
             tc_args = tc.get('args', {}) if isinstance(tc, dict) else getattr(tc, 'args', {})
-            if tc_name == target_tool and tc_args == target_args:
+            if tc_name == target_tool and _args_match_normalized(tc_args, target_args):
                 matching_tc = tc
                 break
         if matching_tc is None:
-            return None
+            # Fallback: match by tool name only when there's exactly one
+            # tool_call with that name.  After JSON round-trip through the
+            # checkpoint, nested args can diverge (int vs float, key order).
+            name_matches = [
+                tc for tc in (original_ai.tool_calls or [])
+                if (tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')) == target_tool
+            ]
+            if len(name_matches) == 1:
+                matching_tc = name_matches[0]
+                logger.info(
+                    "[HITL] Matched original AIMessage tool_call by name-only "
+                    "fallback (tool=%s) — args comparison failed after JSON round-trip",
+                    target_tool,
+                )
+            else:
+                return None
 
         original_tc_id = (
             matching_tc.get('id', '') if isinstance(matching_tc, dict)
             else getattr(matching_tc, 'id', '')
         )
 
-        # Skip reuse if the same AIMessage is already in `messages` (multi-tool
+        # Check if the same AIMessage is already in `messages` (multi-tool
         # sibling case where _trim_pending_messages keeps the AI in restored
         # history). Detect by tool_call id collision.
+        # When found, the original is already in the message history so we
+        # update the tool_call_id and return a sentinel to signal "no new
+        # completion needed" — the caller should proceed directly to tool
+        # execution since the AIMessage with the tool_call is already present.
         if original_tc_id:
             for m in messages:
                 if isinstance(m, AIMessage):
@@ -1430,7 +1504,17 @@ class LLMNode(BaseTool):
                             else getattr(tc, 'id', '')
                         )
                         if existing_id and existing_id == original_tc_id:
-                            return None
+                            # AIMessage already present — update tool_call_id
+                            # in hitl_ctx and return the existing message so
+                            # the caller knows NOT to duplicate it.
+                            hitl_ctx['tool_call_id'] = original_tc_id
+                            hitl_ctx['_completion_already_in_messages'] = True
+                            logger.info(
+                                "[HITL] Original AIMessage already in restored "
+                                "messages (tool_call_id=%s) — skipping duplicate",
+                                original_tc_id,
+                            )
+                            return m
 
         if original_tc_id:
             hitl_ctx['tool_call_id'] = original_tc_id
@@ -1457,6 +1541,43 @@ class LLMNode(BaseTool):
             content_shape,
         )
         return original_ai
+
+    @staticmethod
+    def _extract_original_content_for_resume(hitl_ctx: dict) -> Any:
+        """Extract content from original_ai_message for fallback synthetic AIMessage.
+
+        When ``_build_resume_completion`` returns None (e.g., args mismatch after
+        JSON round-trip), we still want to preserve the original AIMessage's
+        content in the synthetic completion.  For Anthropic thinking models, the
+        content is a list carrying ``thinking``/``redacted_thinking`` blocks that
+        MUST be present for the follow-up LLM call to succeed.
+
+        Without this, the synthetic AIMessage gets ``content=''`` which causes:
+        - Anthropic API to reject the request with a thinking-block format error, OR
+        - The LLM to lose context and re-plan from scratch (re-invoking all tools)
+
+        Returns:
+            The original content (list for thinking models, '' otherwise).
+        """
+        original_dict = hitl_ctx.get('original_ai_message') if isinstance(hitl_ctx, dict) else None
+        if not isinstance(original_dict, dict):
+            return ''
+        data = original_dict.get('data')
+        if isinstance(data, dict):
+            content = data.get('content', '')
+        else:
+            content = original_dict.get('content', '')
+        # Only preserve list content (which indicates structured blocks like
+        # thinking/redacted_thinking/text). Simple string content doesn't need
+        # special handling since content='' works fine for non-thinking models.
+        if isinstance(content, list) and content:
+            logger.info(
+                "[HITL] Preserving original AIMessage content (%d blocks) in "
+                "synthetic completion for thinking-model compatibility",
+                len(content),
+            )
+            return content
+        return ''
 
     @staticmethod
     def _extract_content_from_completion(completion) -> dict:
