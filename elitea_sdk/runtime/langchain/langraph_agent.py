@@ -1199,6 +1199,21 @@ def create_graph(
                 # explicit transition/decision/condition edges.
                 # All possible route targets must be registered as graph nodes.
                 continue
+            elif node_type == 'custom':
+                # Custom node type: users must specify a valid underlying node type in the JSON.
+                # The 'custom' type is a UI-only concept for editing nodes in raw JSON format.
+                # Raise a clear error message to guide users to specify the correct type.
+                valid_types = [
+                    'toolkit', 'mcp',
+                    'agent', 'code', 'llm', 'router',
+                    'state_modifier', 'printer', 'hitl'
+                ]
+                raise ToolException(
+                    f"Node '{node_id}' has type 'custom' which is not a valid execution type. "
+                    f"The 'custom' node in the UI is for editing node configuration in JSON format. "
+                    f"Please specify one of the supported node types in your JSON: {', '.join(valid_types)}. "
+                    f"Example: {{\"type\": \"llm\", \"id\": \"{node_id}\", ...}}"
+                )
             if node.get('transition'):
                 next_step = clean_string(node['transition'])
                 logger.info(f'Adding transition: {next_step}')
