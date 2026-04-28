@@ -56,18 +56,21 @@ class EliteADocxMammothLoader(BaseLoader):
         Returns:
             dict: Dictionary containing the 'src' attribute for the HTML <img> tag.
         """
+        from elitea_sdk.tools.utils.content_parser import image_processing_prompt
         output = {}
         try:
             if self.llm:
                 # Use LLM for image understanding
-                with image.open() as image_bytes:
-                    result = perform_llm_prediction_for_image_bytes(image_bytes, self.llm, self.prompt)
+                with image.open() as image_file:
+                    image_bytes = image_file.read()
+                    result = perform_llm_prediction_for_image_bytes(image_bytes, self.llm,
+                                                                    self.prompt if self.prompt else image_processing_prompt)
                 output['src'] = result  # LLM image transcript in src
                 return output
             else:
                 # Use Tesseract OCR if LLM is not available
-                with image.open() as image_bytes:
-                    img = Image.open(image_bytes)
+                with image.open() as image_file:
+                    img = Image.open(image_file)
                     output['src'] = pytesseract.image_to_string(image=img)  # Tesseract transcript in src
                 return output
         except Exception as e:
