@@ -1,41 +1,39 @@
-name: "PST03 update description"
+name: "PST25 update collection auth"
 priority: High
 description: |
-  Validates duplicate_collection and update_collection_description tools.
+  Validates that the update_collection_auth tool properly handles clearing
+  collection authentication by passing null.
   
-  Objective: Test collection duplication and description update
+  Objective: Verify clearing collection authentication
   
   Expected Behavior:
-  - Collection is duplicated successfully
-  - Description is updated on the duplicate
-  - Updated description is verified
-  - Duplicate collection is deleted after test
+  - Duplicate collection is created for testing
+  - Tool executes successfully on the duplicate
+  - Collection authentication is cleared
+  - Returns confirmation of the update
+  - Collection has no authentication after operation
+  - Duplicate collection is cleaned up successfully
 
 toolkits:
   - id: ${POSTMAN_TOOLKIT_ID}
     name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
-  source_collection_id:
-    type: str
-    value: ${POSTMAN_COLLECTION_ID}
   duplicate_name:
     type: str
-  new_description:
-    type: str
-    value: "Updated by PST03 automated test - this collection is a temporary copy for testing collection description updates"
   duplicate_result:
     type: str
   duplicate_id:
     type: str
-  update_result:
-    type: str
-  get_updated_result:
-    type: str
+  tool_result:
+    type: dict
   delete_result:
     type: str
   test_results:
     type: dict
+  auth:
+    type: dict
+    value: null
 
 entry_point: prepare_test_data
 
@@ -51,7 +49,7 @@ nodes:
         
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-        duplicate_name = f"PST03_DescTest_{timestamp}_{random_suffix}"
+        duplicate_name = f"PST25_ClearAuth_{timestamp}_{random_suffix}"
         
         {"duplicate_name": duplicate_name}
     output:
@@ -106,100 +104,26 @@ nodes:
     output:
       - duplicate_id
     structured_output: true
-    transition: update_description
+    transition: invoke_update_collection_auth
 
-  - id: update_description
+  - id: invoke_update_collection_auth
     type: toolkit
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: update_collection_description
+    tool: update_collection_auth
     input:
       - duplicate_id
-      - new_description
+      - auth
     input_mapping:
       collection_id:
         type: variable
         value: duplicate_id
-      description:
+      auth:
         type: variable
-        value: new_description
+        value: auth
     output:
-      - update_result
-    structured_output: true
-    transition: get_updated_collection
-
-  - id: get_updated_collection
-    type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: get_collection
-    input:
-      - duplicate_id
-    input_mapping:
-      collection_id:
-        type: variable
-        value: duplicate_id
-    output:
-      - get_updated_result
+      - tool_result
     structured_output: true
     transition: cleanup_delete_collection
-
-  - id: validate_results
-    type: llm
-    model: ${DEFAULT_LLM_MODEL}
-    input:
-      - duplicate_result
-      - duplicate_id
-      - update_result
-      - get_updated_result
-      - new_description
-      - delete_result
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fixed
-        value: "You are a strict quality assurance validator. Only return valid JSON."
-      task:
-        type: fstring
-        value: |
-          Analyze collection duplication and description update operations.
-          
-          Duplication Result: {duplicate_result}
-          Duplicate ID: {duplicate_id}
-          Update Result: {update_result}
-          Get Updated Collection: {get_updated_result}
-          Expected Description: {new_description}
-          Delete Result: {delete_result}
-          
-          Validation Criteria (ALL must pass for test_passed=true):
-          1. duplication_succeeded: Collection was duplicated successfully
-          2. id_extracted: Duplicate ID was extracted
-          3. update_succeeded: Description update completed without errors
-          4. collection_retrieved: Updated collection was retrieved
-          5. description_updated: Collection description matches expected value
-          6. no_errors: No error indicators in outputs
-          7. cleanup_succeeded: Duplicate was deleted successfully (no errors in delete_result)
-          
-          Return JSON test_results:
-          {{
-            "test_passed": boolean (true only if ALL criteria pass),
-            "duplication_succeeded": boolean,
-            "id_extracted": boolean,
-            "update_succeeded": boolean,
-            "collection_retrieved": boolean,
-            "description_updated": boolean,
-            "no_errors": boolean,
-            "cleanup_succeeded": boolean,
-            "summary": "brief description of outcome",
-            "error": string | null
-          }}
-          
-          Return ONLY the JSON object. No markdown formatting.
-    output:
-      - test_results
-    structured_output_dict:
-      test_results: dict
-    transition: END
 
   - id: cleanup_delete_collection
     type: toolkit
@@ -215,4 +139,59 @@ nodes:
     output:
       - delete_result
     structured_output: true
-    transition: validate_results
+    transition: process_results
+
+  - id: process_results
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - duplicate_result
+      - duplicate_id
+      - tool_result
+      - delete_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the output from the 'update_collection_auth' tool when clearing auth.
+          
+          Duplicate Result: {duplicate_result}
+          Duplicate ID: {duplicate_id}
+          Tool Result: {tool_result}
+          Delete Result: {delete_result}
+          
+          This test validates that update_collection_auth clears authentication on a duplicate collection.
+          
+          Perform the following checks:
+          1. Confirm duplicate collection was created successfully.
+          2. Confirm the update tool executed successfully without raising an error.
+          3. Verify the result contains a collection object with id and name fields.
+          4. Verify the result contains an 'auth' field that is null or empty.
+          5. Verify the auth field is cleared (null or empty dict {}) indicating authentication was cleared.
+          6. Validate no error message is present in the result.
+          7. Confirm the duplicate collection was deleted successfully (delete_result should not contain errors).
+          
+          Return a JSON object named test_results with the following structure:
+          
+          {{
+            "test_passed": boolean (true if all checks pass),
+            "duplicate_created": boolean,
+            "update_succeeded": boolean,
+            "auth_cleared": boolean,
+            "cleanup_succeeded": boolean,
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+          
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

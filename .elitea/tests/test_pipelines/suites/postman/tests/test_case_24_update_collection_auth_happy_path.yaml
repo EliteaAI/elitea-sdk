@@ -2,19 +2,19 @@ name: "PST24 update collection auth"
 priority: Critical
 description: |
   Validates that the update_collection_auth tool successfully updates
-  collection-level authentication settings.
+  collection-level authentication settings on the default toolkit collection.
   
   Objective: Verify collection authentication update functionality
   
   Expected Behavior:
-  - Tool executes successfully
+  - Tool executes successfully on the default collection
   - Collection authentication is updated
   - Auth settings include type and credentials
   - Returns confirmation of the update
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -35,7 +35,7 @@ entry_point: invoke_update_collection_auth
 nodes:
   - id: invoke_update_collection_auth
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: update_collection_auth
     input:
       - auth
@@ -44,7 +44,6 @@ nodes:
         type: variable
         value: auth
     output:
-
       - tool_result
     structured_output: true
     transition: process_results
@@ -65,18 +64,21 @@ nodes:
           
           Tool Result: {tool_result}
           
-          This test validates that update_collection_auth updates authentication settings.
+          This test validates that update_collection_auth updates authentication settings on the default collection.
           
           Perform the following checks:
-          1. Confirm the tool executed successfully without raising an error.
-          2. Verify the result contains a collection object with id, name, and uid fields.
-          3. Note: The Postman API PUT response only returns minimal collection metadata (id, name, uid) - this is the expected success response format.
-          4. Validate no error message is present in the result.
+          1. Confirm the update tool executed successfully without raising an error.
+          2. Verify the result contains a collection object with id and name fields.
+          3. Verify the result contains an 'auth' object.
+          4. Verify the auth object has type="bearer" and contains bearer token configuration.
+          5. Validate no error message is present in the result.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if tool returned a collection object with id/name/uid and no error),
+            "test_passed": boolean (true if all checks pass),
+            "update_succeeded": boolean,
+            "auth_updated": boolean,
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}

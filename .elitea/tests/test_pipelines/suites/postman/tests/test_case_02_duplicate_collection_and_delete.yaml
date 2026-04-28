@@ -124,6 +124,22 @@ nodes:
     output:
       - get_duplicate_result
     structured_output: true
+    transition: cleanup_delete_collection
+
+  - id: cleanup_delete_collection
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: delete_collection
+    input:
+      - duplicate_id
+    input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
+    output:
+      - delete_result
+    structured_output: true
     transition: validate_results
 
   - id: validate_results
@@ -135,6 +151,7 @@ nodes:
       - get_duplicate_result
       - duplicate_name
       - source_collection_id
+      - delete_result
     input_mapping:
       chat_history:
         type: fixed
@@ -152,10 +169,11 @@ nodes:
           Get Duplicate Result: {get_duplicate_result}
           Expected Name: {duplicate_name}
           Source Collection ID: {source_collection_id}
+          Delete Result: {delete_result}
           
           This is a POSITIVE test - we expect successful collection duplication.
           
-          Validation Criteria (ALL must pass for test_passed=true):
+          REQUIRED Validation Criteria (ALL must pass for test_passed=true):
           1. duplication_succeeded: Collection was duplicated (no errors in duplicate_result)
           2. id_extracted: Duplicate ID was successfully extracted
           3. id_different: Duplicate ID is different from source collection ID
@@ -163,15 +181,19 @@ nodes:
           5. correct_name: Duplicate has the expected name
           6. no_errors: No error indicators in any output
           
+          OPTIONAL (does NOT affect test_passed):
+          7. cleanup_succeeded: Duplicate was deleted successfully (no errors in delete_result)
+          
           Return JSON test_results:
           {{
-            "test_passed": boolean (true only if ALL criteria pass),
+            "test_passed": boolean (true only if ALL REQUIRED criteria pass),
             "duplication_succeeded": boolean,
             "id_extracted": boolean,
             "id_different": boolean,
             "duplicate_retrieved": boolean,
             "correct_name": boolean,
             "no_errors": boolean,
+            "cleanup_succeeded": boolean,
             "duplicate_id": "extracted ID or null",
             "summary": "brief description of outcome",
             "error": string | null
@@ -182,20 +204,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: cleanup_delete_collection
-
-  - id: cleanup_delete_collection
-    type: toolkit
-    continue_on_error: true
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: delete_collection
-    input:
-      - duplicate_id
-    input_mapping:
-      collection_id:
-        type: variable
-        value: duplicate_id
-    output:
-      - delete_result
-    structured_output: true
     transition: END

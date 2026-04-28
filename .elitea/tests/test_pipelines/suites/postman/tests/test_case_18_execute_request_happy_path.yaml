@@ -13,10 +13,16 @@ description: |
   - Request completes without errors
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
+  duplicate_name:
+    type: str
+  duplicate_result:
+    type: str
+  duplicate_id:
+    type: str
   tool_result:
     type: dict
   test_results:
@@ -31,9 +37,7 @@ state:
     type: str
   create_request_result:
     type: str
-  delete_request_result:
-    type: str
-  delete_folder_result:
+  delete_result:
     type: str
 entry_point: prepare_test_data
 
@@ -48,27 +52,83 @@ nodes:
         import string
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        duplicate_name = f"PST18_Collection_{timestamp}_{suffix}"
         folder_name = f"PST18_Folder_{timestamp}_{suffix}"
         request_name = f"PST18_Request_{timestamp}_{suffix}"
         {
+          "duplicate_name": duplicate_name,
           "folder_name": folder_name,
           "request_name": request_name,
           "request_path": f"{folder_name}/{request_name}"
         }
     output:
+      - duplicate_name
       - folder_name
       - request_name
       - request_path
+    structured_output: true
+    transition: duplicate_collection
+
+  - id: duplicate_collection
+    type: toolkit
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: duplicate_collection
+    input:
+      - duplicate_name
+    input_mapping:
+      new_name:
+        type: variable
+        value: duplicate_name
+    output:
+      - duplicate_result
+    structured_output: true
+    transition: extract_duplicate_id
+
+  - id: extract_duplicate_id
+    type: code
+    code:
+      type: fstring
+      value: |
+        import json
+        import re
+        
+        result_str = elitea_state.get('duplicate_result', '')
+        duplicate_id = None
+        
+        try:
+            result_data = json.loads(result_str)
+            if isinstance(result_data, dict) and 'collection' in result_data:
+                coll = result_data['collection']
+                duplicate_id = coll.get('id') or coll.get('uid')
+                if not duplicate_id and 'info' in coll:
+                    duplicate_id = coll['info'].get('_postman_id') or coll['info'].get('uid')
+        except:
+            pass
+        
+        if not duplicate_id:
+            id_match = re.search(r'"(?:id|uid|_postman_id)"\s*:\s*"([^"]+)"', result_str)
+            if id_match:
+                duplicate_id = id_match.group(1)
+        
+        duplicate_id or "ID_NOT_FOUND"
+    input:
+      - duplicate_result
+    output:
+      - duplicate_id
     structured_output: true
     transition: create_test_folder
 
   - id: create_test_folder
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_folder
     input:
+      - duplicate_id
       - folder_name
     input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
       name:
         type: variable
         value: folder_name
@@ -79,12 +139,16 @@ nodes:
 
   - id: create_test_request
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_request
     input:
+      - duplicate_id
       - folder_name
       - request_name
     input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
       folder_path:
         type: variable
         value: folder_name
@@ -104,17 +168,36 @@ nodes:
 
   - id: invoke_execute_request
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: execute_request
     input:
+      - duplicate_id
       - request_path
     input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
       request_path:
         type: variable
         value: request_path
     output:
-
       - tool_result
+    structured_output: true
+    transition: cleanup_delete_collection
+
+  - id: cleanup_delete_collection
+    type: toolkit
+    continue_on_error: true
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    tool: delete_collection
+    input:
+      - duplicate_id
+    input_mapping:
+      collection_id:
+        type: variable
+        value: duplicate_id
+    output:
+      - delete_result
     structured_output: true
     transition: process_results
 
@@ -122,7 +205,10 @@ nodes:
     type: llm
     model: gpt-4o-2024-11-20
     input:
+      - duplicate_result
+      - duplicate_id
       - tool_result
+      - delete_result
     input_mapping:
       system:
         type: fixed
@@ -132,20 +218,28 @@ nodes:
         value: |
           Analyze the output from the 'execute_request' tool.
           
+          Duplicate Result: {duplicate_result}
+          Duplicate ID: {duplicate_id}
           Tool Result: {tool_result}
+          Delete Result: {delete_result}
           
           This test validates that execute_request executes a request and returns response.
           
           Perform the following checks:
-          1. Confirm the tool executed successfully.
-          2. Verify the result contains HTTP response information.
-          3. Check for response status code, headers, or body.
-          4. Validate that the request was actually executed.
+          1. Confirm duplicate collection was created successfully.
+          2. Confirm the tool executed successfully.
+          3. Verify the result contains HTTP response information.
+          4. Check for response status code, headers, or body.
+          5. Validate that the request was actually executed.
+          6. Confirm duplicate collection was deleted successfully.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if request was executed successfully),
+            "test_passed": boolean (true if ALL checks pass),
+            "duplicate_created": boolean,
+            "request_executed": boolean,
+            "cleanup_succeeded": boolean,
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
@@ -158,36 +252,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: cleanup_request
-
-  - id: cleanup_request
-    type: toolkit
-    continue_on_error: true
-    toolkit_name: ${TOOLKIT_NAME}
-    tool: delete_request
-    input:
-      - request_path
-    input_mapping:
-      request_path:
-        type: variable
-        value: request_path
-    output:
-      - delete_request_result
-    structured_output: true
-    transition: cleanup_folder
-
-  - id: cleanup_folder
-    type: toolkit
-    continue_on_error: true
-    toolkit_name: ${TOOLKIT_NAME}
-    tool: delete_folder
-    input:
-      - folder_name
-    input_mapping:
-      folder_path:
-        type: variable
-        value: folder_name
-    output:
-      - delete_folder_result
-    structured_output: true
     transition: END
