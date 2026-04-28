@@ -26,6 +26,7 @@ from .EliteAJSONLinesLoader import EliteAJSONLinesLoader
 from .EliteAPDFLoader import EliteAPDFLoader
 from .EliteAPowerPointLoader import EliteAPowerPointLoader
 from .EliteATextLoader import EliteATextLoader
+from .EliteACodeLoader import EliteACodeLoader
 from .EliteAMarkdownLoader import EliteAMarkdownLoader
 from .EliteAPythonLoader import EliteAPythonLoader
 from enum import Enum
@@ -350,7 +351,15 @@ default_loader_config = {
     'allowed_to_override': DEFAULT_ALLOWED_BASE
 }
 
-code_loaders_map = {ext: default_loader_config for ext in code_extensions}
+code_loader_config = {
+    'class': EliteACodeLoader,
+    'mime_type': 'text/plain',
+    'is_multimodal_processing': False,
+    'kwargs': {},
+    'allowed_to_override': DEFAULT_ALLOWED_BASE
+}
+
+code_loaders_map = {ext: code_loader_config for ext in code_extensions}
 text_loaders_map = {ext: default_loader_config for ext in text_extensions}
 
 # Combined mapping — document_loaders_map is merged last so dedicated loaders
