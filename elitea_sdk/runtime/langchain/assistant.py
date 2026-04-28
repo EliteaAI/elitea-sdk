@@ -1162,15 +1162,26 @@ class Assistant:
             try:
                 from pydantic import create_model as _create_model
                 from pydantic.fields import Field as _Field
+                from pydantic_core import PydanticUndefined
                 # Keep task + any agent variables, but drop chat_history
                 swarm_fields = {}
                 for field_name, field_info in swarm_tool.args_schema.model_fields.items():
                     if field_name == 'chat_history':
                         continue  # Skip - always [] in swarm context
-                    swarm_fields[field_name] = (
-                        field_info.annotation,
-                        _Field(description=field_info.description, default=field_info.default)
-                    )
+                    # Avoid leaking PydanticUndefined into the schema - it causes
+                    # TypeError during LangGraph checkpoint serialization (msgpack).
+                    # For required fields (no default), omit the default parameter entirely.
+                    field_default = field_info.default
+                    if field_default is PydanticUndefined:
+                        swarm_fields[field_name] = (
+                            field_info.annotation,
+                            _Field(description=field_info.description)
+                        )
+                    else:
+                        swarm_fields[field_name] = (
+                            field_info.annotation,
+                            _Field(description=field_info.description, default=field_default)
+                        )
                 if not swarm_fields:
                     swarm_fields['task'] = (str, _Field(description="Task for the agent to execute"))
                 safe = ''.join(c if c.isalnum() else '_' for c in cfg['name'])
