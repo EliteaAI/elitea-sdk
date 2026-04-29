@@ -524,12 +524,11 @@ class Assistant:
             yaml_schema=self.prompt, memory=memory,
             elitea_client=self.elitea_client,
             steps_limit=self.max_iterations,
-            for_subgraph=self.is_subgraph,  # Pass for_subgraph flag to filter PrinterNodes
+            for_subgraph=self.is_subgraph,
             lazy_tools_mode=self.lazy_tools_mode,
-            always_bind_tools=self._always_bind_tools,  # Middleware tools always bound directly
-            middleware_manager=self.middleware_manager,  # Pass middleware for before_model hooks
+            always_bind_tools=self._always_bind_tools,
+            middleware_manager=self.middleware_manager,
         )
-        #
         return agent
 
     @staticmethod
@@ -564,6 +563,8 @@ class Assistant:
 
         from .langraph_agent import prepare_output_schema
         from .utils import create_state
+
+        middleware_mgr = self.middleware_manager
 
         toolnode_tools = [tool for tool in simple_tools if isinstance(tool, BaseTool)]
         if len(toolnode_tools) != len(simple_tools):
@@ -642,8 +643,27 @@ class Assistant:
                         + filtered_messages[insert_at:]
                     )
 
+            # Run before_model middleware (summarization/context trimming)
+            middleware_updates = []
+            if middleware_mgr is not None:
+                before_state = {**state, 'messages': filtered_messages}
+                before_state, middleware_updates = middleware_mgr.run_before_model(before_state, config or {})
+                filtered_messages = before_state.get('messages', filtered_messages)
+
             response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + filtered_messages, config)
-            return {'messages': [response]}
+            result_messages = [response]
+            if middleware_updates:
+                result_messages = list(middleware_updates) + result_messages
+            result = {'messages': result_messages}
+
+            # Run after_model middleware (context_info calculation)
+            if middleware_mgr is not None:
+                final_messages = filtered_messages + [response]
+                final_state = {**state, 'messages': final_messages}
+                middleware_mgr.run_after_model(final_state, config or {})
+                result['context_info'] = middleware_mgr.get_context_info()
+
+            return result
 
         def should_continue(state):
             messages = state.get('messages', [])

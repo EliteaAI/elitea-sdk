@@ -691,7 +691,7 @@ class StateModifierNode(Runnable):
 
 def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_before=None, interrupt_after=None,
                           interrupt_after_successors=None, state_class=None, output_variables=None,
-                          tool_registry=None):
+                          tool_registry=None, middleware_manager=None):
     # prepare output channels
     if interrupt_after is None:
         interrupt_after = []
@@ -741,7 +741,8 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
         store=store,
         schema_to_mapper=state_class,
         output_variables=output_variables,
-        tool_registry=tool_registry
+        tool_registry=tool_registry,
+        middleware_manager=middleware_manager,
     )
 
     compiled.attach_node(START, None)
@@ -1301,7 +1302,8 @@ def create_graph(
         interrupt_after_successors=interrupt_after_successors,
         state_class={state_class: None},
         output_variables=node.get('output', []),
-        tool_registry=tool_registry
+        tool_registry=tool_registry,
+        middleware_manager=middleware_manager,
     )
     return compiled.validate()
 
@@ -1372,11 +1374,12 @@ def convert_dict_to_message(msg_dict):
 
 class LangGraphAgentRunnable(CompiledStateGraph):
     def __init__(self, *args, output_variables=None, tool_registry=None,
-                 interrupt_after_successors=None, **kwargs):
+                 interrupt_after_successors=None, middleware_manager=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_variables = output_variables
         self.tool_registry = tool_registry
         self._interrupt_after_successors = interrupt_after_successors or set()
+        self._middleware_manager = middleware_manager
 
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
@@ -1443,12 +1446,18 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
         # Check if checkpoint exists early for chat_history handling
         checkpoint_exists = self.checkpointer and self.checkpointer.get_tuple(config)
-        
-        # Handle chat history and current input properly
+
+        # Handle chat history and current input properly.
+        # When a checkpoint exists we defer the decision: if the checkpoint
+        # turns out to be stale (completed or crashed) it will be cleared and
+        # we'll need the chat_history to reconstruct conversation context.
+        # We stash the raw list in _deferred_chat_history for that case.
         if input.get('chat_history') and not input.get('messages'):
             if checkpoint_exists:
-                # Checkpoint already has conversation history - discard redundant chat_history
-                input.pop('chat_history', None)
+                # Don't convert yet — the checkpoint *might* still be valid
+                # (e.g. HITL resume, should_continue). If the checkpoint is
+                # cleared later, _inject_deferred_chat_history will convert it.
+                input['_deferred_chat_history'] = input.pop('chat_history')
             else:
                 # No checkpoint - convert chat history dict messages to LangChain message objects
                 chat_history = input.pop('chat_history')
@@ -1554,6 +1563,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         try:
             checkpoint_tuple = self.checkpointer.get_tuple(config) if self.checkpointer else None
             if checkpoint_tuple:
+                # Pop deferred history early — only the stale-checkpoint branches
+                # will re-inject it via _inject_deferred_chat_history.
+                _deferred_history = input.pop('_deferred_chat_history', None)
                 # Check if checkpoint is at END state (previous run completed)
                 checkpoint_state = self.get_state(config)
                 is_at_end = not checkpoint_state.next
@@ -1705,6 +1717,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         f"[CHECKPOINT] Previous run completed (at END), starting fresh turn for thread {thread_id}"
                     )
                     self._clear_stale_checkpoint(config, checkpoint_state)
+                    self._inject_deferred_chat_history(input, _deferred_history)
                     result = super().invoke(input, config=config, *args, **kwargs)
                 else:
                     # Checkpoint exists but execution didn't finish.
@@ -1729,6 +1742,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             f"clearing stale checkpoint for thread {thread_id}"
                         )
                         self._clear_stale_checkpoint(config, checkpoint_state)
+                        self._inject_deferred_chat_history(input, _deferred_history)
                         result = super().invoke(input, config=config, *args, **kwargs)
             else:
                 result = super().invoke(input, config=config, *args, **kwargs)
@@ -1744,6 +1758,27 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
             if isinstance(configurable, dict):
                 configurable.pop('_hitl_resume_context', None)
+
+
+        # ── Fallback context_info for pipelines without LLM nodes ──────
+        # LLMNode computes context_info via after_model middleware. Pipelines
+        # that have only toolkit/function nodes never invoke LLMNode, so
+        # context_info stays None. Compute it here from the final messages.
+        if (isinstance(result, dict)
+                and not result.get('context_info')
+                and self._middleware_manager is not None
+                and self._middleware_manager._middleware):
+            final_messages = result.get('messages', [])
+            if final_messages:
+                msgs_for_count = list(final_messages)
+                # The current user input was extracted into input['input'] during
+                # preprocessing and isn't in the final state messages.
+                if isinstance(input, dict) and input.get('input'):
+                    msgs_for_count.append(HumanMessage(content=''))
+                self._middleware_manager.run_after_model(
+                    {'messages': msgs_for_count}, config or {}
+                )
+                result['context_info'] = self._middleware_manager.get_context_info()
 
         # ── Pipeline-blocked fast path ──────────────────────────────────
         # _pipeline_blocked carries the blocked-termination message string
@@ -1849,6 +1884,10 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             for key, value in config_state.values.items():
                 if key != 'output':
                     result_with_state[key] = value
+
+        # Apply fallback context_info if state didn't have one (pipeline without LLM nodes)
+        if not result_with_state.get('context_info') and isinstance(result, dict) and result.get('context_info'):
+            result_with_state['context_info'] = result['context_info']
 
         return result_with_state
 
@@ -2063,6 +2102,20 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             self.update_state(config, {'hitl_decisions': None})
         if checkpoint_state.values.get('_pipeline_blocked'):
             self.update_state(config, {'_pipeline_blocked': None})
+        if checkpoint_state.values.get('context_info'):
+            self.update_state(config, {'context_info': None})
+
+    @staticmethod
+    def _inject_deferred_chat_history(input: dict, deferred_history: list | None) -> None:
+        """Convert deferred chat_history into input['messages'].
+
+        When a checkpoint existed at decision time, chat_history was stashed
+        instead of being converted. Now that the checkpoint has been cleared,
+        we need this history as messages so the LLM has full conversation
+        context for the new turn.
+        """
+        if deferred_history and not input.get('messages'):
+            input['messages'] = [convert_dict_to_message(msg) for msg in deferred_history]
 
     def _handle_graph_recursion_error(
             self,
