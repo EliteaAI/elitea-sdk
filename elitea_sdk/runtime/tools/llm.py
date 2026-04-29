@@ -932,8 +932,6 @@ class LLMNode(BaseTool):
         try:
             result = self._invoke_llm_internal(state, config, middleware_updates)
         except GraphBubbleUp:
-            # GraphInterrupt (from interrupt()) must propagate to the graph executor
-            # for proper HITL / checkpoint handling.
             raise
         except Exception as e:
             model_info = getattr(self.client, 'model_name', None) or getattr(self.client, 'model', 'unknown')
