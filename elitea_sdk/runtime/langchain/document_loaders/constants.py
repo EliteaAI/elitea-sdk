@@ -204,7 +204,7 @@ document_loaders_map = {
         'mime_type': 'application/pdf',
         'is_multimodal_processing': False,
         'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
+        'allowed_to_override': {**DEFAULT_ALLOWED_WITH_LLM, 'extract_images': False}
     },
     '.docx': {
         'class': EliteADocxMammothLoader,
