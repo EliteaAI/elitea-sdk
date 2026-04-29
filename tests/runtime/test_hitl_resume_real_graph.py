@@ -176,17 +176,55 @@ class _ThinkingComplexArgsLLMBound:
 # ─── Helper to build a fresh runnable (new Assistant + new graph each time) ──
 
 
-def _make_tools():
-    """Create the tools that the LLM will call."""
+class _ToolExecutionCounter:
+    """Side-effect counter shared across runnables built within a single test.
+
+    Mirrors the real-system behavior where each HTTP request creates a fresh
+    graph + tool instances, but real toolkits hit the same external system,
+    so we can tell whether a non-sensitive tool was actually re-executed
+    on the resume path. Closes the gap flagged in PR review (issue #4333).
+    """
+
+    def __init__(self):
+        self.search_issues = 0
+        self.create_issue = 0
+
+
+def _make_tools(counter: "_ToolExecutionCounter | None" = None):
+    """Create the tools that the LLM will call.
+
+    When ``counter`` is provided, each tool invocation increments the matching
+    counter so the test can assert exactly-once execution semantics across
+    HITL round-trips.
+    """
+
+    def _search_issues(query="", project="", max_results=10, filters=None):
+        if counter is not None:
+            counter.search_issues += 1
+        return "search-result:3 issues found"
+
+    def _create_issue(
+        project_key="",
+        summary="",
+        issue_type="",
+        priority="",
+        description="",
+        labels=None,
+        custom_fields=None,
+    ):
+        if counter is not None:
+            counter.create_issue += 1
+        return "create-result:PROJ-123"
+
     return [
         StructuredTool.from_function(
-            func=lambda query="", project="", max_results=10, filters=None: "search-result:3 issues found",
+            func=_search_issues,
             name="search_issues",
             description="Search for issues in a project",
             metadata={"toolkit_type": "jira", "toolkit_name": "jira", "tool_name": "search_issues"},
         ),
         StructuredTool.from_function(
-            func=lambda project_key="", summary="", issue_type="", priority="", description="", labels=None, custom_fields=None: "create-result:PROJ-123",
+            func=_create_issue,
             name="create_issue",
             description="Create a new issue",
             metadata={"toolkit_type": "jira", "toolkit_name": "jira", "tool_name": "create_issue"},
@@ -194,7 +232,7 @@ def _make_tools():
     ]
 
 
-def _build_runnable(memory: MemorySaver, llm):
+def _build_runnable(memory: MemorySaver, llm, counter: "_ToolExecutionCounter | None" = None):
     """Build a fresh Assistant → runnable (creates a new graph each time).
 
     This matches production: each HTTP request creates a new Assistant and
@@ -204,7 +242,7 @@ def _build_runnable(memory: MemorySaver, llm):
         elitea=_DummyRuntime(),
         data={"instructions": "Use tools as needed to complete the task.", "tools": [], "meta": {}},
         client=llm,
-        tools=_make_tools(),
+        tools=_make_tools(counter),
         memory=memory,
         app_type="predict",
         middleware=[SensitiveToolGuardMiddleware()],
@@ -235,10 +273,11 @@ class TestHITLResumeRealGraphComplexArgs:
         configure_sensitive_tools({"jira": ["create_issue"]})
         memory = MemorySaver()
         thread_cfg = {"configurable": {"thread_id": "real-graph-standard-args"}}
+        counter = _ToolExecutionCounter()
 
         # ═══ Phase 1: Initial request → HITL interrupt on create_issue ═══
         llm1 = _ComplexArgsLLM()
-        runnable1 = _build_runnable(memory, llm1)
+        runnable1 = _build_runnable(memory, llm1, counter)
 
         r1 = runnable1.invoke(
             {"messages": [HumanMessage(content="Search for feature X and create a task")]},
@@ -251,9 +290,19 @@ class TestHITLResumeRealGraphComplexArgs:
         # Verify args preserved in interrupt payload
         assert r1["hitl_interrupt"]["tool_args"]["project_key"] == "PROJ"
 
+        # Pre-resume: search_issues ran once; create_issue was blocked before run
+        assert counter.search_issues == 1, (
+            f"search_issues should have run exactly once before HITL, "
+            f"got {counter.search_issues}"
+        )
+        assert counter.create_issue == 0, (
+            "create_issue must NOT execute before HITL approval, "
+            f"got {counter.create_issue}"
+        )
+
         # ═══ Phase 2: Resume with a BRAND NEW runnable (new graph, same memory) ═══
         llm2 = _ComplexArgsLLM()
-        runnable2 = _build_runnable(memory, llm2)
+        runnable2 = _build_runnable(memory, llm2, counter)
 
         r2 = runnable2.invoke(
             {"hitl_resume": True, "hitl_action": "approve", "hitl_value": ""},
@@ -275,6 +324,17 @@ class TestHITLResumeRealGraphComplexArgs:
         assert len(llm2.invocations) == 1, (
             f"Expected 1 LLM invocation on resume (tool results → final answer), "
             f"got {len(llm2.invocations)}. Agent re-invoked tools from scratch!"
+        )
+
+        # CRITICAL: side-effect assertions — non-sensitive sibling must NOT re-run
+        assert counter.search_issues == 1, (
+            f"search_issues was re-executed on HITL resume "
+            f"(count={counter.search_issues}). Issue #4333 regression: "
+            f"non-sensitive sibling tools must not re-execute."
+        )
+        assert counter.create_issue == 1, (
+            f"create_issue should run exactly once (only on resume), "
+            f"got {counter.create_issue}"
         )
 
         # Verify the resume LLM call received BOTH tool results
@@ -300,10 +360,11 @@ class TestHITLResumeRealGraphComplexArgs:
         configure_sensitive_tools({"jira": ["create_issue"]})
         memory = MemorySaver()
         thread_cfg = {"configurable": {"thread_id": "real-graph-thinking-args"}}
+        counter = _ToolExecutionCounter()
 
         # ═══ Phase 1: Initial request → HITL ═══
         llm1 = _ThinkingComplexArgsLLM()
-        runnable1 = _build_runnable(memory, llm1)
+        runnable1 = _build_runnable(memory, llm1, counter)
 
         r1 = runnable1.invoke(
             {"messages": [HumanMessage(content="Search and create task")]},
@@ -312,10 +373,12 @@ class TestHITLResumeRealGraphComplexArgs:
 
         assert r1["execution_finished"] is False
         assert r1["hitl_interrupt"]["tool_name"] == "create_issue"
+        assert counter.search_issues == 1
+        assert counter.create_issue == 0
 
         # ═══ Phase 2: Resume with NEW runnable (new graph) ═══
         llm2 = _ThinkingComplexArgsLLM()
-        runnable2 = _build_runnable(memory, llm2)
+        runnable2 = _build_runnable(memory, llm2, counter)
 
         r2 = runnable2.invoke(
             {"hitl_resume": True, "hitl_action": "approve", "hitl_value": ""},
@@ -332,6 +395,16 @@ class TestHITLResumeRealGraphComplexArgs:
         assert len(llm2.invocations) == 1, (
             f"Expected 1 LLM invocation, got {len(llm2.invocations)}. "
             f"Anthropic thinking model lost context and re-invoked tools."
+        )
+
+        # CRITICAL: side-effect assertions for thinking-model HITL resume
+        assert counter.search_issues == 1, (
+            f"search_issues was re-executed on Anthropic thinking-model HITL "
+            f"resume (count={counter.search_issues}). Issue #4333 regression."
+        )
+        assert counter.create_issue == 1, (
+            f"create_issue should run exactly once (only on resume), "
+            f"got {counter.create_issue}"
         )
 
         # Verify thinking blocks survived in the AIMessage
@@ -374,10 +447,11 @@ class TestHITLResumeRealGraphComplexArgs:
         configure_sensitive_tools({"jira": ["create_issue", "search_issues"]})
         memory = MemorySaver()
         thread_cfg = {"configurable": {"thread_id": "real-graph-multi-sensitive"}}
+        counter = _ToolExecutionCounter()
 
         # ═══ Phase 1: Initial request → first sensitive tool interrupted ═══
         llm1 = _ComplexArgsLLM()
-        runnable1 = _build_runnable(memory, llm1)
+        runnable1 = _build_runnable(memory, llm1, counter)
 
         r1 = runnable1.invoke(
             {"messages": [HumanMessage(content="Do the things")]},
@@ -394,7 +468,7 @@ class TestHITLResumeRealGraphComplexArgs:
 
         # ═══ Phase 2: Approve first tool → expect second tool interrupt ═══
         llm2 = _ComplexArgsLLM()
-        runnable2 = _build_runnable(memory, llm2)
+        runnable2 = _build_runnable(memory, llm2, counter)
 
         r2 = runnable2.invoke(
             {"hitl_resume": True, "hitl_action": "approve", "hitl_value": ""},
@@ -408,7 +482,7 @@ class TestHITLResumeRealGraphComplexArgs:
 
             # ═══ Phase 3: Approve second tool → pipeline completes ═══
             llm3 = _ComplexArgsLLM()
-            runnable3 = _build_runnable(memory, llm3)
+            runnable3 = _build_runnable(memory, llm3, counter)
 
             r3 = runnable3.invoke(
                 {"hitl_resume": True, "hitl_action": "approve", "hitl_value": ""},
@@ -426,3 +500,15 @@ class TestHITLResumeRealGraphComplexArgs:
                 f"Expected pipeline to complete. Got: {r2}"
             )
             assert "PROJ-123" in r2.get("output", "")
+
+        # CRITICAL: each tool must execute exactly once across the full
+        # multi-interrupt round-trip. If an HITL approve causes the LLM to
+        # restart from scratch, these counters will exceed 1.
+        assert counter.search_issues == 1, (
+            f"search_issues executed {counter.search_issues} times across the "
+            f"multi-sensitive HITL round-trip; expected exactly 1."
+        )
+        assert counter.create_issue == 1, (
+            f"create_issue executed {counter.create_issue} times across the "
+            f"multi-sensitive HITL round-trip; expected exactly 1."
+        )

@@ -24,7 +24,12 @@ from langgraph.types import Command
 
 from .constants import PRINTER_NODE_RS, PRINTER, PRINTER_COMPLETED_STATE, DEAULT_AGENT_NAME
 from .mixedAgentRenderes import convert_message_to_json
-from .utils import create_state, propagate_the_input_mapping, safe_format
+from .utils import (
+    args_match_normalized,
+    create_state,
+    propagate_the_input_mapping,
+    safe_format,
+)
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
 from ..tools.function import FunctionTool
 from ..tools.hitl import HITLNode
@@ -72,23 +77,13 @@ def normalize_message_content(content: Any) -> str:
 
 
 def _args_match_normalized(args_a: dict, args_b: dict) -> bool:
-    """Compare tool args with JSON-normalized equality.
+    """Backwards-compatible alias to :func:`args_match_normalized` in utils.
 
-    Handles type differences from JSON round-trip through LangGraph checkpoints:
-    - int vs float (e.g., 1 vs 1.0)
-    - dict key ordering differences
-    - None vs missing keys
+    Kept for any external callers that imported the leading-underscore name
+    from this module. New code should import ``args_match_normalized`` from
+    ``elitea_sdk.runtime.langchain.utils`` directly.
     """
-    if args_a == args_b:
-        return True
-    if not args_a and not args_b:
-        return True
-    try:
-        norm_a = json.dumps(args_a, sort_keys=True, default=str)
-        norm_b = json.dumps(args_b, sort_keys=True, default=str)
-        return norm_a == norm_b
-    except (TypeError, ValueError):
-        return False
+    return args_match_normalized(args_a, args_b)
 
 
 # Global registry for subgraph definitions
@@ -1958,7 +1953,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
         interrupt_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args') or {}
         resumed_args = hitl_resume_ctx.get('tool_args') or {}
-        return _args_match_normalized(interrupt_args, resumed_args)
+        return args_match_normalized(interrupt_args, resumed_args)
 
     @staticmethod
     def _trim_pending_messages(pending_msgs_dicts: list[dict]) -> list[dict]:
@@ -2081,7 +2076,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     continue
                 tc_name = tc.get('name', '')
                 tc_args = tc.get('args', {}) if isinstance(tc.get('args'), dict) else {}
-                if tc_name == tool_name and _args_match_normalized(tc_args, target_args):
+                if tc_name == tool_name and args_match_normalized(tc_args, target_args):
                     return msg_dict
             # Stop walking past the last AIMessage; earlier AIs are not relevant.
             return None
