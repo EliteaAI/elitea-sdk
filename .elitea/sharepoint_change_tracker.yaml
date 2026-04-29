@@ -901,17 +901,9 @@ nodes:
         # 5. Save updated retrieval log
         r = store.create(f'{file_prefix}retrieval_log.txt', '\n'.join(log_lines))
 
-        # 6. Save snapshot to main bucket
+        # 6. Save snapshot to main bucket only
         snapshot_json = json.dumps(current_snapshot, indent=2, ensure_ascii=False)
         r = store.create(f'{file_prefix}snapshot.json', snapshot_json)
-        
-        # Also save snapshot as baseline to ba-user-stories bucket
-        baseline_filename = f"{input_id}_sp_baseline__{username}.json" if username else f"{input_id}_sp_baseline.json"
-        try:
-            ba_store = alita_client.artifact('ba-user-stories')
-            ba_store.create(baseline_filename, snapshot_json)
-        except Exception:
-            pass  # Don't fail if ba-user-stories bucket save fails
 
         # 7. Enhance file entries with artifact storage filenames
         def add_artifact_filenames(files, file_type):
@@ -1455,15 +1447,31 @@ nodes:
       {% if current_diff_index|int < files_to_diff|length %}
         ComputeDiffAndAdvance
       {% else %}
-        CreateJoinedFile
+        CheckChangesExist
       {% endif %}
-    default_output: CreateJoinedFile
+    default_output: CheckChangesExist
     input:
       - current_diff_index
       - files_to_diff
     routes:
       - ComputeDiffAndAdvance
+      - CheckChangesExist
+  - id: CheckChangesExist
+    type: router
+    condition: |
+      {% if new_files|length > 0 or changed_files|length > 0 or removed_files|length > 0 %}
+        CreateJoinedFile
+      {% else %}
+        FormatEnhancedOutput
+      {% endif %}
+    default_output: FormatEnhancedOutput
+    input:
+      - new_files
+      - changed_files
+      - removed_files
+    routes:
       - CreateJoinedFile
+      - FormatEnhancedOutput
   - id: ComputeDiffAndAdvance
     type: code
     code:
@@ -1747,10 +1755,9 @@ nodes:
         else:
             report_lines.append("- `changes_YYYYMMDD_HHMMSS_username.json` — per-run change report (last 5 kept, auto-cleanup)")
 
+        # Only mention context file if it was created (i.e., if there were changes)
         if joined_filename:
-            report_lines.append(f"- `{joined_filename}` — combined file report (new + changed files, overwritten each run)")
-        else:
-            report_lines.append("- `{input_id}_sp_context__{username}.md` — combined file report (overwritten each run)")
+            report_lines.append(f"- `{joined_filename}` — combined file report (new + changed files, updated this run)")
 
         report_lines.extend([
             "- `file_[Id]_[name].txt` — current file versions",
@@ -1811,14 +1818,15 @@ nodes:
 
         new_files = alita_state.get('new_files', [])
         changed_files = alita_state.get('changed_files', [])
+        current_snapshot = alita_state.get('current_snapshot', {})
         current_retrieval_date = alita_state.get('current_retrieval_date', '')
         username = alita_state.get('username', 'unknown')
         input_id = alita_state.get('input_id', '')
 
-        # Filename pattern matches sp_collector: {feature_id}_sp_context__{username}.md
-        joined_filename = f"{input_id}_sp_context__{username}.md" if username else f"{input_id}_sp_context.md"
+        # Build diff filename for incremental changes (new + changed with diffs)
+        diff_filename = f"{input_id}_sp_diff__{username}.md" if username else f"{input_id}_sp_diff.md"
 
-        # Build joined content
+        # Build diff content (incremental changes)
         sections = []
         sections.append("=" * 80)
         sections.append(f"SharePoint Combined Files Report")
@@ -1876,23 +1884,23 @@ nodes:
                 
                 safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
                 safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                diff_filename = f"{file_prefix}file_diff_{file_id}_{safe_name}.txt"
+                artifact_diff_filename = f"{file_prefix}file_diff_{file_id}_{safe_name}.txt"
                 
                 sections.append("\n" + "-" * 80)
                 sections.append(f"File: {name}")
                 sections.append(f"Path: {path}")
                 sections.append(f"Previous Modified: {prev_modified}")
                 sections.append(f"Current Modified: {curr_modified}")
-                sections.append(f"Diff Artifact: {diff_filename}")
+                sections.append(f"Diff Artifact: {artifact_diff_filename}")
                 sections.append("-" * 80)
                 
                 # Fetch diff content from artifact storage
                 try:
-                    diff_content = store.get(diff_filename)
-                    if diff_content and not any(err in str(diff_content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
-                        sections.append(str(diff_content))
+                    file_diff_content = store.get(artifact_diff_filename)
+                    if file_diff_content and not any(err in str(file_diff_content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+                        sections.append(str(file_diff_content))
                     else:
-                        sections.append(f"[Diff not available: {diff_content}]")
+                        sections.append(f"[Diff not available: {file_diff_content}]")
                 except Exception as e:
                     sections.append(f"[Error reading diff: {e}]")
                 
@@ -1903,29 +1911,85 @@ nodes:
         sections.append("END OF REPORT")
         sections.append("=" * 80)
 
-        # Join all sections
-        joined_content = "\n".join(sections)
+        # Join all sections (this becomes the diff file)
+        diff_content = "\n".join(sections)
+
+        # Build context filename for ALL current files (this becomes the main context file)
+        context_filename = f"{input_id}_sp_context__{username}.md" if username else f"{input_id}_sp_context.md"
+        context_sections = []
+        context_sections.append("=" * 80)
+        context_sections.append(f"SharePoint Context - Full Snapshot")
+        context_sections.append(f"Generated: {current_retrieval_date}")
+        context_sections.append(f"Total files: {len(current_snapshot)}")
+        context_sections.append("=" * 80)
+        context_sections.append("")
+
+        # Add ALL current files with full content
+        for idx, (path, metadata) in enumerate(sorted(current_snapshot.items()), 1):
+            name = metadata.get('Name', 'Unknown')
+            file_id = metadata.get('id', '')
+            modified = metadata.get('Modified', '')
+            
+            if not file_id or not name:
+                continue
+            
+            safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+            safe_name = re.sub(r'-+', '-', safe_name)
+            artifact_filename = f"{file_prefix}file_{file_id}_{safe_name}.txt"
+            
+            context_sections.append("\n" + "-" * 80)
+            context_sections.append(f"File {idx}/{len(current_snapshot)}: {name}")
+            context_sections.append(f"Path: {path}")
+            context_sections.append(f"Modified: {modified}")
+            context_sections.append(f"Artifact: {artifact_filename}")
+            context_sections.append("-" * 80)
+            
+            # Fetch file content from artifact storage
+            try:
+                content = store.get(artifact_filename)
+                if content and not any(err in str(content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
+                    context_sections.append(str(content))
+                else:
+                    context_sections.append(f"[Content not available: {content}]")
+            except Exception as e:
+                context_sections.append(f"[Error reading content: {e}]")
+            
+            context_sections.append("")
+
+        context_sections.append("\n" + "=" * 80)
+        context_sections.append("END OF SNAPSHOT")
+        context_sections.append("=" * 80)
+
+        context_content = "\n".join(context_sections)
 
         # Save to main bucket artifact storage with prefix (subfolder structure)
         joined_status = ''
         try:
-            sp_repo_filename = f"{file_prefix}{joined_filename}"
-            store.create(sp_repo_filename, joined_content)
-            joined_status = f"✅ Created `{sp_repo_filename}` in sp-repo ({len(joined_content)} bytes)"
+            # Save context file (full snapshot) to sp-repo
+            sp_repo_context_filename = f"{file_prefix}{context_filename}"
+            store.create(sp_repo_context_filename, context_content)
+            joined_status = f"✅ Created `{sp_repo_context_filename}` (context) in sp-repo ({len(context_content)} bytes)"
             
             # Also save to ba-user-stories bucket (no prefix, root level)
             ba_store = alita_client.artifact('ba-user-stories')
-            ba_store.create(joined_filename, joined_content)
-            joined_status += f" + `{joined_filename}` in ba-user-stories"
+            
+            # Save diff file (incremental changes)
+            ba_store.create(diff_filename, diff_content)
+            joined_status += f" + `{diff_filename}` (diff)"
+            
+            # Save context file (full snapshot - main file)
+            ba_store.create(context_filename, context_content)
+            joined_status += f" + `{context_filename}` (context) in ba-user-stories"
         except Exception as e:
             joined_status = f"❌ Error: {str(e)}"
-            joined_filename = f"error_{joined_filename}"
+            context_filename = f"error_{context_filename}"
 
-        {'joined_filename': sp_repo_filename if 'sp_repo_filename' in locals() else joined_filename, 'joined_status': joined_status}
+        {'joined_filename': sp_repo_context_filename if 'sp_repo_context_filename' in locals() else context_filename, 'joined_status': joined_status}
     input:
       - bucket_name
       - new_files
       - changed_files
+      - current_snapshot
       - current_retrieval_date
       - username
       - input_id
