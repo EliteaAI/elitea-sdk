@@ -169,3 +169,198 @@ class TestToolCallAlreadyCompleted:
             ToolMessage(content="result", tool_call_id=""),
         ]
         assert LLMNode._tool_call_already_completed("", messages) is False
+
+
+class TestSensitiveToolBatchApproval:
+    """User-described UX invariant (#4333):
+
+    "Approve create_file once → other create_file calls in the same batch
+    auto-approve. A different sensitive tool (create_pr) in the same batch
+    must still grab user attention."
+    """
+
+    def test_same_qualified_name_auto_approves_in_batch(self):
+        from unittest.mock import patch
+        from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
+            SensitiveToolGuardMiddleware,
+            begin_hitl_batch,
+            end_hitl_batch,
+        )
+
+        interrupts = []
+
+        def fake_interrupt(payload):
+            interrupts.append(payload)
+            return {'action': 'approve', 'value': ''}
+
+        guard = SensitiveToolGuardMiddleware.__new__(SensitiveToolGuardMiddleware)
+        guard._auto_approve = False
+
+        ctx = {
+            'tool_name': 'create_file',
+            'toolkit_name': 'github',
+            'toolkit_type': 'github',
+            'action_label': 'github.create_file',
+            'policy_message': 'Authorize?',
+            'tool_args': {'path': 'a.txt'},
+        }
+
+        token = begin_hitl_batch()
+        try:
+            with patch(
+                'elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt',
+                side_effect=fake_interrupt,
+            ):
+                # 5 sibling create_file calls: only first prompts.
+                for i in range(5):
+                    assert guard._review_sensitive_tool_call(ctx)['action'] == 'approve'
+                assert len(interrupts) == 1, (
+                    f"5 create_file siblings should produce 1 interrupt; got {len(interrupts)}"
+                )
+        finally:
+            end_hitl_batch(token)
+
+    def test_different_qualified_name_re_prompts_in_batch(self):
+        from unittest.mock import patch
+        from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
+            SensitiveToolGuardMiddleware,
+            begin_hitl_batch,
+            end_hitl_batch,
+        )
+
+        interrupts = []
+
+        def fake_interrupt(payload):
+            interrupts.append(payload)
+            return {'action': 'approve', 'value': ''}
+
+        guard = SensitiveToolGuardMiddleware.__new__(SensitiveToolGuardMiddleware)
+        guard._auto_approve = False
+
+        common = {
+            'toolkit_name': 'github',
+            'toolkit_type': 'github',
+            'policy_message': 'Authorize?',
+            'tool_args': {},
+        }
+
+        token = begin_hitl_batch()
+        try:
+            with patch(
+                'elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt',
+                side_effect=fake_interrupt,
+            ):
+                # First create_file → 1 interrupt.
+                guard._review_sensitive_tool_call({
+                    **common, 'tool_name': 'create_file',
+                    'action_label': 'github.create_file',
+                })
+                # create_pr (different name) → 1 more interrupt.
+                guard._review_sensitive_tool_call({
+                    **common, 'tool_name': 'create_pr',
+                    'action_label': 'github.create_pr',
+                })
+                # Second create_file → 0 more (auto-approved).
+                guard._review_sensitive_tool_call({
+                    **common, 'tool_name': 'create_file',
+                    'action_label': 'github.create_file',
+                })
+                # Second create_pr → 0 more (auto-approved).
+                guard._review_sensitive_tool_call({
+                    **common, 'tool_name': 'create_pr',
+                    'action_label': 'github.create_pr',
+                })
+                assert len(interrupts) == 2, (
+                    f"Expected 2 interrupts (one per distinct qualified name); got {len(interrupts)}"
+                )
+        finally:
+            end_hitl_batch(token)
+
+    def test_batch_approval_does_not_leak_across_batches(self):
+        from unittest.mock import patch
+        from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
+            SensitiveToolGuardMiddleware,
+            begin_hitl_batch,
+            end_hitl_batch,
+        )
+
+        interrupts = []
+
+        def fake_interrupt(payload):
+            interrupts.append(payload)
+            return {'action': 'approve', 'value': ''}
+
+        guard = SensitiveToolGuardMiddleware.__new__(SensitiveToolGuardMiddleware)
+        guard._auto_approve = False
+
+        ctx = {
+            'tool_name': 'create_file',
+            'toolkit_name': 'github',
+            'toolkit_type': 'github',
+            'action_label': 'github.create_file',
+            'policy_message': 'Authorize?',
+            'tool_args': {},
+        }
+
+        with patch(
+            'elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt',
+            side_effect=fake_interrupt,
+        ):
+            # Batch 1
+            t1 = begin_hitl_batch()
+            try:
+                guard._review_sensitive_tool_call(ctx)  # interrupt 1
+                guard._review_sensitive_tool_call(ctx)  # auto-approved
+            finally:
+                end_hitl_batch(t1)
+
+            # Batch 2: clean slate, must re-prompt.
+            t2 = begin_hitl_batch()
+            try:
+                guard._review_sensitive_tool_call(ctx)  # interrupt 2
+            finally:
+                end_hitl_batch(t2)
+
+            assert len(interrupts) == 2, (
+                f"Each batch must re-prompt on first call; got {len(interrupts)}"
+            )
+
+    def test_qualified_identity_separates_toolkits(self):
+        """Approving jira.create_issue must NOT auto-approve github.create_issue."""
+        from unittest.mock import patch
+        from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
+            SensitiveToolGuardMiddleware,
+            begin_hitl_batch,
+            end_hitl_batch,
+        )
+
+        interrupts = []
+
+        def fake_interrupt(payload):
+            interrupts.append(payload)
+            return {'action': 'approve', 'value': ''}
+
+        guard = SensitiveToolGuardMiddleware.__new__(SensitiveToolGuardMiddleware)
+        guard._auto_approve = False
+
+        token = begin_hitl_batch()
+        try:
+            with patch(
+                'elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt',
+                side_effect=fake_interrupt,
+            ):
+                guard._review_sensitive_tool_call({
+                    'tool_name': 'create_issue', 'toolkit_name': 'jira',
+                    'toolkit_type': 'jira', 'action_label': 'jira.create_issue',
+                    'policy_message': '', 'tool_args': {},
+                })
+                guard._review_sensitive_tool_call({
+                    'tool_name': 'create_issue', 'toolkit_name': 'github',
+                    'toolkit_type': 'github', 'action_label': 'github.create_issue',
+                    'policy_message': '', 'tool_args': {},
+                })
+                assert len(interrupts) == 2, (
+                    f"Different toolkits must re-prompt; got {len(interrupts)}"
+                )
+        finally:
+            end_hitl_batch(token)

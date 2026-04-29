@@ -1545,13 +1545,20 @@ def test_state_persisted_hitl_decisions_exclude_blocked_tools():
 def test_auto_approve_skips_interrupt_for_already_authorized_tool():
     """After a tool is authorized, subsequent calls to the same tool in the same
     execution batch must NOT trigger a new interrupt.  The guard should auto-
-    approve based on *_HITL_APPROVED_TOOLS* context variable so the user is not
+    approve based on *_HITL_BATCH_APPROVED* context variable so the user is not
     stuck in an infinite Authorize -> Execute -> Authorize loop.
+
+    NOTE: as of #4333 the middleware itself grows a per-batch approval set on
+    every successful approve so multi-sibling tool_calls in a single AI message
+    auto-approve correctly.  The batch lifecycle is owned by
+    ``__perform_tool_calling`` via ``begin_hitl_batch`` / ``end_hitl_batch``.
     """
     from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
         SensitiveToolGuardMiddleware,
         set_hitl_approved_tools,
         reset_hitl_approved_tools,
+        begin_hitl_batch,
+        end_hitl_batch,
     )
 
     interrupt_called = []
@@ -1579,28 +1586,61 @@ def test_auto_approve_skips_interrupt_for_already_authorized_tool():
             'tool_args': {'method': 'GET', 'endpoint': '/repos'},
         }
 
-        # 1) Without auto-approve, the guard should interrupt.
-        review1 = guard._review_sensitive_tool_call(ctx)
-        assert review1['action'] == 'approve'
-        assert len(interrupt_called) == 1, 'Expected exactly 1 interrupt call before auto-approve'
-
-        # 2) Activate auto-approve for this tool (using qualified identity).
-        token = set_hitl_approved_tools({'github.generic_github_api_call'})
+        # Open a batch (mimics __perform_tool_calling's lifecycle).
+        batch_token = begin_hitl_batch()
         try:
+            # 1) Empty batch set → interrupt fires.  The middleware grows
+            #    the batch set on a successful approve so subsequent calls
+            #    in the same batch with the SAME qualified identity skip
+            #    interrupt().
+            review1 = guard._review_sensitive_tool_call(ctx)
+            assert review1['action'] == 'approve'
+            assert len(interrupt_called) == 1, 'Expected exactly 1 interrupt call before auto-approve'
+
+            # 2) Same tool again in the same batch → auto-approved by the
+            #    grown batch set; no further interrupt.
             interrupt_called.clear()
             review2 = guard._review_sensitive_tool_call(ctx)
             assert review2['action'] == 'approve'
             assert len(interrupt_called) == 0, (
                 f'Auto-approve should skip interrupt(), but got {len(interrupt_called)} call(s)'
             )
-        finally:
-            reset_hitl_approved_tools(token)
 
-        # 3) After reset, interrupt should fire again.
+            # 3) A DIFFERENT sensitive tool in the same batch must still
+            #    re-prompt — only the SAME qualified identity auto-approves.
+            interrupt_called.clear()
+            review_pr = guard._review_sensitive_tool_call({
+                **ctx, 'tool_name': 'create_pr', 'action_label': 'github.create_pr',
+            })
+            assert review_pr['action'] == 'approve'
+            assert len(interrupt_called) == 1, (
+                'Different sensitive tool name must re-prompt; got '
+                f'{len(interrupt_called)} interrupt call(s)'
+            )
+
+            # 4) The pre-batch ``_HITL_APPROVED_TOOLS`` frozenset (set by
+            #    the LLM node from prior hitl_decisions) is still honored
+            #    independently of the batch set.
+            token = set_hitl_approved_tools({'github.list_issues'})
+            try:
+                interrupt_called.clear()
+                review_list = guard._review_sensitive_tool_call({
+                    **ctx, 'tool_name': 'list_issues',
+                    'action_label': 'github.list_issues',
+                })
+                assert review_list['action'] == 'approve'
+                assert len(interrupt_called) == 0, 'Pre-approved list_issues should auto-approve'
+            finally:
+                reset_hitl_approved_tools(token)
+        finally:
+            end_hitl_batch(batch_token)
+
+        # 5) Outside any batch, a fresh call re-prompts (no batch set
+        #    persists across batch boundaries).
         interrupt_called.clear()
-        review3 = guard._review_sensitive_tool_call(ctx)
-        assert review3['action'] == 'approve'
-        assert len(interrupt_called) == 1, 'Expected interrupt to fire again after reset'
+        review_fresh = guard._review_sensitive_tool_call(ctx)
+        assert review_fresh['action'] == 'approve'
+        assert len(interrupt_called) == 1, 'Expected interrupt to fire outside batch scope'
 
 
 def test_auto_approve_disambiguates_across_toolkits():

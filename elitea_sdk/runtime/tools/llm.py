@@ -1245,21 +1245,6 @@ class LLMNode(BaseTool):
             # Handle iterative tool-calling and execution
             hitl_decisions = state.get('hitl_decisions') if isinstance(state, dict) else None
 
-            # In nested-application / subgraph flows the persisted
-            # ``hitl_decisions`` lives only in the *parent* state, so the
-            # child LLM node cannot see the user's approve decision via
-            # state.  When the parent injected ``_hitl_resume_context``
-            # with an approve action, mirror it into a local decision so
-            # the auto-approve set covers any sibling sensitive tool_calls
-            # in the reused original AIMessage (issue #4333).
-            if hitl_ctx and hitl_ctx.get('action') == 'approve' and hitl_ctx.get('tool_name'):
-                synth_decision = {
-                    'tool_name': hitl_ctx.get('tool_name', ''),
-                    'toolkit_name': hitl_ctx.get('toolkit_name', ''),
-                    'action': 'approve',
-                }
-                hitl_decisions = list(hitl_decisions or []) + [synth_decision]
-
             # __perform_tool_calling deduplicates the completion against
             # `messages` internally (multi-tool sibling HITL resume case),
             # so we can pass the full `messages` here unconditionally.
@@ -1822,7 +1807,16 @@ class LLMNode(BaseTool):
         from ..middleware.sensitive_tool_guard import (
             set_hitl_approved_tools,
             reset_hitl_approved_tools,
+            begin_hitl_batch,
+            end_hitl_batch,
         )
+
+        # Open a batch-scoped approval set (mutable, shared by reference
+        # across child task contexts).  The middleware grows this set as
+        # the user approves sensitive tools; subsequent siblings with the
+        # SAME qualified identity in the same AI message auto-approve,
+        # while different sensitive tool names still re-prompt (#4333).
+        _batch_token = begin_hitl_batch()
 
         # Extract historically blocked tools from state-persisted HITL decisions.
         # These survive across checkpoint resumes and prevent the LLM from
@@ -1877,18 +1871,6 @@ class LLMNode(BaseTool):
         # meta-tools, so direct continuation tool calls would fail to resolve.
         # This dict maps tool-name -> BaseTool for the next iteration only.
         _forced_followup_lookup: Dict[str, BaseTool] = {}
-
-        # On HITL resume the original AIMessage may carry MULTIPLE sensitive
-        # sibling tool_calls (issue #4333). The first sibling consumes the
-        # pending resume value via the guard's ``interrupt()``; without
-        # pre-activating the approved-tools set, every subsequent sibling
-        # would raise a fresh interrupt because the legacy "activate after
-        # iteration" placement runs too late. Activating up-front is safe:
-        # the first sensitive tool simply skips ``interrupt()`` and uses the
-        # auto-approve path, leaving the pending resume value harmlessly in
-        # the scratchpad (LangGraph discards it at turn end).
-        if _approved_tool_names and _approved_token is None:
-            _approved_token = set_hitl_approved_tools(_approved_tool_names)
 
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
@@ -2049,6 +2031,7 @@ class LLMNode(BaseTool):
                         # and already consumed by the middleware's interrupt() call.
                         if _approved_token is not None:
                             reset_hitl_approved_tools(_approved_token)
+                        end_hitl_batch(_batch_token)
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
                     except McpAuthorizationRequired:
@@ -2193,6 +2176,7 @@ class LLMNode(BaseTool):
                 # Reset auto-approve context before propagating.
                 if _approved_token is not None:
                     reset_hitl_approved_tools(_approved_token)
+                end_hitl_batch(_batch_token)
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
@@ -2410,6 +2394,7 @@ class LLMNode(BaseTool):
         # GraphBubbleUp paths handle their own cleanup above.
         if _approved_token is not None:
             reset_hitl_approved_tools(_approved_token)
+        end_hitl_batch(_batch_token)
 
         # Handle max iterations
         if iteration >= self.steps_limit:
