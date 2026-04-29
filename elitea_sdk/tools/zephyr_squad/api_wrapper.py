@@ -281,7 +281,7 @@ ExecutionJson = create_model(
 
 TestToCycle = create_model(
     "TestToCycle",
-    step_id=(str, Field(description="Test step id to operate.")),
+    cycle_id=(str, Field(description="The Cycle ID to add tests to (e.g. 0001513838430954-242ac112-0001).")),
     json=(str, Field(description=(
             "JSON body for Zephyr operation. Fields:\n"
             "- issues (array[string], required if method=1): List of Jira issue keys. Example: [\"TEST-1\"]\n"
@@ -299,9 +299,9 @@ TestToCycle = create_model(
 
 TestToFolder = create_model(
     "TestToFolder",
-    step_id=(str, Field(description="folderId of Execution.")),
+    folder_id=(str, Field(description="The Folder ID to add tests to.")),
     json=(str, Field(description=(
-            "JSON body to update a Zephyr test step. Fields:\n"
+            "JSON body to add tests to a Zephyr folder. Fields:\n"
             "- issues (array[string], required): List of Jira issue keys. Example: [\"FSC-2\", \"FSC-3\"]\n"
             "- assigneeType (string, required): Type of assignee. Example: \"currentUser\"\n"
             "- method (integer, required): Method identifier. Example: 1\n"
