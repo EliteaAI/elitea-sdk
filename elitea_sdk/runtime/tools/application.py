@@ -167,8 +167,24 @@ class Application(BaseTool):
         schema_values = self.args_schema(**input).model_dump() if self.args_schema else {}
         extras = {k: v for k, v in input.items() if k not in schema_values}
         all_kwargs = {**kwargs, **extras, **schema_values}
+        logger.debug(f"[APP_INVOKE] Input keys: {list(input.keys()) if isinstance(input, dict) else 'not a dict'}")
+        logger.debug(f"[APP_INVOKE] Schema values: {schema_values}")
+        logger.debug(f"[APP_INVOKE] Extras: {extras}")
+        logger.debug(f"[APP_INVOKE] All kwargs keys: {list(all_kwargs.keys())}")
         if config is None:
             config = {}
+
+        # IMPORTANT: Pass extras through config's configurable dict.
+        # BaseTool._parse_input() validates against args_schema and strips any keys
+        # not defined in the schema. Since args_schema only has 'task' and 'chat_history',
+        # extra variables (like pipeline state variables) get lost before reaching _run().
+        # By storing them in config['configurable']['_application_extras'], they survive
+        # the BaseTool pipeline and can be retrieved in _run().
+        if extras:
+            config = dict(config)
+            config['configurable'] = dict(config.get('configurable') or {})
+            config['configurable']['_application_extras'] = extras
+            logger.debug(f"[APP_INVOKE] Stored extras in config: {list(extras.keys())}")
 
         # Inject tool metadata into config so it's passed to callbacks.
         # IMPORTANT: copy config and its metadata dict before injecting to avoid mutating
@@ -203,10 +219,19 @@ class Application(BaseTool):
                     result.tool_call_id = tool_call_id
                 return result
             # Convert str / dict / other to ToolMessage content
+            # For LLM agent calls, we only need the message content, not state variables
             if isinstance(result, str):
                 content = result
             elif isinstance(result, dict):
-                content = result.get("output", str(result))
+                # Extract message content from our result dict format
+                # _run() returns {"messages": [{"role": "assistant", "content": "..."}], ...}
+                messages = result.get("messages", [])
+                if messages and isinstance(messages[0], dict):
+                    content = messages[0].get("content", "")
+                elif result.get("output"):
+                    content = result.get("output")
+                else:
+                    content = str(result)
             else:
                 content = str(result)
             return ToolMessage(
@@ -223,9 +248,24 @@ class Application(BaseTool):
         # agent_type, etc.) that we need to build nested_config, but NOT callbacks/checkpoints
         # — those are already stripped by BaseTool.run() (it passes child_config to _run, not
         # the full parent config) which prevents double-firing and checkpoint corruption.
+        logger.debug(f"[APP_RUN] kwargs received: {list(kwargs.keys())}")
+        logger.debug(f"[APP_RUN] kwargs values: {kwargs}")
         invoke_config = config
         # Also consume legacy _invoke_config kwarg in case called directly in tests.
         invoke_config = kwargs.pop('_invoke_config', invoke_config)
+
+        # Retrieve extras that were passed through config from invoke().
+        # BaseTool._parse_input() strips keys not in args_schema, so extras (like pipeline
+        # state variables) are stored in config['configurable']['_application_extras'].
+        extras_from_invoke = {}
+        if invoke_config and invoke_config.get('configurable'):
+            extras_from_invoke = invoke_config['configurable'].pop('_application_extras', {})
+            logger.debug(f"[APP_RUN] Retrieved extras from config: {list(extras_from_invoke.keys())}")
+        # Merge extras into kwargs (extras take precedence as they come from the actual input)
+        for k, v in extras_from_invoke.items():
+            if k not in kwargs:
+                kwargs[k] = v
+                logger.debug(f"[APP_RUN] Added extra '{k}' to kwargs")
 
         if self.client and self.args_runnable:
             # Recreate new LanggraphAgentRunnable in order to reflect the current input_mapping (it can be dynamic for pipelines).
@@ -271,8 +311,24 @@ class Application(BaseTool):
             config=nested_config,
         )
         normalized_output = extract_application_response_output(response)
-        if self.return_type == "str":
-            return normalized_output
-        else:
-            return {"messages": [{"role": "assistant", "content": normalized_output}]}
+
+        # Build result dict with output message
+        result = {"messages": [{"role": "assistant", "content": normalized_output}]}
+
+        # Propagate state variables from child response back to parent.
+        # This allows FunctionTool to extract them based on output_variables,
+        # enabling child pipeline state to flow back to parent pipeline.
+        if isinstance(response, dict):
+            # Keys that are internal/output-related and should not be propagated as state
+            excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types', ELITEA_RS, PRINTER_NODE_RS}
+            for key, value in response.items():
+                if key not in excluded_keys:
+                    result[key] = value
+                    logger.debug(f"[APP_RUN] Propagating state variable '{key}' from child to parent")
+
+        # Always return the full result dict with state variables.
+        # The invoke() method will handle converting to string for LLM agent calls
+        # (when tool_call_id is set), while FunctionTool calls (no tool_call_id)
+        # will receive the full dict and can extract state variables.
+        return result
     
