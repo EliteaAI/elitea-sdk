@@ -11,7 +11,7 @@
       "_name": "llm_default_prompt",
       "_use_llm": true,
       "_prompt_default": true,
-      "_max_tokens": 2048
+      "max_tokens": 8192
     }
   ]
 }
