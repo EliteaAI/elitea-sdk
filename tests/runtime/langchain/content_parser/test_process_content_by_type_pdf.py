@@ -154,16 +154,18 @@ class TestChunkingConfigPdf:
     def test_full_ui_config_payload(self):
         """
         Replicate the exact payload the platform UI sends for a PDF:
-            {".pdf": {"max_tokens": 512, "prompt": "", "use_default_prompt": False, "use_llm": False}}
+            {".pdf": {"max_tokens": 512, "prompt": "", "use_default_prompt": False,
+                      "use_llm": False, "extract_images": False}}
         All values match defaults or are no-ops → output identical to bare call.
         """
         content = _read_bytes(_PDF_TEXT_ONLY)
         ui_config = {
             ".pdf": {
-                "max_tokens": 512,          # == LOADER_MAX_TOKENS_DEFAULT → not forwarded
-                "prompt": "",               # == default → not forwarded
-                "use_default_prompt": False,  # == default → not forwarded
-                "use_llm": False,           # == default → not forwarded
+                "max_tokens": 512,           # == LOADER_MAX_TOKENS_DEFAULT → not forwarded
+                "prompt": "",                # == default → not forwarded
+                "use_default_prompt": False, # == default → not forwarded
+                "use_llm": False,            # == default → not forwarded
+                "extract_images": False,     # == default → not forwarded
             }
         }
         docs_ui = list(process_content_by_type(content, "doc.pdf", chunking_config=ui_config))
@@ -450,3 +452,101 @@ class TestImageParserNotCreatedWhenDisabled:
                 f"ImageParser.__init__ was called {len(calls)} time(s) "
                 "but extract_images=False — should not be instantiated."
             )
+
+    def test_extract_images_false_via_chunking_config_does_not_create_image_parser(self):
+        """extract_images=False explicit in chunking config → equals default → not forwarded → ImageParser not created."""
+        content = _read_bytes(_PDF_WITH_IMAGE)
+        with pytest.MonkeyPatch.context() as mp:
+            calls = []
+            original_init = __import__(
+                'elitea_sdk.runtime.langchain.document_loaders.ImageParser',
+                fromlist=['ImageParser']
+            ).ImageParser.__init__
+
+            def tracking_init(self, **kwargs):
+                calls.append(kwargs)
+                return original_init(self, **kwargs)
+
+            mp.setattr(
+                'elitea_sdk.runtime.langchain.document_loaders.EliteAPDFLoader.ImageParser.__init__',
+                tracking_init,
+            )
+            list(process_content_by_type(
+                content, "img.pdf",
+                chunking_config={".pdf": {"extract_images": False}},
+            ))
+            assert len(calls) == 0, (
+                f"ImageParser.__init__ was called {len(calls)} time(s) "
+                "but extract_images=False — should not be instantiated."
+            )
+
+
+# ===========================================================================
+# extract_images forwarded via chunking config (issue #4788)
+# ===========================================================================
+
+class TestExtractImagesChunkingConfigPdf:
+    """
+    extract_images is now in .pdf allowed_to_override (issue #4788).
+    Verify the value from chunking_config reaches EliteAPDFLoader.
+    """
+
+    def test_extract_images_true_forwarded_to_loader(self):
+        """extract_images=True in chunking config must reach EliteAPDFLoader.__init__."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteAPDFLoader import EliteAPDFLoader
+
+        received_flags = []
+        original_init = EliteAPDFLoader.__init__
+
+        def capturing_init(self, **kwargs):
+            original_init(self, **kwargs)
+            received_flags.append(self.extract_images)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(EliteAPDFLoader, '__init__', capturing_init)
+            # Bypass _load_docs to avoid LLM calls and real PDF processing.
+            mp.setattr(EliteAPDFLoader, '_load_docs', lambda self: [])
+            list(process_content_by_type(
+                _read_bytes(_PDF_WITH_IMAGE), "img.pdf",
+                chunking_config={".pdf": {"extract_images": True}},
+            ))
+
+        assert received_flags == [True], (
+            "EliteAPDFLoader must receive extract_images=True from chunking_config"
+        )
+
+    def test_extract_images_false_equals_default_not_forwarded(self):
+        """extract_images=False in chunking config matches the default → not forwarded → loader still gets False."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteAPDFLoader import EliteAPDFLoader
+
+        received_flags = []
+        original_init = EliteAPDFLoader.__init__
+
+        def capturing_init(self, **kwargs):
+            original_init(self, **kwargs)
+            received_flags.append(self.extract_images)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(EliteAPDFLoader, '__init__', capturing_init)
+            mp.setattr(EliteAPDFLoader, '_load_docs', lambda self: [])
+            list(process_content_by_type(
+                _read_bytes(_PDF_WITH_IMAGE), "img.pdf",
+                chunking_config={".pdf": {"extract_images": False}},
+            ))
+
+        assert received_flags == [False], (
+            "EliteAPDFLoader must have extract_images=False when config matches default"
+        )
+
+    def test_extract_images_in_pdf_allowed_to_override(self):
+        """extract_images must be present in .pdf allowed_to_override with default False."""
+        from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
+
+        allowed = loaders_map[".pdf"]["allowed_to_override"]
+        assert "extract_images" in allowed, (
+            "extract_images must be in .pdf allowed_to_override so the UI can expose it"
+        )
+        assert allowed["extract_images"] is False, (
+            "extract_images default must be False (opt-in, not opt-out)"
+        )
+
