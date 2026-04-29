@@ -184,7 +184,9 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
                 values['repo_instances'] = {}
                 import re
                 for repo in re.split(',|;', values.get('repositories')):
-                    values['repo_instances'][repo] = g.projects.get(repo)
+                    repo = repo.strip()
+                    if repo:
+                        values['repo_instances'][repo] = g.projects.get(repo)
             values['_active_branch'] = values.get('branch', 'main')
         except Exception as e:
             raise ImportError(f"Failed to connect to GitLab: {e}")
@@ -196,6 +198,8 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
 
     def _get_repo(self, repository_name: Optional[str] = None) -> Any:
         try:
+            if repository_name:
+                repository_name = repository_name.strip() or None
             # Passed repo as None
             if not repository_name:
                 if len(self.repo_instances) == 0:

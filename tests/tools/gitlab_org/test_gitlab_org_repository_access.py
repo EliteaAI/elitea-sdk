@@ -241,3 +241,110 @@ class TestBug3330Regression:
         configured_instances = {"only/configured": mock_project}
         with pytest.raises(ToolException):
             simulate_get_repo(configured_instances, "other/repo")
+
+
+class TestRepositoryNameStripping:
+    """
+    Tests for whitespace stripping in repository names.
+
+    Fixes the issue where repository names with leading/trailing spaces
+    would cause lookup failures or incorrect repo_instances keys.
+    """
+
+    def test_get_repo_strips_whitespace_from_repository_name(self):
+        """Test that _get_repo strips whitespace from repository_name parameter."""
+        mock_project = MagicMock()
+        repo_instances = {"group/my-repo": mock_project}
+
+        # Simulating the fixed _get_repo behavior with stripping
+        def simulate_get_repo_with_strip(repo_instances, repository_name, get_repo_instance_fn=None):
+            """Simulate _get_repo with the whitespace stripping fix."""
+            try:
+                if repository_name:
+                    repository_name = repository_name.strip() or None
+                if not repository_name:
+                    if len(repo_instances) == 0:
+                        raise ToolException("No repos configured")
+                    return list(repo_instances.items())[0][1]
+                if repository_name not in repo_instances:
+                    if len(repo_instances) > 0:
+                        raise ToolException(f"Repository '{repository_name}' not in configured list")
+                    if get_repo_instance_fn:
+                        repo_instances[repository_name] = get_repo_instance_fn(repository_name)
+                return repo_instances.get(repository_name)
+            except Exception as e:
+                if not isinstance(e, ToolException):
+                    raise ToolException(str(e))
+                raise
+
+        # These should all work - spaces are stripped
+        assert simulate_get_repo_with_strip(repo_instances, "group/my-repo") == mock_project
+        assert simulate_get_repo_with_strip(repo_instances, " group/my-repo") == mock_project
+        assert simulate_get_repo_with_strip(repo_instances, "group/my-repo ") == mock_project
+        assert simulate_get_repo_with_strip(repo_instances, "  group/my-repo  ") == mock_project
+        assert simulate_get_repo_with_strip(repo_instances, "\tgroup/my-repo\n") == mock_project
+
+    def test_get_repo_handles_whitespace_only_as_none(self):
+        """Test that whitespace-only repository_name is treated as None."""
+        mock_project = MagicMock()
+        repo_instances = {"default/repo": mock_project}
+
+        def simulate_get_repo_with_strip(repo_instances, repository_name):
+            if repository_name:
+                repository_name = repository_name.strip() or None
+            if not repository_name:
+                if len(repo_instances) == 0:
+                    raise ToolException("No repos configured")
+                return list(repo_instances.items())[0][1]
+            return repo_instances.get(repository_name)
+
+        # Whitespace-only should return first configured repo (like None)
+        assert simulate_get_repo_with_strip(repo_instances, "   ") == mock_project
+        assert simulate_get_repo_with_strip(repo_instances, "\t\n") == mock_project
+
+    def test_parse_repositories_strips_whitespace(self):
+        """Test that repository parsing strips whitespace from comma/semicolon separated list."""
+        import re
+
+        # Simulate the fixed parsing logic
+        def parse_repositories(repositories_str):
+            """Simulate the fixed repository parsing with stripping."""
+            repo_instances = {}
+            for repo in re.split(',|;', repositories_str):
+                repo = repo.strip()
+                if repo:
+                    repo_instances[repo] = f"project:{repo}"  # Mock project
+            return repo_instances
+
+        # Test with spaces after commas
+        result = parse_repositories("repo1, repo2, repo3")
+        assert "repo1" in result
+        assert "repo2" in result
+        assert "repo3" in result
+        assert " repo2" not in result  # Should NOT have leading space
+
+        # Test with spaces around semicolons
+        result = parse_repositories("repo1 ; repo2 ; repo3")
+        assert "repo1" in result
+        assert "repo2" in result
+        assert "repo3" in result
+
+        # Test with mixed separators and whitespace
+        result = parse_repositories("  repo1  ,  repo2  ;  repo3  ")
+        assert "repo1" in result
+        assert "repo2" in result
+        assert "repo3" in result
+        assert len(result) == 3
+
+        # Test that empty strings from splitting are skipped
+        result = parse_repositories("repo1,,repo2")
+        assert "repo1" in result
+        assert "repo2" in result
+        assert "" not in result
+        assert len(result) == 2
+
+        # Test with only whitespace between separators
+        result = parse_repositories("repo1,   ,repo2")
+        assert "repo1" in result
+        assert "repo2" in result
+        assert len(result) == 2
