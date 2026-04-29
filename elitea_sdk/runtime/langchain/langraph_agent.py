@@ -1764,10 +1764,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # LLMNode computes context_info via after_model middleware. Pipelines
         # that have only toolkit/function nodes never invoke LLMNode, so
         # context_info stays None. Compute it here from the final messages.
+        _mw_manager = getattr(self, '_middleware_manager', None)
         if (isinstance(result, dict)
                 and not result.get('context_info')
-                and self._middleware_manager is not None
-                and self._middleware_manager._middleware):
+                and _mw_manager is not None
+                and _mw_manager._middleware):
             final_messages = result.get('messages', [])
             if final_messages:
                 msgs_for_count = list(final_messages)
@@ -1775,10 +1776,10 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # preprocessing and isn't in the final state messages.
                 if isinstance(input, dict) and input.get('input'):
                     msgs_for_count.append(HumanMessage(content=''))
-                self._middleware_manager.run_after_model(
+                _mw_manager.run_after_model(
                     {'messages': msgs_for_count}, config or {}
                 )
-                result['context_info'] = self._middleware_manager.get_context_info()
+                result['context_info'] = _mw_manager.get_context_info()
 
         # ── Pipeline-blocked fast path ──────────────────────────────────
         # _pipeline_blocked carries the blocked-termination message string
