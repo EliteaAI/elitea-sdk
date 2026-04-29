@@ -202,10 +202,16 @@ def test_build_resume_completion_reuses_original_text_only_structured_content():
     assert hitl_ctx["tool_call_id"] == ORIGINAL_TOOL_CALL_ID
 
 
-def test_build_resume_completion_returns_none_for_empty_content_tool_call_batch():
-    """Empty synthetic-style AI messages should still use the single reviewed
-    tool-call fallback. Reusing them would replay the full original tool-call
-    batch and can re-trigger HITL in nested-child flows."""
+def test_build_resume_completion_reuses_empty_content_ai_message():
+    """Non-thinking models emit ``content=''`` when calling tools. The original
+    AIMessage must still be reused (not replaced by a synthetic) so that:
+
+    * its canonical tool_call ids survive the HITL round-trip, and
+    * downstream sibling-skip logic in ``__perform_tool_calling`` matches
+      the LLM's next-iteration tool_calls against the existing ToolMessages.
+
+    See issue #4333.
+    """
     plain_ai = AIMessage(
         content="",
         tool_calls=[
@@ -222,8 +228,13 @@ def test_build_resume_completion_returns_none_for_empty_content_tool_call_batch(
 
     completion = LLMNode._build_resume_completion(hitl_ctx, messages=[])
 
-    assert completion is None
-    assert hitl_ctx["tool_call_id"] == "synth"
+    assert isinstance(completion, AIMessage)
+    # First matching tool_call's id is propagated into hitl_ctx
+    assert hitl_ctx["tool_call_id"] == "call_1"
+    # All original tool_calls survive (sibling skip in __perform_tool_calling
+    # protects against double-execution)
+    tc_ids = {tc.get("id") for tc in (completion.tool_calls or [])}
+    assert tc_ids == {"call_1", "call_2"}
 
 
 def test_build_resume_completion_returns_none_when_no_original_in_ctx():
@@ -238,8 +249,12 @@ def test_build_resume_completion_returns_none_when_no_original_in_ctx():
 
 def test_build_resume_completion_skips_reuse_when_already_in_messages():
     """Multi-tool sibling case: _trim_pending_messages keeps the AIMessage in
-    the restored ``messages`` list. Reusing it as ``completion`` would duplicate
-    the tool_call. Detect by tool_call id collision and fall back to synthetic."""
+    the restored ``messages`` list. When the AIMessage is already present,
+    _build_resume_completion returns the existing message so it is NOT
+    duplicated. ``__perform_tool_calling`` then dedups via
+    ``_append_completion_dedup`` and skips already-completed siblings via
+    ``_tool_call_already_completed`` — no separate sentinel flag required.
+    """
     original = _make_anthropic_thinking_ai_message()
     hitl_ctx = {
         "tool_name": "danger",
@@ -252,7 +267,11 @@ def test_build_resume_completion_skips_reuse_when_already_in_messages():
         hitl_ctx, messages=[original]  # same id already present
     )
 
-    assert completion is None
+    # Returns the existing AIMessage (deduplicated downstream)
+    assert completion is not None
+    assert isinstance(completion, AIMessage)
+    # tool_call_id is updated to the original's id (so HITL reconciliation lines up)
+    assert hitl_ctx['tool_call_id'] == 'toolu_01ABC'
 
 
 # ───────────────────────────────────────────────────────────────────────────────
