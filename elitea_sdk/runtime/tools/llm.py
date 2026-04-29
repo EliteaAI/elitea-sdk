@@ -1870,18 +1870,6 @@ class LLMNode(BaseTool):
         # This dict maps tool-name -> BaseTool for the next iteration only.
         _forced_followup_lookup: Dict[str, BaseTool] = {}
 
-        # On HITL resume the original AIMessage may carry MULTIPLE sensitive
-        # sibling tool_calls (issue #4333). The first sibling consumes the
-        # pending resume value via the guard's ``interrupt()``; without
-        # pre-activating the approved-tools set, every subsequent sibling
-        # would raise a fresh interrupt because the legacy "activate after
-        # iteration" placement runs too late. Activating up-front is safe:
-        # the first sensitive tool simply skips ``interrupt()`` and uses the
-        # auto-approve path, leaving the pending resume value harmlessly in
-        # the scratchpad (LangGraph discards it at turn end).
-        if _approved_tool_names and _approved_token is None:
-            _approved_token = set_hitl_approved_tools(_approved_tool_names)
-
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
         while (hasattr(current_completion, 'tool_calls') and
