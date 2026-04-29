@@ -55,7 +55,7 @@ class ZephyrSquadCloud(object):
         return self._do_request(method='DELETE', api_path=api_path, json="[]")
 
     def create_new_cycle(self, json):
-        api_path = f"public/rest/api/1.0/cycle"
+        api_path = f"/public/rest/api/1.0/cycle"
         return self._do_request(method='POST', api_path=api_path, json=json)
 
     def create_folder(self, json):
