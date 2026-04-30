@@ -219,13 +219,35 @@ alita_client = elitea_client
         func_args = propagate_the_input_mapping(input_mapping=self.input_mapping, input_variables=self.input_variables,
                                                 state=state)
 
-        # For subgraph nodes, also pass through state variables that match child's expected inputs
-        # This ensures shared state variables are available in the child
-        if hasattr(self.tool, 'is_subgraph') and self.tool.is_subgraph:
-            # Merge state variables that aren't already in func_args
+        # For subgraph nodes (nested pipelines/agents), pass through state variables to the child.
+        # Parent state values should override child's defaults when variable names collide.
+        # This ensures that when parent assigns "foo = X" and child also has "foo", the child sees X.
+        #
+        # Check both is_subgraph attribute AND if the tool is an Application type
+        # (Application tools represent nested agents/pipelines)
+        is_nested_app = (
+            (hasattr(self.tool, 'is_subgraph') and self.tool.is_subgraph) or
+            type(self.tool).__name__ == 'Application'
+        )
+        if is_nested_app:
+            logger.debug(f"[FUNC_TOOL] Passing state variables to nested app. State keys: {list(state.keys())}, func_args keys: {list(func_args.keys())}")
             for key, value in state.items():
-                if key not in func_args and key not in ['messages', 'input']:
+                if key in ['messages', 'input']:
+                    continue
+                # Pass state variables to child, overriding input_mapping values
+                # when the parent has explicitly set a value (not None/empty).
+                # This fixes the issue where parent's assigned variable values
+                # were not available in nested pipelines with same-named variables.
+                if key not in func_args:
+                    # Variable not in input_mapping - add it from parent state
+                    logger.debug(f"[FUNC_TOOL] Adding '{key}' from state to func_args (value: {value!r})")
                     func_args[key] = value
+                elif value is not None and value != '':
+                    # Variable in input_mapping but parent has a real value - override
+                    # This ensures parent's runtime value takes precedence over child's default
+                    logger.debug(f"[FUNC_TOOL] Overriding '{key}' in func_args with state value (value: {value!r})")
+                    func_args[key] = value
+            logger.debug(f"[FUNC_TOOL] Final func_args keys: {list(func_args.keys())}")
 
         # special handler for PyodideSandboxTool
         if self._is_pyodide_tool():
@@ -253,6 +275,28 @@ alita_client = elitea_client
             # handler for PyodideSandboxTool
             if self._is_pyodide_tool():
                 return self._handle_pyodide_output(tool_result)
+
+            # For nested Application tools (pipelines/agents), propagate ALL state variables
+            # from child back to parent, not just those in output_variables.
+            # This ensures bidirectional state flow between parent and child pipelines.
+            if is_nested_app and isinstance(tool_result, dict):
+                # Start with messages from the result
+                if 'messages' in tool_result:
+                    result_dict = {"messages": tool_result['messages']}
+                else:
+                    result_dict = {
+                        "messages": [{
+                            "role": "assistant",
+                            "content": safe_serialize(tool_result)
+                        }]
+                    }
+                # Propagate all state variables from child (excluding internal keys)
+                excluded_keys = {'messages', 'output', 'input', 'chat_history'}
+                for key, value in tool_result.items():
+                    if key not in excluded_keys:
+                        result_dict[key] = value
+                        logger.debug(f"[FUNC_TOOL] Propagating '{key}' from nested app to parent state")
+                return result_dict
 
             if not self.output_variables:
                 return {"messages": [{"role": "assistant", "content": safe_serialize(tool_result)}]}
