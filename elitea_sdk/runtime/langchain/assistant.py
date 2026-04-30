@@ -653,10 +653,7 @@ class Assistant:
             response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + filtered_messages, config)
             result_messages = [response]
             if middleware_updates:
-                # middleware_updates contains only RemoveMessage ops (from summarization).
-                # filtered_messages holds the preserved messages post-summarization.
-                # Include them so the checkpoint retains the preserved context.
-                result_messages = list(middleware_updates) + filtered_messages + [response]
+                result_messages = list(middleware_updates) + result_messages
             result = {'messages': result_messages}
 
             # Run after_model middleware (context_info calculation)
