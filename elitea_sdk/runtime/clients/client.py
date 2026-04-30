@@ -782,6 +782,9 @@ class EliteAClient:
             middleware_list.append(planning_middleware)
             logger.info(f"Auto-created PlanningMiddleware for conversation_id={conversation_id}")
 
+        # Automatically compresses conversation history when threshold is exceeded
+        self._inject_summarization(middleware_list, context_settings, conversation_id)
+
         # Inject sensitive tool authorization guard when configured
         self._inject_sensitive_tool_guard(middleware_list, conversation_id, auto_approve_sensitive_actions)
 
@@ -799,9 +802,6 @@ class EliteAClient:
                 conversation_id=conversation_id
             )
             middleware_list.append(error_handler)
-
-        # Automatically compresses conversation history when threshold is exceeded
-        self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Extract lazy_tools_mode from internal_tools (it's a mode flag, not an actual tool)
         # UI stores it in meta.internal_tools array, not as meta.lazy_tools_mode boolean
