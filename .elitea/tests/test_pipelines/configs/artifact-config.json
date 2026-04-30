@@ -4,16 +4,16 @@
   "id": 1,
   "bucket": "artifact-test-bucket",
   "selected_tools": [
-    "createFile",
+    "create_file",
     "edit_file",
-    "appendData",
-    "readFile",
+    "append_data",
+    "read_file",
     "read_multiple_files",
     "get_file_type",
-    "readFile",
+    "read_file",
     "grep_file",
-    "listFiles",
-    "createNewBucket",
-    "deleteFile"
+    "list_files",
+    "create_new_bucket",
+    "delete_file"
   ]
 }

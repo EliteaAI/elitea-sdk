@@ -1,7 +1,7 @@
 name: "ART03 - Create File: Missing Required Parameter (Error Handling)"
 priority: High
 description: |
-  Verify that createFile returns appropriate error when required parameters are missing.
+  Verify that create_file returns appropriate error when required parameters are missing.
   
   Objective: Validate error handling for missing content (both filedata and filepath are None)
   
@@ -32,7 +32,7 @@ entry_point: create_file_no_content
 nodes:
   - id: create_file_no_content
     type: toolkit
-    tool: createFile
+    tool: create_file
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
     input:
       - filename
@@ -62,9 +62,9 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the error result from createFile when required parameters are missing.
+          Analyze the error result from create_file when required parameters are missing.
           
-          Tool executed: createFile
+          Tool executed: create_file
           Filename: test_file.txt
           Note: Neither filedata nor filepath was provided
           Result: {error_result}

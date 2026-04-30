@@ -1,7 +1,7 @@
 name: "ART05 - Read File: Retrieve Content Integrity"
 priority: Critical
 description: |
-  Verify that readFile correctly retrieves file content with proper encoding and formatting.
+  Verify that read_file correctly retrieves file content with proper encoding and formatting.
   
   Objective: Test complete file retrieval with multi-line content and special characters
   
@@ -55,7 +55,7 @@ nodes:
     name: create_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: createFile
+    tool: create_file
     input:
       - filename
       - bucket_name
@@ -79,7 +79,7 @@ nodes:
     name: read_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: readFile
+    tool: read_file
     input:
       - filename
       - bucket_name
@@ -99,7 +99,7 @@ nodes:
     name: delete_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: deleteFile
+    tool: delete_file
     input:
       - filename
       - bucket_name
@@ -131,7 +131,7 @@ nodes:
         value: |
           Analyze the file read result to verify content integrity.
           
-          Tool executed: readFile
+          Tool executed: read_file
           Filename: read-test-${TIMESTAMP}.txt
           Expected content: 4 lines with special characters and unicode
           Read result: {read_result}

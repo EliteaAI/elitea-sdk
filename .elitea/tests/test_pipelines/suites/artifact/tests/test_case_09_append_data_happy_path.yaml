@@ -1,7 +1,7 @@
 name: "ART09 - Append Data: Add Content to Existing File"
 priority: High
 description: |
-  Verify that appendData correctly adds content to the end of existing files.
+  Verify that append_data correctly adds content to the end of existing files.
   
   Objective: Test file appending with content preservation and order
   
@@ -57,7 +57,7 @@ nodes:
     name: create_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: createFile
+    tool: create_file
     input:
       - filename
       - bucket_name
@@ -81,7 +81,7 @@ nodes:
     name: append_data
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: appendData
+    tool: append_data
     input:
       - filename
       - bucket_name
@@ -105,7 +105,7 @@ nodes:
     name: read_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: readFile
+    tool: read_file
     input:
       - filename
       - bucket_name
@@ -125,7 +125,7 @@ nodes:
     name: delete_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: deleteFile
+    tool: delete_file
     input:
       - filename
       - bucket_name
@@ -158,7 +158,7 @@ nodes:
         value: |
           Analyze the append and read results to verify content concatenation.
           
-          Tool executed: appendData → readFile
+          Tool executed: append_data → read_file
           Initial content: "Initial line 1\nInitial line 2"
           Appended content: "\nAppended line 3\nAppended line 4"
           

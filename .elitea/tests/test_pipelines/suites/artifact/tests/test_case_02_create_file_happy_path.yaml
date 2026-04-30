@@ -1,7 +1,7 @@
 name: "ART02 - Create File: Happy Path"
 priority: Critical
 description: |
-  Verify that the createFile tool correctly creates files with various content types.
+  Verify that the create_file tool correctly creates files with various content types.
   
   Objective: Test file creation with text and JSON content types
   
@@ -39,7 +39,7 @@ entry_point: create_file
 nodes:
   - id: create_file
     type: toolkit
-    tool: createFile
+    tool: create_file
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
     input:
       - filename
@@ -62,7 +62,7 @@ nodes:
 
   - id: read_file
     type: toolkit
-    tool: readFile
+    tool: read_file
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
     input:
       - filename
@@ -81,7 +81,7 @@ nodes:
 
   - id: delete_file
     type: toolkit
-    tool: deleteFile
+    tool: delete_file
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
     input:
       - filename
@@ -114,7 +114,7 @@ nodes:
         value: |
           Analyze the file creation and read results to determine if the test passed.
           
-          Tool executed: createFile → readFile
+          Tool executed: create_file → read_file
           Expected content: This is a test document for artifact toolkit testing.\nLine 2: Testing file creation.\nLine 3: Verifying content integrity.
           
           Creation result: {create_result}

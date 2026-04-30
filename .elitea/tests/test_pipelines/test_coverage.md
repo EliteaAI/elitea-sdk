@@ -124,15 +124,15 @@ See detailed breakdown above in ADO section.
 
 | Tool Name | Tested | Test Case(s) |
 |-----------|--------|--------------|
-| `createNewBucket` | ✅ | test_case_01 |
-| `createFile` | ✅ | test_case_02, test_case_03 |
-| `listFiles` | ✅ | test_case_04 |
-| `readFile` | ✅ | test_case_05 |
+| `create_new_bucket` | ✅ | test_case_01 |
+| `create_file` | ✅ | test_case_02, test_case_03 |
+| `list_files` | ✅ | test_case_04 |
+| `read_file` | ✅ | test_case_05 |
 | `grep_file` (search_file) | ✅ | test_case_07 |
 | `edit_file` | ✅ | test_case_08, test_case_16 |
-| `appendData` | ✅ | test_case_09 |
+| `append_data` | ✅ | test_case_09 |
 | `overwriteData` | ✅ | test_case_10 |
-| `deleteFile` | ✅ | test_case_11 |
+| `delete_file` | ✅ | test_case_11 |
 | `read_multiple_files` | ✅ | test_case_12 |
 | `get_file_type` | ✅ | test_case_13 |
 | `upload_artifact_to_external` | ✅ | (Confluence: test_case_14-15, SharePoint: test_case_18-21, TestRail: test_case_22) |

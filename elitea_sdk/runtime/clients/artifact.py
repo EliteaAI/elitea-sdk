@@ -233,7 +233,7 @@ class Artifact:
                 return {
                     "error": f"Cannot append to '{artifact_name}': File type is not text-editable and no binary append handler is available. "
                             f"Binary files (PDF, images, etc.) cannot be safely appended to as text. "
-                            f"Consider creating a new file instead using createFile tool."
+                            f"Consider creating a new file instead using create_file tool."
                 }
             
             # Safe to text-append - decode already-downloaded bytes directly (avoids re-download)

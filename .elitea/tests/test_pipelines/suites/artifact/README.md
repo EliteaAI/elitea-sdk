@@ -6,21 +6,21 @@ Comprehensive test suite for the artifact toolkit (`elitea_sdk/runtime/tools/art
 
 | # | Tool | Test File | Priority | Objective |
 |---|------|-----------|----------|-----------|
-| AT01 | `createNewBucket` | test_case_01_create_new_bucket_happy_path.yaml | Critical | Bucket creation with expiration and sanitization |
-| AT02 | `createFile` | test_case_02_create_file_happy_path.yaml | Critical | File creation with content verification |
-| AT03 | `createFile` | test_case_03_create_file_error_handling.yaml | High | Error handling for missing parameters |
-| AT04 | `listFiles` | test_case_04_list_files_happy_path.yaml | Critical | File listing with metadata and links |
-| AT05 | `readFile` | test_case_05_read_file_happy_path.yaml | Critical | Full file content retrieval and integrity |
+| AT01 | `create_new_bucket` | test_case_01_create_new_bucket_happy_path.yaml | Critical | Bucket creation with expiration and sanitization |
+| AT02 | `create_file` | test_case_02_create_file_happy_path.yaml | Critical | File creation with content verification |
+| AT03 | `create_file` | test_case_03_create_file_error_handling.yaml | High | Error handling for missing parameters |
+| AT04 | `list_files` | test_case_04_list_files_happy_path.yaml | Critical | File listing with metadata and links |
+| AT05 | `read_file` | test_case_05_read_file_happy_path.yaml | Critical | Full file content retrieval and integrity |
 | AT07 | `search_file` | test_case_07_search_file_happy_path.yaml | High | Pattern matching with context lines |
 | AT08 | `edit_file` | test_case_08_edit_file_happy_path.yaml | High | Text replacement using OLD/NEW markers |
-| AT09 | `appendData` | test_case_09_append_data_happy_path.yaml | High | Appending content to files |
-| AT11 | `deleteFile` | test_case_11_delete_file_happy_path.yaml | High | File deletion and removal verification |
+| AT09 | `append_data` | test_case_09_append_data_happy_path.yaml | High | Appending content to files |
+| AT11 | `delete_file` | test_case_11_delete_file_happy_path.yaml | High | File deletion and removal verification |
 | AT12 | `read_multiple_files` | test_case_12_read_multiple_files_happy_path.yaml | High | Batch file retrieval |
 | AT13 | `get_file_type` | test_case_13_get_file_type_happy_path.yaml | High | File type detection from content |
 | AT14 | `add_file_to_page` (Confluence) | test_case_14_confluence_add_file_to_page_append.yaml | Critical | Add file from artifact to Confluence page (append) |
 | AT15 | `add_file_to_page` (Confluence) | test_case_15_confluence_add_file_to_page_prepend.yaml | High | Add file from artifact to Confluence page (prepend) |
 | AT16 | `edit_file` | test_case_16_edit_empty_file_edge_case.yaml | High | Empty file edit behavior validation |
-| AT17 | `deleteFile` | test_case_17_delete_nonexistent_file_error.yaml | High | Error handling for non-existent file deletion |
+| AT17 | `delete_file` | test_case_17_delete_nonexistent_file_error.yaml | High | Error handling for non-existent file deletion |
 | AT18 | `upload_file` (SharePoint) | test_case_18_sharepoint_upload_file_from_artifact.yaml | Critical | Upload file from artifact to SharePoint |
 | AT19 | `upload_file` (SharePoint) | test_case_19_sharepoint_upload_file_replace.yaml | High | Upload file with replace option |
 | AT20 | `add_attachment_to_list_item` (SharePoint) | test_case_20_sharepoint_add_attachment_from_artifact.yaml | Critical | Add attachment from artifact to SharePoint list item |
@@ -42,12 +42,12 @@ Comprehensive test suite for the artifact toolkit (`elitea_sdk/runtime/tools/art
 ### File Operations
 
 #### Create & Copy
-- `createFile`: Create files from content OR copy existing files (binary-safe)
+- `create_file`: Create files from content OR copy existing files (binary-safe)
 - Supports text, JSON, CSV, Excel formats
 - Option to preserve binary format when copying
 
 #### Read Operations
-- `readFile`: Full file retrieval with optional page/sheet filtering
+- `read_file`: Full file retrieval with optional page/sheet filtering
 - `read_multiple_files`: Batch read multiple files in single operation
 
 #### Search & Edit
@@ -56,11 +56,11 @@ Comprehensive test suite for the artifact toolkit (`elitea_sdk/runtime/tools/art
 - Support for multiple edits per operation
 
 #### Append
-- `appendData`: Append content to file (create if missing with flag control)
+- `append_data`: Append content to file (create if missing with flag control)
 
 #### Management
-- `deleteFile`: Delete with existence validation
-- `listFiles`: List bucket contents with metadata (name, size, modified, download link)
+- `delete_file`: Delete with existence validation
+- `list_files`: List bucket contents with metadata (name, size, modified, download link)
 - `get_file_type`: Detect file type from magic bytes (more reliable than extension)
 
 ### File Type Support
