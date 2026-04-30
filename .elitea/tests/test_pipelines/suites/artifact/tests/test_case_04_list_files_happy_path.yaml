@@ -1,7 +1,7 @@
 name: "ART04 - List Files: Verify Bucket Contents"
 priority: Critical
 description: |
-  Verify that listFiles returns all files in bucket with correct metadata.
+  Verify that list_files returns all files in bucket with correct metadata.
   
   Objective: Test file listing with proper metadata (name, link, modified timestamp, size)
   
@@ -54,7 +54,7 @@ nodes:
     name: create_test_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: createFile
+    tool: create_file
     input:
       - filename
       - bucket_name
@@ -78,7 +78,7 @@ nodes:
     name: list_files
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: listFiles
+    tool: list_files
     input:
       - bucket_name
     input_mapping:
@@ -94,7 +94,7 @@ nodes:
     name: delete_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: deleteFile
+    tool: delete_file
     input:
       - filename
       - bucket_name
@@ -127,7 +127,7 @@ nodes:
         value: |
           Analyze the file listing result to verify correct metadata and formatting.
           
-          Tool executed: listFiles
+          Tool executed: list_files
           Expected test file: {test_filename}
           Result: {list_result}
           

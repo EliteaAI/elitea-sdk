@@ -72,7 +72,7 @@ nodes:
     name: create_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: createFile
+    tool: create_file
     input:
       - filename
       - bucket_name
@@ -120,7 +120,7 @@ nodes:
     name: read_edited
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: readFile
+    tool: read_file
     input:
       - filename
       - bucket_name
@@ -140,7 +140,7 @@ nodes:
     name: delete_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: deleteFile
+    tool: delete_file
     input:
       - filename
       - bucket_name
@@ -173,7 +173,7 @@ nodes:
         value: |
           Analyze the file edit and read results to verify content replacement.
           
-          Tool executed: edit_file → readFile
+          Tool executed: edit_file → read_file
           Original file contained: "This is the old content that needs editing"
           Edit query replaced it with: "This is the new content after editing"
           

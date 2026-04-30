@@ -1,7 +1,7 @@
 name: "ART11 - Delete File: Remove from Bucket"
 priority: High
 description: |
-  Verify that deleteFile correctly removes files from bucket.
+  Verify that delete_file correctly removes files from bucket.
   
   Objective: Test file deletion and verification of removal
   
@@ -56,7 +56,7 @@ nodes:
     name: create_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: createFile
+    tool: create_file
     input:
       - filename
       - bucket_name
@@ -81,7 +81,7 @@ nodes:
     name: read_before_delete
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: readFile
+    tool: read_file
     input:
       - filename
       - bucket_name
@@ -101,7 +101,7 @@ nodes:
     name: delete_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: deleteFile
+    tool: delete_file
     input:
       - filename
       - bucket_name
@@ -122,7 +122,7 @@ nodes:
     name: read_after_delete
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: readFile
+    tool: read_file
     input:
       - filename
       - bucket_name
@@ -138,8 +138,8 @@ nodes:
     structured_output: true
     transition: validate_result
 
-  # Verification using readFile instead of listFiles for more robust deletion check.
-  # Why readFile verification is superior:
+  # Verification using read_file instead of list_files for more robust deletion check.
+  # Why read_file verification is superior:
   # 1. Direct verification - Tests actual behavior (file cannot be accessed after deletion)
   # 2. No JSON parsing complexity - Simple string checks for success/error indicators
   # 3. No scaling issues - Works with 1 file or 10,000 files in bucket
@@ -163,7 +163,7 @@ nodes:
         value: |
           Analyze the deletion workflow results to verify the file was properly deleted.
           
-          Tool execution: readFile (before) → deleteFile → readFile (after)
+          Tool execution: read_file (before) → delete_file → read_file (after)
           File being tested: {filename}
           
           Read before delete: {read_before_result}
@@ -175,7 +175,7 @@ nodes:
           - Delete operation must succeed (delete_result should contain "deleted successfully")
           - File must NOT be readable after deletion: read_after_result MUST contain "not found" OR "does not exist" OR "no such file" OR "404" OR "error" — a plain string like "File 'xxx' not found." counts as the expected not-found indicator
           
-          IMPORTANT: The readFile tool returns a plain string "File 'filename' not found." when a file does not exist. This string IS the expected error indicator — it is NOT an empty or missing response. If read_after_result contains "not found", the deletion is confirmed.
+          IMPORTANT: The read_file tool returns a plain string "File 'filename' not found." when a file does not exist. This string IS the expected error indicator — it is NOT an empty or missing response. If read_after_result contains "not found", the deletion is confirmed.
           
           Evaluate:
           1. Was the file accessible before deletion (read_before_result has actual content, not "not found")?

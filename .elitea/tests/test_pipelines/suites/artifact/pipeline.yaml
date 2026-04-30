@@ -137,7 +137,7 @@ setup:
     type: toolkit_invoke
     config:
       toolkit_id: ${ARTIFACT_TOOLKIT_ID}
-      tool_name: createFile
+      tool_name: create_file
       tool_params:
         filename: test_upload.txt
         filedata: |
@@ -157,7 +157,7 @@ setup:
     type: toolkit_invoke
     config:
       toolkit_id: ${ARTIFACT_TOOLKIT_ID}
-      tool_name: createFile
+      tool_name: create_file
       tool_params:
         filename: sharepoint_test_upload.txt
         filedata: |
@@ -177,7 +177,7 @@ setup:
     type: toolkit_invoke
     config:
       toolkit_id: ${ARTIFACT_TOOLKIT_ID}
-      tool_name: createFile
+      tool_name: create_file
       tool_params:
         filename: testrail_test_attachment.txt
         filedata: |

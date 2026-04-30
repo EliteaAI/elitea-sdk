@@ -1,7 +1,7 @@
 name: "ART17 - Delete File: Non-Existent File (Error Handling)"
 priority: High
 description: |
-  Verify that deleteFile returns appropriate error when attempting to delete a non-existent file.
+  Verify that delete_file returns appropriate error when attempting to delete a non-existent file.
   
   Objective: Validate error handling for file that doesn't exist in the bucket
   
@@ -37,7 +37,7 @@ entry_point: list_existing_files
 nodes:
   - id: list_existing_files
     type: toolkit
-    tool: listFiles
+    tool: list_files
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
     input:
       - bucket_name
@@ -52,7 +52,7 @@ nodes:
 
   - id: attempt_delete_nonexistent
     type: toolkit
-    tool: deleteFile
+    tool: delete_file
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
     input:
       - nonexistent_filename
@@ -85,7 +85,7 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the output from 'deleteFile' with NON-EXISTENT file.
+          Analyze the output from 'delete_file' with NON-EXISTENT file.
           
           Files in Bucket: {files_in_bucket}
           Delete Attempt Result: {delete_result}

@@ -60,7 +60,7 @@ nodes:
   - id: create_empty_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: createFile
+    tool: create_file
     input:
       - filename
       - bucket_name
@@ -106,7 +106,7 @@ nodes:
   - id: read_edited
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: readFile
+    tool: read_file
     input:
       - filename
       - bucket_name
@@ -125,7 +125,7 @@ nodes:
   - id: delete_file
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: deleteFile
+    tool: delete_file
     input:
       - filename
       - bucket_name
@@ -158,7 +158,7 @@ nodes:
         value: |
           analyze the empty file edit operation results.
           
-          tool executed: createFile (empty) → edit_file → readFile
+          tool executed: create_file (empty) → edit_file → read_file
           
           create result: {create_result}
           edit result: {edit_result}

@@ -149,7 +149,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         Partially edit specific sections of an existing text file using OLD/NEW markers.
         Use this for targeted changes — replacing, inserting, or deleting specific lines or sections
         while preserving all other content.
-        NOT for overwriting the whole file — use createFile for that.
+        NOT for overwriting the whole file — use create_file for that.
 
         Args:
             file_path: Path to the file to edit. Must be a text file.
@@ -412,7 +412,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         dispatch_custom_event("file_modified", {
             "message": f"File '{filename}' {'copied' if operation_type == 'copy' else 'created'} successfully",
             "filepath": new_filepath,
-            "tool_name": "createFile",
+            "tool_name": "create_file",
             "toolkit": "artifact",
             "operation_type": operation_type,
             "media_type": media_type,
@@ -586,7 +586,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         
         result = self.artifact.delete(full_key, target_bucket)
         if 'error' in result:
-            raise ToolException(f'Error (deleteFile): {result["error"]}')
+            raise ToolException(f'Error (delete_file): {result["error"]}')
         
         return f'File "{filename}" deleted successfully.'
 
@@ -608,7 +608,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         dispatch_custom_event("file_modified", {
             "message": f"Data appended to file successfully at {new_filepath}",
             "filepath": new_filepath,
-            "tool_name": "appendData",
+            "tool_name": "append_data",
             "toolkit": "artifact",
             "operation_type": "modify",
             "meta": {
@@ -816,10 +816,10 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         basic_tools = [
             {
                 "ref": self.list_files,
-                "name": "listFiles",
+                "name": "list_files",
                 "description": "List files in the artifact bucket. By default lists immediate children (files and subfolders). Use folder parameter to scope listing to a specific prefix/path. Use recursive=True to get all files under the path.",
                 "args_schema": create_model(
-                    "listBucket",
+                    "list_files",
                     bucket_name=bucket_name,
                     folder=(Optional[str], Field(
                         description="Folder/prefix to scope the listing to a specific path within the bucket.",
@@ -833,13 +833,13 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             },
             {
                 "ref": self.create_file,
-                "name": "createFile",
+                "name": "create_file",
                 "description": self._build_tool_description(
                     BASIC_CREATE_FILE_DESCRIPTION,
                     get_tool_description_lines('create'),
                 ),
                 "args_schema": create_model(
-                    "createFile", 
+                    "create_file", 
                     filename=(str, Field(description="Target filename in destination bucket. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
                     bucket_name=bucket_name,
                     filedata=(Optional[str], Field(
@@ -859,10 +859,10 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             },
             {
                 "ref": self.read_file,
-                "name": "readFile",
+                "name": "read_file",
                 "description": "Read a file from the artifact bucket. Supports full filepath (/{bucket}/{filename}) from attachment descriptions or filename+bucket_name. For large text files that exceed size limits, use start_line/end_line to read specific portions.",
                 "args_schema": create_model(
-                    "readFile", 
+                    "read_file", 
                     filename=(Optional[str], Field(
                         description="Filename (required if filepath not provided). Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'",
                         default=None)),
@@ -897,29 +897,29 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 "name": "get_file_type",
                 "description": "Detect the file type of a file using content analysis. More reliable than extension-based detection as it analyzes file magic bytes. Useful for verifying file types before processing or after generation.",
                 "args_schema": create_model(
-                    "getFileType",
+                    "get_file_type",
                     filepath=(str, Field(description="Path to the file (/{bucket}/{filename} format). This filepath is returned when files are uploaded or generated."))
                 )
             },
             {
                 "ref": self.delete_file,
-                "name": "deleteFile",
+                "name": "delete_file",
                 "description": "Delete a file in the artifact",
                 "args_schema": create_model(
-                    "deleteFile", 
+                    "delete_file", 
                     filename=(str, Field(description="Filename to delete. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
                     bucket_name=bucket_name
                 )
             },
             {
                 "ref": self.append_data,
-                "name": "appendData",
+                "name": "append_data",
                 "description": self._build_tool_description(
                     BASIC_APPEND_DESCRIPTION,
                     get_tool_description_lines('append'),
                 ),
                 "args_schema": create_model(
-                    "appendData", 
+                    "append_data", 
                     filename=(str, Field(description="Filename of the file to append to. Do NOT include bucket name - use 'folder/file.txt' or 'file.txt', NOT 'bucket-name/folder/file.txt'")),
                     filedata=(str, Field(description=self._build_filedata_description(
                         BASIC_APPEND_FILEDATA_DESCRIPTION,
@@ -934,13 +934,13 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             },
             {
                 "ref": self.create_new_bucket,
-                "name": "createNewBucket",
+                "name": "create_new_bucket",
                 "description": """Create a new bucket. 
                 **ONLY use when user explicitly requests bucket creation** (e.g., 'create bucket named xyz'). 
                 For file operations (save, create, append), use toolkit's configured bucket or buckets from chat history. 
                 Do not infer bucket creation from filenames.""",
                 "args_schema": create_model(
-                    "createNewBucket",
+                    "create_new_bucket",
                     bucket_name=(str, Field(
                         description="Bucket name to create. Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens. Underscores will be automatically converted to hyphens.",
                         pattern=r'^[a-z][a-z0-9_-]*$'  # Allow underscores in input, will be sanitized
