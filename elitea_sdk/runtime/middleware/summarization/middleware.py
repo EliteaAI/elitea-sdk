@@ -263,6 +263,16 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         in chunks - they should be handled by the agent's system prompt mechanism.
         """
         messages = state.get('messages', [])
+
+        # Account for the current user input when calculating tokens for trigger decision.
+        # In agent flow, current user message is extracted to state['input'] and removed
+        # from state['messages'], but it WILL be sent to LLM as part of the context.
+        # We need to include it for accurate trigger threshold comparison.
+        current_input = state.get('input')
+        _input_token_bonus = 0
+        if current_input and isinstance(current_input, str) and current_input.strip():
+            _input_token_bonus = self.token_counter([HumanMessage(content=current_input)])
+
         if not messages:
             self.last_context_info = {
                 'message_count': 0,
@@ -307,15 +317,21 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             return None
 
         total_tokens = self.token_counter(messages_since_summary)
+        # Add current input tokens for accurate trigger threshold comparison
+        # The current user input is sent to LLM but not in state['messages'] yet
+        effective_tokens = total_tokens + _input_token_bonus
+
 
         # Track context info (messages since last summary only)
         self.last_context_info = {
             'message_count': len(messages_since_summary) + (1 if existing_summary else 0),
-            'token_count': total_tokens,
+            'token_count': effective_tokens,
             'summarized': False,
         }
 
-        if not self.summarization_enabled or not self._should_summarize(messages_since_summary, total_tokens):
+        # Use effective_tokens (including current input) for trigger decision
+        should_summ = self._should_summarize(messages_since_summary, effective_tokens)
+        if not self.summarization_enabled or not should_summ:
             return None
 
         cutoff_index = self._determine_cutoff_index(messages_since_summary)
