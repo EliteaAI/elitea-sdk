@@ -2,29 +2,22 @@ name: "PST10 - get_request_by_id: Retrieve request by ID"
 priority: Critical
 description: |
   Validates that the get_request_by_id tool successfully retrieves a specific
-  API request using its unique identifier.
+  API request using its unique identifier from the default collection.
   
   Objective: Verify request retrieval by ID
   
   Expected Behavior:
-  - Duplicate collection is created for testing
-  - Test folder and request are created in duplicate
+  - Test folder and request are created in the default collection
   - Request ID is extracted from creation result
   - get_request_by_id retrieves the request by ID
   - Returns complete request details
-  - Duplicate collection is cleaned up
+  - Test folder is cleaned up
 
 toolkits:
   - id: ${POSTMAN_TOOLKIT_ID}
     name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
-  duplicate_name:
-    type: str
-  duplicate_result:
-    type: str
-  duplicate_id:
-    type: str
   folder_name:
     type: str
   request_name:
@@ -69,7 +62,6 @@ nodes:
         # Generate unique names
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-        duplicate_name = f"PST10_Collection_{timestamp}_{random_suffix}"
         folder_name = f"PST10_Folder_{timestamp}_{random_suffix}"
         request_name = f"PST10_Request_{timestamp}_{random_suffix}"
         
@@ -78,67 +70,16 @@ nodes:
         request_path = f"{folder_name}/{request_name}"
         
         {
-          "duplicate_name": duplicate_name,
           "folder_name": folder_name,
           "request_name": request_name,
           "folder_path": folder_path,
           "request_path": request_path
         }
     output:
-      - duplicate_name
       - folder_name
       - request_name
       - folder_path
       - request_path
-    structured_output: true
-    transition: duplicate_collection
-
-  - id: duplicate_collection
-    type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: duplicate_collection
-    input:
-      - duplicate_name
-    input_mapping:
-      new_name:
-        type: variable
-        value: duplicate_name
-    output:
-      - duplicate_result
-    structured_output: true
-    transition: extract_duplicate_id
-
-  - id: extract_duplicate_id
-    type: code
-    code:
-      type: fstring
-      value: |
-        import json
-        import re
-        
-        result_str = elitea_state.get('duplicate_result', '')
-        duplicate_id = None
-        
-        try:
-            result_data = json.loads(result_str)
-            if isinstance(result_data, dict) and 'collection' in result_data:
-                coll = result_data['collection']
-                duplicate_id = coll.get('id') or coll.get('uid')
-                if not duplicate_id and 'info' in coll:
-                    duplicate_id = coll['info'].get('_postman_id') or coll['info'].get('uid')
-        except:
-            pass
-        
-        if not duplicate_id:
-            id_match = re.search(r'"(?:id|uid|_postman_id)"\s*:\s*"([^"]+)"', result_str)
-            if id_match:
-                duplicate_id = id_match.group(1)
-        
-        duplicate_id or "ID_NOT_FOUND"
-    input:
-      - duplicate_result
-    output:
-      - duplicate_id
     structured_output: true
     transition: create_test_folder
 
@@ -147,12 +88,8 @@ nodes:
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_folder
     input:
-      - duplicate_id
       - folder_name
     input_mapping:
-      collection_id:
-        type: variable
-        value: duplicate_id
       name:
         type: variable
         value: folder_name
@@ -166,15 +103,11 @@ nodes:
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_request
     input:
-      - duplicate_id
       - folder_path
       - request_name
       - request_method
       - request_url
     input_mapping:
-      collection_id:
-        type: variable
-        value: duplicate_id
       folder_path:
         type: variable
         value: folder_path
@@ -197,12 +130,8 @@ nodes:
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: get_request_by_path
     input:
-      - duplicate_id
       - request_path
     input_mapping:
-      collection_id:
-        type: variable
-        value: duplicate_id
       request_path:
         type: variable
         value: request_path
@@ -273,19 +202,19 @@ nodes:
     output:
       - get_request_result
     structured_output: true
-    transition: cleanup_delete_collection
+    transition: cleanup_delete_folder
 
-  - id: cleanup_delete_collection
+  - id: cleanup_delete_folder
     type: toolkit
     continue_on_error: true
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: delete_collection
+    tool: delete_folder
     input:
-      - duplicate_id
+      - folder_path
     input_mapping:
-      collection_id:
+      folder_path:
         type: variable
-        value: duplicate_id
+        value: folder_path
     output:
       - delete_result
     structured_output: true
@@ -295,8 +224,6 @@ nodes:
     type: llm
     model: ${DEFAULT_LLM_MODEL}
     input:
-      - duplicate_result
-      - duplicate_id
       - create_folder_result
       - create_request_result
       - get_by_path_result
@@ -317,8 +244,6 @@ nodes:
         value: |
           Analyze the output from Postman request operations using ID retrieval.
           
-          Duplicate Result: {duplicate_result}
-          Duplicate ID: {duplicate_id}
           Folder Creation Result: {create_folder_result}
           Request Creation Result: {create_request_result}
           Extracted Request ID: {request_id}
@@ -330,22 +255,18 @@ nodes:
           This is a POSITIVE test - we expect successful ID-based request retrieval.
           
           Validation Criteria (ALL must pass for test_passed=true):
-          1. duplicate_created: Collection was duplicated successfully
-          2. id_extracted_from_duplicate: Duplicate collection ID was extracted
-          3. folder_created: Folder was created successfully in duplicate
-          4. request_created: Request was created successfully in duplicate
-          5. request_id_extracted: Request ID was extracted (not "ID_NOT_FOUND")
-          6. request_retrieved: get_request_by_id returned request details
-          7. correct_name: Request name matches expected
-          8. correct_method: Request method matches expected
-          9. no_errors: No error indicators in any output
-          10. cleanup_succeeded: Duplicate collection was deleted successfully
+          1. folder_created: Folder was created successfully in the default collection
+          2. request_created: Request was created successfully
+          3. request_id_extracted: Request ID was extracted (not "ID_NOT_FOUND")
+          4. request_retrieved: get_request_by_id returned request details
+          5. correct_name: Request name matches expected
+          6. correct_method: Request method matches expected
+          7. no_errors: No error indicators in any output
+          8. cleanup_succeeded: Test folder was deleted successfully
           
           Return JSON test_results:
           {{
             "test_passed": boolean (true only if ALL criteria pass),
-            "duplicate_created": boolean,
-            "id_extracted_from_duplicate": boolean,
             "folder_created": boolean,
             "request_created": boolean,
             "request_id_extracted": boolean,
