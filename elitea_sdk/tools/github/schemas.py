@@ -62,7 +62,7 @@ ReadFile = create_model(
 UpdateFile = create_model(
     "UpdateFile",
     file_query=(str, Field(description=UPDATE_FILE_PROMPT_WITH_PATH, json_schema_extra={'multiline': True})),
-    branch=(Optional[str], Field(default=None, description="The branch to commit the update to. If None, uses the current active branch.")),
+    branch=(str, Field(description="The branch to commit the update to.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
     commit_message=(Optional[str], Field(default=None, description="Commit message for the update operation")),
 )
@@ -70,7 +70,7 @@ UpdateFile = create_model(
 CreateFile = create_model(
     "CreateFile",
     file_path=(str, Field(description="The path of the file to create in the repository, e.g. `src/new_file.py` or `images/photo.png`")),
-    branch=(Optional[str], Field(default=None, description="The branch to create the file on. If None, uses the current active branch.")),
+    branch=(str, Field(description="The branch to create the file on.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
     file_contents=(Optional[str], Field(
         default=None,
@@ -85,7 +85,7 @@ CreateFile = create_model(
 DeleteFile = create_model(
     "DeleteFile",
     file_path=(str, Field(description="The path of the file to delete, e.g. `src/old_file.py`")),
-    branch=(Optional[str], Field(default=None, description="The branch to delete the file from. If None, uses the current active branch.")),
+    branch=(str, Field(description="The branch to delete the file from.")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
 )
 
@@ -105,7 +105,7 @@ CreatePR = create_model(
     "CreatePR",
     title=(str, Field(description="Title of the pull request")),
     body=(str, Field(description="Body of the pull request")),
-    head=(Optional[str], Field(description="The branch containing the changes (defaults to active_branch)")),
+    head=(str, Field(description="The active branch containing the changes")),
     base=(Optional[str], Field(description="The target branch (defaults to github_base_branch)")),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
 )
