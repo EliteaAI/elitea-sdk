@@ -355,6 +355,13 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             'summarized': False,
         }
 
+        # Skip summarization trigger when in the middle of a tool-call loop.
+        # If the last message is a ToolMessage or an AIMessage with tool_calls,
+        # the agent is still processing tools — summarizing mid-loop would break
+        # the tool call/response pairing and cause errors.
+        if messages_since_summary and _is_tool_related_message(messages_since_summary[-1]):
+            return None
+
         # Use full token count (including tool messages) for trigger decision —
         # tool messages DO consume the LLM context window
         should_summ = self._should_summarize(messages_since_summary, effective_tokens)
