@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 _IMAGE_TOKEN_ESTIMATE = 85
 
 
+def _is_tool_related_message(msg) -> bool:
+    """Check if a message is part of a tool-call interaction (not user-facing).
+
+    Tool-related messages:
+    - ToolMessage: result returned from a tool execution
+    - AIMessage with tool_calls: intermediate LLM turn requesting tool execution
+    """
+    if isinstance(msg, ToolMessage):
+        return True
+    if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
+        return True
+    if isinstance(msg, dict):
+        role = msg.get('role', msg.get('type', ''))
+        if role in ('tool',):
+            return True
+        if role in ('assistant', 'ai') and msg.get('tool_calls'):
+            return True
+    return False
+
+
 def _count_tokens_image_aware(
     messages,
     *,
@@ -316,20 +336,27 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             }
             return None
 
+        # Full token count (including tool messages) for trigger decision
         total_tokens = self.token_counter(messages_since_summary)
-        # Add current input tokens for accurate trigger threshold comparison
-        # The current user input is sent to LLM but not in state['messages'] yet
         effective_tokens = total_tokens + _input_token_bonus
 
+        # User-facing counts: exclude tool-related messages (AI with tool_calls, ToolMessage)
+        # These are internal to tool execution and not user-visible conversation turns
+        user_facing_messages = [
+            m for m in messages_since_summary
+            if not _is_tool_related_message(m)
+        ]
+        user_facing_tokens = self.token_counter(user_facing_messages) + _input_token_bonus
 
-        # Track context info (messages since last summary only)
+        # Track context info with user-facing counts only
         self.last_context_info = {
-            'message_count': len(messages_since_summary) + (1 if existing_summary else 0),
-            'token_count': effective_tokens,
+            'message_count': len(user_facing_messages) + (1 if existing_summary else 0),
+            'token_count': user_facing_tokens,
             'summarized': False,
         }
 
-        # Use effective_tokens (including current input) for trigger decision
+        # Use full token count (including tool messages) for trigger decision —
+        # tool messages DO consume the LLM context window
         should_summ = self._should_summarize(messages_since_summary, effective_tokens)
         if not self.summarization_enabled or not should_summ:
             return None
@@ -358,12 +385,13 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
 
         summary = self._create_summary(messages_to_summarize)
 
-        # Calculate token counts for analytics (summary is not in state — only preserved count)
-        preserved_tokens = self.token_counter(preserved_messages) if preserved_messages else 0
+        # User-facing counts for preserved messages (exclude tool internals)
+        preserved_user_facing = [m for m in preserved_messages if not _is_tool_related_message(m)]
+        preserved_tokens = self.token_counter(preserved_user_facing) if preserved_user_facing else 0
 
         # Update context_info with post-summarization state (unified format)
         self.last_context_info = {
-            'message_count': len(preserved_messages),
+            'message_count': len(preserved_user_facing),
             'token_count': preserved_tokens,
             'summarized': True,
             'summarized_count': len(messages_to_summarize),
@@ -405,12 +433,16 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             }
             return None
 
-        # Filter out system messages, RemoveMessage operations, and summary messages
+        # Only count user-facing messages: exclude system, remove ops, summaries,
+        # and tool-related messages (ToolMessage + AIMessage with tool_calls).
+        # Tool messages are internal to tool execution loops and should not
+        # inflate the reported message/token counts.
         countable_messages = [
             m for m in messages
             if not isinstance(m, SystemMessage)
             and not isinstance(m, RemoveMessage)
             and not self._is_summary_message(m)
+            and not _is_tool_related_message(m)
         ]
 
         if not countable_messages:
