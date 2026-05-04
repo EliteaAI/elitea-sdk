@@ -1558,6 +1558,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 "with no accompanying text."
             )
         
+        # Capture the full conversation messages BEFORE checkpoint logic modifies input.
+        # Used later to recalculate context_info from the full conversation perspective
+        # (pipeline LLM nodes may only see a subset via their input_mapping).
+        _full_conversation_messages = list(input.get('messages') or [])
+
         logger.info(f"Input: {thread_id} - {input}")
         hitl_resume_ctx = None
         try:
@@ -1889,6 +1894,42 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # Apply fallback context_info if state didn't have one (pipeline without LLM nodes)
         if not result_with_state.get('context_info') and isinstance(result, dict) and result.get('context_info'):
             result_with_state['context_info'] = result['context_info']
+
+        # ── Recalculate context_info from full conversation perspective ────
+        # Pipeline LLM nodes compute context_info from their local input_mapping
+        # (e.g., only system+task+response = 2 messages). Override with a
+        # recalculation using the FULL conversation messages so that context_info
+        # always reflects the actual conversation size, not pipeline internals.
+        _mw_manager = getattr(self, '_middleware_manager', None)
+        if (_mw_manager is not None
+                and _mw_manager._middleware
+                and _full_conversation_messages):
+            # Build the complete message list: full conversation + current input + response
+            msgs_for_recount = list(_full_conversation_messages)
+            # Add current user input (was extracted from messages during preprocessing)
+            if isinstance(input, dict) and input.get('input'):
+                user_input = input['input']
+                if isinstance(user_input, str):
+                    msgs_for_recount.append(HumanMessage(content=user_input))
+                elif isinstance(user_input, list) and user_input:
+                    # Multimodal content list
+                    msgs_for_recount.append(HumanMessage(content=user_input))
+            # Add response message placeholder (the assistant's reply for this turn)
+            output_content = result_with_state.get('output', '')
+            if output_content and isinstance(output_content, str):
+                msgs_for_recount.append(AIMessage(content=output_content))
+            # Run after_model to recalculate context_info from full conversation
+            _mw_manager.run_after_model({'messages': msgs_for_recount}, config or {})
+            recalculated = _mw_manager.get_context_info()
+            if recalculated and recalculated.get('message_count', 0) > 0:
+                # Preserve summarization details from pipeline LLM node if present
+                existing_context_info = result_with_state.get('context_info') or {}
+                if existing_context_info.get('summarized'):
+                    recalculated['summarized'] = True
+                    for key in ('summarized_count', 'preserved_count', 'fitting_count', 'summary_content'):
+                        if key in existing_context_info:
+                            recalculated[key] = existing_context_info[key]
+                result_with_state['context_info'] = recalculated
 
         return result_with_state
 
