@@ -221,7 +221,7 @@ execution:
     - test_case_19_*.yaml  # ART17 - SharePoint Upload File Replace
     - test_case_20_*.yaml  # ART18 - SharePoint Add Attachment from Artifact
     - test_case_21_*.yaml  # ART19 - SharePoint Add Attachment Replace
-    - test_case_22_*.yaml  # ART22 - TestRail Add File to Case
+    # DISABLED: - test_case_22_*.yaml  # ART22 - TestRail Add File to Case (testrail integration disabled)
 
   # Variables to substitute in test YAML files
   substitutions:
