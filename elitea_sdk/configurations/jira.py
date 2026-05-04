@@ -94,7 +94,6 @@ class JiraConfiguration(BaseModel):
     )
     base_url: str = Field(
         description=_JIRA_BASE_URL_TOOLTIP,
-        default="",
         json_schema_extra={"placeholder": "e.g. https://yourcompany.atlassian.net or https://jira.yourcompany.com"}
     )
     username: Optional[str] = Field(

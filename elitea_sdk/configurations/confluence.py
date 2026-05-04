@@ -94,7 +94,6 @@ class ConfluenceConfiguration(BaseModel):
     )
     base_url: str = Field(
         description=_CONFLUENCE_BASE_URL_TOOLTIP,
-        default="",
         json_schema_extra={"placeholder": "e.g. https://yourcompany.atlassian.net/wiki or https://confluence.yourcompany.com"}
     )
     username: Optional[str] = Field(

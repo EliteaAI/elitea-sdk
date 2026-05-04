@@ -16,7 +16,7 @@ class ZephyrEssentialConfiguration(BaseModel):
             }
         }
     )
-    base_url: Optional[str] = Field(description="Zephyr Essential API Base URL", default=None)
+    base_url: str = Field(description="Zephyr Essential API Base URL")
     token: SecretStr = Field(description="Zephyr Essential API Token")
 
     @staticmethod
