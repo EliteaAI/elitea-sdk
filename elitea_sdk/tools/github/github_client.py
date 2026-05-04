@@ -591,12 +591,13 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain text
             return {"error": str(e), "message": f"Unable to retrieve diff between commits due to error: {str(e)}"}
         
-    def apply_git_patch_from_file(self, bucket_name: str, file_name: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None, branch: Optional[str] = None) -> str:
+    def apply_git_patch_from_file(self, bucket_name: str, file_name: str, branch: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None) -> str:
         """Applies a git patch from a file stored in a specified bucket.
 
         Args:
             bucket_name (str): The name of the bucket where the patch file is stored.
             file_name (str): The name of the patch file to apply.
+            branch (str): The branch to apply the patch to.
             commit_message (Optional[str], optional): The commit message for the patch application. Defaults to "Apply git patch".
             repo_name (Optional[str], optional): The name of the repository to apply the patch to. Defaults to None.
 
@@ -616,16 +617,17 @@ class GitHubClient(BaseModel):
                 return {"error": "Invalid patch content", "message": f"Patch file '{file_name}' contains invalid content type."}
             
             # Apply the git patch using the content
-            return self.apply_git_patch(patch_content, commit_message, repo_name, branch)
+            return self.apply_git_patch(patch_content, branch, commit_message, repo_name)
         except Exception as e:
             return {"error": str(e), "message": f"Unable to download patch file: {str(e)}"}
 
-    def apply_git_patch(self, patch_content: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None, branch: Optional[str] = None) -> str:
+    def apply_git_patch(self, patch_content: str, branch: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None) -> str:
         """
         Applies a git patch to the repository by parsing the unified diff format and updating files accordingly.
 
         Parameters:
             patch_content (str): The git patch content in unified diff format
+            branch (str): The branch to apply the patch to
             commit_message (Optional[str]): Commit message for the patch application
             repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
@@ -636,7 +638,6 @@ class GitHubClient(BaseModel):
         
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
-            branch = branch or self.active_branch
 
             if branch == self.github_base_branch:
                 return {
