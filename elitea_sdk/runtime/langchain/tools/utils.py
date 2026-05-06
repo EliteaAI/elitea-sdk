@@ -141,8 +141,14 @@ def unpack_json(json_data):
         raise ValueError("Wrong type of json_data")
 
 
+REQUIRED_NLTK_PACKAGES = (
+    "punkt_tab",
+    "averaged_perceptron_tagger_eng",
+)
+
+
 def download_nltk(target, force=False):
-    """ Download NLTK punkt """
+    """Download only the NLTK resources required by the runtime."""
     from . import state  # pylint: disable=C0415
     #
     if state.nltk_punkt_downloaded and not force:
@@ -166,9 +172,7 @@ def download_nltk(target, force=False):
     nltk.downloader._downloader._download_dir = target  # pylint: disable=W0212
     nltk.data.path = [target]
     #
-    nltk_packages = ["all"]
-    #
-    for package in nltk_packages:
+    for package in REQUIRED_NLTK_PACKAGES:
         nltk.download(package, download_dir=target)
     #
     state.nltk_punkt_downloaded = True
