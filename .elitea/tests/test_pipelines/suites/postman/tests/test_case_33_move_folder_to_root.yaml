@@ -13,8 +13,8 @@ description: |
   - Returns confirmation of the move
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -57,7 +57,7 @@ nodes:
 
   - id: create_source_folder
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_folder
     input:
       - source_folder_name
@@ -72,7 +72,7 @@ nodes:
 
   - id: invoke_move_folder
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: move_folder
     input:
       - source_path
@@ -134,7 +134,7 @@ nodes:
   - id: cleanup_delete_folder
     type: toolkit
     continue_on_error: true
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: delete_folder
     input:
       - source_path

@@ -12,8 +12,8 @@ description: |
   - Error indicates folder not found
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -31,7 +31,7 @@ entry_point: invoke_update_folder
 nodes:
   - id: invoke_update_folder
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: update_folder
     input:
       - invalid_folder_path

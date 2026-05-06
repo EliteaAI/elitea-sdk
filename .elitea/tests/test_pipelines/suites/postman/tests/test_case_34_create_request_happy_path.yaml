@@ -13,8 +13,8 @@ description: |
   - Returns request ID and confirmation
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -65,7 +65,7 @@ nodes:
 
   - id: create_test_folder
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_folder
     input:
       - folder_name
@@ -80,7 +80,7 @@ nodes:
 
   - id: invoke_create_request
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_request
     input:
       - folder_path
@@ -150,7 +150,7 @@ nodes:
   - id: cleanup_delete_request
     type: toolkit
     continue_on_error: true
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: delete_request
     input:
       - folder_path
@@ -167,7 +167,7 @@ nodes:
   - id: cleanup_delete_folder
     type: toolkit
     continue_on_error: true
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: delete_folder
     input:
       - folder_path
