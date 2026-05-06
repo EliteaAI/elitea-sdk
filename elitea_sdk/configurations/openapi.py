@@ -1,21 +1,23 @@
-from typing import Any, Literal, Optional
+import base64
+import logging
+from typing import Any, Dict, Literal, Optional
+
+import requests
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-import base64
-import requests
+log = logging.getLogger(__name__)
 
 
 class OpenApiConfiguration(BaseModel):
     """
     OpenAPI configuration for authentication.
-    
-    Supports three authentication modes:
+
+    Supports four authentication modes:
     - Anonymous: No authentication (all fields empty)
     - API Key: Static key sent via header (Bearer, Basic, or Custom)
     - OAuth2 Client Credentials: Machine-to-machine authentication flow
-    
-    Note: Only OAuth2 Client Credentials flow is supported. Authorization Code flow
-    is not supported as it requires user interaction and pre-registered redirect URLs.
+    - OAuth2 Authorization Code (Browser): Delegated user-context flow via browser popup
+      (activated when oauth_discovery_endpoint is set)
     """
     
     model_config = ConfigDict(
@@ -29,9 +31,12 @@ class OpenApiConfiguration(BaseModel):
                 "extra_categories": ["api", "openapi", "swagger"],
                 "check_connection": {
                     "enabled_when": {
-                        "all_fields_set": ["client_id", "client_secret", "method", "token_url"],
+                        "any_of": [
+                            {"all_fields_set": ["client_id", "client_secret", "method", "token_url"]},
+                            {"all_fields_set": ["client_id", "client_secret", "oauth_discovery_endpoint"]},
+                        ],
                     },
-                    "disabled_tooltip": "Available only for OAuth (Client Credentials). Please setup client_id, client_secret, method and token_url to activate it on setup.",
+                    "disabled_tooltip": "Available for OAuth. Please setup client_id, client_secret, and either token_url (Client Credentials) or oauth_discovery_endpoint (Delegated) to activate.",
                 },
                 "sections": {
                     "auth": {
@@ -42,7 +47,16 @@ class OpenApiConfiguration(BaseModel):
                                 "fields": ["api_key", "auth_type", "custom_header_name"],
                             },
                             {
-                                "name": "OAuth",
+                                "name": "OAuth (Delegated)",
+                                "fields": [
+                                    "client_id",
+                                    "client_secret",
+                                    "oauth_discovery_endpoint",
+                                    "scope",
+                                ],
+                            },
+                            {
+                                "name": "OAuth (Client Credentials)",
                                 "fields": [
                                     "client_id",
                                     "client_secret",
@@ -125,26 +139,65 @@ class OpenApiConfiguration(BaseModel):
         ),
     )
 
+    # OAuth2 Authorization Code Flow (Delegated/Browser) Fields
+    oauth_discovery_endpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "OAuth2 discovery endpoint (identity provider base URL). When set, enables "
+            "browser-based Authorization Code flow instead of Client Credentials. "
+            "The SDK discovers authorization and token endpoints from .well-known/openid-configuration. "
+            "Examples: "
+            "Azure AD: https://login.microsoftonline.com/{tenant_id}, "
+            "Google: https://accounts.google.com, "
+            "Okta: https://{domain}.okta.com"
+        ),
+    )
+    configuration_uuid: Optional[str] = Field(
+        default=None,
+        description=(
+            "Unique identifier for this credential record, injected at runtime by the platform. "
+            "Used as the token storage key to isolate OAuth sessions across multiple configurations."
+        ),
+        json_schema_extra={'hidden': True},
+    )
+
     @model_validator(mode='before')
     @classmethod
     def _validate_auth_consistency(cls, values):
         if not isinstance(values, dict):
             return values
 
-        # OAuth: if any OAuth field is provided, require the essential ones
-        has_any_oauth = any(
-            (values.get('client_id'), values.get('client_secret'), values.get('token_url'))
-        )
-        if has_any_oauth:
+        is_delegated = bool(values.get('oauth_discovery_endpoint'))
+
+        # OAuth (Delegated): oauth_discovery_endpoint requires client_id and client_secret
+        if is_delegated:
             missing = []
             if not values.get('client_id'):
                 missing.append('client_id')
             if not values.get('client_secret'):
                 missing.append('client_secret')
-            if not values.get('token_url'):
-                missing.append('token_url')
+
             if missing:
-                raise ValueError(f"OAuth is misconfigured; missing: {', '.join(missing)}")
+                raise ValueError(
+                    f"OAuth (Delegated) is misconfigured; missing: {', '.join(missing)}"
+                )
+        else:
+            # OAuth (Client Credentials): if any OAuth field is provided, require the essential ones
+            has_any_oauth = any(
+                (values.get('client_id'), values.get('client_secret'), values.get('token_url'))
+            )
+            if has_any_oauth:
+                missing = []
+                if not values.get('client_id'):
+                    missing.append('client_id')
+                if not values.get('client_secret'):
+                    missing.append('client_secret')
+                if not values.get('token_url'):
+                    missing.append('token_url')
+                if missing:
+                    raise ValueError(
+                        f"OAuth (Client Credentials) is misconfigured; missing: {', '.join(missing)}"
+                    )
 
         # API key: if auth_type is custom, custom_header_name must be present
         auth_type = values.get('auth_type')
@@ -183,25 +236,133 @@ class OpenApiConfiguration(BaseModel):
             str: Error message describing the validation failure
         """
         
-        # =====================================================================
         # Determine authentication type from configured fields
-        # =====================================================================
-        
         client_id = settings.get('client_id')
         client_secret = settings.get('client_secret')
         token_url = settings.get('token_url')
-        
+        oauth_discovery_endpoint = settings.get('oauth_discovery_endpoint')
+
         has_oauth_fields = client_id or client_secret or token_url
-        
+
+        # DELEGATED (Authorization Code flow): Raise McpAuthorizationRequired
+        if oauth_discovery_endpoint:
+            # If a valid access_token is already in settings (injected by the platform after
+            # the user completes the OAuth popup), skip the authorization challenge and
+            # treat the connection as successful — mirrors SharePoint's check_connection behavior.
+            access_token = settings.get('access_token')
+            if access_token:
+                return None
+
+            from ..runtime.utils.mcp_oauth import (
+                McpAuthorizationRequired,
+                fetch_oauth_authorization_server_metadata,
+            )
+            base_discovery = oauth_discovery_endpoint.rstrip("/")
+            azure_v2_endpoint = f"{base_discovery}/v2.0/.well-known/openid-configuration"
+
+            openid_meta = fetch_oauth_authorization_server_metadata(
+                base_discovery,
+                extra_endpoints=[azure_v2_endpoint],
+            )
+
+            resource_metadata_url = f"{base_discovery}/.well-known/openid-configuration"
+            authorization_endpoint = (openid_meta or {}).get(
+                "authorization_endpoint",
+                f"{base_discovery}/oauth2/v2.0/authorize",
+            )
+            token_endpoint = (openid_meta or {}).get(
+                "token_endpoint",
+                token_url or f"{base_discovery}/oauth2/v2.0/token",
+            )
+
+            scope = settings.get('scope')
+            # All scopes the IdP supports — used only for oauth_authorization_server metadata
+            idp_scopes_supported = list((openid_meta or {}).get("scopes_supported") or [])
+            # Scopes the user explicitly configured for this resource
+            configured_scopes = scope.split() if scope else []
+            # Merged list for auth-server metadata
+            all_scopes = list(idp_scopes_supported)
+            for s in configured_scopes:
+                if s not in all_scopes:
+                    all_scopes.append(s)
+
+            www_authenticate = (
+                f'Bearer error="unauthorized_client", '
+                f'error_description="No access token was provided in this request", '
+                f'resource_metadata="{resource_metadata_url}", '
+                f'authorization_uri="{authorization_endpoint}"'
+            )
+
+            oauth_authorization_server: Dict = {
+                "issuer": (openid_meta or {}).get("issuer", base_discovery),
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint": token_endpoint,
+            }
+            jwks_uri = (openid_meta or {}).get("jwks_uri")
+            if jwks_uri:
+                oauth_authorization_server["jwks_uri"] = jwks_uri
+            if all_scopes:
+                oauth_authorization_server["scopes_supported"] = all_scopes
+            if openid_meta:
+                for key in (
+                    "response_types_supported",
+                    "claims_supported",
+                    "id_token_signing_alg_values_supported",
+                    "userinfo_endpoint",
+                    "code_challenge_methods_supported",
+                    "grant_types_supported",
+                    "token_endpoint_auth_methods_supported",
+                ):
+                    if key in openid_meta:
+                        oauth_authorization_server[key] = openid_meta[key]
+
+            resource_metadata: Dict = {
+                "resource_name": "OpenAPI",
+                "resource": settings.get('base_url', ''),
+                "authorization_servers": [base_discovery],
+                "bearer_methods_supported": ["header"],
+                "oauth_authorization_server": oauth_authorization_server,
+            }
+            # resource_metadata.scopes_supported = only user-configured scopes (what this resource needs).
+            # Do NOT include all IdP scopes here — the UI uses this field as the initial scope to request.
+            if configured_scopes:
+                resource_metadata["scopes_supported"] = configured_scopes
+
+            configuration_uuid = settings.get('configuration_uuid')
+            if configuration_uuid:
+                resource_metadata["configuration_uuid"] = configuration_uuid
+
+            provided_settings = {}
+            if client_id:
+                provided_settings['mcp_client_id'] = client_id
+            # NOTE: mcp_client_secret is intentionally NOT included here.
+            # In the check_connection path there is no toolkit DB record, so the proxy
+            # cannot recover a masked secret via toolkit_id lookup.
+            # The frontend falls back to formClientSecret (the vault reference
+            # returned by the credential GET API), which the proxy resolves via
+            # VaultClient.unsecret() — that path works correctly.
+            if scope:
+                provided_settings['scopes'] = scope
+            if provided_settings:
+                resource_metadata['provided_settings'] = provided_settings
+
+            raise McpAuthorizationRequired(
+                message="OpenAPI endpoint requires OAuth authorization. Please log in to continue.",
+                server_url=settings.get('base_url', ''),
+                resource_metadata_url=resource_metadata_url,
+                www_authenticate=www_authenticate,
+                resource_metadata=resource_metadata,
+            )
+
         # =====================================================================
         # ANONYMOUS or API KEY: Cannot validate, return success
         # =====================================================================
-        
+
         if not has_oauth_fields:
             # No OAuth fields configured - this is either:
             # - Anonymous authentication (no auth at all)
             # - API Key authentication (api_key field may be set)
-            # 
+            #
             # Neither can be validated without making actual API calls to the
             # target service, and we don't have the OpenAPI spec available here.
             return None

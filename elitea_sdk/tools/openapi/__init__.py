@@ -214,6 +214,129 @@ def _get_oauth_access_token(settings: Dict[str, Any]) -> Tuple[Optional[str], Op
     )
 
 
+def _build_openapi_mcp_authorization_required(
+    oauth_discovery_endpoint: str,
+    scope: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_secret: Optional[Any] = None,
+    configuration_uuid: Optional[str] = None,
+    toolkit_id: Optional[int] = None,
+    base_url: str = '',
+):
+    """Build a McpAuthorizationRequired exception for the OpenAPI toolkit.
+
+    Mirrors SharepointConfiguration._build_mcp_authorization_required() —
+    discovers OAuth endpoints from .well-known and constructs resource_metadata
+    so the frontend can trigger the browser login popup.
+    """
+    from ...runtime.utils.mcp_oauth import (
+        McpAuthorizationRequired,
+        fetch_oauth_authorization_server_metadata,
+    )
+    from ...runtime.utils.utils import mask_secret
+
+    base_discovery = oauth_discovery_endpoint.rstrip("/")
+    azure_v2_endpoint = f"{base_discovery}/v2.0/.well-known/openid-configuration"
+
+    openid_meta = fetch_oauth_authorization_server_metadata(
+        base_discovery,
+        extra_endpoints=[azure_v2_endpoint],
+    )
+    logger.debug(f"OpenAPI OAuth discovery metadata: {openid_meta}")
+
+    resource_metadata_url = f"{base_discovery}/.well-known/openid-configuration"
+    authorization_endpoint = (openid_meta or {}).get(
+        "authorization_endpoint",
+        f"{base_discovery}/oauth2/v2.0/authorize",
+    )
+    token_endpoint = (openid_meta or {}).get(
+        "token_endpoint",
+        f"{base_discovery}/oauth2/v2.0/token",
+    )
+
+    # All scopes the IdP supports — used only for oauth_authorization_server metadata
+    idp_scopes_supported = list((openid_meta or {}).get("scopes_supported") or [])
+    # Scopes the user explicitly configured for this resource
+    configured_scopes = scope.split() if scope else []
+    # Merged list for auth-server metadata (IdP list + any configured scopes not already present)
+    all_scopes = list(idp_scopes_supported)
+    for s in configured_scopes:
+        if s not in all_scopes:
+            all_scopes.append(s)
+
+    www_authenticate = (
+        f'Bearer error="unauthorized_client", '
+        f'error_description="No access token was provided in this request", '
+        f'resource_metadata="{resource_metadata_url}", '
+        f'authorization_uri="{authorization_endpoint}"'
+    )
+
+    oauth_authorization_server: Dict = {
+        "issuer": (openid_meta or {}).get("issuer", base_discovery),
+        "authorization_endpoint": authorization_endpoint,
+        "token_endpoint": token_endpoint,
+    }
+    jwks_uri = (openid_meta or {}).get("jwks_uri")
+    if jwks_uri:
+        oauth_authorization_server["jwks_uri"] = jwks_uri
+    if all_scopes:
+        oauth_authorization_server["scopes_supported"] = all_scopes
+    if openid_meta:
+        for key in (
+            "response_types_supported",
+            "claims_supported",
+            "id_token_signing_alg_values_supported",
+            "userinfo_endpoint",
+            "code_challenge_methods_supported",
+            "grant_types_supported",
+            "token_endpoint_auth_methods_supported",
+        ):
+            if key in openid_meta:
+                oauth_authorization_server[key] = openid_meta[key]
+
+    resource_metadata: Dict = {
+        "resource_name": "OpenAPI",
+        "resource": base_url,
+        "authorization_servers": [base_discovery],
+        "bearer_methods_supported": ["header"],
+        "oauth_authorization_server": oauth_authorization_server,
+    }
+    # resource_metadata.scopes_supported = only user-configured scopes (what this resource needs).
+    # Do NOT include all IdP scopes here — the UI uses this field as the initial scope to request.
+    if configured_scopes:
+        resource_metadata["scopes_supported"] = configured_scopes
+    if configuration_uuid:
+        resource_metadata["configuration_uuid"] = configuration_uuid
+    if toolkit_id is not None:
+        resource_metadata["toolkit_id"] = toolkit_id
+
+    provided_settings: Dict = {}
+    if client_id:
+        provided_settings['mcp_client_id'] = client_id
+    if client_secret:
+        secret_val = client_secret
+        if hasattr(secret_val, 'get_secret_value'):
+            secret_val = secret_val.get_secret_value()
+        if secret_val:
+            provided_settings['mcp_client_secret'] = mask_secret(str(secret_val))
+    if scope:
+        provided_settings['scopes'] = scope
+    if provided_settings:
+        resource_metadata['provided_settings'] = provided_settings
+
+    return McpAuthorizationRequired(
+        message=(
+            f"OpenAPI endpoint requires OAuth authorization. "
+            "Please log in to continue."
+        ),
+        server_url=base_url,
+        resource_metadata_url=resource_metadata_url,
+        www_authenticate=www_authenticate,
+        resource_metadata=resource_metadata,
+        tool_name=base_url,
+    )
+
+
 def get_toolkit(tool) -> BaseToolkit:
     settings = tool.get('settings', {}) or {}
     # Extract selected_tools separately to avoid duplicate keyword argument when unpacking **settings
@@ -223,6 +346,7 @@ def get_toolkit(tool) -> BaseToolkit:
     return EliteAOpenAPIToolkit.get_toolkit(
         selected_tools=selected_tools,
         toolkit_name=tool.get('toolkit_name'),
+        toolkit_id=tool.get('id'),
         **filtered_settings,
     )
 
@@ -260,7 +384,13 @@ def get_toolkit_available_tools(settings: dict) -> dict:
         return {"tools": [], "args_schemas": {}, "error": "OpenAPI spec is missing"}
 
     try:
-        headers = _build_headers_from_settings(merged_settings)
+        # For tool listing, delegated OAuth does not block — we just need
+        # to parse the spec. Auth headers are only needed for actual API calls.
+        oauth_discovery_endpoint = merged_settings.get('oauth_discovery_endpoint')
+        if oauth_discovery_endpoint:
+            headers = {}
+        else:
+            headers = _build_headers_from_settings(merged_settings)
         api_wrapper = build_wrapper(
             openapi_spec=spec,
             base_headers=headers,
@@ -396,7 +526,41 @@ class EliteAOpenAPIToolkit(BaseToolkit):
 
         openapi_spec = merged_settings.get('spec') or merged_settings.get('schema_settings') or merged_settings.get('openapi_spec')
         base_url_override = merged_settings.get('base_url') or merged_settings.get('base_url_override')
-        headers = _build_headers_from_settings(merged_settings)
+
+        # --- Delegated OAuth (Authorization Code flow) ---
+        oauth_discovery_endpoint = merged_settings.get('oauth_discovery_endpoint')
+        tokens = kwargs.get('tokens') or {}
+        toolkit_id = kwargs.get('toolkit_id')
+
+        if oauth_discovery_endpoint:
+            config_uuid = merged_settings.get('configuration_uuid')
+            logger.debug(
+                f"[OpenAPI OAuth] delegated flow active. config_uuid={config_uuid}, "
+                f"oauth_endpoint={oauth_discovery_endpoint}, token_keys={list(tokens.keys())}"
+            )
+            token = None
+            if config_uuid:
+                token = tokens.get(f"{config_uuid}:{oauth_discovery_endpoint}")
+            if token is None:
+                token = tokens.get(oauth_discovery_endpoint)
+
+            if token is not None:
+                access_token = token.get('access_token') if isinstance(token, dict) else token
+                headers = {'Authorization': f'Bearer {access_token}'}
+                logger.debug("Using delegated OAuth token for OpenAPI authentication")
+            else:
+                logger.debug("OpenAPI OAuth mode active but no token found — raising McpAuthorizationRequired.")
+                raise _build_openapi_mcp_authorization_required(
+                    oauth_discovery_endpoint=oauth_discovery_endpoint,
+                    scope=merged_settings.get('scope'),
+                    client_id=merged_settings.get('client_id'),
+                    client_secret=merged_settings.get('client_secret'),
+                    configuration_uuid=config_uuid,
+                    toolkit_id=toolkit_id,
+                    base_url=base_url_override or '',
+                )
+        else:
+            headers = _build_headers_from_settings(merged_settings)
 
         api_wrapper = build_wrapper(
             openapi_spec=openapi_spec,
