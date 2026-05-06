@@ -361,6 +361,14 @@ def object_to_dict(obj: Any) -> dict | str | list | Any:
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
 
+    # Handle datetime objects - convert to ISO format string
+    # This prevents json.dumps failures that cause safe_serialize to stringify the entire state
+    from datetime import datetime, date
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+
     # Already a dict - recursively process values
     if isinstance(obj, dict):
         return {k: object_to_dict(v) for k, v in obj.items()}
