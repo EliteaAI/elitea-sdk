@@ -13,8 +13,8 @@ description: |
   - Results exclude requests with different methods
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -35,7 +35,7 @@ entry_point: invoke_search_requests
 nodes:
   - id: invoke_search_requests
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: search_requests
     input:
       - search_query
