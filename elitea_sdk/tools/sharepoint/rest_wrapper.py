@@ -335,11 +335,14 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         continue
                     if norm_include and not _matches_extension(file_name, norm_include):
                         continue
+                    # Convert datetime to ISO string for JSON serialization
+                    created = file.properties['TimeCreated']
+                    modified = file.properties['TimeLastModified']
                     result.append({
                         'Name': file_name,
                         'Path': file.properties['ServerRelativeUrl'],
-                        'Created': file.properties['TimeCreated'],
-                        'Modified': file.properties['TimeLastModified'],
+                        'Created': created.isoformat() if hasattr(created, 'isoformat') else str(created),
+                        'Modified': modified.isoformat() if hasattr(modified, 'isoformat') else str(modified),
                         'Link': file.properties['LinkingUrl'],
                         'id': file.properties['UniqueId'],
                     })
