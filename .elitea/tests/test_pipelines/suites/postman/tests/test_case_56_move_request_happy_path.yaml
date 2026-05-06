@@ -13,8 +13,8 @@ description: |
   - Returns confirmation of the move
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -32,13 +32,13 @@ entry_point: invoke_move_request
 nodes:
   - id: invoke_move_request
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: move_request
     input:
       - request_path
       - target_folder_path
     input_mapping:
-      request_path:
+      source_path:
         type: variable
         value: request_path
       target_folder_path:
