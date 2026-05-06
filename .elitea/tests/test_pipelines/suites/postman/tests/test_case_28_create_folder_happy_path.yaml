@@ -13,8 +13,8 @@ description: |
   - Returns folder ID and confirmation
 
 toolkits:
-  - id: ${TOOLKIT_ID}
-    name: ${TOOLKIT_NAME}
+  - id: ${POSTMAN_TOOLKIT_ID}
+    name: ${POSTMAN_TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -32,7 +32,7 @@ entry_point: invoke_create_folder
 nodes:
   - id: invoke_create_folder
     type: toolkit
-    toolkit_name: ${TOOLKIT_NAME}
+    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: create_folder
     input:
       - folder_name
@@ -70,14 +70,14 @@ nodes:
           
           Perform the following checks:
           1. Confirm the tool executed successfully.
-          2. Verify the result indicates a new folder was created.
-          3. Check for folder ID or confirmation.
-          4. Validate the folder has the specified name and description.
+          2. Verify the result contains a success message indicating the folder was created.
+          3. Note: The create_folder tool returns only a message string (e.g. "Folder '...' created successfully") - no folder ID is returned. This is the expected response format.
+          4. Validate no error message is present in the result.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if folder was created successfully),
+            "test_passed": boolean (true if result contains a success message about folder creation and no error),
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
