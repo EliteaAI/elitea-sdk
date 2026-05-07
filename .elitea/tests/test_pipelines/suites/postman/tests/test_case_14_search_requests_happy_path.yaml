@@ -13,8 +13,8 @@ description: |
   - Results are properly filtered by search criteria
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -32,7 +32,7 @@ entry_point: invoke_search_requests
 nodes:
   - id: invoke_search_requests
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: search_requests
     input:
       - search_query

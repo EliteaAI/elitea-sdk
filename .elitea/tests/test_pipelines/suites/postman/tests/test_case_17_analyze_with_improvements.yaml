@@ -13,8 +13,8 @@ description: |
   - Analysis covers both issues and recommendations
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -32,7 +32,7 @@ entry_point: invoke_analyze
 nodes:
   - id: invoke_analyze
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: analyze
     input:
       - scope
