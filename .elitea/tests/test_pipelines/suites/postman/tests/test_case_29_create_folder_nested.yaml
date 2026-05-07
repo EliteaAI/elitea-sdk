@@ -13,8 +13,8 @@ description: |
   - Returns folder ID and confirmation
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -26,51 +26,13 @@ state:
     value: "Nested Folder"
   parent_path:
     type: str
-  parent_folder_name:
-    type: str
-  create_parent_result:
-    type: str
-  delete_parent_result:
-    type: str
-entry_point: prepare_parent_folder
+    value: ${TEST_FOLDER_PATH}
+entry_point: invoke_create_folder
 
 nodes:
-  - id: prepare_parent_folder
-    type: code
-    code:
-      type: fixed
-      value: |
-        import time
-        import random
-        import string
-        timestamp = time.strftime('%Y%m%d-%H%M%S')
-        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-        parent_folder_name = f"PST29_Parent_{timestamp}_{suffix}"
-        {"parent_folder_name": parent_folder_name, "parent_path": parent_folder_name}
-    output:
-      - parent_folder_name
-      - parent_path
-    structured_output: true
-    transition: create_parent_folder
-
-  - id: create_parent_folder
-    type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: create_folder
-    input:
-      - parent_folder_name
-    input_mapping:
-      name:
-        type: variable
-        value: parent_folder_name
-    output:
-      - create_parent_result
-    structured_output: true
-    transition: invoke_create_folder
-
   - id: invoke_create_folder
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: create_folder
     input:
       - folder_name
@@ -87,22 +49,6 @@ nodes:
       - tool_result
     structured_output: true
     transition: process_results
-
-  - id: cleanup_parent_folder
-    type: toolkit
-    continue_on_error: true
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
-    tool: delete_folder
-    input:
-      - parent_folder_name
-    input_mapping:
-      folder_path:
-        type: variable
-        value: parent_folder_name
-    output:
-      - delete_parent_result
-    structured_output: true
-    transition: END
 
   - id: process_results
     type: llm
@@ -124,14 +70,14 @@ nodes:
           
           Perform the following checks:
           1. Confirm the tool executed successfully.
-          2. Verify the result contains a success message indicating the nested folder was created.
-          3. Note: The create_folder tool returns only a message string (e.g. "Folder '...' created successfully") - no folder ID is returned. This is the expected response format.
-          4. Validate no error message is present in the result.
+          2. Verify the folder was created inside the parent folder.
+          3. Check for folder ID and parent relationship.
+          4. Validate the nested structure was established.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if result contains a success message about folder creation and no error),
+            "test_passed": boolean (true if nested folder was created successfully),
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
@@ -144,4 +90,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: cleanup_parent_folder
+    transition: END
