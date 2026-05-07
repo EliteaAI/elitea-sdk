@@ -36,9 +36,8 @@ state:
   delete_folder_result:
     type: str
   override_variables:
-    type: dict
-    value:
-      test_var: "override_value"
+    type: str
+    value: '{"test_var": "override_value"}'
 entry_point: prepare_test_data
 
 nodes:
@@ -118,8 +117,8 @@ nodes:
         type: variable
         value: request_path
       override_variables:
-        type: variable
-        value: override_variables
+        type: fixed
+        value: '{"test_var": "override_value"}'
     output:
 
       - tool_result

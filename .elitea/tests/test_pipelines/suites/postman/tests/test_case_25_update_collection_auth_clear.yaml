@@ -21,9 +21,6 @@ state:
     type: dict
   test_results:
     type: dict
-  auth:
-    type: dict
-    value: {}
 entry_point: invoke_update_collection_auth
 
 nodes:
@@ -31,12 +28,11 @@ nodes:
     type: toolkit
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: update_collection_auth
-    input:
-      - auth
+    input: []
     input_mapping:
       auth:
-        type: variable
-        value: auth
+        type: fixed
+        value: ~
     output:
 
       - tool_result
@@ -59,18 +55,18 @@ nodes:
           
           Tool Result: {tool_result}
           
-          This test validates that update_collection_auth clears authentication by passing an empty dict.
+          This test validates that update_collection_auth clears authentication by passing null.
           
           Perform the following checks:
           1. Confirm the tool executed successfully without raising an error.
-          2. Verify the result contains a collection object with id, name, and uid fields.
-          3. Note: The Postman API PUT response only returns minimal collection metadata (id, name, uid) - this is the expected success response format.
+          2. Verify the result contains a collection object with at least id and name fields.
+          3. Note: The Postman API PUT response returns minimal collection metadata (id, name) - this is the expected success response format. uid may or may not be present.
           4. Validate no error message is present in the result.
           
           Return a JSON object named test_results with the following structure:
           
           {{
-            "test_passed": boolean (true if tool returned a collection object with id/name/uid and no error),
+            "test_passed": boolean (true if tool returned a collection object with id and name and no error),
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
