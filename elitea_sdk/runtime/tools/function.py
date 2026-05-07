@@ -296,6 +296,31 @@ alita_client = elitea_client
                     if key not in excluded_keys:
                         result_dict[key] = value
                         logger.debug(f"[FUNC_TOOL] Propagating '{key}' from nested app to parent state")
+
+                # For agent nodes (react agents), the child response only contains 'messages'
+                # and does not expose custom state variables. If this FunctionTool has declared
+                # output_variables (set by the pipeline designer), map the agent's text output
+                # to any variable that was not already populated by child-state propagation above.
+                if self.output_variables:
+                    # Extract the agent's text content from the messages we already built
+                    agent_output_content = None
+                    messages = result_dict.get('messages', [])
+                    if messages:
+                        last_msg = messages[-1]
+                        if isinstance(last_msg, dict):
+                            agent_output_content = last_msg.get('content', '')
+                        elif hasattr(last_msg, 'content'):
+                            agent_output_content = last_msg.content
+
+                    for var in self.output_variables:
+                        if var == 'messages':
+                            continue
+                        if var not in result_dict or result_dict.get(var) is None:
+                            result_dict[var] = agent_output_content
+                            logger.debug(
+                                f"[FUNC_TOOL] Mapping agent text output to output_variable '{var}'"
+                            )
+
                 return result_dict
 
             if not self.output_variables:
