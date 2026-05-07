@@ -13,8 +13,8 @@ description: |
   - Returns confirmation of the update
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -37,7 +37,7 @@ entry_point: invoke_update_request_pre_script
 nodes:
   - id: invoke_update_request_pre_script
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: update_request_pre_script
     input:
       - request_path
@@ -46,7 +46,7 @@ nodes:
       request_path:
         type: variable
         value: request_path
-      pre_request_script:
+      pre_script:
         type: variable
         value: pre_script
     output:
