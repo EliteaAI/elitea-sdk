@@ -12,8 +12,8 @@ description: |
   - Error indicates request not found
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -31,7 +31,7 @@ entry_point: invoke_update_request_name
 nodes:
   - id: invoke_update_request_name
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: update_request_name
     input:
       - invalid_request_path
