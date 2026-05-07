@@ -140,11 +140,11 @@ nodes:
     toolkit_name: ${POSTMAN_TOOLKIT_NAME}
     tool: delete_request
     input:
-      - request_id
+      - request_path
     input_mapping:
-      request_id:
+      request_path:
         type: variable
-        value: request_id
+        value: request_path
     output:
       - delete_result
     structured_output: true
