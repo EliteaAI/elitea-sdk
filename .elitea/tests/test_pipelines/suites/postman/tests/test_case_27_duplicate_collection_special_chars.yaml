@@ -13,8 +13,8 @@ description: |
   - No character encoding issues
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -29,7 +29,7 @@ entry_point: invoke_duplicate_collection
 nodes:
   - id: invoke_duplicate_collection
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: duplicate_collection
     input:
       - new_name

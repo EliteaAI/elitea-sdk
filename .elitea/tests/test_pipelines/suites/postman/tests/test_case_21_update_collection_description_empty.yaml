@@ -13,8 +13,8 @@ description: |
   - Collection description is cleared or set to empty
 
 toolkits:
-  - id: ${POSTMAN_TOOLKIT_ID}
-    name: ${POSTMAN_TOOLKIT_NAME}
+  - id: ${TOOLKIT_ID}
+    name: ${TOOLKIT_NAME}
 
 state:
   tool_result:
@@ -29,7 +29,7 @@ entry_point: invoke_update_collection_description
 nodes:
   - id: invoke_update_collection_description
     type: toolkit
-    toolkit_name: ${POSTMAN_TOOLKIT_NAME}
+    toolkit_name: ${TOOLKIT_NAME}
     tool: update_collection_description
     input:
       - new_description
