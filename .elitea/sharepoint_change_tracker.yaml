@@ -35,6 +35,9 @@ state:
   downloaded_content:
     type: str
     value: ''
+  error_detected:
+    type: bool
+    value: false
   error_message:
     type: str
     value: ''
@@ -228,7 +231,7 @@ nodes:
     type: router
     condition: |
       {% if validation_passed %}
-        FindFeatureFolder
+        SearchFolders
       {% else %}
         FormatError
       {% endif %}
@@ -237,29 +240,7 @@ nodes:
       - validation_passed
     routes:
       - FormatError
-      - FindFeatureFolder
-  - id: FindFeatureFolder
-    type: code
-    code:
-      type: fixed
-      value: |-
-        # Prepare to search for folder containing the feature ID in its name
-        input_id = alita_state.get('input_id', '').strip()
-        search_base_path = alita_state.get('search_base_path', '').strip()
-
-        # Just pass through - actual search happens in SearchFolders toolkit node
-        result = {
-            "found_folders": []
-        }
-
-        result
-    input:
-      - input_id
-      - search_base_path
-    output:
-      - found_folders
-    structured_output: true
-    transition: SearchFolders
+      - SearchFolders
   - id: SearchFolders
     type: toolkit
     input:
@@ -353,14 +334,14 @@ nodes:
       {% elif found_folders|length > 1 %}
         FolderSearchError
       {% else %}
-        UpdateFolderPath
+        LoadState
       {% endif %}
     default_output: FolderSearchError
     input:
       - found_folders
     routes:
       - FolderSearchError
-      - UpdateFolderPath
+      - LoadState
   - id: FolderSearchError
     type: code
     code:
@@ -392,58 +373,16 @@ nodes:
       - messages
     structured_output: true
     transition: END
-  - id: UpdateFolderPath
-    type: code
-    code:
-      type: fixed
-      value: |-
-        # Extract the path from the single found folder
-        found_folders = alita_state.get('found_folders', [])
-
-        if len(found_folders) == 1:
-            folder = found_folders[0]
-            folder_path = folder.get('Path', '')
-            result = {
-                'folder_path': folder_path
-            }
-        else:
-            # Should not reach here due to router validation, but defensive
-            result = {
-                'folder_path': ''
-            }
-
-        result
-    input:
-      - found_folders
-    output:
-      - folder_path
-    structured_output: true
-    transition: LoadState
-  - id: FormatError
-    type: code
-    code:
-      type: fixed
-      value: |-
-        error_message = alita_state.get('error_message', '')
-
-        report = f"❌ Failed to process request.\n\n**Error:** {error_message}\n\nPlease check the input and try again."
-
-        msgs = list(alita_state.get('messages', []))
-        msgs.append({"role": "assistant", "content": report})
-        result = {"messages": msgs}
-        result
-    input:
-      - error_message
-    output:
-      - messages
-    structured_output: true
-    transition: END
   - id: LoadState
     type: code
     code:
       type: fixed
       value: |-
         import json
+
+        # Extract folder_path from found_folders
+        found_folders = alita_state.get('found_folders', [])
+        folder_path = found_folders[0].get('Path', '')
 
         # Use input bucket_name if provided, otherwise use default from state
         input_bucket_name = alita_state.get('input_bucket_name', '').strip()
@@ -485,6 +424,7 @@ nodes:
                     pass
 
         {
+            'folder_path': folder_path,
             'bucket_name': bucket_name,
             'last_retrieval_date': last_retrieval_date,
             'is_first_run': is_first_run,
@@ -492,10 +432,12 @@ nodes:
             'file_prefix': file_prefix
         }
     input:
+      - found_folders
       - input_bucket_name
       - input_id
       - reload
     output:
+      - folder_path
       - bucket_name
       - last_retrieval_date
       - is_first_run
@@ -503,6 +445,25 @@ nodes:
       - file_prefix
     structured_output: true
     transition: GetFilesFromSharepoint
+  - id: FormatError
+    type: code
+    code:
+      type: fixed
+      value: |-
+        error_message = alita_state.get('error_message', '')
+
+        report = f"❌ Failed to process request.\n\n**Error:** {error_message}\n\nPlease check the input and try again."
+
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({"role": "assistant", "content": report})
+        result = {"messages": msgs}
+        result
+    input:
+      - error_message
+    output:
+      - messages
+    structured_output: true
+    transition: END
   - id: GetFilesFromSharepoint
     type: toolkit
     input:
@@ -575,27 +536,32 @@ nodes:
     code:
       type: fixed
       value: |-
+        import re
         from datetime import datetime
 
         all_files = alita_state.get('all_files', [])
         previous_snapshot = alita_state.get('previous_snapshot', {})
         last_retrieval_date = alita_state.get('last_retrieval_date', '')
 
+        def sanitize_name(name):
+            safe = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
+            return re.sub(r'-+', '-', safe)
+
         # Create current snapshot: {path: {metadata}}
-        # Try multiple possible path field names
         current_snapshot = {}
         for file in all_files:
             if isinstance(file, dict):
-                # Try different possible path field names
-                path = (file.get('Path', '') or 
+                path = (file.get('Path', '') or
                        file.get('ServerRelativeUrl', '') or
                        file.get('FileRef', '') or
                        file.get('FileSystemObjectType', '') or
                        file.get('Url', ''))
-                
+
                 if path:
+                    name = file.get('Name', '')
                     current_snapshot[path] = {
-                        'Name': file.get('Name', ''),
+                        'Name': name,
+                        'safe_name': sanitize_name(name),
                         'Modified': file.get('Modified', ''),
                         'Created': file.get('Created', ''),
                         'Link': file.get('Link', ''),
@@ -619,26 +585,21 @@ nodes:
 
         # New files
         for path in current_paths - previous_paths:
-            new_files.append({
-                'Path': path,
-                **current_snapshot[path]
-            })
+            new_files.append({'Path': path, **current_snapshot[path]})
 
         # Removed files
         for path in previous_paths - current_paths:
-            removed_files.append({
-                'Path': path,
-                **previous_snapshot[path]
-            })
+            meta = previous_snapshot[path]
+            if 'safe_name' not in meta:
+                meta = {**meta, 'safe_name': sanitize_name(meta.get('Name', ''))}
+            removed_files.append({'Path': path, **meta})
 
         # Changed or unchanged files
         for path in current_paths & previous_paths:
             current_modified = current_snapshot[path].get('Modified', '')
             previous_modified = previous_snapshot[path].get('Modified', '')
-            
-            # Compare modification dates
+
             if current_modified != previous_modified:
-                # File was modified
                 try:
                     current_mod_dt = datetime.fromisoformat(current_modified.replace('Z', '').split('+')[0].split('.')[0])
                     if current_mod_dt > last_date:
@@ -824,71 +785,29 @@ nodes:
     code:
       type: fixed
       value: |-
-        import re
-
         changed_files = alita_state.get('changed_files', [])
         removed_files = alita_state.get('removed_files', [])
         new_files = alita_state.get('new_files', [])
 
-        # Prepare list of changed files that need previous version saved
-        files_to_version = []
+        files_to_version = [
+            {'id': f['id'], 'name': f['safe_name'], 'type': 'changed'}
+            for f in changed_files if f.get('id') and f.get('safe_name')
+        ]
 
-        for file in changed_files:
-            file_id = file.get('id', '')
-            file_name = file.get('Name', '')
-            
-            if file_id and file_name:
-                # Sanitize: spaces to hyphens, special chars to underscores
-                safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                files_to_version.append({
-                    'id': file_id,
-                    'name': safe_name,
-                    'type': 'changed'
-                })
+        files_to_delete = [
+            {'id': f['id'], 'name': f['safe_name'], 'type': 'removed'}
+            for f in removed_files if f.get('id') and f.get('safe_name')
+        ]
 
-        # Prepare list of removed files for cleanup
-        files_to_delete = []
-
-        for file in removed_files:
-            file_id = file.get('id', '')
-            file_name = file.get('Name', '')
-            
-            if file_id and file_name:
-                # Sanitize: spaces to hyphens, special chars to underscores
-                safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                files_to_delete.append({
-                    'id': file_id,
-                    'name': safe_name,
-                    'type': 'removed'
-                })
-
-        # Prepare list of files to download (new + changed)
-        files_to_download = []
-
-        for file in new_files + changed_files:
-            file_id = file.get('id', '')
-            file_name = file.get('Name', '')
-            file_path = file.get('Path', '')
-            
-            if not file_id or not file_name or not file_path:
-                continue
-            
-            # Sanitize: spaces to hyphens, special chars to underscores
-            safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
-            safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-            files_to_download.append({
-                'id': file_id,
-                'name': safe_name,
-                'path': file_path,
-                'type': 'new' if file in new_files else 'changed'
-            })
+        files_to_archive = [
+            {'id': f['id'], 'name': f['safe_name'], 'path': f['Path'], 'type': 'new' if f in new_files else 'changed'}
+            for f in new_files + changed_files if f.get('id') and f.get('safe_name') and f.get('Path')
+        ]
 
         {
             'files_to_version': files_to_version,
             'files_to_delete': files_to_delete,
-            'files_to_archive': files_to_download,
+            'files_to_archive': files_to_archive,
             'current_version_index': 0,
             'current_deletion_index': 0,
             'current_archive_index': 0
@@ -929,18 +848,15 @@ nodes:
         files_to_version = alita_state.get('files_to_version', [])
         idx_raw = alita_state.get('current_version_index', 0)
 
-        # Defensive: ensure idx is valid integer
         try:
             idx = int(idx_raw)
         except (ValueError, TypeError):
             idx = 0
 
-        # Defensive: validate index and process file
-        if idx >= 0 and idx < len(files_to_version):
+        if 0 <= idx < len(files_to_version):
             f = files_to_version[idx]
             file_id = f.get('id', '')
             file_name = f.get('name', 'unknown')
-            file_type = f.get('type', 'unknown')
 
             bucket_name = alita_state.get('bucket_name')
             file_prefix = alita_state.get('file_prefix', '')
@@ -948,38 +864,16 @@ nodes:
             src = f"{file_prefix}file_{file_id}_{file_name}.txt"
             dst = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
 
-            # Try to get existing file content
             content = store.get(src)
-            
-            # More specific error detection to avoid false positives in file content
-            def is_error_response(content):
-                if not content:
-                    return True
-                if isinstance(content, dict) and 'error' in content:
-                    return True
-                content_str = str(content).strip()
-                # Only check short responses for error patterns at the start
-                if len(content_str) < 500:
-                    content_lower = content_str.lower()
-                    if content_lower.startswith('error') or content_lower.startswith('file not found') or content_lower.startswith('does not exist'):
-                        return True
-                return False
-            
-            if not is_error_response(content):
-                # Save previous version
+            is_error = not content or (isinstance(content, dict) and 'error' in content)
+
+            if not is_error:
                 try:
                     store.create(dst, content)
-                except Exception as e:
-                    # Log error but continue - create marker file
-                    error_msg = f"[ERROR CREATING PREVIOUS VERSION]\nSource: {src}\nError: {str(e)}\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
-                    try:
-                        store.create(f"{file_prefix}error_prev_{file_id}_{file_name}.txt", error_msg)
-                    except:
-                        pass
+                except:
+                    pass
             else:
-                # File doesn't exist yet - this might be first run after file was added
-                # Create a placeholder to indicate versioning was attempted
-                placeholder = f"[NO PREVIOUS VERSION]\nFile: {file_name}\nID: {file_id}\nReason: Source file '{src}' not found in artifact storage.\nThis is expected for newly tracked files.\nTimestamp: {__import__('datetime').datetime.now().isoformat()}"
+                placeholder = f"[NO PREVIOUS VERSION]\nFile: {file_name}\nID: {file_id}\nSource: {src}"
                 try:
                     store.create(dst, placeholder)
                 except:
@@ -1018,14 +912,12 @@ nodes:
         files_to_delete = alita_state.get('files_to_delete', [])
         idx_raw = alita_state.get('current_deletion_index', 0)
 
-        # Defensive: ensure idx is valid integer
         try:
             idx = int(idx_raw)
         except (ValueError, TypeError):
             idx = 0
 
-        # Defensive: validate index and process file cleanup
-        if idx >= 0 and idx < len(files_to_delete):
+        if 0 <= idx < len(files_to_delete):
             f = files_to_delete[idx]
             file_id = f.get('id', '')
             file_name = f.get('name', 'unknown')
@@ -1033,46 +925,26 @@ nodes:
             bucket_name = alita_state.get('bucket_name')
             file_prefix = alita_state.get('file_prefix', '')
             store = alita_client.artifact(bucket_name)
-            
-            # More specific error detection
-            def is_error_response(content):
-                if not content:
-                    return True
-                if isinstance(content, dict) and 'error' in content:
-                    return True
-                content_str = str(content).strip()
-                if len(content_str) < 500:
-                    content_lower = content_str.lower()
-                    if content_lower.startswith('error') or content_lower.startswith('file not found') or content_lower.startswith('does not exist'):
-                        return True
-                return False
-            
-            # 1. Rename file_* to file_del_* (preserve last known state)
+
             src = f"{file_prefix}file_{file_id}_{file_name}.txt"
             dst = f"{file_prefix}file_del_{file_id}_{file_name}.txt"
+
             content = store.get(src)
-            if not is_error_response(content):
-                # Create the archived version
+            is_error = not content or (isinstance(content, dict) and 'error' in content)
+
+            if not is_error:
                 store.create(dst, content)
-                # Delete the original file_* (now that it's preserved as file_del_*)
                 try:
                     store.delete(src, check_exists=False)
                 except:
-                    pass  # Ignore JsNull errors - deletion likely succeeded
-            
-            # 2. Delete file_prev_* (no longer needed)
-            prev_file = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
-            try:
-                store.delete(prev_file, check_exists=False)
-            except:
-                pass  # Ignore if doesn't exist or JsNull errors
-            
-            # 3. Delete file_diff_* (no longer needed)
-            diff_file = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
-            try:
-                store.delete(diff_file, check_exists=False)
-            except:
-                pass  # Ignore if doesn't exist or JsNull errors
+                    pass
+
+            # Cleanup prev and diff files
+            for suffix in ['prev', 'diff']:
+                try:
+                    store.delete(f"{file_prefix}file_{suffix}_{file_id}_{file_name}.txt", check_exists=False)
+                except:
+                    pass
 
         {'current_deletion_index': idx + 1}
     input:
@@ -1216,26 +1088,12 @@ nodes:
       value: |-
         changed_files = alita_state.get('changed_files', [])
 
-        # Prepare list of changed files for diff computation
-        files_to_diff = []
-        for file in changed_files:
-            file_id = file.get('id', '')
-            file_name = file.get('Name', '')
-            if file_id and file_name:
-                import re
-                # Sanitize: spaces to hyphens, special chars to underscores
-                safe_name = re.sub(r'[^\w\-]', '_', file_name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                files_to_diff.append({
-                    'id': file_id,
-                    'name': safe_name,
-                    'original_name': file_name
-                })
+        files_to_diff = [
+            {'id': f['id'], 'name': f['safe_name'], 'original_name': f['Name']}
+            for f in changed_files if f.get('id') and f.get('safe_name')
+        ]
 
-        {
-            'files_to_diff': files_to_diff,
-            'current_diff_index': 0
-        }
+        {'files_to_diff': files_to_diff, 'current_diff_index': 0}
     input:
       - changed_files
     output:
@@ -1280,116 +1138,57 @@ nodes:
       type: fixed
       value: |-
         import difflib
-        from datetime import datetime
 
         files_to_diff = alita_state.get('files_to_diff', [])
         idx_raw = alita_state.get('current_diff_index', 0)
 
-        # Defensive: ensure idx is valid integer
         try:
             idx = int(idx_raw)
         except (ValueError, TypeError):
             idx = 0
 
-        # Defensive: validate index and process diff
-        if idx >= 0 and idx < len(files_to_diff):
-            current_file = files_to_diff[idx]
+        if 0 <= idx < len(files_to_diff):
+            f = files_to_diff[idx]
+            file_id, file_name, original_name = f.get('id', ''), f.get('name', ''), f.get('original_name', '')
 
-            file_id = current_file.get('id', '')
-            file_name = current_file.get('name', '')
-            original_name = current_file.get('original_name', '')
-            
             bucket_name = alita_state.get('bucket_name')
             file_prefix = alita_state.get('file_prefix', '')
             store = alita_client.artifact(bucket_name)
-            
-            # Read current and previous versions
-            current_file_path = f"{file_prefix}file_{file_id}_{file_name}.txt"
-            previous_file_path = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
-            
-            current_content = store.get(current_file_path)
-            previous_content = store.get(previous_file_path)
-            
-            # Handle errors and missing content
-            # More specific error detection: check if it's a dict with 'error' key or starts with common error patterns
-            def is_error_response(content):
-                if not content:
-                    return True
-                if isinstance(content, dict) and 'error' in content:
-                    return True
-                content_str = str(content).strip()
-                # Check if response starts with error markers (shorter check to avoid false positives in file content)
-                if len(content_str) < 500:  # Only check short responses for error patterns
-                    content_lower = content_str.lower()
-                    if content_lower.startswith('error') or content_lower.startswith('file not found') or content_lower.startswith('does not exist'):
-                        return True
-                return False
-            
-            if is_error_response(current_content):
-                current_content = ''
-            else:
-                current_content = str(current_content)
-            
-            if is_error_response(previous_content):
-                previous_content = ''
-            else:
-                previous_content = str(previous_content)
-            
-            # Only compute diff if both files exist and are not placeholders
-            if current_content and previous_content and '[NO PREVIOUS VERSION]' not in previous_content:
-                # Compute unified diff
-                previous_lines = previous_content.splitlines(keepends=True)
-                current_lines = current_content.splitlines(keepends=True)
-                
+
+            curr_path = f"{file_prefix}file_{file_id}_{file_name}.txt"
+            prev_path = f"{file_prefix}file_prev_{file_id}_{file_name}.txt"
+            diff_path = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
+
+            curr_raw = store.get(curr_path)
+            prev_raw = store.get(prev_path)
+
+            def get_content(raw):
+                if not raw or (isinstance(raw, dict) and 'error' in raw):
+                    return ''
+                return str(raw)
+
+            curr_content = get_content(curr_raw)
+            prev_content = get_content(prev_raw)
+
+            if curr_content and prev_content and '[NO PREVIOUS VERSION]' not in prev_content:
                 diff = difflib.unified_diff(
-                    previous_lines,
-                    current_lines,
+                    prev_content.splitlines(keepends=True),
+                    curr_content.splitlines(keepends=True),
                     fromfile=f'{original_name} (previous)',
                     tofile=f'{original_name} (current)',
                     lineterm='\n'
                 )
-                
                 diff_text = ''.join(diff)
-                
-                # Add metadata header
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                lines_changed = len([line for line in diff_text.split('\n') if line.startswith('+') or line.startswith('-')])
-                diff_header = (
-                    f"# Diff Report for {original_name}\n"
-                    f"# Generated: {timestamp}\n"
-                    f"# Previous: {previous_file_path}\n"
-                    f"# Current: {current_file_path}\n"
-                    f"# Total lines changed: {lines_changed}\n"
-                    f"\n"
-                    f"{diff_text}\n"
-                )
-                
-                # Save diff
-                diff_file_path = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
+                lines_changed = sum(1 for line in diff_text.split('\n') if line.startswith(('+', '-')))
+                diff_output = f"# Diff: {original_name}\n# Lines changed: {lines_changed}\n\n{diff_text}"
                 try:
-                    store.create(diff_file_path, diff_header)
-                except Exception as e:
-                    # Create error marker
-                    error_msg = f"[ERROR CREATING DIFF]\nFile: {original_name}\nError: {str(e)}\nTimestamp: {timestamp}"
-                    try:
-                        store.create(f"{file_prefix}error_diff_{file_id}_{file_name}.txt", error_msg)
-                    except:
-                        pass
+                    store.create(diff_path, diff_output)
+                except:
+                    pass
             else:
-                # Can't create diff - create placeholder
-                timestamp = datetime.now().isoformat()
-                placeholder = f"[NO DIFF COMPUTED]\nFile: {original_name}\nReason: "
-                if not current_content:
-                    placeholder += "Current file not found."
-                elif not previous_content:
-                    placeholder += "Previous file not found."
-                elif '[NO PREVIOUS VERSION]' in previous_content:
-                    placeholder += "No previous version available (newly tracked file)."
-                placeholder += f"\nTimestamp: {timestamp}"
-                
-                diff_file_path = f"{file_prefix}file_diff_{file_id}_{file_name}.txt"
+                reason = "Current file not found" if not curr_content else "Previous file not found" if not prev_content else "No previous version"
                 try:
-                    store.create(diff_file_path, placeholder)
+                    store.create(diff_path, f"[NO DIFF]\nFile: {original_name}\nReason: {reason}")
                 except:
                     pass
 
@@ -1408,10 +1207,6 @@ nodes:
     code:
       type: fixed
       value: |-
-        import json
-        import re
-        from datetime import datetime
-
         folder_path = alita_state.get('folder_path', '')
         current_retrieval_date = alita_state.get('current_retrieval_date', '')
         last_retrieval_date = alita_state.get('last_retrieval_date', '')
@@ -1427,7 +1222,6 @@ nodes:
         files_to_archive = alita_state.get('files_to_archive', [])
         files_to_diff = alita_state.get('files_to_diff', [])
 
-        # Build comprehensive report
         report_lines = [
             "# 📊 SharePoint Change Tracker Report",
             "",
@@ -1450,82 +1244,43 @@ nodes:
             "",
         ]
 
-        # New Files Section
         if new_files:
-            report_lines.append("## ✨ New Files")
-            report_lines.append("")
-            report_lines.append(f"**📥 Downloaded & Stored:** {len([f for f in files_to_archive if f.get('type') == 'new'])} files")
-            report_lines.append("")
-            
-            for idx, file in enumerate(sorted(new_files, key=lambda x: x.get('Modified', ''), reverse=True), 1):
-                name = file.get('Name', 'Unknown')
-                file_id = file.get('id', 'unknown')
-                path = file.get('Path', '')
-                modified = file.get('Modified', '')
-                link = file.get('Link', '')
-                
-                # Sanitize: spaces to hyphens, special chars to underscores
-                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                
-                report_lines.append(f"### {idx}. {name}")
-                report_lines.append(f"- **Path:** `{path}`")
-                report_lines.append(f"- **Created:** `{modified}`")
-                report_lines.append(f"- **Stored as:** `file_{file_id}_{safe_name}.txt`")
-                if link:
-                    report_lines.append(f"- **Link:** {link}")
+            report_lines.extend(["## ✨ New Files", "", f"**📥 Downloaded & Stored:** {len([f for f in files_to_archive if f.get('type') == 'new'])} files", ""])
+            for idx, f in enumerate(sorted(new_files, key=lambda x: x.get('Modified', ''), reverse=True), 1):
+                report_lines.extend([
+                    f"### {idx}. {f.get('Name', 'Unknown')}",
+                    f"- **Path:** `{f.get('Path', '')}`",
+                    f"- **Created:** `{f.get('Modified', '')}`",
+                    f"- **Stored as:** `file_{f.get('id', 'unknown')}_{f.get('safe_name', '')}.txt`"
+                ])
+                if f.get('Link'): report_lines.append(f"- **Link:** {f['Link']}")
                 report_lines.append("")
 
-        # Removed Files Section
         if removed_files:
-            report_lines.append("## 🗑️ Removed Files")
-            report_lines.append("")
-            report_lines.append(f"**💾 Last State Preserved:** {len(files_to_delete)} files (renamed to file_del_*)")
-            report_lines.append("**🧹 Cleanup:** Previous versions and diffs marked as deleted")
-            report_lines.append("")
-            
-            for idx, file in enumerate(sorted(removed_files, key=lambda x: x.get('Modified', ''), reverse=True), 1):
-                name = file.get('Name', 'Unknown')
-                file_id = file.get('id', 'unknown')
-                path = file.get('Path', '')
-                modified = file.get('Modified', '')
-                
-                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                
-                report_lines.append(f"### {idx}. {name}")
-                report_lines.append(f"- **Path:** `{path}`")
-                report_lines.append(f"- **Last Modified:** `{modified}`")
-                report_lines.append(f"- **Archived as:** `file_del_{file_id}_{safe_name}.txt`")
-                report_lines.append("")
+            report_lines.extend(["## 🗑️ Removed Files", "", f"**💾 Last State Preserved:** {len(files_to_delete)} files (renamed to file_del_*)", ""])
+            for idx, f in enumerate(sorted(removed_files, key=lambda x: x.get('Modified', ''), reverse=True), 1):
+                report_lines.extend([
+                    f"### {idx}. {f.get('Name', 'Unknown')}",
+                    f"- **Path:** `{f.get('Path', '')}`",
+                    f"- **Last Modified:** `{f.get('Modified', '')}`",
+                    f"- **Archived as:** `file_del_{f.get('id', 'unknown')}_{f.get('safe_name', '')}.txt`",
+                    ""
+                ])
 
-        # Changed Files Section
         if changed_files:
-            report_lines.append("## 🔄 Changed Files")
-            report_lines.append("")
-            report_lines.append(f"**📦 Both Versions Stored:** {len([f for f in files_to_version if f.get('type') == 'changed'])} files (current + previous)")
-            report_lines.append("")
-            
-            for idx, file in enumerate(sorted(changed_files, key=lambda x: x.get('CurrentModified', ''), reverse=True), 1):
-                name = file.get('Name', 'Unknown')
-                file_id = file.get('id', 'unknown')
-                path = file.get('Path', '')
-                prev_modified = file.get('PreviousModified', '')
-                curr_modified = file.get('CurrentModified', '')
-                link = file.get('Link', '')
-                
-                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                
-                report_lines.append(f"### {idx}. {name}")
-                report_lines.append(f"- **Path:** `{path}`")
-                report_lines.append(f"- **Previous Modified:** `{prev_modified}`")
-                report_lines.append(f"- **Current Modified:** `{curr_modified}`")
-                report_lines.append(f"- **Current version:** `file_{file_id}_{safe_name}.txt`")
-                report_lines.append(f"- **Previous version:** `file_prev_{file_id}_{safe_name}.txt`")
-                report_lines.append(f"- **Diff:** `file_diff_{file_id}_{safe_name}.txt`")
-                if link:
-                    report_lines.append(f"- **Link:** {link}")
+            report_lines.extend(["## 🔄 Changed Files", "", f"**📦 Both Versions Stored:** {len([f for f in files_to_version if f.get('type') == 'changed'])} files (current + previous)", ""])
+            for idx, f in enumerate(sorted(changed_files, key=lambda x: x.get('CurrentModified', ''), reverse=True), 1):
+                fid, sn = f.get('id', 'unknown'), f.get('safe_name', '')
+                report_lines.extend([
+                    f"### {idx}. {f.get('Name', 'Unknown')}",
+                    f"- **Path:** `{f.get('Path', '')}`",
+                    f"- **Previous Modified:** `{f.get('PreviousModified', '')}`",
+                    f"- **Current Modified:** `{f.get('CurrentModified', '')}`",
+                    f"- **Current version:** `file_{fid}_{sn}.txt`",
+                    f"- **Previous version:** `file_prev_{fid}_{sn}.txt`",
+                    f"- **Diff:** `file_diff_{fid}_{sn}.txt`"
+                ])
+                if f.get('Link'): report_lines.append(f"- **Link:** {f['Link']}")
                 report_lines.append("")
 
         # No changes
@@ -1610,10 +1365,6 @@ nodes:
     code:
       type: fixed
       value: |-
-        import json
-        import re
-        from datetime import datetime
-
         bucket_name = alita_state.get('bucket_name')
         store = alita_client.artifact(bucket_name)
         file_prefix = alita_state.get('file_prefix', '')
@@ -1625,146 +1376,47 @@ nodes:
         username = alita_state.get('username', 'unknown')
         input_id = alita_state.get('input_id', '')
 
-        # Build diff filename for incremental changes (new + changed with diffs)
+        def get_content(store, filename):
+            try:
+                content = store.get(filename)
+                if content and not (isinstance(content, dict) and 'error' in content):
+                    return str(content)
+            except:
+                pass
+            return "[Content not available]"
+
         diff_filename = f"{input_id}_sp_diff__{username}.md" if username else f"{input_id}_sp_diff.md"
 
-        # Build diff content (incremental changes)
-        sections = []
-        sections.append("=" * 80)
-        sections.append(f"SharePoint Combined Files Report")
-        sections.append(f"Generated: {current_retrieval_date}")
-        sections.append("=" * 80)
-        sections.append("")
+        sections = ["=" * 80, f"SharePoint Combined Files Report", f"Generated: {current_retrieval_date}", "=" * 80, ""]
 
-        # Add new files (full content)
         if new_files:
-            sections.append("\n" + "=" * 80)
-            sections.append(f"NEW FILES ({len(new_files)} files)")
-            sections.append("=" * 80 + "\n")
-            
-            for file in new_files:
-                name = file.get('Name', 'Unknown')
-                file_id = file.get('id', 'unknown')
-                path = file.get('Path', '')
-                modified = file.get('Modified', '')
-                
-                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                artifact_filename = f"{file_prefix}file_{file_id}_{safe_name}.txt"
-                
-                sections.append("\n" + "-" * 80)
-                sections.append(f"File: {name}")
-                sections.append(f"Path: {path}")
-                sections.append(f"Modified: {modified}")
-                sections.append(f"Artifact: {artifact_filename}")
-                sections.append("-" * 80)
-                
-                # Fetch file content from artifact storage
-                try:
-                    content = store.get(artifact_filename)
-                    if content and not any(err in str(content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
-                        sections.append(str(content))
-                    else:
-                        sections.append(f"[Content not available: {content}]")
-                except Exception as e:
-                    sections.append(f"[Error reading content: {e}]")
-                
-                sections.append("")
+            sections.extend(["\n" + "=" * 80, f"NEW FILES ({len(new_files)} files)", "=" * 80 + "\n"])
+            for f in new_files:
+                artifact = f"{file_prefix}file_{f.get('id', '')}_{f.get('safe_name', '')}.txt"
+                sections.extend(["\n" + "-" * 80, f"File: {f.get('Name', '')}", f"Path: {f.get('Path', '')}", f"Modified: {f.get('Modified', '')}", "-" * 80, get_content(store, artifact), ""])
 
-        # Add changed files (diff only)
         if changed_files:
-            sections.append("\n" + "=" * 80)
-            sections.append(f"CHANGED FILES ({len(changed_files)} files) - DIFFS ONLY")
-            sections.append("=" * 80 + "\n")
-            
-            for file in changed_files:
-                name = file.get('Name', 'Unknown')
-                file_id = file.get('id', 'unknown')
-                path = file.get('Path', '')
-                prev_modified = file.get('PreviousModified', '')
-                curr_modified = file.get('CurrentModified', '')
-                
-                safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
-                safe_name = re.sub(r'-+', '-', safe_name)  # Normalize consecutive hyphens
-                artifact_diff_filename = f"{file_prefix}file_diff_{file_id}_{safe_name}.txt"
-                
-                sections.append("\n" + "-" * 80)
-                sections.append(f"File: {name}")
-                sections.append(f"Path: {path}")
-                sections.append(f"Previous Modified: {prev_modified}")
-                sections.append(f"Current Modified: {curr_modified}")
-                sections.append(f"Diff Artifact: {artifact_diff_filename}")
-                sections.append("-" * 80)
-                
-                # Fetch diff content from artifact storage
-                try:
-                    file_diff_content = store.get(artifact_diff_filename)
-                    if file_diff_content and not any(err in str(file_diff_content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
-                        sections.append(str(file_diff_content))
-                    else:
-                        sections.append(f"[Diff not available: {file_diff_content}]")
-                except Exception as e:
-                    sections.append(f"[Error reading diff: {e}]")
-                
-                sections.append("")
+            sections.extend(["\n" + "=" * 80, f"CHANGED FILES ({len(changed_files)} files) - DIFFS ONLY", "=" * 80 + "\n"])
+            for f in changed_files:
+                diff_artifact = f"{file_prefix}file_diff_{f.get('id', '')}_{f.get('safe_name', '')}.txt"
+                sections.extend(["\n" + "-" * 80, f"File: {f.get('Name', '')}", f"Path: {f.get('Path', '')}", f"Previous: {f.get('PreviousModified', '')}", f"Current: {f.get('CurrentModified', '')}", "-" * 80, get_content(store, diff_artifact), ""])
 
-        # Add footer
-        sections.append("\n" + "=" * 80)
-        sections.append("END OF REPORT")
-        sections.append("=" * 80)
-
-        # Join all sections (this becomes the diff file)
+        sections.extend(["\n" + "=" * 80, "END OF REPORT", "=" * 80])
         diff_content = "\n".join(sections)
 
-        # Build context filename for ALL current files (this becomes the main context file)
         context_filename = f"{input_id}_sp_context__{username}.md" if username else f"{input_id}_sp_context.md"
-        context_sections = []
-        context_sections.append("=" * 80)
-        context_sections.append(f"SharePoint Context - Full Snapshot")
-        context_sections.append(f"Generated: {current_retrieval_date}")
-        context_sections.append(f"Total files: {len(current_snapshot)}")
-        context_sections.append("=" * 80)
-        context_sections.append("")
+        ctx = ["=" * 80, f"SharePoint Context - Full Snapshot", f"Generated: {current_retrieval_date}", f"Total files: {len(current_snapshot)}", "=" * 80, ""]
 
-        # Add ALL current files with full content
-        for idx, (path, metadata) in enumerate(sorted(current_snapshot.items()), 1):
-            name = metadata.get('Name', 'Unknown')
-            file_id = metadata.get('id', '')
-            modified = metadata.get('Modified', '')
-            
-            if not file_id or not name:
+        for idx, (path, meta) in enumerate(sorted(current_snapshot.items()), 1):
+            fid, sn = meta.get('id', ''), meta.get('safe_name', '')
+            if not fid or not sn:
                 continue
-            
-            safe_name = re.sub(r'[^\w\-]', '_', name.replace(' ', '-'))
-            safe_name = re.sub(r'-+', '-', safe_name)
-            artifact_filename = f"{file_prefix}file_{file_id}_{safe_name}.txt"
-            
-            context_sections.append("\n" + "-" * 80)
-            context_sections.append(f"File {idx}/{len(current_snapshot)}: {name}")
-            context_sections.append(f"Path: {path}")
-            context_sections.append(f"Modified: {modified}")
-            context_sections.append(f"Artifact: {artifact_filename}")
-            context_sections.append("-" * 80)
-            
-            # Fetch file content from artifact storage
-            try:
-                content = store.get(artifact_filename)
-                if content and not any(err in str(content).lower() for err in ['error', 'not found', 'does not exist', 'failed']):
-                    context_sections.append(str(content))
-                else:
-                    context_sections.append(f"[Content not available: {content}]")
-            except Exception as e:
-                context_sections.append(f"[Error reading content: {e}]")
-            
-            context_sections.append("")
+            artifact = f"{file_prefix}file_{fid}_{sn}.txt"
+            ctx.extend(["\n" + "-" * 80, f"File {idx}/{len(current_snapshot)}: {meta.get('Name', '')}", f"Path: {path}", f"Modified: {meta.get('Modified', '')}", "-" * 80, get_content(store, artifact), ""])
 
-        context_sections.append("\n" + "=" * 80)
-        context_sections.append("END OF SNAPSHOT")
-        context_sections.append("=" * 80)
+        ctx.extend(["\n" + "=" * 80, "END OF SNAPSHOT", "=" * 80])
+        context_content = "\n".join(ctx)
 
-        context_content = "\n".join(context_sections)
-
-        # Save to main bucket artifact storage with prefix (subfolder structure)
         joined_status = ''
         try:
             # Save context file (full snapshot) to sp-repo

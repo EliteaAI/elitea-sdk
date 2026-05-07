@@ -1,0 +1,206 @@
+# Minimal reproduction pipeline for datetime serialization bug
+#
+# This test simulates the bug by:
+# 1. Injecting datetime objects directly via code node (bypassing toolkit normalization)
+# 2. Checking if state arrives corrupted in subsequent node
+#
+# The bug occurs when:
+# - object_to_dict() doesn't convert datetime to ISO string
+# - json.dumps() fails on datetime objects
+# - safe_serialize() falls back to str(state)
+# - Next node receives Python repr string instead of dict
+#
+# Error signature: AttributeError: 'str' object has no attribute 'get'/'copy'/etc.
+
+state:
+  all_files:
+    type: list
+    value: []
+  input_id:
+    type: str
+    value: 'TEST123'
+  search_base_path:
+    type: str
+    value: '/sites/test/Shared Documents'
+  debug_info:
+    type: dict
+    value: {}
+  found_folders:
+    type: list
+    value: []
+
+entry_point: InjectDatetimeObjects
+
+nodes:
+  # Node 1: Simulate toolkit returning datetime objects
+  # This mimics what SharePoint REST API returns before normalization
+  - id: InjectDatetimeObjects
+    type: code
+    code:
+      type: fixed
+      value: |
+        from datetime import datetime
+
+        # Simulate SharePoint get_files_list response with datetime objects
+        # This is what the toolkit returns BEFORE the fix was applied
+        all_files = [
+            {
+                'Name': 'Document1.docx',
+                'Path': '/sites/test/Shared Documents/TEST123-Feature/Document1.docx',
+                'Created': datetime(2024, 1, 15, 10, 30, 0),
+                'Modified': datetime(2024, 5, 20, 14, 45, 30),
+                'Link': 'https://sharepoint.com/doc1',
+                'id': 'file-uuid-001'
+            },
+            {
+                'Name': 'Report.pdf',
+                'Path': '/sites/test/Shared Documents/TEST123-Feature/Report.pdf',
+                'Created': datetime(2024, 2, 10, 9, 0, 0),
+                'Modified': datetime(2024, 6, 1, 16, 20, 0),
+                'Link': 'https://sharepoint.com/doc2',
+                'id': 'file-uuid-002'
+            }
+        ]
+
+        result = {'all_files': all_files}
+        result
+    input: []
+    output:
+      - all_files
+    structured_output: true
+    transition: FilterFoldersByID
+
+  # Node 2: Mimic FilterFoldersByID logic from sharepoint_change_tracker
+  # This will fail with AttributeError if state is corrupted
+  - id: FilterFoldersByID
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+
+        debug_info = {
+            'alita_state_type': type(alita_state).__name__,
+            'alita_state_is_str': isinstance(alita_state, str),
+            'bug_detected': False,
+            'error_message': ''
+        }
+
+        # This is where the bug manifests:
+        # If alita_state is a string, .get() will fail
+        try:
+            if isinstance(alita_state, str):
+                debug_info['bug_detected'] = True
+                debug_info['error_message'] = 'State is STRING instead of DICT'
+                debug_info['state_preview'] = alita_state[:500]
+                # This would fail in real pipeline:
+                # state.get('input_id') -> AttributeError
+                all_files = []
+                input_id = ''
+                search_base_path = ''
+            else:
+                all_files = alita_state.get('all_files', [])
+                input_id = alita_state.get('input_id', '')
+                search_base_path = alita_state.get('search_base_path', '')
+
+            debug_info['all_files_type'] = type(all_files).__name__
+            debug_info['all_files_len'] = len(all_files) if isinstance(all_files, list) else -1
+
+            # Check if all_files items have datetime objects converted
+            if isinstance(all_files, list) and len(all_files) > 0:
+                first_item = all_files[0]
+                debug_info['first_item_type'] = type(first_item).__name__
+                if isinstance(first_item, dict):
+                    modified = first_item.get('Modified', None)
+                    debug_info['modified_type'] = type(modified).__name__
+                    debug_info['modified_value'] = str(modified)[:100]
+                    # Check if datetime was properly converted to string
+                    if not isinstance(modified, str):
+                        debug_info['datetime_not_converted'] = True
+
+            # Simulate the folder extraction logic
+            found_folders = []
+            if isinstance(all_files, list):
+                for item in all_files:
+                    if isinstance(item, dict):
+                        item_path = item.get('Path', '')
+                        if input_id.lower() in item_path.lower():
+                            path_parts = item_path.split('/')
+                            for part in path_parts:
+                                if input_id.lower() in part.lower():
+                                    found_folders.append({
+                                        'Name': part,
+                                        'Path': item_path,
+                                        'Modified': str(item.get('Modified', ''))
+                                    })
+                                    break
+
+        except AttributeError as e:
+            debug_info['bug_detected'] = True
+            debug_info['error_message'] = str(e)
+            found_folders = []
+
+        result = {
+            'debug_info': debug_info,
+            'found_folders': found_folders
+        }
+        result
+    input:
+      - all_files
+      - input_id
+      - search_base_path
+    output:
+      - debug_info
+      - found_folders
+    structured_output: true
+    transition: ReportResult
+
+  # Node 3: Report test results
+  - id: ReportResult
+    type: code
+    code:
+      type: fixed
+      value: |
+        debug_info = alita_state.get('debug_info', {})
+        found_folders = alita_state.get('found_folders', [])
+
+        bug_detected = debug_info.get('bug_detected', False)
+        state_type = debug_info.get('alita_state_type', 'unknown')
+        error_msg = debug_info.get('error_message', '')
+
+        if bug_detected:
+            status = 'FAIL - BUG REPRODUCED'
+            details = 'State corruption detected: ' + error_msg
+        elif state_type != 'dict':
+            status = 'FAIL - Unexpected state type'
+            details = 'Expected dict, got: ' + state_type
+        else:
+            status = 'PASS - No bug detected'
+            details = 'State serialization working correctly'
+
+        report = '## Datetime Serialization Bug Test\n\n'
+        report += '### Result: ' + status + '\n\n'
+        report += '### Details\n'
+        report += '- State type: `' + state_type + '`\n'
+        report += '- Bug detected: `' + str(bug_detected) + '`\n'
+        report += '- Folders found: `' + str(len(found_folders)) + '`\n'
+        report += '\n### Debug Info\n```\n'
+
+        for key, value in debug_info.items():
+            report += str(key) + ': ' + str(value) + '\n'
+
+        report += '```\n\n'
+        report += '### Explanation\n'
+        report += details + '\n'
+
+        msgs = list(alita_state.get('messages', []))
+        msgs.append({'role': 'assistant', 'content': report})
+        result = {'messages': msgs}
+        result
+    input:
+      - debug_info
+      - found_folders
+    output:
+      - messages
+    structured_output: true
+    transition: END
