@@ -1,0 +1,49 @@
+# SharePoint Change Tracker
+
+Monitors SharePoint folders across runs to detect new, modified, and removed files. Maintains version history, computes diffs, and creates combined context files. **Two modes**: incremental (diffs for changes) or full reload (complete content). Stores artifacts in `sp-repo/{id}/` subfolder with 5-run retention.
+
+**Use when:** tracking document changes for analysis (incremental mode) or needing full content each run for context-based agents (reload mode).
+
+## Input
+
+```json
+{
+  "id": "210391",
+  "folder_path": "/sites/.../Features",
+  "reload": false
+}
+```
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `id` | required | Feature ID for folder matching and subfolder naming |
+| `folder_path` | `/sites/EPAMPPG-LFAProjectExecution/Shared Documents/General/LFA Cloud EPAM Delivery Scope - Features` | SharePoint search base path |
+| `bucket_name` | `"sp-repo"` | Artifact storage bucket |
+| `reload` | `false` | Force full content reload (true = all files with full content; false = incremental with diffs) |
+
+## Rules
+- Matches folders where subfolder name contains feature ID
+- **Reload modes**:
+  - `reload=false` (default): Incremental — first run: baseline; subsequent: diffs for changed, full for new
+  - `reload=true`: Full content — always downloads all files with complete content (like first run)
+- Version control: saves `file_prev_*` before updating, computes unified diffs as `file_diff_*`
+- Removed files: archives as `file_del_*`, cleans up old versions
+- Retention: keeps last 5 runs (auto-deletes older change reports)
+- Thread-safe: usernames in filenames prevent conflicts
+
+## Output
+
+*"# SharePoint Change Tracker Report: 3 new, 2 changed, 1 removed, 12 unchanged files"*
+
+**`sp-repo/{id}/`**:
+- `retrieval_log.txt` — run history (last 5, auto-cleanup)
+- `snapshot.json` — current file state
+- `changes_YYYYMMDD_HHMMSS_{username}.json` — per-run change report (last 5 kept)
+- `{id}_sp_context__{username}.md` — full snapshot of all current files
+- `file_{id}_{name}.txt` — current file versions
+- `file_prev_{id}_{name}.txt` — previous versions of changed files
+- `file_diff_{id}_{name}.txt` — unified diffs for changed files
+- `file_del_{id}_{name}.txt` — last known state of removed files
+
+**`ba-user-stories/`**:
+- `{id}_sp_c

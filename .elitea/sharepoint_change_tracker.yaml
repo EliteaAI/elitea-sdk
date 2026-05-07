@@ -32,15 +32,6 @@ state:
   current_version_index:
     type: int
     value: 0
-  debug_info:
-    type: dict
-    value: {}
-  debug_info_1:
-    type: dict
-    value: {}
-  debug_info_2:
-    type: dict
-    value: {}
   downloaded_content:
     type: str
     value: ''
@@ -202,7 +193,7 @@ nodes:
                         }
                     else:
                         # Get optional parameters with defaults
-                        search_base = input_data.get('folder_path', 'Shared Documents/General')
+                        search_base = input_data.get('folder_path', '/sites/EPAMPPG-LFAProjectExecution/Shared Documents/General/LFA Cloud EPAM Delivery Scope - Features')
                         bucket = input_data.get('bucket_name', 'sp-repo')
                         reload = input_data.get('reload', False)
                         
@@ -310,132 +301,51 @@ nodes:
     code:
       type: fixed
       value: |-
-        import re
-        import json
-        import ast
+        input_id = str(alita_state.get('input_id', '')).strip()
+        search_base_path = str(alita_state.get('search_base_path', '')).strip()
+        all_files = alita_state.get('all_files', [])
 
-        # ── Recover state if it arrived as a string (datetime serialization bug) ──
-        state = alita_state
-        if isinstance(state, str):
-            # Replace datetime.datetime(...) with ISO strings
-            fixed = re.sub(
-                r'datetime\.datetime\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(\d+))?(?:,\s*(\d+))?\)',
-                lambda m: "'{}-{}-{}T{}:{}:{}'".format(
-                    m.group(1).zfill(4), m.group(2).zfill(2), m.group(3).zfill(2),
-                    (m.group(4) or '0').zfill(2), (m.group(5) or '0').zfill(2), (m.group(6) or '0').zfill(2)
-                ),
-                state
-            )
-            try:
-                state = ast.literal_eval(fixed)
-            except Exception:
-                try:
-                    state = json.loads(state)
-                except Exception:
-                    state = {}
-
-        input_id = state.get('input_id', '').strip() if isinstance(state, dict) else ''
-        all_files_raw = state.get('all_files', []) if isinstance(state, dict) else []
-
-        # Capture debug info about what we received
-        debug_info_1 = {
-            'state_type': type(alita_state).__name__,
-            'state_recovery_used': isinstance(alita_state, str),
-            'raw_type': type(all_files_raw).__name__,
-            'raw_is_str': isinstance(all_files_raw, str),
-            'raw_is_list': isinstance(all_files_raw, list),
-            'raw_preview': str(all_files_raw)[:500] if all_files_raw else 'None/Empty'
-        }
-
-        all_files = all_files_raw
-
-        # Parse all_files if it's a JSON string
-        if isinstance(all_files, str):
-            debug_info_1['parse_attempted'] = True
-            try:
-                all_files = json.loads(all_files)
-                debug_info_1['parse_success'] = True
-                debug_info_1['parsed_type'] = type(all_files).__name__
-            except (json.JSONDecodeError, ValueError) as e:
-                debug_info_1['parse_success'] = False
-                debug_info_1['parse_error'] = str(e)
-                all_files = []
-        else:
-            debug_info_1['parse_attempted'] = False
-
-        # Ensure all_files is a list
         if not isinstance(all_files, list):
-            debug_info_1['converted_to_list'] = True
             all_files = []
-        else:
-            debug_info_1['is_valid_list'] = True
-            debug_info_1['list_length'] = len(all_files)
-            if all_files:
-                debug_info_1['first_item_type'] = type(all_files[0]).__name__
-                debug_info_1['first_item_preview'] = str(all_files[0])[:200]
 
         # Extract first-level subfolders that contain the ID
-        # Only look at direct children of search_base_path, not nested subfolders
-        search_base_path = state.get('search_base_path', '').strip() if isinstance(state, dict) else ''
-        base_depth = len([p for p in search_base_path.split('/') if p])  # Count path segments
-
         found_folders = []
-        found_folder_paths = set()  # Track unique folders
-        item_types_seen = []
+        found_folder_paths = set()
 
-        debug_info_1['search_base_path'] = search_base_path
-        debug_info_1['base_depth'] = base_depth
-
-        for idx, item in enumerate(all_files):
-            item_type = type(item).__name__
-            if idx < 3:  # Track first 3 item types
-                item_types_seen.append({'index': idx, 'type': item_type, 'preview': str(item)[:100]})
-            
-            # Skip non-dict items
+        for item in all_files:
             if not isinstance(item, dict):
                 continue
-            
-            # Try to extract first-level folder from file path
-            try:
-                item_path = item.get('Path', '') or item.get('ServerRelativeUrl', '')
-                
-                if not item_path or not item_path.startswith(search_base_path):
-                    continue
-                
-                # Get the relative path after the base
-                relative_path = item_path[len(search_base_path):].lstrip('/')
-                path_parts = [p for p in relative_path.split('/') if p]
-                
-                # Only look at first segment (direct subfolder)
-                if len(path_parts) > 0:
-                    first_folder = path_parts[0]
-                    
-                    # Check if this first-level folder contains the ID
-                    if input_id.lower() in first_folder.lower():
-                        folder_path = f"{search_base_path}/{first_folder}"
-                        
-                        # Only add if not already tracked
-                        if folder_path not in found_folder_paths:
-                            found_folder_paths.add(folder_path)
-                            found_folders.append({
-                                'Name': first_folder,
-                                'Path': folder_path,
-                                'Modified': item.get('Modified', ''),
-                                'Created': item.get('Created', ''),
-                                'Link': '',
-                                'id': ''
-                            })
-                
-            except Exception as e:
-                debug_info_1['item_error'] = {'index': idx, 'error': str(e), 'item_type': item_type}
 
-        debug_info_1['found_folders_count'] = len(found_folders)
-        debug_info_1['item_types_seen'] = item_types_seen
+            item_path = item.get('Path', '') or item.get('ServerRelativeUrl', '')
 
-        result = {
-            'found_folders': found_folders,
-            'debug_info_1': debug_info_1
-        }
+            if not item_path or not item_path.startswith(search_base_path):
+                continue
+
+            # Get the relative path after the base
+            relative_path = item_path[len(search_base_path):].lstrip('/')
+            path_parts = [p for p in relative_path.split('/') if p]
+
+            # Only look at first segment (direct subfolder)
+            if len(path_parts) > 0:
+                first_folder = path_parts[0]
+
+                # Check if this first-level folder contains the ID
+                if input_id.lower() in first_folder.lower():
+                    folder_path = f"{search_base_path}/{first_folder}"
+
+                    # Only add if not already tracked
+                    if folder_path not in found_folder_paths:
+                        found_folder_paths.add(folder_path)
+                        found_folders.append({
+                            'Name': first_folder,
+                            'Path': folder_path,
+                            'Modified': str(item.get('Modified', '')),
+                            'Created': str(item.get('Created', '')),
+                            'Link': '',
+                            'id': ''
+                        })
+
+        result = {'found_folders': found_folders}
         result
     input:
       - input_id
@@ -443,7 +353,6 @@ nodes:
       - search_base_path
     output:
       - found_folders
-      - debug_info_1
     structured_output: true
     transition: ValidateFolderSearch
   - id: ValidateFolderSearch
@@ -552,11 +461,11 @@ nodes:
         bucket_name = input_bucket_name if input_bucket_name else default_bucket_name
 
         store = alita_client.artifact(bucket_name)
-        
+
         # Get input_id for file prefixing
         input_id = alita_state.get('input_id', '')
         file_prefix = f"{input_id}/" if input_id else ''
-        
+
         # Check if reload is requested (force full content)
         reload = alita_state.get('reload', False)
 
@@ -629,97 +538,48 @@ nodes:
     structured_output: true
     tool: get_files_list
     toolkit_name: LFAInternalSharePoint
-    transition: NormalizeFiles
-  - id: NormalizeFiles
+    transition: CheckToolkitErrorAfterGetFiles
+  - id: CheckToolkitErrorAfterGetFiles
     type: code
     code:
       type: fixed
       value: |-
-        import re
-        import ast
-        import json
-        from datetime import datetime
+        all_files = alita_state.get('all_files', [])
+        error_detected = False
+        error_message = ''
 
-        debug_info = {
-            'alita_state_type': type(alita_state).__name__,
-            'recovery_used': False
-        }
+        # Check for toolkit errors (returned as string or dict with error)
+        if isinstance(all_files, str) and ('Traceback' in all_files or 'Error' in all_files):
+            error_detected = True
+            error_message = all_files[:1000]
+        elif isinstance(all_files, dict) and 'error' in all_files:
+            error_detected = True
+            error_message = str(all_files.get('error', ''))[:1000]
 
-        # ── Recover state if it arrived as a string ──
-        # This happens when object_to_dict lets datetime objects through,
-        # safe_serialize falls back to json.dumps(str(state)),
-        # and json.loads returns a str instead of a dict.
-        state = alita_state
-        if isinstance(state, str):
-            debug_info['recovery_used'] = True
-            debug_info['raw_state_preview'] = state[:500]
-            # Replace datetime.datetime(...) with ISO strings
-            fixed = re.sub(
-                r'datetime\.datetime\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(\d+))?(?:,\s*(\d+))?\)',
-                lambda m: "'{}-{}-{}T{}:{}:{}'".format(
-                    m.group(1).zfill(4), m.group(2).zfill(2), m.group(3).zfill(2),
-                    (m.group(4) or '0').zfill(2), (m.group(5) or '0').zfill(2), (m.group(6) or '0').zfill(2)
-                ),
-                state
-            )
-            debug_info['datetime_replacements'] = len(re.findall(r'datetime\.datetime\(', state))
-            try:
-                state = ast.literal_eval(fixed)
-                debug_info['recovery_method'] = 'ast.literal_eval'
-            except Exception as e:
-                debug_info['recovery_error'] = str(e)
-                debug_info['fixed_preview'] = fixed[:500]
-                # Last resort: try json.loads in case it's valid JSON
-                try:
-                    state = json.loads(state)
-                    debug_info['recovery_method'] = 'json.loads_raw'
-                except Exception:
-                    state = {}
-                    debug_info['recovery_method'] = 'failed'
-
-        # ── Normalize files ──
-        all_files = state.get('all_files', []) if isinstance(state, dict) else []
-
-        # If all_files is a JSON string, parse it
-        if isinstance(all_files, str):
-            debug_info['all_files_was_string'] = True
-            try:
-                all_files = json.loads(all_files)
-            except Exception:
-                all_files = []
-
-        converted_count = 0
-        normalized = []
-        for file in (all_files if isinstance(all_files, list) else []):
-            if not isinstance(file, dict):
-                normalized.append(file)
-                continue
-            norm_file = {}
-            for key, val in file.items():
-                if isinstance(val, datetime):
-                    norm_file[key] = val.isoformat()
-                    converted_count += 1
-                else:
-                    norm_file[key] = val
-            normalized.append(norm_file)
-
-        debug_info['files_count'] = len(normalized)
-        debug_info['datetime_fields_converted'] = converted_count
-        if normalized:
-            debug_info['sample_file'] = str(normalized[0])[:300]
-
-        result = {
-            'all_files': normalized,
-            'debug_info': debug_info
-        }
+        result = {'all_files': all_files, 'error_detected': error_detected, 'error_message': error_message}
         result
     input:
       - all_files
     output:
       - all_files
-      - debug_info
+      - error_detected
+      - error_message
     structured_output: true
-    transition: CompareSnapshots
+    transition: RouterAfterGetFiles
+  - id: RouterAfterGetFiles
+    type: router
+    condition: |
+      {% if error_detected %}
+        FormatError
+      {% else %}
+        CompareSnapshots
+      {% endif %}
+    default_output: FormatError
+    input:
+      - error_detected
+    routes:
+      - FormatError
+      - CompareSnapshots
   - id: CompareSnapshots
     type: code
     code:
@@ -859,7 +719,7 @@ nodes:
 
         # 2. Build new log entry with username: "YYYY-MM-DDTHH:MM:SS|username"
         log_entry = f"{current_retrieval_date}|{username}"
-        
+
         # 3. Build new log (keep last 5 entries)
         # Start with all existing log lines, append new entry, then keep last 5
         log_lines = old_log_lines.copy()
@@ -1738,7 +1598,7 @@ nodes:
         bucket_name = alita_state.get('bucket_name', '')
         joined_filename = alita_state.get('joined_filename', '')
         joined_status = alita_state.get('joined_status', '')
-        
+
         report_lines.extend([
             "",
             "---",
@@ -1765,7 +1625,7 @@ nodes:
             "- `file_diff_[Id]_[name].txt` — unified diffs for changed files",
             "- `file_del_[Id]_[name].txt` — last known state of removed files",
         ])
-        
+
         # Add joined file status
         if joined_status:
             report_lines.extend([
