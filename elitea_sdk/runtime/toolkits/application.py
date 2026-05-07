@@ -5,8 +5,7 @@ from langgraph.store.base import BaseStore
 from pydantic import create_model, BaseModel, Field
 from langchain_community.agent_toolkits.base import BaseToolkit
 from langchain_core.tools import BaseTool
-from langchain_core.messages import BaseMessage
-from ..tools.application import Application, applicationToolSchema
+from ..tools.application import Application
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +23,11 @@ def build_dynamic_application_schema(variables: list, app_name: str = "Applicati
         app_name: Name of the application (used for schema naming)
 
     Returns:
-        A dynamically created Pydantic model class with task, chat_history, and variable fields.
+        A dynamically created Pydantic model class with task and variable fields.
     """
     # Base fields - always present
     fields = {
-        'task': (str, Field(description="Task for Application")),
-        'chat_history': (Optional[list[BaseMessage]], Field(
-            description="Chat History relevant for Application",
-            default=[]
-        )),
+        'task': (str, Field(description="Task for Application. Include all context needed by the application.")),
     }
 
     # Add agent variables as optional fields with their default values

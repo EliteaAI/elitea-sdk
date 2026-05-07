@@ -91,10 +91,6 @@ Answer must be JSON only extractable by JSON.LOADS."""
             result = _extract_json(content_text.strip())
             logger.info(f"ToolNode tool params: {result}")
         try:
-            # handler for application added as a tool
-            if isinstance(self.tool, Application):
-                # set empty chat history
-                result['chat_history'] = None
             tool_result = self.tool.invoke(result, config=config, kwargs=kwargs)
             dispatch_custom_event(
                 "on_tool_node", {

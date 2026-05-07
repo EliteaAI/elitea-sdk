@@ -975,9 +975,10 @@ class Assistant:
                     f"'{agent_name}' with task: {task[:100]}..."
                 )
 
-                # Invoke the Application tool directly
+                # Invoke the Application tool directly. Sub-agents receive all
+                # required context through task; chat_history is not forwarded.
                 try:
-                    result = application_tool.invoke({"task": task, "chat_history": []}, config=config)
+                    result = application_tool.invoke({"task": task}, config=config)
                     if isinstance(result, dict):
                         content = result.get("output", str(result))
                     elif isinstance(result, str):
@@ -1175,9 +1176,8 @@ class Assistant:
             peer_system_prompt = f"{base_prompt}{tool_instruction}\n{peer_prompt_addon}"
 
             # Simplify the Application tool schema for swarm peers.
-            # The default schema includes chat_history: Optional[list[BaseMessage]] which
-            # LLMs can't construct (BaseMessage is a Pydantic model, not JSON-serializable).
-            # For swarm peers, chat_history is always [] so we remove it from the schema.
+            # Older fallback schemas can include chat_history: Optional[list[BaseMessage]]
+            # which LLMs can't construct and sub-agents must not receive.
             swarm_tool = cfg['agent_tool']
             try:
                 from pydantic import create_model as _create_model

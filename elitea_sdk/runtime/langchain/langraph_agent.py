@@ -2525,12 +2525,13 @@ def detect_and_flatten_subgraphs(yaml_schema: str) -> tuple[str, list]:
     return flattened_yaml, all_tools
 
 
-def validate_agent_mappings(node) -> list:
+def validate_agent_mappings(node) -> dict:
     """Validate that agent nodes have the required input_mapping parameters."""
     input_mapping = node.get('input_mapping',
                              {'messages': {'type': 'variable', 'value': 'messages'}})
-    # Validate required input_mapping params for agent nodes
-    required_agent_params = {'task', 'chat_history'}
+    # Only task is required for sub-agent invocation. chat_history is accepted
+    # for persisted pipeline compatibility, but Application ignores it.
+    required_agent_params = {'task'}
     provided_params = set(input_mapping.keys())
     missing_params = required_agent_params - provided_params
     if missing_params:
