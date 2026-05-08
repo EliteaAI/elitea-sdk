@@ -10,6 +10,7 @@ def get_tools(tool_type, tool):
         # common
         "selected_tools": tool['settings'].get('selected_tools', []),
         "ado_configuration": tool['settings']['ado_configuration'],
+        "project": tool['settings']['project'],
         "limit": tool['settings'].get('limit', 5),
         "toolkit_name": tool.get('toolkit_name', ''),
         # indexer settings

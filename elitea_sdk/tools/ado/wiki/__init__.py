@@ -21,6 +21,7 @@ def get_toolkit(tool):
     return AzureDevOpsWikiToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
+        project=tool['settings']['project'],
         default_wiki_identifier=tool['settings'].get('default_wiki_identifier'),
         limit=tool['settings'].get('limit', 5),
         toolkit_name=tool.get('toolkit_name', ''),
@@ -42,6 +43,7 @@ class AzureDevOpsWikiToolkit(BaseToolkit):
         m = create_model(
             name_alias,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), json_schema_extra={'configuration_types': ['ado']})),
+            project=(str, Field(description="ADO project name")),
             default_wiki_identifier=(Optional[str], Field(default=None, description="Default Wiki Identifier (Wiki ID or wiki name). If provided, this identifier will be used when tools are invoked without explicitly specifying a wiki identifier.")),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None,
@@ -78,12 +80,16 @@ class AzureDevOpsWikiToolkit(BaseToolkit):
 
         @check_connection_response
         def check_connection(self):
-            ado_config = self.ado_wiki_configuration.ado_configuration if self.ado_wiki_configuration else None
+            ado_config = self.ado_configuration
             if not ado_config:
-                raise ValueError("ADO wiki configuration is required")
+                raise ValueError("ADO configuration is required")
+            project = self.project
+            if not project:
+                raise ValueError("ADO project is required")
+            token = ado_config.token.get_secret_value() if ado_config.token else ""
             response = requests.get(
-                f'{ado_config.organization_url}/{ado_config.project}/_apis/wiki/wikis?api-version=7.0',
-                headers={'Authorization': f'Bearer {ado_config.token}'},
+                f'{ado_config.organization_url}/{project}/_apis/wiki/wikis?api-version=7.0',
+                headers={'Authorization': f'Bearer {token}'},
                 timeout=5
             )
             return response
@@ -101,7 +107,6 @@ class AzureDevOpsWikiToolkit(BaseToolkit):
             selected_tools = []
         wrapper_payload = {
             **kwargs,
-            # TODO use ado_configuration fields in AzureDevOpsApiWrapper
             **kwargs['ado_configuration'],
             **(kwargs.get('pgvector_configuration') or {}),
         }

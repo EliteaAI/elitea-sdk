@@ -19,6 +19,7 @@ def get_toolkit(tool):
     return AzureDevOpsWorkItemsToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
+        project=tool['settings']['project'],
         limit=tool['settings'].get('limit', 5),
         toolkit_name=tool.get('toolkit_name', ''),
         elitea=tool['settings'].get('elitea', None),
@@ -39,6 +40,7 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
         m = create_model(
             name,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), json_schema_extra={'configuration_types': ['ado']})),
+            project=(str, Field(description="ADO project name")),
             limit=(Optional[int], Field(description="Default ADO boards result limit (can be overridden by agent instructions)", default=5, gt=0)),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
             # indexer settings
@@ -75,12 +77,16 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
 
         @check_connection_response
         def check_connection(self):
-            ado_config = self.ado_work_item_configuration.ado_configuration if self.ado_work_item_configuration else None
+            ado_config = self.ado_configuration
             if not ado_config:
-                raise ValueError("ADO work item configuration is required")
+                raise ValueError("ADO configuration is required")
+            project = self.project
+            if not project:
+                raise ValueError("ADO project is required")
+            token = ado_config.token.get_secret_value() if ado_config.token else ""
             response = requests.get(
-                f'{ado_config.organization_url}/{ado_config.project}/_apis/wit/workitemtypes?api-version=7.0',
-                headers={'Authorization': f'Bearer {ado_config.token}'},
+                f'{ado_config.organization_url}/{project}/_apis/wit/workitemtypes?api-version=7.0',
+                headers={'Authorization': f'Bearer {token}'},
                 timeout=5
             )
             return response
@@ -99,7 +105,6 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
 
         wrapper_payload = {
             **kwargs,
-            # TODO use ado_configuration fields in AzureDevOpsApiWrapper
             **kwargs['ado_configuration'],
             **(kwargs.get('pgvector_configuration') or {}),
         }
