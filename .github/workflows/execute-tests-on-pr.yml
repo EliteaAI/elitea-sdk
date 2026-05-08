@@ -208,6 +208,9 @@ jobs:
       - name: Install deepeval for document loader tests
         run: python -m pip install --no-cache-dir "deepeval>=3.4.6"
 
+      - name: Install testcontainers for integration tests
+        run: python -m pip install --no-cache-dir "testcontainers==4.14.2"
+
       - name: Run unit tests
         run: |
           mkdir -p tests/reports
