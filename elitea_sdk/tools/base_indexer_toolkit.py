@@ -561,7 +561,25 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     def _collect_dependencies(self, documents: Generator[Document, None, None]):
         for document in documents:
-            doc_id = document.metadata.get('id') or document.metadata.get('file_path') or document.metadata.get('source', 'unknown')
+            # Build a case-insensitive lookup for important metadata keys
+            meta = document.metadata
+            meta_lower = {k.lower(): v for k, v in meta.items()}
+
+            doc_id = (
+                    meta_lower.get('id') or
+                    meta_lower.get('path') or
+                    meta_lower.get('name') or
+                    meta_lower.get('file_path') or
+                    meta_lower.get('source') or
+                    'unknown'
+            )
+            doc_display = {
+                k: meta_lower.get(k)
+                for k in ('id', 'name', 'path', 'link', 'created', 'updated_on')
+                if meta_lower.get(k) is not None
+            }
+            logger.debug(f"_collect_dependencies: processing document — {doc_display}")
+
             self._log_tool_event(message=f"Collecting the dependencies for document ID "
                                          f"'{doc_id}' to collect dependencies if any...")
             dependencies = self._process_document(document)
