@@ -217,6 +217,7 @@ jobs:
           python -m pytest tests/ \
             --ignore=tests/runtime/test_elitea_llm.py \
             --ignore=tests/runtime/langchain/document_loaders \
+            --ignore=tests/tools/index \
             --junit-xml=tests/reports/unit-test-results.xml
 
       - name: Upload unit test results

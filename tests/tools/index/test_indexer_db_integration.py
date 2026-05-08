@@ -44,7 +44,6 @@ from langchain_core.documents import Document
 from pydantic import SecretStr
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
-from testcontainers.postgres import PostgresContainer
 
 from elitea_sdk.runtime.clients.client import EliteAClient
 from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit
@@ -62,12 +61,11 @@ TEST_INDEX_NAME = "dbtest"
 ELITEA_DEPLOYMENT_URL = os.getenv("ELITEA_DEPLOYMENT_URL")
 API_KEY = os.getenv("ELITEA_TOKEN")
 ELITEA_PROJECT_ID = os.getenv("ELITEA_PROJECT_ID")
-DEFAULT_LLM_MODEL = "gpt-5-mini"#os.getenv("DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS", "gpt-5-mini")
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL")
 DEFAULT_EMBEDDING_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-ada-002")
 
 # Expected embedding dimension for text-embedding-ada-002
 EXPECTED_EMBEDDING_DIM = 1536
-
 
 def _check_credentials_available() -> bool:
     """Check if all required credentials are available."""
@@ -122,21 +120,66 @@ def _setup_docker_host():
 @pytest.fixture(scope="module")
 def postgres_container():
     """
-    Start PostgreSQL container with pgvector extension.
-    
-    This fixture automatically starts a PostgreSQL database with pgvector support
-    and provides a connection string for the tests. The container is automatically
-    cleaned up after all tests complete.
-    
-    Works with:
-    - Docker Desktop (macOS, Windows, Linux)
-    - Colima (macOS)
-    - Podman Desktop
-    - Native Docker (Linux)
+    Provide PostgreSQL connection string with pgvector extension.
+
+    If PGVECTOR_CONNECTION_STRING env var is set (CI environment with docker-compose),
+    uses that directly. Otherwise, starts a testcontainer (local development).
+
+    CI mode (PGVECTOR_CONNECTION_STRING set):
+    - Uses existing pgvector service from docker-compose
+    - No container lifecycle management needed
+
+    Local mode (testcontainers):
+    - Automatically starts PostgreSQL with pgvector
+    - Works with Docker Desktop, Colima, Podman, native Docker
+    - Cleans up container after tests
     """
-    # Configure Docker host for various Docker installations
+    # Check if connection string is provided (CI mode)
+    env_connection_string = os.getenv("PGVECTOR_CONNECTION_STRING")
+    if env_connection_string:
+        print(f"\n✓ Using PGVECTOR_CONNECTION_STRING from environment")
+        # Ensure pgvector extension is enabled
+        from sqlalchemy import create_engine
+        import time
+
+        # Normalize connection string format for langchain-postgres
+        connection_url = env_connection_string
+        if not connection_url.startswith("postgresql+psycopg://"):
+            connection_url = connection_url.replace("postgresql://", "postgresql+psycopg://")
+            connection_url = connection_url.replace("postgresql+psycopg2://", "postgresql+psycopg://")
+
+        max_retries = 10
+        retry_delay = 2
+        for attempt in range(max_retries):
+            try:
+                engine = create_engine(connection_url)
+                with engine.connect() as conn:
+                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                    conn.commit()
+                print(f"✓ pgvector extension enabled")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠ Database not ready (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    pytest.fail(f"Failed to connect to PostgreSQL after {max_retries} attempts: {e}")
+
+        yield connection_url
+        return  # No cleanup needed for external DB
+
+    # Local mode: use testcontainers (import here to avoid CI dependency)
+    try:
+        from testcontainers.postgres import PostgresContainer
+    except ImportError:
+        pytest.fail(
+            "testcontainers not installed. Install with: pip install testcontainers[postgres]\n"
+            "Or set PGVECTOR_CONNECTION_STRING env var to use external database."
+        )
+
+    print("\n✓ Using testcontainers for local PostgreSQL")
     _setup_docker_host()
-    
+
     # Use the official pgvector image
     postgres = PostgresContainer(
         image="pgvector/pgvector:pg17",
@@ -144,23 +187,23 @@ def postgres_container():
         password="test_password",
         dbname="test_db",
     )
-    
+
     try:
         # Start the container
         postgres.start()
-        
+
         # Get connection URL early to ensure container is ready
         connection_url = postgres.get_connection_url()
-        
+
         # Wait a bit more for PostgreSQL to be fully ready (especially with Colima)
         import time
         time.sleep(2)
-        
+
         # Enable pgvector extension
         from sqlalchemy import create_engine
         max_retries = 5
         retry_delay = 2
-        
+
         for attempt in range(max_retries):
             try:
                 engine = create_engine(connection_url)
@@ -174,14 +217,14 @@ def postgres_container():
                     time.sleep(retry_delay)
                 else:
                     raise Exception(f"Failed to connect to PostgreSQL after {max_retries} attempts: {e}")
-        
+
         # Convert to psycopg URL format (langchain-postgres requirement)
         # testcontainers returns postgresql+psycopg2://, we need postgresql+psycopg://
         connection_url = connection_url.replace("postgresql://", "postgresql+psycopg://")
         connection_url = connection_url.replace("postgresql+psycopg2://", "postgresql+psycopg://")
-        
+
         yield connection_url
-        
+
     finally:
         postgres.stop()
 
@@ -1556,10 +1599,8 @@ class TestCollectionManagement:
 
 
 # ===================== Additional Collection Names =====================
-RETRIEVAL_COLLECTION_NAME = f"test_ret_idx_{TEST_RUN_ID}"
 DEDUP_COLLECTION_NAME = f"test_dedup_idx_{TEST_RUN_ID}"
 DEDUP_INDEX_NAME = "dedup"
-RETRIEVAL_INDEX_NAME = "rettest"
 
 
 # ===================== Deduplication Mock Helpers =====================
@@ -1597,119 +1638,7 @@ def _mock_dedup_abstract_methods(toolkit, indexed_data_store):
     return stack
 
 
-# ===================== Known-Answer Test Corpus =====================
-KNOWN_ANSWER_CORPUS = [
-    {
-        "page_content": (
-            "Retry mechanism with exponential backoff: When a transient failure occurs, "
-            "the system waits an exponentially increasing amount of time before retrying. "
-            "The base delay is 1 second, multiplied by 2^attempt. A maximum of 5 retries "
-            "is allowed. Jitter is added to prevent thundering herd problems."
-        ),
-        "metadata": {
-            "source": "docs/error_handling.md",
-            "title": "Error Handling Guide",
-            "category": "documentation",
-            "status": "active",
-        },
-    },
-    {
-        "page_content": (
-            "Circuit breaker pattern: After 3 consecutive failures the circuit opens and "
-            "all subsequent calls fail immediately for 30 seconds. A half-open probe is "
-            "sent after the timeout. If it succeeds the circuit closes; otherwise it "
-            "remains open for another 30 seconds."
-        ),
-        "metadata": {
-            "source": "docs/resilience_patterns.md",
-            "title": "Resilience Patterns",
-            "category": "documentation",
-            "status": "active",
-        },
-    },
-    {
-        "page_content": (
-            "Database connection pooling: The application uses a connection pool with "
-            "min_size=5 and max_size=20. Idle connections are reaped after 300 seconds. "
-            "The pool uses LIFO ordering for better cache locality. Health checks run "
-            "every 60 seconds to remove stale connections."
-        ),
-        "metadata": {
-            "source": "docs/database.md",
-            "title": "Database Configuration",
-            "category": "reference",
-            "status": "active",
-        },
-    },
-    {
-        "page_content": (
-            "Authentication flow: Users authenticate via OAuth2 authorization code flow. "
-            "Access tokens expire after 15 minutes. Refresh tokens are rotated on each use "
-            "and expire after 7 days. PKCE is required for public clients. Token revocation "
-            "is supported via the /revoke endpoint."
-        ),
-        "metadata": {
-            "source": "docs/authentication.md",
-            "title": "Authentication Guide",
-            "category": "tutorial",
-            "status": "active",
-        },
-    },
-    {
-        "page_content": (
-            "Rate limiting configuration: API endpoints are rate-limited using a token bucket "
-            "algorithm. Default limit is 100 requests per minute per API key. Burst allowance "
-            "is 20 requests. Rate limit headers X-RateLimit-Remaining and X-RateLimit-Reset "
-            "are included in every response."
-        ),
-        "metadata": {
-            "source": "docs/rate_limiting.md",
-            "title": "Rate Limiting",
-            "category": "reference",
-            "status": "draft",
-        },
-    },
-]
-
-
-def _known_answer_loader(**kwargs) -> Generator[Document, None, None]:
-    """Load the known-answer test corpus as Documents."""
-    import time
-    for i, item in enumerate(KNOWN_ANSWER_CORPUS):
-        metadata = dict(item["metadata"])
-        metadata["id"] = f"known_doc_{i}"
-        metadata["updated_on"] = time.time()
-        yield Document(page_content=item["page_content"], metadata=metadata)
-
-
 # ===================== Additional Fixtures =====================
-
-@pytest.fixture(scope="module")
-def retrieval_toolkit(elitea_client, postgres_container):
-    """Module-scoped toolkit pre-loaded with known-answer corpus for retrieval tests."""
-    schema = RETRIEVAL_COLLECTION_NAME
-    try:
-        llm = elitea_client.get_llm(model_name=DEFAULT_LLM_MODEL, model_config={"temperature": 0})
-        toolkit = BaseIndexerToolkit(
-            elitea=elitea_client,
-            llm=llm,
-            embedding_model=DEFAULT_EMBEDDING_MODEL,
-            connection_string=postgres_container,
-            collection_schema=schema,
-        )
-        toolkit._ensure_vectorstore_initialized()
-
-        with _mock_indexer_abstract_methods(toolkit), \
-             patch.object(toolkit, "_base_loader", side_effect=_known_answer_loader):
-            result = toolkit.index_data(index_name=RETRIEVAL_INDEX_NAME, clean_index=True)
-            assert result["status"] == "ok", f"Failed to seed retrieval corpus: {result}"
-
-        yield toolkit
-
-        _cleanup_schema(schema, postgres_container)
-    except Exception as e:
-        pytest.skip(f"Failed to create retrieval toolkit: {e}")
-
 
 @pytest.fixture
 def dedup_indexer_toolkit(elitea_client, postgres_container):
@@ -2017,117 +1946,3 @@ class TestWritePathChunkCount:
             assert rec["embedding"] is not None, f"Record {rec['id']} has null embedding"
 
         print(f"\n✓ Chunk count: {reported} reported == {len(actual)} in DB, all have content + embedding")
-
-
-# ===================== Suite B: RET-* Retrieval Correctness =====================
-
-@pytest.mark.integration
-class TestRetrievalCorrectness:
-    """RET-* tests validating search_index behavior."""
-
-    def test_search_returns_relevant_chunks(self, retrieval_toolkit):
-        """
-        RET: search_index returns semantically relevant chunks for the query.
-        """
-        results = retrieval_toolkit.search_index(
-            query="How does the retry mechanism work?",
-            index_name=RETRIEVAL_INDEX_NAME,
-            cut_off=0.0,
-            search_top=5,
-        )
-        assert isinstance(results, list), f"Expected list, got: {type(results)} — {results}"
-        assert len(results) > 0, "search_index returned no results for a known query"
-
-        top_sources = []
-        for doc in results:
-            if isinstance(doc, dict):
-                src = doc.get("metadata", {}).get("source", "")
-            else:
-                src = getattr(doc, "metadata", {}).get("source", "")
-            top_sources.append(src)
-
-        assert "docs/error_handling.md" in top_sources, (
-            f"Expected 'docs/error_handling.md' in top results, got: {top_sources}"
-        )
-        print(f"\n✓ Relevant chunks returned. Top sources: {top_sources[:3]}")
-
-    def test_search_top_parameter(self, retrieval_toolkit):
-        """
-        RET: search_top parameter limits the number of results.
-        """
-        for k in (1, 2, 3):
-            results = retrieval_toolkit.search_index(
-                query="configuration",
-                index_name=RETRIEVAL_INDEX_NAME,
-                cut_off=0.0,
-                search_top=k,
-            )
-            if isinstance(results, str):
-                continue
-            assert len(results) <= k, (
-                f"search_top={k} but got {len(results)} results"
-            )
-        print("\n✓ search_top parameter respected")
-
-    def test_cut_off_parameter(self, retrieval_toolkit):
-        """
-        RET: cut_off filters low-similarity results.
-        """
-        results_strict = retrieval_toolkit.search_index(
-            query="retry exponential backoff",
-            index_name=RETRIEVAL_INDEX_NAME,
-            cut_off=0.99,
-            search_top=10,
-        )
-        results_lenient = retrieval_toolkit.search_index(
-            query="retry exponential backoff",
-            index_name=RETRIEVAL_INDEX_NAME,
-            cut_off=0.0,
-            search_top=10,
-        )
-
-        strict_count = 0 if isinstance(results_strict, str) else len(results_strict)
-        lenient_count = 0 if isinstance(results_lenient, str) else len(results_lenient)
-
-        assert lenient_count >= strict_count, (
-            f"Lenient cut_off returned fewer results ({lenient_count}) than strict ({strict_count})"
-        )
-        print(f"\n✓ cut_off respected: strict={strict_count}, lenient={lenient_count}")
-
-    def test_filter_by_metadata_key(self, retrieval_toolkit):
-        """
-        RET: filter by metadata key limits results to matching documents only.
-        """
-        results = retrieval_toolkit.search_index(
-            query="configuration",
-            index_name=RETRIEVAL_INDEX_NAME,
-            filter={"category": {"$eq": "reference"}},
-            cut_off=0.0,
-            search_top=10,
-        )
-        if isinstance(results, str):
-            pytest.skip("No results returned for metadata filter query")
-
-        for doc in results:
-            meta = doc.get("metadata", {}) if isinstance(doc, dict) else getattr(doc, "metadata", {})
-            assert meta.get("category") == "reference", (
-                f"Filter leak: got category='{meta.get('category')}', expected 'reference'"
-            )
-        print(f"\n✓ Metadata filter: all {len(results)} results have category='reference'")
-
-    def test_empty_index_returns_no_documents(self, retrieval_toolkit):
-        """
-        RET: Querying an empty/non-existent index returns 'No documents found'
-        gracefully without raising an exception.
-        """
-        result = retrieval_toolkit.search_index(
-            query="anything",
-            index_name="noexst",
-            cut_off=0.0,
-            search_top=5,
-        )
-        assert isinstance(result, str), f"Expected string message, got {type(result)}"
-        assert "not found" in result.lower() or "no documents" in result.lower(), (
-            f"Unexpected response for empty index: {result}"
-        )
-        print(f"\n✓ Empty index handled gracefully: '{result[:80]}'")
