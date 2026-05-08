@@ -1,0 +1,46 @@
+# PART 3 — Indexer Integration Tests
+Scope: Full write + read pipeline validated against a live local pgvector DB. No mocks. Two suites: Suite A — Indexing & Storage (IND-*) validates the write path and DB state; Suite B — Retrieval & Quality (RET-*) validates retrieval accuracy and LLM synthesis quality using deepeval metrics with a fixed known-answer test corpus.
+
+## Validation points:
+
+### Write path correctness
+
+Chunks land in DB with non-null page_content, embedding, and metadata
+Chunk count matches expected output from the paired chunker
+Document source metadata preserved end-to-end through the full pipeline
+
+### DB state and lifecycle
+
+index_meta document tracks correct state transitions: in_progress → completed
+indexed count in index_meta equals actual DB row count
+error field null on success; populated correctly on failure
+
+### Deduplication and updates
+
+Re-indexing unchanged file does not create duplicate DB rows
+Re-indexing a modified file replaces the old version; total row count stable
+clean_index=True removes all prior chunks before writing new batch
+
+### Collection management
+
+list_collections() returns only collections that have been indexed
+remove_index() deletes all chunks from the target collection; subsequent search returns 0 results
+Multi-collection queries are fully isolated — no cross-contamination
+
+### Retrieval correctness
+
+search_index returns semantically relevant chunks for the query
+cut_off and search_top parameters respected on output
+filter by metadata key limits results to matching documents only
+Empty index returns "No documents found" gracefully; no exception
+
+### RAG quality (deepeval)
+
+stepback_search_index: ContextualRelevancyMetric ≥ 0.7 — LLM query rewrite broadens retrieval without losing relevance
+stepback_summary_index: FaithfulnessMetric + AnswerRelevancyMetric ≥ 0.7 — LLM summary is grounded in retrieved context and directly answers the question
+ContextualPrecisionMetric and ContextualRecallMetric applied on search_index to confirm ranking and coverage quality
+
+### Error resilience
+
+Partial batch failure (embedder raises on one doc mid-batch): failed_count > 0, remaining docs stored, no uncaught exception
+index_meta.error populated on failure; pipeline does not leave DB in inconsistent state
