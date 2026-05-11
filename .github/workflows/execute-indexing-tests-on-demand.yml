@@ -11,6 +11,15 @@ on:
         default: 'local'
         options:
           - local
+          - dev
+          - stage
+          - prod
+          - custom
+      custom_environment:
+        description: 'Custom environment name (used only when environment=custom). Requires secrets: DEPLOYMENT_URL_<NAME>, ELITEA_API_KEY_<NAME>, PROJECT_ID_<NAME>'
+        required: false
+        type: string
+        default: ''
       run_mode:
         description: 'How to run tests: matrix (suite-based), mark (-m expression), nodeid (single pytest node)'
         required: true
@@ -248,10 +257,18 @@ jobs:
 
       - name: Resolve environment secrets
         run: |
-          if [ "${{ inputs.environment }}" = "local" ]; then
+          # Resolve custom environment if selected
+          if [ "${{ inputs.environment }}" = "custom" ]; then
+            ENV_NAME="${{ inputs.custom_environment }}"
+          else
+            ENV_NAME="${{ inputs.environment }}"
+          fi
+
+          # Map local to STAGE, otherwise uppercase the environment name
+          if [ "$ENV_NAME" = "local" ]; then
             ENV_UPPER="STAGE"
           else
-            ENV_UPPER=$(echo "${{ inputs.environment }}" | tr '[:lower:]' '[:upper:]')
+            ENV_UPPER=$(echo "$ENV_NAME" | tr '[:lower:]' '[:upper:]')
           fi
           echo "ENV_UPPER=${ENV_UPPER}" >> $GITHUB_ENV
 
