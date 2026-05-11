@@ -29,6 +29,7 @@ from .EliteATextLoader import EliteATextLoader
 from .EliteACodeLoader import EliteACodeLoader
 from .EliteAMarkdownLoader import EliteAMarkdownLoader
 from .EliteAPythonLoader import EliteAPythonLoader
+from .EliteAEmailLoader import EliteAEmailLoader
 from enum import Enum
 from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
 
@@ -289,6 +290,27 @@ document_loaders_map = {
     #     'kwargs': {},
     #     'allowed_to_override': DEFAULT_ALLOWED_BASE
     # }
+    # Email formats (.eml and .msg) — uses unstructured for parsing
+    '.eml': {
+        'class': EliteAEmailLoader,
+        'mime_type': 'message/rfc822',
+        'is_multimodal_processing': False,
+        'kwargs': {
+            'process_attachments': True,
+            'ignore_empty_body': True
+        },
+        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True}
+    },
+    '.msg': {
+        'class': EliteAEmailLoader,
+        'mime_type': 'application/vnd.ms-outlook',
+        'is_multimodal_processing': False,
+        'kwargs': {
+            'process_attachments': True,
+            'ignore_empty_body': True
+        },
+        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True}
+    },
 }
 
 code_extensions = [

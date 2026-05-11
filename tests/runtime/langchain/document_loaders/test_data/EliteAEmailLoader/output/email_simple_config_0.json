@@ -1,0 +1,17 @@
+[
+  {
+    "page_content": "**Subject:** Test Email - Simple\n**From:** sender@example.com\n**To:** recipient@example.com\n**Date:** 2024-01-01T10:00:00+00:00\n\n---\n\nHello,\n\nThis is a simple test email with plain text content.\n\nBest regards,\n\nSender",
+    "metadata": {
+      "from": [
+        "sender@example.com"
+      ],
+      "to": [
+        "recipient@example.com"
+      ],
+      "subject": "Test Email - Simple",
+      "date": "2024-01-01T10:00:00+00:00",
+      "is_empty_body": false,
+      "has_attachment": false
+    }
+  }
+]

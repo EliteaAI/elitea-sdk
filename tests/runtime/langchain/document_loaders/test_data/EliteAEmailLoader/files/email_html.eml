@@ -1,0 +1,40 @@
+From: marketing@company.com
+To: customer@example.com
+Cc: manager@company.com
+Subject: Welcome to Our Service
+Date: Tue, 15 Jan 2024 14:30:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="boundary123"
+
+--boundary123
+Content-Type: text/plain; charset="utf-8"
+
+Welcome to Our Service!
+
+Thank you for signing up. Here's what you can do:
+- Access your dashboard
+- Configure settings
+- Contact support
+
+Best,
+The Team
+
+--boundary123
+Content-Type: text/html; charset="utf-8"
+
+<!DOCTYPE html>
+<html>
+<head><title>Welcome</title></head>
+<body>
+<h1>Welcome to Our Service!</h1>
+<p>Thank you for signing up. Here's what you can do:</p>
+<ul>
+<li>Access your dashboard</li>
+<li>Configure settings</li>
+<li>Contact support</li>
+</ul>
+<p>Best,<br>The Team</p>
+</body>
+</html>
+
+--boundary123--

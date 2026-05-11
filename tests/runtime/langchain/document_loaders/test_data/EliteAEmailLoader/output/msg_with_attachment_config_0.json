@@ -1,0 +1,25 @@
+[
+  {
+    "page_content": "**Subject:** Test for TIF files\n**From:** Brian Zhou <brizhou@gmail.com>\n**To:** brianzhou@me.com, brizhou@gmail.com\n**Cc:** Brian Zhou <brizhou@gmail.com>\n**Date:** 2013-11-18T08:26:24+00:00\n\n---\n\nThis is a test email to experiment with the MS Outlook MSG Extractor\n\n--\n\nKind regards\n\nBrian Zhou",
+    "metadata": {
+      "from": [
+        "Brian Zhou <brizhou@gmail.com>"
+      ],
+      "to": [
+        "brianzhou@me.com",
+        "brizhou@gmail.com"
+      ],
+      "subject": "Test for TIF files",
+      "cc": [
+        "Brian Zhou <brizhou@gmail.com>"
+      ],
+      "date": "2013-11-18T08:26:24+00:00",
+      "is_empty_body": false,
+      "has_attachment": true,
+      "attachment": [
+        "import OleFileIO.tif",
+        "raised value error.tif"
+      ]
+    }
+  }
+]

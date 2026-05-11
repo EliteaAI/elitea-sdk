@@ -1,0 +1,23 @@
+MIME-Version: 1.0
+From: sender@example.com
+To: recipient@example.com
+Subject: Test Email - With Attachment
+Date: Fri, 10 May 2024 16:00:00 +0000
+Content-Type: multipart/mixed; boundary="----=_Part_0_123456789"
+
+------=_Part_0_123456789
+Content-Type: text/plain; charset="UTF-8"
+
+Hello,
+
+This is a test email with an attachment.
+
+Best regards,
+Sender
+------=_Part_0_123456789
+Content-Type: text/plain; name="notes.txt"
+Content-Disposition: attachment; filename="notes.txt"
+
+This is a sample text file attachment.
+It contains some notes for testing purposes.
+------=_Part_0_123456789--
