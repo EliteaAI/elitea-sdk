@@ -1,0 +1,7 @@
+{
+    "tags": ["loader:email", "edge:empty-input", "format:eml"],
+    "file_path": "../files/email_empty.eml",
+    "configs": [
+        {"process_attachments": true, "max_tokens": -1}
+    ]
+}

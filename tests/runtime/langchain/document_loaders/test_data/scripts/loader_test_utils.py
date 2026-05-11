@@ -52,6 +52,9 @@ LOADER_SPECIAL_FIELDS = {
     "EliteAHTMLLoader": {
         "source": "path_suffix",
     },
+    "EliteAEmailLoader": {
+        # No source field - email loader doesn't include source in metadata
+    },
 }
 
 # Default: compare all fields (no ignoring)

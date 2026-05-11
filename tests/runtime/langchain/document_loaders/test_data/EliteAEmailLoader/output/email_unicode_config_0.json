@@ -1,0 +1,16 @@
+[
+  {
+    "page_content": "**Subject:** Test ✓ Unicode 🌍\n**From:** =?utf-8?q?M=C3=BCller?= <mueller@example.de>\n**To:** =?utf-8?b?5Lit5paH55So5oi3?= <chinese@example.cn>\n\n---\n\nGuten Tag!\n\nThis email contains Unicode characters: - German: Müller, Größe, Übung - Chinese: 你好世界 - Japanese: こんにちは - Arabic: مرحبا - Emoji: 🎉 🚀 ✅\n\nMit freundlichen Grüßen,\n\nMüller",
+    "metadata": {
+      "is_empty_body": false,
+      "from": [
+        "=?utf-8?q?M=C3=BCller?= <mueller@example.de>"
+      ],
+      "to": [
+        "=?utf-8?b?5Lit5paH55So5oi3?= <chinese@example.cn>"
+      ],
+      "subject": "Test ✓ Unicode 🌍",
+      "has_attachment": false
+    }
+  }
+]

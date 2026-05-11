@@ -1,0 +1,8 @@
+{
+    "tags": ["loader:email", "content:html", "format:eml"],
+    "file_path": "../files/email_html.eml",
+    "configs": [
+        {"process_attachments": true, "max_tokens": -1},
+        {"process_attachments": true, "max_tokens": 256}
+    ]
+}

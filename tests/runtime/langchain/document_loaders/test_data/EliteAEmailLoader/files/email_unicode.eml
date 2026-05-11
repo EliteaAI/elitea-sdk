@@ -1,0 +1,19 @@
+From: =?utf-8?Q?M=C3=BCller?= <mueller@example.de>
+To: =?utf-8?Q?=E4=B8=AD=E6=96=87=E7=94=A8=E6=88=B7?= <chinese@example.cn>
+Subject: =?utf-8?Q?Test_=E2=9C=93_Unicode_=F0=9F=8C=8D?=
+Date: Wed, 20 Mar 2024 09:15:00 +0100
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Guten Tag!
+
+This email contains Unicode characters:
+- German: Müller, Größe, Übung
+- Chinese: 你好世界
+- Japanese: こんにちは
+- Arabic: مرحبا
+- Emoji: 🎉 🚀 ✅
+
+Mit freundlichen Grüßen,
+Müller
