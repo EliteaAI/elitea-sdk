@@ -14,6 +14,12 @@ on:
           - dev
           - stage
           - prod
+          - custom
+      custom_environment:
+        description: 'Custom environment name (used only when environment=custom). Requires secrets: DEPLOYMENT_URL_<NAME>, ELITEA_API_KEY_<NAME>, PROJECT_ID_<NAME>'
+        required: false
+        type: string
+        default: ''
       test_cases_dir:
         description: 'Toolkit tests to execute (all will execute all tests, custom allows specifying comma-separated list of suites, or choose specific suite)'
         required: true
@@ -95,7 +101,7 @@ jobs:
     with:
       test_cases_dir: ${{ matrix.data.suite }}
       tests_to_run: ${{ matrix.data.tests_to_run }}
-      environment: ${{ github.event.inputs.environment }}
+      environment: ${{ inputs.environment == 'custom' && inputs.custom_environment || inputs.environment }}
       enable_parallel: true
       enable_bug_reporting: ${{ inputs.enable_bug_reporting }}
       enable_rp_reporting: ${{ inputs.enable_rp_reporting }}
