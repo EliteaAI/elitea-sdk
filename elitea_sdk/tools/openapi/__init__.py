@@ -242,11 +242,7 @@ def _build_openapi_mcp_authorization_required(
         base_discovery,
         extra_endpoints=[azure_v2_endpoint],
     )
-    logger.debug(
-        "OpenAPI OAuth discovery metadata fetched: authorization_endpoint=%s, token_endpoint=%s",
-        (openid_meta or {}).get("authorization_endpoint"),
-        (openid_meta or {}).get("token_endpoint"),
-    )
+    logger.debug("OpenAPI OAuth discovery metadata fetched successfully")
 
     resource_metadata_url = f"{base_discovery}/.well-known/openid-configuration"
     authorization_endpoint = (openid_meta or {}).get(
@@ -538,11 +534,7 @@ class EliteAOpenAPIToolkit(BaseToolkit):
 
         if oauth_discovery_endpoint:
             config_uuid = merged_settings.get('configuration_uuid')
-            logger.debug(
-                "[OpenAPI OAuth] delegated flow active. config_uuid=%s, oauth_endpoint=%s",
-                config_uuid,
-                oauth_discovery_endpoint,
-            )
+            logger.debug("[OpenAPI OAuth] delegated flow active")
             token = None
             if config_uuid:
                 token = tokens.get(f"{config_uuid}:{oauth_discovery_endpoint}")
