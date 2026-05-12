@@ -68,8 +68,8 @@ jobs:
           docker-compose run --rm --name elitea-sdk-analyzer elitea-sdk \
             sh -c "git config --global --add safe.directory /app && elitea agent run .elitea/agents/pr-impact-analyzer.agent.md --dir . 'Analyze PR ${{ env.PR_NUMBER }}'"
         env:
-          DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
-          DEFAULT_LLM_MODEL: ${{ secrets.DEFAULT_LLM_MODEL }}
+          DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ vars.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+          DEFAULT_LLM_MODEL: ${{ vars.DEFAULT_LLM_MODEL }}
           ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE }}
           ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE }}
           ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE }}
@@ -190,7 +190,7 @@ jobs:
       env:
         PYTHONDONTWRITEBYTECODE: "1"
         PYTHONUNBUFFERED: "1"
-        DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+        DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ vars.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
         ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE }}
         ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE }}
         ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE }}
