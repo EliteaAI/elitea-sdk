@@ -435,12 +435,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         for base_doc in base_documents:
             base_doc_counter += 1
-            self._log_tool_event(f"Processing dependent documents for base documents #{base_doc_counter}.")
+            _meta_lower = {k.lower(): v for k, v in base_doc.metadata.items()}
+            _doc_name = _meta_lower.get('name') or _meta_lower.get('file_path') or _meta_lower.get('path') or 'unknown'
+            self._log_tool_event(f"Processing document #{base_doc_counter}: '{_doc_name}'.")
 
             # (base_doc for _ in range(1)) - wrap single base_doc to Generator in order to reuse existing code
             documents = self._extend_data((base_doc for _ in range(1)))  # update content of not-reduced base document if needed (for sharepoint and similar)
             documents = self._collect_dependencies(documents)  # collect dependencies for base documents
-            self._log_tool_event(f"Dependent documents were processed. "
+            self._log_tool_event(f"Dependent documents for '{_doc_name}' were processed. "
                                  f"Applying chunking tool '{chunking_tool if chunking_tool else "default"}' if specified and preparing documents for indexing...")
             documents = self._apply_loaders_chunkers(documents, chunking_tool, chunking_config)
             documents = self._clean_metadata(documents)
@@ -471,7 +473,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     _flush_chunk(pg_vector_add_docs_chunk)
                     pg_vector_add_docs_chunk = []
 
-            msg = f"Indexed base document #{base_doc_counter} out of {base_total} (with {dependent_docs_counter} chunks)."
+            msg = f"Indexed document #{base_doc_counter} '{_doc_name}' out of {base_total} (with {dependent_docs_counter} chunks)."
             logger.debug(msg)
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
@@ -580,8 +582,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             }
             logger.debug(f"_collect_dependencies: processing document — {doc_display}")
 
-            self._log_tool_event(message=f"Collecting the dependencies for document ID "
-                                         f"'{doc_id}' to collect dependencies if any...")
+            doc_name = meta_lower.get('name') or meta_lower.get('file_path') or meta_lower.get('path') or ''
+            self._log_tool_event(message=f"Collecting the dependencies for document "
+                                         f"'{doc_name}' (ID: '{doc_id}') to collect dependencies if any...")
             dependencies = self._process_document(document)
             yield document
             for dep in dependencies:
