@@ -684,7 +684,10 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
     def get_specific_field_info(self, jira_issue_key: str, field_name: str):
         """ Get the specific field information from Jira by jira issue key and field name """
 
-        jira_issue = self._client.issue(jira_issue_key, fields=field_name)
+        try:
+            jira_issue = self._client.issue(jira_issue_key, fields=field_name)
+        except Exception as e:
+            raise self._handle_jira_auth_error(e, f" (Issue: {jira_issue_key})")
         field_info = jira_issue.get('fields', {}).get(field_name)
         if not field_info:
             existing_fields = [key for key, value in self._client.issue(jira_issue_key).get("fields").items() if value is not None]
@@ -1146,6 +1149,32 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
         return "\n\n".join(attachment_data)
 
+    def _handle_jira_auth_error(self, error: Exception, context: str = "") -> ToolException:
+        """
+        Handle ambiguous Jira 404 errors by distinguishing auth failures from real 404s.
+
+        Jira returns 404 with "does not exist or you do not have permission" for BOTH
+        invalid credentials AND missing/forbidden resources. This method performs a
+        pre-flight check against /myself to determine the actual cause.
+        """
+        error_msg = str(error)
+        status_code = getattr(getattr(error, 'response', None), 'status_code', None)
+
+        if status_code == 404 and "does not exist or you do not have permission" in error_msg:
+            try:
+                self._client.myself()
+                # Auth works - it's a real permission/not-found issue, return original error
+                return ToolException(error_msg)
+            except Exception as auth_error:
+                auth_status = getattr(getattr(auth_error, 'response', None), 'status_code', None)
+                if auth_status in (401, 403):
+                    return ToolException(
+                        "Authentication failed: Unable to connect to Jira. "
+                        "Please verify your Jira toolkit credentials are valid and not expired."
+                    )
+                return ToolException(error_msg)
+        return ToolException(str(error))
+
     def execute_generic_rq(self, method: str, relative_url: str, params: Optional[str] = "", *args):
         """Executes a generic JIRA tool request."""
         payload_params = parse_payload_params(params)
@@ -1156,7 +1185,10 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 params=payload_params,
                 advanced_mode=True
             )
-            self._client.raise_for_status(response)
+            try:
+                self._client.raise_for_status(response)
+            except Exception as e:
+                raise self._handle_jira_auth_error(e, f" (URL: {relative_url})")
             if re.match(self.issue_search_pattern, relative_url):
                 response_text = process_search_response(self._client.url, response, payload_params)
             else:
@@ -1171,7 +1203,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             try:
                 self._client.raise_for_status(response)
             except Exception as e:
-                return ToolException(str(e))
+                raise self._handle_jira_auth_error(e, f" (URL: {relative_url})")
             response_text = response.text
         response_string = f"HTTP: {method} {relative_url} -> {response.status_code} {response.reason} {response_text}"
         logger.debug(response_string)
