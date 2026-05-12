@@ -249,7 +249,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       env:
-        DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ secrets.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
+        DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ vars.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
     
     steps:
       - name: Checkout repository
