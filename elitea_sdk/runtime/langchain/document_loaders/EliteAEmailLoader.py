@@ -164,6 +164,8 @@ class EliteAEmailLoader(BaseLoader):
                 headers['cc'] = [str(msg['Cc'])]
             if msg['Subject']:
                 headers['subject'] = str(msg['Subject'])
+            if msg['Date']:
+                headers['date'] = str(msg['Date'])
         except Exception as e:
             logger.warning(f"Failed to extract email headers: {e}")
 
@@ -208,6 +210,75 @@ class EliteAEmailLoader(BaseLoader):
             logger.warning(f"Failed to extract email attachments: {e}")
 
         return attachments
+
+    def _extract_attachments_with_content_from_msg(self) -> List[Tuple[str, bytes]]:
+        """
+        Extract attachment filenames and content from MSG file using extract_msg library.
+
+        Returns:
+            List of tuples (filename, content_bytes).
+        """
+        import extract_msg
+
+        attachments = []
+        msg = None
+        try:
+            if self.file_path:
+                msg = extract_msg.openMsg(self.file_path)
+            else:
+                # For in-memory content, write to temp file as extract_msg requires file path
+                temp_file = None
+                try:
+                    temp_dir = tempfile.mkdtemp()
+                    temp_file = os.path.join(temp_dir, self.file_name or "temp.msg")
+                    with open(temp_file, 'wb') as f:
+                        f.write(self.file_content)
+                    msg = extract_msg.openMsg(temp_file)
+                finally:
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                            os.rmdir(os.path.dirname(temp_file))
+                        except OSError:
+                            pass
+
+            if msg:
+                for attachment in msg.attachments:
+                    filename = attachment.longFilename or attachment.shortFilename
+                    if filename:
+                        content = attachment.data
+                        if content:
+                            attachments.append((filename, content))
+
+        except Exception as e:
+            logger.warning(f"Failed to extract MSG attachments: {e}")
+        finally:
+            if msg:
+                try:
+                    msg.close()
+                except Exception:
+                    pass
+
+        return attachments
+
+    def _extract_attachments_with_content(self) -> List[Tuple[str, bytes]]:
+        """
+        Extract attachment filenames and content from email file.
+
+        Automatically selects the appropriate extraction method based on file type.
+
+        Returns:
+            List of tuples (filename, content_bytes).
+        """
+        try:
+            file_type = self._detect_file_type()
+            if file_type == 'msg':
+                return self._extract_attachments_with_content_from_msg()
+            else:
+                return self._extract_attachments_with_content_from_eml()
+        except ValueError:
+            # Fallback to EML extraction if file type detection fails
+            return self._extract_attachments_with_content_from_eml()
 
     def _parse_attachment_content(self, filename: str, content: bytes) -> str:
         """
@@ -301,11 +372,19 @@ class EliteAEmailLoader(BaseLoader):
                     if hasattr(elem_metadata, 'cc_recipient') and elem_metadata.cc_recipient:
                         cc = elem_metadata.cc_recipient
                         metadata['cc'] = [str(x) for x in cc] if isinstance(cc, list) else [str(cc)]
+                    if hasattr(elem_metadata, 'last_modified') and elem_metadata.last_modified:
+                        metadata['date'] = str(elem_metadata.last_modified)
                     if any(k in metadata for k in ['from', 'to', 'subject']):
                         break
 
+            # If date not found from unstructured, extract from email headers
+            if 'date' not in metadata:
+                headers = self._extract_headers_from_eml()
+                if 'date' in headers:
+                    metadata['date'] = headers['date']
+
         # Extract attachments with content for metadata and parsing
-        attachments_with_content = self._extract_attachments_with_content_from_eml()
+        attachments_with_content = self._extract_attachments_with_content()
         attachment_filenames = [filename for filename, _ in attachments_with_content]
 
         # Add common metadata fields
@@ -328,6 +407,8 @@ class EliteAEmailLoader(BaseLoader):
         if 'cc' in metadata:
             cc_str = ', '.join(metadata['cc']) if isinstance(metadata['cc'], list) else str(metadata['cc'])
             header_parts.append(f"**Cc:** {cc_str}")
+        if 'date' in metadata:
+            header_parts.append(f"**Date:** {metadata['date']}")
 
         if header_parts:
             content_parts.append('\n'.join(header_parts))

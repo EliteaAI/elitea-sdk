@@ -1,0 +1,18 @@
+{
+    "tags": [
+        "loader:email",
+        "format:msg",
+        "feature:attachment"
+    ],
+    "file_path": "../files/msg_with_attachment.msg",
+    "configs": [
+        {
+            "process_attachments": true,
+            "max_tokens": -1
+        },
+        {
+            "process_attachments": false,
+            "max_tokens": -1
+        }
+    ]
+}

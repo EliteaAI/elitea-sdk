@@ -1,8 +1,7 @@
 [
   {
-    "page_content": "**Subject:** Test Email - With Attachment\n**From:** sender@example.com\n**To:** recipient@example.com\n\n---\n\nHello,\n\nThis is a test email with an attachment.\n\nBest regards,\n\nSender\n\n---\n**Attachment: notes.txt**\n\nThis is a sample text file attachment.\nIt contains some notes for testing purposes.",
+    "page_content": "**Subject:** Test Email - With Attachment\n**From:** sender@example.com\n**To:** recipient@example.com\n**Date:** 2024-05-10T16:00:00+00:00\n\n---\n\nHello,\n\nThis is a test email with an attachment.\n\nBest regards,\n\nSender\n\n---\n**Attachment: notes.txt**\n\nThis is a sample text file attachment.\nIt contains some notes for testing purposes.",
     "metadata": {
-      "is_empty_body": false,
       "from": [
         "sender@example.com"
       ],
@@ -10,6 +9,8 @@
         "recipient@example.com"
       ],
       "subject": "Test Email - With Attachment",
+      "date": "2024-05-10T16:00:00+00:00",
+      "is_empty_body": false,
       "has_attachment": true,
       "attachment": [
         "notes.txt"

@@ -2,6 +2,7 @@ MIME-Version: 1.0
 From: sender@example.com
 To: recipient@example.com
 Subject: Test Email - With Attachment
+Date: Fri, 10 May 2024 16:00:00 +0000
 Content-Type: multipart/mixed; boundary="----=_Part_0_123456789"
 
 ------=_Part_0_123456789

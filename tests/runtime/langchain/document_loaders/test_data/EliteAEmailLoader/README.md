@@ -2,12 +2,14 @@
 
 ## Test Coverage
 
-- **Test files**: 5 (.eml format)
-- **Total configs**: 7
+- **Test files**: 6 (5 .eml + 1 .msg)
+- **Total configs**: 9
 - **Parameters tested**: `process_attachments`, `max_tokens`
 - **Supported formats**: .eml (RFC 5322), .msg (Outlook)
 
 ## Test Breakdown
+
+### EML Format Tests
 
 | File | Configs | Purpose |
 |------|---------|---------|
@@ -16,6 +18,12 @@
 | `email_unicode.eml` | 1 | Unicode characters (German, Chinese, Japanese, Arabic, emoji) |
 | `email_empty.eml` | 1 | Email with empty body - validates edge case handling |
 | `email_with_attachment.eml` | 1 | Email with text file attachment - validates attachment metadata |
+
+### MSG Format Tests
+
+| File | Configs | Purpose |
+|------|---------|---------|
+| `msg_with_attachment.msg` | 2 | Outlook MSG format with TIF attachments - validates MSG parsing |
 
 ## Configuration Matrix
 
@@ -35,6 +43,10 @@
 
 ### email_with_attachment.eml
 - **Config 0** (`{"process_attachments": true, "max_tokens": -1}`): Attachment metadata extraction
+
+### msg_with_attachment.msg
+- **Config 0** (`{"process_attachments": true, "max_tokens": -1}`): Full MSG processing with attachments
+- **Config 1** (`{"process_attachments": false, "max_tokens": -1}`): MSG processing without attachment content
 
 ## Coverage Metrics
 
@@ -62,13 +74,15 @@ From `constants.py`:
 ### Output Structure:
 ```json
 {
-  "page_content": "**Subject:** ...\n**From:** ...\n**To:** ...\n\n---\n\n<body content>",
+  "page_content": "**Subject:** ...\n**From:** ...\n**To:** ...\n**Date:** ...\n\n---\n\n<body content>\n\n---\n**Attachment: filename.ext**\n\n<attachment content>",
   "metadata": {
     "is_empty_body": false,
     "from": ["sender@example.com"],
     "to": ["recipient@example.com"],
     "subject": "Email Subject",
-    "has_attachment": false
+    "date": "2024-01-01T10:00:00+00:00",
+    "has_attachment": true,
+    "attachment": ["filename.ext"]
   }
 }
 ```
@@ -78,9 +92,18 @@ From `constants.py`:
 - `from`: List of sender addresses
 - `to`: List of recipient addresses
 - `subject`: Email subject line
+- `date`: Email date/time (ISO 8601 format)
 - `cc`: List of CC recipients (if present)
 - `has_attachment`: Boolean indicating if email has attachments
 - `attachment`: List of attachment filenames (only present when `has_attachment` is true)
+
+### Attachment Processing:
+When `process_attachments=true`, nested attachments within emails are:
+1. Extracted from the email structure
+2. Parsed using the appropriate loader based on file extension (same loaders as used by ADO, Jira, etc.)
+3. Appended to the document with `---\n**Attachment: filename**\n\n<content>` format
+
+Supported attachment formats include: .txt, .pdf, .docx, .xlsx, .csv, .json, .md, .html, .xml, images, and more (same as `loaders_map` in constants.py).
 
 Note: `source` is NOT included in metadata (handled externally by indexing system)
 
@@ -118,3 +141,11 @@ pytest -m "edge_encoding" -v
 - Supports both .eml (RFC 5322) and .msg (Outlook) formats
 - Lazy import of chunker to avoid circular import issues
 - Empty emails return document with empty page_content
+
+## MSG Format Support
+
+MSG attachment extraction uses the `extract_msg` library (already a dependency) to properly 
+extract attachments from Outlook MSG files. This is handled by `_extract_attachments_with_content_from_msg()`.
+
+The test `msg_with_attachment.msg` contains 2 TIF attachments which are correctly detected 
+and listed in the `attachment` metadata field.
