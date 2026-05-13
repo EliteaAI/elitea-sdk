@@ -99,11 +99,12 @@ def extract_application_response_output(response: Any) -> str:
     if not isinstance(response, dict):
         return normalize_content(response)
 
-    for key in ('output', ELITEA_RS, PRINTER_NODE_RS):
+    for key in ('output',):  # only 'output' is unambiguously "this node's result"
         normalized = normalize_content(response.get(key))
         if normalized.strip():
             return normalized
 
+    # Prefer last AI message from messages over state variables like elitea_response
     messages = response.get('messages') or []
     for message in reversed(messages):
         if isinstance(message, BaseMessage):
@@ -119,6 +120,12 @@ def extract_application_response_output(response: Any) -> str:
             normalized = normalize_content(message.get('content'))
             if normalized.strip():
                 return normalized
+
+    # Only fall back to elitea_response / PRINTER_NODE_RS if messages had nothing useful
+    for key in (ELITEA_RS, PRINTER_NODE_RS):
+        normalized = normalize_content(response.get(key))
+        if normalized.strip():
+            return normalized
 
     return ''
 
