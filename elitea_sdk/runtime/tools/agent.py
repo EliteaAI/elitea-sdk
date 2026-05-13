@@ -45,7 +45,7 @@ class AgentNode(BaseTool):
         else:
             task = 'Input from user: {last_message}'.format(last_message=dumps(last_message))
         try:
-            agent_input = {'task': task, 'chat_history': state.get('messages', [])[:] if 'messages' in self.input_variables else None}
+            agent_input = {'task': task}
             tool_result = self.tool.invoke(agent_input, config=config, kwargs=kwargs)
             dispatch_custom_event(
                 "on_tool_node", {

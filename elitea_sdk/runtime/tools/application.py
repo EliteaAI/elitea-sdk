@@ -3,43 +3,28 @@ import json
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from typing import Any, Type, Optional
 from pydantic import create_model, model_validator, BaseModel
 from pydantic.fields import FieldInfo
-from ..langchain.mixedAgentRenderes import convert_message_to_json
 from logging import getLogger
 
 logger = getLogger(__name__)
 
 applicationToolSchema = create_model(
     "applicatrionSchema", 
-    task = (str, FieldInfo(description="Task for Application")), 
-    chat_history = (Optional[list[BaseMessage]], FieldInfo(description="Chat History relevant for Application", default=[]))
+    task = (str, FieldInfo(description="Task for Application. Include all context needed by the application.")), 
+    chat_history = (Optional[list[BaseMessage]], FieldInfo(description="Deprecated and ignored. Put all application context in task.", default=[]))
 )
 
 
 def formulate_query(kwargs, is_subgraph=False):
-    chat_history = []
-    if kwargs.get('chat_history'):
-        if isinstance(kwargs.get('chat_history')[-1], BaseMessage):
-            chat_history = convert_message_to_json(kwargs.get('chat_history')[:])
-        elif isinstance(kwargs.get('chat_history')[-1], dict):
-            if all([True if message.get('role') and message.get('content') else False for message in kwargs.get('chat_history')]):
-                chat_history = kwargs.get('chat_history')[:]
-            else:
-                for each in kwargs.get('chat_history')[:]:
-                    chat_history.append(AIMessage(json.dumps(each)))
-        elif isinstance(kwargs.get('chat_history')[-1], str):
-            chat_history = []
-            for each in kwargs.get('chat_history')[:]:
-                chat_history.append(AIMessage(each))
     user_task = kwargs.get('task')
     if not user_task:
         raise ToolException("Task is required to invoke the application. "
                             "Check the provided input (some errors may happen on previous steps).")
-    result = {"input": [HumanMessage(content=user_task)] if not is_subgraph else user_task, "chat_history": chat_history}
+    result = {"input": [HumanMessage(content=user_task)] if not is_subgraph else user_task}
     for key, value in kwargs.items():
         if key not in ("task", "chat_history"):
             result[key] = value
@@ -172,7 +157,7 @@ class Application(BaseTool):
             tool_call_id = input.get("id")
             input = input["args"]
         schema_values = self.args_schema(**input).model_dump() if self.args_schema else {}
-        extras = {k: v for k, v in input.items() if k not in schema_values}
+        extras = {k: v for k, v in input.items() if k not in schema_values and k != 'chat_history'}
         all_kwargs = {**kwargs, **extras, **schema_values}
         logger.debug(f"[APP_INVOKE] Input keys: {list(input.keys()) if isinstance(input, dict) else 'not a dict'}")
         logger.debug(f"[APP_INVOKE] Schema values: {schema_values}")
@@ -183,8 +168,9 @@ class Application(BaseTool):
 
         # IMPORTANT: Pass extras through config's configurable dict.
         # BaseTool._parse_input() validates against args_schema and strips any keys
-        # not defined in the schema. Since args_schema only has 'task' and 'chat_history',
-        # extra variables (like pipeline state variables) get lost before reaching _run().
+        # not defined in the schema. Extra variables (like pipeline state variables)
+        # get lost before reaching _run() unless preserved here. chat_history is a
+        # deprecated reserved input and is intentionally not treated as an extra.
         # By storing them in config['configurable']['_application_extras'], they survive
         # the BaseTool pipeline and can be retrieved in _run().
         if extras:
@@ -283,6 +269,8 @@ class Application(BaseTool):
             # This ensures variables always have a value (either default or passed)
             merged_vars = dict(self.variable_defaults)  # Start with defaults
             for k, v in kwargs.items():
+                if k == 'chat_history':
+                    continue
                 # Only override if value is not None (allow explicit override with actual values)
                 if v is not None:
                     merged_vars[k] = v

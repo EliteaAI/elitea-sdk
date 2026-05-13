@@ -14,9 +14,11 @@ which survives the BaseTool validation pipeline.
 """
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import ToolException
 
 # Import the Application class and related functions
+from elitea_sdk.runtime.toolkits.application import build_dynamic_application_schema
 from elitea_sdk.runtime.tools.application import (
     Application,
     applicationToolSchema,
@@ -157,18 +159,32 @@ class TestApplicationVariablePassing:
         """Test that formulate_query includes extra variables in result."""
         kwargs = {
             'task': 'Do the thing',
-            'chat_history': [],
+            'chat_history': [HumanMessage(content='Previous context must stay parent-side')],
             'custom_var': 'custom_value',
             'another_var': 42,
         }
 
         result = formulate_query(kwargs, is_subgraph=False)
 
-        # Should have input, chat_history, and extras
+        # Should have input and extras, but no chat_history in the sub-agent payload.
         assert 'input' in result
-        assert 'chat_history' in result
+        assert 'chat_history' not in result
         assert result['custom_var'] == 'custom_value'
         assert result['another_var'] == 42
+
+    def test_formulate_query_omits_chat_history_for_sub_agent_payload(self):
+        """Test that chat_history is accepted but never forwarded to sub-agents."""
+        result = formulate_query(
+            {
+                'task': 'Summarize all required context from the task only',
+                'chat_history': [HumanMessage(content='Do not forward me')],
+            },
+            is_subgraph=False,
+        )
+
+        assert 'chat_history' not in result
+        assert len(result['input']) == 1
+        assert result['input'][0].content == 'Summarize all required context from the task only'
 
     def test_empty_string_parent_value_overrides_empty_child_default(self):
         """Test that non-None parent values (including empty string) override defaults."""
@@ -221,6 +237,17 @@ class TestApplicationSchemaHandling:
         # Only these two fields
         assert len(schema_fields) == 2
 
+    def test_dynamic_application_schema_does_not_expose_chat_history(self):
+        """Verify parent LLM-facing application schemas only expose task and variables."""
+        schema = build_dynamic_application_schema(
+            [{'name': 'region', 'description': 'Deployment region', 'value': 'us'}],
+            app_name='Child Agent',
+        )
+
+        assert 'task' in schema.model_fields
+        assert 'region' in schema.model_fields
+        assert 'chat_history' not in schema.model_fields
+
     def test_extras_calculation_in_invoke(self):
         """Test that extras correctly identifies non-schema fields."""
         mock_app = MagicMock()
@@ -249,6 +276,38 @@ class TestApplicationSchemaHandling:
         assert 'chat_history' not in extras
         assert extras['extra1'] == 'val1'
         assert extras['extra2'] == 'val2'
+
+    def test_dynamic_schema_ignores_legacy_chat_history_as_extra(self):
+        """Old callers may still pass chat_history; it must not become an app variable."""
+        mock_app = MagicMock()
+        mock_client = MagicMock()
+        dynamic_schema = build_dynamic_application_schema([], app_name='Child Agent')
+
+        app_tool = Application(
+            name='TestApp',
+            description='Test',
+            application=mock_app,
+            client=mock_client,
+            args_runnable={},
+            args_schema=dynamic_schema,
+        )
+
+        captured_config = {}
+
+        def capture_invoke(self_arg, input_dict, config=None, **kwargs):
+            captured_config['config'] = config
+            return 'mock result'
+
+        with patch.object(Application.__bases__[0], 'invoke', capture_invoke):
+            app_tool.invoke({
+                'task': 'Do task',
+                'chat_history': [HumanMessage(content='legacy history')],
+                'extra1': 'val1',
+            })
+
+        extras = captured_config['config']['configurable']['_application_extras']
+        assert 'chat_history' not in extras
+        assert extras['extra1'] == 'val1'
 
 
 class TestNestedPipelineScenario:
@@ -308,6 +367,28 @@ class TestNestedPipelineScenario:
 
         assert 'foo' in app_vars
         assert app_vars['foo']['value'] == 'parent_foo_value'  # NOT 'child_default_foo'
+
+    def test_child_application_payload_omits_chat_history(self):
+        """Sub-agent invocation payload uses task only, even when parent passes history."""
+        child_app = MagicMock()
+        child_app.invoke.return_value = {'output': 'child executed'}
+        child_tool = Application(
+            name='ChildAgent',
+            description='Child agent',
+            application=child_app,
+            client=None,
+            args_runnable={},
+        )
+
+        child_tool._run(
+            config={'configurable': {}, 'metadata': {}},
+            task='Complete this task with all context here',
+            chat_history=[HumanMessage(content='parent history')],
+        )
+
+        child_payload = child_app.invoke.call_args.args[0]
+        assert 'input' in child_payload
+        assert 'chat_history' not in child_payload
 
 
 class TestChildToParentVariablePropagation:
