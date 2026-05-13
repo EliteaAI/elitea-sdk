@@ -1967,34 +1967,51 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             uploaded_filename = upload_info['filename']
             mime_type = upload_info['mime_type']
             
-            # Get current page content
-            page = self.client.get_page_by_id(page_id, expand='body.storage,version')
-            current_body = page.get('body', {}).get('storage', {}).get('value', '')
-            
             # Create appropriate markup based on file type
             if mime_type.startswith('image/') or mime_type.startswith('video/'):
                 file_markup = self._get_confluence_image_markup(uploaded_filename, caption)
             else:
                 file_markup = self._get_confluence_file_link(uploaded_filename)
             
-            # Add the file markup to page content
-            if position == "prepend":
-                new_body = f"{file_markup}<p></p>{current_body}"
-            else:
-                new_body = f"{current_body}<p></p>{file_markup}"
-            
-            # Update the page
-            self.client.update_page(
-                page_id=page_id,
-                title=page['title'],
-                body=new_body,
-                parent_id=None,
-                type='page',
-                representation='storage',
-                minor_edit=False,
-                version_comment=f"Added file: {uploaded_filename}",
-                full_width=False
-            )
+            # Retry page update to handle version conflicts (StaleStateException)
+            # caused by the attachment upload modifying the page's HIBERNATEVERSION
+            max_retries = 3
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    # Re-fetch page content on each attempt to get the latest version
+                    page = self.client.get_page_by_id(page_id, expand='body.storage,version')
+                    current_body = page.get('body', {}).get('storage', {}).get('value', '')
+
+                    # Add the file markup to page content
+                    if position == "prepend":
+                        new_body = f"{file_markup}<p></p>{current_body}"
+                    else:
+                        new_body = f"{current_body}<p></p>{file_markup}"
+
+                    # Update the page
+                    self.client.update_page(
+                        page_id=page_id,
+                        title=page['title'],
+                        body=new_body,
+                        parent_id=None,
+                        type='page',
+                        representation='storage',
+                        minor_edit=False,
+                        version_comment=f"Added file: {uploaded_filename}",
+                        full_width=False
+                    )
+                    break  # Success
+                except HTTPError as e:
+                    status = getattr(e.response, 'status_code', None)
+                    if status == 409 and attempt < max_retries - 1:
+                        logger.warning(
+                            "Confluence version conflict on page %s (attempt %d/%d), retrying",
+                            page_id, attempt + 1, max_retries
+                        )
+                        last_error = e
+                        continue
+                    raise
             
             # Return success message
             page_url = self._build_page_url(page['_links']['webui'])
