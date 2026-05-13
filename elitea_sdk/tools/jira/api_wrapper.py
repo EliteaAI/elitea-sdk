@@ -2,17 +2,18 @@ import json
 from io import BytesIO
 import logging
 import re
+import requests
 import traceback
 from json import JSONDecodeError
 from traceback import format_exc
-from typing import List, Optional, Any, Dict, Generator, Literal
+from typing import List, Optional, Any, Dict, Generator, Literal, NoReturn
 import os
 
 from atlassian import Jira
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import Field, PrivateAttr, model_validator, create_model, SecretStr
-import requests
+from requests.exceptions import HTTPError
 
 from ..llm.img_utils import ImageDescriptionCache
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
@@ -23,6 +24,68 @@ from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
+
+class JiraClient(Jira):
+    """
+    Jira client with auth error handling at HTTP layer.
+
+    Overrides raise_for_status to intercept 404 errors and perform a pre-flight
+    check against /myself to distinguish authentication failures from real 404s.
+    This single override protects both standard calls and advanced_mode calls.
+    """
+
+    def _handle_404_auth_check(self, error: Exception) -> NoReturn:
+        """
+        On 404, call /myself to distinguish auth failure from real 404.
+
+        Args:
+            error: The exception that triggered this check
+
+        Raises:
+            ToolException: With clear auth error if /myself fails, otherwise re-raises original
+        """
+        try:
+            # Direct session access - avoid calling any Jira client methods 
+            # that might have their own error handling, which may cause infinite loops
+            # The session already has auth configured
+            response = self.session.get(
+                f"{self.url}/rest/api/2/myself",
+                headers={'Accept': 'application/json'},
+                timeout=10
+            )
+
+            if response.status_code >= 400:
+                raise ToolException(
+                    "Authentication failed: Unable to connect to Jira. "
+                    "Please verify your Jira toolkit credentials are valid and not expired."
+                ) from error
+
+        except ToolException:
+            raise
+        except HTTPError:
+            raise error
+        except Exception:
+            raise ToolException(
+                "Authentication failed: Unable to connect to Jira."
+            ) from error
+        raise error
+
+    def raise_for_status(self, response):
+        """
+        Override raise_for_status to handle auth errors centrally.
+
+        This catches 404s from both:
+        1. Standard API calls (advanced_mode=False) - called internally by request()
+        2. Generic requests (advanced_mode=True) - called explicitly
+        """
+        try:
+            super().raise_for_status(response)
+        except Exception as e:
+            status_code = getattr(response, 'status_code', None)
+            if status_code == 404:
+                self._handle_404_auth_check(e)
+            raise
 
 NoInput = create_model(
     "NoInput"
@@ -480,7 +543,6 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if not base_url or not isinstance(base_url, str) or not base_url.startswith('http'):
             return
 
-        from atlassian import Jira
         from ..client_registry import get_client_registry
 
         # Extract auth values (handle SecretStr) - safely check type first
@@ -506,13 +568,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             if token and is_cookie_token(token):
                 session = requests.Session()
                 session.cookies.update(parse_cookie_string(token))
-                return Jira(url=self.base_url, session=session, cloud=self.cloud,
+                return JiraClient(url=self.base_url, session=session, cloud=self.cloud,
                            verify_ssl=self.verify_ssl, api_version=self.api_version)
             elif token:
-                return Jira(url=self.base_url, token=token, cloud=self.cloud,
+                return JiraClient(url=self.base_url, token=token, cloud=self.cloud,
                            verify_ssl=self.verify_ssl, api_version=self.api_version)
             else:
-                return Jira(url=self.base_url, username=self.username, password=api_key,
+                return JiraClient(url=self.base_url, username=self.username, password=api_key,
                            cloud=self.cloud, verify_ssl=self.verify_ssl, api_version=self.api_version)
 
         # Get shared client from registry (or create new one)
@@ -1168,10 +1230,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 data=payload_params,
                 advanced_mode=True
             )
-            try:
-                self._client.raise_for_status(response)
-            except Exception as e:
-                return ToolException(str(e))
+            self._client.raise_for_status(response)
             response_text = response.text
         response_string = f"HTTP: {method} {relative_url} -> {response.status_code} {response.reason} {response_text}"
         logger.debug(response_string)
