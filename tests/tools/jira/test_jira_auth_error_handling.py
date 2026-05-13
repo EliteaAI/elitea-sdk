@@ -1,27 +1,16 @@
 """
 Tests for Jira toolkit authentication error handling.
 
-This module tests the fix for bug #3850 where Jira toolkit displayed ambiguous
-error message "Issue does not exist or you do not have permission to see it"
-for authentication failures instead of clear credential validation errors.
+This module tests the fix for bugs #3850 and #3267 where Jira toolkit displayed
+ambiguous error messages for authentication failures.
 
-The tests validate the JiraClient.raise_for_status override which performs a
-pre-flight check against /myself to distinguish auth failures from real 404s.
+The fix implements fail-fast credential validation at client construction time
+by calling /myself endpoint. This ensures invalid credentials are caught
+immediately rather than producing misleading "no documents to index" messages.
 """
 import pytest
 from unittest.mock import Mock
-from requests.exceptions import HTTPError
 from langchain_core.tools import ToolException
-
-
-def create_http_error(status_code: int, message: str) -> HTTPError:
-    """Create an HTTPError with a mock response."""
-    response = Mock()
-    response.status_code = status_code
-    response.text = message
-    error = HTTPError(message)
-    error.response = response
-    return error
 
 
 def create_mock_response(status_code: int, text: str = "") -> Mock:
@@ -29,23 +18,18 @@ def create_mock_response(status_code: int, text: str = "") -> Mock:
     response = Mock()
     response.status_code = status_code
     response.text = text
-    response.reason = "Not Found" if status_code == 404 else "OK"
     return response
 
 
 @pytest.fixture
 def jira_client(monkeypatch):
+    """Create a JiraClient with mocked session for testing."""
     from elitea_sdk.tools.jira.api_wrapper import JiraClient
     from atlassian import Jira
 
     client = object.__new__(JiraClient)
 
-    def mock_parent_raise_for_status(response):
-        if response.status_code >= 400:
-            raise create_http_error(response.status_code, response.text)
-
-    monkeypatch.setattr(Jira, 'raise_for_status', lambda self, response: mock_parent_raise_for_status(response))
-
+    # Mock the session property
     mock_session = Mock()
     monkeypatch.setattr(Jira, 'session', mock_session, raising=False)
 
@@ -54,17 +38,15 @@ def jira_client(monkeypatch):
     return client
 
 
-class TestJiraClientAuthErrorHandling:
-    def test_ambiguous_404_with_invalid_auth_returns_auth_error(self, jira_client):
-        """Bug #3850: ambiguous 404 + invalid credentials = clear auth error."""
+class TestJiraClientCredentialValidation:
+    """Test fail-fast credential validation at client construction."""
+
+    def test_invalid_credentials_401_raises_auth_error(self, jira_client):
+        """Bug #3850/#3267: Invalid credentials should fail fast with clear error."""
         jira_client.session.get.return_value = create_mock_response(401, "Unauthorized")
 
-        response = create_mock_response(
-            404, "Issue does not exist or you do not have permission to see it."
-        )
-
-        with pytest.raises(ToolException, match="Authentication failed"):
-            jira_client.raise_for_status(response)
+        with pytest.raises(ToolException, match="Authentication failed: Invalid username or API key."):
+            jira_client._validate_credentials()
 
         jira_client.session.get.assert_called_once()
         call_args = jira_client.session.get.call_args
@@ -72,81 +54,66 @@ class TestJiraClientAuthErrorHandling:
         assert call_args[1]['headers'] == {'Accept': 'application/json'}
         assert call_args[1]['timeout'] == 10
 
-    def test_ambiguous_404_with_valid_auth_returns_original_error(self, jira_client):
-        """Ambiguous 404 + valid credentials = pass through original error."""
+    def test_forbidden_403_raises_permission_error(self, jira_client):
+        """403 Forbidden should raise clear permission error."""
+        jira_client.session.get.return_value = create_mock_response(403, "Forbidden")
+
+        with pytest.raises(ToolException, match="Authentication failed: Access forbidden."):
+            jira_client._validate_credentials()
+
+    def test_other_4xx_errors_raise_generic_auth_error(self, jira_client):
+        """Other 4xx errors should raise generic auth error with status code."""
+        jira_client.session.get.return_value = create_mock_response(404, "Not Found")
+
+        with pytest.raises(ToolException, match=r"Authentication failed: Unable to connect to Jira \(HTTP 404\)"):
+            jira_client._validate_credentials()
+
+    def test_server_error_5xx_raises_auth_error(self, jira_client):
+        """5xx errors should also raise auth error (can't validate)."""
+        jira_client.session.get.return_value = create_mock_response(500, "Internal Server Error")
+
+        with pytest.raises(ToolException, match=r"Authentication failed: Unable to connect to Jira \(HTTP 500\)"):
+            jira_client._validate_credentials()
+
+    def test_valid_credentials_200_passes_silently(self, jira_client):
+        """Valid credentials (200 OK) should not raise any exception."""
         jira_client.session.get.return_value = create_mock_response(200, '{"name": "testuser"}')
 
-        response = create_mock_response(
-            404, "Issue does not exist or you do not have permission to see it."
-        )
-
-        with pytest.raises(HTTPError, match="Issue does not exist"):
-            jira_client.raise_for_status(response)
+        jira_client._validate_credentials()
 
         jira_client.session.get.assert_called_once()
 
-    def test_non_404_errors_pass_through_unchanged(self, jira_client):
-        """Non-404 errors pass through without auth check."""
-        response = create_mock_response(500, "Internal Server Error")
 
-        with pytest.raises(HTTPError, match="Internal Server Error"):
-            jira_client.raise_for_status(response)
+class TestJiraClientInitialization:
+    """Test that validation is called during client initialization."""
 
-        jira_client.session.get.assert_not_called()
+    def test_init_calls_validate_credentials(self, monkeypatch):
+        """JiraClient.__init__ should call _validate_credentials."""
+        from elitea_sdk.tools.jira.api_wrapper import JiraClient
+        from atlassian import Jira
 
-    def test_200_response_does_not_raise(self, jira_client):
-        """Successful responses don't raise exceptions."""
-        response = create_mock_response(200, "OK")
+        validation_called = []
 
-        jira_client.raise_for_status(response)
+        def mock_validate(self):
+            validation_called.append(True)
 
-        jira_client.session.get.assert_not_called()
+        monkeypatch.setattr(Jira, '__init__', lambda self, *args, **kwargs: None)
+        monkeypatch.setattr(JiraClient, '_validate_credentials', mock_validate)
 
-    def test_session_get_network_error_returns_auth_error(self, jira_client):
-        """If session.get() raises network error, treat as auth failure."""
-        jira_client.session.get.side_effect = ConnectionError("Network unreachable")
+        _ = JiraClient(url="https://test.atlassian.net")
 
-        response = create_mock_response(404, "Issue does not exist or you do not have permission")
+        assert len(validation_called) == 1, "_validate_credentials should be called once during __init__"
 
-        with pytest.raises(ToolException, match="Authentication failed"):
-            jira_client.raise_for_status(response)
+    def test_invalid_credentials_prevent_client_creation(self, monkeypatch):
+        """Invalid credentials should prevent client from being usable."""
+        from elitea_sdk.tools.jira.api_wrapper import JiraClient
+        from atlassian import Jira
 
-    def test_no_recursion_possible(self, jira_client):
-        """Verify that auth check cannot recurse - uses session directly."""
-        jira_client.session.get.return_value = create_mock_response(404, "/myself not found")
+        mock_session = Mock()
+        mock_session.get.return_value = create_mock_response(401, "Unauthorized")
 
-        response = create_mock_response(404, "Issue does not exist")
-
-        with pytest.raises(ToolException, match="Authentication failed"):
-            jira_client.raise_for_status(response)
-
-        assert jira_client.session.get.call_count == 1
-
-
-class TestJiraClientAdvancedMode:
-    """Test that both standard and advanced_mode code paths are protected."""
-
-    def test_advanced_mode_true_calls_raise_for_status_explicitly(self, jira_client):
-        """
-        When advanced_mode=True, request() returns response without raising.
-        execute_generic_rq then calls raise_for_status() explicitly.
-        This test verifies our override catches it.
-        """
-        jira_client.session.get.return_value = create_mock_response(401, "Unauthorized")
-
-        response = create_mock_response(404, "Issue does not exist or you do not have permission")
+        monkeypatch.setattr(Jira, '__init__', lambda self, *args, **kwargs: None)
+        monkeypatch.setattr(Jira, 'session', mock_session, raising=False)
 
         with pytest.raises(ToolException, match="Authentication failed"):
-            jira_client.raise_for_status(response)
-
-    def test_standard_mode_false_raise_for_status_called_internally(self, jira_client):
-        """
-        When advanced_mode=False, request() internally calls raise_for_status().
-        This test verifies our override catches it in that path too.
-        """
-        jira_client.session.get.return_value = create_mock_response(200, '{"name": "testuser"}')
-
-        response = create_mock_response(404, "Issue does not exist or you do not have permission")
-
-        with pytest.raises(HTTPError):
-            jira_client.raise_for_status(response)
+            JiraClient(url="https://test.atlassian.net")
