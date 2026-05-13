@@ -1976,7 +1976,6 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             # Retry page update to handle version conflicts (StaleStateException)
             # caused by the attachment upload modifying the page's HIBERNATEVERSION
             max_retries = 3
-            last_error = None
             for attempt in range(max_retries):
                 try:
                     # Re-fetch page content on each attempt to get the latest version
@@ -2009,7 +2008,6 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                             "Confluence version conflict on page %s (attempt %d/%d), retrying",
                             page_id, attempt + 1, max_retries
                         )
-                        last_error = e
                         continue
                     raise
             
