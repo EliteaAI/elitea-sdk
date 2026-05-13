@@ -6,7 +6,7 @@ import requests
 import traceback
 from json import JSONDecodeError
 from traceback import format_exc
-from typing import List, Optional, Any, Dict, Generator, Literal, NoReturn
+from typing import List, Optional, Any, Dict, Generator, Literal
 import os
 
 from atlassian import Jira
@@ -28,64 +28,56 @@ logger = logging.getLogger(__name__)
 
 class JiraClient(Jira):
     """
-    Jira client with auth error handling at HTTP layer.
+    Jira client with fail-fast credential validation.
 
-    Overrides raise_for_status to intercept 404 errors and perform a pre-flight
-    check against /myself to distinguish authentication failures from real 404s.
-    This single override protects both standard calls and advanced_mode calls.
+    Validates credentials at initialization by calling /myself endpoint.
+    This ensures invalid credentials fail fast at client construction.
+
+    Jira's API can be confusing when credentials are invalid:
+    - search will return 200 OK with empty results for unauthenticated requests.
+    - get issue returns 404 for unauthenticated access
     """
 
-    def _handle_404_auth_check(self, error: Exception) -> NoReturn:
-        """
-        On 404, call /myself to distinguish auth failure from real 404.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validate_credentials()
 
-        Args:
-            error: The exception that triggered this check
+    def _validate_credentials(self):
+        """
+        Validate credentials by calling /myself endpoint.
+
+        This is called at client initialization to ensure credentials are valid
+        before any operations. Jira's search and other endpoints may return
+        200 OK with empty results for invalid credentials (anonymous access),
+        so we validate proactively.
 
         Raises:
-            ToolException: With clear auth error if /myself fails, otherwise re-raises original
+            ToolException: If credentials are invalid or validation fails
         """
         try:
-            # Direct session access - avoid calling any Jira client methods 
-            # that might have their own error handling, which may cause infinite loops
-            # The session already has auth configured
             response = self.session.get(
                 f"{self.url}/rest/api/2/myself",
                 headers={'Accept': 'application/json'},
                 timeout=10
             )
-
-            if response.status_code >= 400:
+            if response.status_code == 401:
                 raise ToolException(
-                    "Authentication failed: Unable to connect to Jira. "
-                    "Please verify your Jira toolkit credentials are valid and not expired."
-                ) from error
-
+                    "Authentication failed: Invalid username or API key."
+                )
+            elif response.status_code == 403:
+                raise ToolException(
+                    "Authentication failed: Access forbidden."
+                )
+            elif response.status_code >= 400:
+                raise ToolException(
+                    f"Authentication failed: Unable to connect to Jira (HTTP {response.status_code})."
+                )
         except ToolException:
             raise
-        except HTTPError:
-            raise error
-        except Exception:
-            raise ToolException(
-                "Authentication failed: Unable to connect to Jira."
-            ) from error
-        raise error
-
-    def raise_for_status(self, response):
-        """
-        Override raise_for_status to handle auth errors centrally.
-
-        This catches 404s from both:
-        1. Standard API calls (advanced_mode=False) - called internally by request()
-        2. Generic requests (advanced_mode=True) - called explicitly
-        """
-        try:
-            super().raise_for_status(response)
         except Exception as e:
-            status_code = getattr(response, 'status_code', None)
-            if status_code == 404:
-                self._handle_404_auth_check(e)
-            raise
+            raise ToolException(
+                f"Authentication failed: {str(e)}"
+            ) from e
 
 NoInput = create_model(
     "NoInput"

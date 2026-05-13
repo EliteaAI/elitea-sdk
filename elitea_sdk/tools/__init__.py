@@ -287,6 +287,8 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
                 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
                 if isinstance(e, McpAuthorizationRequired):
                     raise
+                if isinstance(e, ToolException):
+                    raise
                 logger.error(f"Error getting tools for {tool_type}: {e}")
                 raise ToolException(f"Error getting tools for {tool_type}: {e}")
         elif settings.get("module"):
