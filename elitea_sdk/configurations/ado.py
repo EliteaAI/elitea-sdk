@@ -1,6 +1,5 @@
 import re
 from typing import Optional
-from urllib.parse import quote
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -19,7 +18,6 @@ class AdoConfiguration(BaseModel):
         }
     )
     organization_url: str = Field(description="Base API URL")
-    project: str = Field(description="ADO project")
     token: Optional[SecretStr] = Field(description="ADO Token")
 
     @staticmethod
@@ -28,7 +26,7 @@ class AdoConfiguration(BaseModel):
         Test the connection to Azure DevOps API.
 
         Args:
-            settings: Dictionary containing 'organization_url', 'project', and optionally 'token'
+            settings: Dictionary containing 'organization_url' and optionally 'token'
 
         Returns:
             None if connection is successful, error message string otherwise
@@ -53,20 +51,6 @@ class AdoConfiguration(BaseModel):
         # Remove trailing slash for consistency
         organization_url = organization_url.rstrip("/")
 
-        project = settings.get("project")
-        if project is None or project == "":
-            if project == "":
-                return "Project cannot be empty"
-            return "Project is required"
-
-        # Validate project format
-        if not isinstance(project, str):
-            return "Project must be a string"
-
-        project = project.strip()
-        if not project:
-            return "Project cannot be empty"
-
         token = settings.get("token")
 
         # Extract secret value if it's a SecretStr
@@ -76,12 +60,6 @@ class AdoConfiguration(BaseModel):
         # Validate token if provided
         if token is not None and (not token or not token.strip()):
             return "Token cannot be empty if provided"
-
-        # NOTE on verification strategy:
-        # - Project endpoints can work anonymously for public projects.
-        #   That makes them a weak signal for detecting a bad/expired token.
-        # - If a token is provided, first validate it against a profile endpoint
-        #   that requires authentication, then check project access.
 
         # Strictly require a canonical organization URL so we can build reliable API URLs.
         # Supported formats:
@@ -105,8 +83,6 @@ class AdoConfiguration(BaseModel):
                 "(recommended) or 'https://<org>.visualstudio.com'."
             )
 
-        project_encoded = quote(project, safe="")
-        project_url = f"{organization_url}/_apis/projects/{project_encoded}?api-version=7.0"
         # Auth-required endpoint to validate PAT (works regardless of project visibility)
         if org_url_kind == 'dev.azure.com':
             profile_url = f"https://vssps.dev.azure.com/{org_name}/_apis/profile/profiles/me?api-version=7.1-preview.3"
@@ -115,16 +91,15 @@ class AdoConfiguration(BaseModel):
             profile_url = f"https://{org_name}.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1-preview.3"
 
         try:
-            headers = {}
             if token:
                 # Use Basic Auth with PAT token (username can be empty)
                 from requests.auth import HTTPBasicAuth
                 auth = HTTPBasicAuth("", token)
 
-                # 1) Validate token first (strong signal)
+                # Validate token against profile endpoint
                 profile_resp = requests.get(profile_url, auth=auth, timeout=10)
                 if profile_resp.status_code == 200:
-                    pass
+                    return None  # Connection successful
                 elif profile_resp.status_code == 401:
                     return "Invalid or expired token (PAT). Please generate a new token and try again."
                 elif profile_resp.status_code == 403:
@@ -133,26 +108,19 @@ class AdoConfiguration(BaseModel):
                     return "Organization not found. Verify the Organization URL."
                 else:
                     return f"Token validation failed (HTTP {profile_resp.status_code})."
-
-                # 2) Validate project access
-                response = requests.get(project_url, auth=auth, timeout=10)
             else:
-                # Try without authentication (works for public projects)
-                response = requests.get(project_url, headers=headers, timeout=10)
-
-            if response.status_code == 200:
-                return None  # Connection successful
-            elif response.status_code == 401:
-                if token:
-                    return "Not authorized. Token may be invalid for this organization or expired."
+                # Without token, just verify the organization URL is reachable
+                # Try to access the projects list endpoint (may work for public orgs)
+                projects_url = f"{organization_url}/_apis/projects?api-version=7.0&$top=1"
+                response = requests.get(projects_url, timeout=10)
+                if response.status_code == 200:
+                    return None  # Connection successful
+                elif response.status_code == 401:
+                    return "Authentication required - please provide a token"
+                elif response.status_code == 404:
+                    return "Organization not found. Verify the Organization URL."
                 else:
-                    return "Authentication required - project may be private"
-            elif response.status_code == 403:
-                return "Access forbidden - token may lack required permissions for this project"
-            elif response.status_code == 404:
-                return f"Project '{project}' not found or not accessible. Check project name and organization URL."
-            else:
-                return f"Connection failed (HTTP {response.status_code})."
+                    return f"Connection failed (HTTP {response.status_code})."
 
         except requests.exceptions.Timeout:
             return "Connection timeout - Azure DevOps did not respond within 10 seconds"

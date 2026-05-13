@@ -21,6 +21,7 @@ def get_toolkit(tool) -> BaseToolkit:
     return AzureDevOpsReposToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
+        project=tool['settings']['project'],
         repository_id=tool['settings']['repository_id'],
         limit=tool['settings'].get('limit', 5),
         base_branch=tool['settings'].get('base_branch', "main"),
@@ -46,6 +47,7 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             name,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), default=None,
                                                        json_schema_extra={'configuration_types': ['ado']})),
+            project=(str, Field(description="ADO project name")),
             repository_id=(str, Field(description="ADO repository ID or name")),
             base_branch=(Optional[str], Field(default="main", title="Base branch", description="ADO base branch (e.g., main)")),
             active_branch=(Optional[str], Field(default="main", title="Active branch", description="ADO active branch (e.g., main)")),
@@ -85,9 +87,15 @@ class AzureDevOpsReposToolkit(BaseToolkit):
         @check_connection_response
         def check_connection(self):
             ado_config = self.ado_configuration
+            if not ado_config:
+                raise ValueError("ADO configuration is required")
+            project = self.project
+            if not project:
+                raise ValueError("ADO project is required")
+            token = ado_config.token.get_secret_value() if ado_config.token else ""
             response = requests.get(
-                f'{ado_config.organization_url}/{ado_config.project}/_apis/git/repositories/{self.repository_id}?api-version=7.0',
-                headers = {'Authorization': f'Bearer {ado_config.token.get_secret_value() if ado_config.token else ""}'},
+                f'{ado_config.organization_url}/{project}/_apis/git/repositories/{self.repository_id}?api-version=7.0',
+                headers={'Authorization': f'Bearer {token}'},
                 timeout=5
             )
             return response
@@ -107,7 +115,6 @@ class AzureDevOpsReposToolkit(BaseToolkit):
 
         wrapper_payload = {
             **kwargs,
-            # Extract ADO configuration fields
             **kwargs['ado_configuration'],
             **(kwargs.get('pgvector_configuration') or {}),
         }

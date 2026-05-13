@@ -23,7 +23,6 @@ setup:
       data:
         token: ${ADO_TOKEN}
         organization_url: ${ADO_ORGANIZATION_URL}
-        project: ${ADO_PROJECT}
 
   - name: Create ADO Repos Toolkit
     type: toolkit
