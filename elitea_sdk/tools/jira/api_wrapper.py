@@ -2,6 +2,7 @@ import json
 from io import BytesIO
 import logging
 import re
+import requests
 import traceback
 from json import JSONDecodeError
 from traceback import format_exc
@@ -12,7 +13,7 @@ from atlassian import Jira
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import Field, PrivateAttr, model_validator, create_model, SecretStr
-import requests
+from requests.exceptions import HTTPError
 
 from ..llm.img_utils import ImageDescriptionCache
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
@@ -29,9 +30,9 @@ class JiraClient(Jira):
     """
     Jira client with auth error handling at HTTP layer.
 
-    Overrides the base request method to intercept 404 errors and perform
-    a pre-flight check against /myself to distinguish authentication failures
-    from real 404s.
+    Overrides raise_for_status to intercept 404 errors and perform a pre-flight
+    check against /myself to distinguish authentication failures from real 404s.
+    This single override protects both standard calls and advanced_mode calls.
     """
 
     def _handle_404_auth_check(self, error: Exception) -> NoReturn:
@@ -45,29 +46,43 @@ class JiraClient(Jira):
             ToolException: With clear auth error if /myself fails, otherwise re-raises original
         """
         try:
-            super().myself()  # Auth works - it's a real 404
+            # Direct session access - avoid calling any Jira client methods 
+            # that might have their own error handling, which may cause infinite loops
+            # The session already has auth configured
+            response = self.session.get(
+                f"{self.url}/rest/api/2/myself",
+                headers={'Accept': 'application/json'},
+                timeout=10
+            )
+
+            if response.status_code >= 400:
+                raise ToolException(
+                    "Authentication failed: Unable to connect to Jira. "
+                    "Please verify your Jira toolkit credentials are valid and not expired."
+                ) from error
+
         except ToolException:
-            # Re-raise ToolException from myself()
             raise
+        except HTTPError:
+            raise error
         except Exception:
-            # Auth check failed (401, 403, etc.)
             raise ToolException(
-                "Authentication failed: Unable to connect to Jira. "
-                "Please verify your Jira toolkit credentials are valid and not expired."
+                "Authentication failed: Unable to connect to Jira."
             ) from error
         raise error
 
-    def request(self, method, path, *args, **kwargs):
+    def raise_for_status(self, response):
         """
-        Override request to handle auth errors centrally at HTTP layer.
+        Override raise_for_status to handle auth errors centrally.
 
-        All Jira API calls go through this method, so this single override
-        protects the entire toolkit from ambiguous 404 auth errors.
+        This catches 404s from both:
+        1. Standard API calls (advanced_mode=False) - called internally by request()
+        2. Generic requests (advanced_mode=True) - called explicitly
         """
         try:
-            return super().request(method, path, *args, **kwargs)
+            super().raise_for_status(response)
         except Exception as e:
-            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            status_code = getattr(response, 'status_code', None)
             if status_code == 404:
                 self._handle_404_auth_check(e)
             raise
