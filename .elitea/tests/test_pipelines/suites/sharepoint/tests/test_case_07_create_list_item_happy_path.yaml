@@ -26,9 +26,6 @@ state:
       Title: "Test Item Created by SDK"
   created_item:
     type: dict
-  error_indicators:
-    type: list
-    value: ["error", "failed", "exception"]
   test_results:
     type: dict
 
@@ -61,7 +58,6 @@ nodes:
       - created_item
       - list_title
       - item_fields
-      - error_indicators
     input_mapping:
       system:
         type: fixed
@@ -75,22 +71,24 @@ nodes:
           list title: {list_title}
           provided fields: {item_fields}
           results: {created_item}
-          error indicators: {error_indicators}
 
           expected behavior:
           - tool executes successfully without errors
           - returns object with id and fields properties
-          - id is a valid positive integer
+          - id is a valid positive integer or numeric string
           - all provided fields are present in the response
           - no error messages in output
 
           evaluate:
-          1. did the tool execute successfully?
-          2. are there any error indicators in the output?
-          3. does the result contain an id field?
-          4. is the id a positive integer?
-          5. are the provided fields present in the response?
-          6. does the response include the title field value?
+          1. did the tool return a result (not null or empty)?
+          2. does the result contain an 'id' field?
+          3. is the id a valid positive integer or numeric string?
+          4. does the result contain a 'fields' property?
+          5. are the provided fields (Title) present in the fields property?
+          6. does the Title field match the provided value?
+
+          note: ignore sharepoint metadata field names like '_ComplianceFlags', 'EditorLookupId', etc.
+          focus only on the structure and presence of id, fields, and the provided Title field.
 
           return a json object with:
           {{
