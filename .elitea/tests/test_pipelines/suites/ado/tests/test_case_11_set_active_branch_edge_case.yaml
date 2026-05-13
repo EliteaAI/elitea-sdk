@@ -161,9 +161,9 @@ nodes:
           1. active_switch_success: Switch to ActiveBranchTest succeeded
           2. active_read_success: Read file on ActiveBranchTest returned content (file exists)
           3. elitea_switch_success: Switch to EliteaTest succeeded
-          4. elitea_read_expected_fail: Read file on EliteaTest failed (file doesn't exist - this is expected). A processed error message (containing "contact support" or "Tool execution error!") is a valid expected failure.
+          4. elitea_read_expected_fail: Read file on EliteaTest failed (file doesn't exist - this is expected)
           5. main_switch_success: Switch to main succeeded
-          6. no_unexpected_errors: No unexpected errors in any operation. Processed error messages from SDK (containing "Tool execution error!" or "contact support") are NOT unexpected errors - they are properly handled failures.
+          6. no_unexpected_errors: No unexpected errors in any operation (Note: Processed error messages with 'Tool execution error!' prefix are expected for missing files)
 
           Return a JSON object with structure:
           {{
