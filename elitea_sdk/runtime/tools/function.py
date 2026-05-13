@@ -290,19 +290,26 @@ alita_client = elitea_client
                             "content": safe_serialize(tool_result)
                         }]
                     }
-                # Propagate all state variables from child (excluding internal keys)
+                # Propagate all state variables from child (excluding internal keys).
+                # For react agents (is_subgraph=False): also exclude declared output_variables
+                # from propagation — they contain stale parent-state values that were injected
+                # into the child at invocation time, and must be set from the agent's last AI
+                # message instead.
+                # For pipelines (is_subgraph=True): do NOT exclude output_variables — the child
+                # pipeline may have explicitly computed and set them.
+                is_pipeline = hasattr(self.tool, 'is_subgraph') and self.tool.is_subgraph
                 excluded_keys = {'messages', 'output', 'input', 'chat_history'}
+                if not is_pipeline:
+                    # React agent: stale parent-state values for output vars must not leak back
+                    excluded_keys.update(self.output_variables or [])
                 for key, value in tool_result.items():
                     if key not in excluded_keys:
                         result_dict[key] = value
                         logger.debug(f"[FUNC_TOOL] Propagating '{key}' from nested app to parent state")
 
-                # For agent nodes (react agents), the child response only contains 'messages'
-                # and does not expose custom state variables. If this FunctionTool has declared
-                # output_variables (set by the pipeline designer), map the agent's text output
-                # to any variable that was not already populated by child-state propagation above.
+                # Map the agent/pipeline output to declared output_variables.
                 if self.output_variables:
-                    # Extract the agent's text content from the messages we already built
+                    # Extract the agent's text content from the messages already built
                     agent_output_content = None
                     messages = result_dict.get('messages', [])
                     if messages:
@@ -315,7 +322,12 @@ alita_client = elitea_client
                     for var in self.output_variables:
                         if var == 'messages':
                             continue
-                        if var not in result_dict or result_dict.get(var) is None:
+                        if is_pipeline and var in result_dict and result_dict[var] is not None:
+                            # Child pipeline explicitly set this variable — respect it
+                            logger.debug(f"[FUNC_TOOL] Keeping child pipeline value for output_variable '{var}'")
+                        else:
+                            # React agent (or pipeline that didn't set the var) —
+                            # use the agent's last AI message as the output
                             result_dict[var] = agent_output_content
                             logger.debug(
                                 f"[FUNC_TOOL] Mapping agent text output to output_variable '{var}'"
