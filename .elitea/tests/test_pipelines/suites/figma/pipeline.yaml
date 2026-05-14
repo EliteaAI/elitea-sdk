@@ -93,11 +93,6 @@ execution:
     # Tool: get_project_files
     - test_case_15_*.yaml  # FIG15 - Get Project Files (Happy Path)
 
-    # Tool: analyze_file
-    - test_case_16_*.yaml  # FIG16 - Analyze File (Basic)
-    - test_case_17_*.yaml  # FIG17 - Analyze File (With Filters and Options)
-    - test_case_18_*.yaml  # FIG18 - Analyze File (By URL)
-
   # Variables to substitute in test YAML files
   substitutions:
     FIGMA_TOOLKIT_ID: ${FIGMA_TOOLKIT_ID}

@@ -1795,13 +1795,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 "args_schema": ArgsSchema.File.value,
                 "ref": self.get_file,
             },
-            # TODO disabled until new requirements
-            # {
-            #     "name": "get_file_summary",
-            #     "description": self.get_file_summary.__doc__,
-            #     "args_schema": ArgsSchema.FileSummary.value,
-            #     "ref": self.get_file_summary,
-            # },
             {
                 "name": "get_file_versions",
                 "description": self.get_file_versions.__doc__,
@@ -1838,20 +1831,4 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 "args_schema": ArgsSchema.ProjectFiles.value,
                 "ref": self.get_project_files,
             },
-            # TOON Format Tools (Token-Optimized)
-            # Primary unified tool with configurable detail levels
-            {
-                "name": "analyze_file",
-                "description": self.analyze_file.__doc__,
-                "args_schema": AnalyzeFileSchema,
-                "ref": self.analyze_file,
-            },
-            # TODO disabled until new requirements
-            # # Targeted drill-down for specific frames (more efficient than level 3 for 2-3 frames)
-            # {
-            #     "name": "get_frame_detail_toon",
-            #     "description": self.get_frame_detail_toon.__doc__,
-            #     "args_schema": FrameDetailTOONSchema,
-            #     "ref": self.get_frame_detail_toon,
-            # },
         ]
