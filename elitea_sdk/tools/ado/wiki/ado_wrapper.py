@@ -482,6 +482,11 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Unexpected error during wiki page retrieval: {str(e)}")
 
     def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None):
+        if image_description_prompt and self.llm is None:
+            raise ToolException(
+                "Cannot generate image descriptions: image_description_prompt was provided but no LLM is configured. "
+                "Either initialize the toolkit with an LLM or omit image_description_prompt."
+            )
 
         image_pattern = r"!\[(.*?)\]\((.*?)\)"
         matches = re.findall(image_pattern, page_content)
