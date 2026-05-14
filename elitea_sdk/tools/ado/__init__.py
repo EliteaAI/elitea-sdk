@@ -1,3 +1,11 @@
+from os import environ
+
+# The Azure DevOps SDK computes its file cache during import. Container images
+# running as non-root may have an unwritable HOME, so set a writable cache before
+# importing any ADO toolkit modules.
+if not environ.get("AZURE_DEVOPS_CACHE_DIR", None):
+    environ["AZURE_DEVOPS_CACHE_DIR"] = "/tmp/.azure-devops"
+
 from .test_plan import AzureDevOpsPlansToolkit
 from .wiki import AzureDevOpsWikiToolkit
 from .work_item import AzureDevOpsWorkItemsToolkit
