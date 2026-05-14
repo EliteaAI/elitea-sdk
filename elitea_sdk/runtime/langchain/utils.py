@@ -154,7 +154,7 @@ def _find_json_bounds(json_string: str) -> Tuple[int, int] | Tuple[None, None]:
     return None, None
 
 
-def extract_json_content(text: str):
+def extract_json_content(text: str) -> dict | list:
     """Extract JSON (object or array) from text that may have markdown fences.
 
     Handles:
@@ -162,7 +162,7 @@ def extract_json_content(text: str):
     - Plain JSON objects and arrays
     - Text with embedded JSON
     """
-    fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
+    fence_match = re.search(r'```(?:json)?\s*\n(.*?)\n\s*```', text, re.DOTALL)
     clean = fence_match.group(1).strip() if fence_match else text.strip()
 
     try:
@@ -403,7 +403,7 @@ def parse_pydantic_type(type_name: str):
         "float": float,
         "bool": bool,
         "dict": dict[str, Any],
-        "list": list[dict[str, Any]],
+        "list": list[Any],
         "any": JsonValue,
     }
     if t in base:

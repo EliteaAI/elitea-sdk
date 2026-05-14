@@ -162,15 +162,16 @@ class TestExtractJsonContentErrors:
 class TestParsePydanticType:
     """Verify parse_pydantic_type produces Anthropic & OpenAI compatible schemas."""
 
-    def test_list_type_produces_array_of_objects(self):
+    def test_list_type_accepts_any_elements(self):
         from typing import Any
         t = parse_pydantic_type("list")
-        assert t == list[dict[str, Any]]
-        # Create a model and check schema
+        assert t == list[Any]
+        # Schema must not have broken $defs (the Anthropic rejection)
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
         schema = model.model_json_schema()
-        items_schema = schema["properties"]["items"]["items"]
-        assert items_schema["type"] == "object"
+        assert "$defs" not in schema
+        # items: {} means any element type (valid JSON Schema)
+        assert schema["properties"]["items"]["items"] == {}
 
     def test_dict_type_produces_object(self):
         t = parse_pydantic_type("dict")
@@ -189,12 +190,19 @@ class TestParsePydanticType:
         for def_name, def_schema in defs.items():
             assert def_schema, f"Empty schema definition: {def_name}"
 
-    def test_list_accepts_dict_data(self):
-        """list type must accept list of dicts at runtime."""
+    def test_list_accepts_any_data(self):
+        """list type must accept dicts, strings, ints — any JSON value."""
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
+        # Dicts
         instance = model(items=[{"key": "val"}, {"another": 123}])
         assert len(instance.items) == 2
         assert instance.items[0] == {"key": "val"}
+        # Strings
+        instance = model(items=["a", "b", "c"])
+        assert instance.items == ["a", "b", "c"]
+        # Mixed
+        instance = model(items=[1, "two", {"three": 3}])
+        assert len(instance.items) == 3
 
     def test_str_int_float_bool_unchanged(self):
         assert parse_pydantic_type("str") is str
@@ -241,16 +249,14 @@ class TestCreatePydanticModel:
         assert getattr(instance, ELITEA_RS) == ""
 
     def test_model_schema_for_anthropic(self):
-        """Schema must be accepted by Anthropic's json_schema method."""
+        """Schema must be accepted by Anthropic (no empty $defs)."""
         model = create_pydantic_model("LLMOutput", {
             "items": {"type": "list", "description": "Result items"},
         })
         schema = model.model_json_schema()
-        # Must have properties with items as array of objects
+        # Must have properties with items as array
         assert schema["properties"]["items"]["type"] == "array"
-        items_def = schema["properties"]["items"]["items"]
-        assert items_def["type"] == "object"
-        # No empty definitions
-        assert not any(
-            v == {} for v in schema.get("$defs", {}).values()
+        # No empty $defs (this is what Anthropic rejected)
+        assert "$defs" not in schema or not any(
+            v == {} for v in schema["$defs"].values()
         )

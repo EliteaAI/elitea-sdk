@@ -5,13 +5,14 @@ import logging
 from traceback import format_exc
 from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.callbacks import dispatch_custom_event
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt as _langgraph_interrupt
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 try:
     from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD as _SCRATCHPAD_KEY
@@ -218,7 +219,7 @@ class LLMNode(BaseTool):
             try:
                 completion = llm.invoke(messages, config=config)
                 return completion, initial_completion, messages
-            except (ValueError, Exception) as e:
+            except (ValueError, ValidationError, OutputParserException) as e:
                 # Structured output call failed — try extracting JSON from initial response
                 completion = self._extract_structured_from_content(initial_completion, struct_model)
                 if completion is not None:
@@ -400,7 +401,7 @@ class LLMNode(BaseTool):
                     parsed = extract_json_content(content)
                     completion = self._map_parsed_json_to_model(parsed, struct_model)
                     return completion
-                except (ValueError, Exception) as parse_error:
+                except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
                     logger.warning(f"Could not parse extracted JSON: {parse_error}")
                     return self._create_fallback_completion(content, struct_model)
 
