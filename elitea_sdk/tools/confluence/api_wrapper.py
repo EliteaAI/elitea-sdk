@@ -750,11 +750,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return self._process_search(cql, skip_images)
 
     def _escape_cql_query(self, query: str) -> str:
-        """Escape special characters in a CQL query string."""
-        # List of special characters in CQL that need escaping
-        special_chars = r'\\|+*?[]{}()^$~#:'
-        # Escape each special character with a backslash
-        return re.sub(r'([{}])'.format(re.escape(special_chars)), r'\\\1', query)
+        """Escape CQL string delimiters in a query value.
+
+        Only backslashes and double quotes need escaping because they are
+        CQL string delimiters.  Lucene special characters (``*``, ``?``,
+        ``~``, ``[]``, etc.) are intentionally left unescaped so that
+        they can be used as wildcards / operators by the caller.  If a
+        literal special character is needed the caller should escape it
+        before passing the query.
+        """
+        return query.replace('\\', '\\\\').replace('"', '\\"')
 
     def site_search(self, query: str):
         """Search for pages in Confluence using site search by query text."""
