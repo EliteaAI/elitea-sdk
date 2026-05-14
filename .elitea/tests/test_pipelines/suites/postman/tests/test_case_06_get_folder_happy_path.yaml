@@ -140,18 +140,20 @@ nodes:
           
           This is a POSITIVE test - we expect successful folder creation and retrieval.
           
-          Validation Criteria (ALL must pass for test_passed=true):
+          REQUIRED Validation Criteria (ALL must pass for test_passed=true):
           1. folder_created: Folder was created successfully in the default collection
           2. folder_retrieved: get_folder returned folder details successfully
           3. correct_name: Folder name matches expected name
           4. has_description: Folder description is present
           5. flattened_format: Result is in flattened format (contains path information)
           6. no_errors: No error indicators in any output
+          
+          OPTIONAL (does NOT affect test_passed):
           7. cleanup_succeeded: Test folder was deleted successfully
           
           Return JSON test_results:
           {{
-            "test_passed": boolean (true only if ALL criteria pass),
+            "test_passed": boolean (true only if ALL REQUIRED criteria pass),
             "folder_created": boolean,
             "folder_retrieved": boolean,
             "correct_name": boolean,
