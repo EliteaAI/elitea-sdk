@@ -169,28 +169,28 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 stats.total_fetched = total_files
                 # Check whitelist first
                 if whitelist and not is_whitelisted(file):
-                    stats.files_skipped_whitelist.append(file)
+                    stats.files_skipped_whitelist.add(file)
                     continue
 
                 # Check blacklist
                 if is_blacklisted(file):
-                    stats.files_skipped_blacklist.append(file)
+                    stats.files_skipped_blacklist.add(file)
                     continue
 
                 # Check for supported extensions (only when skip_unsupported_extensions is True)
                 if skip_unsupported_extensions and not has_supported_extension(file):
-                    stats.files_unsupported_extension.append(file)
+                    stats.files_unsupported_extension.add(file)
                     continue
 
                 try:
                     file_content = self._read_file(file, self.__get_branch(branch))
                 except Exception as e:
                     logger.error(f"Failed to read file {file}: {e}")
-                    stats.files_skipped_read_error.append(file)
+                    stats.files_skipped_read_error.add(file)
                     continue
 
                 if not file_content:
-                    stats.files_skipped_empty.append(file)
+                    stats.files_skipped_empty.add(file)
                     continue
 
                 # Ensure file content is a string

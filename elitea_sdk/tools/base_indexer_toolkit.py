@@ -4,7 +4,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, List, Dict, Generator
+from typing import Any, Optional, List, Dict, Generator, Set
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
@@ -36,17 +36,17 @@ class IndexingStats:
     items_processed: int = 0
     total_fetched: int = 0  # All items from source before any filtering
 
-    # For code toolkits (files)
-    files_skipped_whitelist: List[str] = field(default_factory=list)
-    files_skipped_blacklist: List[str] = field(default_factory=list)
-    files_skipped_read_error: List[str] = field(default_factory=list)
-    files_skipped_empty: List[str] = field(default_factory=list)
-    files_unsupported_extension: List[str] = field(default_factory=list)
+    # For code toolkits (files) - Use sets to deduplicate entries
+    files_skipped_whitelist: Set[str] = field(default_factory=set)
+    files_skipped_blacklist: Set[str] = field(default_factory=set)
+    files_skipped_read_error: Set[str] = field(default_factory=set)
+    files_skipped_empty: Set[str] = field(default_factory=set)
+    files_unsupported_extension: Set[str] = field(default_factory=set)
 
     # For non-code toolkits (documents/runtime)
-    documents_skipped_error: List[str] = field(default_factory=list)
-    runtime_skipped_extension: List[str] = field(default_factory=list)
-    runtime_skipped_error: List[str] = field(default_factory=list)
+    documents_skipped_error: Set[str] = field(default_factory=set)
+    runtime_skipped_extension: Set[str] = field(default_factory=set)
+    runtime_skipped_error: Set[str] = field(default_factory=set)
 
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
@@ -71,27 +71,27 @@ class IndexingStats:
             "total_skipped": total_skipped,
             "files_skipped": {
                 "count": files_skipped_count,
-                "whitelist_filtered": self.files_skipped_whitelist,
+                "whitelist_filtered": sorted(self.files_skipped_whitelist),
                 "whitelist_filtered_count": len(self.files_skipped_whitelist),
-                "blacklist_filtered": self.files_skipped_blacklist,
+                "blacklist_filtered": sorted(self.files_skipped_blacklist),
                 "blacklist_filtered_count": len(self.files_skipped_blacklist),
-                "read_error": self.files_skipped_read_error,
+                "read_error": sorted(self.files_skipped_read_error),
                 "read_error_count": len(self.files_skipped_read_error),
-                "empty_content": self.files_skipped_empty,
+                "empty_content": sorted(self.files_skipped_empty),
                 "empty_content_count": len(self.files_skipped_empty),
-                "unsupported_extension": self.files_unsupported_extension,
+                "unsupported_extension": sorted(self.files_unsupported_extension),
                 "unsupported_extension_count": len(self.files_unsupported_extension),
             },
             "documents_skipped": {
                 "count": documents_skipped_count,
-                "error": self.documents_skipped_error,
+                "error": sorted(self.documents_skipped_error),
                 "error_count": len(self.documents_skipped_error),
             },
             "runtime_skipped": {
                 "count": runtime_skipped_count,
-                "extension_filtered": self.runtime_skipped_extension,
+                "extension_filtered": sorted(self.runtime_skipped_extension),
                 "extension_filtered_count": len(self.runtime_skipped_extension),
-                "error": self.runtime_skipped_error,
+                "error": sorted(self.runtime_skipped_error),
                 "error_count": len(self.runtime_skipped_error),
             }
         }
@@ -121,45 +121,53 @@ class IndexingStats:
 
         # File-related skips (for code toolkits)
         if self.files_skipped_whitelist:
-            lines.append(f"  - Files not in whitelist ({len(self.files_skipped_whitelist)}): {', '.join(self.files_skipped_whitelist[:5])}")
-            if len(self.files_skipped_whitelist) > 5:
-                lines.append(f"    ... and {len(self.files_skipped_whitelist) - 5} more")
+            sorted_whitelist = sorted(self.files_skipped_whitelist)
+            lines.append(f"  - Files not in whitelist ({len(sorted_whitelist)}): {', '.join(sorted_whitelist[:5])}")
+            if len(sorted_whitelist) > 5:
+                lines.append(f"    ... and {len(sorted_whitelist) - 5} more")
 
         if self.files_skipped_blacklist:
-            lines.append(f"  - Files blacklisted ({len(self.files_skipped_blacklist)}): {', '.join(self.files_skipped_blacklist[:5])}")
-            if len(self.files_skipped_blacklist) > 5:
-                lines.append(f"    ... and {len(self.files_skipped_blacklist) - 5} more")
+            sorted_blacklist = sorted(self.files_skipped_blacklist)
+            lines.append(f"  - Files blacklisted ({len(sorted_blacklist)}): {', '.join(sorted_blacklist[:5])}")
+            if len(sorted_blacklist) > 5:
+                lines.append(f"    ... and {len(sorted_blacklist) - 5} more")
 
         if self.files_skipped_read_error:
-            lines.append(f"  - Files with read errors ({len(self.files_skipped_read_error)}): {', '.join(self.files_skipped_read_error[:5])}")
-            if len(self.files_skipped_read_error) > 5:
-                lines.append(f"    ... and {len(self.files_skipped_read_error) - 5} more")
+            sorted_read_error = sorted(self.files_skipped_read_error)
+            lines.append(f"  - Files with read errors ({len(sorted_read_error)}): {', '.join(sorted_read_error[:5])}")
+            if len(sorted_read_error) > 5:
+                lines.append(f"    ... and {len(sorted_read_error) - 5} more")
 
         if self.files_skipped_empty:
-            lines.append(f"  - Files with empty content ({len(self.files_skipped_empty)}): {', '.join(self.files_skipped_empty[:5])}")
-            if len(self.files_skipped_empty) > 5:
-                lines.append(f"    ... and {len(self.files_skipped_empty) - 5} more")
+            sorted_empty = sorted(self.files_skipped_empty)
+            lines.append(f"  - Files with empty content ({len(sorted_empty)}): {', '.join(sorted_empty[:5])}")
+            if len(sorted_empty) > 5:
+                lines.append(f"    ... and {len(sorted_empty) - 5} more")
 
         if self.files_unsupported_extension:
-            lines.append(f"  - Files with unsupported extension ({len(self.files_unsupported_extension)}): {', '.join(self.files_unsupported_extension[:5])}")
-            if len(self.files_unsupported_extension) > 5:
-                lines.append(f"    ... and {len(self.files_unsupported_extension) - 5} more")
+            sorted_unsupported = sorted(self.files_unsupported_extension)
+            lines.append(f"  - Files with unsupported extension ({len(sorted_unsupported)}): {', '.join(sorted_unsupported[:5])}")
+            if len(sorted_unsupported) > 5:
+                lines.append(f"    ... and {len(sorted_unsupported) - 5} more")
 
         # Document/attachment-related skips (for non-code toolkits)
         if self.documents_skipped_error:
-            lines.append(f"  - Documents with errors ({len(self.documents_skipped_error)}): {', '.join(self.documents_skipped_error[:5])}")
-            if len(self.documents_skipped_error) > 5:
-                lines.append(f"    ... and {len(self.documents_skipped_error) - 5} more")
+            sorted_doc_error = sorted(self.documents_skipped_error)
+            lines.append(f"  - Documents with errors ({len(sorted_doc_error)}): {', '.join(sorted_doc_error[:5])}")
+            if len(sorted_doc_error) > 5:
+                lines.append(f"    ... and {len(sorted_doc_error) - 5} more")
 
         if self.runtime_skipped_extension:
-            lines.append(f"  - Runtime skipped (extension) ({len(self.runtime_skipped_extension)}): {', '.join(self.runtime_skipped_extension[:5])}")
-            if len(self.runtime_skipped_extension) > 5:
-                lines.append(f"    ... and {len(self.runtime_skipped_extension) - 5} more")
+            sorted_runtime_ext = sorted(self.runtime_skipped_extension)
+            lines.append(f"  - Runtime skipped (extension) ({len(sorted_runtime_ext)}): {', '.join(sorted_runtime_ext[:5])}")
+            if len(sorted_runtime_ext) > 5:
+                lines.append(f"    ... and {len(sorted_runtime_ext) - 5} more")
 
         if self.runtime_skipped_error:
-            lines.append(f"  - Runtime skipped (errors) ({len(self.runtime_skipped_error)}): {', '.join(self.runtime_skipped_error[:5])}")
-            if len(self.runtime_skipped_error) > 5:
-                lines.append(f"    ... and {len(self.runtime_skipped_error) - 5} more")
+            sorted_runtime_err = sorted(self.runtime_skipped_error)
+            lines.append(f"  - Runtime skipped (errors) ({len(sorted_runtime_err)}): {', '.join(sorted_runtime_err[:5])}")
+            if len(sorted_runtime_err) > 5:
+                lines.append(f"    ... and {len(sorted_runtime_err) - 5} more")
 
         return "\n".join(lines)
 
