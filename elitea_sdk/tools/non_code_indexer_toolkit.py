@@ -52,16 +52,16 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         """Track a skipped document during indexing."""
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
-        self._indexing_stats.documents_skipped_error.append(doc_id)
+        self._indexing_stats.documents_skipped_error.add(doc_id)
 
     def _track_runtime_skipped(self, item_name: str, reason: str = "extension"):
         """Track a runtime skipped item during indexing (e.g., attachments, artifacts)."""
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
         if reason == "extension":
-            self._indexing_stats.runtime_skipped_extension.append(item_name)
+            self._indexing_stats.runtime_skipped_extension.add(item_name)
         else:
-            self._indexing_stats.runtime_skipped_error.append(item_name)
+            self._indexing_stats.runtime_skipped_error.add(item_name)
 
     # Backward compatibility alias
     def _track_skipped_attachment(self, attachment_name: str, reason: str = "extension"):
@@ -72,19 +72,19 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         """Track a file skipped due to unsupported extension."""
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
-        self._indexing_stats.files_unsupported_extension.append(file_name)
+        self._indexing_stats.files_unsupported_extension.add(file_name)
 
     def _track_skipped_file_read_error(self, file_name: str):
         """Track a file skipped due to read error."""
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
-        self._indexing_stats.files_skipped_read_error.append(file_name)
+        self._indexing_stats.files_skipped_read_error.add(file_name)
 
     def _track_skipped_file_empty(self, file_name: str):
         """Track a file skipped due to empty content."""
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
-        self._indexing_stats.files_skipped_empty.append(file_name)
+        self._indexing_stats.files_skipped_empty.add(file_name)
 
     def _track_processed_item(self):
         """Increment the count of processed items."""

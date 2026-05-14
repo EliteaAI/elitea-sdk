@@ -65,7 +65,7 @@ class TestCIL_WL_Whitelist:
         tk = make_toolkit(["a.py", "b.md", "c.txt"])
         docs = load(tk, chunked=False, whitelist=None, skip_unsupported_extensions=False)
         assert len(docs) == 3
-        assert tk._indexing_stats.files_skipped_whitelist == []
+        assert tk._indexing_stats.files_skipped_whitelist == set()
 
     def test_WL02_glob_pattern_filters_non_matching(self):
         """whitelist=['*.py'] → only .py files pass; others in files_skipped_whitelist."""
@@ -73,7 +73,7 @@ class TestCIL_WL_Whitelist:
         docs = load(tk, chunked=False, whitelist=["*.py"], skip_unsupported_extensions=False)
         assert len(docs) == 1
         assert docs[0].metadata["filename"] == "a.py"
-        assert sorted(tk._indexing_stats.files_skipped_whitelist) == ["b.md", "c.txt"]
+        assert tk._indexing_stats.files_skipped_whitelist == {"b.md", "c.txt"}
 
     def test_WL03_bare_extension_without_glob_matches_via_endswith(self):
         """whitelist=['py'] (no dot, no star) matches via file_path.endswith('.py')."""
@@ -81,7 +81,7 @@ class TestCIL_WL_Whitelist:
         docs = load(tk, chunked=False, whitelist=["py"], skip_unsupported_extensions=False)
         assert len(docs) == 1
         assert docs[0].metadata["filename"] == "a.py"
-        assert tk._indexing_stats.files_skipped_whitelist == ["b.md"]
+        assert tk._indexing_stats.files_skipped_whitelist == {"b.md"}
 
     def test_WL04_multiple_patterns_any_match_includes_file(self):
         """whitelist=['*.py', '*.md'] → files matching either pattern are included."""
@@ -90,7 +90,7 @@ class TestCIL_WL_Whitelist:
                     skip_unsupported_extensions=False)
         filenames = {d.metadata["filename"] for d in docs}
         assert filenames == {"a.py", "b.md"}
-        assert tk._indexing_stats.files_skipped_whitelist == ["c.java"]
+        assert tk._indexing_stats.files_skipped_whitelist == {"c.java"}
 
     def test_WL05_glob_matches_path_with_directory_prefix(self):
         """*.py glob matches paths that include directory separators."""
@@ -112,7 +112,7 @@ class TestCIL_BL_Blacklist:
         tk = make_toolkit(["a.py", "b.md"])
         docs = load(tk, chunked=False, blacklist=None, skip_unsupported_extensions=False)
         assert len(docs) == 2
-        assert tk._indexing_stats.files_skipped_blacklist == []
+        assert tk._indexing_stats.files_skipped_blacklist == set()
 
     def test_BL02_glob_pattern_excludes_matching_files(self):
         """blacklist=['*.test.py'] → test files go to files_skipped_blacklist."""
@@ -121,7 +121,7 @@ class TestCIL_BL_Blacklist:
                     skip_unsupported_extensions=False)
         filenames = {d.metadata["filename"] for d in docs}
         assert filenames == {"app.py", "utils.py"}
-        assert tk._indexing_stats.files_skipped_blacklist == ["app.test.py"]
+        assert tk._indexing_stats.files_skipped_blacklist == {"app.test.py"}
 
     def test_BL03_bare_extension_excludes_via_endswith(self):
         """blacklist=['py'] excludes .py files via endswith('.py')."""
@@ -130,7 +130,7 @@ class TestCIL_BL_Blacklist:
                     skip_unsupported_extensions=False)
         assert len(docs) == 1
         assert docs[0].metadata["filename"] == "b.md"
-        assert tk._indexing_stats.files_skipped_blacklist == ["a.py"]
+        assert tk._indexing_stats.files_skipped_blacklist == {"a.py"}
 
     def test_BL04_blacklist_applied_after_whitelist_check(self):
         """A file that passes the whitelist but matches the blacklist is excluded."""
@@ -139,8 +139,8 @@ class TestCIL_BL_Blacklist:
                     skip_unsupported_extensions=False)
         filenames = {d.metadata["filename"] for d in docs}
         assert filenames == {"a.py"}
-        assert tk._indexing_stats.files_skipped_whitelist == ["b.md"]
-        assert tk._indexing_stats.files_skipped_blacklist == ["test_a.py"]
+        assert tk._indexing_stats.files_skipped_whitelist == {"b.md"}
+        assert tk._indexing_stats.files_skipped_blacklist == {"test_a.py"}
 
     def test_BL05_file_matching_both_whitelist_and_blacklist_is_excluded(self):
         """Blacklist wins: a .py file on both whitelist and blacklist is not yielded."""
@@ -148,7 +148,7 @@ class TestCIL_BL_Blacklist:
         docs = load(tk, chunked=False, whitelist=["*.py"], blacklist=["*.py"],
                     skip_unsupported_extensions=False)
         assert len(docs) == 0
-        assert tk._indexing_stats.files_skipped_blacklist == ["a.py"]
+        assert tk._indexing_stats.files_skipped_blacklist == {"a.py"}
 
 
 # ---------------------------------------------------------------------------
@@ -163,14 +163,14 @@ class TestCIL_EXT_ExtensionFilter:
         docs = load(tk, chunked=False)
         assert len(docs) == 1
         assert docs[0].metadata["filename"] == "a.py"
-        assert sorted(tk._indexing_stats.files_unsupported_extension) == ["b.xyz", "c.abc"]
+        assert tk._indexing_stats.files_unsupported_extension == {"b.xyz", "c.abc"}
 
     def test_EXT02_unsupported_extension_included_when_flag_false(self):
         """skip_unsupported_extensions=False → .xyz files are not filtered."""
         tk = make_toolkit(["a.xyz"])
         docs = load(tk, chunked=False, skip_unsupported_extensions=False)
         assert len(docs) == 1
-        assert tk._indexing_stats.files_unsupported_extension == []
+        assert tk._indexing_stats.files_unsupported_extension == set()
 
     def test_EXT03_all_common_supported_extensions_pass(self):
         """Spot-check that .py .md .json .txt .yml are all considered supported."""
@@ -178,14 +178,14 @@ class TestCIL_EXT_ExtensionFilter:
         tk = make_toolkit(files)
         docs = load(tk, chunked=False)
         assert len(docs) == 5
-        assert tk._indexing_stats.files_unsupported_extension == []
+        assert tk._indexing_stats.files_unsupported_extension == set()
 
     def test_EXT04_extension_check_is_case_insensitive(self):
         """Upper-case extensions like .PY and .MD are recognised as supported."""
         tk = make_toolkit(["A.PY", "B.MD"])
         docs = load(tk, chunked=False)
         assert len(docs) == 2
-        assert tk._indexing_stats.files_unsupported_extension == []
+        assert tk._indexing_stats.files_unsupported_extension == set()
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +215,7 @@ class TestCIL_STAT_IndexingStats:
         )
         docs = load(tk, chunked=False)
         assert len(docs) == 1
-        assert tk._indexing_stats.files_skipped_read_error == ["b.py"]
+        assert tk._indexing_stats.files_skipped_read_error == {"b.py"}
 
     def test_STAT04_empty_content_populates_files_skipped_empty(self):
         """Files where _read_file returns empty string land in files_skipped_empty."""
@@ -225,7 +225,7 @@ class TestCIL_STAT_IndexingStats:
         )
         docs = load(tk, chunked=False)
         assert len(docs) == 1
-        assert tk._indexing_stats.files_skipped_empty == ["b.py"]
+        assert tk._indexing_stats.files_skipped_empty == {"b.py"}
 
     def test_STAT05_stats_reset_on_each_loader_call(self):
         """Calling loader() twice resets stats — previous run does not bleed through."""
@@ -236,14 +236,31 @@ class TestCIL_STAT_IndexingStats:
         load(tk, chunked=False)
         # Stats should reflect only the second call
         assert tk._indexing_stats.total_fetched == 2
-        assert tk._indexing_stats.files_unsupported_extension == ["c.xyz"]
+        assert tk._indexing_stats.files_unsupported_extension == {"c.xyz"}
 
     def test_STAT06_whitelist_skip_increments_correct_counter(self):
         """files_skipped_whitelist is populated only for whitelist misses, not for blacklist."""
         tk = make_toolkit(["a.py", "b.md"], skip_unsupported_extensions=False)
         load(tk, chunked=False, whitelist=["*.py"], skip_unsupported_extensions=False)
-        assert tk._indexing_stats.files_skipped_whitelist == ["b.md"]
-        assert tk._indexing_stats.files_skipped_blacklist == []
+        assert tk._indexing_stats.files_skipped_whitelist == {"b.md"}
+        assert tk._indexing_stats.files_skipped_blacklist == set()
+
+    def test_STAT07_skipped_files_are_deduplicated(self):
+        """Issue #4720: Sets deduplicate entries - same file tracked multiple times appears once."""
+        from elitea_sdk.tools.base_indexer_toolkit import IndexingStats
+        stats = IndexingStats()
+        # Simulate tracking the same file multiple times (as happens with multi-page PDFs)
+        stats.files_skipped_empty.add("document.pdf")
+        stats.files_skipped_empty.add("document.pdf")
+        stats.files_skipped_empty.add("document.pdf")
+        stats.files_skipped_empty.add("document.pdf")
+        # Should only have 1 entry, not 4
+        assert len(stats.files_skipped_empty) == 1
+        assert stats.files_skipped_empty == {"document.pdf"}
+        # Summary should show count as 1
+        summary = stats.get_summary()
+        assert "Files with empty content (1)" in summary
+        assert summary.count("document.pdf") == 1
 
 
 # ---------------------------------------------------------------------------
