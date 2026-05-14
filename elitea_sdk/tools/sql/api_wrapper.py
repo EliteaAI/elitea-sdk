@@ -1,5 +1,6 @@
 import logging
 from typing import Optional
+from urllib.parse import quote_plus
 
 from langchain_core.tools import ToolException
 from pydantic import create_model, SecretStr, model_validator
@@ -60,8 +61,8 @@ class SQLApiWrapper(BaseToolApiWrapper):
             try:
                 dialect = self.dialect
                 host = self.host
-                username = self.username
-                password = self.password.get_secret_value()
+                username = quote_plus(self.username)
+                password = quote_plus(self.password.get_secret_value())
                 database_name = self.database_name
                 port = self.port
 
