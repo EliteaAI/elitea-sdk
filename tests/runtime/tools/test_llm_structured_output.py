@@ -353,10 +353,41 @@ class TestBuildCleanMessagesForStructuredOutput:
         assert len(result) == 2
         assert result[1].content == "final answer"
 
-    def test_max_iterations_fallback_strips_tool_calls_from_last(self):
-        """When the loop exits with the last AIMessage still carrying tool_calls,
-        return a copy with tool_calls cleared so Anthropic does not see unmatched
+    def test_max_iterations_fallback_strips_tool_calls_and_tool_use_blocks(self):
+        """When the loop exits with the last AIMessage still carrying tool_calls
+        AND Anthropic-shape list content with tool_use blocks (the realistic case
+        for thinking-on Anthropic), return a copy with tool_calls cleared AND
+        tool_use blocks removed from content so Anthropic does not see unmatched
         tool_use blocks."""
+        node = _make_llm_node()
+        messages = [HumanMessage(content="task")]
+        anthropic_content = [
+            {"type": "thinking", "thinking": "I should call search", "signature": "s1"},
+            {"type": "text", "text": "Let me search for that"},
+            {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"query": "x"}},
+        ]
+        msg = AIMessage(
+            content=anthropic_content,
+            tool_calls=[{"id": "tu_1", "name": "search", "args": {"query": "x"}, "type": "tool_call"}],
+        )
+        new_messages = [HumanMessage(content="task"), msg]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert len(result) == 2
+        cleaned = result[1]
+        assert isinstance(cleaned, AIMessage)
+        assert not getattr(cleaned, 'tool_calls', None)
+        assert isinstance(cleaned.content, list)
+        # tool_use stripped, thinking + text kept
+        assert all(
+            not (isinstance(b, dict) and b.get('type') == 'tool_use')
+            for b in cleaned.content
+        )
+        block_types = {b.get('type') for b in cleaned.content if isinstance(b, dict)}
+        assert block_types == {"thinking", "text"}
+
+    def test_max_iterations_fallback_with_string_content(self):
+        """Backward-compatible string-content case (non-Anthropic / thinking-off):
+        clear tool_calls attribute, leave string content intact."""
         node = _make_llm_node()
         messages = [HumanMessage(content="task")]
         new_messages = [
@@ -365,7 +396,6 @@ class TestBuildCleanMessagesForStructuredOutput:
         ]
         result = node._build_clean_messages_for_structured_output(messages, new_messages)
         assert len(result) == 2
-        assert isinstance(result[1], AIMessage)
         assert not getattr(result[1], 'tool_calls', None)
         assert result[1].content == "interrupted"
 
@@ -411,7 +441,7 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         - llm_client.invoke (first call): returns AIMessage with tool_calls
         - __perform_tool_calling: short-circuited to return tool_call_loop_messages
         - llm.invoke (struct output, second call): determined by second_call_behavior
-        - llm_client.invoke (fallback plain call): returns plain_call_response
+        - self.client.invoke (fallback plain call, UNBOUND): returns plain_call_response
         """
         node = _make_llm_node()
         struct_model = self._struct_model_with_question_list()
@@ -420,10 +450,13 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
             {"id": "tc_1", "name": "search", "args": {}, "type": "tool_call"}
         ])
 
+        # llm_client (tool-bound) — used only for the FIRST invoke
         llm_client = MagicMock()
-        # First .invoke is the initial call inside _invoke_with_structured_output.
-        # If a fallback fires, the second .invoke on llm_client returns plain_call_response.
-        llm_client.invoke = MagicMock(side_effect=[first_completion, plain_call_response])
+        llm_client.invoke = MagicMock(return_value=first_completion)
+
+        # self.client (unbound base) — used for the fallback retry
+        node.client = MagicMock()
+        node.client.invoke = MagicMock(return_value=plain_call_response)
 
         struct_llm = MagicMock()
         if isinstance(second_call_behavior, Exception):
@@ -431,7 +464,6 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         else:
             struct_llm.invoke = MagicMock(return_value=second_call_behavior)
 
-        # Patch __get_struct_output_model and __perform_tool_calling on the node.
         node._LLMNode__get_struct_output_model = MagicMock(return_value=struct_llm)
 
         async def _fake_perform_tool_calling(completion, msgs, client, cfg):
@@ -496,8 +528,11 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
     def test_anthropic_thinking_on_markdown_fallback_extracts_list(self):
         """When Anthropic with thinking ON returns markdown-fenced JSON as text
         instead of tool_use, the structured-output parser raises ValidationError,
-        the fallback re-issues a plain invoke, and _extract_structured_from_content
-        successfully parses the array."""
+        the fallback re-issues a plain invoke (on the UNBOUND client to avoid
+        another tool call), and _extract_structured_from_content parses the array.
+        The plain_completion is returned upstream as initial_completion so
+        _format_structured_output_result reads ELITEA_RS fallback text from the
+        actually-parsed response, not the original planning AIMessage."""
         messages = [HumanMessage(content="give me a list")]
         loop_messages = [
             HumanMessage(content="give me a list"),
@@ -508,7 +543,6 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
                 {"type": "text", "text": "I'll synthesize the answer."},
             ]),
         ]
-        # Plain fallback response: thinking block + text containing fenced array
         fallback_response = AIMessage(content=[
             {"type": "thinking", "thinking": "Let me format this", "signature": "s2"},
             {"type": "text", "text": "```json\n[{\"question_id\": \"q1\"}, {\"question_id\": \"q2\"}]\n```"},
@@ -519,14 +553,19 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
             plain_call_response=fallback_response,
         )
 
-        completion, _, final_messages = node._invoke_with_structured_output(
+        completion, returned_initial, final_messages = node._invoke_with_structured_output(
             llm_client, messages, struct_model, config={}
         )
 
         assert struct_llm.invoke.call_count == 1, "structured output attempted once"
-        assert llm_client.invoke.call_count == 2, "first call + fallback plain call"
+        assert llm_client.invoke.call_count == 1, "tool-bound client used only for first call"
+        assert node.client.invoke.call_count == 1, "fallback uses unbound client"
         assert len(completion.question) == 2
         assert completion.question[0]["question_id"] == "q1"
+        assert returned_initial is fallback_response, (
+            "initial_completion returned upstream must be plain_completion so "
+            "_format_structured_output_result extracts ELITEA_RS from the parsed response"
+        )
         assert final_messages == loop_messages, "checkpoint state preserved"
 
     def test_propagates_exception_when_fallback_also_fails(self):

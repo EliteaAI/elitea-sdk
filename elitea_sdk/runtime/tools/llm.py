@@ -187,6 +187,23 @@ class LLMNode(BaseTool):
 
         return struct_params
 
+    @staticmethod
+    def _strip_tool_use_blocks(content: Any) -> Any:
+        """Drop ``tool_use`` blocks from Anthropic-shape list content.
+
+        Anthropic returns assistant content as a list of typed blocks
+        (``thinking``, ``text``, ``tool_use``). Sending an unmatched
+        ``tool_use`` block back to the API triggers the
+        "tool_use without tool_result" format error. String content is
+        returned unchanged.
+        """
+        if isinstance(content, list):
+            return [
+                b for b in content
+                if not (isinstance(b, dict) and b.get('type') == 'tool_use')
+            ]
+        return content
+
     def _build_clean_messages_for_structured_output(self, messages: List, new_messages: List) -> List:
         """
         Build a sanitized message history for the structured-output follow-up call.
@@ -205,21 +222,24 @@ class LLMNode(BaseTool):
         available upstream via the unchanged ``new_messages`` returned to the
         caller (used for checkpoint serialization).
 
-        Walks ``new_messages`` from the tail and picks the last AIMessage that has
-        no pending ``tool_calls``. If no such message exists (e.g. max-iterations
-        exit left a tool-calling AIMessage as the last turn), falls back to a copy
-        of that AIMessage with ``tool_calls`` cleared so Anthropic does not see
-        unmatched tool_use blocks.
+        Walks ``new_messages`` from the tail and picks the last AIMessage. If that
+        message still carries ``tool_calls`` or any ``tool_use`` content blocks
+        (e.g. max-iterations / error exit), returns a copy with the
+        ``tool_calls`` attribute cleared AND ``tool_use`` blocks stripped from
+        list-shaped content. Otherwise returns the message unchanged.
 
         Returns ``messages + [final_clean_aimessage]`` if a final AIMessage is
         present; otherwise returns ``messages`` unchanged.
         """
         for msg in reversed(new_messages):
             if isinstance(msg, AIMessage):
-                if not getattr(msg, 'tool_calls', None):
+                cleaned_content = self._strip_tool_use_blocks(msg.content)
+                has_tool_calls = bool(getattr(msg, 'tool_calls', None))
+                content_changed = cleaned_content is not msg.content and cleaned_content != msg.content
+                if not has_tool_calls and not content_changed:
                     return list(messages) + [msg]
                 cleaned = AIMessage(
-                    content=msg.content,
+                    content=cleaned_content,
                     additional_kwargs=dict(getattr(msg, 'additional_kwargs', {}) or {}),
                     response_metadata=dict(getattr(msg, 'response_metadata', {}) or {}),
                     id=getattr(msg, 'id', None),
@@ -261,10 +281,19 @@ class LLMNode(BaseTool):
                 completion = llm.invoke(clean_messages, config=config)
                 return completion, initial_completion, new_messages
             except (ValueError, ValidationError, OutputParserException):
-                plain_completion = llm_client.invoke(clean_messages, config=config)
+                # Use the unbound base client (``self.client``) so the retry
+                # cannot trigger another tool call — we want plain text the
+                # extractor can parse. ``llm_client`` is the tool-bound client
+                # from the caller (``self.client.bind_tools(...)``), which would
+                # let Claude pick another operational tool instead of replying.
+                plain_completion = self.client.invoke(clean_messages, config=config)
                 completion = self._extract_structured_from_content(plain_completion, struct_model)
                 if completion is not None:
-                    return completion, initial_completion, new_messages
+                    # Return ``plain_completion`` as the initial-completion-equivalent
+                    # so ``_format_structured_output_result`` reads ELITEA_RS fallback
+                    # text from the response we actually parsed, not from the original
+                    # planning AIMessage which may carry only tool-call text.
+                    return completion, plain_completion, new_messages
                 raise
         else:
             # Direct structured output without tool calls
