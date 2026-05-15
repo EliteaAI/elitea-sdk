@@ -5,13 +5,14 @@ import logging
 from traceback import format_exc
 from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.callbacks import dispatch_custom_event
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt as _langgraph_interrupt
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 try:
     from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD as _SCRATCHPAD_KEY
@@ -22,6 +23,7 @@ from ..langchain.constants import ELITEA_RS
 from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
+    extract_json_content,
     propagate_the_input_mapping,
 )
 from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
@@ -189,6 +191,9 @@ class LLMNode(BaseTool):
         """
         Invoke LLM with structured output, handling tool calls if present.
 
+        When the forced structured output call fails, attempts to extract valid JSON
+        from the initial LLM response (handles models returning fenced JSON as text).
+
         Args:
             llm_client: LLM client instance
             messages: List of conversation messages
@@ -211,8 +216,15 @@ class LLMNode(BaseTool):
         else:
             # Direct structured output without tool calls
             llm = self.__get_struct_output_model(llm_client, struct_model)
-            completion = llm.invoke(messages, config=config)
-            return completion, initial_completion, messages
+            try:
+                completion = llm.invoke(messages, config=config)
+                return completion, initial_completion, messages
+            except (ValueError, ValidationError, OutputParserException) as e:
+                # Structured output call failed — try extracting JSON from initial response
+                completion = self._extract_structured_from_content(initial_completion, struct_model)
+                if completion is not None:
+                    return completion, initial_completion, messages
+                raise
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -239,6 +251,63 @@ class LLMNode(BaseTool):
             field_descriptions="\n".join(field_descriptions),
             example_fields=example_fields
         )
+
+    def _extract_structured_from_content(self, completion: Any, struct_model: Any) -> Any:
+        """
+        Try to extract structured output from an LLM response's text content.
+
+        Handles models (especially Anthropic) that return valid JSON wrapped in
+        markdown code fences as text content instead of using tool calls.
+
+        Returns None if extraction fails.
+        """
+        try:
+            content = completion.content if hasattr(completion, 'content') else str(completion)
+            if isinstance(content, list):
+                content = ''.join(
+                    block.get('text', '') for block in content
+                    if isinstance(block, dict) and block.get('type') == 'text'
+                )
+            content = content.strip()
+            if not content:
+                return None
+            parsed = extract_json_content(content)
+            return self._map_parsed_json_to_model(parsed, struct_model)
+        except Exception as e:
+            logger.debug(f"Content extraction failed: {e}")
+            return None
+
+    def _map_parsed_json_to_model(self, parsed: Any, struct_model: Any) -> Any:
+        """
+        Map parsed JSON (dict or list) to the structured output Pydantic model.
+
+        Handles cases where:
+        - parsed is a dict matching the model fields directly
+        - parsed is a dict with a single key containing list data for a list field
+        - parsed is a list that should map to the first list-type field
+        """
+        if isinstance(parsed, dict):
+            model_fields = set(struct_model.model_fields.keys()) - {ELITEA_RS}
+            if model_fields & set(parsed.keys()):
+                return struct_model(**parsed)
+            # Response has different field names — map by type
+            list_fields = [
+                k for k, f in struct_model.model_fields.items()
+                if k != ELITEA_RS and getattr(f.annotation, '__origin__', None) is list
+            ]
+            if list_fields:
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        return struct_model(**{list_fields[0]: v})
+            return struct_model(**parsed)
+        elif isinstance(parsed, list):
+            list_fields = [
+                k for k, f in struct_model.model_fields.items()
+                if k != ELITEA_RS and getattr(f.annotation, '__origin__', None) is list
+            ]
+            if list_fields:
+                return struct_model(**{list_fields[0]: parsed})
+        raise ValueError(f"Cannot map parsed JSON to model: {type(parsed)}")
 
     def _create_fallback_completion(self, content: str, struct_model: Any) -> Any:
         """
@@ -328,22 +397,12 @@ class LLMNode(BaseTool):
                 plain_completion = llm_client.invoke(modified_messages, config=config)
                 content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
 
-                # Try to extract JSON from the response
-                import json
-                import re
-
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    try:
-                        parsed_json = json.loads(json_match.group(0))
-                        # Validate it has expected fields and wrap in pydantic model
-                        completion = struct_model(**parsed_json)
-                        return completion
-                    except (json.JSONDecodeError, Exception) as parse_error:
-                        logger.warning(f"Could not parse extracted JSON: {parse_error}")
-                        return self._create_fallback_completion(content, struct_model)
-                else:
-                    # No JSON found, create response with content in elitea_response
+                try:
+                    parsed = extract_json_content(content)
+                    completion = self._map_parsed_json_to_model(parsed, struct_model)
+                    return completion
+                except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
+                    logger.warning(f"Could not parse extracted JSON: {parse_error}")
                     return self._create_fallback_completion(content, struct_model)
 
     def _format_structured_output_result(self, result: dict, messages: List, initial_completion: Any) -> dict:

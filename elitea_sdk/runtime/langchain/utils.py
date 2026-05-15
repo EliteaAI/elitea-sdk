@@ -154,6 +154,47 @@ def _find_json_bounds(json_string: str) -> Tuple[int, int] | Tuple[None, None]:
     return None, None
 
 
+def extract_json_content(text: str) -> dict | list:
+    """Extract JSON (object or array) from text that may have markdown fences.
+
+    Handles:
+    - Markdown code fences (```json ... ``` or ``` ... ```)
+    - Plain JSON objects and arrays
+    - Text with embedded JSON
+    """
+    fence_match = re.search(r'```(?:json)?\s*\n(.*?)\n\s*```', text, re.DOTALL)
+    clean = fence_match.group(1).strip() if fence_match else text.strip()
+
+    try:
+        return json.loads(clean)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    json_start, json_end = _find_json_bounds(clean)
+    if json_start is not None:
+        try:
+            return json.loads(clean[json_start:json_end])
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    arr_start = clean.find('[')
+    if arr_start != -1:
+        depth = 0
+        for i in range(arr_start, len(clean)):
+            if clean[i] == '[':
+                depth += 1
+            elif clean[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(clean[arr_start:i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+
+    raise ValueError('Cannot extract JSON from text')
+
+
 def _extract_json(json_string: str) -> dict:
     json_start, json_end = _find_json_bounds(json_string)
 
@@ -361,11 +402,8 @@ def parse_pydantic_type(type_name: str):
         "int": int,
         "float": float,
         "bool": bool,
-        # "dict" means JSON object
-        "dict": dict[str, JsonValue],
-        # "list" means array of JSON values (or pick str if you want)
-        "list": list[JsonValue],
-        # IMPORTANT: don't return bare Any -> it produces {} schema
+        "dict": dict[str, Any],
+        "list": list[Any],
         "any": JsonValue,
     }
     if t in base:
