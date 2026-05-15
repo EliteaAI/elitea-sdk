@@ -10,12 +10,15 @@ Tests cover:
 2. _map_parsed_json_to_model — maps parsed JSON to Pydantic model fields
 3. _create_fallback_completion — generates safe fallback when parsing fails
 """
+import asyncio
 import json
 import pytest
 from unittest.mock import MagicMock, patch
-from typing import Any
+from typing import Any, List
 
-from pydantic import create_model, Field
+from pydantic import create_model, Field, ValidationError
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.exceptions import OutputParserException
 
 from elitea_sdk.runtime.tools.llm import LLMNode
 from elitea_sdk.runtime.langchain.constants import ELITEA_RS
@@ -280,3 +283,319 @@ class TestStructuredOutputIntegration:
         result = node._extract_structured_from_content(completion, model)
         assert result is not None
         assert len(result.question) == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #4890 part 2: tool-calling branch of _invoke_with_structured_output
+#
+# Covers the regression where LLMNode with tools assigned, Anthropic models, and
+# extended thinking ENABLED silently returned [] for list-type structured output.
+# Root cause: passing the full tool exchange history (AI(tool_calls) + ToolMsg)
+# back to with_structured_output caused Anthropic to respond with continuation
+# text (markdown-fenced JSON) instead of a fresh tool_use. The fix sanitizes the
+# history to "messages + [last clean AIMessage]" before the structured call.
+# ---------------------------------------------------------------------------
+
+
+def _ai_with_tool_calls(text: str = "", tool_calls=None, content_blocks=None):
+    """Build an AIMessage carrying tool_calls (with optional thinking blocks)."""
+    msg = AIMessage(
+        content=content_blocks if content_blocks is not None else text,
+        tool_calls=tool_calls or [
+            {"id": "tc_1", "name": "search", "args": {"query": "x"}, "type": "tool_call"}
+        ],
+    )
+    return msg
+
+
+def _ai_clean(text="done", content_blocks=None):
+    """Build a clean AIMessage (no tool_calls)."""
+    return AIMessage(content=content_blocks if content_blocks is not None else text)
+
+
+def _tool_msg(content="result", call_id="tc_1"):
+    return ToolMessage(content=content, tool_call_id=call_id)
+
+
+class TestBuildCleanMessagesForStructuredOutput:
+    """Helper-level tests for the history sanitizer."""
+
+    def test_drops_tool_use_aimessages_keeps_final(self):
+        node = _make_llm_node()
+        messages = [HumanMessage(content="ask")]
+        new_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("calling"),
+            _tool_msg(),
+            _ai_clean("here is the synthesis"),
+        ]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert len(result) == 2
+        assert isinstance(result[0], HumanMessage)
+        assert isinstance(result[1], AIMessage)
+        assert not getattr(result[1], 'tool_calls', None)
+        assert result[1].content == "here is the synthesis"
+
+    def test_picks_last_clean_aimessage_in_multi_iteration_loop(self):
+        node = _make_llm_node()
+        messages = [HumanMessage(content="task")]
+        new_messages = [
+            HumanMessage(content="task"),
+            _ai_with_tool_calls("first"),
+            _tool_msg(call_id="tc_1"),
+            _ai_with_tool_calls("second", tool_calls=[
+                {"id": "tc_2", "name": "search", "args": {}, "type": "tool_call"}
+            ]),
+            _tool_msg(call_id="tc_2"),
+            _ai_clean("final answer"),
+        ]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert len(result) == 2
+        assert result[1].content == "final answer"
+
+    def test_max_iterations_fallback_strips_tool_calls_from_last(self):
+        """When the loop exits with the last AIMessage still carrying tool_calls,
+        return a copy with tool_calls cleared so Anthropic does not see unmatched
+        tool_use blocks."""
+        node = _make_llm_node()
+        messages = [HumanMessage(content="task")]
+        new_messages = [
+            HumanMessage(content="task"),
+            _ai_with_tool_calls("interrupted"),
+        ]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert len(result) == 2
+        assert isinstance(result[1], AIMessage)
+        assert not getattr(result[1], 'tool_calls', None)
+        assert result[1].content == "interrupted"
+
+    def test_preserves_thinking_blocks_in_final_aimessage(self):
+        """Anthropic returns content as a list of blocks when thinking is on; the
+        helper must keep the structure intact so the API still accepts the turn."""
+        node = _make_llm_node()
+        messages = [HumanMessage(content="ask")]
+        thinking_blocks = [
+            {"type": "thinking", "thinking": "Let me think...", "signature": "sig_xyz"},
+            {"type": "text", "text": "synthesis"},
+        ]
+        new_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("first"),
+            _tool_msg(),
+            _ai_clean(content_blocks=thinking_blocks),
+        ]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert len(result) == 2
+        assert result[1].content == thinking_blocks
+        assert result[1].content[0]["type"] == "thinking"
+        assert result[1].content[1]["type"] == "text"
+
+    def test_returns_messages_only_when_no_aimessage_in_new_messages(self):
+        """Edge case: __perform_tool_calling somehow returns no AIMessage."""
+        node = _make_llm_node()
+        messages = [HumanMessage(content="ask")]
+        new_messages = [HumanMessage(content="ask"), _tool_msg()]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert result == messages
+
+
+class TestInvokeWithStructuredOutputToolCallingBranch:
+    """Verify the patched tool-calling branch passes sanitized history and falls
+    back via _extract_structured_from_content on parser failure."""
+
+    def _struct_model_with_question_list(self):
+        return _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+    def _build_node_with_mocks(self, tool_call_loop_messages: List, second_call_behavior, plain_call_response=None):
+        """Wire mocks so that:
+        - llm_client.invoke (first call): returns AIMessage with tool_calls
+        - __perform_tool_calling: short-circuited to return tool_call_loop_messages
+        - llm.invoke (struct output, second call): determined by second_call_behavior
+        - llm_client.invoke (fallback plain call): returns plain_call_response
+        """
+        node = _make_llm_node()
+        struct_model = self._struct_model_with_question_list()
+
+        first_completion = _ai_with_tool_calls("planning", tool_calls=[
+            {"id": "tc_1", "name": "search", "args": {}, "type": "tool_call"}
+        ])
+
+        llm_client = MagicMock()
+        # First .invoke is the initial call inside _invoke_with_structured_output.
+        # If a fallback fires, the second .invoke on llm_client returns plain_call_response.
+        llm_client.invoke = MagicMock(side_effect=[first_completion, plain_call_response])
+
+        struct_llm = MagicMock()
+        if isinstance(second_call_behavior, Exception):
+            struct_llm.invoke = MagicMock(side_effect=second_call_behavior)
+        else:
+            struct_llm.invoke = MagicMock(return_value=second_call_behavior)
+
+        # Patch __get_struct_output_model and __perform_tool_calling on the node.
+        node._LLMNode__get_struct_output_model = MagicMock(return_value=struct_llm)
+
+        async def _fake_perform_tool_calling(completion, msgs, client, cfg):
+            return tool_call_loop_messages, completion
+        node._LLMNode__perform_tool_calling = _fake_perform_tool_calling
+        node._run_async_in_sync_context = lambda coro: asyncio.new_event_loop().run_until_complete(coro)
+
+        return node, struct_model, llm_client, struct_llm
+
+    def test_uses_sanitized_history_not_full_new_messages(self):
+        """The structured-output call must receive messages + [last_clean_ai],
+        NOT the full new_messages list."""
+        messages = [HumanMessage(content="ask for list")]
+        loop_messages = [
+            HumanMessage(content="ask for list"),
+            _ai_with_tool_calls("calling tool"),
+            _tool_msg(),
+            _ai_clean("synthesized answer"),
+        ]
+        success_completion = self._struct_model_with_question_list()(
+            question=[{"id": "q1"}, {"id": "q2"}], **{ELITEA_RS: ""}
+        )
+        node, struct_model, llm_client, struct_llm = self._build_node_with_mocks(
+            loop_messages, second_call_behavior=success_completion,
+        )
+
+        completion, initial, final = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+
+        assert struct_llm.invoke.call_count == 1
+        passed_messages = struct_llm.invoke.call_args[0][0]
+        assert len(passed_messages) == 2, "should be messages + [last_clean_ai], not full loop history"
+        assert isinstance(passed_messages[1], AIMessage)
+        assert not getattr(passed_messages[1], 'tool_calls', None)
+        assert passed_messages[1].content == "synthesized answer"
+        assert completion.question == [{"id": "q1"}, {"id": "q2"}]
+
+    def test_returns_full_new_messages_for_checkpoint_preservation(self):
+        """final_messages returned upstream must be the full new_messages so
+        checkpoint state and audit trail see the real exchange."""
+        messages = [HumanMessage(content="ask")]
+        loop_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("calling"),
+            _tool_msg(),
+            _ai_clean("done"),
+        ]
+        success_completion = self._struct_model_with_question_list()(
+            question=[{"id": "q1"}], **{ELITEA_RS: ""}
+        )
+        node, struct_model, llm_client, _ = self._build_node_with_mocks(
+            loop_messages, second_call_behavior=success_completion,
+        )
+
+        _, _, final_messages = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+        assert final_messages == loop_messages
+        assert len(final_messages) == 4
+
+    def test_anthropic_thinking_on_markdown_fallback_extracts_list(self):
+        """When Anthropic with thinking ON returns markdown-fenced JSON as text
+        instead of tool_use, the structured-output parser raises ValidationError,
+        the fallback re-issues a plain invoke, and _extract_structured_from_content
+        successfully parses the array."""
+        messages = [HumanMessage(content="give me a list")]
+        loop_messages = [
+            HumanMessage(content="give me a list"),
+            _ai_with_tool_calls("calling"),
+            _tool_msg(content="some data"),
+            _ai_clean(content_blocks=[
+                {"type": "thinking", "thinking": "...", "signature": "s"},
+                {"type": "text", "text": "I'll synthesize the answer."},
+            ]),
+        ]
+        # Plain fallback response: thinking block + text containing fenced array
+        fallback_response = AIMessage(content=[
+            {"type": "thinking", "thinking": "Let me format this", "signature": "s2"},
+            {"type": "text", "text": "```json\n[{\"question_id\": \"q1\"}, {\"question_id\": \"q2\"}]\n```"},
+        ])
+        node, struct_model, llm_client, struct_llm = self._build_node_with_mocks(
+            loop_messages,
+            second_call_behavior=ValidationError.from_exception_data("LLMOutput", []),
+            plain_call_response=fallback_response,
+        )
+
+        completion, _, final_messages = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+
+        assert struct_llm.invoke.call_count == 1, "structured output attempted once"
+        assert llm_client.invoke.call_count == 2, "first call + fallback plain call"
+        assert len(completion.question) == 2
+        assert completion.question[0]["question_id"] == "q1"
+        assert final_messages == loop_messages, "checkpoint state preserved"
+
+    def test_propagates_exception_when_fallback_also_fails(self):
+        """If both structured-output parsing AND content extraction fail, the
+        original exception must propagate — never silently return None/empty."""
+        messages = [HumanMessage(content="ask")]
+        loop_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("calling"),
+            _tool_msg(),
+            _ai_clean("done"),
+        ]
+        unparseable = AIMessage(content="this is not json at all")
+        node, struct_model, llm_client, _ = self._build_node_with_mocks(
+            loop_messages,
+            second_call_behavior=OutputParserException("parse failed"),
+            plain_call_response=unparseable,
+        )
+
+        with pytest.raises(OutputParserException):
+            node._invoke_with_structured_output(llm_client, messages, struct_model, config={})
+
+    def test_thinking_off_anthropic_no_regression(self):
+        """Anthropic without extended thinking returns plain string content;
+        helper must still produce a valid 2-element history and the structured
+        output call must succeed."""
+        messages = [HumanMessage(content="ask")]
+        loop_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("calling"),
+            _tool_msg(),
+            _ai_clean("plain string final answer"),
+        ]
+        success = self._struct_model_with_question_list()(
+            question=[{"id": "a"}], **{ELITEA_RS: ""}
+        )
+        node, struct_model, llm_client, struct_llm = self._build_node_with_mocks(
+            loop_messages, second_call_behavior=success,
+        )
+
+        completion, _, _ = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+
+        passed = struct_llm.invoke.call_args[0][0]
+        assert isinstance(passed[1].content, str)
+        assert completion.question == [{"id": "a"}]
+
+    def test_openai_no_regression_with_proper_tool_use(self):
+        """GPT path returns a valid Pydantic instance directly from
+        with_structured_output — fallback must not fire."""
+        messages = [HumanMessage(content="ask")]
+        loop_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("calling"),
+            _tool_msg(),
+            _ai_clean("done"),
+        ]
+        success = self._struct_model_with_question_list()(
+            question=[{"q": 1}, {"q": 2}, {"q": 3}], **{ELITEA_RS: ""}
+        )
+        node, struct_model, llm_client, struct_llm = self._build_node_with_mocks(
+            loop_messages, second_call_behavior=success,
+        )
+
+        completion, _, _ = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+
+        assert struct_llm.invoke.call_count == 1
+        assert llm_client.invoke.call_count == 1, "no fallback should fire"
+        assert len(completion.question) == 3

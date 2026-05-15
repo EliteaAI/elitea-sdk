@@ -187,6 +187,46 @@ class LLMNode(BaseTool):
 
         return struct_params
 
+    def _build_clean_messages_for_structured_output(self, messages: List, new_messages: List) -> List:
+        """
+        Build a sanitized message history for the structured-output follow-up call.
+
+        After ``__perform_tool_calling`` runs, ``new_messages`` contains the original
+        input plus the full tool-using exchange (AIMessage with tool_calls →
+        ToolMessage results → ... → final AIMessage). When this entire history is
+        replayed to ``with_structured_output``, Anthropic models — particularly with
+        extended thinking enabled — read the conversation as already complete and
+        respond with continuation text (markdown-fenced JSON) instead of emitting
+        a fresh ``tool_use`` for the structured target.
+
+        The fix is to drop the intermediate tool exchange and present only the
+        original user input plus the final synthesis AIMessage to the structured-
+        output call. The original assistant turn(s) and tool results are still
+        available upstream via the unchanged ``new_messages`` returned to the
+        caller (used for checkpoint serialization).
+
+        Walks ``new_messages`` from the tail and picks the last AIMessage that has
+        no pending ``tool_calls``. If no such message exists (e.g. max-iterations
+        exit left a tool-calling AIMessage as the last turn), falls back to a copy
+        of that AIMessage with ``tool_calls`` cleared so Anthropic does not see
+        unmatched tool_use blocks.
+
+        Returns ``messages + [final_clean_aimessage]`` if a final AIMessage is
+        present; otherwise returns ``messages`` unchanged.
+        """
+        for msg in reversed(new_messages):
+            if isinstance(msg, AIMessage):
+                if not getattr(msg, 'tool_calls', None):
+                    return list(messages) + [msg]
+                cleaned = AIMessage(
+                    content=msg.content,
+                    additional_kwargs=dict(getattr(msg, 'additional_kwargs', {}) or {}),
+                    response_metadata=dict(getattr(msg, 'response_metadata', {}) or {}),
+                    id=getattr(msg, 'id', None),
+                )
+                return list(messages) + [cleaned]
+        return list(messages)
+
     def _invoke_with_structured_output(self, llm_client: Any, messages: List, struct_model: Any, config: RunnableConfig):
         """
         Invoke LLM with structured output, handling tool calls if present.
@@ -206,13 +246,26 @@ class LLMNode(BaseTool):
         initial_completion = llm_client.invoke(messages, config=config)
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
-            # Handle tool calls first, then apply structured output
+            # Handle tool calls first, then apply structured output.
+            #
+            # See ``_build_clean_messages_for_structured_output`` for why we strip
+            # the intermediate tool exchange before the second call. The full
+            # ``new_messages`` history is still returned upstream so checkpoint
+            # state and audit-trail hooks remain unaffected.
             new_messages, _ = self._run_async_in_sync_context(
                 self.__perform_tool_calling(initial_completion, messages, llm_client, config)
             )
+            clean_messages = self._build_clean_messages_for_structured_output(messages, new_messages)
             llm = self.__get_struct_output_model(llm_client, struct_model)
-            completion = llm.invoke(new_messages, config=config)
-            return completion, initial_completion, new_messages
+            try:
+                completion = llm.invoke(clean_messages, config=config)
+                return completion, initial_completion, new_messages
+            except (ValueError, ValidationError, OutputParserException):
+                plain_completion = llm_client.invoke(clean_messages, config=config)
+                completion = self._extract_structured_from_content(plain_completion, struct_model)
+                if completion is not None:
+                    return completion, initial_completion, new_messages
+                raise
         else:
             # Direct structured output without tool calls
             llm = self.__get_struct_output_model(llm_client, struct_model)
