@@ -428,6 +428,44 @@ class TestBuildCleanMessagesForStructuredOutput:
         result = node._build_clean_messages_for_structured_output(messages, new_messages)
         assert result == messages
 
+    def test_strip_tool_use_blocks_passes_through_string_content(self):
+        """No-regression: OpenAI/non-Anthropic models return string content. The
+        strip helper must be a no-op for strings — same object reference returned."""
+        node = _make_llm_node()
+        s = "plain text answer"
+        result = node._strip_tool_use_blocks(s)
+        assert result is s, "string content must be returned unchanged (same reference)"
+
+    def test_strip_tool_use_blocks_passes_through_list_without_tool_use(self):
+        """List content with only thinking + text blocks (no tool_use) — returned
+        list must be equal to the original. Used to verify that the helper does
+        not corrupt thinking-on responses that happen not to contain tool_use."""
+        node = _make_llm_node()
+        blocks = [
+            {"type": "thinking", "thinking": "thinking text", "signature": "s"},
+            {"type": "text", "text": "answer"},
+        ]
+        result = node._strip_tool_use_blocks(blocks)
+        assert result == blocks
+        assert all(b.get('type') != 'tool_use' for b in result)
+
+    def test_openai_shape_string_content_passes_through_unchanged(self):
+        """No-regression: when the last AIMessage has plain string content and no
+        tool_calls (the typical OpenAI/GPT shape after __perform_tool_calling
+        completes), the helper returns the message unchanged (same reference) —
+        no defensive copy, no allocation."""
+        node = _make_llm_node()
+        messages = [HumanMessage(content="ask")]
+        final_ai = AIMessage(content="OpenAI-style string synthesis answer")
+        new_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("planning"),
+            _tool_msg(),
+            final_ai,
+        ]
+        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        assert result[1] is final_ai, "string-content AIMessage must be passed through by reference"
+
 
 class TestInvokeWithStructuredOutputToolCallingBranch:
     """Verify the patched tool-calling branch passes sanitized history and falls
@@ -637,4 +675,66 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
 
         assert struct_llm.invoke.call_count == 1
         assert llm_client.invoke.call_count == 1, "no fallback should fire"
+        assert node.client.invoke.call_count == 0, "unbound client must not be touched on success"
         assert len(completion.question) == 3
+
+    def test_openai_happy_path_returns_original_initial_completion_unchanged(self):
+        """No-regression contract for _format_structured_output_result consumer:
+        on the OpenAI/GPT happy path (structured output succeeds without fallback),
+        the initial_completion returned upstream MUST be the original first
+        AIMessage with tool_calls — not plain_completion. This preserves the
+        pre-fix behavior where _format_structured_output_result reads
+        initial_completion.content for ELITEA_RS fallback."""
+        messages = [HumanMessage(content="ask")]
+        loop_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("planning"),
+            _tool_msg(),
+            _ai_clean("done"),
+        ]
+        success = self._struct_model_with_question_list()(
+            question=[{"id": "x"}], **{ELITEA_RS: "user-facing summary"}
+        )
+        node, struct_model, llm_client, _ = self._build_node_with_mocks(
+            loop_messages, second_call_behavior=success,
+        )
+
+        # Capture the first_completion the mock returns
+        first_completion_returned = llm_client.invoke.return_value
+
+        _, returned_initial, _ = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+
+        assert returned_initial is first_completion_returned, (
+            "happy path must return the original initial_completion — only the "
+            "fallback path swaps it for plain_completion"
+        )
+
+    def test_openai_value_error_falls_through_to_upstream_handler(self):
+        """No-regression: when structured output raises ValueError AND the local
+        fallback's content extraction fails (returns None), the original
+        ValueError must re-raise so the upstream caller's _handle_structured_output_fallback
+        (json_mode → function_calling → text extraction chain) still gets to run.
+        Verifies we did not shortcut the existing OpenAI fallback chain."""
+        messages = [HumanMessage(content="ask")]
+        loop_messages = [
+            HumanMessage(content="ask"),
+            _ai_with_tool_calls("planning"),
+            _tool_msg(),
+            _ai_clean("done"),
+        ]
+        # Fallback response that _extract_structured_from_content cannot parse
+        unparseable = AIMessage(content="not json, just words and more words")
+        node, struct_model, llm_client, _ = self._build_node_with_mocks(
+            loop_messages,
+            second_call_behavior=ValueError("structured output failed"),
+            plain_call_response=unparseable,
+        )
+
+        with pytest.raises(ValueError, match="structured output failed"):
+            node._invoke_with_structured_output(llm_client, messages, struct_model, config={})
+
+        # Verify the upstream handler will receive a ValueError it can catch
+        # (line 1252 of llm.py only catches ValueError).
+        assert node.client.invoke.call_count == 1, "local fallback attempted"
