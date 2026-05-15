@@ -42,9 +42,19 @@ class BaseAction(BaseTool):
         **kwargs: Any,
     ) -> ToolException | str:
         """Use the Confluence API to run an operation."""
+        nullable_fields = set()
+        if self.args_schema:
+            for field_name, field_info in self.args_schema.model_fields.items():
+                json_extra = getattr(field_info, 'json_schema_extra', None) or {}
+                if json_extra.get('nullable'):
+                    nullable_fields.add(field_name)
+
         # Strip None values — LLM sends explicit nulls for optional params
         # (Pydantic schemas show "default": null), which can cause failures
-        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        kwargs = {
+            k: v for k, v in kwargs.items()
+            if v is not None or k in nullable_fields
+        }
         # Strip numeric suffix added for deduplication (_2, _3, etc.)
         # to get the original tool name that exists in the wrapper
         import re

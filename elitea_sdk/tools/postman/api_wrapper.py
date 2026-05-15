@@ -77,7 +77,10 @@ PostmanCreateCollection = create_model(
     variables=(Optional[List[Dict]], Field(
         description="Optional collection variables", default=None)),
     auth=(Optional[Dict], Field(
-        description="Optional default authentication", default=None))
+        description="Optional default authentication. Pass null to explicitly set no auth.",
+        default=None,
+        json_schema_extra={'nullable': True}
+    ))
 )
 
 PostmanUpdateCollectionName = create_model(
@@ -104,8 +107,9 @@ PostmanUpdateCollectionVariables = create_model(
 PostmanUpdateCollectionAuth = create_model(
     "PostmanUpdateCollectionAuth",
     auth=(Optional[Dict[str, Any]], Field(default=None,
-         description="Updated authentication settings. Example: {'type': 'bearer',token '': 'your_token'}"
-     ))
+        description="Updated authentication settings. Pass null to clear authentication. Example: {'type': 'bearer', 'token': 'your_token'}",
+        json_schema_extra={'nullable': True}
+    ))
 )
 
 PostmanDeleteCollection = create_model(
@@ -126,7 +130,10 @@ PostmanCreateFolder = create_model(
     parent_path=(Optional[str], Field(
         description="Optional parent folder path", default=None)),
     auth=(Optional[Dict], Field(
-        description="Optional folder-level authentication", default=None))
+        description="Optional folder-level authentication. Pass null to explicitly set no auth.",
+        default=None,
+        json_schema_extra={'nullable': True}
+    ))
 )
 
 PostmanUpdateFolder = create_model(
@@ -137,7 +144,10 @@ PostmanUpdateFolder = create_model(
     description=(Optional[str], Field(
         description="New description for the folder", default=None)),
     auth=(Optional[Dict], Field(
-        description="Updated authentication settings", default=None))
+        description="Updated authentication settings. Pass null to clear authentication.",
+        default=None,
+        json_schema_extra={'nullable': True}
+    ))
 )
 
 PostmanDeleteFolder = create_model(
@@ -166,7 +176,10 @@ PostmanCreateRequest = create_model(
     body=(Optional[Dict], Field(
         description="Optional request body", default=None)),
     auth=(Optional[Dict], Field(
-        description="Optional request authentication", default=None)),
+        description="Optional request authentication. Pass null to explicitly set no auth.",
+        default=None,
+        json_schema_extra={'nullable': True}
+    )),
     tests=(Optional[str], Field(
         description="Optional test script code", default=None)),
     pre_request_script=(Optional[str], Field(
@@ -234,7 +247,9 @@ PostmanUpdateRequestAuth = create_model(
             "`type`: Authentication type (e.g., \"apikey\", \"bearer\", \"basic\"). "
             "`apikey`, `bearer`, `basic`: List of key-value pairs for configuration."
             "Other types can be added as needed, following the same structure."
-        )))
+        ),
+        json_schema_extra={'nullable': True}
+    ))
 )
 
 PostmanUpdateRequestTests = create_model(
@@ -1227,7 +1242,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             if variables:
                 collection_data["collection"]["variable"] = variables
 
-            if auth:
+            if auth is not None:
                 collection_data["collection"]["auth"] = auth
 
             response = self._make_request(
@@ -1396,7 +1411,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
 
             if description:
                 folder_item["description"] = description
-            if auth:
+            if auth is not None:
                 folder_item["auth"] = auth
 
             # Add folder to appropriate location
@@ -1570,7 +1585,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
                 request_item["request"]["description"] = description
             if body:
                 request_item["request"]["body"] = body
-            if auth:
+            if auth is not None:
                 request_item["request"]["auth"] = auth
 
             # Add events if provided
