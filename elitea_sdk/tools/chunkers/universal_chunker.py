@@ -120,7 +120,7 @@ def _code_chunker_from_documents(
             }
     
     # parse_code_files_for_db returns chunks with proper metadata
-    for chunk in parse_code_files_for_db(file_content_generator()):
+    for chunk in parse_code_files_for_db(file_content_generator(), config=config):
         # Ensure file_path is preserved
         if 'file_path' not in chunk.metadata and 'filename' in chunk.metadata:
             chunk.metadata['file_path'] = chunk.metadata['filename']
