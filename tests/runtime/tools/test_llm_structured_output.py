@@ -738,3 +738,636 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         # Verify the upstream handler will receive a ValueError it can catch
         # (line 1252 of llm.py only catches ValueError).
         assert node.client.invoke.call_count == 1, "local fallback attempted"
+
+
+# ---------------------------------------------------------------------------
+# Issue #4890 fix: Anthropic thinking-mode detection and json_schema routing
+#
+# These tests verify the core fix introduced in PR for #4890 (second pass):
+# - _is_anthropic_thinking_client detects the thinking flag correctly
+# - _patch_schema_empty_items patches list[Any] items for Anthropic's schema validator
+# - __get_struct_output_model routes to method='json_schema' for thinking Anthropic
+#   and leaves method='function_calling' for non-thinking Anthropic and all other providers
+# - _handle_structured_output_fallback skips function_calling retry for thinking Anthropic
+#
+# Uses the realistic Assistant + LLM stub pattern (like test_hitl_resume_real_graph.py)
+# for the integration scenario so the real langchain routing is exercised — NOT mocked
+# away as in the previous PR's tests.
+# ---------------------------------------------------------------------------
+
+
+# ─── Minimal Anthropic-like client stubs (mirror pattern from test_hitl_resume_real_graph.py) ──
+
+
+class _AnthropicThinkingLLM:
+    """Stub that looks like langchain_anthropic.ChatAnthropic with thinking enabled.
+
+    Carries the .thinking attribute that _is_anthropic_thinking_client reads, and
+    a .bound attribute on the tool-bound version so the helper can traverse the
+    RunnableBinding wrapper.
+    """
+
+    def __init__(self):
+        # Matches the ChatAnthropic attribute shape
+        self.thinking = {"type": "enabled", "budget_tokens": 1000}
+        # Fake module-like identifier — module is checked via type().__module__
+        self._module = "langchain_anthropic.chat_models"
+        self.invocations: list = []
+        self.with_structured_output_calls: list = []
+
+    def bind_tools(self, tools, **kwargs):
+        return _AnthropicThinkingLLMBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _AnthropicThinkingLLMBound(self, []).invoke(messages, config=config)
+
+    def with_structured_output(self, schema, method="function_calling", **kwargs):
+        self.with_structured_output_calls.append(method)
+        # Return a stub that produces a Pydantic-like result
+        return _StructuredOutputStub(schema, method)
+
+
+class _AnthropicThinkingLLMBound:
+    """Tool-bound version wrapping _AnthropicThinkingLLM.
+
+    The .bound attribute mimics the RunnableBinding.bound attribute that
+    _is_anthropic_thinking_client inspects.
+    """
+
+    def __init__(self, root: "_AnthropicThinkingLLM", tools):
+        self.root = root
+        self.tools = list(tools)
+        # The key: .bound points back to the real LLM (carries .thinking)
+        self.bound = root
+
+    def invoke(self, messages, config=None):
+        self.root.invocations.append(list(messages))
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        tool_contents = [str(m.content) for m in tool_messages]
+
+        # After tool result present: return clean synthesis AIMessage
+        if any("tool-result" in c for c in tool_contents):
+            return AIMessage(
+                content=[
+                    {"type": "thinking", "thinking": "Both tools completed.", "signature": "sig_final"},
+                    {"type": "text", "text": "Here is the synthesis result."},
+                ]
+            )
+
+        # First call: issue one tool call
+        return AIMessage(
+            content=[
+                {
+                    "type": "thinking",
+                    "thinking": "I need to call the data_fetch tool.",
+                    "signature": "sig_planning",
+                },
+                {"type": "text", "text": ""},
+            ],
+            tool_calls=[
+                {"name": "data_fetch", "args": {"query": "test"}, "id": "call-001"},
+            ],
+        )
+
+    def with_structured_output(self, schema, method="function_calling", **kwargs):
+        self.root.with_structured_output_calls.append(method)
+        return _StructuredOutputStub(schema, method)
+
+
+class _AnthropicNonThinkingLLM:
+    """Stub ChatAnthropic WITHOUT thinking enabled (thinking is None / not set)."""
+
+    def __init__(self):
+        self.thinking = None
+        self._module = "langchain_anthropic.chat_models"
+        self.invocations: list = []
+        self.with_structured_output_calls: list = []
+
+    def bind_tools(self, tools, **kwargs):
+        bound = _AnthropicNonThinkingLLMBound(self, tools)
+        return bound
+
+    def with_structured_output(self, schema, method="function_calling", **kwargs):
+        self.with_structured_output_calls.append(method)
+        return _StructuredOutputStub(schema, method)
+
+    def invoke(self, messages, config=None):
+        return AIMessage(content="synthesis answer")
+
+
+class _AnthropicNonThinkingLLMBound:
+    def __init__(self, root, tools):
+        self.root = root
+        self.bound = root
+
+    def invoke(self, messages, config=None):
+        return self.root.invoke(messages, config=config)
+
+    def with_structured_output(self, schema, method="function_calling", **kwargs):
+        return self.root.with_structured_output(schema, method=method, **kwargs)
+
+
+class _OpenAILikeLLM:
+    """Stub that does NOT look like langchain_anthropic (no thinking attribute)."""
+
+    def __init__(self):
+        self.invocations: list = []
+        self.with_structured_output_calls: list = []
+
+    def bind_tools(self, tools, **kwargs):
+        return _OpenAILikeLLMBound(self, tools)
+
+    def with_structured_output(self, schema, method="function_calling", **kwargs):
+        self.with_structured_output_calls.append(method)
+        return _StructuredOutputStub(schema, method)
+
+    def invoke(self, messages, config=None):
+        return AIMessage(content="openai answer")
+
+
+class _OpenAILikeLLMBound:
+    def __init__(self, root, tools):
+        self.root = root
+        # No .bound attribute — mirrors real OpenAI tool-bound RunnableBinding
+
+    def invoke(self, messages, config=None):
+        return self.root.invoke(messages, config=config)
+
+    def with_structured_output(self, schema, method="function_calling", **kwargs):
+        return self.root.with_structured_output(schema, method=method, **kwargs)
+
+
+class _StructuredOutputStub:
+    """A fake structured-output runnable that returns a Pydantic-like instance."""
+
+    def __init__(self, schema, method: str):
+        self.schema = schema
+        self.method = method
+
+    def invoke(self, messages, config=None):
+        # Return an instance of the Pydantic model with synthetic data
+        try:
+            return self.schema(question=[{"id": "q1", "text": "What?"}], rs="synthesis")
+        except Exception:
+            # Fallback if model doesn't have those exact fields
+            return self.schema.model_construct()
+
+
+# ─── Patch type.__module__ so _is_anthropic_thinking_client sees the right module ──────
+
+def _patch_module(cls: type, module_path: str):
+    """Monkey-patch __module__ on a class so the module-name check in
+    _is_anthropic_thinking_client sees the right string."""
+    cls.__module__ = module_path
+
+
+# Apply the module patches once so the stubs look like langchain_anthropic classes.
+_patch_module(_AnthropicThinkingLLM, "langchain_anthropic.chat_models")
+_patch_module(_AnthropicThinkingLLMBound, "langchain_anthropic.chat_models")
+_patch_module(_AnthropicNonThinkingLLM, "langchain_anthropic.chat_models")
+_patch_module(_AnthropicNonThinkingLLMBound, "langchain_anthropic.chat_models")
+# _OpenAILikeLLM intentionally NOT patched — stays outside langchain_anthropic
+
+
+# ─── Helper ──────────────────────────────────────────────────────────────────
+
+
+def _make_data_fetch_tool():
+    """Return a simple StructuredTool that simulates a data fetch."""
+    from langchain_core.tools import StructuredTool
+
+    def _fetch(query: str = ""):
+        return "tool-result:data"
+
+    return StructuredTool.from_function(
+        func=_fetch,
+        name="data_fetch",
+        description="Fetch data",
+    )
+
+
+# ─── Unit tests: detection helpers ───────────────────────────────────────────
+
+
+class TestIsAnthropicThinkingClient:
+    """Unit tests for LLMNode._is_anthropic_thinking_client."""
+
+    def test_detects_direct_thinking_enabled_client(self):
+        """Direct ChatAnthropic stub with thinking=enabled → True."""
+        client = _AnthropicThinkingLLM()
+        assert LLMNode._is_anthropic_thinking_client(client) is True
+
+    def test_detects_thinking_via_bound_attribute(self):
+        """Tool-bound RunnableBinding stub with .bound carrying .thinking → True."""
+        llm = _AnthropicThinkingLLM()
+        bound = llm.bind_tools([])  # returns _AnthropicThinkingLLMBound
+        assert LLMNode._is_anthropic_thinking_client(bound) is True
+
+    def test_non_thinking_anthropic_returns_false(self):
+        """ChatAnthropic stub with thinking=None → False."""
+        client = _AnthropicNonThinkingLLM()
+        assert LLMNode._is_anthropic_thinking_client(client) is False
+
+    def test_openai_like_client_returns_false(self):
+        """Non-Anthropic client stub → False."""
+        client = _OpenAILikeLLM()
+        assert LLMNode._is_anthropic_thinking_client(client) is False
+
+    def test_magic_mock_returns_false(self):
+        """MagicMock (used in tests) must not be detected as Anthropic thinking."""
+        from unittest.mock import MagicMock
+        assert LLMNode._is_anthropic_thinking_client(MagicMock()) is False
+
+    def test_none_returns_false(self):
+        assert LLMNode._is_anthropic_thinking_client(None) is False
+
+
+class TestPatchSchemaEmptyItems:
+    """Unit tests for LLMNode._patch_schema_empty_items."""
+
+    def test_patches_empty_items_in_array_property(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {}},
+            },
+        }
+        result = LLMNode._patch_schema_empty_items(schema)
+        assert result["properties"]["items"]["items"] == {"type": "object"}
+
+    def test_does_not_mutate_original(self):
+        schema = {"type": "object", "properties": {"a": {"type": "array", "items": {}}}}
+        original_items = schema["properties"]["a"]["items"]
+        LLMNode._patch_schema_empty_items(schema)
+        assert schema["properties"]["a"]["items"] is original_items  # not mutated
+
+    def test_leaves_typed_items_untouched(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"type": "string"}},
+            },
+        }
+        result = LLMNode._patch_schema_empty_items(schema)
+        assert result["properties"]["items"]["items"] == {"type": "string"}
+
+    def test_nested_schema_patched(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "arr": {"type": "array", "items": {}},
+                    },
+                },
+            },
+        }
+        result = LLMNode._patch_schema_empty_items(schema)
+        assert result["properties"]["nested"]["properties"]["arr"]["items"] == {"type": "object"}
+
+
+# ─── Unit tests: __get_struct_output_model routing ────────────────────────────
+
+
+class TestGetStructOutputModelRouting:
+    """Verify that __get_struct_output_model routes to json_schema for
+    thinking-enabled Anthropic and leaves function_calling for all other cases."""
+
+    def _make_node_with_client(self, client) -> LLMNode:
+        node = _make_llm_node()
+        node.client = client
+        return node
+
+    def test_anthropic_thinking_routes_to_json_schema(self):
+        """Thinking-enabled Anthropic → with_structured_output called with method='json_schema'."""
+        llm = _AnthropicThinkingLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        # Call the private method via name-mangling
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="function_calling")
+
+        assert "json_schema" in llm.with_structured_output_calls, (
+            "Anthropic thinking client must trigger json_schema routing, "
+            f"but got: {llm.with_structured_output_calls}"
+        )
+        assert "function_calling" not in llm.with_structured_output_calls, (
+            "function_calling must NOT be called for thinking-enabled Anthropic"
+        )
+
+    def test_anthropic_thinking_bound_client_routes_to_json_schema(self):
+        """Tool-bound (RunnableBinding) wrapping thinking-enabled Anthropic → json_schema."""
+        llm = _AnthropicThinkingLLM()
+        node = self._make_node_with_client(llm)
+        bound = llm.bind_tools([])  # _AnthropicThinkingLLMBound
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        node._LLMNode__get_struct_output_model(bound, struct_model, method="function_calling")
+
+        # Both node.client (base) and the llm stub share the same call list
+        assert "json_schema" in llm.with_structured_output_calls
+
+    def test_non_thinking_anthropic_uses_function_calling(self):
+        """Non-thinking Anthropic → original method='function_calling' forwarded unchanged."""
+        llm = _AnthropicNonThinkingLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="function_calling")
+
+        assert "function_calling" in llm.with_structured_output_calls, (
+            "Non-thinking Anthropic must use function_calling (the default path)"
+        )
+        assert "json_schema" not in llm.with_structured_output_calls
+
+    def test_openai_uses_function_calling(self):
+        """OpenAI-like client → original method='function_calling' forwarded unchanged."""
+        llm = _OpenAILikeLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="function_calling")
+
+        assert "function_calling" in llm.with_structured_output_calls
+        assert "json_schema" not in llm.with_structured_output_calls
+
+    def test_explicit_json_schema_always_forwarded(self):
+        """When caller explicitly requests json_schema (e.g., fallback path), it must be
+        forwarded for ALL providers including thinking Anthropic — no extra routing."""
+        llm = _AnthropicThinkingLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        # The json_schema → json_schema identity path: Anthropic + thinking but
+        # method already is json_schema → falls through to default, still json_schema
+        # via the base path (the if-branch only fires for method="function_calling")
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="json_schema")
+        # json_schema was forwarded (not re-routed from function_calling)
+        # The call must appear in the log exactly once
+        assert llm.with_structured_output_calls.count("json_schema") == 1
+
+    def test_json_mode_forwarded_for_non_thinking_client(self):
+        """json_mode forwarded as-is for non-Anthropic (used in _handle_structured_output_fallback)."""
+        llm = _OpenAILikeLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"name": {"type": "str"}})
+
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="json_mode")
+
+        assert "json_mode" in llm.with_structured_output_calls
+
+
+# ─── Integration-style test: full _invoke_with_structured_output with realistic shapes ──────
+
+
+class TestAnthropicThinkingStructuredOutputIntegration:
+    """Integration-level tests using the realistic LLM stub pattern.
+
+    These tests exercise the REAL _invoke_with_structured_output code path
+    (not mocked away) with fake Anthropic thinking LLM stubs. They verify:
+    1. The full tool-calling → structured output loop works end-to-end.
+    2. with_structured_output is called with method='json_schema' (NOT function_calling).
+    3. Non-raising path: no OutputParserException.
+    4. Non-thinking Anthropic and OpenAI remain on the function_calling path.
+    """
+
+    def _make_node_for_anthropic_thinking(self, llm) -> LLMNode:
+        """Build a minimal LLMNode wired for structured output with a thinking Anthropic LLM."""
+        node = LLMNode(
+            name="test_thinking_llm",
+            description="test",
+            input_variables=["messages"],
+            input_mapping={},
+            output_variables=["question"],
+            structured_output=True,
+            structured_output_dict={"question": {"type": "list", "description": "Questions"}},
+            available_tools=[_make_data_fetch_tool()],
+            tool_names=["data_fetch"],
+        )
+        node.client = llm
+        return node
+
+    def test_anthropic_thinking_with_tool_call_uses_json_schema(self):
+        """Full scenario: thinking-enabled Anthropic LLM issues a tool call,
+        tool returns result, then structured output is requested. The
+        with_structured_output call must use method='json_schema', NOT
+        method='function_calling', to avoid _raise_if_no_tool_calls.
+
+        This is the core fix for issue #4890 (second pass).
+        """
+        llm = _AnthropicThinkingLLM()
+        node = self._make_node_for_anthropic_thinking(llm)
+
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        # Simulate: first LLM call returns a tool-calling AIMessage (thinking blocks)
+        tool_call_msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "I'll call data_fetch.", "signature": "sig1"},
+                {"type": "text", "text": ""},
+            ],
+            tool_calls=[{"name": "data_fetch", "args": {"query": "test"}, "id": "tc-001"}],
+        )
+        # After tool result: clean AIMessage (no tool_calls)
+        synthesis_msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "Got results.", "signature": "sig2"},
+                {"type": "text", "text": "Here is the answer."},
+            ]
+        )
+
+        # Wire the tool-bound client: first call = tool_call_msg
+        llm_bound = llm.bind_tools([_make_data_fetch_tool()])
+        llm_bound_invoke_responses = iter([tool_call_msg, synthesis_msg])
+
+        original_bound_invoke = llm_bound.invoke
+
+        def controlled_invoke(messages, config=None):
+            try:
+                return next(llm_bound_invoke_responses)
+            except StopIteration:
+                return synthesis_msg
+
+        llm_bound.invoke = controlled_invoke
+
+        # Track with_structured_output calls
+        wso_calls = []
+        original_wso = llm_bound.with_structured_output
+
+        def tracked_wso(schema, method="function_calling", **kwargs):
+            wso_calls.append(method)
+            return original_wso(schema, method=method, **kwargs)
+
+        llm_bound.with_structured_output = tracked_wso
+
+        messages = [HumanMessage(content="Fetch data and give me a structured list")]
+
+        # Run _invoke_with_structured_output
+        completion, initial, final_messages = node._invoke_with_structured_output(
+            llm_bound, messages, struct_model, config={}
+        )
+
+        # CRITICAL ASSERTION: structured output must use json_schema, not function_calling
+        assert "json_schema" in wso_calls, (
+            f"Anthropic thinking-enabled model must use method='json_schema' for "
+            f"structured output, but with_structured_output was called with: {wso_calls}. "
+            "This is the root cause of issue #4890 — function_calling goes through "
+            "_raise_if_no_tool_calls which raises OutputParserException on synthesis turns."
+        )
+        assert "function_calling" not in wso_calls, (
+            f"function_calling must NOT be used for thinking-enabled Anthropic, "
+            f"got: {wso_calls}"
+        )
+
+        # No exception was raised — the fix works
+        assert completion is not None
+
+    def test_non_thinking_anthropic_still_uses_function_calling(self):
+        """Non-regression: non-thinking Anthropic must still use function_calling."""
+        llm = _AnthropicNonThinkingLLM()
+        node = self._make_node_for_anthropic_thinking(llm)
+
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        # Single call: direct completion without tool calling
+        synthesis = AIMessage(content="plain string synthesis")
+
+        llm_bound = llm.bind_tools([_make_data_fetch_tool()])
+        llm_bound.invoke = lambda msgs, config=None: synthesis
+
+        wso_calls = []
+        original_wso = llm_bound.with_structured_output
+
+        def tracked_wso(schema, method="function_calling", **kwargs):
+            wso_calls.append(method)
+            return original_wso(schema, method=method, **kwargs)
+
+        llm_bound.with_structured_output = tracked_wso
+
+        messages = [HumanMessage(content="Give me a list")]
+
+        completion, _, _ = node._invoke_with_structured_output(
+            llm_bound, messages, struct_model, config={}
+        )
+
+        assert "function_calling" in wso_calls, (
+            f"Non-thinking Anthropic must use function_calling, got: {wso_calls}"
+        )
+        assert "json_schema" not in wso_calls, (
+            "json_schema must NOT be used for non-thinking Anthropic"
+        )
+
+    def test_openai_path_uses_function_calling(self):
+        """No-regression: OpenAI-like client must use function_calling (unchanged path)."""
+        llm = _OpenAILikeLLM()
+        node = self._make_node_for_anthropic_thinking(llm)
+
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        synthesis = AIMessage(content="openai synthesis answer")
+        llm_bound = llm.bind_tools([_make_data_fetch_tool()])
+        llm_bound.invoke = lambda msgs, config=None: synthesis
+
+        wso_calls = []
+        original_wso = llm_bound.with_structured_output
+
+        def tracked_wso(schema, method="function_calling", **kwargs):
+            wso_calls.append(method)
+            return original_wso(schema, method=method, **kwargs)
+
+        llm_bound.with_structured_output = tracked_wso
+
+        messages = [HumanMessage(content="Give me a list")]
+
+        node._invoke_with_structured_output(llm_bound, messages, struct_model, config={})
+
+        assert "function_calling" in wso_calls, (
+            f"OpenAI path must use function_calling, got: {wso_calls}"
+        )
+        assert "json_schema" not in wso_calls
+
+
+# ─── _handle_structured_output_fallback: thinking model skips function_calling ──────
+
+
+class TestHandleStructuredOutputFallbackThinkingModel:
+    """Verify that the fallback chain skips function_calling for thinking Anthropic.
+
+    The json_mode → function_calling → plain text chain would previously loop back
+    into function_calling which always raises OutputParserException for thinking models.
+    The fix skips function_calling and falls through directly to plain text extraction.
+    """
+
+    def test_thinking_anthropic_skips_function_calling_in_fallback(self):
+        """When json_mode fails for a thinking-enabled Anthropic model, the fallback must
+        skip function_calling and go straight to plain text extraction."""
+        llm = _AnthropicThinkingLLM()
+        node = _make_llm_node()
+        node.client = llm
+
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        method_calls = []
+
+        # Patch __get_struct_output_model to track which methods are attempted
+        def patched_get_struct_output(client, model, method="function_calling"):
+            method_calls.append(method)
+            if method == "json_mode":
+                raise ValueError("json_mode failed for thinking model")
+            if method == "function_calling":
+                pytest.fail(
+                    "function_calling must NOT be attempted in the fallback chain "
+                    "for thinking-enabled Anthropic models — it always raises "
+                    "OutputParserException via _raise_if_no_tool_calls."
+                )
+            raise ValueError(f"unexpected method: {method}")
+
+        node._LLMNode__get_struct_output_model = patched_get_struct_output
+
+        # Plain client invoke returns parseable JSON
+        json_response = AIMessage(
+            content='{"question": [{"id": "q1"}], "rs": "summary"}'
+        )
+        llm.invoke = lambda msgs, config=None: json_response
+
+        messages = [HumanMessage(content="list please")]
+
+        # Must not raise; must not call function_calling
+        result = node._handle_structured_output_fallback(
+            llm, messages, struct_model, {}, ValueError("initial error")
+        )
+
+        assert "function_calling" not in method_calls, (
+            f"function_calling was called in fallback for thinking model: {method_calls}"
+        )
+        assert result is not None
+
+    def test_non_thinking_anthropic_still_tries_function_calling_in_fallback(self):
+        """Non-regression: non-thinking Anthropic must still try function_calling."""
+        llm = _AnthropicNonThinkingLLM()
+        node = _make_llm_node()
+        node.client = llm
+
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        method_calls = []
+
+        def patched_get_struct_output(client, model, method="function_calling"):
+            method_calls.append(method)
+            raise ValueError(f"{method} failed")
+
+        node._LLMNode__get_struct_output_model = patched_get_struct_output
+
+        # Plain client invoke returns parseable JSON
+        json_response = AIMessage(content='{"question": [{"id": "q1"}], "rs": ""}')
+        llm.invoke = lambda msgs, config=None: json_response
+
+        messages = [HumanMessage(content="list please")]
+        node._handle_structured_output_fallback(
+            llm, messages, struct_model, {}, ValueError("initial")
+        )
+
+        assert "function_calling" in method_calls, (
+            "Non-thinking Anthropic fallback must attempt function_calling"
+        )

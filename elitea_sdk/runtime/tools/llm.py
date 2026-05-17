@@ -455,7 +455,9 @@ class LLMNode(BaseTool):
         else:
             modified_messages.append(HumanMessage(content=json_instruction))
 
-        # Try json_mode with explicit instructions
+        # Try json_mode with explicit instructions.
+        # Note: for langchain-anthropic json_mode is an alias for json_schema,
+        # so this is safe for thinking-enabled Anthropic models too.
         try:
             completion = self.__get_struct_output_model(
                 llm_client, struct_model, method="json_mode"
@@ -463,29 +465,41 @@ class LLMNode(BaseTool):
             return completion
         except Exception as json_mode_error:
             logger.warning(f"json_mode also failed: {json_mode_error}")
-            logger.info("Falling back to function_calling method")
 
-            # Try function_calling as a third fallback
-            try:
-                completion = self.__get_struct_output_model(
-                    llm_client, struct_model, method="function_calling"
-                ).invoke(modified_messages, config=config)
-                return completion
-            except Exception as function_calling_error:
-                logger.error(f"function_calling also failed: {function_calling_error}")
-                logger.info("Final fallback: using plain LLM response")
-
-                # Last resort: get plain text response and wrap in structure
-                plain_completion = llm_client.invoke(modified_messages, config=config)
-                content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
-
+            # Fix for #4890: skip the function_calling retry for
+            # thinking-enabled Anthropic models — it will always raise
+            # OutputParserException via _raise_if_no_tool_calls when the model
+            # produces a synthesis turn with no tool_use block. Use the plain
+            # text extraction path directly instead.
+            if self._is_anthropic_thinking_client(self.client):
+                logger.info(
+                    "[#4890] Skipping function_calling retry for thinking-enabled "
+                    "Anthropic model in fallback path; using plain LLM response."
+                )
+            else:
+                logger.info("Falling back to function_calling method")
+                # Try function_calling as a third fallback
                 try:
-                    parsed = extract_json_content(content)
-                    completion = self._map_parsed_json_to_model(parsed, struct_model)
+                    completion = self.__get_struct_output_model(
+                        llm_client, struct_model, method="function_calling"
+                    ).invoke(modified_messages, config=config)
                     return completion
-                except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
-                    logger.warning(f"Could not parse extracted JSON: {parse_error}")
-                    return self._create_fallback_completion(content, struct_model)
+                except Exception as function_calling_error:
+                    logger.error(f"function_calling also failed: {function_calling_error}")
+
+            logger.info("Final fallback: using plain LLM response")
+
+            # Last resort: get plain text response and wrap in structure
+            plain_completion = llm_client.invoke(modified_messages, config=config)
+            content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
+
+            try:
+                parsed = extract_json_content(content)
+                completion = self._map_parsed_json_to_model(parsed, struct_model)
+                return completion
+            except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
+                logger.warning(f"Could not parse extracted JSON: {parse_error}")
+                return self._create_fallback_completion(content, struct_model)
 
     def _format_structured_output_result(self, result: dict, messages: List, initial_completion: Any) -> dict:
         """
@@ -2578,5 +2592,155 @@ class LLMNode(BaseTool):
         _PENDING_TOOL_MESSAGES.set([])
         return new_messages, current_completion
 
-    def __get_struct_output_model(self, llm_client, pydantic_model, method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling"):
+    # -----------------------------------------------------------------------
+    # Anthropic thinking-mode detection
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _is_anthropic_thinking_client(client: Any) -> bool:
+        """Return True when *client* is (or wraps) a langchain-anthropic ChatAnthropic
+        instance that has ``thinking={"type": "enabled"}``.
+
+        Checks both the direct client object and, when the client is a
+        ``RunnableBinding`` (produced by ``bind_tools``), the underlying ``bound``
+        model that carries the ``thinking`` attribute.
+
+        Returns False defensively on any unexpected type or attribute error so
+        that the detection cannot break the structured-output path.
+        """
+        try:
+            # llm_client may be the tool-bound RunnableBinding wrapping the real
+            # ChatAnthropic model, or it may be the base ChatAnthropic directly.
+            # We check both layers.
+            candidates = [client]
+            bound = getattr(client, 'bound', None)
+            if bound is not None:
+                candidates.append(bound)
+
+            for candidate in candidates:
+                module = getattr(type(candidate), '__module__', '') or ''
+                if 'langchain_anthropic' not in module:
+                    continue
+                thinking = getattr(candidate, 'thinking', None)
+                if isinstance(thinking, dict) and thinking.get('type') == 'enabled':
+                    return True
+        except Exception:  # pragma: no cover — defensive
+            pass
+        return False
+
+    @staticmethod
+    def _patch_schema_empty_items(schema: dict) -> dict:
+        """Patch ``"items": {}`` entries in a JSON Schema dict so that the
+        Anthropic ``transform_schema`` utility accepts it.
+
+        Pydantic generates ``"items": {}`` for ``list[Any]`` (bare untyped
+        lists). The Anthropic SDK's ``transform_schema`` raises
+        ``ValueError("Schema must have a 'type' …")`` on empty items objects.
+        Replacing the empty object with ``{"type": "object"}`` is the minimal
+        fix that keeps the schema semantically correct (a list of objects covers
+        the ``Any`` case for the purposes of the structured-output API call).
+
+        The schema argument is deep-copied before modification so callers'
+        original schema objects are not mutated.
+        """
+        import copy
+
+        schema = copy.deepcopy(schema)
+
+        def _fix(obj: Any) -> None:
+            if not isinstance(obj, dict):
+                return
+            if obj.get('type') == 'array' and obj.get('items') == {}:
+                obj['items'] = {'type': 'object'}
+            for value in obj.values():
+                _fix(value)
+
+        _fix(schema)
+        return schema
+
+    def __get_struct_output_model(
+        self,
+        llm_client: Any,
+        pydantic_model: Any,
+        method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling",
+    ) -> Any:
+        """Return ``llm_client.with_structured_output(pydantic_model, method=...)``.
+
+        Fix for #4890 (incomplete after PR #156):
+        When the bound LLM is a langchain-anthropic ``ChatAnthropic`` with
+        ``thinking={"type": "enabled"}``, calling
+        ``with_structured_output(method='function_calling')`` (the default)
+        routes through ``_get_llm_for_structured_output_when_thinking_is_enabled``
+        which appends a ``_raise_if_no_tool_calls`` parser. After the preceding
+        tool-calling exchange is resolved and the model produces a plain text
+        synthesis turn, this parser raises ``OutputParserException`` because no
+        ``tool_use`` block is present in the synthesis response.
+
+        The fix: detect Anthropic + thinking and route to ``method='json_schema'``
+        instead. ``json_schema`` uses Anthropic's native ``output_format`` API
+        parameter which is compatible with thinking mode and does NOT go through
+        ``_raise_if_no_tool_calls``.
+
+        Because Pydantic dynamically generates ``list[Any]`` fields (from the
+        ``"list"`` type string in the pipeline config) which produce
+        ``"items": {}`` in the JSON Schema, and the Anthropic SDK's
+        ``transform_schema`` rejects empty items objects, we attempt the
+        ``json_schema`` call directly and catch the ``ValueError`` emitted by
+        ``transform_schema``. On failure we build the structured runnable
+        manually: patch the schema's empty items, call ``with_structured_output``
+        on the patched dict schema, and wire in a ``PydanticOutputParser`` so
+        the output is still a Pydantic instance.
+
+        For non-thinking Anthropic, OpenAI, Azure, Google, and any other
+        provider the existing ``method`` argument is forwarded unchanged.
+        """
+        # --- Anthropic thinking-mode detection (Fix #4890) ---
+        # self.client is the unbound base ChatAnthropic (carries the .thinking
+        # attribute).  llm_client is the tool-bound RunnableBinding — its
+        # .bound attribute points back to the base model.  Check both.
+        if method == "function_calling" and self._is_anthropic_thinking_client(self.client):
+            # First attempt: json_schema directly on the Pydantic model.
+            # This succeeds when all list fields are typed (e.g., list[str]).
+            try:
+                return llm_client.with_structured_output(pydantic_model, method='json_schema')
+            except ValueError:
+                # Second attempt: patch empty-items in the JSON schema so
+                # transform_schema accepts it, then build the runnable manually
+                # to keep the output as a Pydantic instance.
+                logger.debug(
+                    "[#4890] json_schema direct call failed (likely list[Any] field); "
+                    "patching schema and building structured runnable manually."
+                )
+                try:
+                    from langchain_anthropic.chat_models import _convert_to_anthropic_output_format
+                    from langchain_core.output_parsers import PydanticOutputParser
+                    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+                    patched_schema = self._patch_schema_empty_items(pydantic_model.model_json_schema())
+                    output_format = _convert_to_anthropic_output_format(patched_schema)
+                    openai_schema = convert_to_openai_tool(pydantic_model)
+
+                    # Resolve the actual ChatAnthropic base model so we can
+                    # call .bind() on it (not on the tool-bound RunnableBinding,
+                    # which would double-bind tools into the structured call).
+                    base_model = getattr(llm_client, 'bound', llm_client)
+                    bound_for_output = base_model.bind(
+                        output_format=output_format,
+                        ls_structured_output_format={
+                            'kwargs': {'method': 'json_schema'},
+                            'schema': openai_schema,
+                        },
+                    )
+                    output_parser = PydanticOutputParser(pydantic_object=pydantic_model)
+                    return bound_for_output | output_parser
+                except Exception as manual_err:
+                    # All json_schema attempts failed — fall back to the
+                    # original function_calling path and let the caller's
+                    # try/except deal with any OutputParserException.
+                    logger.warning(
+                        "[#4890] Manual json_schema structured output build failed (%s); "
+                        "falling back to function_calling.",
+                        manual_err,
+                    )
+        # --- Default / fallback path (all other providers and non-thinking Anthropic) ---
         return llm_client.with_structured_output(pydantic_model, method=method)
