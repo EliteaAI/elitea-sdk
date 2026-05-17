@@ -24,6 +24,7 @@ from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
     extract_json_content,
+    make_anthropic_compatible_schema,
     propagate_the_input_mapping,
 )
 from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 SENSITIVE_TOOL_BLOCKED_RESULT_TYPE = 'sensitive_tool_blocked'
 MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS = 5
 BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER = 'This is a continuation turn after the blocked action(s):'
+STRUCTURED_OUTPUT_PREFILL_PROMPT = "Now produce the structured output based on the information above."
 
 # ContextVar used by __perform_tool_calling to expose intermediate messages
 # accumulated during the current LLMNode execution.  The sensitive-tool guard
@@ -205,28 +207,26 @@ class LLMNode(BaseTool):
         return content
 
     def _build_clean_messages_for_structured_output(self, new_messages: List) -> List:
-        """Return ``new_messages`` for the structured-output follow-up call,
-        sanitizing only the last ``AIMessage`` if it carries unmatched
-        ``tool_calls`` / ``tool_use`` blocks (e.g. max-iterations exit).
+        """Return ``new_messages`` shaped for the structured-output follow-up
+        call. Two contracts are enforced:
 
-        The full tool exchange — all matched ``(tool_call → tool_result)``
-        pairs — is preserved so the structured-output call sees the data the
-        model used for its synthesis. Without this, the model is asked to
-        emit structured output for a question it can no longer see the
-        evidence for, and both Anthropic (json_schema) and OpenAI/Azure
-        (function_calling) return empty/hallucinated values.
+        1. **Tool-use sanitization.** The full tool exchange — all matched
+           ``(tool_call → tool_result)`` pairs — is preserved so the
+           structured-output call sees the data the model used for its
+           synthesis. Only the last ``AIMessage`` is sanitized, and only
+           when it carries unmatched ``tool_calls`` / ``tool_use`` blocks
+           (the max-iterations exit case). Sending unmatched ``tool_use``
+           triggers Anthropic's *"tool_use without tool_result"* error.
 
-        The earlier "drop the entire tool exchange" workaround was specific
-        to the original Anthropic-thinking + forced-tool-calling failure
-        mode (issue #4890); with the source-level fix in
-        ``parse_pydantic_type`` (``AnyJsonValue``) and the json_schema
-        routing in ``__get_struct_output_model``, no stripping of matched
-        pairs is needed.
-
-        Sanitization is applied only to the **last** ``AIMessage`` and only
-        when it has unmatched tool calls (no ``ToolMessage`` follows it).
-        That is the corner case where Anthropic would otherwise reject the
-        history with *"tool_use without tool_result"*.
+        2. **Trailing-user-message invariant.** When the conversation
+           ends with an ``AIMessage`` (the synthesis turn), Anthropic's
+           gateway treats it as an assistant prefill and rejects it with
+           *"This model does not support assistant message prefill. The
+           conversation must end with a user message."* Append a short
+           ``HumanMessage`` to satisfy the invariant. Schema enforcement
+           still happens at the API boundary via
+           ``with_structured_output``; the HumanMessage is purely the
+           "your turn" signal Anthropic requires.
         """
         if not new_messages:
             return list(new_messages)
@@ -245,16 +245,20 @@ class LLMNode(BaseTool):
         has_tool_calls = bool(getattr(last_msg, 'tool_calls', None))
         content_changed = cleaned_content is not last_msg.content and cleaned_content != last_msg.content
 
-        if not has_tool_calls and not content_changed:
-            return list(new_messages)
+        if has_tool_calls or content_changed:
+            cleaned = AIMessage(
+                content=cleaned_content,
+                additional_kwargs=dict(getattr(last_msg, 'additional_kwargs', {}) or {}),
+                response_metadata=dict(getattr(last_msg, 'response_metadata', {}) or {}),
+                id=getattr(last_msg, 'id', None),
+            )
+            result = list(new_messages[:last_ai_index]) + [cleaned]
+        else:
+            result = list(new_messages)
 
-        cleaned = AIMessage(
-            content=cleaned_content,
-            additional_kwargs=dict(getattr(last_msg, 'additional_kwargs', {}) or {}),
-            response_metadata=dict(getattr(last_msg, 'response_metadata', {}) or {}),
-            id=getattr(last_msg, 'id', None),
-        )
-        return list(new_messages[:last_ai_index]) + [cleaned]
+        if isinstance(result[-1], AIMessage):
+            result.append(HumanMessage(content=STRUCTURED_OUTPUT_PREFILL_PROMPT))
+        return result
 
     def _invoke_with_structured_output(self, llm_client: Any, messages: List, struct_model: Any, config: RunnableConfig):
         """
@@ -265,10 +269,9 @@ class LLMNode(BaseTool):
 
         Exceptions from the structured-output invocation propagate to the caller,
         which routes them through ``_handle_structured_output_fallback``. There is
-        no local recovery path here — the source schema (``parse_pydantic_type``
-        emits Anthropic-compatible shapes via ``AnyJsonValue``) and the routing
-        in ``__get_struct_output_model`` (``json_schema`` for thinking-Anthropic)
-        make the previous local recovery dead code.
+        no local recovery path here — the Anthropic schema patch and json_schema
+        routing in ``__get_struct_output_model`` keep the supported provider
+        matrix functional, so the previous local recovery is dead code.
         """
         initial_completion = llm_client.invoke(messages, config=config)
 
@@ -1268,7 +1271,13 @@ class LLMNode(BaseTool):
                 initial_completion = None
                 final_messages = messages
 
-            result = completion.model_dump()
+            # Normalize to dict regardless of provider. Anthropic's path
+            # passes a JSON-schema dict to ``with_structured_output`` (the
+            # ``$defs.JsonValue`` patch lives in ``__get_struct_output_model``),
+            # so its runnable yields ``dict`` directly. OpenAI / Azure /
+            # Google / extraction-fallback all yield Pydantic instances.
+            # Either way, the consumer wants a dict.
+            result = completion if isinstance(completion, dict) else completion.model_dump()
             result = self._format_structured_output_result(result, final_messages, initial_completion or completion)
 
             # Prepend middleware updates to messages for checkpoint
@@ -2564,35 +2573,47 @@ class LLMNode(BaseTool):
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _is_anthropic_thinking_client(client: Any) -> bool:
-        """Return True when *client* is (or wraps) a langchain-anthropic ChatAnthropic
-        instance that has ``thinking={"type": "enabled"}``.
+    def _anthropic_candidates(client: Any) -> list:
+        """Return *client* plus its ``.bound`` if present.
 
-        Checks both the direct client object and, when the client is a
-        ``RunnableBinding`` (produced by ``bind_tools``), the underlying ``bound``
-        model that carries the ``thinking`` attribute.
-
-        Returns False defensively on any unexpected type or attribute error so
-        that the detection cannot break the structured-output path.
+        ``llm_client`` may be a tool-bound ``RunnableBinding`` (produced
+        by ``bind_tools``) wrapping the real ChatAnthropic model, or the
+        base ChatAnthropic directly. Both detection helpers below need to
+        check both layers — this returns the list to walk.
         """
         try:
-            # llm_client may be the tool-bound RunnableBinding wrapping the real
-            # ChatAnthropic model, or it may be the base ChatAnthropic directly.
-            # We check both layers.
-            candidates = [client]
             bound = getattr(client, 'bound', None)
-            if bound is not None:
-                candidates.append(bound)
-
-            for candidate in candidates:
-                module = getattr(type(candidate), '__module__', '') or ''
-                if 'langchain_anthropic' not in module:
-                    continue
-                thinking = getattr(candidate, 'thinking', None)
-                if isinstance(thinking, dict) and thinking.get('type') == 'enabled':
-                    return True
+            return [client, bound] if bound is not None else [client]
         except Exception:  # pragma: no cover — defensive
-            pass
+            return [client]
+
+    @staticmethod
+    def _is_anthropic_client(client: Any) -> bool:
+        """Return True when *client* is (or wraps) any langchain-anthropic
+        ``ChatAnthropic`` — thinking or non-thinking.
+
+        Used to decide whether the structured-output schema needs the
+        ``$defs.JsonValue`` patch applied (Anthropic's ``transform_schema``
+        rejects the empty def Pydantic emits for ``JsonValue``).
+        """
+        for candidate in LLMNode._anthropic_candidates(client):
+            module = getattr(type(candidate), '__module__', '') or ''
+            if 'langchain_anthropic' in module:
+                return True
+        return False
+
+    @staticmethod
+    def _is_anthropic_thinking_client(client: Any) -> bool:
+        """Return True when *client* is (or wraps) a langchain-anthropic
+        ChatAnthropic with ``thinking={"type": "enabled"}``.
+        """
+        for candidate in LLMNode._anthropic_candidates(client):
+            module = getattr(type(candidate), '__module__', '') or ''
+            if 'langchain_anthropic' not in module:
+                continue
+            thinking = getattr(candidate, 'thinking', None)
+            if isinstance(thinking, dict) and thinking.get('type') == 'enabled':
+                return True
         return False
 
     def __get_struct_output_model(
@@ -2601,30 +2622,43 @@ class LLMNode(BaseTool):
         pydantic_model: Any,
         method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling",
     ) -> Any:
-        """Return ``llm_client.with_structured_output(pydantic_model, method=...)``.
+        """Return a structured-output runnable bound to ``pydantic_model``.
 
-        Fix for #4890: when the bound LLM is a langchain-anthropic
-        ``ChatAnthropic`` with ``thinking={"type": "enabled"}``, the default
-        ``method='function_calling'`` routes through
-        ``_get_llm_for_structured_output_when_thinking_is_enabled`` which
-        appends a ``_raise_if_no_tool_calls`` parser. After the tool-calling
-        exchange is resolved and the model produces a plain synthesis turn,
-        that parser raises ``OutputParserException`` because no ``tool_use``
-        block is present.
+        Two provider-specific divergences are encoded here:
 
-        Routing to ``method='json_schema'`` uses Anthropic's native
-        ``output_format`` API parameter which is compatible with thinking mode
-        and does NOT go through ``_raise_if_no_tool_calls``.
+        1. **Anthropic schema patch.** ``parse_pydantic_type`` emits
+           Pydantic's ``JsonValue`` for the ``"list"`` / ``"any"`` types,
+           which OpenAI accepts (including the reasoning models — they
+           hallucinate ``list[list[str]]`` under tighter element unions).
+           Anthropic's ``transform_schema``, however, rejects the empty
+           ``$defs.JsonValue`` Pydantic emits. For Anthropic clients we
+           replace ``$defs.JsonValue`` with the canonical recursive
+           concrete union via ``make_anthropic_compatible_schema`` and
+           pass the resulting **dict** to ``with_structured_output`` —
+           OpenAI / Azure / Google / etc. continue to receive the
+           Pydantic class unchanged.
 
-        Pipeline-config schemas with ``"list"`` / ``"any"`` typed fields are
-        emitted by ``parse_pydantic_type`` using the ``AnyJsonValue``
-        annotation, which produces an ``anyOf`` JSON-schema variant that
-        Anthropic's ``transform_schema`` accepts directly — no further schema
-        patching is needed here.
+        2. **Thinking-mode method override** (issue #4890). For Anthropic
+           with ``thinking={"type": "enabled"}`` and the default
+           ``function_calling`` request, we force ``method='json_schema'``
+           because ``function_calling`` routes through
+           ``_raise_if_no_tool_calls`` which raises after the
+           tool-calling exchange resolves to a plain synthesis turn.
+           ``json_schema`` uses Anthropic's native ``output_format`` API
+           parameter, which is compatible with thinking and does NOT go
+           through ``_raise_if_no_tool_calls``.
 
-        For non-thinking Anthropic, OpenAI, Azure, Google, and any other
-        provider the ``method`` argument is forwarded unchanged.
+        For non-Anthropic providers the ``method`` is forwarded unchanged
+        and the Pydantic class is passed directly.
+
+        Heterogeneous return: the Anthropic branch returns a runnable
+        that yields ``dict`` (it received a dict schema); other providers
+        yield Pydantic instances. Callers normalize with a one-line
+        ``isinstance`` check.
         """
-        if method == "function_calling" and self._is_anthropic_thinking_client(self.client):
-            return llm_client.with_structured_output(pydantic_model, method='json_schema')
+        if self._is_anthropic_client(self.client):
+            schema_dict = make_anthropic_compatible_schema(pydantic_model)
+            if method == "function_calling" and self._is_anthropic_thinking_client(self.client):
+                return llm_client.with_structured_output(schema_dict, method='json_schema')
+            return llm_client.with_structured_output(schema_dict, method=method)
         return llm_client.with_structured_output(pydantic_model, method=method)
