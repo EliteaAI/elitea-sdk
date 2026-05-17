@@ -1,0 +1,20 @@
+[
+  {
+    "page_content": "**Subject:** Welcome to Our Service\n**From:** marketing@company.com\n**To:** customer@example.com\n**Cc:** manager@company.com\n**Date:** 2024-01-15T14:30:00+00:00\n\n---\n\nWelcome to Our Service!\n\nThank you for signing up. Here's what you can do:\n\nAccess your dashboard\n\nConfigure settings\n\nContact support\n\nBest, The Team",
+    "metadata": {
+      "from": [
+        "marketing@company.com"
+      ],
+      "to": [
+        "customer@example.com"
+      ],
+      "subject": "Welcome to Our Service",
+      "cc": [
+        "manager@company.com"
+      ],
+      "date": "2024-01-15T14:30:00+00:00",
+      "is_empty_body": false,
+      "has_attachment": false
+    }
+  }
+]

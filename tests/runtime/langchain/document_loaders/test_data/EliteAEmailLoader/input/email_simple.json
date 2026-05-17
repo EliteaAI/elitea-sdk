@@ -1,0 +1,8 @@
+{
+    "tags": ["loader:email", "content:simple", "format:eml"],
+    "file_path": "../files/email_simple.eml",
+    "configs": [
+        {"process_attachments": true, "max_tokens": -1},
+        {"process_attachments": false, "max_tokens": -1}
+    ]
+}

@@ -1,0 +1,7 @@
+{
+    "tags": ["loader:email", "format:eml", "feature:attachment"],
+    "file_path": "../files/email_with_attachment.eml",
+    "configs": [
+        {"process_attachments": true, "max_tokens": -1}
+    ]
+}
