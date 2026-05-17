@@ -396,24 +396,44 @@ def create_pydantic_model(model_name: str, variables: dict[str, dict]):
             fields[var_name] = (parse_pydantic_type(var_data['type']), Field(description=var_data.get('description', None)))
     return create_model(model_name, **fields)
 
+_PRIMITIVE_JSON_TYPES_ANY_OF = [
+    {"type": "string"},
+    {"type": "number"},
+    {"type": "integer"},
+    {"type": "boolean"},
+    {"type": "null"},
+    {"type": "object"},
+]
+
+
 class _AnyJsonValueAnnotation:
-    """Pydantic annotation that produces an Anthropic-friendly JSON Schema.
+    """Pydantic annotation that produces a schema accepted by both Anthropic
+    and OpenAI structured-output validators.
 
     Both ``Any`` and Pydantic's ``JsonValue`` serialize to schema shapes that
-    Anthropic's ``transform_schema`` rejects: ``Any`` becomes an empty ``{}``
-    (no ``type``), and ``JsonValue`` becomes an empty ``$defs`` entry that
-    triggers the same recursive failure. Neither shape can be sent through
-    ``with_structured_output(method='json_schema')`` for a thinking-enabled
-    Claude model (issue #4890).
+    Anthropic's ``transform_schema`` rejects (``Any`` → empty ``{}``;
+    ``JsonValue`` → empty ``$defs.JsonValue``). Neither survives the
+    ``with_structured_output(method='json_schema')`` path for a
+    thinking-enabled Claude model (issue #4890).
 
-    This annotation produces an explicit ``anyOf`` of JSON primitive types
-    plus ``object`` and ``array``. Each variant has a concrete ``type`` field
-    so ``transform_schema`` accepts it, and the union covers any JSON value
-    a user might pass via the pipeline-config ``"any"`` / ``"list"`` types.
+    The schema this annotation emits is an ``anyOf`` of the JSON primitive
+    types plus ``object`` and ``array``. Two constraints govern the shape:
 
-    Runtime validation remains permissive (``core_schema.any_schema()``) so
-    pipelines that rely on heterogeneous list contents (mixed strings, ints,
-    dicts) continue to work unchanged.
+    * **Anthropic** (``transform_schema``) requires every node to have a
+      ``type`` / ``anyOf`` / ``oneOf`` / ``allOf`` field — each branch here
+      has a concrete ``type``.
+    * **OpenAI** (server-side strict validator) requires every ``array``
+      node to carry an ``items`` field. A bare ``{"type": "array"}`` is
+      rejected with *"Invalid schema for function ...: array schema missing
+      items"*. The ``array`` branch therefore nests another ``anyOf`` of the
+      primitive types under ``items``.
+
+    Nested arrays (array-of-array) are intentionally not supported; the
+    ``items`` anyOf covers primitives + object only. This is a pragmatic
+    bound — the only documented user need is heterogeneous lists of strings,
+    numbers, and dicts coming from the pipeline-config ``"list"`` type.
+
+    Runtime validation stays permissive (``core_schema.any_schema()``).
     """
 
     @classmethod
@@ -425,14 +445,8 @@ class _AnyJsonValueAnnotation:
         cls, schema: CoreSchema, handler: GetJsonSchemaHandler
     ) -> JsonSchemaValue:
         return {
-            "anyOf": [
-                {"type": "string"},
-                {"type": "number"},
-                {"type": "integer"},
-                {"type": "boolean"},
-                {"type": "null"},
-                {"type": "object"},
-                {"type": "array"},
+            "anyOf": _PRIMITIVE_JSON_TYPES_ANY_OF + [
+                {"type": "array", "items": {"anyOf": list(_PRIMITIVE_JSON_TYPES_ANY_OF)}},
             ]
         }
 

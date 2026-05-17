@@ -12,6 +12,7 @@ import json
 import pytest
 
 from anthropic.lib._parse._transform import transform_schema
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from elitea_sdk.runtime.langchain.utils import (
     AnyJsonValue,
@@ -22,14 +23,16 @@ from elitea_sdk.runtime.langchain.utils import (
 from elitea_sdk.runtime.langchain.constants import ELITEA_RS
 
 
-_ANY_JSON_ANYOF = [
+_PRIMITIVE_ANYOF = [
     {"type": "string"},
     {"type": "number"},
     {"type": "integer"},
     {"type": "boolean"},
     {"type": "null"},
     {"type": "object"},
-    {"type": "array"},
+]
+_ANY_JSON_ANYOF = _PRIMITIVE_ANYOF + [
+    {"type": "array", "items": {"anyOf": list(_PRIMITIVE_ANYOF)}},
 ]
 
 
@@ -217,6 +220,49 @@ class TestParsePydanticType:
         model = create_pydantic_model("Test", {"val": {"type": "any"}})
         schema = model.model_json_schema()
         transform_schema(schema)
+
+    def test_list_schema_has_items_at_every_array_node_for_openai(self):
+        """Regression for the OpenAI/Azure strict-mode validator: every
+        ``"type": "array"`` node in the schema must carry an ``items`` key,
+        otherwise the API responds 400 'array schema missing items'.
+        This hit PR #157 because the original anyOf had a bare
+        ``{"type": "array"}`` entry."""
+        model = create_pydantic_model("Test", {"items": {"type": "list"}})
+        tool = convert_to_openai_tool(model, strict=True)
+
+        def _assert_arrays_have_items(node, path=()):
+            if isinstance(node, dict):
+                if node.get("type") == "array":
+                    assert "items" in node, (
+                        f"OpenAI strict-mode requires 'items' on every array "
+                        f"schema node; missing at path {path!r}: {node!r}"
+                    )
+                for key, value in node.items():
+                    _assert_arrays_have_items(value, path + (key,))
+            elif isinstance(node, list):
+                for idx, value in enumerate(node):
+                    _assert_arrays_have_items(value, path + (idx,))
+
+        _assert_arrays_have_items(tool)
+
+    def test_any_schema_has_items_at_every_array_node_for_openai(self):
+        model = create_pydantic_model("Test", {"val": {"type": "any"}})
+        tool = convert_to_openai_tool(model, strict=True)
+
+        def _assert_arrays_have_items(node, path=()):
+            if isinstance(node, dict):
+                if node.get("type") == "array":
+                    assert "items" in node, (
+                        f"OpenAI strict-mode array node missing 'items' at "
+                        f"{path!r}: {node!r}"
+                    )
+                for key, value in node.items():
+                    _assert_arrays_have_items(value, path + (key,))
+            elif isinstance(node, list):
+                for idx, value in enumerate(node):
+                    _assert_arrays_have_items(value, path + (idx,))
+
+        _assert_arrays_have_items(tool)
 
     def test_dict_type_produces_object(self):
         t = parse_pydantic_type("dict")
