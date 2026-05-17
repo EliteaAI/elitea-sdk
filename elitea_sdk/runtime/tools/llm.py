@@ -2628,36 +2628,6 @@ class LLMNode(BaseTool):
             pass
         return False
 
-    @staticmethod
-    def _patch_schema_empty_items(schema: dict) -> dict:
-        """Patch ``"items": {}`` entries in a JSON Schema dict so that the
-        Anthropic ``transform_schema`` utility accepts it.
-
-        Pydantic generates ``"items": {}`` for ``list[Any]`` (bare untyped
-        lists). The Anthropic SDK's ``transform_schema`` raises
-        ``ValueError("Schema must have a 'type' …")`` on empty items objects.
-        Replacing the empty object with ``{"type": "object"}`` is the minimal
-        fix that keeps the schema semantically correct (a list of objects covers
-        the ``Any`` case for the purposes of the structured-output API call).
-
-        The schema argument is deep-copied before modification so callers'
-        original schema objects are not mutated.
-        """
-        import copy
-
-        schema = copy.deepcopy(schema)
-
-        def _fix(obj: Any) -> None:
-            if not isinstance(obj, dict):
-                return
-            if obj.get('type') == 'array' and obj.get('items') == {}:
-                obj['items'] = {'type': 'object'}
-            for value in obj.values():
-                _fix(value)
-
-        _fix(schema)
-        return schema
-
     def __get_struct_output_model(
         self,
         llm_client: Any,
@@ -2666,81 +2636,28 @@ class LLMNode(BaseTool):
     ) -> Any:
         """Return ``llm_client.with_structured_output(pydantic_model, method=...)``.
 
-        Fix for #4890 (incomplete after PR #156):
-        When the bound LLM is a langchain-anthropic ``ChatAnthropic`` with
-        ``thinking={"type": "enabled"}``, calling
-        ``with_structured_output(method='function_calling')`` (the default)
-        routes through ``_get_llm_for_structured_output_when_thinking_is_enabled``
-        which appends a ``_raise_if_no_tool_calls`` parser. After the preceding
-        tool-calling exchange is resolved and the model produces a plain text
-        synthesis turn, this parser raises ``OutputParserException`` because no
-        ``tool_use`` block is present in the synthesis response.
+        Fix for #4890: when the bound LLM is a langchain-anthropic
+        ``ChatAnthropic`` with ``thinking={"type": "enabled"}``, the default
+        ``method='function_calling'`` routes through
+        ``_get_llm_for_structured_output_when_thinking_is_enabled`` which
+        appends a ``_raise_if_no_tool_calls`` parser. After the tool-calling
+        exchange is resolved and the model produces a plain synthesis turn,
+        that parser raises ``OutputParserException`` because no ``tool_use``
+        block is present.
 
-        The fix: detect Anthropic + thinking and route to ``method='json_schema'``
-        instead. ``json_schema`` uses Anthropic's native ``output_format`` API
-        parameter which is compatible with thinking mode and does NOT go through
-        ``_raise_if_no_tool_calls``.
+        Routing to ``method='json_schema'`` uses Anthropic's native
+        ``output_format`` API parameter which is compatible with thinking mode
+        and does NOT go through ``_raise_if_no_tool_calls``.
 
-        Because Pydantic dynamically generates ``list[Any]`` fields (from the
-        ``"list"`` type string in the pipeline config) which produce
-        ``"items": {}`` in the JSON Schema, and the Anthropic SDK's
-        ``transform_schema`` rejects empty items objects, we attempt the
-        ``json_schema`` call directly and catch the ``ValueError`` emitted by
-        ``transform_schema``. On failure we build the structured runnable
-        manually: patch the schema's empty items, call ``with_structured_output``
-        on the patched dict schema, and wire in a ``PydanticOutputParser`` so
-        the output is still a Pydantic instance.
+        Pipeline-config schemas with ``"list"`` / ``"any"`` typed fields are
+        emitted by ``parse_pydantic_type`` using the ``AnyJsonValue``
+        annotation, which produces an ``anyOf`` JSON-schema variant that
+        Anthropic's ``transform_schema`` accepts directly — no further schema
+        patching is needed here.
 
         For non-thinking Anthropic, OpenAI, Azure, Google, and any other
-        provider the existing ``method`` argument is forwarded unchanged.
+        provider the ``method`` argument is forwarded unchanged.
         """
-        # --- Anthropic thinking-mode detection (Fix #4890) ---
-        # self.client is the unbound base ChatAnthropic (carries the .thinking
-        # attribute).  llm_client is the tool-bound RunnableBinding — its
-        # .bound attribute points back to the base model.  Check both.
         if method == "function_calling" and self._is_anthropic_thinking_client(self.client):
-            # First attempt: json_schema directly on the Pydantic model.
-            # This succeeds when all list fields are typed (e.g., list[str]).
-            try:
-                return llm_client.with_structured_output(pydantic_model, method='json_schema')
-            except ValueError:
-                # Second attempt: patch empty-items in the JSON schema so
-                # transform_schema accepts it, then build the runnable manually
-                # to keep the output as a Pydantic instance.
-                logger.debug(
-                    "[#4890] json_schema direct call failed (likely list[Any] field); "
-                    "patching schema and building structured runnable manually."
-                )
-                try:
-                    from langchain_anthropic.chat_models import _convert_to_anthropic_output_format
-                    from langchain_core.output_parsers import PydanticOutputParser
-                    from langchain_core.utils.function_calling import convert_to_openai_tool
-
-                    patched_schema = self._patch_schema_empty_items(pydantic_model.model_json_schema())
-                    output_format = _convert_to_anthropic_output_format(patched_schema)
-                    openai_schema = convert_to_openai_tool(pydantic_model)
-
-                    # Resolve the actual ChatAnthropic base model so we can
-                    # call .bind() on it (not on the tool-bound RunnableBinding,
-                    # which would double-bind tools into the structured call).
-                    base_model = getattr(llm_client, 'bound', llm_client)
-                    bound_for_output = base_model.bind(
-                        output_format=output_format,
-                        ls_structured_output_format={
-                            'kwargs': {'method': 'json_schema'},
-                            'schema': openai_schema,
-                        },
-                    )
-                    output_parser = PydanticOutputParser(pydantic_object=pydantic_model)
-                    return bound_for_output | output_parser
-                except Exception as manual_err:
-                    # All json_schema attempts failed — fall back to the
-                    # original function_calling path and let the caller's
-                    # try/except deal with any OutputParserException.
-                    logger.warning(
-                        "[#4890] Manual json_schema structured output build failed (%s); "
-                        "falling back to function_calling.",
-                        manual_err,
-                    )
-        # --- Default / fallback path (all other providers and non-thinking Anthropic) ---
+            return llm_client.with_structured_output(pydantic_model, method='json_schema')
         return llm_client.with_structured_output(pydantic_model, method=method)

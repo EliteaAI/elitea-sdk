@@ -743,12 +743,14 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
 # ---------------------------------------------------------------------------
 # Issue #4890 fix: Anthropic thinking-mode detection and json_schema routing
 #
-# These tests verify the core fix introduced in PR for #4890 (second pass):
+# These tests verify the fix:
 # - _is_anthropic_thinking_client detects the thinking flag correctly
-# - _patch_schema_empty_items patches list[Any] items for Anthropic's schema validator
 # - __get_struct_output_model routes to method='json_schema' for thinking Anthropic
 #   and leaves method='function_calling' for non-thinking Anthropic and all other providers
 # - _handle_structured_output_fallback skips function_calling retry for thinking Anthropic
+# - The schema produced by parse_pydantic_type for "list"/"any" types is accepted by
+#   Anthropic's transform_schema directly (verified in test_extract_json_content.py),
+#   so no schema patching is needed at this layer.
 #
 # Uses the realistic Assistant + LLM stub pattern (like test_hitl_resume_real_graph.py)
 # for the integration scenario so the real langchain routing is exercised — NOT mocked
@@ -980,51 +982,6 @@ class TestIsAnthropicThinkingClient:
 
     def test_none_returns_false(self):
         assert LLMNode._is_anthropic_thinking_client(None) is False
-
-
-class TestPatchSchemaEmptyItems:
-    """Unit tests for LLMNode._patch_schema_empty_items."""
-
-    def test_patches_empty_items_in_array_property(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "items": {"type": "array", "items": {}},
-            },
-        }
-        result = LLMNode._patch_schema_empty_items(schema)
-        assert result["properties"]["items"]["items"] == {"type": "object"}
-
-    def test_does_not_mutate_original(self):
-        schema = {"type": "object", "properties": {"a": {"type": "array", "items": {}}}}
-        original_items = schema["properties"]["a"]["items"]
-        LLMNode._patch_schema_empty_items(schema)
-        assert schema["properties"]["a"]["items"] is original_items  # not mutated
-
-    def test_leaves_typed_items_untouched(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "items": {"type": "array", "items": {"type": "string"}},
-            },
-        }
-        result = LLMNode._patch_schema_empty_items(schema)
-        assert result["properties"]["items"]["items"] == {"type": "string"}
-
-    def test_nested_schema_patched(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "nested": {
-                    "type": "object",
-                    "properties": {
-                        "arr": {"type": "array", "items": {}},
-                    },
-                },
-            },
-        }
-        result = LLMNode._patch_schema_empty_items(schema)
-        assert result["properties"]["nested"]["properties"]["arr"]["items"] == {"type": "object"}
 
 
 # ─── Unit tests: __get_struct_output_model routing ────────────────────────────
