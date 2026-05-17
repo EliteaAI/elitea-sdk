@@ -204,48 +204,57 @@ class LLMNode(BaseTool):
             ]
         return content
 
-    def _build_clean_messages_for_structured_output(self, messages: List, new_messages: List) -> List:
+    def _build_clean_messages_for_structured_output(self, new_messages: List) -> List:
+        """Return ``new_messages`` for the structured-output follow-up call,
+        sanitizing only the last ``AIMessage`` if it carries unmatched
+        ``tool_calls`` / ``tool_use`` blocks (e.g. max-iterations exit).
+
+        The full tool exchange — all matched ``(tool_call → tool_result)``
+        pairs — is preserved so the structured-output call sees the data the
+        model used for its synthesis. Without this, the model is asked to
+        emit structured output for a question it can no longer see the
+        evidence for, and both Anthropic (json_schema) and OpenAI/Azure
+        (function_calling) return empty/hallucinated values.
+
+        The earlier "drop the entire tool exchange" workaround was specific
+        to the original Anthropic-thinking + forced-tool-calling failure
+        mode (issue #4890); with the source-level fix in
+        ``parse_pydantic_type`` (``AnyJsonValue``) and the json_schema
+        routing in ``__get_struct_output_model``, no stripping of matched
+        pairs is needed.
+
+        Sanitization is applied only to the **last** ``AIMessage`` and only
+        when it has unmatched tool calls (no ``ToolMessage`` follows it).
+        That is the corner case where Anthropic would otherwise reject the
+        history with *"tool_use without tool_result"*.
         """
-        Build a sanitized message history for the structured-output follow-up call.
+        if not new_messages:
+            return list(new_messages)
 
-        After ``__perform_tool_calling`` runs, ``new_messages`` contains the original
-        input plus the full tool-using exchange (AIMessage with tool_calls →
-        ToolMessage results → ... → final AIMessage). When this entire history is
-        replayed to ``with_structured_output``, Anthropic models — particularly with
-        extended thinking enabled — read the conversation as already complete and
-        respond with continuation text (markdown-fenced JSON) instead of emitting
-        a fresh ``tool_use`` for the structured target.
+        last_ai_index = None
+        for i in range(len(new_messages) - 1, -1, -1):
+            if isinstance(new_messages[i], AIMessage):
+                last_ai_index = i
+                break
 
-        The fix is to drop the intermediate tool exchange and present only the
-        original user input plus the final synthesis AIMessage to the structured-
-        output call. The original assistant turn(s) and tool results are still
-        available upstream via the unchanged ``new_messages`` returned to the
-        caller (used for checkpoint serialization).
+        if last_ai_index is None:
+            return list(new_messages)
 
-        Walks ``new_messages`` from the tail and picks the last AIMessage. If that
-        message still carries ``tool_calls`` or any ``tool_use`` content blocks
-        (e.g. max-iterations / error exit), returns a copy with the
-        ``tool_calls`` attribute cleared AND ``tool_use`` blocks stripped from
-        list-shaped content. Otherwise returns the message unchanged.
+        last_msg = new_messages[last_ai_index]
+        cleaned_content = self._strip_tool_use_blocks(last_msg.content)
+        has_tool_calls = bool(getattr(last_msg, 'tool_calls', None))
+        content_changed = cleaned_content is not last_msg.content and cleaned_content != last_msg.content
 
-        Returns ``messages + [final_clean_aimessage]`` if a final AIMessage is
-        present; otherwise returns ``messages`` unchanged.
-        """
-        for msg in reversed(new_messages):
-            if isinstance(msg, AIMessage):
-                cleaned_content = self._strip_tool_use_blocks(msg.content)
-                has_tool_calls = bool(getattr(msg, 'tool_calls', None))
-                content_changed = cleaned_content is not msg.content and cleaned_content != msg.content
-                if not has_tool_calls and not content_changed:
-                    return list(messages) + [msg]
-                cleaned = AIMessage(
-                    content=cleaned_content,
-                    additional_kwargs=dict(getattr(msg, 'additional_kwargs', {}) or {}),
-                    response_metadata=dict(getattr(msg, 'response_metadata', {}) or {}),
-                    id=getattr(msg, 'id', None),
-                )
-                return list(messages) + [cleaned]
-        return list(messages)
+        if not has_tool_calls and not content_changed:
+            return list(new_messages)
+
+        cleaned = AIMessage(
+            content=cleaned_content,
+            additional_kwargs=dict(getattr(last_msg, 'additional_kwargs', {}) or {}),
+            response_metadata=dict(getattr(last_msg, 'response_metadata', {}) or {}),
+            id=getattr(last_msg, 'id', None),
+        )
+        return list(new_messages[:last_ai_index]) + [cleaned]
 
     def _invoke_with_structured_output(self, llm_client: Any, messages: List, struct_model: Any, config: RunnableConfig):
         """
@@ -265,14 +274,15 @@ class LLMNode(BaseTool):
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
             # Tool-calling branch: run the agentic tool exchange first, then issue
-            # the structured-output follow-up against a sanitized history. See
-            # ``_build_clean_messages_for_structured_output`` for why the history
-            # is sanitized; the full ``new_messages`` is still returned upstream
-            # so checkpoint state remains unaffected.
+            # the structured-output follow-up against the FULL ``new_messages``
+            # history (including the matched tool_call/tool_result pairs). The
+            # sanitizer below only touches the last AIMessage if it carries
+            # unmatched tool calls — needed for max-iterations exits, harmless
+            # otherwise.
             new_messages, _ = self._run_async_in_sync_context(
                 self.__perform_tool_calling(initial_completion, messages, llm_client, config)
             )
-            clean_messages = self._build_clean_messages_for_structured_output(messages, new_messages)
+            clean_messages = self._build_clean_messages_for_structured_output(new_messages)
             llm = self.__get_struct_output_model(llm_client, struct_model)
             completion = llm.invoke(clean_messages, config=config)
             return completion, initial_completion, new_messages

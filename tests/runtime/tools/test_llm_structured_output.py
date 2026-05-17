@@ -318,27 +318,39 @@ def _tool_msg(content="result", call_id="tc_1"):
 
 
 class TestBuildCleanMessagesForStructuredOutput:
-    """Helper-level tests for the history sanitizer."""
+    """Helper-level tests for the history-prep used in the structured-output
+    follow-up call.
 
-    def test_drops_tool_use_aimessages_keeps_final(self):
+    Contract: the full ``new_messages`` history (including matched
+    ``tool_call → tool_result`` pairs) is preserved so the model has the
+    data the synthesis was based on. Only the **last** ``AIMessage`` is
+    sanitized, and only when it carries unmatched ``tool_calls`` /
+    ``tool_use`` blocks (the max-iterations exit case).
+    """
+
+    def test_completed_loop_passes_full_history_unchanged(self):
+        """Normal completion: the synthesis AIMessage has no tool_calls.
+        The full new_messages list — including the tool exchange — must be
+        returned unchanged (same list contents, same final AIMessage
+        reference) so the structured-output call sees the tool data."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="ask")]
         new_messages = [
             HumanMessage(content="ask"),
             _ai_with_tool_calls("calling"),
-            _tool_msg(),
+            _tool_msg(content="search returned: [a, b, c]"),
             _ai_clean("here is the synthesis"),
         ]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
-        assert len(result) == 2
-        assert isinstance(result[0], HumanMessage)
-        assert isinstance(result[1], AIMessage)
-        assert not getattr(result[1], 'tool_calls', None)
-        assert result[1].content == "here is the synthesis"
+        result = node._build_clean_messages_for_structured_output(new_messages)
+        assert len(result) == 4, "tool exchange must be preserved for the model"
+        assert result[0] is new_messages[0]
+        assert result[1] is new_messages[1]
+        assert result[2] is new_messages[2]
+        assert result[3] is new_messages[3], "final AIMessage passed by reference"
 
-    def test_picks_last_clean_aimessage_in_multi_iteration_loop(self):
+    def test_multi_iteration_loop_keeps_all_pairs(self):
+        """Two tool iterations + final synthesis: ALL six messages — both
+        tool_call/tool_result pairs and the synthesis — must be preserved."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="task")]
         new_messages = [
             HumanMessage(content="task"),
             _ai_with_tool_calls("first"),
@@ -349,61 +361,64 @@ class TestBuildCleanMessagesForStructuredOutput:
             _tool_msg(call_id="tc_2"),
             _ai_clean("final answer"),
         ]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
-        assert len(result) == 2
-        assert result[1].content == "final answer"
+        result = node._build_clean_messages_for_structured_output(new_messages)
+        assert len(result) == 6
+        assert result[-1].content == "final answer"
 
-    def test_max_iterations_fallback_strips_tool_calls_and_tool_use_blocks(self):
-        """When the loop exits with the last AIMessage still carrying tool_calls
-        AND Anthropic-shape list content with tool_use blocks (the realistic case
-        for thinking-on Anthropic), return a copy with tool_calls cleared AND
-        tool_use blocks removed from content so Anthropic does not see unmatched
-        tool_use blocks."""
+    def test_max_iter_exit_sanitizes_only_last_aimessage(self):
+        """When the loop exits with the last AIMessage still carrying
+        tool_calls + tool_use blocks (max-iterations / error exit), strip
+        them from THAT message only — preserve every prior message,
+        including any earlier matched tool exchanges."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="task")]
-        anthropic_content = [
-            {"type": "thinking", "thinking": "I should call search", "signature": "s1"},
-            {"type": "text", "text": "Let me search for that"},
-            {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"query": "x"}},
-        ]
-        msg = AIMessage(
-            content=anthropic_content,
-            tool_calls=[{"id": "tu_1", "name": "search", "args": {"query": "x"}, "type": "tool_call"}],
+        unmatched_anthropic = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "I should call search", "signature": "s2"},
+                {"type": "text", "text": "Let me search again"},
+                {"type": "tool_use", "id": "tu_99", "name": "search", "input": {"query": "x"}},
+            ],
+            tool_calls=[{"id": "tu_99", "name": "search", "args": {"query": "x"}, "type": "tool_call"}],
         )
-        new_messages = [HumanMessage(content="task"), msg]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
-        assert len(result) == 2
-        cleaned = result[1]
-        assert isinstance(cleaned, AIMessage)
+        new_messages = [
+            HumanMessage(content="task"),
+            _ai_with_tool_calls("first"),
+            _tool_msg(call_id="tc_1", content="prior tool result"),
+            unmatched_anthropic,
+        ]
+        result = node._build_clean_messages_for_structured_output(new_messages)
+        assert len(result) == 4
+        # Prior matched pair is preserved by reference
+        assert result[0] is new_messages[0]
+        assert result[1] is new_messages[1]
+        assert result[2] is new_messages[2]
+        # Last AIMessage is sanitized: no tool_calls, no tool_use blocks,
+        # but thinking + text blocks kept
+        cleaned = result[3]
+        assert cleaned is not unmatched_anthropic, "must be a sanitized copy"
         assert not getattr(cleaned, 'tool_calls', None)
         assert isinstance(cleaned.content, list)
-        # tool_use stripped, thinking + text kept
-        assert all(
-            not (isinstance(b, dict) and b.get('type') == 'tool_use')
-            for b in cleaned.content
-        )
         block_types = {b.get('type') for b in cleaned.content if isinstance(b, dict)}
         assert block_types == {"thinking", "text"}
 
-    def test_max_iterations_fallback_with_string_content(self):
-        """Backward-compatible string-content case (non-Anthropic / thinking-off):
-        clear tool_calls attribute, leave string content intact."""
+    def test_max_iter_exit_string_content(self):
+        """String-content variant of the max-iter exit: clear tool_calls
+        attribute, leave string content intact, preserve all prior msgs."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="task")]
         new_messages = [
             HumanMessage(content="task"),
             _ai_with_tool_calls("interrupted"),
         ]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
+        result = node._build_clean_messages_for_structured_output(new_messages)
         assert len(result) == 2
+        assert result[0] is new_messages[0]
         assert not getattr(result[1], 'tool_calls', None)
         assert result[1].content == "interrupted"
 
-    def test_preserves_thinking_blocks_in_final_aimessage(self):
-        """Anthropic returns content as a list of blocks when thinking is on; the
-        helper must keep the structure intact so the API still accepts the turn."""
+    def test_thinking_blocks_in_final_aimessage_are_preserved(self):
+        """Anthropic returns content as a list of blocks with thinking on.
+        The helper must not modify the synthesis message when it has no
+        unmatched tool calls — preserve the block structure intact."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="ask")]
         thinking_blocks = [
             {"type": "thinking", "thinking": "Let me think...", "signature": "sig_xyz"},
             {"type": "text", "text": "synthesis"},
@@ -414,19 +429,18 @@ class TestBuildCleanMessagesForStructuredOutput:
             _tool_msg(),
             _ai_clean(content_blocks=thinking_blocks),
         ]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
-        assert len(result) == 2
-        assert result[1].content == thinking_blocks
-        assert result[1].content[0]["type"] == "thinking"
-        assert result[1].content[1]["type"] == "text"
+        result = node._build_clean_messages_for_structured_output(new_messages)
+        assert len(result) == 4
+        assert result[-1].content == thinking_blocks
+        assert result[-1] is new_messages[-1]
 
-    def test_returns_messages_only_when_no_aimessage_in_new_messages(self):
-        """Edge case: __perform_tool_calling somehow returns no AIMessage."""
+    def test_returns_input_when_no_aimessage_present(self):
+        """Edge case: history with no AIMessage (shouldn't happen, but safe
+        no-op). Return the list as-is."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="ask")]
         new_messages = [HumanMessage(content="ask"), _tool_msg()]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
-        assert result == messages
+        result = node._build_clean_messages_for_structured_output(new_messages)
+        assert result == new_messages
 
     def test_strip_tool_use_blocks_passes_through_string_content(self):
         """No-regression: OpenAI/non-Anthropic models return string content. The
@@ -434,12 +448,12 @@ class TestBuildCleanMessagesForStructuredOutput:
         node = _make_llm_node()
         s = "plain text answer"
         result = node._strip_tool_use_blocks(s)
-        assert result is s, "string content must be returned unchanged (same reference)"
+        assert result is s
 
     def test_strip_tool_use_blocks_passes_through_list_without_tool_use(self):
-        """List content with only thinking + text blocks (no tool_use) — returned
-        list must be equal to the original. Used to verify that the helper does
-        not corrupt thinking-on responses that happen not to contain tool_use."""
+        """List content with only thinking + text blocks (no tool_use) —
+        helper must not corrupt thinking-on responses that happen not to
+        contain tool_use."""
         node = _make_llm_node()
         blocks = [
             {"type": "thinking", "thinking": "thinking text", "signature": "s"},
@@ -450,12 +464,10 @@ class TestBuildCleanMessagesForStructuredOutput:
         assert all(b.get('type') != 'tool_use' for b in result)
 
     def test_openai_shape_string_content_passes_through_unchanged(self):
-        """No-regression: when the last AIMessage has plain string content and no
-        tool_calls (the typical OpenAI/GPT shape after __perform_tool_calling
-        completes), the helper returns the message unchanged (same reference) —
-        no defensive copy, no allocation."""
+        """No-regression: when the last AIMessage has plain string content
+        and no tool_calls (typical OpenAI/GPT shape), the message is
+        returned by reference (no copy)."""
         node = _make_llm_node()
-        messages = [HumanMessage(content="ask")]
         final_ai = AIMessage(content="OpenAI-style string synthesis answer")
         new_messages = [
             HumanMessage(content="ask"),
@@ -463,8 +475,9 @@ class TestBuildCleanMessagesForStructuredOutput:
             _tool_msg(),
             final_ai,
         ]
-        result = node._build_clean_messages_for_structured_output(messages, new_messages)
-        assert result[1] is final_ai, "string-content AIMessage must be passed through by reference"
+        result = node._build_clean_messages_for_structured_output(new_messages)
+        assert result[-1] is final_ai, "string-content AIMessage passed by reference"
+        assert len(result) == 4, "full history preserved"
 
 
 class TestInvokeWithStructuredOutputToolCallingBranch:
@@ -511,14 +524,17 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
 
         return node, struct_model, llm_client, struct_llm
 
-    def test_uses_sanitized_history_not_full_new_messages(self):
-        """The structured-output call must receive messages + [last_clean_ai],
-        NOT the full new_messages list."""
+    def test_passes_full_history_with_tool_exchange_to_structured_output(self):
+        """The structured-output call must receive the FULL ``new_messages``
+        history including the matched tool_call/tool_result pair — without
+        the tool data the model cannot produce correct structured output.
+        This was the regression in PR #157 v1: dropping the tool exchange
+        made both providers return empty fields."""
         messages = [HumanMessage(content="ask for list")]
         loop_messages = [
             HumanMessage(content="ask for list"),
             _ai_with_tool_calls("calling tool"),
-            _tool_msg(),
+            _tool_msg(content="search returned: [a, b, c]"),
             _ai_clean("synthesized answer"),
         ]
         success_completion = self._struct_model_with_question_list()(
@@ -534,10 +550,19 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
 
         assert struct_llm.invoke.call_count == 1
         passed_messages = struct_llm.invoke.call_args[0][0]
-        assert len(passed_messages) == 2, "should be messages + [last_clean_ai], not full loop history"
+        # Full history (Human + AI-with-tool-calls + ToolMessage + final AIMessage)
+        assert len(passed_messages) == 4, (
+            "full history must reach the structured-output call so the model "
+            "sees the tool data the synthesis was based on"
+        )
+        # Tool exchange present
         assert isinstance(passed_messages[1], AIMessage)
-        assert not getattr(passed_messages[1], 'tool_calls', None)
-        assert passed_messages[1].content == "synthesized answer"
+        assert isinstance(passed_messages[2], ToolMessage)
+        assert "search returned" in passed_messages[2].content
+        # Final AIMessage is the synthesis (no pending tool_calls)
+        assert isinstance(passed_messages[3], AIMessage)
+        assert not getattr(passed_messages[3], 'tool_calls', None)
+        assert passed_messages[3].content == "synthesized answer"
         assert completion.question == [{"id": "q1"}, {"id": "q2"}]
 
     def test_returns_full_new_messages_for_checkpoint_preservation(self):
