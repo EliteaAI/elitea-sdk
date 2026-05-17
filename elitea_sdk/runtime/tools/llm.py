@@ -251,62 +251,35 @@ class LLMNode(BaseTool):
         """
         Invoke LLM with structured output, handling tool calls if present.
 
-        When the forced structured output call fails, attempts to extract valid JSON
-        from the initial LLM response (handles models returning fenced JSON as text).
-
-        Args:
-            llm_client: LLM client instance
-            messages: List of conversation messages
-            struct_model: Pydantic model for structured output
-            config: Runnable configuration
-
         Returns:
             Tuple of (completion, initial_completion, final_messages)
+
+        Exceptions from the structured-output invocation propagate to the caller,
+        which routes them through ``_handle_structured_output_fallback``. There is
+        no local recovery path here — the source schema (``parse_pydantic_type``
+        emits Anthropic-compatible shapes via ``AnyJsonValue``) and the routing
+        in ``__get_struct_output_model`` (``json_schema`` for thinking-Anthropic)
+        make the previous local recovery dead code.
         """
         initial_completion = llm_client.invoke(messages, config=config)
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
-            # Handle tool calls first, then apply structured output.
-            #
-            # See ``_build_clean_messages_for_structured_output`` for why we strip
-            # the intermediate tool exchange before the second call. The full
-            # ``new_messages`` history is still returned upstream so checkpoint
-            # state and audit-trail hooks remain unaffected.
+            # Tool-calling branch: run the agentic tool exchange first, then issue
+            # the structured-output follow-up against a sanitized history. See
+            # ``_build_clean_messages_for_structured_output`` for why the history
+            # is sanitized; the full ``new_messages`` is still returned upstream
+            # so checkpoint state remains unaffected.
             new_messages, _ = self._run_async_in_sync_context(
                 self.__perform_tool_calling(initial_completion, messages, llm_client, config)
             )
             clean_messages = self._build_clean_messages_for_structured_output(messages, new_messages)
             llm = self.__get_struct_output_model(llm_client, struct_model)
-            try:
-                completion = llm.invoke(clean_messages, config=config)
-                return completion, initial_completion, new_messages
-            except (ValueError, ValidationError, OutputParserException):
-                # Use the unbound base client (``self.client``) so the retry
-                # cannot trigger another tool call — we want plain text the
-                # extractor can parse. ``llm_client`` is the tool-bound client
-                # from the caller (``self.client.bind_tools(...)``), which would
-                # let Claude pick another operational tool instead of replying.
-                plain_completion = self.client.invoke(clean_messages, config=config)
-                completion = self._extract_structured_from_content(plain_completion, struct_model)
-                if completion is not None:
-                    # Return ``plain_completion`` as the initial-completion-equivalent
-                    # so ``_format_structured_output_result`` reads ELITEA_RS fallback
-                    # text from the response we actually parsed, not from the original
-                    # planning AIMessage which may carry only tool-call text.
-                    return completion, plain_completion, new_messages
-                raise
-        else:
-            # Direct structured output without tool calls
-            llm = self.__get_struct_output_model(llm_client, struct_model)
-            try:
-                completion = llm.invoke(messages, config=config)
-                return completion, initial_completion, messages
-            except (ValueError, ValidationError, OutputParserException) as e:
-                # Structured output call failed — try extracting JSON from initial response
-                completion = self._extract_structured_from_content(initial_completion, struct_model)
-                if completion is not None:
-                    return completion, initial_completion, messages
-                raise
+            completion = llm.invoke(clean_messages, config=config)
+            return completion, initial_completion, new_messages
+
+        llm = self.__get_struct_output_model(llm_client, struct_model)
+        completion = llm.invoke(messages, config=config)
+        return completion, initial_completion, messages
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -455,9 +428,8 @@ class LLMNode(BaseTool):
         else:
             modified_messages.append(HumanMessage(content=json_instruction))
 
-        # Try json_mode with explicit instructions.
-        # Note: for langchain-anthropic json_mode is an alias for json_schema,
-        # so this is safe for thinking-enabled Anthropic models too.
+        # Try json_mode (for langchain-anthropic this aliases to json_schema —
+        # which __get_struct_output_model also routes thinking-Anthropic to).
         try:
             completion = self.__get_struct_output_model(
                 llm_client, struct_model, method="json_mode"
@@ -465,41 +437,26 @@ class LLMNode(BaseTool):
             return completion
         except Exception as json_mode_error:
             logger.warning(f"json_mode also failed: {json_mode_error}")
-
-            # Fix for #4890: skip the function_calling retry for
-            # thinking-enabled Anthropic models — it will always raise
-            # OutputParserException via _raise_if_no_tool_calls when the model
-            # produces a synthesis turn with no tool_use block. Use the plain
-            # text extraction path directly instead.
-            if self._is_anthropic_thinking_client(self.client):
-                logger.info(
-                    "[#4890] Skipping function_calling retry for thinking-enabled "
-                    "Anthropic model in fallback path; using plain LLM response."
-                )
-            else:
-                logger.info("Falling back to function_calling method")
-                # Try function_calling as a third fallback
-                try:
-                    completion = self.__get_struct_output_model(
-                        llm_client, struct_model, method="function_calling"
-                    ).invoke(modified_messages, config=config)
-                    return completion
-                except Exception as function_calling_error:
-                    logger.error(f"function_calling also failed: {function_calling_error}")
-
-            logger.info("Final fallback: using plain LLM response")
-
-            # Last resort: get plain text response and wrap in structure
-            plain_completion = llm_client.invoke(modified_messages, config=config)
-            content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
-
+            logger.info("Falling back to function_calling method")
             try:
-                parsed = extract_json_content(content)
-                completion = self._map_parsed_json_to_model(parsed, struct_model)
+                completion = self.__get_struct_output_model(
+                    llm_client, struct_model, method="function_calling"
+                ).invoke(modified_messages, config=config)
                 return completion
-            except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
-                logger.warning(f"Could not parse extracted JSON: {parse_error}")
-                return self._create_fallback_completion(content, struct_model)
+            except Exception as function_calling_error:
+                logger.error(f"function_calling also failed: {function_calling_error}")
+                logger.info("Final fallback: using plain LLM response")
+
+                plain_completion = llm_client.invoke(modified_messages, config=config)
+                content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
+
+                try:
+                    parsed = extract_json_content(content)
+                    completion = self._map_parsed_json_to_model(parsed, struct_model)
+                    return completion
+                except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
+                    logger.warning(f"Could not parse extracted JSON: {parse_error}")
+                    return self._create_fallback_completion(content, struct_model)
 
     def _format_structured_output_result(self, result: dict, messages: List, initial_completion: Any) -> dict:
         """
@@ -1293,8 +1250,8 @@ class LLMNode(BaseTool):
                 completion, initial_completion, final_messages = self._invoke_with_structured_output(
                     llm_client, messages, struct_model, config
                 )
-            except ValueError as e:
-                # Handle fallback for structured output failures
+            except (ValueError, ValidationError, OutputParserException) as e:
+                # Single recovery point for any structured-output failure.
                 completion = self._handle_structured_output_fallback(
                     llm_client, messages, struct_model, config, e
                 )

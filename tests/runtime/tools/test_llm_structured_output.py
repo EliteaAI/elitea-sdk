@@ -563,49 +563,6 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         assert final_messages == loop_messages
         assert len(final_messages) == 4
 
-    def test_anthropic_thinking_on_markdown_fallback_extracts_list(self):
-        """When Anthropic with thinking ON returns markdown-fenced JSON as text
-        instead of tool_use, the structured-output parser raises ValidationError,
-        the fallback re-issues a plain invoke (on the UNBOUND client to avoid
-        another tool call), and _extract_structured_from_content parses the array.
-        The plain_completion is returned upstream as initial_completion so
-        _format_structured_output_result reads ELITEA_RS fallback text from the
-        actually-parsed response, not the original planning AIMessage."""
-        messages = [HumanMessage(content="give me a list")]
-        loop_messages = [
-            HumanMessage(content="give me a list"),
-            _ai_with_tool_calls("calling"),
-            _tool_msg(content="some data"),
-            _ai_clean(content_blocks=[
-                {"type": "thinking", "thinking": "...", "signature": "s"},
-                {"type": "text", "text": "I'll synthesize the answer."},
-            ]),
-        ]
-        fallback_response = AIMessage(content=[
-            {"type": "thinking", "thinking": "Let me format this", "signature": "s2"},
-            {"type": "text", "text": "```json\n[{\"question_id\": \"q1\"}, {\"question_id\": \"q2\"}]\n```"},
-        ])
-        node, struct_model, llm_client, struct_llm = self._build_node_with_mocks(
-            loop_messages,
-            second_call_behavior=ValidationError.from_exception_data("LLMOutput", []),
-            plain_call_response=fallback_response,
-        )
-
-        completion, returned_initial, final_messages = node._invoke_with_structured_output(
-            llm_client, messages, struct_model, config={}
-        )
-
-        assert struct_llm.invoke.call_count == 1, "structured output attempted once"
-        assert llm_client.invoke.call_count == 1, "tool-bound client used only for first call"
-        assert node.client.invoke.call_count == 1, "fallback uses unbound client"
-        assert len(completion.question) == 2
-        assert completion.question[0]["question_id"] == "q1"
-        assert returned_initial is fallback_response, (
-            "initial_completion returned upstream must be plain_completion so "
-            "_format_structured_output_result extracts ELITEA_RS from the parsed response"
-        )
-        assert final_messages == loop_messages, "checkpoint state preserved"
-
     def test_propagates_exception_when_fallback_also_fails(self):
         """If both structured-output parsing AND content extraction fail, the
         original exception must propagate — never silently return None/empty."""
@@ -712,11 +669,10 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         )
 
     def test_openai_value_error_falls_through_to_upstream_handler(self):
-        """No-regression: when structured output raises ValueError AND the local
-        fallback's content extraction fails (returns None), the original
-        ValueError must re-raise so the upstream caller's _handle_structured_output_fallback
-        (json_mode → function_calling → text extraction chain) still gets to run.
-        Verifies we did not shortcut the existing OpenAI fallback chain."""
+        """When structured output raises ValueError, _invoke_with_structured_output
+        propagates it directly — there is no local recovery. The upstream caller
+        catches (ValueError, ValidationError, OutputParserException) and routes
+        to _handle_structured_output_fallback, which is the single recovery point."""
         messages = [HumanMessage(content="ask")]
         loop_messages = [
             HumanMessage(content="ask"),
@@ -724,20 +680,18 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
             _tool_msg(),
             _ai_clean("done"),
         ]
-        # Fallback response that _extract_structured_from_content cannot parse
-        unparseable = AIMessage(content="not json, just words and more words")
         node, struct_model, llm_client, _ = self._build_node_with_mocks(
             loop_messages,
             second_call_behavior=ValueError("structured output failed"),
-            plain_call_response=unparseable,
         )
 
         with pytest.raises(ValueError, match="structured output failed"):
             node._invoke_with_structured_output(llm_client, messages, struct_model, config={})
 
-        # Verify the upstream handler will receive a ValueError it can catch
-        # (line 1252 of llm.py only catches ValueError).
-        assert node.client.invoke.call_count == 1, "local fallback attempted"
+        # No local fallback path: the unbound client must NOT be invoked.
+        assert node.client.invoke.call_count == 0, (
+            "no local recovery — exceptions propagate to the upstream handler"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1245,60 +1199,14 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         assert "json_schema" not in wso_calls
 
 
-# ─── _handle_structured_output_fallback: thinking model skips function_calling ──────
+# ─── _handle_structured_output_fallback: chain still tries all methods ──────
 
 
 class TestHandleStructuredOutputFallbackThinkingModel:
-    """Verify that the fallback chain skips function_calling for thinking Anthropic.
-
-    The json_mode → function_calling → plain text chain would previously loop back
-    into function_calling which always raises OutputParserException for thinking models.
-    The fix skips function_calling and falls through directly to plain text extraction.
-    """
-
-    def test_thinking_anthropic_skips_function_calling_in_fallback(self):
-        """When json_mode fails for a thinking-enabled Anthropic model, the fallback must
-        skip function_calling and go straight to plain text extraction."""
-        llm = _AnthropicThinkingLLM()
-        node = _make_llm_node()
-        node.client = llm
-
-        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
-
-        method_calls = []
-
-        # Patch __get_struct_output_model to track which methods are attempted
-        def patched_get_struct_output(client, model, method="function_calling"):
-            method_calls.append(method)
-            if method == "json_mode":
-                raise ValueError("json_mode failed for thinking model")
-            if method == "function_calling":
-                pytest.fail(
-                    "function_calling must NOT be attempted in the fallback chain "
-                    "for thinking-enabled Anthropic models — it always raises "
-                    "OutputParserException via _raise_if_no_tool_calls."
-                )
-            raise ValueError(f"unexpected method: {method}")
-
-        node._LLMNode__get_struct_output_model = patched_get_struct_output
-
-        # Plain client invoke returns parseable JSON
-        json_response = AIMessage(
-            content='{"question": [{"id": "q1"}], "rs": "summary"}'
-        )
-        llm.invoke = lambda msgs, config=None: json_response
-
-        messages = [HumanMessage(content="list please")]
-
-        # Must not raise; must not call function_calling
-        result = node._handle_structured_output_fallback(
-            llm, messages, struct_model, {}, ValueError("initial error")
-        )
-
-        assert "function_calling" not in method_calls, (
-            f"function_calling was called in fallback for thinking model: {method_calls}"
-        )
-        assert result is not None
+    """Verify the fallback chain (json_mode → function_calling → plain text)
+    still attempts function_calling. For thinking-Anthropic, function_calling is
+    transparently rerouted to json_schema by ``__get_struct_output_model``, so
+    the chain is safe — no separate skip-guard is needed."""
 
     def test_non_thinking_anthropic_still_tries_function_calling_in_fallback(self):
         """Non-regression: non-thinking Anthropic must still try function_calling."""
