@@ -11,12 +11,29 @@ both Anthropic and OpenAI structured output methods.
 import json
 import pytest
 
+from anthropic.lib._parse._transform import transform_schema
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
 from elitea_sdk.runtime.langchain.utils import (
+    AnyJsonValue,
     extract_json_content,
     parse_pydantic_type,
     create_pydantic_model,
 )
 from elitea_sdk.runtime.langchain.constants import ELITEA_RS
+
+
+_PRIMITIVE_ANYOF = [
+    {"type": "string"},
+    {"type": "number"},
+    {"type": "integer"},
+    {"type": "boolean"},
+    {"type": "null"},
+    {"type": "object"},
+]
+_ANY_JSON_ANYOF = _PRIMITIVE_ANYOF + [
+    {"type": "array", "items": {"anyOf": list(_PRIMITIVE_ANYOF)}},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -160,38 +177,111 @@ class TestExtractJsonContentErrors:
 # ---------------------------------------------------------------------------
 
 class TestParsePydanticType:
-    """Verify parse_pydantic_type produces Anthropic & OpenAI compatible schemas."""
+    """Verify parse_pydantic_type produces Anthropic-compatible schemas (#4890).
 
-    def test_list_type_accepts_any_elements(self):
-        from typing import Any
+    Both ``Any`` (which emits ``items: {}``) and Pydantic's ``JsonValue``
+    (which emits an empty ``$defs`` entry) are rejected by Anthropic's
+    ``transform_schema``. ``AnyJsonValue`` is a custom annotation that emits
+    an explicit ``anyOf`` JSON-schema, which transform_schema accepts.
+    """
+
+    def test_list_type_uses_any_json_value(self):
         t = parse_pydantic_type("list")
-        assert t == list[Any]
-        # Schema must not have broken $defs (the Anthropic rejection)
+        assert t == list[AnyJsonValue]
+
+    def test_any_type_uses_any_json_value(self):
+        assert parse_pydantic_type("any") is AnyJsonValue
+
+    def test_unknown_type_falls_back_to_any_json_value(self):
+        assert parse_pydantic_type("does-not-exist") is AnyJsonValue
+
+    def test_list_field_emits_any_of_items(self):
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
         schema = model.model_json_schema()
-        assert "$defs" not in schema
-        # items: {} means any element type (valid JSON Schema)
-        assert schema["properties"]["items"]["items"] == {}
+        items_schema = schema["properties"]["items"]["items"]
+        assert items_schema == {"anyOf": _ANY_JSON_ANYOF}
+
+    def test_any_field_emits_any_of(self):
+        model = create_pydantic_model("Test", {"val": {"type": "any"}})
+        schema = model.model_json_schema()
+        val_schema = schema["properties"]["val"]
+        assert val_schema["anyOf"] == _ANY_JSON_ANYOF
+
+    def test_list_schema_passes_anthropic_transform_schema(self):
+        """The exact schema sent to Anthropic must round-trip through
+        ``transform_schema`` without raising ``ValueError``. This is the
+        regression that #4890 hit before this fix."""
+        model = create_pydantic_model("Test", {"items": {"type": "list"}})
+        schema = model.model_json_schema()
+        # Should not raise
+        transform_schema(schema)
+
+    def test_any_schema_passes_anthropic_transform_schema(self):
+        model = create_pydantic_model("Test", {"val": {"type": "any"}})
+        schema = model.model_json_schema()
+        transform_schema(schema)
+
+    def test_list_schema_has_items_at_every_array_node_for_openai(self):
+        """Regression for the OpenAI/Azure strict-mode validator: every
+        ``"type": "array"`` node in the schema must carry an ``items`` key,
+        otherwise the API responds 400 'array schema missing items'.
+        This hit PR #157 because the original anyOf had a bare
+        ``{"type": "array"}`` entry."""
+        model = create_pydantic_model("Test", {"items": {"type": "list"}})
+        tool = convert_to_openai_tool(model, strict=True)
+
+        def _assert_arrays_have_items(node, path=()):
+            if isinstance(node, dict):
+                if node.get("type") == "array":
+                    assert "items" in node, (
+                        f"OpenAI strict-mode requires 'items' on every array "
+                        f"schema node; missing at path {path!r}: {node!r}"
+                    )
+                for key, value in node.items():
+                    _assert_arrays_have_items(value, path + (key,))
+            elif isinstance(node, list):
+                for idx, value in enumerate(node):
+                    _assert_arrays_have_items(value, path + (idx,))
+
+        _assert_arrays_have_items(tool)
+
+    def test_any_schema_has_items_at_every_array_node_for_openai(self):
+        model = create_pydantic_model("Test", {"val": {"type": "any"}})
+        tool = convert_to_openai_tool(model, strict=True)
+
+        def _assert_arrays_have_items(node, path=()):
+            if isinstance(node, dict):
+                if node.get("type") == "array":
+                    assert "items" in node, (
+                        f"OpenAI strict-mode array node missing 'items' at "
+                        f"{path!r}: {node!r}"
+                    )
+                for key, value in node.items():
+                    _assert_arrays_have_items(value, path + (key,))
+            elif isinstance(node, list):
+                for idx, value in enumerate(node):
+                    _assert_arrays_have_items(value, path + (idx,))
+
+        _assert_arrays_have_items(tool)
 
     def test_dict_type_produces_object(self):
         t = parse_pydantic_type("dict")
-        # Should produce valid schema without empty $defs
         model = create_pydantic_model("Test", {"data": {"type": "dict"}})
         schema = model.model_json_schema()
         data_prop = schema["properties"]["data"]
         assert data_prop["type"] == "object"
 
-    def test_list_type_schema_no_empty_defs(self):
-        """Regression: list type must not produce empty $defs (Anthropic rejects this)."""
+    def test_list_schema_has_no_empty_defs(self):
+        """Regression: must not produce empty ``$defs`` entries that Anthropic
+        ``transform_schema`` recurses into and fails on (the JsonValue trap)."""
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
         schema = model.model_json_schema()
         defs = schema.get("$defs", {})
-        # If $defs exist, none should be empty
         for def_name, def_schema in defs.items():
             assert def_schema, f"Empty schema definition: {def_name}"
 
     def test_list_accepts_any_data(self):
-        """list type must accept dicts, strings, ints — any JSON value."""
+        """Runtime semantics preserved: list type accepts heterogeneous data."""
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
         # Dicts
         instance = model(items=[{"key": "val"}, {"another": 123}])
@@ -200,9 +290,17 @@ class TestParsePydanticType:
         # Strings
         instance = model(items=["a", "b", "c"])
         assert instance.items == ["a", "b", "c"]
-        # Mixed
-        instance = model(items=[1, "two", {"three": 3}])
-        assert len(instance.items) == 3
+        # Mixed primitives + nested
+        instance = model(items=[1, "two", {"three": 3}, [4, 5], None, True])
+        assert len(instance.items) == 6
+
+    def test_any_field_accepts_any_data(self):
+        """Runtime semantics preserved for the bare 'any' type."""
+        model = create_pydantic_model("Test", {"val": {"type": "any"}})
+        # Each JSON-typed value should round-trip
+        for value in ("string", 42, 3.14, True, None, {"k": "v"}, [1, 2]):
+            instance = model(val=value)
+            assert instance.val == value
 
     def test_str_int_float_bool_unchanged(self):
         assert parse_pydantic_type("str") is str

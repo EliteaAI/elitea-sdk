@@ -204,109 +204,92 @@ class LLMNode(BaseTool):
             ]
         return content
 
-    def _build_clean_messages_for_structured_output(self, messages: List, new_messages: List) -> List:
+    def _build_clean_messages_for_structured_output(self, new_messages: List) -> List:
+        """Return ``new_messages`` for the structured-output follow-up call,
+        sanitizing only the last ``AIMessage`` if it carries unmatched
+        ``tool_calls`` / ``tool_use`` blocks (e.g. max-iterations exit).
+
+        The full tool exchange — all matched ``(tool_call → tool_result)``
+        pairs — is preserved so the structured-output call sees the data the
+        model used for its synthesis. Without this, the model is asked to
+        emit structured output for a question it can no longer see the
+        evidence for, and both Anthropic (json_schema) and OpenAI/Azure
+        (function_calling) return empty/hallucinated values.
+
+        The earlier "drop the entire tool exchange" workaround was specific
+        to the original Anthropic-thinking + forced-tool-calling failure
+        mode (issue #4890); with the source-level fix in
+        ``parse_pydantic_type`` (``AnyJsonValue``) and the json_schema
+        routing in ``__get_struct_output_model``, no stripping of matched
+        pairs is needed.
+
+        Sanitization is applied only to the **last** ``AIMessage`` and only
+        when it has unmatched tool calls (no ``ToolMessage`` follows it).
+        That is the corner case where Anthropic would otherwise reject the
+        history with *"tool_use without tool_result"*.
         """
-        Build a sanitized message history for the structured-output follow-up call.
+        if not new_messages:
+            return list(new_messages)
 
-        After ``__perform_tool_calling`` runs, ``new_messages`` contains the original
-        input plus the full tool-using exchange (AIMessage with tool_calls →
-        ToolMessage results → ... → final AIMessage). When this entire history is
-        replayed to ``with_structured_output``, Anthropic models — particularly with
-        extended thinking enabled — read the conversation as already complete and
-        respond with continuation text (markdown-fenced JSON) instead of emitting
-        a fresh ``tool_use`` for the structured target.
+        last_ai_index = None
+        for i in range(len(new_messages) - 1, -1, -1):
+            if isinstance(new_messages[i], AIMessage):
+                last_ai_index = i
+                break
 
-        The fix is to drop the intermediate tool exchange and present only the
-        original user input plus the final synthesis AIMessage to the structured-
-        output call. The original assistant turn(s) and tool results are still
-        available upstream via the unchanged ``new_messages`` returned to the
-        caller (used for checkpoint serialization).
+        if last_ai_index is None:
+            return list(new_messages)
 
-        Walks ``new_messages`` from the tail and picks the last AIMessage. If that
-        message still carries ``tool_calls`` or any ``tool_use`` content blocks
-        (e.g. max-iterations / error exit), returns a copy with the
-        ``tool_calls`` attribute cleared AND ``tool_use`` blocks stripped from
-        list-shaped content. Otherwise returns the message unchanged.
+        last_msg = new_messages[last_ai_index]
+        cleaned_content = self._strip_tool_use_blocks(last_msg.content)
+        has_tool_calls = bool(getattr(last_msg, 'tool_calls', None))
+        content_changed = cleaned_content is not last_msg.content and cleaned_content != last_msg.content
 
-        Returns ``messages + [final_clean_aimessage]`` if a final AIMessage is
-        present; otherwise returns ``messages`` unchanged.
-        """
-        for msg in reversed(new_messages):
-            if isinstance(msg, AIMessage):
-                cleaned_content = self._strip_tool_use_blocks(msg.content)
-                has_tool_calls = bool(getattr(msg, 'tool_calls', None))
-                content_changed = cleaned_content is not msg.content and cleaned_content != msg.content
-                if not has_tool_calls and not content_changed:
-                    return list(messages) + [msg]
-                cleaned = AIMessage(
-                    content=cleaned_content,
-                    additional_kwargs=dict(getattr(msg, 'additional_kwargs', {}) or {}),
-                    response_metadata=dict(getattr(msg, 'response_metadata', {}) or {}),
-                    id=getattr(msg, 'id', None),
-                )
-                return list(messages) + [cleaned]
-        return list(messages)
+        if not has_tool_calls and not content_changed:
+            return list(new_messages)
+
+        cleaned = AIMessage(
+            content=cleaned_content,
+            additional_kwargs=dict(getattr(last_msg, 'additional_kwargs', {}) or {}),
+            response_metadata=dict(getattr(last_msg, 'response_metadata', {}) or {}),
+            id=getattr(last_msg, 'id', None),
+        )
+        return list(new_messages[:last_ai_index]) + [cleaned]
 
     def _invoke_with_structured_output(self, llm_client: Any, messages: List, struct_model: Any, config: RunnableConfig):
         """
         Invoke LLM with structured output, handling tool calls if present.
 
-        When the forced structured output call fails, attempts to extract valid JSON
-        from the initial LLM response (handles models returning fenced JSON as text).
-
-        Args:
-            llm_client: LLM client instance
-            messages: List of conversation messages
-            struct_model: Pydantic model for structured output
-            config: Runnable configuration
-
         Returns:
             Tuple of (completion, initial_completion, final_messages)
+
+        Exceptions from the structured-output invocation propagate to the caller,
+        which routes them through ``_handle_structured_output_fallback``. There is
+        no local recovery path here — the source schema (``parse_pydantic_type``
+        emits Anthropic-compatible shapes via ``AnyJsonValue``) and the routing
+        in ``__get_struct_output_model`` (``json_schema`` for thinking-Anthropic)
+        make the previous local recovery dead code.
         """
         initial_completion = llm_client.invoke(messages, config=config)
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
-            # Handle tool calls first, then apply structured output.
-            #
-            # See ``_build_clean_messages_for_structured_output`` for why we strip
-            # the intermediate tool exchange before the second call. The full
-            # ``new_messages`` history is still returned upstream so checkpoint
-            # state and audit-trail hooks remain unaffected.
+            # Tool-calling branch: run the agentic tool exchange first, then issue
+            # the structured-output follow-up against the FULL ``new_messages``
+            # history (including the matched tool_call/tool_result pairs). The
+            # sanitizer below only touches the last AIMessage if it carries
+            # unmatched tool calls — needed for max-iterations exits, harmless
+            # otherwise.
             new_messages, _ = self._run_async_in_sync_context(
                 self.__perform_tool_calling(initial_completion, messages, llm_client, config)
             )
-            clean_messages = self._build_clean_messages_for_structured_output(messages, new_messages)
+            clean_messages = self._build_clean_messages_for_structured_output(new_messages)
             llm = self.__get_struct_output_model(llm_client, struct_model)
-            try:
-                completion = llm.invoke(clean_messages, config=config)
-                return completion, initial_completion, new_messages
-            except (ValueError, ValidationError, OutputParserException):
-                # Use the unbound base client (``self.client``) so the retry
-                # cannot trigger another tool call — we want plain text the
-                # extractor can parse. ``llm_client`` is the tool-bound client
-                # from the caller (``self.client.bind_tools(...)``), which would
-                # let Claude pick another operational tool instead of replying.
-                plain_completion = self.client.invoke(clean_messages, config=config)
-                completion = self._extract_structured_from_content(plain_completion, struct_model)
-                if completion is not None:
-                    # Return ``plain_completion`` as the initial-completion-equivalent
-                    # so ``_format_structured_output_result`` reads ELITEA_RS fallback
-                    # text from the response we actually parsed, not from the original
-                    # planning AIMessage which may carry only tool-call text.
-                    return completion, plain_completion, new_messages
-                raise
-        else:
-            # Direct structured output without tool calls
-            llm = self.__get_struct_output_model(llm_client, struct_model)
-            try:
-                completion = llm.invoke(messages, config=config)
-                return completion, initial_completion, messages
-            except (ValueError, ValidationError, OutputParserException) as e:
-                # Structured output call failed — try extracting JSON from initial response
-                completion = self._extract_structured_from_content(initial_completion, struct_model)
-                if completion is not None:
-                    return completion, initial_completion, messages
-                raise
+            completion = llm.invoke(clean_messages, config=config)
+            return completion, initial_completion, new_messages
+
+        llm = self.__get_struct_output_model(llm_client, struct_model)
+        completion = llm.invoke(messages, config=config)
+        return completion, initial_completion, messages
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -455,7 +438,8 @@ class LLMNode(BaseTool):
         else:
             modified_messages.append(HumanMessage(content=json_instruction))
 
-        # Try json_mode with explicit instructions
+        # Try json_mode (for langchain-anthropic this aliases to json_schema —
+        # which __get_struct_output_model also routes thinking-Anthropic to).
         try:
             completion = self.__get_struct_output_model(
                 llm_client, struct_model, method="json_mode"
@@ -464,8 +448,6 @@ class LLMNode(BaseTool):
         except Exception as json_mode_error:
             logger.warning(f"json_mode also failed: {json_mode_error}")
             logger.info("Falling back to function_calling method")
-
-            # Try function_calling as a third fallback
             try:
                 completion = self.__get_struct_output_model(
                     llm_client, struct_model, method="function_calling"
@@ -475,7 +457,6 @@ class LLMNode(BaseTool):
                 logger.error(f"function_calling also failed: {function_calling_error}")
                 logger.info("Final fallback: using plain LLM response")
 
-                # Last resort: get plain text response and wrap in structure
                 plain_completion = llm_client.invoke(modified_messages, config=config)
                 content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
 
@@ -1279,8 +1260,8 @@ class LLMNode(BaseTool):
                 completion, initial_completion, final_messages = self._invoke_with_structured_output(
                     llm_client, messages, struct_model, config
                 )
-            except ValueError as e:
-                # Handle fallback for structured output failures
+            except (ValueError, ValidationError, OutputParserException) as e:
+                # Single recovery point for any structured-output failure.
                 completion = self._handle_structured_output_fallback(
                     llm_client, messages, struct_model, config, e
                 )
@@ -2578,5 +2559,72 @@ class LLMNode(BaseTool):
         _PENDING_TOOL_MESSAGES.set([])
         return new_messages, current_completion
 
-    def __get_struct_output_model(self, llm_client, pydantic_model, method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling"):
+    # -----------------------------------------------------------------------
+    # Anthropic thinking-mode detection
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _is_anthropic_thinking_client(client: Any) -> bool:
+        """Return True when *client* is (or wraps) a langchain-anthropic ChatAnthropic
+        instance that has ``thinking={"type": "enabled"}``.
+
+        Checks both the direct client object and, when the client is a
+        ``RunnableBinding`` (produced by ``bind_tools``), the underlying ``bound``
+        model that carries the ``thinking`` attribute.
+
+        Returns False defensively on any unexpected type or attribute error so
+        that the detection cannot break the structured-output path.
+        """
+        try:
+            # llm_client may be the tool-bound RunnableBinding wrapping the real
+            # ChatAnthropic model, or it may be the base ChatAnthropic directly.
+            # We check both layers.
+            candidates = [client]
+            bound = getattr(client, 'bound', None)
+            if bound is not None:
+                candidates.append(bound)
+
+            for candidate in candidates:
+                module = getattr(type(candidate), '__module__', '') or ''
+                if 'langchain_anthropic' not in module:
+                    continue
+                thinking = getattr(candidate, 'thinking', None)
+                if isinstance(thinking, dict) and thinking.get('type') == 'enabled':
+                    return True
+        except Exception:  # pragma: no cover — defensive
+            pass
+        return False
+
+    def __get_struct_output_model(
+        self,
+        llm_client: Any,
+        pydantic_model: Any,
+        method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling",
+    ) -> Any:
+        """Return ``llm_client.with_structured_output(pydantic_model, method=...)``.
+
+        Fix for #4890: when the bound LLM is a langchain-anthropic
+        ``ChatAnthropic`` with ``thinking={"type": "enabled"}``, the default
+        ``method='function_calling'`` routes through
+        ``_get_llm_for_structured_output_when_thinking_is_enabled`` which
+        appends a ``_raise_if_no_tool_calls`` parser. After the tool-calling
+        exchange is resolved and the model produces a plain synthesis turn,
+        that parser raises ``OutputParserException`` because no ``tool_use``
+        block is present.
+
+        Routing to ``method='json_schema'`` uses Anthropic's native
+        ``output_format`` API parameter which is compatible with thinking mode
+        and does NOT go through ``_raise_if_no_tool_calls``.
+
+        Pipeline-config schemas with ``"list"`` / ``"any"`` typed fields are
+        emitted by ``parse_pydantic_type`` using the ``AnyJsonValue``
+        annotation, which produces an ``anyOf`` JSON-schema variant that
+        Anthropic's ``transform_schema`` accepts directly — no further schema
+        patching is needed here.
+
+        For non-thinking Anthropic, OpenAI, Azure, Google, and any other
+        provider the ``method`` argument is forwarded unchanged.
+        """
+        if method == "function_calling" and self._is_anthropic_thinking_client(self.client):
+            return llm_client.with_structured_output(pydantic_model, method='json_schema')
         return llm_client.with_structured_output(pydantic_model, method=method)
