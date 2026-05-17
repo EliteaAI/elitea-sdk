@@ -2,7 +2,9 @@ import builtins
 import json
 import logging
 import re
-from pydantic import create_model, Field, JsonValue
+from pydantic import create_model, Field, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema, core_schema
 from typing import Tuple, TypedDict, Any, Optional, Annotated
 from langchain_core.messages import AnyMessage
 from langgraph.graph import add_messages
@@ -394,6 +396,50 @@ def create_pydantic_model(model_name: str, variables: dict[str, dict]):
             fields[var_name] = (parse_pydantic_type(var_data['type']), Field(description=var_data.get('description', None)))
     return create_model(model_name, **fields)
 
+class _AnyJsonValueAnnotation:
+    """Pydantic annotation that produces an Anthropic-friendly JSON Schema.
+
+    Both ``Any`` and Pydantic's ``JsonValue`` serialize to schema shapes that
+    Anthropic's ``transform_schema`` rejects: ``Any`` becomes an empty ``{}``
+    (no ``type``), and ``JsonValue`` becomes an empty ``$defs`` entry that
+    triggers the same recursive failure. Neither shape can be sent through
+    ``with_structured_output(method='json_schema')`` for a thinking-enabled
+    Claude model (issue #4890).
+
+    This annotation produces an explicit ``anyOf`` of JSON primitive types
+    plus ``object`` and ``array``. Each variant has a concrete ``type`` field
+    so ``transform_schema`` accepts it, and the union covers any JSON value
+    a user might pass via the pipeline-config ``"any"`` / ``"list"`` types.
+
+    Runtime validation remains permissive (``core_schema.any_schema()``) so
+    pipelines that rely on heterogeneous list contents (mixed strings, ints,
+    dicts) continue to work unchanged.
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> CoreSchema:
+        return core_schema.any_schema()
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        return {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "number"},
+                {"type": "integer"},
+                {"type": "boolean"},
+                {"type": "null"},
+                {"type": "object"},
+                {"type": "array"},
+            ]
+        }
+
+
+AnyJsonValue = Annotated[Any, _AnyJsonValueAnnotation]
+
+
 def parse_pydantic_type(type_name: str):
     t = (type_name or "any").strip().lower()
 
@@ -403,8 +449,8 @@ def parse_pydantic_type(type_name: str):
         "float": float,
         "bool": bool,
         "dict": dict[str, Any],
-        "list": list[Any],
-        "any": JsonValue,
+        "list": list[AnyJsonValue],
+        "any": AnyJsonValue,
     }
     if t in base:
         return base[t]
@@ -420,8 +466,7 @@ def parse_pydantic_type(type_name: str):
         # restrict keys to str for JSON objects
         return dict[str, v] if k is not str else dict[str, v]
 
-    # fallback: avoid Any
-    return JsonValue
+    return AnyJsonValue
 
 def safe_serialize(obj: Any) -> str:
     """
