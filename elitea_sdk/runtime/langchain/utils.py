@@ -1,10 +1,9 @@
 import builtins
+import copy
 import json
 import logging
 import re
-from pydantic import create_model, Field, GetJsonSchemaHandler
-from pydantic.json_schema import JsonSchemaValue
-from pydantic_core import CoreSchema, core_schema
+from pydantic import create_model, Field, JsonValue
 from typing import Tuple, TypedDict, Any, Optional, Annotated
 from langchain_core.messages import AnyMessage
 from langgraph.graph import add_messages
@@ -396,65 +395,23 @@ def create_pydantic_model(model_name: str, variables: dict[str, dict]):
             fields[var_name] = (parse_pydantic_type(var_data['type']), Field(description=var_data.get('description', None)))
     return create_model(model_name, **fields)
 
-_PRIMITIVE_JSON_TYPES_ANY_OF = [
-    {"type": "string"},
-    {"type": "number"},
-    {"type": "integer"},
-    {"type": "boolean"},
-    {"type": "null"},
-    {"type": "object"},
-]
-
-
-class _AnyJsonValueAnnotation:
-    """Pydantic annotation that produces a schema accepted by both Anthropic
-    and OpenAI structured-output validators.
-
-    Both ``Any`` and Pydantic's ``JsonValue`` serialize to schema shapes that
-    Anthropic's ``transform_schema`` rejects (``Any`` → empty ``{}``;
-    ``JsonValue`` → empty ``$defs.JsonValue``). Neither survives the
-    ``with_structured_output(method='json_schema')`` path for a
-    thinking-enabled Claude model (issue #4890).
-
-    The schema this annotation emits is an ``anyOf`` of the JSON primitive
-    types plus ``object`` and ``array``. Two constraints govern the shape:
-
-    * **Anthropic** (``transform_schema``) requires every node to have a
-      ``type`` / ``anyOf`` / ``oneOf`` / ``allOf`` field — each branch here
-      has a concrete ``type``.
-    * **OpenAI** (server-side strict validator) requires every ``array``
-      node to carry an ``items`` field. A bare ``{"type": "array"}`` is
-      rejected with *"Invalid schema for function ...: array schema missing
-      items"*. The ``array`` branch therefore nests another ``anyOf`` of the
-      primitive types under ``items``.
-
-    Nested arrays (array-of-array) are intentionally not supported; the
-    ``items`` anyOf covers primitives + object only. This is a pragmatic
-    bound — the only documented user need is heterogeneous lists of strings,
-    numbers, and dicts coming from the pipeline-config ``"list"`` type.
-
-    Runtime validation stays permissive (``core_schema.any_schema()``).
-    """
-
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> CoreSchema:
-        return core_schema.any_schema()
-
-    @classmethod
-    def __get_pydantic_json_schema__(
-        cls, schema: CoreSchema, handler: GetJsonSchemaHandler
-    ) -> JsonSchemaValue:
-        return {
-            "anyOf": _PRIMITIVE_JSON_TYPES_ANY_OF + [
-                {"type": "array", "items": {"anyOf": list(_PRIMITIVE_JSON_TYPES_ANY_OF)}},
-            ]
-        }
-
-
-AnyJsonValue = Annotated[Any, _AnyJsonValueAnnotation]
-
-
 def parse_pydantic_type(type_name: str):
+    """Map a pipeline-config type string to a Pydantic-compatible Python type.
+
+    ``"list"`` and ``"any"`` use Pydantic's native ``JsonValue`` — the
+    union ``str | int | float | bool | None | list[JsonValue] |
+    dict[str, JsonValue]``. This is intentionally permissive: OpenAI
+    reasoning models (``o1`` / ``o3-*``) hallucinate ``list[list[str]]``
+    when the schema constrains the element union too tightly. Pydantic
+    emits ``JsonValue`` as ``$ref: #/$defs/JsonValue`` with an empty def,
+    which OpenAI's API engine accepts; Anthropic's ``transform_schema``
+    rejects the empty def, so the Anthropic path patches the schema —
+    see ``make_anthropic_compatible_schema``.
+
+    Three earlier merged PRs tried to find one annotation that worked
+    for both providers and all model variants. None did. Schema
+    requirements genuinely diverge — the right shape is provider-aware.
+    """
     t = (type_name or "any").strip().lower()
 
     base = {
@@ -463,8 +420,8 @@ def parse_pydantic_type(type_name: str):
         "float": float,
         "bool": bool,
         "dict": dict[str, Any],
-        "list": list[AnyJsonValue],
-        "any": AnyJsonValue,
+        "list": list[JsonValue],
+        "any": JsonValue,
     }
     if t in base:
         return base[t]
@@ -480,7 +437,49 @@ def parse_pydantic_type(type_name: str):
         # restrict keys to str for JSON objects
         return dict[str, v] if k is not str else dict[str, v]
 
-    return AnyJsonValue
+    return JsonValue
+
+
+_JSON_VALUE_CONCRETE_DEF: dict = {
+    "anyOf": [
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "integer"},
+        {"type": "boolean"},
+        {"type": "null"},
+        {"type": "object"},
+        {"type": "array", "items": {"$ref": "#/$defs/JsonValue"}},
+    ]
+}
+
+
+def make_anthropic_compatible_schema(pydantic_model: Any) -> dict:
+    """Return a JSON-schema dict for ``pydantic_model`` accepted by
+    Anthropic's ``transform_schema`` (the validator inside
+    ``langchain_anthropic.ChatAnthropic.with_structured_output``).
+
+    Pydantic's ``JsonValue`` emits ``"$defs": {"JsonValue": {}}`` — a
+    deliberately empty definition because the type self-references.
+    ``transform_schema`` rejects empty schema nodes with
+    *"Schema must have a 'type', 'anyOf', 'oneOf', or 'allOf' field"*,
+    so the empty def must be replaced before the schema reaches Anthropic.
+
+    The replacement is the canonical recursive JSON-value union: the six
+    JSON primitives plus ``object`` plus ``array`` whose ``items`` refs
+    back to ``JsonValue`` itself. ``transform_schema`` accepts this
+    (verified via integration test) and the recursion preserves the full
+    semantics of ``JsonValue`` — Anthropic models can still emit
+    arbitrarily nested JSON.
+
+    For non-``JsonValue`` schemas (no ``$defs.JsonValue`` to patch) the
+    function is a no-op deep copy. Safe to call unconditionally for any
+    Anthropic-bound structured-output invocation.
+    """
+    schema = copy.deepcopy(pydantic_model.model_json_schema())
+    defs = schema.get("$defs")
+    if isinstance(defs, dict) and "JsonValue" in defs:
+        defs["JsonValue"] = copy.deepcopy(_JSON_VALUE_CONCRETE_DEF)
+    return schema
 
 def safe_serialize(obj: Any) -> str:
     """

@@ -20,7 +20,7 @@ from pydantic import create_model, Field, ValidationError
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.exceptions import OutputParserException
 
-from elitea_sdk.runtime.tools.llm import LLMNode
+from elitea_sdk.runtime.tools.llm import LLMNode, STRUCTURED_OUTPUT_PREFILL_PROMPT
 from elitea_sdk.runtime.langchain.constants import ELITEA_RS
 from elitea_sdk.runtime.langchain.utils import create_pydantic_model
 
@@ -321,18 +321,26 @@ class TestBuildCleanMessagesForStructuredOutput:
     """Helper-level tests for the history-prep used in the structured-output
     follow-up call.
 
-    Contract: the full ``new_messages`` history (including matched
-    ``tool_call → tool_result`` pairs) is preserved so the model has the
-    data the synthesis was based on. Only the **last** ``AIMessage`` is
-    sanitized, and only when it carries unmatched ``tool_calls`` /
-    ``tool_use`` blocks (the max-iterations exit case).
+    Two contracts are enforced:
+    1. The full ``new_messages`` history (including matched
+       ``tool_call → tool_result`` pairs) is preserved so the model has
+       the data the synthesis was based on. Only the **last** ``AIMessage``
+       is sanitized, and only when it carries unmatched ``tool_calls`` /
+       ``tool_use`` blocks (the max-iterations exit case).
+    2. If the cleaned list still ends with an ``AIMessage`` (the synthesis
+       turn), a trailing ``HumanMessage`` is appended so the conversation
+       satisfies Anthropic's "must end with a user message" invariant.
+       This is the prefill-rejection regression that PR #157 missed.
     """
 
-    def test_completed_loop_passes_full_history_unchanged(self):
+    _PREFILL_PROMPT = STRUCTURED_OUTPUT_PREFILL_PROMPT
+
+    def test_completed_loop_appends_human_message_after_synthesis_ai(self):
         """Normal completion: the synthesis AIMessage has no tool_calls.
-        The full new_messages list — including the tool exchange — must be
-        returned unchanged (same list contents, same final AIMessage
-        reference) so the structured-output call sees the tool data."""
+        The full tool exchange is preserved AND a trailing HumanMessage
+        is appended to satisfy Anthropic's prefill rule. Prior to Fix A,
+        the second structured-output invoke ended on the synthesis
+        AIMessage and Anthropic returned 400."""
         node = _make_llm_node()
         new_messages = [
             HumanMessage(content="ask"),
@@ -341,15 +349,21 @@ class TestBuildCleanMessagesForStructuredOutput:
             _ai_clean("here is the synthesis"),
         ]
         result = node._build_clean_messages_for_structured_output(new_messages)
-        assert len(result) == 4, "tool exchange must be preserved for the model"
+        assert len(result) == 5, (
+            "tool exchange preserved (4 msgs) + appended HumanMessage prefill prompt"
+        )
+        # Original four are unchanged and passed by reference
         assert result[0] is new_messages[0]
         assert result[1] is new_messages[1]
         assert result[2] is new_messages[2]
         assert result[3] is new_messages[3], "final AIMessage passed by reference"
+        # Trailing HumanMessage closes the conversation for Anthropic
+        assert isinstance(result[4], HumanMessage)
+        assert result[4].content == self._PREFILL_PROMPT
 
-    def test_multi_iteration_loop_keeps_all_pairs(self):
-        """Two tool iterations + final synthesis: ALL six messages — both
-        tool_call/tool_result pairs and the synthesis — must be preserved."""
+    def test_multi_iteration_loop_keeps_all_pairs_and_appends_human(self):
+        """Two tool iterations + final synthesis: ALL six original messages
+        preserved + HumanMessage appended → 7 total."""
         node = _make_llm_node()
         new_messages = [
             HumanMessage(content="task"),
@@ -362,14 +376,16 @@ class TestBuildCleanMessagesForStructuredOutput:
             _ai_clean("final answer"),
         ]
         result = node._build_clean_messages_for_structured_output(new_messages)
-        assert len(result) == 6
-        assert result[-1].content == "final answer"
+        assert len(result) == 7
+        assert result[-2].content == "final answer", "synthesis preserved at index -2"
+        assert isinstance(result[-1], HumanMessage)
 
-    def test_max_iter_exit_sanitizes_only_last_aimessage(self):
+    def test_max_iter_exit_sanitizes_last_ai_and_appends_human(self):
         """When the loop exits with the last AIMessage still carrying
         tool_calls + tool_use blocks (max-iterations / error exit), strip
         them from THAT message only — preserve every prior message,
-        including any earlier matched tool exchanges."""
+        AND append a HumanMessage (the sanitized message is still an
+        AIMessage; the prefill rule still applies)."""
         node = _make_llm_node()
         unmatched_anthropic = AIMessage(
             content=[
@@ -386,7 +402,7 @@ class TestBuildCleanMessagesForStructuredOutput:
             unmatched_anthropic,
         ]
         result = node._build_clean_messages_for_structured_output(new_messages)
-        assert len(result) == 4
+        assert len(result) == 5
         # Prior matched pair is preserved by reference
         assert result[0] is new_messages[0]
         assert result[1] is new_messages[1]
@@ -399,25 +415,29 @@ class TestBuildCleanMessagesForStructuredOutput:
         assert isinstance(cleaned.content, list)
         block_types = {b.get('type') for b in cleaned.content if isinstance(b, dict)}
         assert block_types == {"thinking", "text"}
+        # Trailing HumanMessage closes the conversation for Anthropic
+        assert isinstance(result[4], HumanMessage)
 
-    def test_max_iter_exit_string_content(self):
+    def test_max_iter_exit_string_content_appends_human_message(self):
         """String-content variant of the max-iter exit: clear tool_calls
-        attribute, leave string content intact, preserve all prior msgs."""
+        attribute, leave string content intact, append HumanMessage."""
         node = _make_llm_node()
         new_messages = [
             HumanMessage(content="task"),
             _ai_with_tool_calls("interrupted"),
         ]
         result = node._build_clean_messages_for_structured_output(new_messages)
-        assert len(result) == 2
+        assert len(result) == 3
         assert result[0] is new_messages[0]
         assert not getattr(result[1], 'tool_calls', None)
         assert result[1].content == "interrupted"
+        assert isinstance(result[2], HumanMessage)
 
     def test_thinking_blocks_in_final_aimessage_are_preserved(self):
         """Anthropic returns content as a list of blocks with thinking on.
         The helper must not modify the synthesis message when it has no
-        unmatched tool calls — preserve the block structure intact."""
+        unmatched tool calls — preserve the block structure intact, and
+        append the prefill HumanMessage."""
         node = _make_llm_node()
         thinking_blocks = [
             {"type": "thinking", "thinking": "Let me think...", "signature": "sig_xyz"},
@@ -430,13 +450,16 @@ class TestBuildCleanMessagesForStructuredOutput:
             _ai_clean(content_blocks=thinking_blocks),
         ]
         result = node._build_clean_messages_for_structured_output(new_messages)
-        assert len(result) == 4
-        assert result[-1].content == thinking_blocks
-        assert result[-1] is new_messages[-1]
+        assert len(result) == 5
+        # Synthesis AIMessage is at index -2 now; HumanMessage is appended at -1
+        assert result[-2].content == thinking_blocks
+        assert result[-2] is new_messages[-1]
+        assert isinstance(result[-1], HumanMessage)
 
     def test_returns_input_when_no_aimessage_present(self):
-        """Edge case: history with no AIMessage (shouldn't happen, but safe
-        no-op). Return the list as-is."""
+        """Edge case: history with no AIMessage. Trailing element is a
+        ``ToolMessage`` (which Anthropic accepts as a user-role turn), so
+        no HumanMessage append is needed. Return the list as-is."""
         node = _make_llm_node()
         new_messages = [HumanMessage(content="ask"), _tool_msg()]
         result = node._build_clean_messages_for_structured_output(new_messages)
@@ -463,10 +486,13 @@ class TestBuildCleanMessagesForStructuredOutput:
         assert result == blocks
         assert all(b.get('type') != 'tool_use' for b in result)
 
-    def test_openai_shape_string_content_passes_through_unchanged(self):
+    def test_openai_shape_string_content_appends_human_message(self):
         """No-regression: when the last AIMessage has plain string content
-        and no tool_calls (typical OpenAI/GPT shape), the message is
-        returned by reference (no copy)."""
+        (typical OpenAI/GPT shape), the synthesis message is preserved by
+        reference and a HumanMessage is still appended. The HumanMessage
+        is harmless for OpenAI (which accepts trailing AIMessage too) but
+        is required for Anthropic — applying it uniformly keeps the path
+        provider-agnostic."""
         node = _make_llm_node()
         final_ai = AIMessage(content="OpenAI-style string synthesis answer")
         new_messages = [
@@ -476,8 +502,16 @@ class TestBuildCleanMessagesForStructuredOutput:
             final_ai,
         ]
         result = node._build_clean_messages_for_structured_output(new_messages)
-        assert result[-1] is final_ai, "string-content AIMessage passed by reference"
-        assert len(result) == 4, "full history preserved"
+        assert len(result) == 5, "full history (4) + trailing HumanMessage (1)"
+        assert result[-2] is final_ai, "string-content AIMessage passed by reference"
+        assert isinstance(result[-1], HumanMessage)
+
+    def test_empty_input_returns_empty_list(self):
+        """Defensive: empty new_messages → empty list, no append (nothing
+        to follow up on)."""
+        node = _make_llm_node()
+        result = node._build_clean_messages_for_structured_output([])
+        assert result == []
 
 
 class TestInvokeWithStructuredOutputToolCallingBranch:
@@ -529,7 +563,13 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         history including the matched tool_call/tool_result pair — without
         the tool data the model cannot produce correct structured output.
         This was the regression in PR #157 v1: dropping the tool exchange
-        made both providers return empty fields."""
+        made both providers return empty fields.
+
+        After Fix A (Anthropic prefill regression), the helper also
+        appends a trailing ``HumanMessage`` when the synthesis turn ends
+        in an ``AIMessage``. So the structured-output call receives 5
+        messages: the 4-message tool exchange + 1 prefill HumanMessage.
+        """
         messages = [HumanMessage(content="ask for list")]
         loop_messages = [
             HumanMessage(content="ask for list"),
@@ -550,19 +590,21 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
 
         assert struct_llm.invoke.call_count == 1
         passed_messages = struct_llm.invoke.call_args[0][0]
-        # Full history (Human + AI-with-tool-calls + ToolMessage + final AIMessage)
-        assert len(passed_messages) == 4, (
-            "full history must reach the structured-output call so the model "
-            "sees the tool data the synthesis was based on"
+        # Full history (4 msgs) + appended HumanMessage prefill prompt (1)
+        assert len(passed_messages) == 5, (
+            "full tool exchange must reach the structured-output call AND "
+            "a trailing HumanMessage must close the conversation for Anthropic"
         )
         # Tool exchange present
         assert isinstance(passed_messages[1], AIMessage)
         assert isinstance(passed_messages[2], ToolMessage)
         assert "search returned" in passed_messages[2].content
-        # Final AIMessage is the synthesis (no pending tool_calls)
+        # Synthesis AIMessage at index 3 (no pending tool_calls)
         assert isinstance(passed_messages[3], AIMessage)
         assert not getattr(passed_messages[3], 'tool_calls', None)
         assert passed_messages[3].content == "synthesized answer"
+        # Trailing HumanMessage closes the conversation (Fix A: prefill rule)
+        assert isinstance(passed_messages[4], HumanMessage)
         assert completion.question == [{"id": "q1"}, {"id": "q2"}]
 
     def test_returns_full_new_messages_for_checkpoint_preservation(self):
@@ -878,19 +920,54 @@ class _OpenAILikeLLMBound:
         return self.root.with_structured_output(schema, method=method, **kwargs)
 
 
+class _AnthropicPrefillRejection(Exception):
+    """Mimics ``anthropic.BadRequestError`` raised by the gateway when the
+    conversation handed to a structured-output invoke ends with an
+    ``AIMessage``. Real production error message:
+
+        "This model does not support assistant message prefill. The
+        conversation must end with a user message."
+
+    Three prior PRs against the same code path all merged with mock-only
+    validation that ignored this contract — the stub now enforces it so a
+    regression cannot reach production again.
+    """
+
+
 class _StructuredOutputStub:
-    """A fake structured-output runnable that returns a Pydantic-like instance."""
+    """A fake structured-output runnable that returns a Pydantic-like instance.
+
+    Accepts both shapes that ``with_structured_output`` can be called
+    with: a Pydantic class (default for OpenAI / non-Anthropic) or a
+    JSON-schema dict (the Anthropic path, which patches
+    ``$defs.JsonValue`` before sending). The stub mirrors the real
+    runnable's behavior: dict-shaped invocation returns a dict, class-
+    shaped invocation returns the class instance.
+
+    Enforces the Anthropic prefill contract: invoking with a message list
+    that ends in ``AIMessage`` raises ``_AnthropicPrefillRejection``. This
+    mirrors the real gateway behavior that PR #157 missed because the
+    permissive stub silently accepted any input shape.
+    """
 
     def __init__(self, schema, method: str):
         self.schema = schema
         self.method = method
 
     def invoke(self, messages, config=None):
-        # Return an instance of the Pydantic model with synthetic data
+        if messages and isinstance(messages[-1], AIMessage):
+            raise _AnthropicPrefillRejection(
+                "This model does not support assistant message prefill. "
+                "The conversation must end with a user message."
+            )
+        # Anthropic path: schema is a dict — return a dict matching the
+        # canonical "question + ELITEA_RS" shape used across tests.
+        if isinstance(self.schema, dict):
+            return {"question": [{"id": "q1", "text": "What?"}], ELITEA_RS: "synthesis"}
+        # OpenAI / default path: schema is a Pydantic class.
         try:
             return self.schema(question=[{"id": "q1", "text": "What?"}], rs="synthesis")
         except Exception:
-            # Fallback if model doesn't have those exact fields
             return self.schema.model_construct()
 
 
@@ -1053,6 +1130,93 @@ class TestGetStructOutputModelRouting:
 
         assert "json_mode" in llm.with_structured_output_calls
 
+    def test_anthropic_receives_patched_schema_dict_not_pydantic_class(self):
+        """The whole point of the JsonValue revert: Anthropic gets a
+        patched schema **dict** (with concrete ``$defs.JsonValue``),
+        not the raw Pydantic class. Without this patch the empty
+        ``$defs.JsonValue`` would reach ``transform_schema`` and the
+        call would 400. Both thinking and non-thinking Anthropic go
+        through the patch — the only difference is the method override
+        for thinking mode."""
+        llm = _AnthropicThinkingLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        captured_schemas = []
+        original = llm.with_structured_output
+
+        def capture(schema, method="function_calling", **kwargs):
+            captured_schemas.append(schema)
+            return original(schema, method=method, **kwargs)
+
+        llm.with_structured_output = capture
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="function_calling")
+
+        assert len(captured_schemas) == 1
+        passed = captured_schemas[0]
+        assert isinstance(passed, dict), (
+            f"Anthropic must receive a JSON-schema dict (patched), got {type(passed).__name__}"
+        )
+        # The patch concretely defines $defs.JsonValue
+        assert "$defs" in passed
+        assert "JsonValue" in passed["$defs"]
+        assert "anyOf" in passed["$defs"]["JsonValue"], (
+            "patched JsonValue must have a concrete anyOf; the empty default is "
+            "what transform_schema rejects"
+        )
+
+    def test_non_thinking_anthropic_also_receives_patched_dict(self):
+        """The patch applies to non-thinking Anthropic too — the empty
+        ``$defs.JsonValue`` is rejected regardless of which structured-
+        output method is used (function_calling translates it to a tool
+        spec; json_schema runs it through transform_schema). Patching
+        unconditionally for any Anthropic client is the simplest correct
+        rule."""
+        llm = _AnthropicNonThinkingLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list"}})
+
+        captured_schemas = []
+        original = llm.with_structured_output
+
+        def capture(schema, method="function_calling", **kwargs):
+            captured_schemas.append(schema)
+            return original(schema, method=method, **kwargs)
+
+        llm.with_structured_output = capture
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="function_calling")
+
+        assert len(captured_schemas) == 1
+        assert isinstance(captured_schemas[0], dict)
+        assert captured_schemas[0]["$defs"]["JsonValue"]["anyOf"]
+
+    def test_openai_receives_pydantic_class_unchanged(self):
+        """OpenAI / Azure / Google / etc. continue to receive the
+        Pydantic class directly. This is the path that lets reasoning
+        models see the permissive ``JsonValue`` schema with empty
+        ``$defs.JsonValue`` (which OpenAI's API engine accepts and
+        reasoning models interpret correctly) — patching it would
+        re-introduce the ``list[list[str]]`` regression that motivated
+        the revert."""
+        llm = _OpenAILikeLLM()
+        node = self._make_node_with_client(llm)
+        struct_model = _make_struct_model({"question": {"type": "list"}})
+
+        captured_schemas = []
+        original = llm.with_structured_output
+
+        def capture(schema, method="function_calling", **kwargs):
+            captured_schemas.append(schema)
+            return original(schema, method=method, **kwargs)
+
+        llm.with_structured_output = capture
+        node._LLMNode__get_struct_output_model(llm, struct_model, method="function_calling")
+
+        assert captured_schemas[0] is struct_model, (
+            "OpenAI must receive the Pydantic class by reference — "
+            "no schema patching, no dict translation"
+        )
+
 
 # ─── Integration-style test: full _invoke_with_structured_output with realistic shapes ──────
 
@@ -1158,6 +1322,100 @@ class TestAnthropicThinkingStructuredOutputIntegration:
 
         # No exception was raised — the fix works
         assert completion is not None
+
+    def test_anthropic_prefill_contract_satisfied_by_clean_messages(self):
+        """End-to-end check that Fix A satisfies Anthropic's prefill rule.
+
+        The hardened ``_StructuredOutputStub`` raises
+        ``_AnthropicPrefillRejection`` when invoked with an
+        ``AIMessage``-terminated message list (the real gateway returns
+        400). For the tool-calling branch, the synthesis turn is an
+        ``AIMessage``; without Fix A appending a trailing
+        ``HumanMessage`` in ``_build_clean_messages_for_structured_output``
+        this integration would raise.
+
+        The bare-stub demonstration confirms the stub enforces the rule;
+        the integration call proves Fix A actually feeds the stub a
+        compliant list. Together these prevent the PR-#157 regression
+        from recurring (mock that ignored the contract → silently green
+        tests → 400 in production).
+        """
+        # 1. Demonstrate the stub raises on bare AIMessage-terminated input.
+        bare_stub = _StructuredOutputStub(
+            _make_struct_model({"question": {"type": "list"}}),
+            method="json_schema",
+        )
+        with pytest.raises(_AnthropicPrefillRejection):
+            bare_stub.invoke([
+                HumanMessage(content="ask"),
+                AIMessage(content="synthesis"),
+            ])
+
+        # 2. Drive the full tool-calling integration. Fix A appends a
+        # HumanMessage so the stub does NOT raise — proving the contract
+        # is satisfied at the boundary the real gateway enforces.
+        llm = _AnthropicThinkingLLM()
+        node = self._make_node_for_anthropic_thinking(llm)
+        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+
+        tool_call_msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "I'll fetch.", "signature": "s1"},
+                {"type": "text", "text": ""},
+            ],
+            tool_calls=[{"name": "data_fetch", "args": {"query": "x"}, "id": "tc-1"}],
+        )
+        synthesis_msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "Done.", "signature": "s2"},
+                {"type": "text", "text": "Answer."},
+            ]
+        )
+
+        llm_bound = llm.bind_tools([_make_data_fetch_tool()])
+        responses = iter([tool_call_msg, synthesis_msg])
+        llm_bound.invoke = lambda msgs, config=None: next(responses, synthesis_msg)
+
+        # Capture the messages handed to the structured-output invoke so
+        # we can assert the trailing-HumanMessage shape directly.
+        captured_struct_input: list = []
+        original_wso = llm_bound.with_structured_output
+
+        def capturing_wso(schema, method="function_calling", **kwargs):
+            stub = original_wso(schema, method=method, **kwargs)
+            original_invoke = stub.invoke
+
+            def capture_and_invoke(messages, config=None):
+                captured_struct_input.append(list(messages))
+                return original_invoke(messages, config=config)
+
+            stub.invoke = capture_and_invoke
+            return stub
+
+        llm_bound.with_structured_output = capturing_wso
+
+        completion, _, _ = node._invoke_with_structured_output(
+            llm_bound,
+            [HumanMessage(content="Fetch and structure")],
+            struct_model,
+            config={},
+        )
+
+        assert completion is not None, "structured output succeeded — prefill rule satisfied"
+        assert captured_struct_input, "structured-output stub was invoked"
+        passed = captured_struct_input[0]
+        assert isinstance(passed[-1], HumanMessage), (
+            "Fix A must append a HumanMessage so Anthropic does not reject the "
+            f"conversation as assistant prefill; got trailing {type(passed[-1]).__name__}"
+        )
+        # Production contract: ``_invoke_llm_internal`` normalizes
+        # ``completion`` to a dict via ``isinstance`` check. The Anthropic
+        # path's dict comes through directly; the OpenAI path's Pydantic
+        # instance is dumped. Mirror that exact pattern here so this test
+        # locks in the contract end-to-end.
+        result = completion if isinstance(completion, dict) else completion.model_dump()
+        assert isinstance(result, dict)
+        assert "question" in result
 
     def test_non_thinking_anthropic_still_uses_function_calling(self):
         """Non-regression: non-thinking Anthropic must still use function_calling."""
