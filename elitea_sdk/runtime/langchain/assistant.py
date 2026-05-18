@@ -583,6 +583,10 @@ class Assistant:
         if not toolnode_tools:
             raise ToolException("ToolNode react runtime requires at least one BaseTool.")
 
+        renamed = deduplicate_tool_names(toolnode_tools, context="toolnode-react")
+        if renamed:
+            logger.info("Deduplicated %s tool names for ToolNode react agent", renamed)
+
         state_class = create_state({
             'input': {'type': 'str'},
             'messages': {'type': 'list'},
