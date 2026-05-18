@@ -450,7 +450,7 @@ class PyodideSandboxTool(BaseTool):
 
         tool_result = (
             f"Error during execution: {result.stderr}"
-            if result.stderr
+            if result.stderr and result.status == 'error'
             else result.stdout
         )
 
@@ -505,7 +505,7 @@ class PyodideSandboxTool(BaseTool):
 
         tool_result = (
             f"Error during execution: {result.stderr}"
-            if result.stderr
+            if result.stderr and result.status == 'error'
             else result.stdout
         )
 
