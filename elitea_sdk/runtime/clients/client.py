@@ -1415,10 +1415,21 @@ class EliteAClient:
                 # Keep original settings for runtime toolkits not in AVAILABLE_TOOLS
                 toolkit_config_parsed_json['settings'] = toolkit_config.get('settings', {})
         except Exception as toolkit_config_error:
-            logger.error(f"Failed to validate toolkit configuration: {str(toolkit_config_error)}")
+            full_error_str = str(toolkit_config_error)
+            logger.error(f"Failed to validate toolkit configuration: {full_error_str}")
+
+            # Extract human-friendly message (pattern from carrier/tickets_tool.py)
+            # TODO: Create util function if usage of this pattern grows
+            human_error = f"Toolkit '{toolkit_config_type}' configuration error"
+            if hasattr(toolkit_config_error, 'errors'):
+                missing = [err['loc'][-1] for err in toolkit_config_error.errors() if err['type'] == 'missing']
+                if missing:
+                    human_error = f"Missing required fields: {', '.join(missing)}"
+
             return {
                 "success": False,
-                "error": f"Failed to validate toolkit configuration: {str(toolkit_config_error)}",
+                "error": human_error,
+                "debug_error": f"Failed to validate toolkit configuration: {full_error_str}",
                 "tool_name": tool_name,
                 "toolkit_config": None,
                 "llm_model": llm_model,
