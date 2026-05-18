@@ -77,10 +77,8 @@ PostmanCreateCollection = create_model(
     variables=(Optional[List[Dict]], Field(
         description="Optional collection variables", default=None)),
     auth=(Optional[Dict], Field(
-        description="Optional default authentication. Pass null to explicitly set no auth.",
-        default=None,
-        json_schema_extra={'nullable': True}
-    ))
+        description="Optional default authentication. Omit this parameter to create collection without auth.",
+        default=None))
 )
 
 PostmanUpdateCollectionName = create_model(
@@ -107,9 +105,7 @@ PostmanUpdateCollectionVariables = create_model(
 PostmanUpdateCollectionAuth = create_model(
     "PostmanUpdateCollectionAuth",
     auth=(Optional[Dict[str, Any]], Field(default=None,
-        description="Updated authentication settings. Pass null to clear authentication. Example: {'type': 'bearer', 'token': 'your_token'}",
-        json_schema_extra={'nullable': True}
-    ))
+        description="Authentication settings. Omit this parameter to clear authentication. Example: {'type': 'bearer', 'token': 'your_token'}"))
 )
 
 PostmanDeleteCollection = create_model(
@@ -130,10 +126,8 @@ PostmanCreateFolder = create_model(
     parent_path=(Optional[str], Field(
         description="Optional parent folder path", default=None)),
     auth=(Optional[Dict], Field(
-        description="Optional folder-level authentication. Pass null to explicitly set no auth.",
-        default=None,
-        json_schema_extra={'nullable': True}
-    ))
+        description="Optional folder-level authentication. Omit to create folder without auth.",
+        default=None))
 )
 
 PostmanUpdateFolder = create_model(
@@ -144,10 +138,8 @@ PostmanUpdateFolder = create_model(
     description=(Optional[str], Field(
         description="New description for the folder", default=None)),
     auth=(Optional[Dict], Field(
-        description="Updated authentication settings. Pass null to clear authentication.",
-        default=None,
-        json_schema_extra={'nullable': True}
-    ))
+        description="Authentication settings. Omit this parameter to clear authentication.",
+        default=None))
 )
 
 PostmanDeleteFolder = create_model(
@@ -176,10 +168,8 @@ PostmanCreateRequest = create_model(
     body=(Optional[Dict], Field(
         description="Optional request body", default=None)),
     auth=(Optional[Dict], Field(
-        description="Optional request authentication. Pass null to explicitly set no auth.",
-        default=None,
-        json_schema_extra={'nullable': True}
-    )),
+        description="Optional request authentication. Omit to create request without auth.",
+        default=None)),
     tests=(Optional[str], Field(
         description="Optional test script code", default=None)),
     pre_request_script=(Optional[str], Field(
@@ -246,10 +236,9 @@ PostmanUpdateRequestAuth = create_model(
             "For basic authentication, use: {\"type\": \"basic\", \"basic\": [{\"key\": \"username\", \"value\": \"user\"}, {\"key\": \"password\", \"value\": \"pass\"}]}. "
             "`type`: Authentication type (e.g., \"apikey\", \"bearer\", \"basic\"). "
             "`apikey`, `bearer`, `basic`: List of key-value pairs for configuration."
-            "Other types can be added as needed, following the same structure."
-        ),
-        json_schema_extra={'nullable': True}
-    ))
+            "Other types can be added as needed, following the same structure. "
+            "Omit this parameter to clear authentication."
+        )))
 )
 
 PostmanUpdateRequestTests = create_model(
@@ -1325,15 +1314,18 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update collection {self.collection_id} variables: {str(e)}")
 
-    def update_collection_auth(self, auth: Dict[str, Any], **kwargs) -> str:
-        """Update collection authentication settings."""
+    def update_collection_auth(self, auth: Dict[str, Any] = None, **kwargs) -> str:
+        """Update or clear collection authentication settings.
+
+        When auth is omitted or None, authentication is cleared from the collection.
+        """
         try:
             # Get current collection
             current = self._make_request(
                 'GET', f'/collections/{self.collection_id}')
             collection_data = current["collection"]
 
-            # Update auth
+            # Always apply auth — None clears authentication
             collection_data["auth"] = auth
 
             self._make_request('PUT', f'/collections/{self.collection_id}',
@@ -1836,13 +1828,16 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' body: {str(e)}")
 
-    def update_request_auth(self, request_path: str, auth: Dict[str, Any], **kwargs) -> str:
-        """Update request authentication."""
+    def update_request_auth(self, request_path: str, auth: Dict[str, Any] = None, **kwargs) -> str:
+        """Update or clear request authentication.
+
+        When auth is omitted or None, authentication is cleared from the request.
+        """
         try:
             # Get request item and ID
             request_item, request_id, _ = self._get_request_item_and_id(request_path)
-            
-            # Create update payload
+
+            # Always apply auth — None clears authentication
             request_update = {
                 "auth": auth
             }
