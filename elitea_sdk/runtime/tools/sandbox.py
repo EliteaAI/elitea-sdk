@@ -266,7 +266,7 @@ class PyodideSandboxTool(BaseTool):
             if result.stdout:
                 result_dict["output"] = result.stdout
 
-            if result.stderr:
+            if result.stderr and result.status == 'error':
                 result_dict["error"] = result.stderr
 
             if result.status == 'error':
