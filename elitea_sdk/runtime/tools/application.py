@@ -20,13 +20,37 @@ applicationToolSchema = create_model(
 
 
 def formulate_query(kwargs, is_subgraph=False):
+    """
+    Formulate input for nested application invocation.
+
+    Only passes user-defined business variables to child agent.
+    Filters out internal/metadata keys that are specific to parent's execution context.
+    """
     user_task = kwargs.get('task')
     if not user_task:
         raise ToolException("Task is required to invoke the application. "
                             "Check the provided input (some errors may happen on previous steps).")
     result = {"input": [HumanMessage(content=user_task)] if not is_subgraph else user_task}
+
+    # Internal/metadata keys that should NOT be passed to child agent:
+    # - task, chat_history: handled separately
+    # - messages, input, output: graph I/O keys
+    # - context_info: parent's summarization metadata
+    # - state_types: parent's state schema definition
+    # - hitl_decisions, hitl_interrupt: parent's HITL state
+    # - thread_id, execution_finished: parent's execution state
+    # - ELITEA_RS, PRINTER_NODE_RS: internal output keys
+    excluded_keys = {
+        "task", "chat_history",
+        "messages", "input", "output",
+        "context_info", "state_types",
+        "hitl_decisions", "hitl_interrupt",
+        "thread_id", "execution_finished",
+        ELITEA_RS, PRINTER_NODE_RS,
+    }
+
     for key, value in kwargs.items():
-        if key not in ("task", "chat_history"):
+        if key not in excluded_keys:
             result[key] = value
     return result
 
