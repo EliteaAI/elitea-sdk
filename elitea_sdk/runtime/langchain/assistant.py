@@ -26,6 +26,52 @@ APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
+def _extract_task_for_agent(messages: list, agent_name: str) -> str:
+    """Extract the task description for a swarm sub-agent from the shared message history.
+
+    The swarm's create_handoff_tool carries no task argument (args: {} always).
+    The task is encoded in the AIMessage that ASSIGNED this agent: the last AIMessage
+    whose tool_calls contain a transfer_to_<agent_name> entry.  Its text content is
+    what the assigning agent said about why it is handing off and what it expects.
+
+    Falls back to the last HumanMessage when no assigning AIMessage is found (e.g.
+    the very first handoff with no prior AI context).
+    """
+    target_tool = f"transfer_to_{agent_name}"
+
+    # Walk backwards to find the AIMessage that triggered this handoff
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not any(tc.get("name") == target_tool for tc in tool_calls):
+            continue
+        content = msg.content
+        if isinstance(content, list):
+            content = "\n".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+                if not (isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"))
+            ).strip()
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+    # Fallback: use the last HumanMessage (the original user request)
+    for msg in reversed(messages):
+        if not isinstance(msg, HumanMessage):
+            continue
+        content = msg.content
+        if isinstance(content, list):
+            content = "\n".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            ).strip()
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+    return "Execute the assigned task"
+
+
 class Assistant:
     def __init__(self,
                  elitea: 'EliteAClient',
@@ -730,11 +776,11 @@ class Assistant:
         from langgraph.types import Command
         from langgraph_swarm import create_swarm, create_handoff_tool
 
-        # For swarm mode, always use a fresh MemorySaver to avoid corrupted state
-        # from previous failed runs. The message history is passed via invoke(),
-        # so we don't need to persist across invocations.
-        checkpointer = MemorySaver()
-        logger.info("[SWARM] Using fresh MemorySaver for swarm mode")
+        checkpointer = self.memory if self.memory is not None else MemorySaver()
+        logger.info(
+            "[SWARM] Using %s for swarm checkpointer",
+            "persistent self.memory" if self.memory is not None else "fresh MemorySaver"
+        )
 
         # Separate regular tools from agent tools
         regular_tools = [t for t in all_tools if t not in agent_tools]
@@ -956,23 +1002,9 @@ class Assistant:
                     except Exception as e:
                         logger.debug(f"[SWARM] Failed to emit swarm_agent_start: {e}")
 
-                # Extract the user's task from the last HumanMessage
-                task = ""
-                for msg in reversed(messages):
-                    if isinstance(msg, HumanMessage):
-                        content = msg.content
-                        if isinstance(content, list):
-                            content = "\n".join(
-                                block.get("text", "") if isinstance(block, dict) else str(block)
-                                for block in content
-                            )
-                        if isinstance(content, str) and content.strip():
-                            task = content.strip()
-                            break
-
-                if not task:
-                    task = "Execute the assigned task"
-                    logger.warning(f"[SWARM] No HumanMessage found for {agent_name}, using default task")
+                task = _extract_task_for_agent(messages, agent_name)
+                if task == "Execute the assigned task":
+                    logger.warning(f"[SWARM] No task context found for {agent_name}, using default")
 
                 logger.info(
                     f"[SWARM] Direct invoking {'pipeline' if is_pipeline else 'agent'} "
@@ -1256,7 +1288,32 @@ class Assistant:
             def __init__(self, compiled_graph):
                 self._graph = compiled_graph
 
+            def _clear_stale_checkpoint(self, config, checkpoint_state) -> None:
+                from langchain_core.messages import RemoveMessage
+                existing_messages = checkpoint_state.values.get("messages", [])
+                if existing_messages:
+                    remove_msgs = [
+                        RemoveMessage(id=msg.id)
+                        for msg in existing_messages
+                        if hasattr(msg, "id") and msg.id
+                    ]
+                    if remove_msgs:
+                        self._graph.update_state(config, {"messages": remove_msgs})
+
             def invoke(self, input, config=None, **kwargs):
+                thread_id = (
+                    config.get("configurable", {}).get("thread_id")
+                    if isinstance(config, dict) else None
+                )
+
+                if thread_id and checkpointer:
+                    try:
+                        prior_state = self._graph.get_state(config)
+                        if prior_state and prior_state.values.get("messages"):
+                            self._clear_stale_checkpoint(config, prior_state)
+                    except Exception as e:
+                        logger.debug("[SWARM] Could not check/clear prior checkpoint: %s", e)
+
                 result = self._graph.invoke(input, config, **kwargs)
                 messages = result.get("messages", [])
                 output = None
@@ -1271,10 +1328,17 @@ class Assistant:
                         if isinstance(content, str) and content.strip():
                             output = content
                             break
+
+                try:
+                    post_state = self._graph.get_state(config)
+                    is_execution_finished = not post_state.next
+                except Exception:
+                    is_execution_finished = True
+
                 return {
                     "output": output or "",
-                    "thread_id": None,
-                    "execution_finished": True,
+                    "thread_id": None if is_execution_finished else thread_id,
+                    "execution_finished": is_execution_finished,
                 }
 
         # --- Wire with official create_swarm() ---
