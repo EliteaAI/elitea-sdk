@@ -81,7 +81,7 @@ nodes:
     name: get_type
     type: toolkit
     toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
-    tool: get_file_type
+    tool: get_file_metadata
     input:
       - filepath
       - bucket_name
@@ -137,7 +137,7 @@ nodes:
         value: |
           Analyze the file type detection result to verify correct identification.
           
-          Tool executed: get_file_type
+          Tool executed: get_file_metadata
           File: type-test-${TIMESTAMP}.txt (plain text)
           Filepath format: /{bucket}/{filename}
           
@@ -145,14 +145,14 @@ nodes:
           
           Expected behavior:
           - Operation succeeds (status: success)
-          - File type is detected as text (txt)
+          - File type is detected as text (extension returned as ".txt" with leading dot)
           - MIME type is text/plain or similar text type
           - Filename is returned correctly
           - No error in detection
           
           Evaluate:
           1. Is the status "success"?
-          2. Does the result contain extension field (should be "txt")?
+          2. Does the result contain extension field (should be ".txt" with a leading dot)?
           3. Does the result contain mime field with text type?
           4. Is the filename correctly identified?
           5. Is there any error message?

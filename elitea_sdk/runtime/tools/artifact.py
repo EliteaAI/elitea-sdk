@@ -436,7 +436,8 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                   filepath: str = None,
                   start_line: int = None,
                   end_line: int = None,
-                  skip_size_check: bool = True):
+                  skip_size_check: bool = True,
+                  extra_params: str = None):
         """
         Read a file from the artifact bucket.
         
@@ -445,6 +446,8 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         2. filepath: Full path in /{bucket}/{filename} format (extracts bucket and filename automatically)
         
         For large text files, use start_line/end_line to read specific portions.
+        For other file types (e.g. Excel), call ``get_file_metadata`` first to
+        discover which per-type options can be passed via ``extra_params``.
         
         Args:
             filename: Name of the file (required if filepath not provided)
@@ -457,6 +460,9 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             start_line: Starting line number (1-indexed, inclusive) for partial read
             end_line: Ending line number (1-indexed, inclusive) for partial read
             skip_size_check: If True, skip content size limit check and return full content
+            extra_params: JSON-encoded string of per-file-type options
+                discovered via ``get_file_metadata`` (e.g.
+                ``{"sheet_name": "Sheet1", "start_row": 1, "end_row": 100}``).
             
         Returns:
             File content or error message if content exceeds size limit
@@ -479,7 +485,23 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         
         # Determine bucket to use
         target_bucket = bucket_name or self.bucket
-        
+
+        # Parse extra_params JSON string (EL-4389). Use a string param because
+        # some LLMs drop dict-typed params with additionalProperties=true.
+        parsed_extra = None
+        if extra_params:
+            if isinstance(extra_params, dict):
+                parsed_extra = extra_params
+            else:
+                try:
+                    parsed_extra = json.loads(extra_params)
+                except (TypeError, ValueError) as e:
+                    raise ToolException(
+                        f"extra_params must be a JSON object string, got error: {e}"
+                    )
+                if not isinstance(parsed_extra, dict):
+                    raise ToolException("extra_params JSON must decode to an object")
+
         # Use Artifact client's get() method (now uses S3 API internally)
         content = self.artifact.get(
             artifact_name=full_key,
@@ -488,7 +510,8 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             page_number=page_number,
             sheet_name=sheet_name,
             excel_by_sheets=excel_by_sheets,
-            llm=self.llm
+            llm=self.llm,
+            extra_params=parsed_extra,
         )
 
         # Apply line range slicing if requested (for text content only)
@@ -496,6 +519,15 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             offset = start_line if start_line is not None else 1
             limit = (end_line - offset + 1) if end_line is not None else None
             content = apply_line_slice(content, offset=offset, limit=limit)
+        elif not isinstance(content, str) and (start_line is not None or end_line is not None):
+            # Non-text result (e.g. dict from Excel row-range mode). Line-based
+            # slicing cannot apply; inform the caller rather than silently dropping.
+            if isinstance(content, dict):
+                content["_note"] = (
+                    "start_line/end_line parameters were ignored because the "
+                    "file was read using per-type extra_params. Use start_row/"
+                    "end_row inside extra_params for row-based slicing."
+                )
 
         # Check content size limit (after slicing if applicable)
         if not skip_size_check and isinstance(content, str) and len(content) > self.max_single_read_size:
@@ -505,7 +537,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             return f"[Content has {line_count} lines and exceeds size limit. Use partial read options.]"
 
         return content
-    
+
     def _read_file(
         self,
         file_path: str,
@@ -625,87 +657,57 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             "message": "Data appended successfully"
         })
 
-    def get_file_type(self, filepath: str) -> str:
-        """Detect file type of a file using file content analysis.
+    def get_file_metadata(self, filepath: str = None, filename: str = None,
+                          bucket_name: str = None) -> str:
+        """Return type metadata + per-type ``read_file`` hints for an artifact.
 
-        Uses the `filetype` library to determine file type from magic bytes,
-        which is more reliable than extension-based detection.
+        Renamed from ``get_file_type`` (EL-4389). Output is a JSON string with:
 
-        Args:
-            filepath: Path to the file (/{bucket}/{filename} format)
+            - ``filename``, ``type`` (mime), ``extension``, ``filesize``
+            - ``bucket``
+            - ``sheets`` (only for Excel) — list of ``{name, max_row, max_column}``
+            - ``instruction_for_readFile`` — describes the ``extra_params`` the
+              ``read_file`` tool will accept for this file type.
 
-        Returns:
-            JSON string with file type information:
-            {
-                "filepath": str,
-                "extension": str,      # e.g., "jpg", "png", "pdf"
-                "mime": str,          # e.g., "image/jpeg", "application/pdf"
-                "status": "success" | "error",
-                "message": str        # Error message if status is "error"
-            }
+        Either ``filepath`` (``/{bucket}/{filename}`` form) or
+        ``filename``+``bucket_name`` must be provided.
         """
         try:
-            import filetype
-        except ImportError:
-            return json.dumps({
-                "filepath": filepath,
-                "status": "error",
-                "message": "filetype library not installed. Install with: pip install filetype"
-            })
-
-        try:
-            # Get raw file content using Artifact client's get_raw_content_by_filepath() method
-            file_content, filename = self.artifact.get_raw_content_by_filepath(filepath)
-
-            if not file_content:
-                return json.dumps({
-                    "filepath": filepath,
-                    "status": "error",
-                    "message": "File not found or empty"
-                })
-
-            # Detect file type from content first (more reliable)
-            kind = filetype.guess(file_content)
-
-            if kind is None:
-                # Fallback to extension-based detection from filename
-                import mimetypes
-                from pathlib import Path
-                
-                ext = Path(filename).suffix.lower()
-                mime_type = mimetypes.guess_type(filename)[0]
-                
-                if mime_type:
+            if filepath:
+                try:
+                    target_bucket, key = parse_filepath(filepath)
+                except ValueError as e:
                     return json.dumps({
                         "filepath": filepath,
-                        "extension": ext.lstrip('.') if ext else "unknown",
-                        "mime": mime_type,
-                        "filename": filename,
-                        "status": "success",
-                        "message": f"File type detected from extension: {mime_type}"
-                    })
-                else:
-                    return json.dumps({
-                        "filepath": filepath,
-                        "filename": filename,
                         "status": "error",
-                        "message": "Cannot guess file type from content or extension"
+                        "message": f"Invalid filepath format: {e}",
                     })
+            else:
+                if not filename:
+                    return json.dumps({
+                        "status": "error",
+                        "message": "Must provide either 'filepath' or 'filename'.",
+                    })
+                target_bucket = bucket_name or self.bucket
+                key = filename.lstrip('/')
 
+            # Always download so the loader can provide full structural hints
+            # (e.g. Excel sheet listing). This is the purpose of the tool.
+            meta = self.artifact.get_metadata(
+                key,
+                bucket_name=target_bucket,
+                download_for_detection=True,
+            )
+            meta.setdefault("status", "success")
+            if filepath:
+                meta["filepath"] = filepath
+            return json.dumps(meta, default=str)
+        except Exception as e:  # pylint: disable=broad-except
             return json.dumps({
                 "filepath": filepath,
-                "extension": kind.extension,
-                "mime": kind.mime,
                 "filename": filename,
-                "status": "success",
-                "message": f"File type detected: {kind.mime}"
-            })
-
-        except Exception as e:
-            return json.dumps({
-                "filepath": filepath,
                 "status": "error",
-                "message": f"Error detecting file type: {str(e)}"
+                "message": f"Error reading file metadata: {e}",
             })
 
     def create_new_bucket(self, bucket_name: str, expiration_measure = "weeks", expiration_value = 1):
@@ -889,16 +891,40 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                         default=None)),
                     skip_size_check=(bool, Field(
                         description="If True, skip content size limit check and return full file content.",
-                        default=True))
+                        default=True)),
+                    extra_params=(Optional[str], Field(
+                        description=(
+                            "JSON-encoded string of per-file-type options. "
+                            "Call get_file_metadata first to discover which "
+                            "keys are accepted for this file type. Example "
+                            "for Excel: '{\"sheet_name\":\"Sheet1\", "
+                            "\"start_row\":1, \"end_row\":100}'. "
+                            "Pass as a JSON STRING, not as an object."),
+                        default=None,
+                    )),
                 )
             },
             {
-                "ref": self.get_file_type,
-                "name": "get_file_type",
-                "description": "Detect the file type of a file using content analysis. More reliable than extension-based detection as it analyzes file magic bytes. Useful for verifying file types before processing or after generation.",
+                "ref": self.get_file_metadata,
+                "name": "get_file_metadata",
+                "description": (
+                    "Return type metadata for a file (mime, extension, filesize) "
+                    "plus per-file-type hints describing which extra options "
+                    "the `read_file` tool will accept via its `extra_params` "
+                    "JSON-string argument. For Excel files, also returns the "
+                    "list of sheets with row/column counts. Call this BEFORE "
+                    "read_file when the file may be large or its structure is "
+                    "unknown."
+                ),
                 "args_schema": create_model(
-                    "get_file_type",
-                    filepath=(str, Field(description="Path to the file (/{bucket}/{filename} format). This filepath is returned when files are uploaded or generated."))
+                    "get_file_metadata",
+                    filepath=(Optional[str], Field(
+                        description="Full path in /{bucket}/{filename} format. This filepath is returned when files are uploaded or generated.",
+                        default=None)),
+                    filename=(Optional[str], Field(
+                        description="Filename of the file. Alternative to filepath when used together with bucket_name.",
+                        default=None)),
+                    bucket_name=bucket_name,
                 )
             },
             {

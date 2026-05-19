@@ -98,13 +98,25 @@ class Artifact:
             page_number: int = None,
             sheet_name: str = None,
             excel_by_sheets: bool = False,
-            llm = None):
+            llm = None,
+            extra_params: dict = None):
         if not bucket_name:
             bucket_name = self.bucket_name
         # Use S3 API for downloading
         data = self.client.download_artifact_s3(bucket_name, artifact_name)
         if isinstance(data, dict) and 'error' in data:
             return f"{data['error']}. {data.get('content', '')}"
+        # When extra_params is provided we MUST go through parse_file_content
+        # so the per-type loader can honor the requested slice / options.
+        if extra_params:
+            return parse_file_content(file_name=artifact_name,
+                                      file_content=data,
+                                      is_capture_image=is_capture_image,
+                                      page_number=page_number,
+                                      sheet_name=sheet_name,
+                                      excel_by_sheets=excel_by_sheets,
+                                      llm=llm,
+                                      extra_params=extra_params)
         try:
             return self._decode_text(data)
         except ValueError:
@@ -116,6 +128,51 @@ class Artifact:
                                       sheet_name=sheet_name,
                                       excel_by_sheets=excel_by_sheets,
                                       llm=llm)
+
+    def get_metadata(self, artifact_name: str, bucket_name: str = None,
+                     include_filesize: bool = True,
+                     download_for_detection: bool = False) -> dict:
+        """Return type metadata for an artifact.
+
+        Uses the S3 list API (same source as the UI) for filesize — more
+        reliable than HEAD which may omit Content-Length for some file types.
+        Set ``download_for_detection=True`` to also download the file so the
+        loader's ``get_file_metadata`` classmethod can add per-type structural
+        hints (e.g. sheet listing for Excel).
+        """
+        from elitea_sdk.tools.utils.file_metadata import get_file_metadata
+        if not bucket_name:
+            bucket_name = self.bucket_name
+        file_size = None
+        if include_filesize:
+            try:
+                # Use list API with exact-prefix match (no delimiter = no folder
+                # grouping) so we get back only entries whose key starts with the
+                # artifact name.  The UI uses the same endpoint and field.
+                listing = self.client.list_artifacts_s3(
+                    bucket_name, prefix=artifact_name, delimiter=None
+                )
+                for item in listing.get('contents', []):
+                    if item.get('key') == artifact_name:
+                        file_size = item.get('size')
+                        break
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug("List failed for %s/%s: %s",
+                             bucket_name, artifact_name, e)
+        file_content = None
+        if download_for_detection:
+            data = self.client.download_artifact_s3(bucket_name, artifact_name)
+            if isinstance(data, dict) and 'error' in data:
+                return {
+                    "filename": artifact_name,
+                    "bucket": bucket_name,
+                    "error": f"{data['error']}. {data.get('content', '')}"
+                }
+            file_content = data
+        meta = get_file_metadata(artifact_name, file_content=file_content,
+                                 file_size=file_size)
+        meta["bucket"] = bucket_name
+        return meta
 
     def get_raw_content_by_filepath(self, filepath: str) -> tuple:
         """Get artifact content and filename by filepath.
