@@ -287,7 +287,13 @@ class TestSwarmResultAdapterContract:
             {"configurable": {"thread_id": str(uuid.uuid4())}},
         )
 
-        assert result == {"output": "world", "thread_id": None, "execution_finished": True}
+        # AgentResponse.to_dict() exposes the full standardized contract,
+        # including the messages list. Assert the load-bearing fields without
+        # over-specifying keys we don't own.
+        assert result["output"] == "world"
+        assert result["thread_id"] is None
+        assert result["execution_finished"] is True
+        assert isinstance(result["messages"], list) and len(result["messages"]) == 2
 
 
 class TestSwarmPersistentCheckpointer:

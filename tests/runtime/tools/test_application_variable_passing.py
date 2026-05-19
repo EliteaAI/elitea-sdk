@@ -498,10 +498,11 @@ class TestChildToParentVariablePropagation:
 
         # user_var should propagate
         assert result['user_var'] == 'should_propagate'
-        # These should not be duplicated/propagated as state vars
+        # 'input' and 'chat_history' should not be propagated as state vars
         assert 'input' not in result
-        assert 'output' not in result
-        # messages is the result format, should exist
+        assert 'chat_history' not in result
+        # 'output' and 'messages' ARE now part of standardized response format (not propagated state)
+        assert 'output' in result
         assert 'messages' in result
 
     def test_bidirectional_variable_flow(self):

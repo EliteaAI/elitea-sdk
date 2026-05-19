@@ -1678,6 +1678,56 @@ class LLMNode(BaseTool):
         else:
             content_shape = type(content).__name__
 
+        # Filter tool_calls to prevent orphaned tool_call_ids. The API requires
+        # that ToolMessages FOLLOW their AIMessage. Tool_calls are kept if:
+        # 1. They are at or after the resumed tool's position (will execute and
+        #    get ToolMessages AFTER this AIMessage), OR
+        # 2. They are before the resumed position AND already have ToolMessages
+        #    in the conversation history (already completed).
+        #
+        # This prevents the "tool_call_ids did not have response messages" error
+        # when the original AIMessage had multiple tool_calls but not all executed
+        # before the interrupt.
+
+        # Find the index of the resumed tool_call
+        resumed_idx = None
+        for i, tc in enumerate(original_ai.tool_calls or []):
+            tc_id = tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')
+            if tc_id == original_tc_id:
+                resumed_idx = i
+                break
+
+        if resumed_idx is not None:
+            # Collect tool_call_ids that already have ToolMessages
+            tool_result_ids = {
+                getattr(m, 'tool_call_id', None)
+                for m in messages
+                if isinstance(m, ToolMessage) and getattr(m, 'tool_call_id', None)
+            }
+
+            filtered_tool_calls = []
+            for i, tc in enumerate(original_ai.tool_calls or []):
+                tc_id = tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')
+                if i >= resumed_idx:
+                    # This tool_call will execute (at or after resumed position), keep it
+                    filtered_tool_calls.append(tc)
+                elif tc_id in tool_result_ids:
+                    # This tool_call already has a ToolMessage, keep it
+                    filtered_tool_calls.append(tc)
+                # else: tool_call before resumed position without ToolMessage - filter out
+
+            if len(filtered_tool_calls) != len(original_ai.tool_calls or []):
+                logger.info(
+                    "[HITL] Filtered original AIMessage tool_calls from %d to %d "
+                    "(keeping completed siblings + resumed tool and later siblings)",
+                    len(original_ai.tool_calls or []),
+                    len(filtered_tool_calls),
+                )
+                try:
+                    original_ai = original_ai.model_copy(update={"tool_calls": filtered_tool_calls})
+                except Exception:
+                    original_ai = AIMessage(content=original_ai.content, tool_calls=filtered_tool_calls)
+
         logger.info(
             "[HITL] Reusing original AIMessage as resume completion "
             "(tool=%s, tool_call_id=%s, content_shape=%s) — preserves the "
@@ -2156,8 +2206,6 @@ class LLMNode(BaseTool):
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
                         # Reset auto-approve context before propagating.
-                        # NOTE: _PENDING_TOOL_MESSAGES was set right before invoke
-                        # and already consumed by the middleware's interrupt() call.
                         if _approved_token is not None:
                             reset_hitl_approved_tools(_approved_token)
                         end_hitl_batch(_batch_token)

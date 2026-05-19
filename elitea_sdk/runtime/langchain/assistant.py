@@ -17,6 +17,7 @@ from .constants import (
 )
 from ..middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from ..middleware.base import Middleware, MiddlewareManager
+from ..models.agent_response import AgentResponse
 from ..utils.utils import deduplicate_tool_names
 
 logger = logging.getLogger(__name__)
@@ -1415,10 +1416,10 @@ class Assistant:
                                 "[SWARM] Continuation: keeping checkpoint state, "
                                 "appending only the new HumanMessage"
                             )
-
                 result = self._graph.invoke(input, config, **kwargs)
+                messages = result.get("messages", [])
                 output = ""
-                for msg in reversed(result.get("messages", [])):
+                for msg in reversed(messages):
                     if not hasattr(msg, "content") or isinstance(msg, HumanMessage):
                         continue
                     text = normalize_message_content(msg.content).strip()
@@ -1429,11 +1430,12 @@ class Assistant:
                 # Swarm has no interrupt_before/after, so a top-level invoke always
                 # reaches END. thread_id is therefore None on completion (matches the
                 # LangGraphAgentRunnable contract for finished runs).
-                return {
-                    "output": output,
-                    "thread_id": None,
-                    "execution_finished": True,
-                }
+                return AgentResponse(
+                    output=output,
+                    messages=messages,
+                    thread_id=None,
+                    execution_finished=True,
+                ).to_dict()
 
         # --- Wire with official create_swarm() ---
         try:
