@@ -101,7 +101,7 @@ class TestExtractSubagentOutput:
 
 class TestInvokeApplicationTaskExtraction:
 
-    def test_aggregates_session_transcript_through_assigning_aimessage(self):
+    def test_structured_brief_with_task_user_and_prior_sections(self):
         messages = [
             HumanMessage(content="Get and fix all security issues"),
             AIMessage(
@@ -123,14 +123,21 @@ class TestInvokeApplicationTaskExtraction:
 
         task = _extract_task_for_agent(messages, "securityresolver")
 
-        assert "User: Get and fix all security issues" in task
-        # Sub-agent result is preserved
-        assert "Here are the issues: [issue1, issue2]" in task
-        # Assigning AIMessage is preserved
+        assert "## Your Task" in task
         assert "Fix both CVEs: issue1 and issue2" in task
-        # Orchestrator's first transition is dropped (intermediate)
+        assert "## Original User Request" in task
+        assert "Get and fix all security issues" in task
+        assert "## Prior Agent Outputs" in task
+        assert "Here are the issues: [issue1, issue2]" in task
+        # Orchestrator's intermediate transition dropped
         assert "I'll retrieve the issues first" not in task
         assert "Successfully transferred" not in task
+
+        # Section ordering: task first, user request, then references
+        task_idx = task.index("## Your Task")
+        req_idx = task.index("## Original User Request")
+        ref_idx = task.index("## Prior Agent Outputs")
+        assert task_idx < req_idx < ref_idx
 
     def test_aggregates_prior_agent_outputs_for_chained_handoffs(self):
         # Issue #4950 production case: the orchestrator's handoff message uses
@@ -168,14 +175,15 @@ class TestInvokeApplicationTaskExtraction:
 
         task = _extract_task_for_agent(messages, "GuidedDeveloper")
 
-        # Kept: original user task, both sub-agent results, the current handoff
+        assert "## Your Task" in task
+        assert "hand off all 4 issues" in task
+        assert "## Original User Request" in task
         assert "Fix all open issues" in task
+        assert "## Prior Agent Outputs" in task
         assert "Issues: #11, #14, #20, #21" in task
         assert "Security fixes for #11 and #14 applied: patch X and Y." in task
-        assert "hand off all 4 issues" in task
-        # Dropped: orchestrator's intermediate transitions (restate context that
-        # is already conveyed by the sub-agent results that follow them) and
-        # langgraph_swarm handoff acks
+        # Orchestrator transitions dropped — they restate context already in the
+        # sub-agent results that follow them
         assert "Retrieving issues first" not in task
         assert "I've got 4 issues, 2 security" not in task
         assert "Successfully transferred" not in task
@@ -239,7 +247,7 @@ class TestInvokeApplicationTaskExtraction:
 
         task_camel = _extract_task_for_agent(messages, "SecurityResolver")
         assert "Delegating the security work" in task_camel
-        assert "User: user request" in task_camel
+        assert "user request" in task_camel
 
         messages_ws = [
             HumanMessage(content="ws request"),
@@ -250,7 +258,7 @@ class TestInvokeApplicationTaskExtraction:
         ]
         task_ws = _extract_task_for_agent(messages_ws, "Data Agent")
         assert "Hand off to data team" in task_ws
-        assert "User: ws request" in task_ws
+        assert "ws request" in task_ws
 
 
 class TestSwarmResultAdapterContract:

@@ -63,22 +63,19 @@ def _extract_subagent_output(result: Any) -> str:
 
 
 def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: str = "main_agent") -> str:
-    """Build the sub-agent's task as a compact transcript of the current swarm turn.
+    """Build the sub-agent's task as a structured brief of the current swarm turn.
 
-    The orchestrator's handoff message often uses anaphora ("hand off all 4
-    issues...") that points at data sitting in earlier sub-agent outputs.
-    Returning only the assigning AIMessage's text loses the referent, so we
-    aggregate the slice [latest HumanMessage .. assigning AIMessage].
+    The output has up to three labeled sections so the sub-agent LLM can
+    prioritize what to act on vs what is reference:
 
-    To keep the transcript bounded as the chain grows we drop the orchestrator's
-    intermediate transitions (AIMessages routing to a peer that isn't the
-    current target). They only restate what's about to happen — the actual
-    payload is in the next sub-agent's result. We keep:
-      - the latest HumanMessage (the user's task)
-      - sub-agent result AIMessages (those routing back to ``main_agent_name``)
-      - the assigning AIMessage (current handoff intent)
-    Handoff-ack ToolMessages ("Successfully transferred to X") and empty
-    messages are also dropped. Tool name normalization mirrors langgraph_swarm's
+      ## Your Task          — the assigning AIMessage's text (primary)
+      ## Original User Request   — the latest HumanMessage (intent anchor)
+      ## Prior Agent Outputs (reference)  — earlier sub-agent results, joined
+                                            with ``---`` separators
+
+    Orchestrator transitions between sub-agent runs are dropped: they restate
+    what is about to happen and the data is already in the sub-agent results
+    that follow. Tool name normalization mirrors langgraph_swarm's
     ``_normalize_agent_name`` (lowercase + whitespace collapse).
     """
     if not messages:
@@ -107,38 +104,40 @@ def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: st
                     return text
         return ""
 
-    # Anchor at the latest HumanMessage at-or-before the handoff so prior
-    # turns don't bleed in.
     session_start = 0
     for i in range(assign_idx, -1, -1):
         if isinstance(messages[i], HumanMessage):
             session_start = i
             break
 
-    parts = []
-    for i, msg in enumerate(messages[session_start:assign_idx + 1], start=session_start):
+    task_text = normalize_message_content(messages[assign_idx].content).strip()
+    user_request = ""
+    prior_outputs = []
+    for msg in messages[session_start:assign_idx]:
         text = normalize_message_content(msg.content).strip()
         if not text:
             continue
         if isinstance(msg, HumanMessage):
-            parts.append(f"User: {text}")
+            user_request = text
         elif isinstance(msg, AIMessage):
-            tool_calls = getattr(msg, "tool_calls", None) or []
-            names = [tc.get("name") for tc in tool_calls]
-            is_subagent_result = back_handoff in names
-            is_assigning = i == assign_idx
-            is_orchestrator_transition = (
-                bool(names) and not is_subagent_result and not is_assigning
-            )
-            if is_orchestrator_transition:
-                continue
-            parts.append(f"Assistant: {text}")
-        elif isinstance(msg, ToolMessage):
-            if text.startswith("Successfully transferred to "):
-                continue
-            parts.append(f"Tool result: {text}")
+            tool_call_names = [
+                tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
+            ]
+            if back_handoff in tool_call_names:
+                prior_outputs.append(text)
 
-    return "\n\n".join(parts)
+    sections = []
+    if task_text:
+        sections.append(f"## Your Task\n{task_text}")
+    if user_request:
+        sections.append(f"## Original User Request\n{user_request}")
+    if prior_outputs:
+        sections.append(
+            "## Prior Agent Outputs (reference — consult only if data is missing from Your Task)\n"
+            + "\n\n---\n\n".join(prior_outputs)
+        )
+
+    return "\n\n".join(sections)
 
 
 class Assistant:
@@ -1435,12 +1434,20 @@ class Assistant:
         if agent_role == "main":
             lines.extend([
                 "You can delegate tasks to the following peer agents by using their handoff tools.",
-                "When you hand off to a peer, they will have access to the full conversation history.",
+                "Your handoff MESSAGE TEXT (the AIMessage you emit alongside the transfer tool "
+                "call) becomes the peer's primary task. It must be self-contained — include the "
+                "specific data the peer needs to do its work (issue IDs and descriptions, prior "
+                "fix results, file paths, etc.), not just references like \"the remaining bug\" "
+                "or \"hand off the issues\". Assume the peer cannot see the rest of the conversation.",
                 "",
             ])
         else:
             lines.extend([
                 "You are part of a multi-agent swarm. You can hand off to the following peer agents.",
+                "Your task is delivered as a structured brief with sections like \"## Your Task\", "
+                "\"## Original User Request\", and \"## Prior Agent Outputs (reference)\". Act on "
+                "\"## Your Task\"; consult the other sections only when you need data not present "
+                "there.",
                 "When you have completed your task, you MUST hand off to another agent "
                 "(typically the main agent) so the conversation can continue.",
                 "If you simply respond with text and no tool calls, the entire swarm will stop.",
