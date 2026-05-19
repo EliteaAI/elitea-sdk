@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -30,10 +31,13 @@ def _extract_task_for_agent(messages: list, agent_name: str) -> str:
     """Pull the sub-agent's task from the shared swarm history.
 
     create_handoff_tool emits tool_calls with empty args, so the task lives in
-    the text of the AIMessage that issued ``transfer_to_<agent_name>``. Falls
-    back to the last HumanMessage; returns ``""`` if neither exists.
+    the text of the AIMessage that issued ``transfer_to_<agent_name>``. The
+    tool name is lowercased and whitespace-collapsed by langgraph_swarm
+    (``_normalize_agent_name``), so we mirror that here. Falls back to the
+    last HumanMessage; returns ``""`` if neither exists.
     """
-    target_tool = f"transfer_to_{agent_name}"
+    normalized = re.sub(r"\s+", "_", agent_name.strip()).lower()
+    target_tool = f"transfer_to_{normalized}"
 
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):

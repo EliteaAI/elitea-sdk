@@ -120,6 +120,35 @@ class TestInvokeApplicationTaskExtraction:
     def test_empty_messages_returns_empty_string(self):
         assert _extract_task_for_agent([], "any_agent") == ""
 
+    def test_agent_name_normalization_matches_langgraph_swarm(self):
+        # langgraph_swarm.create_handoff_tool lowercases and collapses whitespace
+        # in agent_name when building the tool name. The helper must mirror that
+        # or it never finds the assigning AIMessage and silently falls back to
+        # the original HumanMessage — the exact symptom reported on issue #4950.
+        messages = [
+            HumanMessage(content="Original user request"),
+            AIMessage(
+                content="Delegating the security work to the resolver.",
+                tool_calls=[{"name": "transfer_to_securityresolver", "args": {}, "id": "tc1"}],
+            ),
+            ToolMessage(content="Transferred", tool_call_id="tc1"),
+        ]
+
+        # CamelCase name as it would appear in agent_tool.name
+        task = _extract_task_for_agent(messages, "SecurityResolver")
+        assert "Delegating the security work" in task
+        assert task != "Original user request"
+
+        # Whitespace in name
+        messages_ws = [
+            HumanMessage(content="user req"),
+            AIMessage(
+                content="Hand off to data team.",
+                tool_calls=[{"name": "transfer_to_data_agent", "args": {}, "id": "tc1"}],
+            ),
+        ]
+        assert _extract_task_for_agent(messages_ws, "Data Agent") == "Hand off to data team."
+
 
 class TestSwarmResultAdapterContract:
 
