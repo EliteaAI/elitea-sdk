@@ -126,6 +126,30 @@ def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: st
             if back_handoff in tool_call_names:
                 prior_outputs.append(text)
 
+    # Multi-turn safety net: when the current turn has not produced any
+    # sub-agent outputs yet (e.g. a follow-up "fix only the security issues"
+    # right after a prior turn that generated the issue list), surface the
+    # immediately-prior turn's sub-agent outputs as reference data. The
+    # orchestrator's history-aware handoff text alone is fragile —
+    # the LLM tends to use anaphora and skip embedding the data inline.
+    if not prior_outputs and session_start > 0:
+        prev_start = 0
+        for i in range(session_start - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                prev_start = i
+                break
+        for msg in messages[prev_start:session_start]:
+            if not isinstance(msg, AIMessage):
+                continue
+            tool_call_names = [
+                tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
+            ]
+            if back_handoff not in tool_call_names:
+                continue
+            text = normalize_message_content(msg.content).strip()
+            if text:
+                prior_outputs.append(text)
+
     sections = []
     if task_text:
         sections.append(f"## Your Task\n{task_text}")
@@ -1434,11 +1458,16 @@ class Assistant:
         if agent_role == "main":
             lines.extend([
                 "You can delegate tasks to the following peer agents by using their handoff tools.",
-                "Your handoff MESSAGE TEXT (the AIMessage you emit alongside the transfer tool "
-                "call) becomes the peer's primary task. It must be self-contained — include the "
-                "specific data the peer needs to do its work (issue IDs and descriptions, prior "
-                "fix results, file paths, etc.), not just references like \"the remaining bug\" "
-                "or \"hand off the issues\". Assume the peer cannot see the rest of the conversation.",
+                "",
+                "**Handoff message rules (mandatory, not stylistic):**",
+                "- The MESSAGE TEXT you emit alongside the transfer tool call IS the peer's task.",
+                "  The peer does not see the rest of the conversation. Treat them as a fresh "
+                "  agent who only sees your message.",
+                "- Inline the **actual data** the peer needs to do the work — never refer to "
+                "  data by anaphora (\"the remaining items\", \"those results\", \"the file from "
+                "  earlier\"). If a prior step produced a payload the peer must operate on, "
+                "  copy that payload into your handoff message verbatim.",
+                "- State explicitly what the peer must produce in return.",
                 "",
             ])
         else:

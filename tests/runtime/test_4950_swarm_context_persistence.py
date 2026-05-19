@@ -391,3 +391,193 @@ class TestSwarmStaleCheckpointClearing:
             and any(isinstance(m, RemoveMessage) for m in call["messages"])
         ]
         assert len(remove_calls) > 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn integration test: a fresh Assistant per turn sharing the same
+# MemorySaver and thread_id, mirroring how pylon invokes the swarm from the UI.
+# pylon's prepare_invoke_input sends chat_history + new HumanMessage each turn
+# (see centry/pylon_indexer/.../utils/agent_execution_common.py:856), so each
+# turn the swarm receives the full conversation as input.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingApp:
+    """Stand-in for a sub-agent's compiled graph: records every invoke."""
+
+    def __init__(self, output: str):
+        self.output = output
+        self.calls = []
+
+    def invoke(self, payload, config=None):
+        self.calls.append(dict(payload) if isinstance(payload, dict) else payload)
+        return {"output": self.output}
+
+
+class _ScriptedOrchestratorLLM:
+    """Fake orchestrator LLM that:
+
+    - Emits ``transfer_to_provider`` for any HumanMessage containing 'generate'
+    - Emits ``transfer_to_fixer`` for any HumanMessage containing 'fix' (with
+      anaphoric handoff text — the exact production failure mode)
+    - Emits a final response (no tool_calls) once a sub-agent has handed back
+      in the current turn.
+    """
+
+    temperature = 0
+    max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {"temperature": 0, "max_tokens": 1000}
+
+    def bind_tools(self, tools, **_kwargs):
+        return _ScriptedBound(list(tools))
+
+    def invoke(self, messages, config=None):
+        return _ScriptedBound([]).invoke(messages, config=config)
+
+
+class _ScriptedBound:
+    def __init__(self, tools):
+        self.tools = tools
+
+    def invoke(self, messages, config=None, **_kwargs):
+        latest_human_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                latest_human_idx = i
+                break
+        if latest_human_idx is None:
+            return AIMessage(content="empty")
+
+        # If a sub-agent has already handed back in this turn, emit final.
+        for msg in messages[latest_human_idx + 1:]:
+            if isinstance(msg, AIMessage):
+                tc_names = [
+                    tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
+                ]
+                if "transfer_to_main_agent" in tc_names:
+                    return AIMessage(content="Done.")
+
+        human = messages[latest_human_idx]
+        text = human.content if isinstance(human.content, str) else str(human.content)
+        lower = text.lower()
+
+        if "generate" in lower:
+            target = "transfer_to_provider"
+            handoff_text = "Routing to provider to generate items."
+        elif "fix" in lower:
+            target = "transfer_to_fixer"
+            # Deliberate anaphora — the production failure mode the helper must compensate for.
+            handoff_text = "Now routing the items to the fixer."
+        else:
+            return AIMessage(content="unknown request")
+
+        return AIMessage(
+            content=handoff_text,
+            tool_calls=[{
+                "name": target,
+                "args": {},
+                "id": f"tc-{len(messages)}",
+                "type": "tool_call",
+            }],
+        )
+
+
+class TestSwarmMultiTurnIntegration:
+    """Each turn = a fresh Assistant + same MemorySaver + same thread_id.
+    Mirrors pylon's UI invocation: full chat_history + new HumanMessage per turn.
+    """
+
+    def _build_runnable(self, llm, memory, provider_app, fixer_app):
+        # Fresh Application instances per turn — _create_swarm_agent mutates
+        # tool.is_subgraph = False during pipeline detection (assistant.py:1180),
+        # so reusing the same instance across turns silently demotes the pipeline
+        # peer to an LLM peer. Real pylon rebuilds tools per request; we mirror that.
+        provider_tool = Application(
+            name="Provider",
+            description="Generates items",
+            application=provider_app,
+            return_type="str",
+            client=None,
+            is_subgraph=True,
+        )
+        fixer_tool = Application(
+            name="Fixer",
+            description="Fixes items of a given kind",
+            application=fixer_app,
+            return_type="str",
+            client=None,
+            is_subgraph=True,
+        )
+        return Assistant(
+            elitea=DummyEliteaRuntime(),
+            data={
+                "instructions": "Coordinate sub-agents",
+                "tools": [],
+                "meta": {"internal_tools": ["swarm"]},
+                "internal_tools": ["swarm"],
+            },
+            client=llm,
+            tools=[provider_tool, fixer_tool],
+            memory=memory,
+            app_type="agent",
+        ).runnable()
+
+    def test_subagent_in_turn_2_sees_prior_turn_output(self):
+        memory = MemorySaver()
+        thread_id = str(uuid.uuid4())
+
+        provider_app = _RecordingApp(output='[{"id": 1, "kind": "X"}, {"id": 2, "kind": "Y"}]')
+        fixer_app = _RecordingApp(output="fixed")
+        llm = _ScriptedOrchestratorLLM()
+
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # ---- Turn 1: "generate items" ----
+        runnable_t1 = self._build_runnable(llm, memory, provider_app, fixer_app)
+        h1 = HumanMessage(content="please generate items")
+        runnable_t1.invoke({"messages": [h1]}, config=config)
+
+        assert len(provider_app.calls) == 1, (
+            "Provider should have been invoked exactly once in turn 1"
+        )
+        assert len(fixer_app.calls) == 0, "Fixer must not run in turn 1"
+
+        # Capture the conversation as pylon would: full message history.
+        post_t1_state = runnable_t1._graph.get_state(config)
+        history = list(post_t1_state.values.get("messages", []))
+        assert any(isinstance(m, HumanMessage) for m in history)
+
+        # ---- Turn 2: "fix only the X-kind items" — fresh Assistant + fresh tools ----
+        runnable_t2 = self._build_runnable(llm, memory, provider_app, fixer_app)
+        h2 = HumanMessage(content="fix only the X-kind items")
+        # Mirror pylon's prepare_invoke_input: chat_history + new user_message
+        runnable_t2.invoke({"messages": history + [h2]}, config=config)
+
+        assert len(fixer_app.calls) == 1, (
+            "Fixer should have been invoked exactly once in turn 2"
+        )
+        # _create_swarm_agent mutates is_subgraph=False on pipeline peers
+        # (assistant.py:1180), so formulate_query wraps the task as
+        # {"input": [HumanMessage(content=task)], ...}. Pull the content from
+        # the first HumanMessage to get the actual task string.
+        payload = fixer_app.calls[0]
+        wrapped_input = payload.get("input")
+        assert isinstance(wrapped_input, list) and wrapped_input, (
+            f"Expected formulate_query-wrapped input, got: {payload!r}"
+        )
+        fixer_task = wrapped_input[0].content
+
+        # The production gap: even though the orchestrator's turn-2 handoff uses
+        # anaphora ("the items") without inlining the data, the fixer's task
+        # must surface turn 1's provider output as reference.
+        assert '"kind": "X"' in fixer_task or '"id": 1' in fixer_task, (
+            f"Fixer task in turn 2 does not include turn 1's provider output. "
+            f"Multi-turn fallback failed.\nTask:\n{fixer_task}"
+        )
+        # The structured-brief shape is preserved
+        assert "## Your Task" in fixer_task
+        assert "## Original User Request" in fixer_task
+        assert "fix only the X-kind items" in fixer_task
