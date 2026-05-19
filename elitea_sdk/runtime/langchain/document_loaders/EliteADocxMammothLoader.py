@@ -23,18 +23,51 @@ class EliteADocxMammothLoader(BaseLoader):
     and then Markdownify to convert HTML to markdown.
     Detects bordered paragraphs and text boxes and treats them as code blocks.
     """
-    def __init__(self, **kwargs):
-        """
-        Initializes EliteADocxMammothLoader.
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Return per-type metadata for DOCX files (EL-4629).
 
-        Args:
-            **kwargs: Keyword arguments, including:
-                file_path (str): Path to the Docx file. Required.
-                llm (LLM, optional): Language model for processing images.
-                prompt (str, optional): Prompt for the language model.
-        Raises:
-            ValueError: If the 'path' parameter is not provided.
+        Reports embedded image count and advertises the extra_params
+        that ``read_file`` accepts for DOCX.
         """
+        import logging
+        _logger = logging.getLogger(__name__)
+        image_count = 0
+        if file_content:
+            try:
+                doc = DocxDocument(BytesIO(file_content) if isinstance(file_content, (bytes, bytearray)) else file_content)
+                for rel in doc.part.rels.values():
+                    if hasattr(rel, 'target_part') and hasattr(rel.target_part, 'content_type'):
+                        if rel.target_part.content_type.startswith('image/'):
+                            image_count += 1
+            except Exception as exc:  # pylint: disable=broad-except
+                _logger.warning("Failed to count images in %s: %s", filename, exc)
+
+        instruction = {
+            "extra_params": {
+                "extract_images": (
+                    "boolean (default false) — when true, embedded images are "
+                    "transcribed by the AI vision model and appended to the "
+                    "text content."
+                ),
+                "prompt": (
+                    "string (optional) — custom prompt for the vision model. "
+                    "If omitted, the default image-processing prompt is used."
+                ),
+            },
+            "notes": (
+                "Enabling extract_images adds latency proportional to the "
+                "number of embedded images. Call get_file_metadata first to "
+                "check image_count before deciding. "
+                "Pass extra_params as a JSON string."
+            ),
+        }
+        return {"image_count": image_count, "instruction_for_readFile": instruction}
+
+    def __init__(self, **kwargs):
+        """Initializes EliteADocxMammothLoader."""
         self.path =  kwargs.get('file_path')
         self.file_content = kwargs.get('file_content')
         self.file_name = kwargs.get('file_name')
@@ -42,6 +75,9 @@ class EliteADocxMammothLoader(BaseLoader):
         self.llm = kwargs.get("llm")
         self.prompt = kwargs.get("prompt")
         self.max_tokens = kwargs.get('max_tokens', 512)
+        # When True, use LLM-only image handler (no Tesseract fallback).
+        # Intended for the read_file extra_params path (EL-4629).
+        self._llm_only_images = kwargs.get('_llm_only_images', False)
 
     def __handle_image(self, image) -> dict:
         """
@@ -80,16 +116,27 @@ class EliteADocxMammothLoader(BaseLoader):
             # a single image processing failure and provides a default image representation.
             return self.__default_image_handler(image)
 
+    def __handle_image_llm_only(self, image) -> dict:
+        """LLM-only image handler for the read_file extra_params path (EL-4629).
+
+        Uses LLM vision when available; returns a placeholder otherwise.
+        Does NOT fall back to Tesseract OCR.
+        """
+        from elitea_sdk.tools.utils.content_parser import image_processing_prompt
+        if self.llm:
+            try:
+                with image.open() as image_file:
+                    image_bytes = image_file.read()
+                    result = perform_llm_prediction_for_image_bytes(
+                        image_bytes, self.llm,
+                        self.prompt if self.prompt else image_processing_prompt)
+                return {'src': result}
+            except Exception:
+                pass
+        return self.__default_image_handler(image)
+
     def __default_image_handler(self, image) -> dict:
-        """
-        Default image handler: encodes image to base64 data URL.
-
-        Args:
-            image (mammoth.images.Image): Image object from Mammoth.
-
-        Returns:
-            dict: Dictionary with base64 encoded 'src' for HTML <img> tag.
-        """
+        """Default image handler: returns a placeholder string."""
         return {"src": "Transcript is not available"}
 
 
@@ -445,8 +492,10 @@ class EliteADocxMammothLoader(BaseLoader):
         
         # Step 2: Convert marked DOCX to HTML using Mammoth
         if self.extract_images:
-            # Extract images using the provided image handler
-            result = convert_to_html(marked_docx, convert_image=mammoth.images.img_element(self.__handle_image))
+            # Pick LLM-only handler for the read_file extra_params path (EL-4629),
+            # otherwise use the default handler with Tesseract fallback.
+            handler = self.__handle_image_llm_only if self._llm_only_images else self.__handle_image
+            result = convert_to_html(marked_docx, convert_image=mammoth.images.img_element(handler))
         else:
             # Ignore images
             result = convert_to_html(marked_docx, convert_image=lambda image: "")

@@ -193,6 +193,10 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
         for k, v in extra_params.items():
             if v is not None:
                 loader_kwargs[k] = v
+        # EL-4629: when extract_images comes from extra_params (read_file path),
+        # signal the DOCX loader to use the LLM-only image handler.
+        if extra_params.get('extract_images'):
+            loader_kwargs['_llm_only_images'] = True
     return loader_kwargs
 
 def prepare_loader(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,

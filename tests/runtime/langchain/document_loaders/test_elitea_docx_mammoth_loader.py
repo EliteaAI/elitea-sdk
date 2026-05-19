@@ -49,17 +49,16 @@ class MockMammothImage:
         return MockImageFile(self._data)
 
 
-# Minimal valid PNG header for testing
+# Minimal valid 1x1 red pixel PNG (proper CRCs so python-docx can parse it)
 MINIMAL_PNG_BYTES = (
-    b'\x89PNG\r\n\x1a\n'  # PNG signature
-    b'\x00\x00\x00\rIHDR'  # IHDR chunk
-    b'\x00\x00\x00\x01'    # width: 1
-    b'\x00\x00\x00\x01'    # height: 1
-    b'\x08\x02'            # bit depth: 8, color type: 2 (RGB)
-    b'\x00\x00\x00'        # compression, filter, interlace
-    b'\x90wS\xde'          # CRC
-    b'\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N'  # minimal IDAT
-    b'\x00\x00\x00\x00IEND\xaeB`\x82'  # IEND chunk
+    b'\x89PNG\r\n\x1a\n'
+    b'\x00\x00\x00\rIHDR'
+    b'\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00'
+    b'\x90wS\xde'
+    b'\x00\x00\x00\x0cIDAT'
+    b'x\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00'
+    b'\xc9\xfe\x92\xef'
+    b'\x00\x00\x00\x00IEND\xaeB`\x82'
 )
 
 
@@ -315,3 +314,187 @@ class TestProcessContentByTypeDocxWithLLM:
             # The llm should be passed to the loader
             assert 'llm' in call_kwargs, "LLM should be passed to loader when use_llm=True"
             assert call_kwargs['llm'] == mock_llm
+
+
+# ---------------------------------------------------------------------------
+# EL-4629 — LLM-only image handler & get_file_metadata
+# ---------------------------------------------------------------------------
+
+def _make_docx_with_image():
+    """Build a minimal DOCX (bytes) with one paragraph and one embedded PNG image."""
+    from docx import Document as DocxDocument
+    doc = DocxDocument()
+    doc.add_paragraph("Hello, this document has an image.")
+    doc.add_picture(io.BytesIO(MINIMAL_PNG_BYTES))
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+class TestDocxLlmOnlyImageHandler:
+    """Tests for __handle_image_llm_only (EL-4629)."""
+
+    def test_llm_only_handler_invokes_llm(self):
+        """LLM-only handler should call perform_llm_prediction_for_image_bytes."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        mock_llm = MagicMock()
+        loader = EliteADocxMammothLoader(
+            file_path='/tmp/test.docx', llm=mock_llm, extract_images=True,
+            _llm_only_images=True)
+        mock_image = MockMammothImage(MINIMAL_PNG_BYTES)
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            mock_predict.return_value = 'LLM-only result'
+            result = loader._EliteADocxMammothLoader__handle_image_llm_only(mock_image)
+
+        assert result == {'src': 'LLM-only result'}
+        mock_predict.assert_called_once()
+
+    def test_llm_only_handler_returns_placeholder_without_llm(self):
+        """Without an LLM, the handler returns a placeholder (no Tesseract)."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        loader = EliteADocxMammothLoader(
+            file_path='/tmp/test.docx', llm=None, extract_images=True,
+            _llm_only_images=True)
+        mock_image = MockMammothImage(MINIMAL_PNG_BYTES)
+
+        result = loader._EliteADocxMammothLoader__handle_image_llm_only(mock_image)
+        assert result == {'src': 'Transcript is not available'}
+
+    def test_llm_only_handler_returns_placeholder_on_llm_failure(self):
+        """If LLM raises, returns placeholder instead of calling Tesseract."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        mock_llm = MagicMock()
+        loader = EliteADocxMammothLoader(
+            file_path='/tmp/test.docx', llm=mock_llm, extract_images=True,
+            _llm_only_images=True)
+        mock_image = MockMammothImage(MINIMAL_PNG_BYTES)
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            mock_predict.side_effect = RuntimeError('boom')
+            result = loader._EliteADocxMammothLoader__handle_image_llm_only(mock_image)
+
+        assert result == {'src': 'Transcript is not available'}
+
+    def test_convert_uses_llm_only_handler_when_flag_set(self):
+        """_convert_docx_to_markdown picks __handle_image_llm_only when _llm_only_images is True."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        docx_bytes = _make_docx_with_image()
+        mock_llm = MagicMock()
+        loader = EliteADocxMammothLoader(
+            file_content=docx_bytes, file_name='test.docx',
+            llm=mock_llm, extract_images=True, _llm_only_images=True)
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            mock_predict.return_value = 'LLM-DESCRIBED-IMAGE'
+            content = loader.get_content()
+
+        assert 'LLM-DESCRIBED-IMAGE' in content
+        mock_predict.assert_called()
+
+    def test_convert_uses_default_handler_when_flag_not_set(self):
+        """Without _llm_only_images, the existing __handle_image (with Tesseract fallback) is used."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        docx_bytes = _make_docx_with_image()
+        mock_llm = MagicMock()
+        loader = EliteADocxMammothLoader(
+            file_content=docx_bytes, file_name='test.docx',
+            llm=mock_llm, extract_images=True)  # _llm_only_images defaults to False
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            mock_predict.return_value = 'DEFAULT-HANDLER-RESULT'
+            content = loader.get_content()
+
+        assert 'DEFAULT-HANDLER-RESULT' in content
+        mock_predict.assert_called()
+
+    def test_extract_images_false_skips_all_image_handlers(self):
+        """When extract_images is False, no image handler is invoked."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        docx_bytes = _make_docx_with_image()
+        loader = EliteADocxMammothLoader(
+            file_content=docx_bytes, file_name='test.docx',
+            extract_images=False, _llm_only_images=True)
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            content = loader.get_content()
+
+        mock_predict.assert_not_called()
+        assert 'Image Transcript' not in content
+
+
+class TestDocxGetFileMetadata:
+    """Tests for EliteADocxMammothLoader.get_file_metadata (EL-4629)."""
+
+    def test_metadata_reports_image_count(self):
+        """File with 1 embedded image should return image_count=1."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        docx_bytes = _make_docx_with_image()
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename='report.docx', file_content=docx_bytes, file_size=len(docx_bytes))
+
+        assert meta['image_count'] >= 1
+        instr = meta['instruction_for_readFile']
+        assert 'extract_images' in instr['extra_params']
+        assert 'prompt' in instr['extra_params']
+
+    def test_metadata_no_content_returns_zero_count(self):
+        """Without file_content, image_count should be 0."""
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename='doc.docx', file_content=None)
+
+        assert meta['image_count'] == 0
+        assert 'extract_images' in meta['instruction_for_readFile']['extra_params']
+
+    def test_metadata_no_images_document(self):
+        """A plain text DOCX with no images should return image_count=0."""
+        from docx import Document as DocxDocument
+        from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+            EliteADocxMammothLoader
+        )
+
+        doc = DocxDocument()
+        doc.add_paragraph("Just text, no images.")
+        buf = io.BytesIO()
+        doc.save(buf)
+        docx_bytes = buf.getvalue()
+
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename='plain.docx', file_content=docx_bytes)
+
+        assert meta['image_count'] == 0
