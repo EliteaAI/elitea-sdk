@@ -144,6 +144,54 @@ class TestInvokeApplicationTaskExtraction:
             < task.index("## Last Available Result")
         )
 
+    def test_recent_orchestrator_message_surfaces_when_task_text_is_empty(self):
+        # Live failure mode: on turn 3 the orchestrator emits an empty-content
+        # AIMessage with just the transfer tool_call. ## Your Task is then
+        # absent. The peer must still have context — surface the orchestrator's
+        # last final-summary message ("Fixed #X #Y. Remaining: #A #B.") from
+        # the prior turn as ## Recent Orchestrator Message.
+        messages = [
+            HumanMessage(content="generate issues"),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "transfer_to_provider", "args": {}, "id": "t1"}],
+            ),
+            AIMessage(
+                content='[{"id":1,"kind":"sec"},{"id":2,"kind":"bug"}]',
+                tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "t2"}],
+            ),
+            AIMessage(content="Issues retrieved."),  # turn-1 final summary
+            HumanMessage(content="fix security issues"),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "transfer_to_securityresolver", "args": {}, "id": "t3"}],
+            ),
+            AIMessage(
+                content='{"fixed":[{"id":1,"patch":"sanitize"}]}',
+                tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "t4"}],
+            ),
+            AIMessage(content="Fixed security issue #1. Remaining: #2."),  # turn-2 final summary
+            HumanMessage(content="fix remaining issues"),
+            # Turn 3 handoff — empty content, just the tool_call
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "transfer_to_developer", "args": {}, "id": "t5"}],
+            ),
+        ]
+
+        task = _extract_task_for_agent(messages, "developer")
+
+        # Your Task is empty (orchestrator wrote no content)
+        assert "## Your Task" not in task
+        assert "## User's Most Recent Request" in task
+        assert "fix remaining issues" in task
+        # Orchestrator's last summary from turn 2 — load-bearing for "remaining"
+        assert "## Recent Orchestrator Message" in task
+        assert "Fixed security issue #1. Remaining: #2." in task
+        # Last sub-agent output also surfaces
+        assert "## Last Available Result" in task
+        assert '"fixed":[{"id":1,"patch":"sanitize"}]' in task
+
     def test_only_most_recent_subagent_output_is_included_not_all(self):
         # The previous design dumped ALL prior sub-agent outputs (noisy).
         # The reference section must contain ONE payload only — the most
@@ -200,10 +248,12 @@ class TestInvokeApplicationTaskExtraction:
         assert "process these records" in task
         assert "[{" not in task
 
-    def test_session_boundary_anchors_at_latest_human_message(self):
-        # Earlier turns (already-completed swarm runs) must not bleed into the
-        # current turn's transcript. The session anchor is the latest
-        # HumanMessage at-or-before the assigning AIMessage.
+    def test_user_request_anchors_at_latest_human_message(self):
+        # User's Most Recent Request is bounded to the latest HumanMessage
+        # (scope anchor). Older user messages must not leak into that section.
+        # Reference sections (Recent Orchestrator Message, Last Available
+        # Result) DO span turns — that is how follow-up turns like
+        # "fix remaining issues" work.
         messages = [
             HumanMessage(content="OLD turn user message"),
             AIMessage(content="OLD turn assistant reply"),
@@ -216,8 +266,12 @@ class TestInvokeApplicationTaskExtraction:
 
         task = _extract_task_for_agent(messages, "Worker")
 
-        assert "NEW turn task" in task
-        assert "OLD turn" not in task
+        # Scope anchor uses NEW turn only
+        assert "## User's Most Recent Request\nNEW turn task" in task
+        assert "OLD turn user message" not in task
+        # Prior orchestrator content IS surfaced as reference (intentional)
+        assert "## Recent Orchestrator Message" in task
+        assert "OLD turn assistant reply" in task
 
     def test_empty_messages_returns_empty_string(self):
         assert _extract_task_for_agent([], "any_agent") == ""

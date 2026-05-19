@@ -64,27 +64,32 @@ def _extract_subagent_output(result: Any) -> str:
 
 
 def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: str = "main_agent") -> str:
-    """Build the sub-agent's task from the orchestrator's handoff message.
+    """Build the sub-agent's task from chat history.
 
-    The orchestrator's prompt requires it to write a self-contained handoff
-    with data inlined. When it complies, ``## Your Task`` is enough. When it
-    falls back to anaphora, the peer still needs SOMETHING actionable — so we
-    include a single reference: the most recent prior sub-agent output. One
-    payload, not a verbose dump, and labeled as fallback context.
-
-    Format:
+    The orchestrator's prompt asks it to write a self-contained handoff
+    message, but compliance is variable — sometimes it emits anaphoric text
+    or empty content with just a tool_call. The peer needs context regardless,
+    so we pick relevant signals from the message list (chat_history) and
+    surface them as labeled reference sections, each bounded to one payload:
 
       ## Your Task
-      <assigning AIMessage text>
+      <assigning AIMessage text — present when orchestrator wrote any content>
 
       ## User's Most Recent Request
-      <latest HumanMessage>
+      <latest HumanMessage — scope anchor>
 
-      ## Last Available Result (reference only — consult if Your Task lacks data)
-      <most recent AIMessage with transfer_to_main_agent before this handoff>
+      ## Recent Orchestrator Message
+      <most recent main-agent AIMessage with content — typically the final
+       summary from the prior turn ("Fixed #X #Y. Remaining: #A #B."),
+       load-bearing for follow-up turns>
 
-    Tool name normalization mirrors langgraph_swarm's
-    ``_normalize_agent_name`` (lowercase + whitespace collapse).
+      ## Last Available Result
+      <most recent AIMessage with transfer_to_main_agent — concrete data
+       from the most recent sub-agent run>
+
+    Sections are emitted only when their data exists. Tool name normalization
+    mirrors langgraph_swarm's ``_normalize_agent_name`` (lowercase +
+    whitespace collapse).
     """
     if not messages:
         return ""
@@ -114,22 +119,36 @@ def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: st
 
     task_text = normalize_message_content(messages[assign_idx].content).strip()
 
+    # Walk backwards once and collect all three fallback signals:
+    #   - user_request: latest HumanMessage (the user's scope anchor)
+    #   - recent_orchestrator_msg: latest main-agent AIMessage with content
+    #     (a final summary like "Fixed #X #Y. Remaining: #A #B." carries the
+    #     orchestrator's last meaningful thinking — load-bearing on turn N+1)
+    #   - last_subagent_output: latest AIMessage that handed back to main_agent
+    #     (concrete data from the most recent sub-agent run)
     user_request = ""
+    recent_orchestrator_msg = ""
     last_subagent_output = ""
     for msg in reversed(messages[:assign_idx]):
-        if not user_request and isinstance(msg, HumanMessage):
-            text = normalize_message_content(msg.content).strip()
-            if text:
-                user_request = text
-        elif not last_subagent_output and isinstance(msg, AIMessage):
-            tcs = [
-                tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
-            ]
-            if back_handoff in tcs:
+        if isinstance(msg, HumanMessage):
+            if not user_request:
                 text = normalize_message_content(msg.content).strip()
                 if text:
-                    last_subagent_output = text
-        if user_request and last_subagent_output:
+                    user_request = text
+            continue
+        if not isinstance(msg, AIMessage):
+            continue
+        text = normalize_message_content(msg.content).strip()
+        if not text:
+            continue
+        tcs = [tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])]
+        if back_handoff in tcs:
+            if not last_subagent_output:
+                last_subagent_output = text
+        else:
+            if not recent_orchestrator_msg:
+                recent_orchestrator_msg = text
+        if user_request and recent_orchestrator_msg and last_subagent_output:
             break
 
     sections = []
@@ -137,9 +156,14 @@ def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: st
         sections.append(f"## Your Task\n{task_text}")
     if user_request:
         sections.append(f"## User's Most Recent Request\n{user_request}")
+    if recent_orchestrator_msg:
+        sections.append(
+            "## Recent Orchestrator Message (reference — last summary or narrative from main agent)\n"
+            + recent_orchestrator_msg
+        )
     if last_subagent_output:
         sections.append(
-            "## Last Available Result (reference only — consult if Your Task lacks data)\n"
+            "## Last Available Result (reference — most recent sub-agent output)\n"
             + last_subagent_output
         )
 
@@ -1496,11 +1520,13 @@ class Assistant:
         else:
             lines.extend([
                 "You are part of a multi-agent swarm. You can hand off to the following peer agents.",
-                "Your task arrives as a brief with up to three sections: \"## Your Task\" (the "
-                "work to do — should be self-contained), \"## User's Most Recent Request\" "
-                "(the user's scope anchor), and optionally \"## Last Available Result\" (a "
-                "single reference payload to consult only if Your Task is missing data). "
-                "Treat \"## Your Task\" as authoritative; use the reference only as a fallback.",
+                "Your task arrives as a brief with up to four sections: \"## Your Task\" (the "
+                "work to do — may be empty if the orchestrator did not write content), "
+                "\"## User's Most Recent Request\" (the user's scope anchor), "
+                "\"## Recent Orchestrator Message\" (the main agent's last summary or narrative — "
+                "useful when Your Task is empty), and \"## Last Available Result\" (the most "
+                "recent sub-agent output). Treat \"## Your Task\" as authoritative; the reference "
+                "sections are fallback context to be consulted when Your Task lacks data.",
                 "When you have completed your task, you MUST hand off to another agent "
                 "(typically the main agent) so the conversation can continue.",
                 "If you simply respond with text and no tool calls, the entire swarm will stop.",
