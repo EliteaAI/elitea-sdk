@@ -134,10 +134,11 @@ class Artifact:
                      download_for_detection: bool = False) -> dict:
         """Return type metadata for an artifact.
 
-        Uses an S3 HEAD for filesize and extension-based mime detection by
-        default (cheap). Set ``download_for_detection=True`` to also download
-        the file so the loader's ``get_file_metadata`` classmethod can add
-        per-type structural hints (e.g. sheet listing for Excel).
+        Uses the S3 list API (same source as the UI) for filesize — more
+        reliable than HEAD which may omit Content-Length for some file types.
+        Set ``download_for_detection=True`` to also download the file so the
+        loader's ``get_file_metadata`` classmethod can add per-type structural
+        hints (e.g. sheet listing for Excel).
         """
         from elitea_sdk.tools.utils.file_metadata import get_file_metadata
         if not bucket_name:
@@ -145,11 +146,18 @@ class Artifact:
         file_size = None
         if include_filesize:
             try:
-                head = self.client.head_artifact_s3(bucket_name, artifact_name)
-                if isinstance(head, dict) and head.get('exists'):
-                    file_size = head.get('size')
+                # Use list API with exact-prefix match (no delimiter = no folder
+                # grouping) so we get back only entries whose key starts with the
+                # artifact name.  The UI uses the same endpoint and field.
+                listing = self.client.list_artifacts_s3(
+                    bucket_name, prefix=artifact_name, delimiter=None
+                )
+                for item in listing.get('contents', []):
+                    if item.get('key') == artifact_name:
+                        file_size = item.get('size')
+                        break
             except Exception as e:  # pylint: disable=broad-except
-                logger.debug("HEAD failed for %s/%s: %s",
+                logger.debug("List failed for %s/%s: %s",
                              bucket_name, artifact_name, e)
         file_content = None
         if download_for_detection:
