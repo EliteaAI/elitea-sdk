@@ -44,7 +44,7 @@ def _build_swarm_assistant(agent_tools, memory=None) -> Assistant:
 
 class TestInvokeApplicationTaskExtraction:
 
-    def test_extracts_task_from_assigning_aimessage(self):
+    def test_aggregates_session_transcript_through_assigning_aimessage(self):
         messages = [
             HumanMessage(content="Get and fix all security issues"),
             AIMessage(
@@ -53,9 +53,7 @@ class TestInvokeApplicationTaskExtraction:
             ),
             ToolMessage(content="Successfully transferred to issuesprovider", tool_call_id="tc1"),
             AIMessage(
-                content=[
-                    {"type": "text", "text": "Here are the issues: [issue1, issue2]"},
-                ],
+                content=[{"type": "text", "text": "Here are the issues: [issue1, issue2]"}],
                 tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "tc2"}],
             ),
             ToolMessage(content="Successfully transferred to main_agent", tool_call_id="tc2"),
@@ -68,15 +66,57 @@ class TestInvokeApplicationTaskExtraction:
 
         task = _extract_task_for_agent(messages, "securityresolver")
 
-        assert "security issues" in task.lower() or "CVE" in task or "issue1" in task
-        assert "Get and fix all security issues" not in task
+        assert "User: Get and fix all security issues" in task
+        assert "Here are the issues: [issue1, issue2]" in task
+        assert "Fix both CVEs: issue1 and issue2" in task
+        assert "Successfully transferred" not in task
+
+    def test_aggregates_prior_agent_outputs_for_chained_handoffs(self):
+        # Issue #4950 production case: the orchestrator's handoff message uses
+        # anaphora ("hand off all 4 issues") referring to data emitted by prior
+        # sub-agents. The next sub-agent must see those outputs, not just the
+        # transition narrative.
+        messages = [
+            HumanMessage(content="Fix all open issues"),
+            AIMessage(
+                content="Retrieving issues first.",
+                tool_calls=[{"name": "transfer_to_issuesprovider", "args": {}, "id": "tc1"}],
+            ),
+            ToolMessage(content="Successfully transferred to issuesprovider", tool_call_id="tc1"),
+            AIMessage(
+                content="Issues: #11, #14, #20, #21. #11 and #14 are security.",
+                tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "tc2"}],
+            ),
+            ToolMessage(content="Successfully transferred to main_agent", tool_call_id="tc2"),
+            AIMessage(
+                content="I've got 4 issues, 2 security.",
+                tool_calls=[{"name": "transfer_to_securityissuesresolver", "args": {}, "id": "tc3"}],
+            ),
+            ToolMessage(content="Successfully transferred to SecurityIssuesResolver", tool_call_id="tc3"),
+            AIMessage(
+                content="Security fixes for #11 and #14 applied: patch X and Y.",
+                tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "tc4"}],
+            ),
+            ToolMessage(content="Successfully transferred to main_agent", tool_call_id="tc4"),
+            AIMessage(
+                content="Now hand off all 4 issues to GuidedDeveloper.",
+                tool_calls=[{"name": "transfer_to_guideddeveloper", "args": {}, "id": "tc5"}],
+            ),
+            ToolMessage(content="Successfully transferred to GuidedDeveloper", tool_call_id="tc5"),
+        ]
+
+        task = _extract_task_for_agent(messages, "GuidedDeveloper")
+
+        assert "Fix all open issues" in task
+        assert "Issues: #11, #14, #20, #21" in task
+        assert "Security fixes for #11 and #14 applied: patch X and Y." in task
+        assert "hand off all 4 issues" in task
+        assert "Successfully transferred" not in task
 
     def test_falls_back_to_human_message_when_no_assigning_aimessage(self):
         messages = [HumanMessage(content="Initial user request")]
 
-        task = _extract_task_for_agent(messages, "some_agent")
-
-        assert task == "Initial user request"
+        assert _extract_task_for_agent(messages, "some_agent") == "Initial user request"
 
     def test_handles_list_content_in_assigning_aimessage(self):
         messages = [
@@ -93,61 +133,57 @@ class TestInvokeApplicationTaskExtraction:
 
         task = _extract_task_for_agent(messages, "dataagent")
 
-        assert isinstance(task, str)
         assert "process these records" in task
         assert "[{" not in task
 
-    def test_ignores_handoffs_to_other_agents(self):
+    def test_session_boundary_anchors_at_latest_human_message(self):
+        # Earlier turns (already-completed swarm runs) must not bleed into the
+        # current turn's transcript. The session anchor is the latest
+        # HumanMessage at-or-before the assigning AIMessage.
         messages = [
-            HumanMessage(content="Original request"),
+            HumanMessage(content="OLD turn user message"),
+            AIMessage(content="OLD turn assistant reply"),
+            HumanMessage(content="NEW turn task"),
             AIMessage(
-                content="Let agent A handle the first part.",
-                tool_calls=[{"name": "transfer_to_agent_a", "args": {}, "id": "tc_a"}],
+                content="Routing.",
+                tool_calls=[{"name": "transfer_to_worker", "args": {}, "id": "tc1"}],
             ),
-            ToolMessage(content="Transferred to agent_a", tool_call_id="tc_a"),
-            AIMessage(
-                content="Now route to agent B for the second part.",
-                tool_calls=[{"name": "transfer_to_agent_b", "args": {}, "id": "tc_b"}],
-            ),
-            ToolMessage(content="Transferred to agent_b", tool_call_id="tc_b"),
         ]
 
-        task = _extract_task_for_agent(messages, "agent_b")
+        task = _extract_task_for_agent(messages, "Worker")
 
-        assert "second part" in task
-        assert "first part" not in task
+        assert "NEW turn task" in task
+        assert "OLD turn" not in task
 
     def test_empty_messages_returns_empty_string(self):
         assert _extract_task_for_agent([], "any_agent") == ""
 
     def test_agent_name_normalization_matches_langgraph_swarm(self):
-        # langgraph_swarm.create_handoff_tool lowercases and collapses whitespace
-        # in agent_name when building the tool name. The helper must mirror that
-        # or it never finds the assigning AIMessage and silently falls back to
-        # the original HumanMessage — the exact symptom reported on issue #4950.
+        # langgraph_swarm.create_handoff_tool lowercases agent_name and collapses
+        # whitespace; the helper must mirror that or never match the tool_call
+        # and silently fall back to the HumanMessage — the symptom on #4950.
         messages = [
-            HumanMessage(content="Original user request"),
+            HumanMessage(content="user request"),
             AIMessage(
                 content="Delegating the security work to the resolver.",
                 tool_calls=[{"name": "transfer_to_securityresolver", "args": {}, "id": "tc1"}],
             ),
-            ToolMessage(content="Transferred", tool_call_id="tc1"),
         ]
 
-        # CamelCase name as it would appear in agent_tool.name
-        task = _extract_task_for_agent(messages, "SecurityResolver")
-        assert "Delegating the security work" in task
-        assert task != "Original user request"
+        task_camel = _extract_task_for_agent(messages, "SecurityResolver")
+        assert "Delegating the security work" in task_camel
+        assert "User: user request" in task_camel
 
-        # Whitespace in name
         messages_ws = [
-            HumanMessage(content="user req"),
+            HumanMessage(content="ws request"),
             AIMessage(
                 content="Hand off to data team.",
                 tool_calls=[{"name": "transfer_to_data_agent", "args": {}, "id": "tc1"}],
             ),
         ]
-        assert _extract_task_for_agent(messages_ws, "Data Agent") == "Hand off to data team."
+        task_ws = _extract_task_for_agent(messages_ws, "Data Agent")
+        assert "Hand off to data team" in task_ws
+        assert "User: ws request" in task_ws
 
 
 class TestSwarmResultAdapterContract:

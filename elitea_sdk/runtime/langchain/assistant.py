@@ -28,35 +28,69 @@ APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
 def _extract_task_for_agent(messages: list, agent_name: str) -> str:
-    """Pull the sub-agent's task from the shared swarm history.
+    """Build the sub-agent's task as a transcript of the current swarm turn.
 
-    create_handoff_tool emits tool_calls with empty args, so the task lives in
-    the text of the AIMessage that issued ``transfer_to_<agent_name>``. The
-    tool name is lowercased and whitespace-collapsed by langgraph_swarm
-    (``_normalize_agent_name``), so we mirror that here. Falls back to the
-    last HumanMessage; returns ``""`` if neither exists.
+    The orchestrator's handoff message often uses anaphora ("hand off all 4
+    issues...") that points at data sitting in earlier sub-agent outputs.
+    Returning only the assigning AIMessage's text loses the referent, so we
+    aggregate the slice [latest HumanMessage .. assigning AIMessage] into a
+    "User: ... / Assistant: ... / Tool result: ..." transcript.
+
+    The handoff tool name is lowercased and whitespace-collapsed by
+    langgraph_swarm's ``_normalize_agent_name``, so we mirror that here.
+    Handoff-ack ToolMessages ("Successfully transferred to X") and empty
+    messages are dropped. Returns ``""`` only if there is no HumanMessage at
+    all (fresh empty state).
     """
+    if not messages:
+        return ""
+
     normalized = re.sub(r"\s+", "_", agent_name.strip()).lower()
     target_tool = f"transfer_to_{normalized}"
 
-    for msg in reversed(messages):
+    assign_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
         if not isinstance(msg, AIMessage):
             continue
         tool_calls = getattr(msg, "tool_calls", None) or []
-        if not any(tc.get("name") == target_tool for tc in tool_calls):
-            continue
-        text = normalize_message_content(msg.content).strip()
-        if text:
-            return text
+        if any(tc.get("name") == target_tool for tc in tool_calls):
+            assign_idx = i
+            break
 
-    for msg in reversed(messages):
-        if not isinstance(msg, HumanMessage):
-            continue
-        text = normalize_message_content(msg.content).strip()
-        if text:
-            return text
+    # No handoff to this agent yet — first-turn fallback to the user's request.
+    if assign_idx is None:
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                text = normalize_message_content(msg.content).strip()
+                if text:
+                    return text
+        return ""
 
-    return ""
+    # Anchor the slice at the latest HumanMessage at-or-before the handoff so
+    # prior conversation turns (already cleared from a fresh checkpoint, but
+    # defensive here too) are not folded in.
+    session_start = 0
+    for i in range(assign_idx, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            session_start = i
+            break
+
+    parts = []
+    for msg in messages[session_start:assign_idx + 1]:
+        text = normalize_message_content(msg.content).strip()
+        if not text:
+            continue
+        if isinstance(msg, HumanMessage):
+            parts.append(f"User: {text}")
+        elif isinstance(msg, AIMessage):
+            parts.append(f"Assistant: {text}")
+        elif isinstance(msg, ToolMessage):
+            if text.startswith("Successfully transferred to "):
+                continue
+            parts.append(f"Tool result: {text}")
+
+    return "\n\n".join(parts)
 
 
 class Assistant:
