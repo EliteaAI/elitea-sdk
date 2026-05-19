@@ -1269,6 +1269,7 @@ class Assistant:
                             break
                 return {
                     "output": output or "",
+                    "messages": messages,
                     "thread_id": None,
                     "execution_finished": True,
                 }

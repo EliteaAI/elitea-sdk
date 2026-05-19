@@ -307,15 +307,22 @@ class Application(BaseTool):
         )
         normalized_output = extract_application_response_output(response)
 
-        # Build result dict with output message
-        result = {"messages": [{"role": "assistant", "content": normalized_output}]}
+        # Build result dict with standardized AgentResponse format
+        # All keys present for consistent response shape across agent types
+        result = {
+            "output": normalized_output,
+            "messages": [{"role": "assistant", "content": normalized_output}],
+            "thread_id": response.get('thread_id') if isinstance(response, dict) else None,
+            "execution_finished": response.get('execution_finished', True) if isinstance(response, dict) else True,
+        }
 
         # Propagate state variables from child response back to parent.
         # This allows FunctionTool to extract them based on output_variables,
         # enabling child pipeline state to flow back to parent pipeline.
         if isinstance(response, dict):
             # Keys that are internal/output-related and should not be propagated as state
-            excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types', ELITEA_RS, PRINTER_NODE_RS}
+            excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types',
+                           'thread_id', 'execution_finished', ELITEA_RS, PRINTER_NODE_RS}
             for key, value in response.items():
                 if key not in excluded_keys:
                     result[key] = value
