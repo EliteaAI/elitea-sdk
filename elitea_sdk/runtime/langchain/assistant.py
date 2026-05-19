@@ -66,31 +66,32 @@ def _extract_subagent_output(result: Any) -> str:
 def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: str = "main_agent") -> str:
     """Build the sub-agent's task from the orchestrator's handoff message.
 
-    The orchestrator (main agent) is responsible for writing a self-contained
-    handoff message: it sees the full conversation history via the langgraph
-    checkpoint, and its prompt requires it to inline the actual data the peer
-    needs (no anaphora). The peer therefore only needs the assigning
-    AIMessage's text plus the user's most recent request as a scope anchor.
+    The orchestrator's prompt requires it to write a self-contained handoff
+    with data inlined. When it complies, ``## Your Task`` is enough. When it
+    falls back to anaphora, the peer still needs SOMETHING actionable — so we
+    include a single reference: the most recent prior sub-agent output. One
+    payload, not a verbose dump, and labeled as fallback context.
 
     Format:
 
       ## Your Task
-      <assigning AIMessage text — orchestrator's instruction with data inlined>
+      <assigning AIMessage text>
 
       ## User's Most Recent Request
       <latest HumanMessage>
 
-    No prior-agent-outputs dump: the orchestrator must extract what the peer
-    needs and put it in the handoff. Bloating the task with verbose prior
-    payloads invites the peer to drift onto irrelevant context. Tool name
-    normalization mirrors langgraph_swarm's ``_normalize_agent_name``
-    (lowercase + whitespace collapse).
+      ## Last Available Result (reference only — consult if Your Task lacks data)
+      <most recent AIMessage with transfer_to_main_agent before this handoff>
+
+    Tool name normalization mirrors langgraph_swarm's
+    ``_normalize_agent_name`` (lowercase + whitespace collapse).
     """
     if not messages:
         return ""
 
     normalized = re.sub(r"\s+", "_", agent_name.strip()).lower()
     target_tool = f"transfer_to_{normalized}"
+    back_handoff = f"transfer_to_{main_agent_name}"
 
     assign_idx = None
     for i in range(len(messages) - 1, -1, -1):
@@ -112,19 +113,35 @@ def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: st
         return ""
 
     task_text = normalize_message_content(messages[assign_idx].content).strip()
+
     user_request = ""
+    last_subagent_output = ""
     for msg in reversed(messages[:assign_idx]):
-        if isinstance(msg, HumanMessage):
+        if not user_request and isinstance(msg, HumanMessage):
             text = normalize_message_content(msg.content).strip()
             if text:
                 user_request = text
-                break
+        elif not last_subagent_output and isinstance(msg, AIMessage):
+            tcs = [
+                tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
+            ]
+            if back_handoff in tcs:
+                text = normalize_message_content(msg.content).strip()
+                if text:
+                    last_subagent_output = text
+        if user_request and last_subagent_output:
+            break
 
     sections = []
     if task_text:
         sections.append(f"## Your Task\n{task_text}")
     if user_request:
         sections.append(f"## User's Most Recent Request\n{user_request}")
+    if last_subagent_output:
+        sections.append(
+            "## Last Available Result (reference only — consult if Your Task lacks data)\n"
+            + last_subagent_output
+        )
 
     return "\n\n".join(sections)
 
@@ -1479,10 +1496,11 @@ class Assistant:
         else:
             lines.extend([
                 "You are part of a multi-agent swarm. You can hand off to the following peer agents.",
-                "Your task arrives as a self-contained brief with two sections: \"## Your Task\" "
-                "(the work to do, with all data you need inlined) and \"## User's Most Recent "
-                "Request\" (the user's scope anchor). Treat \"## Your Task\" as authoritative "
-                "and act on it directly.",
+                "Your task arrives as a brief with up to three sections: \"## Your Task\" (the "
+                "work to do — should be self-contained), \"## User's Most Recent Request\" "
+                "(the user's scope anchor), and optionally \"## Last Available Result\" (a "
+                "single reference payload to consult only if Your Task is missing data). "
+                "Treat \"## Your Task\" as authoritative; use the reference only as a fallback.",
                 "When you have completed your task, you MUST hand off to another agent "
                 "(typically the main agent) so the conversation can continue.",
                 "If you simply respond with text and no tool calls, the entire swarm will stop.",
