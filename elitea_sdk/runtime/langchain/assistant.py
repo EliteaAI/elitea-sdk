@@ -1377,28 +1377,44 @@ class Assistant:
                 self._graph = compiled_graph
 
             def invoke(self, input, config=None, **kwargs):
-                from langchain_core.messages import RemoveMessage
-
                 thread_id = (
                     config.get("configurable", {}).get("thread_id")
                     if isinstance(config, dict) else None
                 )
 
-                # Clear stale messages from a prior turn so the add_messages reducer
-                # does not double-accumulate. Only `messages` matters here — swarm
-                # state has no hitl/pipeline/context keys to reset.
-                if thread_id and checkpointer:
+                # On a continuation (the thread already has checkpoint state),
+                # pylon's input["messages"] is its UI-tracked chat_history dicts
+                # + the new HumanMessage. That history does NOT contain raw
+                # sub-agent outputs from prior turns — pylon only stores
+                # user-facing assistant turns. The langgraph checkpoint already
+                # holds the COMPLETE message stream including those outputs, so
+                # we trust it as the source of truth and pass only the new
+                # HumanMessage. add_messages then appends it without disturbing
+                # the prior state, and the orchestrator sees turn N-1's
+                # sub-agent results.
+                if thread_id and checkpointer and isinstance(input, dict):
                     try:
                         prior_state = self._graph.get_state(config)
-                        prior_msgs = prior_state.values.get("messages", []) if prior_state else []
-                        remove_msgs = [
-                            RemoveMessage(id=m.id) for m in prior_msgs
-                            if getattr(m, "id", None)
-                        ]
-                        if remove_msgs:
-                            self._graph.update_state(config, {"messages": remove_msgs})
+                        prior_msgs = (
+                            prior_state.values.get("messages", []) if prior_state else []
+                        )
                     except Exception as e:
-                        logger.debug("[SWARM] Could not check/clear prior checkpoint: %s", e)
+                        logger.debug("[SWARM] Could not read prior checkpoint: %s", e)
+                        prior_msgs = []
+                    if prior_msgs:
+                        in_msgs = input.get("messages") or []
+                        new_human = None
+                        for msg in reversed(in_msgs):
+                            if isinstance(msg, HumanMessage):
+                                new_human = msg
+                                break
+                        if new_human is not None:
+                            input = dict(input)
+                            input["messages"] = [new_human]
+                            logger.info(
+                                "[SWARM] Continuation: keeping checkpoint state, "
+                                "appending only the new HumanMessage"
+                            )
 
                 result = self._graph.invoke(input, config, **kwargs)
                 output = ""

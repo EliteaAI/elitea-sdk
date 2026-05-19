@@ -343,54 +343,83 @@ class TestSwarmPersistentCheckpointer:
         assert captured_checkpointer.get("value") is not None
 
 
-class TestSwarmStaleCheckpointClearing:
+class TestSwarmContinuationInputRewrite:
+    """On a follow-up turn (prior checkpoint exists) the adapter must pass
+    only the new HumanMessage to graph.invoke. pylon's chat_history dicts
+    don't carry sub-agent raw outputs; the langgraph checkpoint does.
+    """
 
-    def test_stale_messages_cleared_before_fresh_turn(self):
-        from langchain_core.messages import RemoveMessage
-
-        thread_id = str(uuid.uuid4())
-        memory = MemorySaver()
-
+    def _make_adapter(self, memory, prior_messages, captured):
         agent_tool = _make_application_tool("subagent")
         assistant = _build_swarm_assistant([agent_tool], memory=memory)
 
-        update_state_calls = []
-
         fake_compiled = MagicMock()
-        fake_compiled.invoke.return_value = {"messages": [AIMessage(content="fresh result")]}
+        fake_compiled.invoke.side_effect = lambda inp, cfg, **kw: (
+            captured.update({"input": inp, "config": cfg})
+            or {"messages": [AIMessage(content="ok")]}
+        )
 
-        # Simulate a prior completed checkpoint
-        prior_msg = AIMessage(content="old result", id="msg-old-1")
-        fake_state = MagicMock()
-        fake_state.next = []  # completed — at END
-        fake_state.values = {"messages": [prior_msg]}
-        fake_compiled.get_state.return_value = fake_state
-
-        def fake_update_state(cfg, update):
-            update_state_calls.append(update)
-
-        fake_compiled.update_state = fake_update_state
+        if prior_messages:
+            fake_state = MagicMock()
+            fake_state.values = {"messages": prior_messages}
+            fake_compiled.get_state.return_value = fake_state
+        else:
+            empty_state = MagicMock()
+            empty_state.values = {"messages": []}
+            fake_compiled.get_state.return_value = empty_state
 
         with patch("langgraph_swarm.create_swarm") as mock_create_swarm:
             mock_swarm = MagicMock()
             mock_swarm.compile.return_value = fake_compiled
             mock_create_swarm.return_value = mock_swarm
-
-            adapter = assistant._create_swarm_agent(
+            return assistant._create_swarm_agent(
                 all_tools=[agent_tool],
                 agent_tools=[agent_tool],
             )
 
-        config = {"configurable": {"thread_id": thread_id}}
-        adapter.invoke({"messages": [HumanMessage(content="new request")]}, config)
-
-        remove_calls = [
-            call for call in update_state_calls
-            if isinstance(call, dict)
-            and "messages" in call
-            and any(isinstance(m, RemoveMessage) for m in call["messages"])
+    def test_continuation_passes_only_new_human_message(self):
+        captured = {}
+        # Prior state has the full turn-1 stream including a raw sub-agent output
+        prior = [
+            HumanMessage(content="turn 1 request", id="m1"),
+            AIMessage(
+                content="route",
+                id="m2",
+                tool_calls=[{"name": "transfer_to_subagent", "args": {}, "id": "tc"}],
+            ),
+            AIMessage(content="raw subagent payload", id="m3"),
+            AIMessage(content="turn 1 final", id="m4"),
         ]
-        assert len(remove_calls) > 0
+        adapter = self._make_adapter(MemorySaver(), prior, captured)
+
+        # pylon-style input: chat_history dicts + new HumanMessage
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        pylon_input = {
+            "messages": [
+                {"role": "user", "content": "turn 1 request"},
+                {"role": "assistant", "content": "turn 1 final"},
+                HumanMessage(content="follow-up request"),
+            ]
+        }
+        adapter.invoke(pylon_input, config)
+
+        forwarded = captured["input"]["messages"]
+        assert len(forwarded) == 1, (
+            f"Expected only the new HumanMessage to be forwarded, got {forwarded!r}"
+        )
+        assert isinstance(forwarded[0], HumanMessage)
+        assert forwarded[0].content == "follow-up request"
+
+    def test_fresh_thread_passes_input_unchanged(self):
+        captured = {}
+        adapter = self._make_adapter(MemorySaver(), [], captured)
+
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        adapter.invoke({"messages": [HumanMessage(content="first turn")]}, config)
+
+        forwarded = captured["input"]["messages"]
+        assert len(forwarded) == 1
+        assert forwarded[0].content == "first turn"
 
 
 # ---------------------------------------------------------------------------
@@ -545,16 +574,24 @@ class TestSwarmMultiTurnIntegration:
         )
         assert len(fixer_app.calls) == 0, "Fixer must not run in turn 1"
 
-        # Capture the conversation as pylon would: full message history.
-        post_t1_state = runnable_t1._graph.get_state(config)
-        history = list(post_t1_state.values.get("messages", []))
-        assert any(isinstance(m, HumanMessage) for m in history)
-
         # ---- Turn 2: "fix only the X-kind items" — fresh Assistant + fresh tools ----
+        # Pylon sends chat_history-as-dicts + the new HumanMessage. The dicts
+        # don't contain raw sub-agent outputs; SwarmResultAdapter must rely on
+        # the persistent checkpoint and forward only the new HumanMessage.
         runnable_t2 = self._build_runnable(llm, memory, provider_app, fixer_app)
         h2 = HumanMessage(content="fix only the X-kind items")
-        # Mirror pylon's prepare_invoke_input: chat_history + new user_message
-        runnable_t2.invoke({"messages": history + [h2]}, config=config)
+        pylon_chat_history_dicts = [
+            {"role": "user", "content": "please generate items"},
+            {"role": "assistant", "content": "Done."},
+        ]
+        runnable_t2.invoke({"messages": pylon_chat_history_dicts + [h2]}, config=config)
+
+        # The orchestrator must NOT re-call provider: it has visibility into
+        # turn-1's checkpoint state and knows items are already generated.
+        assert len(provider_app.calls) == 1, (
+            f"Provider was re-called in turn 2 — orchestrator lost prior context. "
+            f"calls={len(provider_app.calls)}"
+        )
 
         assert len(fixer_app.calls) == 1, (
             "Fixer should have been invoked exactly once in turn 2"
