@@ -64,27 +64,33 @@ def _extract_subagent_output(result: Any) -> str:
 
 
 def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: str = "main_agent") -> str:
-    """Build the sub-agent's task as a structured brief of the current swarm turn.
+    """Build the sub-agent's task from the orchestrator's handoff message.
 
-    The output has up to three labeled sections so the sub-agent LLM can
-    prioritize what to act on vs what is reference:
+    The orchestrator (main agent) is responsible for writing a self-contained
+    handoff message: it sees the full conversation history via the langgraph
+    checkpoint, and its prompt requires it to inline the actual data the peer
+    needs (no anaphora). The peer therefore only needs the assigning
+    AIMessage's text plus the user's most recent request as a scope anchor.
 
-      ## Your Task          — the assigning AIMessage's text (primary)
-      ## Original User Request   — the latest HumanMessage (intent anchor)
-      ## Prior Agent Outputs (reference)  — earlier sub-agent results, joined
-                                            with ``---`` separators
+    Format:
 
-    Orchestrator transitions between sub-agent runs are dropped: they restate
-    what is about to happen and the data is already in the sub-agent results
-    that follow. Tool name normalization mirrors langgraph_swarm's
-    ``_normalize_agent_name`` (lowercase + whitespace collapse).
+      ## Your Task
+      <assigning AIMessage text — orchestrator's instruction with data inlined>
+
+      ## User's Most Recent Request
+      <latest HumanMessage>
+
+    No prior-agent-outputs dump: the orchestrator must extract what the peer
+    needs and put it in the handoff. Bloating the task with verbose prior
+    payloads invites the peer to drift onto irrelevant context. Tool name
+    normalization mirrors langgraph_swarm's ``_normalize_agent_name``
+    (lowercase + whitespace collapse).
     """
     if not messages:
         return ""
 
     normalized = re.sub(r"\s+", "_", agent_name.strip()).lower()
     target_tool = f"transfer_to_{normalized}"
-    back_handoff = f"transfer_to_{main_agent_name}"
 
     assign_idx = None
     for i in range(len(messages) - 1, -1, -1):
@@ -105,62 +111,20 @@ def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: st
                     return text
         return ""
 
-    session_start = 0
-    for i in range(assign_idx, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            session_start = i
-            break
-
     task_text = normalize_message_content(messages[assign_idx].content).strip()
     user_request = ""
-    prior_outputs = []
-    for msg in messages[session_start:assign_idx]:
-        text = normalize_message_content(msg.content).strip()
-        if not text:
-            continue
+    for msg in reversed(messages[:assign_idx]):
         if isinstance(msg, HumanMessage):
-            user_request = text
-        elif isinstance(msg, AIMessage):
-            tool_call_names = [
-                tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
-            ]
-            if back_handoff in tool_call_names:
-                prior_outputs.append(text)
-
-    # Multi-turn safety net: when the current turn has not produced any
-    # sub-agent outputs yet (e.g. a follow-up "fix only the security issues"
-    # right after a prior turn that generated the issue list), surface the
-    # immediately-prior turn's sub-agent outputs as reference data. The
-    # orchestrator's history-aware handoff text alone is fragile —
-    # the LLM tends to use anaphora and skip embedding the data inline.
-    if not prior_outputs and session_start > 0:
-        prev_start = 0
-        for i in range(session_start - 1, -1, -1):
-            if isinstance(messages[i], HumanMessage):
-                prev_start = i
-                break
-        for msg in messages[prev_start:session_start]:
-            if not isinstance(msg, AIMessage):
-                continue
-            tool_call_names = [
-                tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
-            ]
-            if back_handoff not in tool_call_names:
-                continue
             text = normalize_message_content(msg.content).strip()
             if text:
-                prior_outputs.append(text)
+                user_request = text
+                break
 
     sections = []
     if task_text:
         sections.append(f"## Your Task\n{task_text}")
     if user_request:
-        sections.append(f"## Original User Request\n{user_request}")
-    if prior_outputs:
-        sections.append(
-            "## Prior Agent Outputs (reference — consult only if data is missing from Your Task)\n"
-            + "\n\n---\n\n".join(prior_outputs)
-        )
+        sections.append(f"## User's Most Recent Request\n{user_request}")
 
     return "\n\n".join(sections)
 
@@ -1479,13 +1443,27 @@ class Assistant:
                 "",
                 "**Handoff message rules (mandatory, not stylistic):**",
                 "- The MESSAGE TEXT you emit alongside the transfer tool call IS the peer's task.",
-                "  The peer does not see the rest of the conversation. Treat them as a fresh "
-                "  agent who only sees your message.",
-                "- Inline the **actual data** the peer needs to do the work — never refer to "
-                "  data by anaphora (\"the remaining items\", \"those results\", \"the file from "
-                "  earlier\"). If a prior step produced a payload the peer must operate on, "
-                "  copy that payload into your handoff message verbatim.",
-                "- State explicitly what the peer must produce in return.",
+                "  The peer does not see prior conversation, prior tool results, or other peers' "
+                "  outputs. Treat them as a fresh agent who only sees your message.",
+                "- Extract from the conversation only the data this specific peer needs to "
+                "  complete its assignment, then INLINE that data verbatim in the handoff text. "
+                "  Do not refer to data by anaphora (\"the remaining items\", \"those results\", "
+                "  \"the data from earlier\", \"hand these off\"). If you find yourself wanting "
+                "  to write a pronoun, replace it with the actual data.",
+                "- State the action the peer must perform and the shape you expect back.",
+                "- Do not narrate the handoff (\"I'll route...\", \"Now I'll hand off...\"). "
+                "  Address the peer directly with the work to do.",
+                "",
+                "**Examples (generic; the same shape applies regardless of agent type):**",
+                "",
+                "  Bad — peer receives nothing it can act on:",
+                "  > \"I'll route the items to the next agent to handle.\"",
+                "  > \"The previous step produced results. Hand them off for processing.\"",
+                "",
+                "  Good — peer can complete the work from this message alone:",
+                "  > \"Process the following items and return a summary of actions taken: "
+                "  >  <inline the actual list/JSON/text the peer must operate on>. "
+                "  >  Return shape: <describe the expected output>.\"",
                 "",
                 "**Scope discipline (mandatory):**",
                 "- Respect the user's explicit scope. If the user narrows the request "
@@ -1501,10 +1479,10 @@ class Assistant:
         else:
             lines.extend([
                 "You are part of a multi-agent swarm. You can hand off to the following peer agents.",
-                "Your task is delivered as a structured brief with sections like \"## Your Task\", "
-                "\"## Original User Request\", and \"## Prior Agent Outputs (reference)\". Act on "
-                "\"## Your Task\"; consult the other sections only when you need data not present "
-                "there.",
+                "Your task arrives as a self-contained brief with two sections: \"## Your Task\" "
+                "(the work to do, with all data you need inlined) and \"## User's Most Recent "
+                "Request\" (the user's scope anchor). Treat \"## Your Task\" as authoritative "
+                "and act on it directly.",
                 "When you have completed your task, you MUST hand off to another agent "
                 "(typically the main agent) so the conversation can continue.",
                 "If you simply respond with text and no tool calls, the entire swarm will stop.",

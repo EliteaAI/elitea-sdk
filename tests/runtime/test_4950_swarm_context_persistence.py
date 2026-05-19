@@ -101,7 +101,11 @@ class TestExtractSubagentOutput:
 
 class TestInvokeApplicationTaskExtraction:
 
-    def test_structured_brief_with_task_user_and_prior_sections(self):
+    def test_brief_contains_only_task_and_user_request_sections(self):
+        # The peer's task is the orchestrator's handoff message text plus the
+        # user's most recent request as a scope anchor. Prior sub-agent outputs
+        # are NOT dumped into the task — the orchestrator is responsible for
+        # extracting and inlining whatever data the peer needs.
         messages = [
             HumanMessage(content="Get and fix all security issues"),
             AIMessage(
@@ -110,12 +114,15 @@ class TestInvokeApplicationTaskExtraction:
             ),
             ToolMessage(content="Successfully transferred to issuesprovider", tool_call_id="tc1"),
             AIMessage(
-                content=[{"type": "text", "text": "Here are the issues: [issue1, issue2]"}],
+                content="Here are the issues I retrieved.",
                 tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "tc2"}],
             ),
             ToolMessage(content="Successfully transferred to main_agent", tool_call_id="tc2"),
             AIMessage(
-                content="I found 2 security issues. Fix both CVEs: issue1 and issue2.",
+                content=(
+                    "Resolve these 2 security issues and return a JSON summary "
+                    "of fix steps for each: [issue1, issue2]."
+                ),
                 tool_calls=[{"name": "transfer_to_securityresolver", "args": {}, "id": "tc3"}],
             ),
             ToolMessage(content="Successfully transferred to SecurityResolver", tool_call_id="tc3"),
@@ -124,69 +131,17 @@ class TestInvokeApplicationTaskExtraction:
         task = _extract_task_for_agent(messages, "securityresolver")
 
         assert "## Your Task" in task
-        assert "Fix both CVEs: issue1 and issue2" in task
-        assert "## Original User Request" in task
+        assert "Resolve these 2 security issues" in task
+        assert "## User's Most Recent Request" in task
         assert "Get and fix all security issues" in task
-        assert "## Prior Agent Outputs" in task
-        assert "Here are the issues: [issue1, issue2]" in task
-        # Orchestrator's intermediate transition dropped
-        assert "I'll retrieve the issues first" not in task
+        # Prior sub-agent output is NOT dumped — the orchestrator inlined the
+        # relevant data itself in Your Task
+        assert "## Prior Agent Outputs" not in task
+        assert "Here are the issues I retrieved" not in task
         assert "Successfully transferred" not in task
 
-        # Section ordering: task first, user request, then references
-        task_idx = task.index("## Your Task")
-        req_idx = task.index("## Original User Request")
-        ref_idx = task.index("## Prior Agent Outputs")
-        assert task_idx < req_idx < ref_idx
-
-    def test_aggregates_prior_agent_outputs_for_chained_handoffs(self):
-        # Issue #4950 production case: the orchestrator's handoff message uses
-        # anaphora ("hand off all 4 issues") referring to data emitted by prior
-        # sub-agents. The next sub-agent must see those outputs, not just the
-        # transition narrative.
-        messages = [
-            HumanMessage(content="Fix all open issues"),
-            AIMessage(
-                content="Retrieving issues first.",
-                tool_calls=[{"name": "transfer_to_issuesprovider", "args": {}, "id": "tc1"}],
-            ),
-            ToolMessage(content="Successfully transferred to issuesprovider", tool_call_id="tc1"),
-            AIMessage(
-                content="Issues: #11, #14, #20, #21. #11 and #14 are security.",
-                tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "tc2"}],
-            ),
-            ToolMessage(content="Successfully transferred to main_agent", tool_call_id="tc2"),
-            AIMessage(
-                content="I've got 4 issues, 2 security.",
-                tool_calls=[{"name": "transfer_to_securityissuesresolver", "args": {}, "id": "tc3"}],
-            ),
-            ToolMessage(content="Successfully transferred to SecurityIssuesResolver", tool_call_id="tc3"),
-            AIMessage(
-                content="Security fixes for #11 and #14 applied: patch X and Y.",
-                tool_calls=[{"name": "transfer_to_main_agent", "args": {}, "id": "tc4"}],
-            ),
-            ToolMessage(content="Successfully transferred to main_agent", tool_call_id="tc4"),
-            AIMessage(
-                content="Now hand off all 4 issues to GuidedDeveloper.",
-                tool_calls=[{"name": "transfer_to_guideddeveloper", "args": {}, "id": "tc5"}],
-            ),
-            ToolMessage(content="Successfully transferred to GuidedDeveloper", tool_call_id="tc5"),
-        ]
-
-        task = _extract_task_for_agent(messages, "GuidedDeveloper")
-
-        assert "## Your Task" in task
-        assert "hand off all 4 issues" in task
-        assert "## Original User Request" in task
-        assert "Fix all open issues" in task
-        assert "## Prior Agent Outputs" in task
-        assert "Issues: #11, #14, #20, #21" in task
-        assert "Security fixes for #11 and #14 applied: patch X and Y." in task
-        # Orchestrator transitions dropped — they restate context already in the
-        # sub-agent results that follow them
-        assert "Retrieving issues first" not in task
-        assert "I've got 4 issues, 2 security" not in task
-        assert "Successfully transferred" not in task
+        # Section ordering: task first, then user request
+        assert task.index("## Your Task") < task.index("## User's Most Recent Request")
 
     def test_falls_back_to_human_message_when_no_assigning_aimessage(self):
         messages = [HumanMessage(content="Initial user request")]
@@ -450,13 +405,13 @@ class _RecordingApp:
 
 
 class _ScriptedOrchestratorLLM:
-    """Fake orchestrator LLM that:
+    """Fake orchestrator LLM that follows the production prompt rules:
 
-    - Emits ``transfer_to_provider`` for any HumanMessage containing 'generate'
-    - Emits ``transfer_to_fixer`` for any HumanMessage containing 'fix' (with
-      anaphoric handoff text — the exact production failure mode)
-    - Emits a final response (no tool_calls) once a sub-agent has handed back
-      in the current turn.
+    - On the first invoke of a turn, picks the target peer from the user's
+      keywords ('generate' -> provider, 'fix' -> fixer).
+    - Inlines actual data from prior sub-agent outputs into its handoff
+      message (the prompt requires self-contained handoffs).
+    - Emits a final response (no tool_calls) once a sub-agent has handed back.
     """
 
     temperature = 0
@@ -500,24 +455,44 @@ class _ScriptedBound:
         lower = text.lower()
 
         if "generate" in lower:
-            target = "transfer_to_provider"
-            handoff_text = "Routing to provider to generate items."
-        elif "fix" in lower:
-            target = "transfer_to_fixer"
-            # Deliberate anaphora — the production failure mode the helper must compensate for.
-            handoff_text = "Now routing the items to the fixer."
-        else:
-            return AIMessage(content="unknown request")
+            return AIMessage(
+                content="Generate the items list and return it as JSON.",
+                tool_calls=[{
+                    "name": "transfer_to_provider",
+                    "args": {},
+                    "id": f"tc-{len(messages)}",
+                    "type": "tool_call",
+                }],
+            )
 
-        return AIMessage(
-            content=handoff_text,
-            tool_calls=[{
-                "name": target,
-                "args": {},
-                "id": f"tc-{len(messages)}",
-                "type": "tool_call",
-            }],
-        )
+        if "fix" in lower:
+            # Production prompt requires inlining the data. Walk earlier
+            # messages for the most recent sub-agent payload (any AIMessage
+            # whose tool_calls include transfer_to_main_agent) and inline it.
+            payload = ""
+            for msg in messages[:latest_human_idx]:
+                if isinstance(msg, AIMessage):
+                    tc_names = [
+                        tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
+                    ]
+                    if "transfer_to_main_agent" in tc_names:
+                        c = msg.content if isinstance(msg.content, str) else str(msg.content)
+                        if c.strip():
+                            payload = c.strip()
+            return AIMessage(
+                content=(
+                    "Fix the X-kind items in this list and return a summary "
+                    f"of fixes applied:\n{payload}"
+                ),
+                tool_calls=[{
+                    "name": "transfer_to_fixer",
+                    "args": {},
+                    "id": f"tc-{len(messages)}",
+                    "type": "tool_call",
+                }],
+            )
+
+        return AIMessage(content="unknown request")
 
 
 class TestSwarmMultiTurnIntegration:
@@ -613,14 +588,17 @@ class TestSwarmMultiTurnIntegration:
         )
         fixer_task = wrapped_input[0].content
 
-        # The production gap: even though the orchestrator's turn-2 handoff uses
-        # anaphora ("the items") without inlining the data, the fixer's task
-        # must surface turn 1's provider output as reference.
+        # The orchestrator complied with the prompt: it walked the prior turn's
+        # checkpoint state, inlined the provider's payload into its handoff
+        # message. The fixer therefore sees turn 1's data via Your Task — not
+        # via a verbose Prior Agent Outputs dump.
         assert '"kind": "X"' in fixer_task or '"id": 1' in fixer_task, (
-            f"Fixer task in turn 2 does not include turn 1's provider output. "
-            f"Multi-turn fallback failed.\nTask:\n{fixer_task}"
+            f"Fixer task does not contain turn 1's provider data. "
+            f"Either the orchestrator failed to inline (prompt issue) or the "
+            f"checkpoint state is not visible across turns.\nTask:\n{fixer_task}"
         )
-        # The structured-brief shape is preserved
+        # The brief shape: just two sections, no Prior Agent Outputs dump
         assert "## Your Task" in fixer_task
-        assert "## Original User Request" in fixer_task
+        assert "## User's Most Recent Request" in fixer_task
         assert "fix only the X-kind items" in fixer_task
+        assert "## Prior Agent Outputs" not in fixer_task
