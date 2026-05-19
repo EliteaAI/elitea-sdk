@@ -1678,6 +1678,37 @@ class LLMNode(BaseTool):
         else:
             content_shape = type(content).__name__
 
+        # Filter tool_calls to only include the one being resumed plus any that
+        # already have ToolMessages in the conversation history. This prevents
+        # the "tool_call_ids did not have response messages" API error when the
+        # original AIMessage had multiple tool_calls but not all executed before
+        # the interrupt.
+        tool_result_ids = {
+            getattr(m, 'tool_call_id', None)
+            for m in messages
+            if isinstance(m, ToolMessage) and getattr(m, 'tool_call_id', None)
+        }
+        # Always include the tool being resumed (it will get a ToolMessage after execution)
+        if original_tc_id:
+            tool_result_ids.add(original_tc_id)
+
+        filtered_tool_calls = [
+            tc for tc in (original_ai.tool_calls or [])
+            if (tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')) in tool_result_ids
+        ]
+
+        if len(filtered_tool_calls) != len(original_ai.tool_calls or []):
+            logger.info(
+                "[HITL] Filtered original AIMessage tool_calls from %d to %d "
+                "(keeping only completed siblings + resumed tool)",
+                len(original_ai.tool_calls or []),
+                len(filtered_tool_calls),
+            )
+            try:
+                original_ai = original_ai.model_copy(update={"tool_calls": filtered_tool_calls})
+            except Exception:
+                original_ai = AIMessage(content=original_ai.content, tool_calls=filtered_tool_calls)
+
         logger.info(
             "[HITL] Reusing original AIMessage as resume completion "
             "(tool=%s, tool_call_id=%s, content_shape=%s) — preserves the "
@@ -2155,16 +2186,6 @@ class LLMNode(BaseTool):
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
-                        # Add placeholder ToolMessage so tool_call_id is not orphaned.
-                        # This ensures the AIMessage's tool_calls have matching responses
-                        # when the message history is restored on HITL resume. Without this,
-                        # the LLM API rejects the request with "tool_call_ids did not have
-                        # response messages" error.
-                        tool_message = ToolMessage(
-                            content="Tool execution paused for approval.",
-                            tool_call_id=tool_call_id
-                        )
-                        new_messages.append(tool_message)
                         # Reset auto-approve context before propagating.
                         if _approved_token is not None:
                             reset_hitl_approved_tools(_approved_token)
@@ -2177,12 +2198,6 @@ class LLMNode(BaseTool):
                         # which triggers the Login button in the Chat UI.
                         # Without this, the exception is swallowed into a ToolMessage
                         # and the nested agent silently fails to show the login prompt.
-                        # Add placeholder ToolMessage to prevent orphaned tool_call_id.
-                        tool_message = ToolMessage(
-                            content="Tool execution paused for MCP authorization.",
-                            tool_call_id=tool_call_id
-                        )
-                        new_messages.append(tool_message)
                         raise
                     except Exception as e:
                         import traceback
