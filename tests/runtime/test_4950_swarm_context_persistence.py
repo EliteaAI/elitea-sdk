@@ -8,6 +8,7 @@ from elitea_sdk.runtime.langchain.assistant import (
     Assistant,
     _extract_subagent_output,
     _extract_task_for_agent,
+    _extract_task_from_assigning_tool_call,
 )
 from elitea_sdk.runtime.tools.application import Application
 
@@ -97,6 +98,85 @@ class TestExtractSubagentOutput:
             ],
         }
         assert _extract_subagent_output(result) == "first"
+
+
+class TestExtractTaskFromAssigningToolCall:
+    """Primary path: task is read directly from the assigning tool_call's
+    args. The new _create_swarm_handoff_tool requires `task: str`, so the
+    LLM is forced by the schema to populate it. invoke_application reads it
+    deterministically — no message-walking required.
+    """
+
+    def test_reads_task_arg_from_latest_matching_tool_call(self):
+        messages = [
+            HumanMessage(content="user"),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "transfer_to_securityresolver",
+                    "args": {"task": "Resolve issue #123: details inlined."},
+                    "id": "tc1",
+                }],
+            ),
+        ]
+        assert _extract_task_from_assigning_tool_call(messages, "SecurityResolver") == (
+            "Resolve issue #123: details inlined."
+        )
+
+    def test_normalizes_agent_name_for_match(self):
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "transfer_to_data_agent",
+                    "args": {"task": "Run the analysis on rows 1-100."},
+                    "id": "tc1",
+                }],
+            ),
+        ]
+        # CamelCase + whitespace agent name still matches normalized tool name
+        assert _extract_task_from_assigning_tool_call(messages, "Data Agent") == (
+            "Run the analysis on rows 1-100."
+        )
+
+    def test_returns_empty_when_no_matching_tool_call(self):
+        messages = [HumanMessage(content="user")]
+        assert _extract_task_from_assigning_tool_call(messages, "anyone") == ""
+
+    def test_returns_empty_when_tool_call_lacks_task_arg(self):
+        # Legacy handoff with no task in args — fallback to helper expected
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "transfer_to_worker",
+                    "args": {},
+                    "id": "tc1",
+                }],
+            ),
+        ]
+        assert _extract_task_from_assigning_tool_call(messages, "worker") == ""
+
+    def test_picks_most_recent_when_multiple_handoffs_to_same_agent(self):
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "transfer_to_worker",
+                    "args": {"task": "OLD task"},
+                    "id": "tc1",
+                }],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "transfer_to_worker",
+                    "args": {"task": "NEW task"},
+                    "id": "tc2",
+                }],
+            ),
+        ]
+        assert _extract_task_from_assigning_tool_call(messages, "worker") == "NEW task"
 
 
 class TestInvokeApplicationTaskExtraction:
@@ -493,13 +573,11 @@ class _RecordingApp:
 
 
 class _ScriptedOrchestratorLLM:
-    """Fake orchestrator LLM that simulates the PRODUCTION FAILURE MODE:
+    """Fake orchestrator LLM that uses the production path:
 
-    Emits anaphoric handoff messages ("Now routing the items to the fixer.")
-    instead of inlining the data. This exercises the helper's safety-net
-    fallback (the ## Last Available Result section). The orchestrator's
-    real prompt asks it to inline, but compliance varies — the SDK must
-    deliver something actionable to the peer regardless.
+    Populates the `task` argument on the transfer tool — same way the real
+    LLM is forced to by the new tool schema. invoke_application reads task
+    directly from tool_call args; no heuristics needed.
     """
 
     temperature = 0
@@ -544,20 +622,33 @@ class _ScriptedBound:
 
         if "generate" in lower:
             target = "transfer_to_provider"
-            handoff_text = "Routing to provider to generate items."
+            task_arg = "Generate the items list and return it as JSON."
         elif "fix" in lower:
             target = "transfer_to_fixer"
-            # Anaphoric — does NOT inline the data. The helper's safety net
-            # must surface the prior sub-agent output for the peer to act on.
-            handoff_text = "Now routing the items to the fixer."
+            # Mirror production: orchestrator populates `task` with full data.
+            # Walk prior sub-agent outputs to inline.
+            payload = ""
+            for msg in messages[:latest_human_idx]:
+                if isinstance(msg, AIMessage):
+                    tc_names = [
+                        tc.get("name") for tc in (getattr(msg, "tool_calls", None) or [])
+                    ]
+                    if "transfer_to_main_agent" in tc_names:
+                        c = msg.content if isinstance(msg.content, str) else str(msg.content)
+                        if c.strip():
+                            payload = c.strip()
+            task_arg = (
+                "Fix the X-kind items in this list and return a summary "
+                f"of fixes applied:\n{payload}"
+            )
         else:
             return AIMessage(content="unknown request")
 
         return AIMessage(
-            content=handoff_text,
+            content="",  # peer ignores free-form content; task lives in tool_call args
             tool_calls=[{
                 "name": target,
-                "args": {},
+                "args": {"task": task_arg},
                 "id": f"tc-{len(messages)}",
                 "type": "tool_call",
             }],
@@ -657,18 +748,15 @@ class TestSwarmMultiTurnIntegration:
         )
         fixer_task = wrapped_input[0].content
 
-        # The orchestrator emitted anaphora ("Now routing the items..."), so
-        # Your Task does NOT contain the items data. The safety-net section
-        # ## Last Available Result must surface turn 1's provider payload so
-        # the fixer can still act.
-        assert '"kind": "X"' in fixer_task or '"id": 1' in fixer_task, (
-            f"Fixer task lacks turn 1's provider data. The safety-net "
-            f"section is missing or empty.\nTask:\n{fixer_task}"
+        # The orchestrator populated the transfer tool's `task` arg with
+        # turn 1's provider payload inlined. The fixer reads it verbatim —
+        # no multi-section brief, no message-walking heuristics.
+        assert fixer_task.startswith(
+            "Fix the X-kind items in this list and return a summary of fixes applied:"
         )
-        # Brief shape: three sections, with the reference bounded to ONE payload
-        assert "## Your Task" in fixer_task
-        assert "## User's Most Recent Request" in fixer_task
-        assert "fix only the X-kind items" in fixer_task
-        assert "## Last Available Result" in fixer_task
-        # Old verbose label must not be used
-        assert "## Prior Agent Outputs" not in fixer_task
+        assert '"kind": "X"' in fixer_task or '"id": 1' in fixer_task, (
+            f"Fixer task lacks the inlined provider data.\nTask:\n{fixer_task}"
+        )
+        # No section labels — the task is the raw string the orchestrator wrote
+        assert "## Your Task" not in fixer_task
+        assert "## User's Most Recent Request" not in fixer_task

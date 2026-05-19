@@ -28,6 +28,84 @@ APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
+def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = None):
+    """Build a swarm handoff tool that REQUIRES a `task: str` argument.
+
+    Mirrors langgraph_swarm.create_handoff_tool's routing semantics
+    (Command(goto=agent_name, graph=Command.PARENT) + a "Successfully
+    transferred" ToolMessage), but adds a mandatory ``task`` parameter so
+    the LLM is forced by the tool schema to write a self-contained task
+    description for the peer. The peer's ``invoke_application`` reads
+    ``task`` directly from the assigning AIMessage's tool_call args —
+    deterministic, no message-walking heuristics needed.
+    """
+    from typing import Annotated, Any
+    from langchain_core.tools import tool, InjectedToolCallId
+    from langchain_core.messages import ToolMessage as _ToolMessage
+    from langgraph.prebuilt import InjectedState
+    from langgraph.types import Command as _Command
+
+    tool_name = f"transfer_to_{re.sub(r'\\s+', '_', agent_name.strip()).lower()}"
+    tool_description = description or f"Hand off to agent '{agent_name}'."
+
+    @tool(tool_name, description=tool_description)
+    def handoff_to_agent(
+        task: str,
+        state: Annotated[Any, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Any:
+        """Transfer control with a self-contained task for the receiving agent.
+
+        Args:
+            task: Complete task description for the peer with all data inlined
+                (full JSON/text/lists they must operate on, expected return
+                shape). Do not use anaphora — the peer does not see the rest
+                of the conversation. Treat them as a fresh agent who only
+                sees this string.
+        """
+        existing = (
+            state.get("messages", []) if isinstance(state, dict)
+            else (getattr(state, "messages", []) or [])
+        )
+        ack = _ToolMessage(
+            content=f"Successfully transferred to {agent_name}",
+            name=tool_name,
+            tool_call_id=tool_call_id,
+        )
+        return _Command(
+            goto=agent_name,
+            graph=_Command.PARENT,
+            update={
+                "messages": [*existing, ack],
+                "active_agent": agent_name,
+            },
+        )
+
+    handoff_to_agent.metadata = {"_swarm_handoff_destination": agent_name}
+    return handoff_to_agent
+
+
+def _extract_task_from_assigning_tool_call(messages: list, agent_name: str) -> str:
+    """Read the ``task`` arg from the assigning AIMessage's tool_call.
+
+    Returns ``""`` if no matching tool_call is found or the arg is missing.
+    With the task-arg handoff tool this is the deterministic primary path;
+    the message-walking helper is only a fallback for edge cases.
+    """
+    if not messages:
+        return ""
+    normalized = re.sub(r"\s+", "_", agent_name.strip()).lower()
+    target_tool = f"transfer_to_{normalized}"
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            if tc.get("name") == target_tool:
+                args = tc.get("args") or {}
+                return str(args.get("task") or "").strip()
+    return ""
+
+
 def _extract_subagent_output(result: Any) -> str:
     """Extract the clean text answer from a sub-agent pipeline's result.
 
@@ -872,7 +950,7 @@ class Assistant:
         from langgraph.prebuilt import ToolNode
         from langgraph.checkpoint.memory import MemorySaver
         from langgraph.types import Command
-        from langgraph_swarm import create_swarm, create_handoff_tool
+        from langgraph_swarm import create_swarm, create_handoff_tool as _swarm_handoff_back_tool
 
         checkpointer = self.memory if self.memory is not None else MemorySaver()
         logger.info(
@@ -1066,7 +1144,11 @@ class Assistant:
             builder = StateGraph(MessagesState)
 
             # Create a handoff tool for routing back to main_agent via ToolNode
-            handoff_back_tool = create_handoff_tool(
+            # Back-handoff (sub-agent → main_agent) doesn't need a task arg —
+            # it carries the sub-agent's result content. Keep langgraph_swarm's
+            # original no-arg tool so the code-emitted AIMessage at line below
+            # remains compatible.
+            handoff_back_tool = _swarm_handoff_back_tool(
                 agent_name=main_agent_name,
                 description="Hand back to the main coordinating agent after completing the task"
             )
@@ -1100,7 +1182,13 @@ class Assistant:
                     except Exception as e:
                         logger.debug(f"[SWARM] Failed to emit swarm_agent_start: {e}")
 
-                task = _extract_task_for_agent(messages, agent_name, main_agent_name)
+                # Primary path: task is carried in the assigning tool_call's
+                # args (the new task-arg handoff tool forces this). Fall back
+                # to message-walking only when the tool_call has no task —
+                # e.g. a legacy/manual handoff or a code-emitted handoff.
+                task = _extract_task_from_assigning_tool_call(messages, agent_name)
+                if not task:
+                    task = _extract_task_for_agent(messages, agent_name, main_agent_name)
                 if not task:
                     logger.warning(f"[SWARM] No task context found for {agent_name}, using default")
                     task = "Execute the assigned task"
@@ -1224,10 +1312,20 @@ class Assistant:
                     target_cfg = next((c for c in peer_configs if c['name'] == target_name), None)
                     desc = (f"Hand off to {target_cfg['original_name']}: {target_cfg['description']}"
                             if target_cfg else f"Hand off to {target_name}")
-                handoff = create_handoff_tool(
-                    agent_name=target_name,
-                    description=desc,
-                )
+                # Forward handoff (to a peer): use our task-arg tool so the LLM
+                # is forced by the schema to write a self-contained task.
+                # Back-handoff (peer → main_agent): keep no-arg tool — it's a
+                # result-return, not a delegation.
+                if target_name == main_agent_name:
+                    handoff = _swarm_handoff_back_tool(
+                        agent_name=target_name,
+                        description=desc,
+                    )
+                else:
+                    handoff = _create_swarm_handoff_tool(
+                        agent_name=target_name,
+                        description=desc,
+                    )
                 # Inject swarm metadata so the FE chip shows "Swarm Mode" with the
                 # swarm icon for all handoff actions (toolkit_type='internal', toolkit_name='swarm')
                 if isinstance(handoff.metadata, dict):
@@ -1482,29 +1580,28 @@ class Assistant:
             lines.extend([
                 "You can delegate tasks to the following peer agents by using their handoff tools.",
                 "",
-                "**Handoff message rules (mandatory, not stylistic):**",
-                "- The MESSAGE TEXT you emit alongside the transfer tool call IS the peer's task.",
-                "  The peer does not see prior conversation, prior tool results, or other peers' "
-                "  outputs. Treat them as a fresh agent who only sees your message.",
-                "- Extract from the conversation only the data this specific peer needs to "
-                "  complete its assignment, then INLINE that data verbatim in the handoff text. "
-                "  Do not refer to data by anaphora (\"the remaining items\", \"those results\", "
-                "  \"the data from earlier\", \"hand these off\"). If you find yourself wanting "
-                "  to write a pronoun, replace it with the actual data.",
-                "- State the action the peer must perform and the shape you expect back.",
-                "- Do not narrate the handoff (\"I'll route...\", \"Now I'll hand off...\"). "
-                "  Address the peer directly with the work to do.",
+                "**The handoff tool's `task` argument IS the peer's task (mandatory):**",
+                "- Each transfer tool requires a `task: str` argument. Whatever you put there "
+                "  is the entire input the peer sees — they have no access to prior "
+                "  conversation, tool results, or other peers' outputs.",
+                "- The `task` value must be self-contained: extract from the conversation only "
+                "  what this specific peer needs and INLINE it verbatim (full lists/JSON/text). "
+                "  No anaphora (\"the items\", \"those results\", \"the data from earlier\"). "
+                "  If you would write a pronoun, substitute the actual data.",
+                "- State the action and the shape of the result you expect back.",
+                "- The free-form AIMessage text you emit alongside the tool call is for the "
+                "  human user, not the peer. The peer reads only the `task` argument.",
                 "",
-                "**Examples (generic; the same shape applies regardless of agent type):**",
+                "**Examples (generic; same shape applies regardless of agent type):**",
                 "",
-                "  Bad — peer receives nothing it can act on:",
-                "  > \"I'll route the items to the next agent to handle.\"",
-                "  > \"The previous step produced results. Hand them off for processing.\"",
+                "  Bad — `task` arg is anaphoric, peer can't act:",
+                "  > transfer_to_peer(task=\"Process the items.\")",
+                "  > transfer_to_peer(task=\"Hand these results off.\")",
                 "",
-                "  Good — peer can complete the work from this message alone:",
-                "  > \"Process the following items and return a summary of actions taken: "
-                "  >  <inline the actual list/JSON/text the peer must operate on>. "
-                "  >  Return shape: <describe the expected output>.\"",
+                "  Good — `task` arg is self-contained:",
+                "  > transfer_to_peer(task=\"Process the following items and return a "
+                "  >   summary of actions: <inline list/JSON/text>. Return shape: "
+                "  >   <describe expected output>.\")",
                 "",
                 "**Scope discipline (mandatory):**",
                 "- Respect the user's explicit scope. If the user narrows the request "
@@ -1520,13 +1617,12 @@ class Assistant:
         else:
             lines.extend([
                 "You are part of a multi-agent swarm. You can hand off to the following peer agents.",
-                "Your task arrives as a brief with up to four sections: \"## Your Task\" (the "
-                "work to do — may be empty if the orchestrator did not write content), "
-                "\"## User's Most Recent Request\" (the user's scope anchor), "
-                "\"## Recent Orchestrator Message\" (the main agent's last summary or narrative — "
-                "useful when Your Task is empty), and \"## Last Available Result\" (the most "
-                "recent sub-agent output). Treat \"## Your Task\" as authoritative; the reference "
-                "sections are fallback context to be consulted when Your Task lacks data.",
+                "Your task is the string passed via the orchestrator's transfer tool's `task` "
+                "argument: a self-contained instruction with all the data you need inlined. "
+                "Treat it as authoritative — you do not see prior conversation or other peers' "
+                "outputs. (For legacy/manual handoffs that did not populate the `task` arg, you "
+                "may receive a multi-section brief instead; act on \"## Your Task\" and use the "
+                "reference sections only as fallback context.)",
                 "When you have completed your task, you MUST hand off to another agent "
                 "(typically the main agent) so the conversation can continue.",
                 "If you simply respond with text and no tool calls, the entire swarm will stop.",
