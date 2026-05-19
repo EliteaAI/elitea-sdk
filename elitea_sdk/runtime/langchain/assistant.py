@@ -27,6 +27,41 @@ APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
+def _extract_subagent_output(result: Any) -> str:
+    """Extract the clean text answer from a sub-agent pipeline's result.
+
+    Application/pipeline subgraphs return state dicts shaped like
+    ``{'messages': [...], 'thread_id': ..., 'execution_finished': ...,
+    'context_info': ..., 'hitl_decisions': ...}`` — there is no ``output``
+    key, so a naive ``result.get("output", str(result))`` dumps the entire
+    dict. Walk the messages tail to find the last non-user assistant
+    content and normalize it to plain text.
+    """
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, dict):
+        return str(result)
+    output = result.get("output")
+    if isinstance(output, str) and output.strip():
+        return output
+    for msg in reversed(result.get("messages") or []):
+        if isinstance(msg, dict):
+            role = msg.get("role") or msg.get("type")
+            if role in ("user", "human"):
+                continue
+            content = msg.get("content")
+        else:
+            if isinstance(msg, HumanMessage):
+                continue
+            content = getattr(msg, "content", None)
+        if content is None:
+            continue
+        text = normalize_message_content(content).strip()
+        if text:
+            return text
+    return str(result)
+
+
 def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: str = "main_agent") -> str:
     """Build the sub-agent's task as a compact transcript of the current swarm turn.
 
@@ -1050,12 +1085,7 @@ class Assistant:
                 # required context through task; chat_history is not forwarded.
                 try:
                     result = application_tool.invoke({"task": task}, config=config)
-                    if isinstance(result, dict):
-                        content = result.get("output", str(result))
-                    elif isinstance(result, str):
-                        content = result
-                    else:
-                        content = str(result)
+                    content = _extract_subagent_output(result)
                 except Exception as e:
                     logger.error(f"[SWARM] Direct invocation of '{agent_name}' failed: {e}", exc_info=True)
                     content = f"Execution failed: {e}"

@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from elitea_sdk.runtime.langchain.assistant import Assistant, _extract_task_for_agent
+from elitea_sdk.runtime.langchain.assistant import (
+    Assistant,
+    _extract_subagent_output,
+    _extract_task_for_agent,
+)
 from elitea_sdk.runtime.tools.application import Application
 
 
@@ -40,6 +44,59 @@ def _build_swarm_assistant(agent_tools, memory=None) -> Assistant:
         memory=memory or MemorySaver(),
         app_type="agent",
     )
+
+
+class TestExtractSubagentOutput:
+
+    def test_pipeline_state_dict_extracts_last_assistant_content(self):
+        # The exact shape that was producing the str(dict) noise on the live env:
+        # the sub-agent returns its pipeline state with no "output" key, so the
+        # naive fallback dumped the whole dict (thread_id, execution_finished,
+        # context_info, hitl_decisions and all) into the next sub-agent's task.
+        result = {
+            "messages": [
+                {"role": "assistant", "content": '[{"id": 1, "title": "issue"}]'},
+            ],
+            "thread_id": None,
+            "execution_finished": True,
+            "context_info": {"message_count": 0, "token_count": 0, "summarized": False},
+            "hitl_decisions": [],
+        }
+
+        out = _extract_subagent_output(result)
+
+        assert out == '[{"id": 1, "title": "issue"}]'
+        assert "thread_id" not in out
+        assert "execution_finished" not in out
+        assert "context_info" not in out
+
+    def test_explicit_output_key_wins(self):
+        result = {"output": "clean answer", "messages": [{"role": "assistant", "content": "ignored"}]}
+        assert _extract_subagent_output(result) == "clean answer"
+
+    def test_message_objects_are_handled(self):
+        result = {"messages": [HumanMessage(content="ignored"), AIMessage(content="real answer")]}
+        assert _extract_subagent_output(result) == "real answer"
+
+    def test_anthropic_list_content(self):
+        result = {
+            "messages": [
+                {"role": "assistant", "content": [{"type": "text", "text": "block answer"}]},
+            ],
+        }
+        assert _extract_subagent_output(result) == "block answer"
+
+    def test_string_result_passes_through(self):
+        assert _extract_subagent_output("plain") == "plain"
+
+    def test_skips_user_messages_when_walking_tail(self):
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "should be ignored"},
+            ],
+        }
+        assert _extract_subagent_output(result) == "first"
 
 
 class TestInvokeApplicationTaskExtraction:
