@@ -67,8 +67,12 @@ class TestInvokeApplicationTaskExtraction:
         task = _extract_task_for_agent(messages, "securityresolver")
 
         assert "User: Get and fix all security issues" in task
+        # Sub-agent result is preserved
         assert "Here are the issues: [issue1, issue2]" in task
+        # Assigning AIMessage is preserved
         assert "Fix both CVEs: issue1 and issue2" in task
+        # Orchestrator's first transition is dropped (intermediate)
+        assert "I'll retrieve the issues first" not in task
         assert "Successfully transferred" not in task
 
     def test_aggregates_prior_agent_outputs_for_chained_handoffs(self):
@@ -107,10 +111,16 @@ class TestInvokeApplicationTaskExtraction:
 
         task = _extract_task_for_agent(messages, "GuidedDeveloper")
 
+        # Kept: original user task, both sub-agent results, the current handoff
         assert "Fix all open issues" in task
         assert "Issues: #11, #14, #20, #21" in task
         assert "Security fixes for #11 and #14 applied: patch X and Y." in task
         assert "hand off all 4 issues" in task
+        # Dropped: orchestrator's intermediate transitions (restate context that
+        # is already conveyed by the sub-agent results that follow them) and
+        # langgraph_swarm handoff acks
+        assert "Retrieving issues first" not in task
+        assert "I've got 4 issues, 2 security" not in task
         assert "Successfully transferred" not in task
 
     def test_falls_back_to_human_message_when_no_assigning_aimessage(self):

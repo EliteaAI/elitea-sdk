@@ -27,26 +27,31 @@ APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
-def _extract_task_for_agent(messages: list, agent_name: str) -> str:
-    """Build the sub-agent's task as a transcript of the current swarm turn.
+def _extract_task_for_agent(messages: list, agent_name: str, main_agent_name: str = "main_agent") -> str:
+    """Build the sub-agent's task as a compact transcript of the current swarm turn.
 
     The orchestrator's handoff message often uses anaphora ("hand off all 4
     issues...") that points at data sitting in earlier sub-agent outputs.
     Returning only the assigning AIMessage's text loses the referent, so we
-    aggregate the slice [latest HumanMessage .. assigning AIMessage] into a
-    "User: ... / Assistant: ... / Tool result: ..." transcript.
+    aggregate the slice [latest HumanMessage .. assigning AIMessage].
 
-    The handoff tool name is lowercased and whitespace-collapsed by
-    langgraph_swarm's ``_normalize_agent_name``, so we mirror that here.
+    To keep the transcript bounded as the chain grows we drop the orchestrator's
+    intermediate transitions (AIMessages routing to a peer that isn't the
+    current target). They only restate what's about to happen — the actual
+    payload is in the next sub-agent's result. We keep:
+      - the latest HumanMessage (the user's task)
+      - sub-agent result AIMessages (those routing back to ``main_agent_name``)
+      - the assigning AIMessage (current handoff intent)
     Handoff-ack ToolMessages ("Successfully transferred to X") and empty
-    messages are dropped. Returns ``""`` only if there is no HumanMessage at
-    all (fresh empty state).
+    messages are also dropped. Tool name normalization mirrors langgraph_swarm's
+    ``_normalize_agent_name`` (lowercase + whitespace collapse).
     """
     if not messages:
         return ""
 
     normalized = re.sub(r"\s+", "_", agent_name.strip()).lower()
     target_tool = f"transfer_to_{normalized}"
+    back_handoff = f"transfer_to_{main_agent_name}"
 
     assign_idx = None
     for i in range(len(messages) - 1, -1, -1):
@@ -67,9 +72,8 @@ def _extract_task_for_agent(messages: list, agent_name: str) -> str:
                     return text
         return ""
 
-    # Anchor the slice at the latest HumanMessage at-or-before the handoff so
-    # prior conversation turns (already cleared from a fresh checkpoint, but
-    # defensive here too) are not folded in.
+    # Anchor at the latest HumanMessage at-or-before the handoff so prior
+    # turns don't bleed in.
     session_start = 0
     for i in range(assign_idx, -1, -1):
         if isinstance(messages[i], HumanMessage):
@@ -77,13 +81,22 @@ def _extract_task_for_agent(messages: list, agent_name: str) -> str:
             break
 
     parts = []
-    for msg in messages[session_start:assign_idx + 1]:
+    for i, msg in enumerate(messages[session_start:assign_idx + 1], start=session_start):
         text = normalize_message_content(msg.content).strip()
         if not text:
             continue
         if isinstance(msg, HumanMessage):
             parts.append(f"User: {text}")
         elif isinstance(msg, AIMessage):
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            names = [tc.get("name") for tc in tool_calls]
+            is_subagent_result = back_handoff in names
+            is_assigning = i == assign_idx
+            is_orchestrator_transition = (
+                bool(names) and not is_subagent_result and not is_assigning
+            )
+            if is_orchestrator_transition:
+                continue
             parts.append(f"Assistant: {text}")
         elif isinstance(msg, ToolMessage):
             if text.startswith("Successfully transferred to "):
@@ -1023,7 +1036,7 @@ class Assistant:
                     except Exception as e:
                         logger.debug(f"[SWARM] Failed to emit swarm_agent_start: {e}")
 
-                task = _extract_task_for_agent(messages, agent_name)
+                task = _extract_task_for_agent(messages, agent_name, main_agent_name)
                 if not task:
                     logger.warning(f"[SWARM] No task context found for {agent_name}, using default")
                     task = "Execute the assigned task"
