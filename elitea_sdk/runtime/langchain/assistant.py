@@ -1485,6 +1485,16 @@ class Assistant:
                 "  copy that payload into your handoff message verbatim.",
                 "- State explicitly what the peer must produce in return.",
                 "",
+                "**Scope discipline (mandatory):**",
+                "- Respect the user's explicit scope. If the user narrows the request "
+                "  (\"only X\", \"just Y\", \"exclusively Z\", \"don't do W\"), DO NOT hand off "
+                "  to peers whose work falls outside that scope, even if a broader workflow "
+                "  exists for the same data. Stop after the scoped work is done and reply "
+                "  with plain text (no tool calls) so the swarm finishes.",
+                "- Do not auto-extend the workflow beyond what the user asked for. The user's "
+                "  most recent instruction is authoritative; earlier turns are context, not a "
+                "  template to repeat.",
+                "",
             ])
         else:
             lines.extend([
