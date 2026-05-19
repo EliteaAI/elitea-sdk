@@ -1,6 +1,7 @@
 import json
 
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
+from ..models.agent_response import AgentResponse
 from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
@@ -20,13 +21,37 @@ applicationToolSchema = create_model(
 
 
 def formulate_query(kwargs, is_subgraph=False):
+    """
+    Formulate input for nested application invocation.
+
+    Only passes user-defined business variables to child agent.
+    Filters out internal/metadata keys that are specific to parent's execution context.
+    """
     user_task = kwargs.get('task')
     if not user_task:
         raise ToolException("Task is required to invoke the application. "
                             "Check the provided input (some errors may happen on previous steps).")
     result = {"input": [HumanMessage(content=user_task)] if not is_subgraph else user_task}
+
+    # Internal/metadata keys that should NOT be passed to child agent:
+    # - task, chat_history: handled separately
+    # - messages, input, output: graph I/O keys
+    # - context_info: parent's summarization metadata
+    # - state_types: parent's state schema definition
+    # - hitl_decisions, hitl_interrupt: parent's HITL state
+    # - thread_id, execution_finished: parent's execution state
+    # - ELITEA_RS, PRINTER_NODE_RS: internal output keys
+    excluded_keys = {
+        "task", "chat_history",
+        "messages", "input", "output",
+        "context_info", "state_types",
+        "hitl_decisions", "hitl_interrupt",
+        "thread_id", "execution_finished",
+        ELITEA_RS, PRINTER_NODE_RS,
+    }
+
     for key, value in kwargs.items():
-        if key not in ("task", "chat_history"):
+        if key not in excluded_keys:
             result[key] = value
     return result
 
@@ -307,19 +332,29 @@ class Application(BaseTool):
         )
         normalized_output = extract_application_response_output(response)
 
-        # Build result dict with output message
-        result = {"messages": [{"role": "assistant", "content": normalized_output}]}
+        # Build standardized AgentResponse
+        agent_response = AgentResponse(
+            output=normalized_output,
+            messages=[{"role": "assistant", "content": normalized_output}],
+            thread_id=response.get('thread_id') if isinstance(response, dict) else None,
+            execution_finished=response.get('execution_finished', True) if isinstance(response, dict) else True,
+        )
 
         # Propagate state variables from child response back to parent.
         # This allows FunctionTool to extract them based on output_variables,
         # enabling child pipeline state to flow back to parent pipeline.
+        extra_state = {}
         if isinstance(response, dict):
             # Keys that are internal/output-related and should not be propagated as state
-            excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types', ELITEA_RS, PRINTER_NODE_RS}
+            excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types',
+                           'thread_id', 'execution_finished', ELITEA_RS, PRINTER_NODE_RS}
             for key, value in response.items():
                 if key not in excluded_keys:
-                    result[key] = value
+                    extra_state[key] = value
                     logger.debug(f"[APP_RUN] Propagating state variable '{key}' from child to parent")
+
+        # Convert to dict with extra state variables
+        result = {**agent_response.to_dict(), **extra_state}
 
         # Always return the full result dict with state variables.
         # The invoke() method will handle converting to string for LLM agent calls
