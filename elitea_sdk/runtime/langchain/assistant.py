@@ -16,6 +16,7 @@ from .constants import (
 )
 from ..middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from ..middleware.base import Middleware, MiddlewareManager
+from ..models.agent_response import AgentResponse
 from ..utils.utils import deduplicate_tool_names
 
 logger = logging.getLogger(__name__)
@@ -1267,12 +1268,12 @@ class Assistant:
                         if isinstance(content, str) and content.strip():
                             output = content
                             break
-                return {
-                    "output": output or "",
-                    "messages": messages,
-                    "thread_id": None,
-                    "execution_finished": True,
-                }
+                return AgentResponse(
+                    output=output or "",
+                    messages=messages,
+                    thread_id=None,
+                    execution_finished=True,
+                ).to_dict()
 
         # --- Wire with official create_swarm() ---
         try:

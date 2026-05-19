@@ -1,6 +1,7 @@
 import json
 
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
+from ..models.agent_response import AgentResponse
 from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
@@ -331,26 +332,29 @@ class Application(BaseTool):
         )
         normalized_output = extract_application_response_output(response)
 
-        # Build result dict with standardized AgentResponse format
-        # All keys present for consistent response shape across agent types
-        result = {
-            "output": normalized_output,
-            "messages": [{"role": "assistant", "content": normalized_output}],
-            "thread_id": response.get('thread_id') if isinstance(response, dict) else None,
-            "execution_finished": response.get('execution_finished', True) if isinstance(response, dict) else True,
-        }
+        # Build standardized AgentResponse
+        agent_response = AgentResponse(
+            output=normalized_output,
+            messages=[{"role": "assistant", "content": normalized_output}],
+            thread_id=response.get('thread_id') if isinstance(response, dict) else None,
+            execution_finished=response.get('execution_finished', True) if isinstance(response, dict) else True,
+        )
 
         # Propagate state variables from child response back to parent.
         # This allows FunctionTool to extract them based on output_variables,
         # enabling child pipeline state to flow back to parent pipeline.
+        extra_state = {}
         if isinstance(response, dict):
             # Keys that are internal/output-related and should not be propagated as state
             excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types',
                            'thread_id', 'execution_finished', ELITEA_RS, PRINTER_NODE_RS}
             for key, value in response.items():
                 if key not in excluded_keys:
-                    result[key] = value
+                    extra_state[key] = value
                     logger.debug(f"[APP_RUN] Propagating state variable '{key}' from child to parent")
+
+        # Convert to dict with extra state variables
+        result = {**agent_response.to_dict(), **extra_state}
 
         # Always return the full result dict with state variables.
         # The invoke() method will handle converting to string for LLM agent calls
