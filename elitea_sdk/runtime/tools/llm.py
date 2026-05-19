@@ -2155,9 +2155,17 @@ class LLMNode(BaseTool):
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
+                        # Add placeholder ToolMessage so tool_call_id is not orphaned.
+                        # This ensures the AIMessage's tool_calls have matching responses
+                        # when the message history is restored on HITL resume. Without this,
+                        # the LLM API rejects the request with "tool_call_ids did not have
+                        # response messages" error.
+                        tool_message = ToolMessage(
+                            content="Tool execution paused for approval.",
+                            tool_call_id=tool_call_id
+                        )
+                        new_messages.append(tool_message)
                         # Reset auto-approve context before propagating.
-                        # NOTE: _PENDING_TOOL_MESSAGES was set right before invoke
-                        # and already consumed by the middleware's interrupt() call.
                         if _approved_token is not None:
                             reset_hitl_approved_tools(_approved_token)
                         end_hitl_batch(_batch_token)
@@ -2169,6 +2177,12 @@ class LLMNode(BaseTool):
                         # which triggers the Login button in the Chat UI.
                         # Without this, the exception is swallowed into a ToolMessage
                         # and the nested agent silently fails to show the login prompt.
+                        # Add placeholder ToolMessage to prevent orphaned tool_call_id.
+                        tool_message = ToolMessage(
+                            content="Tool execution paused for MCP authorization.",
+                            tool_call_id=tool_call_id
+                        )
+                        new_messages.append(tool_message)
                         raise
                     except Exception as e:
                         import traceback
