@@ -1,0 +1,418 @@
+name: "ART25 - List Files: Folder Scoping with Filters"
+priority: High
+description: |
+  Verify that list_files folder parameter works with include/skip filters.
+
+  Objective: Test combined folder scoping + pattern filtering
+
+  Expected Behavior:
+  - folder param scopes to specific folder (S3 prefix)
+  - include/skip patterns filter within that folder
+  - Combination provides efficient and precise filtering
+
+toolkits:
+  - id: ${ARTIFACT_TOOLKIT_ID}
+    name: ${ARTIFACT_TOOLKIT_NAME}
+
+state:
+  toolkit_id:
+    type: str
+    value: ${ARTIFACT_TOOLKIT_ID}
+  bucket_name:
+    type: str
+    value: ${TEST_BUCKET}
+  base_folder:
+    type: str
+    value: "folder-scope-test-${TIMESTAMP}"
+  docs_folder:
+    type: str
+    value: ""
+  file1_name:
+    type: str
+    value: ""
+  file2_name:
+    type: str
+    value: ""
+  file3_name:
+    type: str
+    value: ""
+  file4_name:
+    type: str
+    value: ""
+  create_result:
+    type: str
+    value: ''
+  list_result_all:
+    type: str
+    value: ''
+  list_result_docs:
+    type: str
+    value: ''
+  list_result_docs_md:
+    type: str
+    value: ''
+  delete_result:
+    type: str
+    value: ''
+  test_results:
+    type: str
+    value: ''
+
+entry_point: setup_paths
+
+nodes:
+  - id: setup_paths
+    name: setup_paths
+    type: code
+    code:
+      type: fixed
+      value: |
+        base_folder = elitea_state.get("base_folder", "")
+        docs_folder = f"{base_folder}/docs"
+        file1_name = f"{base_folder}/root.txt"
+        file2_name = f"{base_folder}/docs/api.md"
+        file3_name = f"{base_folder}/docs/guide.pdf"
+        file4_name = f"{base_folder}/docs/drafts/draft.md"
+        result = {
+            "docs_folder": docs_folder,
+            "file1_name": file1_name,
+            "file2_name": file2_name,
+            "file3_name": file3_name,
+            "file4_name": file4_name
+        }
+        result
+    input:
+      - base_folder
+    output:
+      - docs_folder
+      - file1_name
+      - file2_name
+      - file3_name
+      - file4_name
+    structured_output: true
+    transition: create_file1
+
+  - id: create_file1
+    name: create_file1
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file1_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "Root level file"
+    output:
+      - create_result
+    structured_output: true
+    transition: create_file2
+
+  - id: create_file2
+    name: create_file2
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file2_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "# API Documentation"
+    output:
+      - create_result
+    structured_output: true
+    transition: create_file3
+
+  - id: create_file3
+    name: create_file3
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file3_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "PDF guide content"
+    output:
+      - create_result
+    structured_output: true
+    transition: create_file4
+
+  - id: create_file4
+    name: create_file4
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file4_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "# Draft Document"
+    output:
+      - create_result
+    structured_output: true
+    transition: list_all_files
+
+  - id: list_all_files
+    name: list_all_files
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: base_folder
+      recursive:
+        type: fixed
+        value: true
+    output:
+      - list_result_all
+    structured_output: true
+    transition: list_docs_folder
+
+  - id: list_docs_folder
+    name: list_docs_folder
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: docs_folder
+      recursive:
+        type: fixed
+        value: true
+    output:
+      - list_result_docs
+    structured_output: true
+    transition: list_docs_md_only
+
+  - id: list_docs_md_only
+    name: list_docs_md_only
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+      - include
+      - skip
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: docs_folder
+      recursive:
+        type: fixed
+        value: true
+      include:
+        type: fixed
+        value: ["*.md"]
+      skip:
+        type: fixed
+        value: ["*draft*"]
+    output:
+      - list_result_docs_md
+    structured_output: true
+    transition: cleanup_file1
+
+  - id: cleanup_file1
+    name: cleanup_file1
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file1_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file2
+
+  - id: cleanup_file2
+    name: cleanup_file2
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file2_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file3
+
+  - id: cleanup_file3
+    name: cleanup_file3
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file3_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file4
+
+  - id: cleanup_file4
+    name: cleanup_file4
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file4_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    name: validate_result
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - list_result_all
+      - list_result_docs
+      - list_result_docs_md
+      - file1_name
+      - file2_name
+      - file3_name
+      - file4_name
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator for file filtering operations."
+      task:
+        type: fstring
+        value: |
+          Analyze the file listing results to verify folder scoping with filters works correctly.
+
+          Test files created:
+          - {file1_name} (root level .txt)
+          - {file2_name} (docs/ .md)
+          - {file3_name} (docs/ .pdf)
+          - {file4_name} (docs/drafts/ .md - draft)
+
+          Results:
+          1. List all (base folder): {list_result_all}
+          2. List docs folder only: {list_result_docs}
+          3. List docs folder + include=['*.md'] + skip=['*draft*']: {list_result_docs_md}
+
+          Expected behavior:
+          1. "List all" should return 4 files
+          2. "List docs" should return 3 files (excludes root.txt)
+          3. "List docs with filters" should return 1 file (api.md only)
+             - guide.pdf excluded by include filter
+             - draft.md excluded by skip filter
+
+          Evaluate:
+          1. Does folder scoping work (docs folder excludes root file)?
+          2. Does include pattern work within folder scope?
+          3. Does skip pattern work within folder scope?
+          4. Is only api.md returned in the final filtered result?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of folder scoping + filter result",
+            "all_count": <number>,
+            "docs_count": <number>,
+            "filtered_count": <number>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

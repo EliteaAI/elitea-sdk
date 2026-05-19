@@ -1,0 +1,328 @@
+name: "ART24 - List Files: Skip Pattern Filtering"
+priority: High
+description: |
+  Verify that list_files correctly excludes files using skip patterns.
+
+  Objective: Test glob-style skip pattern filtering
+
+  Expected Behavior:
+  - skip=['*.tmp'] excludes .tmp files
+  - skip=['temp/*'] excludes files in temp folder
+  - Files not matching skip patterns are returned
+
+toolkits:
+  - id: ${ARTIFACT_TOOLKIT_ID}
+    name: ${ARTIFACT_TOOLKIT_NAME}
+
+state:
+  toolkit_id:
+    type: str
+    value: ${ARTIFACT_TOOLKIT_ID}
+  bucket_name:
+    type: str
+    value: ${TEST_BUCKET}
+  test_folder:
+    type: str
+    value: "skip-test-${TIMESTAMP}"
+  file1_name:
+    type: str
+    value: ""
+  file2_name:
+    type: str
+    value: ""
+  file3_name:
+    type: str
+    value: ""
+  create_result1:
+    type: str
+    value: ''
+  create_result2:
+    type: str
+    value: ''
+  create_result3:
+    type: str
+    value: ''
+  list_result_all:
+    type: str
+    value: ''
+  list_result_skip:
+    type: str
+    value: ''
+  delete_result:
+    type: str
+    value: ''
+  test_results:
+    type: str
+    value: ''
+
+entry_point: setup_file_names
+
+nodes:
+  - id: setup_file_names
+    name: setup_file_names
+    type: code
+    code:
+      type: fixed
+      value: |
+        test_folder = elitea_state.get("test_folder", "")
+        file1_name = f"{test_folder}/document.md"
+        file2_name = f"{test_folder}/cache.tmp"
+        file3_name = f"{test_folder}/temp/draft.txt"
+        result = {
+            "file1_name": file1_name,
+            "file2_name": file2_name,
+            "file3_name": file3_name
+        }
+        result
+    input:
+      - test_folder
+    output:
+      - file1_name
+      - file2_name
+      - file3_name
+    structured_output: true
+    transition: create_file1
+
+  - id: create_file1
+    name: create_file1
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file1_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "# Important Document\nKeep this file"
+    output:
+      - create_result1
+    structured_output: true
+    transition: create_file2
+
+  - id: create_file2
+    name: create_file2
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file2_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "temporary cache data"
+    output:
+      - create_result2
+    structured_output: true
+    transition: create_file3
+
+  - id: create_file3
+    name: create_file3
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file3_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "draft content in temp folder"
+    output:
+      - create_result3
+    structured_output: true
+    transition: list_all_files
+
+  - id: list_all_files
+    name: list_all_files
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: test_folder
+      recursive:
+        type: fixed
+        value: true
+    output:
+      - list_result_all
+    structured_output: true
+    transition: list_with_skip
+
+  - id: list_with_skip
+    name: list_with_skip
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+      - skip
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: test_folder
+      recursive:
+        type: fixed
+        value: true
+      skip:
+        type: fixed
+        value: ["*.tmp", "*/temp/*"]
+    output:
+      - list_result_skip
+    structured_output: true
+    transition: cleanup_files
+
+  - id: cleanup_files
+    name: cleanup_files
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file1_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file2
+
+  - id: cleanup_file2
+    name: cleanup_file2
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file2_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file3
+
+  - id: cleanup_file3
+    name: cleanup_file3
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file3_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    name: validate_result
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - list_result_all
+      - list_result_skip
+      - file1_name
+      - file2_name
+      - file3_name
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator for file filtering operations."
+      task:
+        type: fstring
+        value: |
+          Analyze the file listing results to verify skip pattern filtering works correctly.
+
+          Test files created:
+          - {file1_name} (markdown - should be kept)
+          - {file2_name} (.tmp file - should be skipped)
+          - {file3_name} (in temp/ folder - should be skipped)
+
+          List all files (no filter): {list_result_all}
+          List with skip=['*.tmp', '*/temp/*']: {list_result_skip}
+
+          Expected behavior:
+          1. "List all" should return 3 files
+          2. "List with skip" should return only 1 file (the .md file)
+          3. Both .tmp file and temp/ folder file should be excluded
+
+          Evaluate:
+          1. Does the unfiltered list contain all 3 files?
+          2. Does the filtered list contain exactly 1 file?
+          3. Is the .md file the only one remaining?
+          4. Are both .tmp and temp/* files correctly excluded?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of skip filtering result",
+            "all_files_count": <number>,
+            "filtered_files_count": <number>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

@@ -1,0 +1,370 @@
+name: "ART23 - List Files: Include Pattern Filtering"
+priority: High
+description: |
+  Verify that list_files correctly filters files using include patterns.
+
+  Objective: Test glob-style include pattern filtering (folder and extension patterns)
+
+  Expected Behavior:
+  - include=['*.md'] returns only .md files
+  - include=['folder/*'] returns files in that folder
+  - Multiple patterns use OR logic
+  - Empty include returns all files
+
+toolkits:
+  - id: ${ARTIFACT_TOOLKIT_ID}
+    name: ${ARTIFACT_TOOLKIT_NAME}
+
+state:
+  toolkit_id:
+    type: str
+    value: ${ARTIFACT_TOOLKIT_ID}
+  bucket_name:
+    type: str
+    value: ${TEST_BUCKET}
+  test_folder:
+    type: str
+    value: "filter-test-${TIMESTAMP}"
+  file1_name:
+    type: str
+    value: ""
+  file2_name:
+    type: str
+    value: ""
+  file3_name:
+    type: str
+    value: ""
+  create_result1:
+    type: str
+    value: ''
+  create_result2:
+    type: str
+    value: ''
+  create_result3:
+    type: str
+    value: ''
+  list_result_all:
+    type: str
+    value: ''
+  list_result_md:
+    type: str
+    value: ''
+  list_result_folder:
+    type: str
+    value: ''
+  delete_result:
+    type: str
+    value: ''
+  test_results:
+    type: str
+    value: ''
+
+entry_point: setup_file_names
+
+nodes:
+  - id: setup_file_names
+    name: setup_file_names
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - test_folder
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a helper that generates file paths."
+      task:
+        type: fstring
+        value: |
+          Generate three file paths for testing:
+          1. A markdown file in the test folder
+          2. A text file in the test folder
+          3. A markdown file in a subfolder
+
+          Test folder: {test_folder}
+
+          Return JSON:
+          {{
+            "file1": "{test_folder}/doc.md",
+            "file2": "{test_folder}/notes.txt",
+            "file3": "{test_folder}/sub/readme.md"
+          }}
+
+          Return ONLY the JSON.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - file_paths
+    structured_output_dict:
+      file_paths: "dict"
+    transition: extract_paths
+
+  - id: extract_paths
+    name: extract_paths
+    type: code
+    code:
+      type: fixed
+      value: |
+        file_paths = elitea_state.get("file_paths", {})
+        test_folder = elitea_state.get("test_folder", "")
+        file1_name = file_paths.get("file1", f"{test_folder}/doc.md")
+        file2_name = file_paths.get("file2", f"{test_folder}/notes.txt")
+        file3_name = file_paths.get("file3", f"{test_folder}/sub/readme.md")
+        result = {
+            "file1_name": file1_name,
+            "file2_name": file2_name,
+            "file3_name": file3_name
+        }
+        result
+    input:
+      - file_paths
+      - test_folder
+    output:
+      - file1_name
+      - file2_name
+      - file3_name
+    structured_output: true
+    transition: create_file1
+
+  - id: create_file1
+    name: create_file1
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file1_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "# Test Document\nMarkdown content"
+    output:
+      - create_result1
+    structured_output: true
+    transition: create_file2
+
+  - id: create_file2
+    name: create_file2
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file2_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "Plain text notes"
+    output:
+      - create_result2
+    structured_output: true
+    transition: create_file3
+
+  - id: create_file3
+    name: create_file3
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: create_file
+    input:
+      - filename
+      - bucket_name
+      - filedata
+    input_mapping:
+      filename:
+        type: variable
+        value: file3_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+      filedata:
+        type: fixed
+        value: "# Subfolder README\nNested markdown"
+    output:
+      - create_result3
+    structured_output: true
+    transition: list_all_files
+
+  - id: list_all_files
+    name: list_all_files
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: test_folder
+      recursive:
+        type: fixed
+        value: true
+    output:
+      - list_result_all
+    structured_output: true
+    transition: list_md_files
+
+  - id: list_md_files
+    name: list_md_files
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: list_files
+    input:
+      - bucket_name
+      - folder
+      - recursive
+      - include
+    input_mapping:
+      bucket_name:
+        type: variable
+        value: bucket_name
+      folder:
+        type: variable
+        value: test_folder
+      recursive:
+        type: fixed
+        value: true
+      include:
+        type: fixed
+        value: ["*.md"]
+    output:
+      - list_result_md
+    structured_output: true
+    transition: cleanup_files
+
+  - id: cleanup_files
+    name: cleanup_files
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file1_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file2
+
+  - id: cleanup_file2
+    name: cleanup_file2
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file2_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: cleanup_file3
+
+  - id: cleanup_file3
+    name: cleanup_file3
+    type: toolkit
+    toolkit_name: ${ARTIFACT_TOOLKIT_NAME}
+    tool: delete_file
+    input:
+      - filename
+      - bucket_name
+    input_mapping:
+      filename:
+        type: variable
+        value: file3_name
+      bucket_name:
+        type: variable
+        value: bucket_name
+    output:
+      - delete_result
+    structured_output: true
+    continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    name: validate_result
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - list_result_all
+      - list_result_md
+      - file1_name
+      - file2_name
+      - file3_name
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator for file filtering operations."
+      task:
+        type: fstring
+        value: |
+          Analyze the file listing results to verify include pattern filtering works correctly.
+
+          Test files created:
+          - {file1_name} (markdown)
+          - {file2_name} (text)
+          - {file3_name} (markdown in subfolder)
+
+          List all files (no filter): {list_result_all}
+          List with include=['*.md']: {list_result_md}
+
+          Expected behavior:
+          1. "List all" should return 3 files
+          2. "List *.md" should return only 2 files (the .md files)
+          3. The .txt file should NOT appear in the filtered result
+
+          Evaluate:
+          1. Does the unfiltered list contain all 3 files?
+          2. Does the filtered list contain exactly 2 .md files?
+          3. Is the .txt file correctly excluded from the filtered result?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of filtering result",
+            "all_files_count": <number>,
+            "filtered_files_count": <number>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END
