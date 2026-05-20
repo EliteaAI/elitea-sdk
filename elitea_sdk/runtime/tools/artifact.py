@@ -881,7 +881,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                         default=None,
                         ge=1)),
                     is_capture_image=(Optional[bool],
-                                      Field(description="Determines if pictures in the document should be recognized.",
+                                      Field(description="Set to true ONLY when the user explicitly asks to read, describe, or analyse images/pictures in the document. Leave false (default) for normal text reading — enabling it invokes a costly AI vision model call.",
                                             default=False)),
                     page_number=(Optional[int], Field(
                         description="Specifies which page to read. If it is None, then full document will be read.",
