@@ -42,10 +42,13 @@ class EliteADocxMammothLoader(BaseLoader):
             try:
                 doc = DocxDocument(BytesIO(file_content) if isinstance(file_content, (bytes, bytearray)) else file_content)
                 for rel in doc.part.rels.values():
-                    if hasattr(rel, 'target_part') and hasattr(rel.target_part, 'content_type'):
-                        if rel.target_part.content_type.startswith('image/'):
-                            image_count += 1
-                            image_names.append(rel.target_part.partname.filename)
+                    try:
+                        tp = rel.target_part
+                    except Exception:  # pylint: disable=broad-except
+                        continue  # skip External relationships (hyperlinks etc.)
+                    if hasattr(tp, 'content_type') and tp.content_type.startswith('image/'):
+                        image_count += 1
+                        image_names.append(tp.partname.filename)
             except Exception as exc:  # pylint: disable=broad-except
                 _logger.warning("Failed to inspect images in %s: %s", filename, exc)
 
@@ -115,10 +118,12 @@ class EliteADocxMammothLoader(BaseLoader):
         self._rid_to_filename = {}
         self._filename_to_rel = {}
         for rel in doc.part.rels.values():
-            if (hasattr(rel, 'target_part')
-                    and hasattr(rel.target_part, 'content_type')
-                    and rel.target_part.content_type.startswith('image/')):
-                fname = rel.target_part.partname.filename
+            try:
+                tp = rel.target_part
+            except Exception:  # pylint: disable=broad-except
+                continue  # skip External relationships (hyperlinks etc.)
+            if hasattr(tp, 'content_type') and tp.content_type.startswith('image/'):
+                fname = tp.partname.filename
                 self._rid_to_filename[rel.rId] = fname
                 self._filename_to_rel[fname] = rel
 
@@ -557,10 +562,12 @@ class EliteADocxMammothLoader(BaseLoader):
         # Build filename → relationship mapping
         file_rels = {}
         for rel in doc.part.rels.values():
-            if (hasattr(rel, 'target_part')
-                    and hasattr(rel.target_part, 'content_type')
-                    and rel.target_part.content_type.startswith('image/')):
-                file_rels[rel.target_part.partname.filename] = rel
+            try:
+                tp = rel.target_part
+            except Exception:  # pylint: disable=broad-except
+                continue  # skip External relationships (hyperlinks etc.)
+            if hasattr(tp, 'content_type') and tp.content_type.startswith('image/'):
+                file_rels[tp.partname.filename] = rel
 
         results = {}
         for name in self.extracted_images_names:
