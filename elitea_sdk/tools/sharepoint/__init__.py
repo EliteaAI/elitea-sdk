@@ -101,6 +101,13 @@ class SharepointToolkit(BaseToolkit):
                     token = kwargs['tokens'].get(site_url_key)
             if token is not None:
                 wrapper_payload['token'] = token.get('access_token') if isinstance(token, dict) else token
+                # Phase 2: pass refresh_token and oauth_token_endpoint for reactive 401 retry
+                if isinstance(token, dict):
+                    if token.get('refresh_token'):
+                        wrapper_payload['refresh_token'] = token['refresh_token']
+                    oauth_discovery = sp_config.get('oauth_discovery_endpoint', '').rstrip('/')
+                    if oauth_discovery:
+                        wrapper_payload['oauth_token_endpoint'] = f"{oauth_discovery}/v2.0/oauth2/token"
                 # Delegated tokens from mcp_tokens are always Azure AD Graph tokens.
                 # Ensure 'scopes' is non-empty so validate_toolkit selects
                 # SharepointGraphWrapper (token + scopes path) rather than
@@ -123,6 +130,7 @@ class SharepointToolkit(BaseToolkit):
                 oauth_discovery_endpoint=sp_config['oauth_discovery_endpoint'],
                 scopes=sp_config.get('scopes'),
                 configuration_uuid=sp_config.get('configuration_uuid'),
+                auto_refresh_token=sp_config.get('auto_refresh_token', False),
             )
             # Embed provided_settings so the login modal knows credentials are already
             # configured and does not ask the user to re-enter client_id / client_secret.

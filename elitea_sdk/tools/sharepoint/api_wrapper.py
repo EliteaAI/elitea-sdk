@@ -362,6 +362,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         description="OAuth scopes for delegated Graph API access. "
                     "When provided together with *token*, activates the "
                     "Graph API backend (SharepointGraphWrapper).")
+    refresh_token: Optional[SecretStr] = None
+    oauth_token_endpoint: Optional[str] = None
     elitea: Any = None
     _backend: BaseSharepointWrapper = PrivateAttr()
 
@@ -379,6 +381,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        if hasattr(raw_token, 'get_secret_value') else raw_token)
         secret_plain = (raw_secret.get_secret_value()
                         if hasattr(raw_secret, 'get_secret_value') else raw_secret)
+        raw_refresh = values.get('refresh_token')
+        refresh_plain = (raw_refresh.get_secret_value()
+                         if hasattr(raw_refresh, 'get_secret_value') else raw_refresh)
 
         if token_plain and scopes:
             # ── Delegated Graph API path ──────────────────────────────
@@ -388,6 +393,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 site_url=site_url,
                 token=token_plain,
                 scopes=scopes,
+                refresh_token=refresh_plain,
+                client_id=client_id,
+                client_secret=secret_plain,
+                oauth_token_endpoint=values.get('oauth_token_endpoint'),
             )
         elif client_id and secret_plain:
             # ── App-credential REST path ──────────────────────────────
