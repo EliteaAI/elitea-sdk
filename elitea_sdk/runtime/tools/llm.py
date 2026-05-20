@@ -720,45 +720,96 @@ class LLMNode(BaseTool):
 
     @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
-        """Remove AI tool calls that no longer have matching tool results in history."""
+        """Remove AI tool calls that lack matching tool results immediately after.
+
+        Anthropic requires each tool_use block to have a corresponding tool_result
+        in the immediately following message(s), before the next assistant message.
+        This method filters both the `tool_calls` field and `tool_use` blocks in
+        `content` (Anthropic's native format).
+        """
         if not messages:
             return messages
 
-        tool_result_ids = {
-            message.tool_call_id
-            for message in messages
-            if isinstance(message, ToolMessage) and getattr(message, 'tool_call_id', None)
-        }
-        if not tool_result_ids:
+        # Single pass: identify AIMessage indices and collect following ToolMessage ids
+        # For each AIMessage with tool_calls, gather tool_call_ids from ToolMessages
+        # that appear between it and the next AIMessage (or end of list).
+        following_tool_ids: dict[int, set[str]] = {}
+        current_ai_idx: int | None = None
+
+        for i, msg in enumerate(messages):
+            if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
+                current_ai_idx = i
+                following_tool_ids[i] = set()
+            elif isinstance(msg, ToolMessage) and current_ai_idx is not None:
+                tc_id = getattr(msg, 'tool_call_id', None)
+                if tc_id:
+                    following_tool_ids[current_ai_idx].add(tc_id)
+
+        # Early exit if no AIMessages with tool_calls
+        if not following_tool_ids:
             return messages
 
         cleaned_messages: List = []
-        for message in messages:
-            if isinstance(message, AIMessage) and getattr(message, 'tool_calls', None):
-                valid_tool_calls = [
-                    tool_call
-                    for tool_call in message.tool_calls
-                    if tool_call.get('id', '') in tool_result_ids
-                ]
-                if not valid_tool_calls:
-                    if message.content:
-                        try:
-                            cleaned_messages.append(message.model_copy(update={"tool_calls": []}))
-                        except Exception:
-                            cleaned_messages.append(AIMessage(content=message.content))
-                    continue
-                if len(valid_tool_calls) != len(message.tool_calls):
-                    try:
-                        cleaned_messages.append(
-                            message.model_copy(update={"tool_calls": valid_tool_calls})
-                        )
-                    except Exception:
-                        cleaned_messages.append(
-                            AIMessage(content=message.content, tool_calls=valid_tool_calls)
-                        )
-                    continue
-            cleaned_messages.append(message)
+        filtered_count = 0
 
+        for i, message in enumerate(messages):
+            if i not in following_tool_ids:
+                cleaned_messages.append(message)
+                continue
+
+            # This is an AIMessage with tool_calls - check for orphans
+            valid_result_ids = following_tool_ids[i]
+            tool_calls = message.tool_calls
+
+            # Build valid tool_calls list and collect orphaned ids in one pass
+            valid_tool_calls = []
+            orphaned_ids: set[str] = set()
+            for tc in tool_calls:
+                tc_id = tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')
+                if tc_id in valid_result_ids:
+                    valid_tool_calls.append(tc)
+                else:
+                    orphaned_ids.add(tc_id)
+
+            # No orphans - keep message as-is
+            if not orphaned_ids:
+                cleaned_messages.append(message)
+                continue
+
+            filtered_count += len(orphaned_ids)
+
+            # Filter tool_use blocks from content if it's a list (Anthropic format)
+            content = message.content
+            if isinstance(content, list):
+                # When no valid tool_calls remain, remove ALL tool_use blocks
+                # Otherwise, remove only orphaned tool_use blocks
+                if valid_tool_calls:
+                    content = [
+                        block for block in content
+                        if not (isinstance(block, dict) and
+                               block.get('type') == 'tool_use' and
+                               block.get('id') in orphaned_ids)
+                    ]
+                else:
+                    content = [
+                        block for block in content
+                        if not (isinstance(block, dict) and block.get('type') == 'tool_use')
+                    ]
+
+            # Skip message entirely if no content and no valid tool_calls
+            if not valid_tool_calls and not content:
+                continue
+
+            # Create filtered message
+            try:
+                cleaned_messages.append(
+                    message.model_copy(update={"tool_calls": valid_tool_calls, "content": content})
+                )
+            except Exception:
+                cleaned_messages.append(AIMessage(content=content, tool_calls=valid_tool_calls))
+
+        if filtered_count > 0:
+            logger.info("Filtered %d orphaned tool_calls from message history", filtered_count)
         return cleaned_messages
 
     @staticmethod
@@ -2526,7 +2577,7 @@ class LLMNode(BaseTool):
                         new_messages[last_tool_msg_idx] = truncated_msg
                         
                         logger.info(f"Truncated large tool result from '{last_tool_name}' and retrying LLM call")
-                        
+
                         # CRITICAL FIX: Call LLM again with truncated message to get fresh completion
                         # This prevents duplicate tool_call_ids that occur when we continue with
                         # the same current_completion that still has the original tool_calls
