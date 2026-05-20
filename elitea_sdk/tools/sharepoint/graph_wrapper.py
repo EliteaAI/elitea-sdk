@@ -122,7 +122,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             except Exception:
                 err_code = str(resp.status_code)
                 err_desc_safe = ""
-            logging.warning("SharePoint: token refresh failed: %s — %s: %s", resp.status_code, err_code, err_desc_safe)
+            logging.warning("SharePoint: token refresh failed with HTTP status %s", resp.status_code)
             return False
         except Exception as e:
             logging.warning("SharePoint: token refresh error: %s", e)
