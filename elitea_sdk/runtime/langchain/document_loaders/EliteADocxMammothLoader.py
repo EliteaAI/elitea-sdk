@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 import uuid
 from io import BytesIO
@@ -27,14 +29,15 @@ class EliteADocxMammothLoader(BaseLoader):
     def get_file_metadata(cls, *, filename: str,
                           file_content=None,
                           file_size=None) -> dict:
-        """Return per-type metadata for DOCX files (EL-4629).
+        """Return per-type metadata for DOCX files.
 
-        Reports embedded image count and advertises the extra_params
+        Reports embedded image count/names and advertises the extra_params
         that ``read_file`` accepts for DOCX.
         """
         import logging
         _logger = logging.getLogger(__name__)
         image_count = 0
+        image_names = []
         if file_content:
             try:
                 doc = DocxDocument(BytesIO(file_content) if isinstance(file_content, (bytes, bytearray)) else file_content)
@@ -42,29 +45,45 @@ class EliteADocxMammothLoader(BaseLoader):
                     if hasattr(rel, 'target_part') and hasattr(rel.target_part, 'content_type'):
                         if rel.target_part.content_type.startswith('image/'):
                             image_count += 1
+                            image_names.append(rel.target_part.partname.filename)
             except Exception as exc:  # pylint: disable=broad-except
-                _logger.warning("Failed to count images in %s: %s", filename, exc)
+                _logger.warning("Failed to inspect images in %s: %s", filename, exc)
 
         instruction = {
+            "first_class_params": {
+                "is_capture_image": (
+                    "set to true to transcribe ALL embedded images "
+                    "via the AI vision model"
+                ),
+            },
             "extra_params": {
-                "extract_images": (
-                    "boolean (default false) — when true, embedded images are "
-                    "transcribed by the AI vision model and appended to the "
-                    "text content."
+                "extracted_images_names": (
+                    "list of image filenames to selectively transcribe "
+                    '(e.g. ["image1.png", "image2.png"])'
+                ),
+                "read_images_only": (
+                    "boolean — when true together with "
+                    "extracted_images_names, returns only image "
+                    "transcripts without the document text"
                 ),
                 "prompt": (
-                    "string (optional) — custom prompt for the vision model. "
-                    "If omitted, the default image-processing prompt is used."
+                    "string (optional) — custom prompt for the vision "
+                    "model. If omitted, the default image-processing "
+                    "prompt is used."
                 ),
             },
             "notes": (
-                "Enabling extract_images adds latency proportional to the "
-                "number of embedded images. Call get_file_metadata first to "
-                "check image_count before deciding. "
-                "Pass extra_params as a JSON string."
+                "Image transcription adds latency proportional to the "
+                "number of images. Use extracted_images_names + "
+                "read_images_only to transcribe only the images you "
+                "need. Pass extra_params as a JSON string."
             ),
         }
-        return {"image_count": image_count, "instruction_for_readFile": instruction}
+        return {
+            "image_count": image_count,
+            "image_names": image_names,
+            "instruction_for_readFile": instruction,
+        }
 
     def __init__(self, **kwargs):
         """Initializes EliteADocxMammothLoader."""
@@ -75,43 +94,112 @@ class EliteADocxMammothLoader(BaseLoader):
         self.llm = kwargs.get("llm")
         self.prompt = kwargs.get("prompt")
         self.max_tokens = kwargs.get('max_tokens', 512)
+        self.extracted_images_names = kwargs.get('extracted_images_names')
+        self.read_images_only = kwargs.get('read_images_only', False)
+        # Dedup cache: MD5(image_bytes) → transcript string
+        self._image_cache = {}
+        # Ordered list of image filenames as they appear in the document
+        self._image_ref_order = []
+        # Counter to track current position during mammoth callbacks
+        self._image_ref_index = 0
+
+    def _scan_image_references(self, doc):
+        """Pre-scan document XML for image references in document order.
+
+        Builds an ordered list of image filenames (from ``word/media/``)
+        matching the order mammoth will invoke its ``convert_image`` callback.
+        Also builds a mapping from relationship-ID to filename for direct
+        image extraction.
+        """
+        # Build rId → filename mapping from relationships
+        self._rid_to_filename = {}
+        self._filename_to_rel = {}
+        for rel in doc.part.rels.values():
+            if (hasattr(rel, 'target_part')
+                    and hasattr(rel.target_part, 'content_type')
+                    and rel.target_part.content_type.startswith('image/')):
+                fname = rel.target_part.partname.filename
+                self._rid_to_filename[rel.rId] = fname
+                self._filename_to_rel[fname] = rel
+
+        # Walk body XML in document order to find <a:blip r:embed="rIdN">
+        ns = {
+            'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+            'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        }
+        self._image_ref_order = []
+        for blip in doc.element.body.iter(qn('a:blip')):
+            rid = blip.get(qn('r:embed'))
+            if rid and rid in self._rid_to_filename:
+                self._image_ref_order.append(self._rid_to_filename[rid])
+
+        self._image_ref_index = 0
+
+    def _get_current_image_name(self):
+        """Return the filename for the current image callback invocation."""
+        if self._image_ref_index < len(self._image_ref_order):
+            name = self._image_ref_order[self._image_ref_index]
+        else:
+            name = f"image_{self._image_ref_index + 1}"
+        self._image_ref_index += 1
+        return name
 
     def __handle_image(self, image) -> dict:
-        """
-        Handles image processing within the Docx file.
+        """Handles image processing with dedup cache.
 
-        Uses LLM for image captioning if available, otherwise falls back to Tesseract OCR,
-        and defaults to base64 encoding if both fail.
-
-        Args:
-            image (mammoth.images.Image): Image object from Mammoth.
-
-        Returns:
-            dict: Dictionary containing the 'src' attribute for the HTML <img> tag.
+        On first encounter of unique image bytes: process via LLM/Tesseract,
+        cache result, return transcript with filename.  On duplicate bytes:
+        return back-reference placeholder.
         """
         from elitea_sdk.tools.utils.content_parser import image_processing_prompt
-        output = {}
+
+        image_name = self._get_current_image_name()
         try:
+            with image.open() as image_file:
+                image_bytes = image_file.read()
+
+            img_hash = hashlib.md5(image_bytes).hexdigest()
+
+            # Check dedup cache
+            if img_hash in self._image_cache:
+                return {"src": f"Image: {image_name} [already transcribed, see above]"}
+
+            # Process image
+            transcript = None
             if self.llm:
-                # Use LLM for image understanding
-                with image.open() as image_file:
-                    image_bytes = image_file.read()
-                    result = perform_llm_prediction_for_image_bytes(image_bytes, self.llm,
-                                                                    self.prompt if self.prompt else image_processing_prompt)
-                output['src'] = result  # LLM image transcript in src
-                return output
-            else:
-                # Use Tesseract OCR if LLM is not available
-                with image.open() as image_file:
-                    img = Image.open(image_file)
-                    output['src'] = pytesseract.image_to_string(image=img)  # Tesseract transcript in src
-                return output
-        except Exception as e:
-            # Fallback to default image handling for any exceptions during image processing
-            # This ensures robustness against various image format issues, OCR failures,
-            # or LLM invocation problems. It prevents the loader from crashing due to
-            # a single image processing failure and provides a default image representation.
-            return self.__default_image_handler(image)
+                try:
+                    transcript = perform_llm_prediction_for_image_bytes(
+                        image_bytes, self.llm,
+                        self.prompt if self.prompt else image_processing_prompt)
+                except Exception:
+                    transcript = None
+
+            if transcript is None:
+                try:
+                    img = Image.open(BytesIO(image_bytes))
+                    transcript = pytesseract.image_to_string(image=img)
+                except Exception:
+                    transcript = "Transcript is not available"
+
+            self._image_cache[img_hash] = transcript
+            return {"src": f"Image: {image_name}, {transcript}"}
+
+        except Exception:
+            return {"src": f"Image: {image_name}, Transcript is not available"}
+
+    def __placeholder_image_handler(self, image) -> dict:
+        """Placeholder handler for non-image reads.
+
+        Returns a marker with the image filename so the LLM knows an image
+        exists and can request selective expansion later.
+        """
+        image_name = self._get_current_image_name()
+        return {
+            "src": (
+                f"Image: {image_name}, you can selectively read it, "
+                "call get_file_metadata to figure out how"
+            )
+        }
 
     def __default_image_handler(self, image) -> dict:
         """Default image handler: returns a placeholder string."""
@@ -431,49 +519,96 @@ class EliteADocxMammothLoader(BaseLoader):
         return list(markdown_by_headers_chunker(iter([Document(page_content=result_content, metadata={'source': str(self.path)})]), config={'max_tokens':self.max_tokens}))
 
     def get_content(self):
-        """
-        Extracts and converts the content of the Docx file to markdown format.
+        """Extracts and converts the content of the Docx file.
 
-        Handles both file paths and in-memory file content.
-
-        Returns:
-            str: The markdown content extracted from the Docx file.
+        When ``read_images_only`` is True and ``extracted_images_names`` is
+        provided, bypasses mammoth entirely and returns a JSON dict of
+        ``{filename: transcript}`` for the requested images only.
         """
+        if self.read_images_only and self.extracted_images_names:
+            return self._read_images_only()
+
         if self.path:
-            # If path is provided, read from file system
             with open(self.path, 'rb') as docx_file:
                 return self._convert_docx_to_markdown(docx_file)
         elif self.file_content and self.file_name:
-            # If file_content and file_name are provided, read from memory
             docx_file = BytesIO(self.file_content)
             return self._convert_docx_to_markdown(docx_file)
         else:
             raise ValueError("Either 'path' or 'file_content' and 'file_name' must be provided.")
 
+    def _read_images_only(self):
+        """Extract and transcribe only the requested images, bypassing mammoth.
+
+        Uses python-docx relationships to find images by filename and
+        ``rel.target_part.blob`` for raw bytes.  Returns a JSON string of
+        ``{filename: transcript_or_error}``.
+        """
+        from elitea_sdk.tools.utils.content_parser import image_processing_prompt
+
+        if self.path:
+            doc = DocxDocument(self.path)
+        elif self.file_content:
+            doc = DocxDocument(BytesIO(self.file_content) if isinstance(
+                self.file_content, (bytes, bytearray)) else self.file_content)
+        else:
+            raise ValueError("Either 'path' or 'file_content' must be provided.")
+
+        # Build filename → relationship mapping
+        file_rels = {}
+        for rel in doc.part.rels.values():
+            if (hasattr(rel, 'target_part')
+                    and hasattr(rel.target_part, 'content_type')
+                    and rel.target_part.content_type.startswith('image/')):
+                file_rels[rel.target_part.partname.filename] = rel
+
+        results = {}
+        for name in self.extracted_images_names:
+            if name not in file_rels:
+                results[name] = "Error: image not found in document"
+                continue
+            try:
+                image_bytes = file_rels[name].target_part.blob
+                if self.llm:
+                    transcript = perform_llm_prediction_for_image_bytes(
+                        image_bytes, self.llm,
+                        self.prompt if self.prompt else image_processing_prompt)
+                else:
+                    img = Image.open(BytesIO(image_bytes))
+                    transcript = pytesseract.image_to_string(image=img)
+                results[name] = transcript
+            except Exception as exc:
+                results[name] = f"Error: {exc}"
+
+        return json.dumps(results)
+
     def _convert_docx_to_markdown(self, docx_file):
-        """
-        Converts the content of a Docx file to markdown format.
-        Detects bordered content and treats it as code blocks.
+        """Converts DOCX content to markdown with image handling.
 
-        Args:
-            docx_file (BinaryIO): The Docx file object.
-
-        Returns:
-            str: The markdown content extracted from the Docx file.
+        Detects bordered content and treats it as code blocks.  Pre-scans
+        image references so that callbacks can include the original filename.
         """
-        # Step 1: Detect and mark bordered content
-        # Reset stream position if needed
         if hasattr(docx_file, 'seek'):
             docx_file.seek(0)
-        
+
+        # Step 0: Pre-scan image references for filename resolution
+        pre_doc = DocxDocument(docx_file)
+        self._scan_image_references(pre_doc)
+        if hasattr(docx_file, 'seek'):
+            docx_file.seek(0)
+
+        # Step 1: Detect and mark bordered content
         marked_docx, start_marker, end_marker = self.__detect_and_mark_bordered_content(docx_file)
         
         # Step 2: Convert marked DOCX to HTML using Mammoth
+        # Reset callback counter — bordered-content detection re-saves the
+        # document which may change internal order, but the blip sequence is
+        # preserved so the counter just needs to restart from 0.
+        self._image_ref_index = 0
         if self.extract_images:
             result = convert_to_html(marked_docx, convert_image=mammoth.images.img_element(self.__handle_image))
         else:
-            # Ignore images
-            result = convert_to_html(marked_docx, convert_image=lambda image: "")
+            result = convert_to_html(marked_docx, convert_image=mammoth.images.img_element(self.__placeholder_image_handler))
         
         # Step 3: Wrap marked sections in <pre><code> tags
         html_with_code_blocks = self.__wrap_marked_sections_in_code_blocks(

@@ -46,8 +46,10 @@ def test_docx_metadata_returns_image_count_and_instruction():
     assert meta["extension"] == ".docx"
     assert meta["filesize"] == len(data)
     assert meta["image_count"] >= 1
+    assert len(meta["image_names"]) >= 1
     instr = meta["instruction_for_readFile"]
-    assert "extract_images" in instr["extra_params"]
+    assert "is_capture_image" in instr["first_class_params"]
+    assert "extracted_images_names" in instr["extra_params"]
     assert "prompt" in instr["extra_params"]
     assert "JSON string" in instr["notes"]
 
@@ -58,12 +60,14 @@ def test_docx_metadata_no_images():
     meta = get_file_metadata("plain.docx", file_content=data, file_size=len(data))
 
     assert meta["image_count"] == 0
-    assert "extract_images" in meta["instruction_for_readFile"]["extra_params"]
+    assert meta["image_names"] == []
+    assert "extracted_images_names" in meta["instruction_for_readFile"]["extra_params"]
 
 
 def test_docx_metadata_no_content():
     meta = get_file_metadata("doc.docx", file_content=None, file_size=4096)
 
     assert meta["image_count"] == 0
+    assert meta["image_names"] == []
     assert meta["filesize"] == 4096
-    assert "extract_images" in meta["instruction_for_readFile"]["extra_params"]
+    assert "extracted_images_names" in meta["instruction_for_readFile"]["extra_params"]
