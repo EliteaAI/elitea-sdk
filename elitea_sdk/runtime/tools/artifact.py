@@ -63,8 +63,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         bucket_name: str = None,
         offset: Optional[int] = None,
         limit: Optional[int] = None,
-        skip_size_check: bool = True,
-        extra_params: str = None
+        skip_size_check: bool = True
     ) -> dict:
         """
         Read multiple files in batch from an artifact bucket.
@@ -75,7 +74,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             offset: Starting line number for all files (1-indexed)
             limit: Number of lines to read from offset for all files
             skip_size_check: If True, skip content size limit check and return full content
-            extra_params: JSON-encoded string of per-file-type options (same as read_file)
 
         Returns:
             Dict mapping file paths to their content
@@ -91,13 +89,11 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 if path.startswith('/'):
                     content = self.read_file(filepath=path, bucket_name=bucket_name,
                                             start_line=start_line, end_line=end_line,
-                                            skip_size_check=skip_size_check,
-                                            extra_params=extra_params)
+                                            skip_size_check=skip_size_check)
                 else:
                     content = self.read_file(filename=path, bucket_name=bucket_name,
                                             start_line=start_line, end_line=end_line,
-                                            skip_size_check=skip_size_check,
-                                            extra_params=extra_params)
+                                            skip_size_check=skip_size_check)
                 results[path] = content
             except Exception as e:
                 results[path] = f"Error reading file: {str(e)}"
@@ -231,14 +227,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             skip_size_check=(bool, Field(
                 description="If True, skip content size limit check and return full file content.",
                 default=True
-            )),
-            extra_params=(Optional[str], Field(
-                description=(
-                    "JSON-encoded string of per-file-type options. "
-                    "Call get_file_metadata first to discover which "
-                    "keys are accepted for this file type. "
-                    "Pass as a JSON STRING, not as an object."),
-                default=None,
             )),
         )
 
@@ -531,6 +519,15 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             offset = start_line if start_line is not None else 1
             limit = (end_line - offset + 1) if end_line is not None else None
             content = apply_line_slice(content, offset=offset, limit=limit)
+        elif not isinstance(content, str) and (start_line is not None or end_line is not None):
+            # Non-text result (e.g. dict from Excel row-range mode). Line-based
+            # slicing cannot apply; inform the caller rather than silently dropping.
+            if isinstance(content, dict):
+                content["_note"] = (
+                    "start_line/end_line parameters were ignored because the "
+                    "file was read using per-type extra_params. Use start_row/"
+                    "end_row inside extra_params for row-based slicing."
+                )
 
         # Check content size limit (after slicing if applicable)
         if not skip_size_check and isinstance(content, str) and len(content) > self.max_single_read_size:

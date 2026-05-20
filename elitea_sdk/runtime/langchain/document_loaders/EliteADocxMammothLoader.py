@@ -75,9 +75,6 @@ class EliteADocxMammothLoader(BaseLoader):
         self.llm = kwargs.get("llm")
         self.prompt = kwargs.get("prompt")
         self.max_tokens = kwargs.get('max_tokens', 512)
-        # When True, use LLM-only image handler (no Tesseract fallback).
-        # Intended for the read_file extra_params path (EL-4629).
-        self._llm_only_images = kwargs.get('_llm_only_images', False)
 
     def __handle_image(self, image) -> dict:
         """
@@ -115,25 +112,6 @@ class EliteADocxMammothLoader(BaseLoader):
             # or LLM invocation problems. It prevents the loader from crashing due to
             # a single image processing failure and provides a default image representation.
             return self.__default_image_handler(image)
-
-    def __handle_image_llm_only(self, image) -> dict:
-        """LLM-only image handler for the read_file extra_params path (EL-4629).
-
-        Uses LLM vision when available; returns a placeholder otherwise.
-        Does NOT fall back to Tesseract OCR.
-        """
-        from elitea_sdk.tools.utils.content_parser import image_processing_prompt
-        if self.llm:
-            try:
-                with image.open() as image_file:
-                    image_bytes = image_file.read()
-                    result = perform_llm_prediction_for_image_bytes(
-                        image_bytes, self.llm,
-                        self.prompt if self.prompt else image_processing_prompt)
-                return {'src': result}
-            except Exception:
-                pass
-        return self.__default_image_handler(image)
 
     def __default_image_handler(self, image) -> dict:
         """Default image handler: returns a placeholder string."""
@@ -492,10 +470,7 @@ class EliteADocxMammothLoader(BaseLoader):
         
         # Step 2: Convert marked DOCX to HTML using Mammoth
         if self.extract_images:
-            # Pick LLM-only handler for the read_file extra_params path (EL-4629),
-            # otherwise use the default handler with Tesseract fallback.
-            handler = self.__handle_image_llm_only if self._llm_only_images else self.__handle_image
-            result = convert_to_html(marked_docx, convert_image=mammoth.images.img_element(handler))
+            result = convert_to_html(marked_docx, convert_image=mammoth.images.img_element(self.__handle_image))
         else:
             # Ignore images
             result = convert_to_html(marked_docx, convert_image=lambda image: "")
