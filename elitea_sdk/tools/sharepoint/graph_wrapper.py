@@ -112,7 +112,17 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     self._refresh_token = token_data['refresh_token']
                 logging.info("SharePoint: access token refreshed successfully via refresh_token")
                 return True
-            logging.warning("SharePoint: token refresh failed: %s %s", resp.status_code, resp.text)
+            try:
+                err = resp.json()
+                err_code = err.get("error", "unknown")
+                err_desc = err.get("error_description", "")
+                # Truncate description to avoid logging full Azure AD trace metadata
+                # which may contain user identifiers (UPN, object ID, tenant ID).
+                err_desc_safe = err_desc[:200] if err_desc else ""
+            except Exception:
+                err_code = str(resp.status_code)
+                err_desc_safe = ""
+            logging.warning("SharePoint: token refresh failed: %s — %s: %s", resp.status_code, err_code, err_desc_safe)
             return False
         except Exception as e:
             logging.warning("SharePoint: token refresh error: %s", e)
