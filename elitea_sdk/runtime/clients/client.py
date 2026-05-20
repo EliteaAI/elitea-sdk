@@ -14,6 +14,7 @@ from langchain_core.tools import ToolException
 from langgraph.store.base import BaseStore
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_anthropic import ChatAnthropic
+from pydantic import ValidationError
 
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
@@ -21,6 +22,7 @@ from ..middleware import TransformErrorStrategy, LoggingStrategy, SensitiveToolG
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools
+from ...tools.exceptions import ToolkitConfigurationError
 from ..middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from ...configurations import get_class_configurations
 
@@ -1324,6 +1326,29 @@ class EliteAClient:
             lazy_tools_mode=lazy_tools_mode
         ).runnable()
 
+    def _validate_toolkit_config(self, toolkit_config: dict) -> dict:
+        toolkit_config_type = toolkit_config.get('type')
+        try:
+            available_toolkit_models = get_available_toolkit_models().get(toolkit_config_type)
+            toolkit_config_parsed_json = deepcopy(toolkit_config)
+            if available_toolkit_models:
+                toolkit_class = available_toolkit_models['toolkit_class']
+                toolkit_config_model_class = toolkit_class.toolkit_config_schema()
+                toolkit_config_validated_settings = toolkit_config_model_class(
+                    **toolkit_config.get('settings', {})
+                ).model_dump(mode='json')
+                toolkit_config_parsed_json['settings'] = toolkit_config_validated_settings
+            else:
+                logger.warning(f"Toolkit type '{toolkit_config_type}' is skipping model validation")
+                toolkit_config_parsed_json['settings'] = toolkit_config.get('settings', {})
+            return toolkit_config_parsed_json
+        except ValidationError as e:
+            missing = [err['loc'][-1] for err in e.errors() if err['type'] == 'missing']
+            msg = f"Missing required fields: {', '.join(missing)}" if missing else f"Toolkit '{toolkit_config_type}' configuration error"
+            raise ToolkitConfigurationError(msg, e) from e
+        except Exception as e:
+            raise ToolkitConfigurationError(f"Toolkit '{toolkit_config_type}' configuration error", e) from e
+
     def test_toolkit_tool(self, toolkit_config: dict, tool_name: str, tool_params: dict = None,
                           runtime_config: dict = None, llm_model: str = None,
                           llm_config: dict = None, mcp_tokens: dict = None) -> dict:
@@ -1394,42 +1419,16 @@ class EliteAClient:
                 'max_tokens': 1024,
                 'temperature': 0.1,
             }
-        import logging
-        logger = logging.getLogger(__name__)
-        toolkit_config_parsed_json = None
         events_dispatched = []
 
         try:
-            toolkit_config_type = toolkit_config.get('type')
-            available_toolkit_models = get_available_toolkit_models().get(toolkit_config_type)
-            toolkit_config_parsed_json = deepcopy(toolkit_config)
-            if available_toolkit_models:
-                toolkit_class = available_toolkit_models['toolkit_class']
-                toolkit_config_model_class = toolkit_class.toolkit_config_schema()
-                toolkit_config_validated_settings = toolkit_config_model_class(
-                    **toolkit_config.get('settings', {})
-                ).model_dump(mode='json')
-                toolkit_config_parsed_json['settings'] = toolkit_config_validated_settings
-            else:
-                logger.warning(f"Toolkit type '{toolkit_config_type}' is skipping model validation")
-                # Keep original settings for runtime toolkits not in AVAILABLE_TOOLS
-                toolkit_config_parsed_json['settings'] = toolkit_config.get('settings', {})
-        except Exception as toolkit_config_error:
-            full_error_str = str(toolkit_config_error)
-            logger.error(f"Failed to validate toolkit configuration: {full_error_str}")
-
-            # Extract human-friendly message (pattern from carrier/tickets_tool.py)
-            # TODO: Create util function if usage of this pattern grows
-            human_error = f"Toolkit '{toolkit_config_type}' configuration error"
-            if hasattr(toolkit_config_error, 'errors'):
-                missing = [err['loc'][-1] for err in toolkit_config_error.errors() if err['type'] == 'missing']
-                if missing:
-                    human_error = f"Missing required fields: {', '.join(missing)}"
-
+            toolkit_config_parsed_json = self._validate_toolkit_config(toolkit_config)
+        except ToolkitConfigurationError as e:
+            logger.error(f"Failed to validate toolkit configuration: {e}")
             return {
                 "success": False,
-                "error": human_error,
-                "debug_error": f"Failed to validate toolkit configuration: {full_error_str}",
+                "error": e.user_message,
+                "debug_error": f"Failed to validate toolkit configuration: {e}",
                 "tool_name": tool_name,
                 "toolkit_config": None,
                 "llm_model": llm_model,
