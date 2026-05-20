@@ -23,7 +23,7 @@ class SharepointConfiguration(BaseModel):
                             },
                             {
                                 "name": "Delegated",
-                                "fields": ["oauth_discovery_endpoint", "scopes"]
+                                "fields": ["oauth_discovery_endpoint", "scopes", "auto_refresh_token"]
                             }
                         ]
                     }
@@ -43,6 +43,12 @@ class SharepointConfiguration(BaseModel):
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
     scopes: Optional[List[str]] = Field(default=None, description="OAuth Scopes")
+    auto_refresh_token: Optional[bool] = Field(
+        default=False,
+        description="Automatically refresh the access token using the offline_access scope. "
+                    "When enabled, the OAuth authorization request will include offline_access, "
+                    "allowing the system to silently renew the access token without user interaction."
+    )
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
@@ -140,6 +146,7 @@ class SharepointConfiguration(BaseModel):
         scopes: Optional[List[str]],
         status: Optional[int] = None,
         configuration_uuid: Optional[str] = None,
+        auto_refresh_token: bool = False,
     ) -> "McpAuthorizationRequired":
         """Build a ``McpAuthorizationRequired`` exception with the same rich metadata
         shape that the MCP OAuth flow produces, so upstream handlers can treat
@@ -155,6 +162,13 @@ class SharepointConfiguration(BaseModel):
             McpAuthorizationRequired,
             fetch_oauth_authorization_server_metadata,
         )
+
+        # Always inject offline_access in delegated OAuth mode so Azure AD returns
+        # a refresh_token in the token exchange response. The auto_refresh_token
+        # flag previously gated this, but the feature spec requires it by default.
+        effective_scopes = list(scopes or [])
+        if "offline_access" not in effective_scopes:
+            effective_scopes.insert(0, "offline_access")
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         # Azure AD v2.0 well-known URL — injected as an extra candidate so the
@@ -182,8 +196,8 @@ class SharepointConfiguration(BaseModel):
         jwks_uri = (openid_meta or {}).get("jwks_uri")
         issuer = (openid_meta or {}).get("issuer", base_discovery)
         scopes_supported = list((openid_meta or {}).get("scopes_supported") or [])
-        if scopes:
-            for s in scopes:
+        if effective_scopes:
+            for s in effective_scopes:
                 if s not in scopes_supported:
                     scopes_supported.append(s)
 
@@ -216,8 +230,8 @@ class SharepointConfiguration(BaseModel):
             "bearer_methods_supported": ["header"],
             "oauth_authorization_server": oauth_authorization_server,
         }
-        if scopes:
-            resource_metadata["scopes_supported"] = scopes
+        if effective_scopes:
+            resource_metadata["scopes_supported"] = effective_scopes
         if configuration_uuid:
             resource_metadata["configuration_uuid"] = configuration_uuid
         log.debug(f"SharePoint resource_metadata: {resource_metadata}")
@@ -376,6 +390,7 @@ class SharepointConfiguration(BaseModel):
 
         scopes = settings.get("scopes")
         configuration_uuid = settings.get("configuration_uuid")
+        auto_refresh_token = settings.get("auto_refresh_token", False)
         access_token = settings.get("access_token")
         if not access_token:
             raise SharepointConfiguration._build_mcp_authorization_required(
@@ -387,6 +402,7 @@ class SharepointConfiguration(BaseModel):
                 oauth_discovery_endpoint=oauth_discovery_endpoint,
                 scopes=scopes,
                 configuration_uuid=configuration_uuid,
+                auto_refresh_token=auto_refresh_token,
             )
 
         # Use Graph API for health-check — delegated tokens are Graph tokens

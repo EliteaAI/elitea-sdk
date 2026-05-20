@@ -44,12 +44,20 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     """
 
     def __init__(self, site_url: str, token: str, scopes: List[str],
-                 elitea=None, llm=None):
+                 elitea=None, llm=None,
+                 refresh_token: Optional[str] = None,
+                 client_id: Optional[str] = None,
+                 client_secret: Optional[str] = None,
+                 oauth_token_endpoint: Optional[str] = None):
         self.site_url = site_url.rstrip('/')
         self._token = token
         self._scopes = scopes
         self.elitea = elitea
         self.llm = llm
+        self._refresh_token = refresh_token
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._oauth_token_endpoint = oauth_token_endpoint
         # Lazily resolved and cached
         self.__site_id: Optional[str] = None
         self.__drive_id: Optional[str] = None
@@ -79,18 +87,70 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         logging.error("Graph API HTTP %s for %s: %s", resp.status_code, resp.url, body)
         resp.raise_for_status()
 
+    def _try_refresh_token(self) -> bool:
+        """Attempt to refresh the access token using the stored refresh_token.
+
+        Returns True if successful and self._token was updated, False otherwise.
+        """
+        if not self._refresh_token or not self._oauth_token_endpoint:
+            return False
+        try:
+            data = {
+                'grant_type': 'refresh_token',
+                'refresh_token': self._refresh_token,
+                'scope': ' '.join(self._scopes) if self._scopes else 'https://graph.microsoft.com/.default',
+            }
+            if self._client_id:
+                data['client_id'] = self._client_id
+            if self._client_secret:
+                data['client_secret'] = self._client_secret
+            resp = requests.post(self._oauth_token_endpoint, data=data, timeout=10)
+            if resp.status_code == 200:
+                token_data = resp.json()
+                self._token = token_data['access_token']
+                if token_data.get('refresh_token'):
+                    self._refresh_token = token_data['refresh_token']
+                logging.info("SharePoint: access token refreshed successfully via refresh_token")
+                return True
+            logging.warning("SharePoint: token refresh failed: %s %s", resp.status_code, resp.text)
+            return False
+        except Exception as e:
+            logging.warning("SharePoint: token refresh error: %s", e)
+            return False
+
     def _get(self, url: str, params: Optional[dict] = None) -> dict:
         resp = requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+        if resp.status_code == 401 and self._try_refresh_token():
+            resp = requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
         self._raise_with_body(resp)
         return resp.json()
 
+    def _get_raw(self, url: str, **kwargs) -> requests.Response:
+        """GET with automatic 401 retry after token refresh. Returns the raw Response.
+
+        Used for binary/HTML downloads and probe calls where the caller handles
+        the response body directly (not JSON). Auth header is always injected from
+        the current ``self._token`` so it stays fresh after a token refresh.
+        """
+        headers = dict(kwargs.pop('headers', None) or {})
+        headers['Authorization'] = f"Bearer {self._token}"
+        resp = requests.get(url, headers=headers, **kwargs)
+        if resp.status_code == 401 and self._try_refresh_token():
+            headers['Authorization'] = f"Bearer {self._token}"
+            resp = requests.get(url, headers=headers, **kwargs)
+        return resp
+
     def _post(self, url: str, payload: dict) -> dict:
         resp = requests.post(url, headers=self._auth_headers(), json=payload, timeout=60)
+        if resp.status_code == 401 and self._try_refresh_token():
+            resp = requests.post(url, headers=self._auth_headers(), json=payload, timeout=60)
         self._raise_with_body(resp)
         return resp.json()
 
     def _delete(self, url: str) -> None:
         resp = requests.delete(url, headers=self._auth_headers(), timeout=30)
+        if resp.status_code == 401 and self._try_refresh_token():
+            resp = requests.delete(url, headers=self._auth_headers(), timeout=30)
         self._raise_with_body(resp)
 
     # ------------------------------------------------------------------ #
@@ -234,9 +294,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 continue
             probe_url = f"{_GRAPH_BASE}/drives/{did}/root:/{encoded}"
             _t_probe = time.perf_counter()
-            resp = requests.get(
+            resp = self._get_raw(
                 probe_url,
-                headers=self._auth_headers(),
                 params={"$select": "id,folder"},
                 timeout=15,
             )
@@ -481,6 +540,13 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             data=file_bytes,
             timeout=120,
         )
+        if resp.status_code == 401 and self._try_refresh_token():
+            resp = requests.put(
+                url,
+                headers={"Authorization": f"Bearer {self._token}", "Content-Type": mime_type},
+                data=file_bytes,
+                timeout=120,
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -502,17 +568,16 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         while offset < total:
             chunk = file_bytes[offset: offset + _CHUNK_SIZE]
             end = offset + len(chunk) - 1
-            chunk_resp = requests.put(
-                upload_url,
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    "Content-Length": str(len(chunk)),
-                    "Content-Range": f"bytes {offset}-{end}/{total}",
-                    "Content-Type": "application/octet-stream",
-                },
-                data=chunk,
-                timeout=120,
-            )
+            chunk_headers = {
+                "Authorization": f"Bearer {self._token}",
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {offset}-{end}/{total}",
+                "Content-Type": "application/octet-stream",
+            }
+            chunk_resp = requests.put(upload_url, headers=chunk_headers, data=chunk, timeout=120)
+            if chunk_resp.status_code == 401 and self._try_refresh_token():
+                chunk_headers["Authorization"] = f"Bearer {self._token}"
+                chunk_resp = requests.put(upload_url, headers=chunk_headers, data=chunk, timeout=120)
             chunk_resp.raise_for_status()
             if chunk_resp.status_code in (200, 201):
                 result = chunk_resp.json()
@@ -749,11 +814,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
         encoded = quote(relative, safe='/')
         url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:/content"
-        resp = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=120,
-            allow_redirects=True)
+        resp = self._get_raw(url, timeout=120, allow_redirects=True)
         resp.raise_for_status()
         return resp.content
 
@@ -1014,9 +1075,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if not page_id:
             raise ToolException("page_id is required")
         try:
-            resp = requests.get(
+            resp = self._get_raw(
                 f"{self._onenote_prefix}/pages/{page_id}/content",
-                headers=self._auth_headers(),
                 timeout=60,
             )
             resp.raise_for_status()
@@ -1175,12 +1235,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             )
 
         try:
-            att_resp = requests.get(
-                download_url,
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=60,
-                allow_redirects=True,
-            )
+            att_resp = self._get_raw(download_url, timeout=60, allow_redirects=True)
             if att_resp.status_code in (400, 404):
                 raise ToolException(
                     f"Graph API returned {att_resp.status_code} when downloading "
@@ -1219,12 +1274,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             Raw bytes of the attachment content.
         """
         try:
-            resp = requests.get(
-                download_url,
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=60,
-                allow_redirects=True,
-            )
+            resp = self._get_raw(download_url, timeout=60, allow_redirects=True)
             if resp.status_code in (400, 404):
                 raise ToolException(
                     f"Graph API returned {resp.status_code} when downloading "
@@ -1301,12 +1351,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             return description, None, f"image_{resource_id}.jpg"
 
         try:
-            img_resp = requests.get(
-                canonical_src,
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=30,
-                allow_redirects=True,
-            )
+            img_resp = self._get_raw(canonical_src, timeout=30, allow_redirects=True)
             if img_resp.status_code in (400, 404):
                 logging.warning(
                     "OneNote image URL returned %d, skipping: %s",
@@ -1748,15 +1793,15 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if not html_content or not html_content.strip():
             raise ToolException("html_content is required and cannot be empty")
         try:
-            resp = requests.post(
-                f"{self._onenote_prefix}/sections/{section_id}/pages",
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    "Content-Type": "text/html",
-                },
-                data=html_content.encode("utf-8"),
-                timeout=60,
-            )
+            url = f"{self._onenote_prefix}/sections/{section_id}/pages"
+            onenote_headers = {
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "text/html",
+            }
+            resp = requests.post(url, headers=onenote_headers, data=html_content.encode("utf-8"), timeout=60)
+            if resp.status_code == 401 and self._try_refresh_token():
+                onenote_headers["Authorization"] = f"Bearer {self._token}"
+                resp = requests.post(url, headers=onenote_headers, data=html_content.encode("utf-8"), timeout=60)
             resp.raise_for_status()
             result = resp.json()
             return {
@@ -1789,12 +1834,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if not patch_commands:
             raise ToolException("patch_commands must be a non-empty list")
         try:
-            resp = requests.patch(
-                f"{self._onenote_prefix}/pages/{page_id}/content",
-                headers=self._auth_headers("application/json"),
-                json=patch_commands,
-                timeout=60,
-            )
+            url = f"{self._onenote_prefix}/pages/{page_id}/content"
+            resp = requests.patch(url, headers=self._auth_headers("application/json"), json=patch_commands, timeout=60)
+            if resp.status_code == 401 and self._try_refresh_token():
+                resp = requests.patch(url, headers=self._auth_headers("application/json"), json=patch_commands, timeout=60)
             resp.raise_for_status()
             return (
                 f"OneNote page '{page_id}' updated successfully with "
