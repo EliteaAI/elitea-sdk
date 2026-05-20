@@ -281,11 +281,11 @@ class TestMakeAnthropicCompatibleSchema:
         patched = make_anthropic_compatible_schema(model)
         transform_schema(patched)
 
-    def test_patched_def_is_recursive_concrete_union(self):
-        """The replacement ``$defs.JsonValue`` must be the recursive
-        JSON-value union: primitives + object + array-of-JsonValue. The
-        recursion preserves full ``JsonValue`` semantics — Anthropic
-        models can emit arbitrarily nested structures."""
+    def test_patched_def_is_concrete_union(self):
+        """The replacement ``$defs.JsonValue`` must be a concrete union of
+        JSON primitives + object + array. The array branch intentionally
+        omits ``items`` to avoid circular references that Azure rejects.
+        This is non-recursive but still allows arbitrary JSON values."""
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
         patched = make_anthropic_compatible_schema(model)
         json_value_def = patched["$defs"]["JsonValue"]
@@ -293,9 +293,9 @@ class TestMakeAnthropicCompatibleSchema:
         types_present = {b.get("type") for b in json_value_def["anyOf"] if "type" in b}
         # six JSON primitives + object + array
         assert types_present == {"string", "number", "integer", "boolean", "null", "object", "array"}
-        # the array branch refs back to JsonValue (recursive — the whole point)
+        # the array branch does NOT have items to avoid circular ref that Azure rejects
         array_branch = next(b for b in json_value_def["anyOf"] if b.get("type") == "array")
-        assert array_branch["items"] == {"$ref": "#/$defs/JsonValue"}
+        assert "items" not in array_branch  # intentionally omitted for Azure compatibility
 
     def test_patch_does_not_mutate_input_model_schema(self):
         """Defensive: the patch must deep-copy. Mutating the cached
