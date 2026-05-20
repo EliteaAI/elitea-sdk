@@ -280,8 +280,15 @@ alita_client = elitea_client
             # from child back to parent, not just those in output_variables.
             # This ensures bidirectional state flow between parent and child pipelines.
             if is_nested_app and isinstance(tool_result, dict):
-                # Start with messages from the result
-                if 'messages' in tool_result:
+                # Build result with standardized format - prefer 'output' key, fallback to 'messages'
+                if 'output' in tool_result:
+                    # Standardized format: use output directly, include messages if present
+                    result_dict = {
+                        "output": tool_result['output'],
+                        "messages": tool_result.get('messages', [{"role": "assistant", "content": tool_result['output']}])
+                    }
+                elif 'messages' in tool_result:
+                    # Legacy format: extract output from messages
                     result_dict = {"messages": tool_result['messages']}
                 else:
                     result_dict = {
@@ -309,15 +316,16 @@ alita_client = elitea_client
 
                 # Map the agent/pipeline output to declared output_variables.
                 if self.output_variables:
-                    # Extract the agent's text content from the messages already built
-                    agent_output_content = None
-                    messages = result_dict.get('messages', [])
-                    if messages:
-                        last_msg = messages[-1]
-                        if isinstance(last_msg, dict):
-                            agent_output_content = last_msg.get('content', '')
-                        elif hasattr(last_msg, 'content'):
-                            agent_output_content = last_msg.content
+                    # Extract the agent's text content - prefer 'output' key, fallback to messages
+                    agent_output_content = result_dict.get('output')
+                    if agent_output_content is None:
+                        messages = result_dict.get('messages', [])
+                        if messages:
+                            last_msg = messages[-1]
+                            if isinstance(last_msg, dict):
+                                agent_output_content = last_msg.get('content', '')
+                            elif hasattr(last_msg, 'content'):
+                                agent_output_content = last_msg.content
 
                     for var in self.output_variables:
                         if var == 'messages':

@@ -1,10 +1,10 @@
 import os
 
-from typing import Generator
+from typing import Generator, Optional, Dict, Any
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter
 
-from .constants import (Language, get_langchain_language, get_file_extension, 
+from .constants import (Language, get_langchain_language, get_file_extension,
                         get_programming_language, image_extensions, default_skip)
 from .treesitter.treesitter import Treesitter, TreesitterMethodNode
 
@@ -12,16 +12,37 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
-def parse_code_files_for_db(file_content_generator: Generator[str, None, None], *args, **kwargs) -> Generator[Document, None, None]:
+def parse_code_files_for_db(
+    file_content_generator: Generator[str, None, None],
+    config: Optional[Dict[str, Any]] = None
+) -> Generator[Document, None, None]:
     """
     Parses code files from a generator and returns a generator of Document objects for database storage.
 
     Args:
         file_content_generator (Generator[str, None, None]): Generator that yields file contents.
+        config (dict, optional): Configuration dict with:
+            - max_tokens or chunk_size: Maximum tokens per chunk for known languages (default: 1024)
+            - token_overlap or chunk_overlap: Token overlap for known languages (default: 128)
+            - unknown_chunk_size: Chunk size for unknown file types (default: 256)
+            - unknown_chunk_overlap: Overlap for unknown file types (default: 30)
 
     Returns:
         Generator[Document, None, None]: Generator of Document objects containing parsed code information.
     """
+    if config is None:
+        config = {}
+
+    chunk_size = config.get('max_tokens', config.get('chunk_size', 1024))
+    chunk_overlap = config.get('token_overlap', config.get('chunk_overlap', 128))
+    unknown_chunk_size = config.get('unknown_chunk_size', 256)
+    unknown_chunk_overlap = config.get('unknown_chunk_overlap', 30)
+
+    if chunk_overlap >= chunk_size:
+        chunk_overlap = max(0, chunk_size // 8)
+    if unknown_chunk_overlap >= unknown_chunk_size:
+        unknown_chunk_overlap = max(0, unknown_chunk_size // 8)
+
     code_splitter = None
     for data in file_content_generator:
         file_name: str = data.get("file_name")
@@ -38,7 +59,7 @@ def parse_code_files_for_db(file_content_generator: Generator[str, None, None], 
             continue
         chunk_id = 0
         if programming_language == Language.UNKNOWN:
-            documents = TokenTextSplitter(encoding_name="gpt2", chunk_size=256, chunk_overlap=30).split_text(file_content)
+            documents = TokenTextSplitter(encoding_name="gpt2", chunk_size=unknown_chunk_size, chunk_overlap=unknown_chunk_overlap).split_text(file_content)
             for document in documents:
                 metadata = {
                     "filename": file_name,
@@ -62,8 +83,8 @@ def parse_code_files_for_db(file_content_generator: Generator[str, None, None], 
                 if langchain_language:
                     code_splitter = RecursiveCharacterTextSplitter.from_language(
                         language=langchain_language,
-                        chunk_size=1024,
-                        chunk_overlap=128,
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
                     )
                 treesitter_parser = Treesitter.create_treesitter(programming_language)
                 treesitterNodes: list[TreesitterMethodNode] = treesitter_parser.parse(

@@ -862,7 +862,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             {
                 "ref": self.read_file,
                 "name": "read_file",
-                "description": "Read a file from the artifact bucket. Supports full filepath (/{bucket}/{filename}) from attachment descriptions or filename+bucket_name. For large text files that exceed size limits, use start_line/end_line to read specific portions.",
+                "description": "Read a file from the artifact bucket. Supports full filepath (/{bucket}/{filename}) from attachment descriptions or filename+bucket_name. Use start_line/end_line to read specific portions of text files. If the user's request cannot be fully expressed using the parameters above, call get_file_metadata first — it returns which additional options this file type supports via extra_params.",
                 "args_schema": create_model(
                     "read_file", 
                     filename=(Optional[str], Field(
@@ -908,13 +908,11 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 "ref": self.get_file_metadata,
                 "name": "get_file_metadata",
                 "description": (
-                    "Return type metadata for a file (mime, extension, filesize) "
-                    "plus per-file-type hints describing which extra options "
-                    "the `read_file` tool will accept via its `extra_params` "
-                    "JSON-string argument. For Excel files, also returns the "
-                    "list of sheets with row/column counts. Call this BEFORE "
-                    "read_file when the file may be large or its structure is "
-                    "unknown."
+                    "Inspect a file before reading it. Returns file type, size, and file-type-specific details "
+                    "(e.g. number of embedded images, sheet names with row counts). "
+                    "Also lists additional options that read_file accepts via extra_params for this specific file type. "
+                    "Call this when the user asks about a file's structure or properties, "
+                    "or when what the user wants cannot be expressed with read_file's standard parameters alone."
                 ),
                 "args_schema": create_model(
                     "get_file_metadata",

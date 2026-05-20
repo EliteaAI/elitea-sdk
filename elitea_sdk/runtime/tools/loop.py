@@ -22,7 +22,10 @@ def process_response(response, return_type, accumulated_response):
         if isinstance(response, str):
             accumulated_response['messages'][-1]["content"] += f'{response}\n\n'
         elif isinstance(response, dict):
-            if response.get('messages'):
+            # Prefer 'output' key (standardized format), fallback to 'messages' for compatibility
+            if response.get('output'):
+                accumulated_response['messages'][-1]["content"] += f"{response['output']}\n\n"
+            elif response.get('messages'):
                 accumulated_response['messages'][-1]["content"] += "\n\n".join(
                     [message['content'] for message in response['messages']]) + "\n\n"
             else:

@@ -134,20 +134,23 @@ nodes:
       value: |
         file_path = elitea_state.get('file_path')
 
-        old_content = """delete this section start
-        this entire section should be removed
-        including this line
-        delete this section end"""
-
-        file_query = f"""{file_path}
-        OLD <<<<
-        {old_content}
-        >>>> OLD
-        NEW <<<<
-
-        >>>> NEW"""
-
         nl = chr(10)
+
+        old_content = (
+            "delete this section start" + nl +
+            "this entire section should be removed" + nl +
+            "including this line" + nl +
+            "delete this section end"
+        )
+
+        file_query = file_path + nl
+        file_query += "OLD <<<<" + nl
+        file_query += old_content + nl
+        file_query += ">>>> OLD" + nl
+        file_query += "NEW <<<<" + nl
+        file_query += nl
+        file_query += ">>>> NEW"
+
         new_content = nl
 
         {"new_content": new_content, "file_query": file_query, "old_content": old_content}
