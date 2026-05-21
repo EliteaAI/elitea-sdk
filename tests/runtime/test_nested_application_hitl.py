@@ -515,7 +515,10 @@ def test_application_run_forwards_parent_checkpoint_context():
     nested_config = nested.calls[0]['config']
     assert nested_config['metadata']['origin'] == 'parent'
     assert nested_config['metadata']['parent_agent_name'] == 'child_agent'
-    assert nested_config['configurable']['thread_id'] == 'parent-thread'
+    # Child gets its own thread_id namespace derived from parent + child name —
+    # stable across parent turns (multi-turn child history works), isolated
+    # from parent (no stale-mixing — #4949). See test_application_task_toolkit.
+    assert nested_config['configurable']['thread_id'] == 'parent-thread:child_agent'
     assert nested_config['configurable']['checkpoint_ns'] == 'parent-ns'
     assert nested_config['configurable']['checkpoint_id'] == 'parent-cp'
     assert 'selected_tools' not in nested_config['configurable']

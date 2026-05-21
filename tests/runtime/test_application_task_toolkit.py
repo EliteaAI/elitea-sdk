@@ -135,13 +135,13 @@ def test_smart_tool_selection_works_with_application_tools_attached():
 # --- #4949: Quarantined child thread_id ---------------------------------------
 
 
-def test_swarm_subagent_gets_isolated_thread_id_derived_from_tool_call_id():
-    """Application._run must derive child thread_id as f"{parent}:{tool_call_id}"
-    so child checkpoints don't collide with parent's MemorySaver on second-turn
-    swarm invocation. Resolves #4949."""
+def test_subagent_gets_isolated_thread_id_derived_from_child_name():
+    """Application._run derives child thread_id as f"{parent}:{child_name}".
+    Stable across parent turns (multi-turn child history works) and namespace-
+    isolated from parent (no stale-mixing — #4949)."""
     captured = StaticApplication(output='ok')
     app = Application(
-        name='child',
+        name='analyst',
         description='child',
         application=captured,
         return_type='str',
@@ -149,39 +149,56 @@ def test_swarm_subagent_gets_isolated_thread_id_derived_from_tool_call_id():
         is_subgraph=True,
     )
 
-    parent_config = {
-        'configurable': {
-            'thread_id': 'parent-thread-42',
-            '_tool_call_id': 'call-child-7',
-        }
-    }
+    parent_config = {'configurable': {'thread_id': 'parent-chat-42'}}
     app._run(task='do work', config=parent_config)
 
     assert captured.calls, 'child application was not invoked'
     child_config = captured.calls[0]['config']
-    assert child_config['configurable']['thread_id'] == 'parent-thread-42:call-child-7'
-    assert '_tool_call_id' not in child_config['configurable']
+    assert child_config['configurable']['thread_id'] == 'parent-chat-42:analyst'
 
 
-def test_swarm_subagent_falls_back_to_parent_thread_id_without_tool_call_id():
-    """When invoked from a non-tool-calling path (e.g. pipeline FunctionTool),
-    tool_call_id is None and the child should use the parent's thread_id directly.
-    Preserves existing pipeline semantics."""
+def test_subagent_thread_id_stable_across_parent_turns():
+    """Multi-turn parent conversation must produce the SAME child thread_id on every
+    turn — otherwise a swarm child loses its conversation history between parent
+    turns (the reason we don't key on tool_call_id)."""
     captured = StaticApplication(output='ok')
     app = Application(
-        name='child',
+        name='researcher',
         description='child',
         application=captured,
         return_type='str',
         client=None,
         is_subgraph=True,
     )
+    parent_config = {'configurable': {'thread_id': 'parent-chat-42'}}
 
-    parent_config = {'configurable': {'thread_id': 'parent-thread-only'}}
-    app._run(task='do work', config=parent_config)
+    # Two separate parent turns, two separate _run invocations
+    app._run(task='turn 1 task', config=parent_config)
+    app._run(task='turn 2 task', config=parent_config)
 
-    child_config = captured.calls[0]['config']
-    assert child_config['configurable']['thread_id'] == 'parent-thread-only'
+    thread_ids = [call['config']['configurable']['thread_id'] for call in captured.calls]
+    assert thread_ids == ['parent-chat-42:researcher', 'parent-chat-42:researcher'], (
+        'child thread_id must be stable across parent turns to preserve multi-turn '
+        'history (especially for swarm children)'
+    )
+
+
+def test_two_different_subagents_get_isolated_thread_ids():
+    """Two different Application children attached to the same parent must get
+    distinct thread_ids — they are independent agents and shouldn't share state."""
+    a = StaticApplication(output='a')
+    b = StaticApplication(output='b')
+    app_a = Application(name='analyst', description='', application=a,
+                        return_type='str', client=None, is_subgraph=True)
+    app_b = Application(name='writer', description='', application=b,
+                        return_type='str', client=None, is_subgraph=True)
+    parent_config = {'configurable': {'thread_id': 'shared-parent'}}
+
+    app_a._run(task='analyze', config=parent_config)
+    app_b._run(task='write', config=parent_config)
+
+    assert a.calls[0]['config']['configurable']['thread_id'] == 'shared-parent:analyst'
+    assert b.calls[0]['config']['configurable']['thread_id'] == 'shared-parent:writer'
 
 
 # --- G2: result collapse via LLMNode ------------------------------------------

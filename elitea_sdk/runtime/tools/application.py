@@ -204,14 +204,6 @@ class Application(BaseTool):
             config['configurable']['_application_extras'] = extras
             logger.debug(f"[APP_INVOKE] Stored extras in config: {list(extras.keys())}")
 
-        # Forward tool_call_id to _run so it derives an isolated child thread_id.
-        # Prevents stale-checkpoint replay on nested swarm turns (#4949) and gives
-        # parallel sub-agents non-colliding checkpoint lineages.
-        if tool_call_id is not None:
-            config = dict(config)
-            config['configurable'] = dict(config.get('configurable') or {})
-            config['configurable']['_tool_call_id'] = tool_call_id
-
         # Inject tool metadata into config so it's passed to callbacks.
         # IMPORTANT: copy config and its metadata dict before injecting to avoid mutating
         # the caller's LangGraph run config. LangGraph builds per-tool configs via shallow
@@ -330,13 +322,13 @@ class Application(BaseTool):
             parent_configurable = dict(invoke_config['configurable'])
             parent_configurable.pop('selected_tools', None)
             parent_configurable.pop('selected_toolkits', None)
-            # Derive an isolated child thread_id so stale parent checkpoints don't
-            # replay into the child (#4949). Same tool_call_id → same child thread,
-            # so HITL resume hits the right checkpoint.
-            tool_call_id_local = parent_configurable.pop('_tool_call_id', None)
+            # Give the child its own thread_id namespace, derived from the parent
+            # thread + child name. Stable across parent turns (so a swarm child
+            # keeps its conversation history; non-swarm child can resume HITL),
+            # but isolated from the parent's namespace (no stale-mixing — #4949).
             parent_thread_id = parent_configurable.get('thread_id')
-            if tool_call_id_local and parent_thread_id:
-                parent_configurable['thread_id'] = f"{parent_thread_id}:{tool_call_id_local}"
+            if parent_thread_id and self.name:
+                parent_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
             nested_config['configurable'] = parent_configurable
         if nested_metadata:
             nested_config['metadata'] = nested_metadata
