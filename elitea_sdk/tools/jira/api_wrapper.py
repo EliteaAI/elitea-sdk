@@ -15,6 +15,7 @@ from langchain_core.tools import ToolException
 from pydantic import Field, PrivateAttr, model_validator, create_model, SecretStr
 from requests.exceptions import HTTPError
 
+from ..exceptions import ToolkitConfigurationError
 from ..llm.img_utils import ImageDescriptionCache
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import is_cookie_token, parse_cookie_string, get_file_bytes_from_artifact, detect_mime_type
@@ -585,6 +586,15 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             for header, value in custom_headers.items():
                 self._client._update_header(header, value)
 
+    def _get_client(self) -> Jira:
+        if not hasattr(self, '_client') or self._client is None:
+            base_url = getattr(self, 'base_url', 'not set')
+            raise ToolkitConfigurationError(
+                user_message="Jira client is not properly initialized. Please check your Jira configuration and ensure all settings are correct.",
+                cause=RuntimeError(f"Jira client not initialized - base_url: '{base_url}', has _client: {hasattr(self, '_client')}, _client is None: {getattr(self, '_client', None) is None}")
+            )
+        return self._client
+
     def _parse_issues(self, issues: Dict) -> List[dict]:
         parsed: List[dict] = []
         issues_list = issues.get("issues") if isinstance(issues, dict) else None
@@ -711,7 +721,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def search_using_jql(self, jql: str):
         """ Search for Jira issues using JQL."""
-        parsed = self._parse_issues(self._client.jql(jql))
+        client = self._get_client()
+        parsed = self._parse_issues(client.jql(jql))
         if len(parsed) == 0:
             return "No Jira issues found"
         return "Found " + str(len(parsed)) + " Jira issues:\n" + str(parsed)
@@ -720,7 +731,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """ Link issues functionality for Jira issues. To link test to another issue ( test 'test' story, story 'is tested by test').
         Use the appropriate issue link type (e.g., "Test", "Relates", "Blocks").
         If we use "Test" linktype, the test is inward issue, the story/other issue is outward issue.."""
-
+        client = self._get_client()
         comment = f"Issue {inward_issue_key} was linked to {outward_issue_key}."
         comment_body = {"content": [{"content": [{"text": comment,"type": "text"}],"type": "paragraph"}],"type": "doc","version": 1} if self.api_version == "3" else comment
         link_data = {
@@ -731,24 +742,25 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 "body": comment_body
             }
         }
-        self._client.create_issue_link(link_data)
+        client.create_issue_link(link_data)
         """ Get the remote links from the specified jira issue key"""
         return f"Link created using following data: {link_data}."
 
     def get_specific_field_info(self, jira_issue_key: str, field_name: str):
         """ Get the specific field information from Jira by jira issue key and field name """
-
-        jira_issue = self._client.issue(jira_issue_key, fields=field_name)
+        client = self._get_client()
+        jira_issue = client.issue(jira_issue_key, fields=field_name)
         field_info = jira_issue.get('fields', {}).get(field_name)
         if not field_info:
-            existing_fields = [key for key, value in self._client.issue(jira_issue_key).get("fields").items() if value is not None]
+            existing_fields = [key for key, value in client.issue(jira_issue_key).get("fields").items() if value is not None]
             existing_fields_str = ', '.join(existing_fields)
             return ToolException(f"Unable to find field '{field_name}'. All available fields are '{existing_fields_str}'")
         return f"Got the data from following Jira issue - {jira_issue_key} and field - {field_name}. The data is:\n{field_info}"
 
     def get_remote_links(self, jira_issue_key: str):
         """ Get the remote links from the specified jira issue key"""
-        remote_links = self._client.get_issue_remotelinks(jira_issue_key)
+        client = self._get_client()
+        remote_links = client.get_issue_remotelinks(jira_issue_key)
         return f"Jira issue - {jira_issue_key} has the following remote links:\n{str(remote_links)}"
 
     def _add_default_labels(self, issue_key: str):
@@ -759,13 +771,14 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def create_issue(self, issue_json: str):
         """ Create an issue in Jira."""
+        client = self._get_client()
         try:
             params = json.loads(issue_json)
             self.create_issue_validate(params)
             # used in case linkage via `update` is required
             update = dict(params["update"]) if (params.get("update")) is not None else None
-            issue = self._client.create_issue(fields=dict(params["fields"]), update=update)
-            issue_url = f"{self._client.url}browse/{issue['key']}"
+            issue = client.create_issue(fields=dict(params["fields"]), update=update)
+            issue_url = f"{client.url}browse/{issue['key']}"
             logger.info(f"issue is created: {issue}")
             self._add_default_labels(issue_key=issue['key'])
             return f"Done. Issue {issue['key']} is created successfully. You can view it at {issue_url}. Details: {str(issue)}"
@@ -778,6 +791,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def set_issue_status(self, issue_key: str, status_name: str, mandatory_fields_json: str):
         """Set new status for the issue in Jira. Used to move ticket through the defined workflow."""
+        client = self._get_client()
         try:
             self.set_issue_status_validate(issue_key, status_name)
             fields = json.loads(mandatory_fields_json)
@@ -785,10 +799,10 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             fields_data = dict(fields["update"]) if (fields.get("update")) is not None else None
             # prepare update block
             update = dict(fields["update"]) if (fields.get("update")) is not None else None
-            self._client.set_issue_status(issue_key=issue_key, status_name=status_name, fields=fields_data,
+            client.set_issue_status(issue_key=issue_key, status_name=status_name, fields=fields_data,
                                           update=update)
             logger.info(f"issue is updated: {issue_key} with status {status_name}")
-            issue_url = f"{self._client.url}browse/{issue_key}"
+            issue_url = f"{client.url}browse/{issue_key}"
             self._add_default_labels(issue_key=issue_key)
             return f"Done. Status for issue {issue_key} was updated successfully. You can view it at {issue_url}."
         except ToolException as e:
@@ -847,8 +861,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def list_comments(self, issue_key: str):
         """ Extract the comments related to specified Jira issue """
+        client = self._get_client()
         try:
-            comments = self._client.issue_get_comments(issue_key)
+            comments = client.issue_get_comments(issue_key)
             comments_list = []
             for comment in comments['comments']:
                 comments_list.append(
@@ -864,12 +879,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def add_comments(self, issue_key: str, comment: str):
         """ Add a comment to a Jira issue."""
+        client = self._get_client()
         try:
             if self.api_version == '3':
                 comment = {"content": [{"content": [{"text": comment,"type": "text"}],"type": "paragraph"}],"type": "doc","version": 1}
-            response = self._client.issue_add_comment(issue_key, comment)
+            response = client.issue_add_comment(issue_key, comment)
             comment_id = response.get('id', 'unknown') if response else 'unknown'
-            issue_url = f"{self._client.url}browse/{issue_key}"
+            issue_url = f"{client.url}browse/{issue_key}"
             output = f"Done. Comment {comment_id} is added for issue {issue_key}. You can view it at {issue_url}"
             logger.info(output)
             self._add_default_labels(issue_key=issue_key)
@@ -1146,8 +1162,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def list_projects(self):
         """ List all projects in Jira. """
+        client = self._get_client()
         try:
-            projects = self._client.projects()
+            projects = client.projects()
             parsed_projects = self._parse_projects(projects)
             parsed_projects_str = (
                     "Found " + str(len(parsed_projects)) + " projects:\n" + str(parsed_projects)
@@ -1170,9 +1187,10 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             A string containing the content of all relevant attachments, separated by double newlines.
          """
 
+        client = self._get_client()
         attachment_data = []
-        attachments = self._client.get_attachments_ids_from_issue(issue=jira_issue_key)
-        api_version = str(getattr(self._client, "api_version", "2"))
+        attachments = client.get_attachments_ids_from_issue(issue=jira_issue_key)
+        api_version = str(getattr(client, "api_version", "2"))
         for attachment in attachments:
             if attachment_pattern and not re.search(attachment_pattern, attachment['filename']):
                 logger.info(f"Skipping attachment {attachment['filename']} as it does not match pattern {attachment_pattern}")
@@ -1189,11 +1207,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                     )
 
                 if attachment_content is None:
-                    attachment_content = self._client.get_attachment_content(attachment['attachment_id'])
+                    attachment_content = client.get_attachment_content(attachment['attachment_id'])
             except Exception as e:
                 logger.error(
                     f"Failed to download attachment {attachment['filename']} for issue {jira_issue_key}: {str(e)}")
-                attachment_content = self._client.get(
+                attachment_content = client.get(
                     path=f"secure/attachment/{attachment['attachment_id']}/{attachment['filename']}", not_json_response=True)
             content_docs = process_content_by_type(attachment_content, attachment['filename'], llm=self.llm, fallback_extensions=[".txt", ".png"])
             attachment_data.append("filename: " + attachment['filename'] + "\ncontent: " + str([doc.page_content for doc in content_docs]))
@@ -1202,27 +1220,28 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def execute_generic_rq(self, method: str, relative_url: str, params: Optional[str] = "", *args):
         """Executes a generic JIRA tool request."""
+        client = self._get_client()
         payload_params = parse_payload_params(params)
         if method == "GET":
-            response = self._client.request(
+            response = client.request(
                 method=method,
                 path=relative_url,
                 params=payload_params,
                 advanced_mode=True
             )
-            self._client.raise_for_status(response)
+            client.raise_for_status(response)
             if re.match(self.issue_search_pattern, relative_url):
-                response_text = process_search_response(self._client.url, response, payload_params)
+                response_text = process_search_response(client.url, response, payload_params)
             else:
                 response_text = response.text
         else:
-            response = self._client.request(
+            response = client.request(
                 method=method,
                 path=relative_url,
                 data=payload_params,
                 advanced_mode=True
             )
-            self._client.raise_for_status(response)
+            client.raise_for_status(response)
             response_text = response.text
         response_string = f"HTTP: {method} {relative_url} -> {response.status_code} {response.reason} {response_text}"
         logger.debug(response_string)
@@ -1545,13 +1564,14 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             The field content with image references replaced with contextual descriptions,
             or raw field content when process_images=False
         """
+        client = self._get_client()
         try:
             # Get the specified field from the Jira issue
-            jira_issue = self._client.issue(jira_issue_key, fields=field_name)
+            jira_issue = client.issue(jira_issue_key, fields=field_name)
             field_content = jira_issue.get('fields', {}).get(field_name)
 
             if not field_content:
-                existing_fields = [key for key, value in self._client.issue(jira_issue_key).get("fields").items() if
+                existing_fields = [key for key, value in client.issue(jira_issue_key).get("fields").items() if
                                 value is not None]
                 existing_fields_str = ', '.join(existing_fields)
                 return f"Unable to find field '{field_name}' or it's empty. Available fields are: {existing_fields_str}"
@@ -1573,7 +1593,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             image_pattern = r'!([^!|]+)(?:\|[^!]*)?!'
 
             # Create an AttachmentResolver to efficiently handle attachment lookups
-            attachment_resolver = AttachmentResolver(self._client, jira_issue_key)
+            attachment_resolver = AttachmentResolver(client, jira_issue_key)
 
             def process_image_match(match):
                 """Process each image reference and get its contextual description"""
@@ -1679,8 +1699,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             return f"[Image: {image_ref} - Error: {str(e)}]"
 
     def get_processed_comments_list_with_image_description(self, jira_issue_key: str, prompt: Optional[str] = None, context_radius: int = 500, process_images: bool = True):
+        client = self._get_client()
         # Retrieve all comments for the issue
-        comments = self._client.issue_get_comments(jira_issue_key)
+        comments = client.issue_get_comments(jira_issue_key)
 
         if not comments or not comments.get('comments'):
              return []
@@ -1688,7 +1709,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         processed_comments = []
 
         # Create an AttachmentResolver to efficiently handle attachment lookups
-        attachment_resolver = AttachmentResolver(self._client, jira_issue_key)
+        attachment_resolver = AttachmentResolver(client, jira_issue_key)
 
         # Regular expression to find image references in Jira markup
         image_pattern = r'!([^!|]+)(?:\|[^!]*)?!'
