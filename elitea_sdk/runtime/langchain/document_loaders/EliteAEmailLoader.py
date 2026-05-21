@@ -34,6 +34,24 @@ from langchain_core.documents import Document
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_text(text: str) -> str:
+    """
+    Remove null bytes and other problematic characters from text.
+
+    PostgreSQL cannot store null bytes (\x00) in text fields.
+    This function removes them to prevent database insertion errors.
+
+    Args:
+        text: Text to sanitize
+
+    Returns:
+        Sanitized text with null bytes removed
+    """
+    if not text:
+        return text
+    return text.replace('\x00', '')
+
+
 class EliteAEmailLoader(BaseLoader):
     """
     Loader for email files (.eml and .msg formats).
@@ -138,15 +156,15 @@ class EliteAEmailLoader(BaseLoader):
                 msg = email.message_from_bytes(self.file_content, policy=policy.default)
 
             if msg['From']:
-                headers['from'] = [str(msg['From'])]
+                headers['from'] = [_sanitize_text(str(msg['From']))]
             if msg['To']:
-                headers['to'] = [str(msg['To'])]
+                headers['to'] = [_sanitize_text(str(msg['To']))]
             if msg['Cc']:
-                headers['cc'] = [str(msg['Cc'])]
+                headers['cc'] = [_sanitize_text(str(msg['Cc']))]
             if msg['Subject']:
-                headers['subject'] = str(msg['Subject'])
+                headers['subject'] = _sanitize_text(str(msg['Subject']))
             if msg['Date']:
-                headers['date'] = str(msg['Date'])
+                headers['date'] = _sanitize_text(str(msg['Date']))
         except Exception as e:
             logger.warning(f"Failed to extract email headers: {e}")
 
@@ -258,7 +276,7 @@ class EliteAEmailLoader(BaseLoader):
         from .constants import loaders_map
 
         _, extension = os.path.splitext(filename)
-        extension = extension.lower()
+        extension = _sanitize_text(extension.lower())
 
         if extension not in loaders_map:
             logger.debug(f"No loader found for extension {extension}, skipping attachment {filename}")
@@ -267,7 +285,9 @@ class EliteAEmailLoader(BaseLoader):
         temp_file = None
         try:
             temp_dir = tempfile.mkdtemp()
-            temp_file = os.path.join(temp_dir, filename)
+            # Sanitize filename to remove null bytes and other invalid characters
+            safe_filename = _sanitize_text(filename)
+            temp_file = os.path.join(temp_dir, safe_filename)
 
             with open(temp_file, 'wb') as f:
                 f.write(content)
@@ -327,17 +347,17 @@ class EliteAEmailLoader(BaseLoader):
                 if elem_metadata:
                     if hasattr(elem_metadata, 'sent_from') and elem_metadata.sent_from:
                         sent_from = elem_metadata.sent_from
-                        metadata['from'] = [str(x) for x in sent_from] if isinstance(sent_from, list) else [str(sent_from)]
+                        metadata['from'] = [_sanitize_text(str(x)) for x in sent_from] if isinstance(sent_from, list) else [_sanitize_text(str(sent_from))]
                     if hasattr(elem_metadata, 'sent_to') and elem_metadata.sent_to:
                         sent_to = elem_metadata.sent_to
-                        metadata['to'] = [str(x) for x in sent_to] if isinstance(sent_to, list) else [str(sent_to)]
+                        metadata['to'] = [_sanitize_text(str(x)) for x in sent_to] if isinstance(sent_to, list) else [_sanitize_text(str(sent_to))]
                     if hasattr(elem_metadata, 'subject') and elem_metadata.subject:
-                        metadata['subject'] = str(elem_metadata.subject)
+                        metadata['subject'] = _sanitize_text(str(elem_metadata.subject))
                     if hasattr(elem_metadata, 'cc_recipient') and elem_metadata.cc_recipient:
                         cc = elem_metadata.cc_recipient
-                        metadata['cc'] = [str(x) for x in cc] if isinstance(cc, list) else [str(cc)]
+                        metadata['cc'] = [_sanitize_text(str(x)) for x in cc] if isinstance(cc, list) else [_sanitize_text(str(cc))]
                     if hasattr(elem_metadata, 'last_modified') and elem_metadata.last_modified:
-                        metadata['date'] = str(elem_metadata.last_modified)
+                        metadata['date'] = _sanitize_text(str(elem_metadata.last_modified))
                     if any(k in metadata for k in ['from', 'to', 'subject']):
                         break
 
@@ -349,7 +369,7 @@ class EliteAEmailLoader(BaseLoader):
 
         # Extract attachments with content for metadata and parsing
         attachments_with_content = self._extract_attachments_with_content()
-        attachment_filenames = [filename for filename, _ in attachments_with_content]
+        attachment_filenames = [_sanitize_text(filename) for filename, _ in attachments_with_content]
 
         # Add common metadata fields
         metadata['is_empty_body'] = is_empty_body
@@ -361,18 +381,21 @@ class EliteAEmailLoader(BaseLoader):
         content_parts = []
         header_parts = []
         if 'subject' in metadata:
-            header_parts.append(f"**Subject:** {metadata['subject']}")
+            header_parts.append(f"**Subject:** {_sanitize_text(metadata['subject'])}")
         if 'from' in metadata:
-            from_str = ', '.join(metadata['from']) if isinstance(metadata['from'], list) else str(metadata['from'])
+            from_list = metadata['from'] if isinstance(metadata['from'], list) else [metadata['from']]
+            from_str = ', '.join(_sanitize_text(str(x)) for x in from_list)
             header_parts.append(f"**From:** {from_str}")
         if 'to' in metadata:
-            to_str = ', '.join(metadata['to']) if isinstance(metadata['to'], list) else str(metadata['to'])
+            to_list = metadata['to'] if isinstance(metadata['to'], list) else [metadata['to']]
+            to_str = ', '.join(_sanitize_text(str(x)) for x in to_list)
             header_parts.append(f"**To:** {to_str}")
         if 'cc' in metadata:
-            cc_str = ', '.join(metadata['cc']) if isinstance(metadata['cc'], list) else str(metadata['cc'])
+            cc_list = metadata['cc'] if isinstance(metadata['cc'], list) else [metadata['cc']]
+            cc_str = ', '.join(_sanitize_text(str(x)) for x in cc_list)
             header_parts.append(f"**Cc:** {cc_str}")
         if 'date' in metadata:
-            header_parts.append(f"**Date:** {metadata['date']}")
+            header_parts.append(f"**Date:** {_sanitize_text(metadata['date'])}")
 
         if header_parts:
             content_parts.append('\n'.join(header_parts))
@@ -382,7 +405,7 @@ class EliteAEmailLoader(BaseLoader):
         if not is_empty_body:
             body_parts = []
             for element in elements:
-                text = str(element).strip()
+                text = _sanitize_text(str(element).strip())
                 if text:
                     body_parts.append(text)
             if body_parts:
@@ -391,9 +414,10 @@ class EliteAEmailLoader(BaseLoader):
         # Parse and append attachment content if process_attachments is enabled
         if self.process_attachments and attachments_with_content:
             for filename, content in attachments_with_content:
-                parsed_content = self._parse_attachment_content(filename, content)
+                parsed_content = _sanitize_text(self._parse_attachment_content(filename, content))
                 if parsed_content:
-                    content_parts.append(f"\n---\n**Attachment: {filename}**\n\n{parsed_content}")
+                    sanitized_filename = _sanitize_text(filename)
+                    content_parts.append(f"\n---\n**Attachment: {sanitized_filename}**\n\n{parsed_content}")
 
         page_content = '\n'.join(content_parts)
 
