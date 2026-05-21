@@ -2183,9 +2183,27 @@ class LLMNode(BaseTool):
                         # checkpoint and can be restored on resume.
                         _PENDING_TOOL_MESSAGES.set(list(new_messages[_pending_capture_start:]))
 
-                        # Try async invoke first (for MCP tools), fallback to sync
+                        # Application reads tool_call_id from a ToolCall envelope and
+                        # returns a collapsed ToolMessage; other tools get raw args so
+                        # langchain's BaseTool.invoke does not auto-wrap their result
+                        # (which would defeat blocked-payload detection below).
+                        from .application import Application
+                        is_application = isinstance(tool_to_execute, Application)
+
                         tool_result = None
-                        if hasattr(tool_to_execute, 'ainvoke'):
+                        if is_application:
+                            # Application overrides invoke() (not ainvoke) to read tool_call_id
+                            # from a ToolCall envelope and collapse AgentResponse → output string.
+                            # Routing to ainvoke would hit BaseTool.ainvoke instead, which auto-
+                            # wraps the dict result and defeats the collapse.
+                            tool_call_envelope = {
+                                "type": "tool_call",
+                                "id": tool_call_id,
+                                "args": tool_args,
+                                "name": tool_name,
+                            }
+                            tool_result = tool_to_execute.invoke(tool_call_envelope, config=config)
+                        elif hasattr(tool_to_execute, 'ainvoke'):
                             try:
                                 tool_result = await tool_to_execute.ainvoke(tool_args, config=config)
                             except (NotImplementedError, AttributeError):
@@ -2197,6 +2215,14 @@ class LLMNode(BaseTool):
 
                         # Create tool message with result - preserve structured content
                         from langchain_core.messages import ToolMessage
+
+                        # Short-circuit: Application returned an already-formed ToolMessage
+                        # with collapsed content (output string, not stringified dict).
+                        if isinstance(tool_result, ToolMessage):
+                            if not tool_result.tool_call_id:
+                                tool_result.tool_call_id = tool_call_id
+                            new_messages.append(tool_result)
+                            continue
 
                         blocked_payload = self._parse_sensitive_tool_blocked_result(tool_result)
                         if blocked_payload is not None:

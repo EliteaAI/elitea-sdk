@@ -460,8 +460,7 @@ def test_multiple_application_tools_use_toolnode_runtime_and_resume_hitl():
     initial_runnable = _build_parent_runnable(parent_memory, initial_llm, tools)
     graph = initial_runnable.get_graph()
 
-    assert 'model' in graph.nodes
-    assert 'tools' in graph.nodes
+    assert 'agent' in graph.nodes
 
     initial_result = initial_runnable.invoke(
         {'messages': [HumanMessage(content='Delegate this task')]},

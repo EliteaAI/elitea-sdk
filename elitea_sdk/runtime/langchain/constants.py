@@ -620,6 +620,21 @@ Example of a **high-quality plan**:
 Low-quality plans ("run tests → fix things → done") are not acceptable.
 """
 
+TASK_DELEGATION_ADDON = """
+---
+
+## Sub-agent delegation
+
+You have specialized sub-agents available as tools (with `task: str` argument).
+They run in isolated contexts — no shared memory or conversation history.
+
+Rules:
+- Inline ALL context the sub-agent needs in `task`. No anaphora.
+- Delegate independent subtasks; do simple work yourself.
+- Each sub-agent returns a separate ToolMessage; reason over results in next turn.
+- You may emit multiple sub-agent tool_calls in one response; they are processed in order.
+"""
+
 PYODITE_ADDON = """
 ---
 
