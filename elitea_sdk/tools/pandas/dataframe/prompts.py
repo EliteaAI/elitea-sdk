@@ -1,4 +1,5 @@
-import os 
+import os
+import tempfile
 
 PLAN_CODE_PROMPT = """
 <dataframe>
@@ -67,6 +68,6 @@ IMPORTANT: last link of the code should start with `result = dict(df = df, resul
 Generate python code and return full updated code:
 """
 
-DEFAULT_CHART_DIRECTORY = os.path.join("charts")
+DEFAULT_CHART_DIRECTORY = os.path.join(tempfile.gettempdir(), "charts")
 if not os.path.exists(DEFAULT_CHART_DIRECTORY):
     os.makedirs(DEFAULT_CHART_DIRECTORY)
