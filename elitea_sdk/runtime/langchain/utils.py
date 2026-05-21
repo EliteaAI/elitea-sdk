@@ -440,10 +440,11 @@ def parse_pydantic_type(type_name: str):
     return JsonValue
 
 
-# Non-recursive JSON value schema for maximum provider compatibility.
-# Azure rejects circular/self-referencing definitions, so this schema
-# avoids $ref entirely by using a permissive {} for array items.
-# This means arrays can contain ANY JSON values (validated at runtime).
+# Non-recursive JSON value union used to fully inline every reference
+# to ``$defs.JsonValue`` Pydantic emits. The union is kept permissive
+# (primitives + open object + open array with implicit any items) so
+# OpenAI reasoning models don't hallucinate tighter element shapes,
+# while staying acyclic — no branch references JsonValue back.
 _JSON_VALUE_CONCRETE_DEF: dict = {
     "anyOf": [
         {"type": "string"},
@@ -452,36 +453,62 @@ _JSON_VALUE_CONCRETE_DEF: dict = {
         {"type": "boolean"},
         {"type": "null"},
         {"type": "object"},
-        {"type": "array"},  # items: any (implicit, avoids circular ref)
+        {"type": "array"},
     ]
 }
 
+_JSON_VALUE_REF = "#/$defs/JsonValue"
+
+
+def _inline_json_value_refs(node: Any) -> None:
+    """Walk ``node`` in place; for any dict carrying
+    ``"$ref": "#/$defs/JsonValue"``, drop that key and merge in
+    ``_JSON_VALUE_CONCRETE_DEF``. Sibling keywords like ``description``
+    / ``title`` that Pydantic emits next to the ``$ref`` are preserved.
+    Other ``$ref``s (nested Pydantic models with their own defs) are
+    untouched.
+    """
+    if isinstance(node, dict):
+        if node.get("$ref") == _JSON_VALUE_REF:
+            node.pop("$ref")
+            node.update(copy.deepcopy(_JSON_VALUE_CONCRETE_DEF))
+        for value in node.values():
+            _inline_json_value_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            _inline_json_value_refs(item)
+
 
 def make_anthropic_compatible_schema(pydantic_model: Any) -> dict:
-    """Return a JSON-schema dict for ``pydantic_model`` compatible with
-    both Anthropic's ``transform_schema`` and Azure's schema validator.
+    """Return a JSON-schema dict for ``pydantic_model`` with every
+    ``JsonValue`` reference fully inlined.
 
-    Pydantic's ``JsonValue`` emits ``"$defs": {"JsonValue": {}}`` — a
-    deliberately empty definition because the type self-references.
+    Pydantic emits ``JsonValue`` as ``$ref: #/$defs/JsonValue`` with an
+    empty ``$defs.JsonValue: {}``. Three providers fail differently on
+    that shape:
 
-    This causes TWO issues:
-    1. Anthropic's ``transform_schema`` rejects empty schema nodes with
-       *"Schema must have a 'type', 'anyOf', 'oneOf', or 'allOf' field"*
-    2. Azure rejects circular/self-referencing definitions with
-       *"Circular reference detected in schema definitions"*
+    1. Anthropic's ``transform_schema`` rejects empty defs with
+       *"Schema must have a 'type', 'anyOf', 'oneOf', or 'allOf' field"*.
+    2. Azure (legacy) rejects empty / self-referencing defs.
+    3. Azure AI Foundry's validator chases the ``$ref`` and reports
+       *"Circular reference detected in schema definitions:
+       JsonValue -> JsonValue"* even when the def is non-recursive,
+       because the union admits open ``object`` / ``array`` branches
+       the validator treats as a possible cycle back through the
+       referrer.
 
-    The fix replaces the empty def with a non-recursive union of JSON
-    primitives. The array branch uses implicit items (any) rather than
-    a ``$ref`` back to ``JsonValue`` — this avoids the circular reference
-    that Azure rejects while still allowing arbitrary JSON values.
-
-    For non-``JsonValue`` schemas (no ``$defs.JsonValue`` to patch) the
-    function is a no-op deep copy. Safe to call unconditionally.
+    Inlining leaves no ``JsonValue`` symbol for any validator to chase,
+    which all three accept. No-op for schemas without ``$defs.JsonValue``,
+    so the boundary call site stays unconditional.
     """
     schema = copy.deepcopy(pydantic_model.model_json_schema())
     defs = schema.get("$defs")
-    if isinstance(defs, dict) and "JsonValue" in defs:
-        defs["JsonValue"] = copy.deepcopy(_JSON_VALUE_CONCRETE_DEF)
+    if not (isinstance(defs, dict) and "JsonValue" in defs):
+        return schema
+    _inline_json_value_refs(schema)
+    defs.pop("JsonValue", None)
+    if not defs:
+        schema.pop("$defs", None)
     return schema
 
 def safe_serialize(obj: Any) -> str:

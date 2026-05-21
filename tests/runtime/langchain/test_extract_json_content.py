@@ -19,6 +19,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import JsonValue
 
 from elitea_sdk.runtime.langchain.utils import (
+    _JSON_VALUE_REF,
     extract_json_content,
     make_anthropic_compatible_schema,
     parse_pydantic_type,
@@ -257,14 +258,20 @@ class TestParsePydanticType:
 
 
 class TestMakeAnthropicCompatibleSchema:
-    """Verify the Anthropic schema patch is correct and idempotent.
+    """Verify the Anthropic-compatible schema patch.
 
-    Two contracts:
-    1. Patched schemas pass ``transform_schema`` (the validator inside
-       ``langchain_anthropic.with_structured_output(method='json_schema')``).
-    2. The patch is a no-op for schemas without ``$defs.JsonValue`` — so
-       calling it from the structured-output boundary is always safe,
-       regardless of which fields the Pydantic model carries.
+    Three contracts the Anthropic / Bedrock / Foundry providers
+    collectively impose:
+    1. ``transform_schema`` (Anthropic SDK; runs for ``method='json_schema'``)
+       must accept the patched dict.
+    2. The patched dict must carry no symbol named ``JsonValue`` —
+       Azure AI Foundry's validator chases ``$ref: JsonValue`` and
+       reports *"Circular reference detected in schema definitions:
+       JsonValue -> JsonValue"* even when the def itself is not
+       self-referencing. The fix inlines every reference and drops
+       the def, leaving nothing to chase.
+    3. The patch is a no-op for schemas without ``$defs.JsonValue`` —
+       the boundary call site stays unconditional.
     """
 
     def test_patched_list_schema_passes_anthropic_transform(self):
@@ -281,21 +288,60 @@ class TestMakeAnthropicCompatibleSchema:
         patched = make_anthropic_compatible_schema(model)
         transform_schema(patched)
 
-    def test_patched_def_is_concrete_union(self):
-        """The replacement ``$defs.JsonValue`` must be a concrete union of
-        JSON primitives + object + array. The array branch intentionally
-        omits ``items`` to avoid circular references that Azure rejects.
-        This is non-recursive but still allows arbitrary JSON values."""
+    def test_patched_schema_inlines_json_value_union(self):
+        """Every ``$ref: #/$defs/JsonValue`` is replaced in place with
+        the concrete anyOf union; ``$defs.JsonValue`` is dropped, and
+        an otherwise-empty ``$defs`` goes with it."""
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
         patched = make_anthropic_compatible_schema(model)
-        json_value_def = patched["$defs"]["JsonValue"]
-        assert "anyOf" in json_value_def
-        types_present = {b.get("type") for b in json_value_def["anyOf"] if "type" in b}
-        # six JSON primitives + object + array
+
+        # No $defs.JsonValue (and $defs is dropped when empty).
+        assert "JsonValue" not in patched.get("$defs", {})
+        # `items` field used to be {"$ref": "#/$defs/JsonValue"}; it is now
+        # an array whose items hold the inlined union directly.
+        items_field = patched["properties"]["items"]
+        assert items_field["type"] == "array"
+        inlined = items_field["items"]
+        assert "$ref" not in inlined
+        assert "anyOf" in inlined
+        types_present = {b.get("type") for b in inlined["anyOf"] if "type" in b}
         assert types_present == {"string", "number", "integer", "boolean", "null", "object", "array"}
-        # the array branch does NOT have items to avoid circular ref that Azure rejects
-        array_branch = next(b for b in json_value_def["anyOf"] if b.get("type") == "array")
-        assert "items" not in array_branch  # intentionally omitted for Azure compatibility
+        array_branch = next(b for b in inlined["anyOf"] if b.get("type") == "array")
+        assert "items" not in array_branch  # implicit any; non-circular
+
+    def test_patched_schema_preserves_sibling_description_on_ref(self):
+        """Pydantic emits ``$ref`` together with sibling keywords
+        (``description``, ``title``) for ``Field(description=...)``
+        on a ``JsonValue``-typed attribute. The walker must drop the
+        ``$ref`` while preserving siblings — otherwise the description
+        the agent author wrote disappears."""
+        model = create_pydantic_model("Test", {"val": {"type": "any", "description": "free-form blob"}})
+        patched = make_anthropic_compatible_schema(model)
+        val_field = patched["properties"]["val"]
+        assert "$ref" not in val_field
+        assert val_field["description"] == "free-form blob"
+        assert "anyOf" in val_field
+
+    def test_patched_schema_has_no_json_value_ref_anywhere(self):
+        """Foundry-specific guarantee: a recursive walk of the patched
+        schema must not encounter any ``{"$ref": "#/$defs/JsonValue"}``.
+        This is the cycle Foundry rejects."""
+        model = create_pydantic_model("Test", {
+            "items": {"type": "list", "description": "List field"},
+            "val": {"type": "any", "description": "Any field"},
+        })
+        patched = make_anthropic_compatible_schema(model)
+
+        def find_ref(node):
+            if isinstance(node, dict):
+                if node.get("$ref") == _JSON_VALUE_REF:
+                    return True
+                return any(find_ref(v) for v in node.values())
+            if isinstance(node, list):
+                return any(find_ref(item) for item in node)
+            return False
+
+        assert not find_ref(patched)
 
     def test_patch_does_not_mutate_input_model_schema(self):
         """Defensive: the patch must deep-copy. Mutating the cached
@@ -303,10 +349,14 @@ class TestMakeAnthropicCompatibleSchema:
         the OpenAI path on subsequent invocations and break the very
         provider divergence the patch exists to enforce."""
         model = create_pydantic_model("Test", {"items": {"type": "list"}})
-        original_def = model.model_json_schema()["$defs"]["JsonValue"]
+        original_schema = model.model_json_schema()
         patched = make_anthropic_compatible_schema(model)
-        patched["$defs"]["JsonValue"]["anyOf"].append({"type": "string"})
-        assert model.model_json_schema()["$defs"]["JsonValue"] == original_def
+        # Mutate the patched schema; the original cached schema must remain
+        # untouched (still has the empty $defs.JsonValue Pydantic emits for
+        # OpenAI compatibility).
+        patched["properties"]["items"]["items"]["anyOf"].append({"type": "string"})
+        assert model.model_json_schema() == original_schema
+        assert model.model_json_schema()["$defs"]["JsonValue"] == {}
 
     def test_patch_is_noop_when_no_json_value_def(self):
         """Schemas without ``$defs.JsonValue`` (e.g., a model with only
@@ -349,17 +399,20 @@ class TestCreatePydanticModel:
         assert getattr(instance, ELITEA_RS) == ""
 
     def test_patched_model_schema_accepted_by_anthropic(self):
-        """The patched schema (what actually flows to Anthropic) must
-        have no empty ``$defs`` entries — that's what
-        ``transform_schema`` rejects. The unpatched schema *does* have
-        the empty ``$defs.JsonValue`` (intentional — needed for OpenAI);
-        ``make_anthropic_compatible_schema`` is the boundary that
-        translates between the two provider expectations."""
+        """The patched schema must carry no ``JsonValue`` symbol —
+        Anthropic's ``transform_schema`` rejects empty defs, and Azure
+        Foundry rejects any ``$ref`` chain involving ``JsonValue``."""
         model = create_pydantic_model("LLMOutput", {
             "items": {"type": "list", "description": "Result items"},
         })
         patched = make_anthropic_compatible_schema(model)
         assert patched["properties"]["items"]["type"] == "array"
+        # No JsonValue def survives, and any defs that do survive are non-empty.
         defs = patched.get("$defs", {})
+        assert "JsonValue" not in defs
         for def_name, def_schema in defs.items():
             assert def_schema, f"Empty schema definition after patch: {def_name}"
+        # The consumer property holds the inlined union, not a $ref.
+        items_inner = patched["properties"]["items"]["items"]
+        assert items_inner.get("$ref") is None
+        assert "anyOf" in items_inner
