@@ -2193,7 +2193,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             {
                 "name": "execute_generic_rq",
                 "ref": self.execute_generic_rq,
-                "description": self.execute_generic_rq.__doc__,
+                "description": f"{self.execute_generic_rq.__doc__}\nAPI version: {self.api_version}",
                 "args_schema": JiraInput,
             }
         ]

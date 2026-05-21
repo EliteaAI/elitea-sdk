@@ -440,6 +440,10 @@ def parse_pydantic_type(type_name: str):
     return JsonValue
 
 
+# Non-recursive JSON value schema for maximum provider compatibility.
+# Azure rejects circular/self-referencing definitions, so this schema
+# avoids $ref entirely by using a permissive {} for array items.
+# This means arrays can contain ANY JSON values (validated at runtime).
 _JSON_VALUE_CONCRETE_DEF: dict = {
     "anyOf": [
         {"type": "string"},
@@ -448,32 +452,31 @@ _JSON_VALUE_CONCRETE_DEF: dict = {
         {"type": "boolean"},
         {"type": "null"},
         {"type": "object"},
-        {"type": "array", "items": {"$ref": "#/$defs/JsonValue"}},
+        {"type": "array"},  # items: any (implicit, avoids circular ref)
     ]
 }
 
 
 def make_anthropic_compatible_schema(pydantic_model: Any) -> dict:
-    """Return a JSON-schema dict for ``pydantic_model`` accepted by
-    Anthropic's ``transform_schema`` (the validator inside
-    ``langchain_anthropic.ChatAnthropic.with_structured_output``).
+    """Return a JSON-schema dict for ``pydantic_model`` compatible with
+    both Anthropic's ``transform_schema`` and Azure's schema validator.
 
     Pydantic's ``JsonValue`` emits ``"$defs": {"JsonValue": {}}`` — a
     deliberately empty definition because the type self-references.
-    ``transform_schema`` rejects empty schema nodes with
-    *"Schema must have a 'type', 'anyOf', 'oneOf', or 'allOf' field"*,
-    so the empty def must be replaced before the schema reaches Anthropic.
 
-    The replacement is the canonical recursive JSON-value union: the six
-    JSON primitives plus ``object`` plus ``array`` whose ``items`` refs
-    back to ``JsonValue`` itself. ``transform_schema`` accepts this
-    (verified via integration test) and the recursion preserves the full
-    semantics of ``JsonValue`` — Anthropic models can still emit
-    arbitrarily nested JSON.
+    This causes TWO issues:
+    1. Anthropic's ``transform_schema`` rejects empty schema nodes with
+       *"Schema must have a 'type', 'anyOf', 'oneOf', or 'allOf' field"*
+    2. Azure rejects circular/self-referencing definitions with
+       *"Circular reference detected in schema definitions"*
+
+    The fix replaces the empty def with a non-recursive union of JSON
+    primitives. The array branch uses implicit items (any) rather than
+    a ``$ref`` back to ``JsonValue`` — this avoids the circular reference
+    that Azure rejects while still allowing arbitrary JSON values.
 
     For non-``JsonValue`` schemas (no ``$defs.JsonValue`` to patch) the
-    function is a no-op deep copy. Safe to call unconditionally for any
-    Anthropic-bound structured-output invocation.
+    function is a no-op deep copy. Safe to call unconditionally.
     """
     schema = copy.deepcopy(pydantic_model.model_json_schema())
     defs = schema.get("$defs")
