@@ -1439,7 +1439,6 @@ class EliteAClient:
         try:
             from ..utils.toolkit_utils import instantiate_toolkit_with_client
             from langchain_core.runnables import RunnableConfig
-            import logging
             import time
 
             logger.info(f"Testing tool '{tool_name}' from toolkit '{toolkit_config.get('toolkit_name')}' with LLM '{llm_model}'")
@@ -1707,7 +1706,6 @@ class EliteAClient:
             # Re-raise McpAuthorizationRequired to allow proper handling upstream
             if isinstance(e, McpAuthorizationRequired):
                 raise
-            logger = logging.getLogger(__name__)
             logger.error(f"Error in test_toolkit_tool: {str(e)}")
             return {
                 "success": False,
