@@ -297,9 +297,11 @@ document_loaders_map = {
         'is_multimodal_processing': False,
         'kwargs': {
             'process_attachments': True,
-            'ignore_empty_body': True
+            'ignore_empty_body': True,
+            'max_attachment_depth': 2,
+            'max_attachment_size_mb': 10
         },
-        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True}
+        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True, 'max_attachment_depth': True, 'max_attachment_size_mb': True}
     },
     '.msg': {
         'class': EliteAEmailLoader,
@@ -307,9 +309,11 @@ document_loaders_map = {
         'is_multimodal_processing': False,
         'kwargs': {
             'process_attachments': True,
-            'ignore_empty_body': True
+            'ignore_empty_body': True,
+            'max_attachment_depth': 2,
+            'max_attachment_size_mb': 10
         },
-        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True}
+        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True, 'max_attachment_depth': True, 'max_attachment_size_mb': True}
     },
 }
 

@@ -72,6 +72,8 @@ class EliteAEmailLoader(BaseLoader):
                 process_attachments (bool): Whether to process nested attachments. Default: True.
                 ignore_empty_body (bool): Return empty list if email has no body content. Default: True.
                 max_tokens (int): Maximum tokens per chunk. Default: 512.
+                max_attachment_depth (int): Maximum recursion depth for nested attachments. Default: 2.
+                max_attachment_size_mb (int): Maximum attachment size in MB to process. Default: 10.
 
         Raises:
             ValueError: If neither file_path nor (file_content + file_name) is provided.
@@ -82,6 +84,8 @@ class EliteAEmailLoader(BaseLoader):
         self.process_attachments = kwargs.get('process_attachments', True)
         self.ignore_empty_body = kwargs.get('ignore_empty_body', True)
         self.max_tokens = kwargs.get('max_tokens', 512)
+        self.max_attachment_depth = kwargs.get('max_attachment_depth', 2)
+        self.max_attachment_size_mb = kwargs.get('max_attachment_size_mb', 10)
 
         if not self.file_path and not (self.file_content and self.file_name):
             raise ValueError("Either 'file_path' or ('file_content' and 'file_name') must be provided.")
@@ -319,17 +323,29 @@ class EliteAEmailLoader(BaseLoader):
             return self._extract_attachments_with_content_from_msg()
         return self._extract_attachments_with_content_from_eml()
 
-    def _parse_attachment_content(self, filename: str, content: bytes) -> str:
+    def _parse_attachment_content(self, filename: str, content: bytes, current_depth: int = 0) -> str:
         """
         Parse attachment content using appropriate loader based on file extension.
 
         Args:
             filename: The attachment filename.
             content: The attachment content as bytes.
+            current_depth: Current recursion depth (used to prevent infinite recursion).
 
         Returns:
             Parsed content as string, or empty string if parsing fails.
         """
+        # Check recursion depth
+        if current_depth >= self.max_attachment_depth:
+            logger.warning(f"Max attachment depth ({self.max_attachment_depth}) reached, skipping nested attachment: {filename}")
+            return ""
+
+        # Check attachment size
+        content_size_mb = len(content) / (1024 * 1024)
+        if content_size_mb > self.max_attachment_size_mb:
+            logger.warning(f"Attachment {filename} size ({content_size_mb:.2f}MB) exceeds limit ({self.max_attachment_size_mb}MB), skipping")
+            return ""
+
         from .constants import loaders_map
 
         _, extension = os.path.splitext(filename)
@@ -355,7 +371,19 @@ class EliteAEmailLoader(BaseLoader):
 
             loader_kwargs.pop('max_tokens', None)
 
-            loader = loader_cls(file_path=temp_file, **loader_kwargs)
+            # Pass depth to nested email loaders to prevent infinite recursion
+            # Check if loader is same class or subclass of current email loader
+            if isinstance(loader_cls, type) and issubclass(loader_cls, self.__class__):
+                loader_kwargs['max_attachment_depth'] = self.max_attachment_depth
+                loader_kwargs['max_attachment_size_mb'] = self.max_attachment_size_mb
+                # Create a depth-aware wrapper for nested attachments
+                loader = loader_cls(file_path=temp_file, **loader_kwargs)
+                # Monkey-patch the _parse_attachment_content to pass depth + 1
+                original_parse = loader._parse_attachment_content
+                loader._parse_attachment_content = lambda fn, cnt: original_parse(fn, cnt, current_depth + 1)
+            else:
+                loader = loader_cls(file_path=temp_file, **loader_kwargs)
+
             documents = loader.load()
 
             page_contents = [doc.page_content for doc in documents if doc.page_content]
@@ -526,3 +554,28 @@ class EliteAEmailLoader(BaseLoader):
         """
         for doc in self.load():
             yield doc
+
+    def get_content(self) -> str:
+        """
+        Get email content as a formatted string for interactive parsing.
+
+        This method is used by ADO and other toolkits when parse_attachments=True.
+        Returns the same formatted content as would appear in page_content.
+
+        Returns:
+            Formatted email content with headers, body, and attachments.
+        """
+        try:
+            # Load raw documents (without chunking)
+            docs = self._load_raw()
+
+            if not docs:
+                return ""
+
+            # Return the page_content of the first (and typically only) document
+            # This contains the full formatted email: headers + body + attachments
+            return docs[0].page_content
+
+        except Exception as e:
+            logger.warning(f"Failed to get email content: {e}")
+            return ""

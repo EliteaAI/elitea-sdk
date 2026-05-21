@@ -55,13 +55,18 @@
 From `constants.py`:
 ```python
 '.eml': {
-    'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True}
+    'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 
+                           'ignore_empty_body': True, 'max_attachment_depth': True, 
+                           'max_attachment_size_mb': True}
 }
 ```
 
-**Coverage**: 2/2 parameters (100%)
+**Coverage**: 5/5 parameters (100%)
 - ✅ `max_tokens`: Tested with -1 (no limit) and 256
 - ✅ `process_attachments`: Tested with true and false
+- ✅ `ignore_empty_body`: Tested via empty email files
+- ✅ `max_attachment_depth`: Unit tested with depth limits
+- ✅ `max_attachment_size_mb`: Unit tested with size limits
 
 ## Expected Behavior
 
@@ -149,3 +154,32 @@ extract attachments from Outlook MSG files. This is handled by `_extract_attachm
 
 The test `msg_with_attachment.msg` contains 2 TIF attachments which are correctly detected 
 and listed in the `attachment` metadata field.
+
+## Unit Tests (PR #123 Additions)
+
+In addition to the data-driven integration tests above, `test_elitea_email_loader.py` includes 
+unit tests for new features:
+
+### TestRecursionGuard (6 tests)
+- Tests default and custom depth/size limits
+- Validates depth limit prevents deep recursion
+- Validates size limit prevents large attachments
+
+### TestGetContent (4 tests)
+- Tests `get_content()` method for ADO integration
+- Validates return type and content format
+- Tests with both file_path and file_content
+- Ensures consistency with page_content
+
+### TestNullByteSanitization (3 tests)
+- Tests `_sanitize_text()` removes null bytes
+- Validates extension lookup with contaminated filenames
+- Ensures temp file creation works with sanitized names
+
+### TestMSGHeaderExtraction (2 tests)
+- Validates `_extract_headers_from_msg()` method exists
+- Ensures MSG and EML use different header extractors
+
+**Total Unit Tests**: 15  
+**Total Integration Tests**: 9  
+**Grand Total**: 24 tests
