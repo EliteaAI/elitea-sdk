@@ -1797,6 +1797,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         Base loader for Jira issues, used to load issues as documents.
         Uses the existing Jira client instance to fetch and process issues.
         """
+        client = self._get_client()
         # Initialize indexing stats for this run
         self._init_indexing_stats()
 
@@ -1835,6 +1836,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
             # Fetch issues using the existing Jira client
             issue_generator = self._jql_get_tickets(
+                client,
                 jql_query,
                 fields=final_fields,
                 limit=max_total_issues
@@ -1877,11 +1879,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """
         Process a base document to extract and index Jira issues extra fields: comments, attachments, etc..
         """
-
+        client = self._get_client()
         issue_key = base_document.metadata.get('issue_key')
         # get attachments content
         if self._include_attachments:
-            issue = self._client.issue(issue_key, fields="attachment")
+            issue = client.issue(issue_key, fields="attachment")
             attachments = issue.get('fields', {}).get('attachment', [])
             for attachment in attachments:
                 # get extension
@@ -1894,11 +1896,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 attachment_id = f"attach_{attachment['id']}"
                 base_document.metadata.setdefault(IndexerKeywords.DEPENDENT_DOCS.value, []).append(attachment_id)
                 try:
-                    attachment_content = self._client.get_attachment_content(attachment['id'])
+                    attachment_content = client.get_attachment_content(attachment['id'])
                 except Exception as e:
                     logger.error(f"Failed to download attachment {attachment['filename']} for issue {issue_key}: {str(e)}")
                     try:
-                        attachment_content = self._client.get(path=f"secure/attachment/{attachment['id']}/{attachment['filename']}", not_json_response=True)
+                        attachment_content = client.get(path=f"secure/attachment/{attachment['id']}/{attachment['filename']}", not_json_response=True)
                     except Exception as e2:
                         logger.error(f"Fallback also failed for attachment {attachment['filename']}: {str(e2)}")
                         self._track_skipped_attachment(attachment['filename'], reason="error")
@@ -1935,7 +1937,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                                        'type': 'comment',
                                    })
 
-    def _jql_get_tickets(self, jql, fields="*all", start=0, limit=None, expand=None, validate_query=None):
+    def _jql_get_tickets(self, client: Jira, jql, fields="*all", start=0, limit=None, expand=None, validate_query=None):
         """
         Generator that yields batches of Jira issues based on JQL query.
         """
@@ -1955,12 +1957,12 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if validate_query is not None:
             params["validateQuery"] = validate_query
 
-        url = self._client.resource_url("search/jql" if self.api_version == '3' else "search")
+        url = client.resource_url("search/jql" if self.api_version == '3' else "search")
 
         while True:
             params["startAt"] = int(start)
             try:
-                response = self._client.get(url, params=params)
+                response = client.get(url, params=params)
                 if not response:
                     break
             except ApiError as e:
