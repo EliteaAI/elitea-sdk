@@ -812,7 +812,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error creating Jira issue: {stacktrace}")
             return ToolException(f"Error creating Jira issue: {stacktrace}")
 
-    def _update_issue(self, issue_json: str):
+    def _update_issue(self, client: Jira, issue_json: str):
         """ Update an issue in Jira.
             IMPORTANT: default labels won't be changed
         """
@@ -822,8 +822,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             key = params["key"]
             update_body = {"fields": dict(params["fields"])} if params.get("fields") else {}
             update_body = update_body | {"update": dict(params["update"])} if params.get('update') else update_body
-            issue = self._client.update_issue(issue_key=key, update=dict(update_body))
-            issue_url = f"{self._client.url.rstrip('/')}/browse/{key}"
+            issue = client.update_issue(issue_key=key, update=dict(update_body))
+            issue_url = f"{client.url.rstrip('/')}/browse/{key}"
             output = f"Done. Issue {key} has been updated successfully. You can view it at {issue_url}. Details: {str(issue)}"
             logger.info(output)
             return output
@@ -836,15 +836,16 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def update_issue(self, issue_json: str):
         """ Update an issue in Jira."""
+        client = self._get_client()
         params = json.loads(issue_json)
         key = params["key"]
-        result = self._update_issue(issue_json)
+        result = self._update_issue(client, issue_json)
         self._add_default_labels(issue_key=key)
         return result
 
     def modify_labels(self, issue_key: str, add_labels: list[str] = None, remove_labels: list[str] = None):
         """Updates labels of an issue in Jira."""
-
+        client = self._get_client()
         if add_labels is None and remove_labels is None:
             return ToolException("You must provide at least 1 label to be added or removed")
         update_issue_json = {"key": issue_key, "update": {"labels": []}}
@@ -857,7 +858,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if remove_labels:
             for label in remove_labels:
                 update_issue_json["update"]["labels"].append({"remove": label})
-        return self._update_issue(json.dumps(update_issue_json))
+        return self._update_issue(client, json.dumps(update_issue_json))
 
     def list_comments(self, issue_key: str):
         """ Extract the comments related to specified Jira issue """
@@ -932,29 +933,29 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         else:
             return f"[^{filename}]"
 
-    def _upload_file_from_artifact(self, issue_key: str, filepath: str, filename: str = None) -> Dict[str, Any]:
+    def _upload_file_from_artifact(self, client: Jira, issue_key: str, filepath: str, filename: str = None) -> Dict[str, Any]:
         """Upload file from artifact storage to Jira issue."""
         # Get raw file bytes from artifact storage using shared utility
         try:
             file_bytes, artifact_filename = get_file_bytes_from_artifact(self.elitea, filepath)
         except Exception as e:
             raise ToolException(f"Failed to retrieve artifact '{filepath}': {str(e)}")
-        
+
         # Use provided filename or fallback to artifact filename
         filename = filename or artifact_filename
-        
+
         if not file_bytes:
             raise ToolException(f"Artifact '{filepath}' not found or empty")
-        
+
         # Detect MIME type using shared utility
         mime_type = detect_mime_type(file_bytes, filename)
-        
+
         # Upload to Jira as attachment
         file_io = BytesIO(file_bytes)
         file_io.name = filename
-        
+
         try:
-            attachment_response = self._client.add_attachment_object(
+            attachment_response = client.add_attachment_object(
                 issue_key=issue_key,
                 attachment=file_io
             )
@@ -986,16 +987,17 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         position: Literal["append", "prepend"] = "append"
     ) -> str:
         """Upload file from artifact and add to issue description. Images/videos inline, others as links."""
+        client = self._get_client()
         try:
             # Upload file to Jira
-            upload_info = self._upload_file_from_artifact(issue_key, filepath, filename)
+            upload_info = self._upload_file_from_artifact(client, issue_key, filepath, filename)
             uploaded_filename = upload_info['filename']
             mime_type = upload_info['mime_type']
             attachment_id = upload_info.get('attachment_id')
             content_url = upload_info.get('content_url', '')
-            
+
             # Get current issue description
-            issue = self._client.issue(issue_key)
+            issue = client.issue(issue_key)
             current_description_raw = issue.get('fields', {}).get('description', '') or ''
             
             # Handle v2 vs v3 differently
@@ -1051,13 +1053,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                     new_description = f"{current_description}{separator}{file_markup}"
             
             # Update the description field
-            self._client.update_issue_field(
+            client.update_issue_field(
                 key=issue_key,
                 fields={'description': new_description}
             )
-            
+
             # Return success message
-            issue_url = f"{self._client.url.rstrip('/')}/browse/{issue_key}"
+            issue_url = f"{client.url.rstrip('/')}/browse/{issue_key}"
             file_type = "image" if mime_type.startswith('image/') else "video" if mime_type.startswith('video/') else "file"
             return (
                 f"File '{uploaded_filename}' uploaded and added to {issue_key} description as {file_type}. "
@@ -1080,15 +1082,16 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         position: Literal["append", "prepend"] = "append"
     ) -> str:
         """Upload file and add to existing comment. Images/videos inline, others as links."""
+        client = self._get_client()
         try:
             # Upload file to Jira
-            upload_info = self._upload_file_from_artifact(issue_key, filepath, filename)
+            upload_info = self._upload_file_from_artifact(client, issue_key, filepath, filename)
             uploaded_filename = upload_info['filename']
             mime_type = upload_info['mime_type']
             content_url = upload_info.get('content_url', '')
             
             # Get existing comment
-            comment = self._client.issue_get_comment(issue_key, comment_id)
+            comment = client.issue_get_comment(issue_key, comment_id)
             existing_body_raw = comment.get('body', '')
             
             # Handle v2 vs v3 differently
@@ -1144,9 +1147,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                     new_body = f"{existing_body}{separator}{file_markup}"
             
             # Update comment
-            self._client.issue_edit_comment(issue_key, comment_id, new_body)
-            
-            issue_url = f"{self._client.url}browse/{issue_key}"
+            client.issue_edit_comment(issue_key, comment_id, new_body)
+
+            issue_url = f"{client.url}browse/{issue_key}"
             file_type = "image" if mime_type.startswith('image/') else "video" if mime_type.startswith('video/') else "file"
             return (
                 f"File '{uploaded_filename}' uploaded and added to {issue_key} comment {comment_id} as {file_type}. "
