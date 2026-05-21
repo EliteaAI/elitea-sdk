@@ -1342,6 +1342,8 @@ class EliteAClient:
                 logger.warning(f"Toolkit type '{toolkit_config_type}' is skipping model validation")
                 toolkit_config_parsed_json['settings'] = toolkit_config.get('settings', {})
             return toolkit_config_parsed_json
+        except ToolkitConfigurationError:
+            raise
         except ValidationError as e:
             missing = [err['loc'][-1] for err in e.errors() if err['type'] == 'missing']
             msg = f"Missing required fields: {', '.join(missing)}" if missing else f"Toolkit '{toolkit_config_type}' configuration error"
@@ -1678,6 +1680,19 @@ class EliteAClient:
                     "execution_time_seconds": execution_time
                 }
 
+            except ToolkitConfigurationError as config_error:
+                # FIXME: Consider creating a helper function to return toolkit results 
+                execution_time = time.time() - start_time
+                return {
+                    "success": False,
+                    "error": config_error.user_message,
+                    "debug_error": str(config_error),
+                    "tool_name": tool_name,
+                    "toolkit_config": toolkit_config_parsed_json,
+                    "llm_model": llm_model,
+                    "events_dispatched": events_dispatched,
+                    "execution_time_seconds": execution_time
+                }
             except Exception as tool_error:
                 # Calculate execution time even for failed executions
                 execution_time = time.time() - start_time
