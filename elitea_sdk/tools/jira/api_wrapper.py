@@ -1701,8 +1701,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error retrieving attachment {image_ref}: {str(e)}")
             return f"[Image: {image_ref} - Error: {str(e)}]"
 
-    def get_processed_comments_list_with_image_description(self, jira_issue_key: str, prompt: Optional[str] = None, context_radius: int = 500, process_images: bool = True):
-        client = self._get_client()
+    def get_processed_comments_list_with_image_description(self, client: Jira, jira_issue_key: str, prompt: Optional[str] = None, context_radius: int = 500, process_images: bool = True):
         # Retrieve all comments for the issue
         comments = client.issue_get_comments(jira_issue_key)
 
@@ -1767,13 +1766,15 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             The comments with image references replaced with contextual descriptions,
             or raw comments when process_images=False
         """
+        client = self._get_client()
         try:
             if process_images and not self.llm:
                 raise ToolException(
                     "LLM is required for image processing but is not configured in this toolkit instance. "
                     "Please configure an LLM in the toolkit settings or set process_images=False to skip image processing."
                 )
-            processed_comments = self.get_processed_comments_list_with_image_description(jira_issue_key=jira_issue_key,
+            processed_comments = self.get_processed_comments_list_with_image_description(client=client,
+                                                                                         jira_issue_key=jira_issue_key,
                                                                                          prompt=prompt,
                                                                                          context_radius=context_radius,
                                                                                          process_images=process_images)
