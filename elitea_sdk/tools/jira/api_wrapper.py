@@ -1922,7 +1922,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                                            'type': 'attachment',
                                        })
         if self._include_comments:
-            comments = self.get_processed_comments_list_with_image_description(issue_key)
+            comments = self.get_processed_comments_list_with_image_description(client, issue_key)
             if comments:
                 for comment in comments:
                     yield Document(page_content='',
