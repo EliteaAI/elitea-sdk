@@ -132,7 +132,7 @@ class EliteAEmailLoader(BaseLoader):
         else:
             elements = partition_func(filename=str(file_obj), process_attachments=False)
 
-        return self._elements_to_documents(elements)
+        return self._elements_to_documents(elements, file_type)
 
     def _extract_headers_from_eml(self) -> dict:
         """
@@ -167,6 +167,63 @@ class EliteAEmailLoader(BaseLoader):
                 headers['date'] = _sanitize_text(str(msg['Date']))
         except Exception as e:
             logger.warning(f"Failed to extract email headers: {e}")
+
+        return headers
+
+    def _extract_headers_from_msg(self) -> dict:
+        """
+        Extract email headers directly using extract_msg library.
+
+        This is used as a fallback when unstructured returns no elements
+        for MSG files (e.g., email with headers but empty body).
+
+        Returns:
+            Dict with 'from', 'to', 'cc', 'subject', 'date' keys (if present).
+        """
+        import extract_msg
+
+        headers = {}
+        msg = None
+        try:
+            if self.file_path:
+                msg = extract_msg.openMsg(self.file_path)
+            else:
+                # For in-memory content, write to temp file as extract_msg requires file path
+                temp_file = None
+                try:
+                    temp_dir = tempfile.mkdtemp()
+                    temp_file = os.path.join(temp_dir, self.file_name or "temp.msg")
+                    with open(temp_file, 'wb') as f:
+                        f.write(self.file_content)
+                    msg = extract_msg.openMsg(temp_file)
+                finally:
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                            os.rmdir(os.path.dirname(temp_file))
+                        except OSError:
+                            pass
+
+            if msg:
+                if msg.sender:
+                    headers['from'] = [_sanitize_text(str(msg.sender))]
+                if msg.to:
+                    headers['to'] = [_sanitize_text(str(msg.to))]
+                if msg.cc:
+                    headers['cc'] = [_sanitize_text(str(msg.cc))]
+                if msg.subject:
+                    headers['subject'] = _sanitize_text(str(msg.subject))
+                if msg.date:
+                    headers['date'] = _sanitize_text(str(msg.date))
+
+        except Exception as e:
+            logger.warning(f"Failed to extract MSG headers: {e}")
+        finally:
+            if msg:
+                try:
+                    msg.close()
+                except Exception:
+                    pass
 
         return headers
 
@@ -315,7 +372,7 @@ class EliteAEmailLoader(BaseLoader):
                 except OSError:
                     pass
 
-    def _elements_to_documents(self, elements) -> List[Document]:
+    def _elements_to_documents(self, elements, file_type: str) -> List[Document]:
         """
         Convert unstructured elements to LangChain Documents.
 
@@ -324,6 +381,7 @@ class EliteAEmailLoader(BaseLoader):
 
         Args:
             elements: List of unstructured Element objects
+            file_type: 'eml' or 'msg' - used for type-aware header extraction
 
         Returns:
             List containing a single Document with combined content and metadata.
@@ -336,8 +394,11 @@ class EliteAEmailLoader(BaseLoader):
 
         # Extract metadata based on elements presence
         if is_empty_body:
-            # No body content - extract headers directly using email module
-            headers = self._extract_headers_from_eml()
+            # No body content - extract headers directly using appropriate method
+            if file_type == 'msg':
+                headers = self._extract_headers_from_msg()
+            else:
+                headers = self._extract_headers_from_eml()
             metadata = {**headers}
         else:
             # Extract metadata from unstructured elements
@@ -363,7 +424,10 @@ class EliteAEmailLoader(BaseLoader):
 
             # If date not found from unstructured, extract from email headers
             if 'date' not in metadata:
-                headers = self._extract_headers_from_eml()
+                if file_type == 'msg':
+                    headers = self._extract_headers_from_msg()
+                else:
+                    headers = self._extract_headers_from_eml()
                 if 'date' in headers:
                     metadata['date'] = headers['date']
 
