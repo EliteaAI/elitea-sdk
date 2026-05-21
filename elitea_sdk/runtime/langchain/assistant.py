@@ -1330,6 +1330,19 @@ class Assistant:
                 self._graph = compiled_graph
 
             def invoke(self, input, config=None, **kwargs):
+                # Normalize input shape: swarm uses MessagesState (key "messages"),
+                # but Application._run / formulate_query produces {"input": [...]}
+                # when invoked as a sub-agent of another agent. Without this
+                # translation, state["messages"] stays empty on the swarm's first
+                # turn and the peer's agent_node calls Anthropic with [SystemMessage]
+                # only — 500 "messages is required" (#4949 chat/nested-agent path).
+                if isinstance(input, dict) and not input.get("messages"):
+                    raw_input = input.get("input")
+                    if isinstance(raw_input, list) and raw_input:
+                        input = {**input, "messages": list(raw_input)}
+                    elif isinstance(raw_input, str) and raw_input:
+                        input = {**input, "messages": [HumanMessage(content=raw_input)]}
+
                 thread_id = (
                     config.get("configurable", {}).get("thread_id")
                     if isinstance(config, dict) else None

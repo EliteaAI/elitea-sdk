@@ -250,6 +250,105 @@ def test_subagent_exception_yields_error_toolmessage_and_parent_continues():
     assert error_msg.tool_call_id == 'call-fail-1'
 
 
+# --- #4949 (chat / nested-agent path): swarm-as-subagent input normalization --
+
+
+def test_swarm_subagent_invoked_via_application_input_translates_to_messages():
+    """When a swarm-mode child agent is invoked as an Application tool from a parent,
+    Application._run/formulate_query passes {"input": [HumanMessage(...)]}. The swarm
+    graph uses MessagesState (key "messages") — without translation, state["messages"]
+    stays empty and the peer's agent_node calls Anthropic with [SystemMessage] only,
+    raising 500 'messages is required'. This is the failure mode reported in #4949
+    (chat-execution + nested-agent paths)."""
+    from unittest.mock import MagicMock
+    from langgraph.checkpoint.memory import MemorySaver
+
+    child_app = Application(
+        name='child',
+        description='child',
+        application=StaticApplication(),
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+    )
+
+    swarm_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={
+            'instructions': 'You are the main agent',
+            'tools': [],
+            'meta': {'internal_tools': ['swarm']},
+            'internal_tools': ['swarm'],
+        },
+        client=MagicMock(),
+        tools=[child_app],
+        memory=MemorySaver(),
+        app_type='agent',
+    )
+
+    adapter = swarm_assistant.runnable()
+
+    captured = {}
+    real_graph = adapter._graph
+
+    def capturing_invoke(input, config=None, **kwargs):
+        captured['input'] = input
+        # Don't actually run the swarm graph — just capture and return a minimal result
+        return {'messages': [HumanMessage(content='captured')]}
+
+    adapter._graph = MagicMock()
+    adapter._graph.invoke = capturing_invoke
+    adapter._graph.get_state = real_graph.get_state
+
+    adapter.invoke(
+        {'input': [HumanMessage(content='Run the child task')]},
+        config={'configurable': {'thread_id': 'swarm-as-subagent-thread'}},
+    )
+
+    assert captured['input'].get('messages'), (
+        'SwarmResultAdapter did not translate input["input"] to input["messages"] — '
+        'swarm peer agent_node would receive empty state["messages"] and Anthropic '
+        'would crash with "messages is required" (#4949 chat/nested path)'
+    )
+    msgs = captured['input']['messages']
+    assert isinstance(msgs[0], HumanMessage)
+    assert msgs[0].content == 'Run the child task'
+
+
+def test_swarm_subagent_input_translation_handles_string_task():
+    """When Application is_subgraph=True (pipeline-shaped child), formulate_query
+    passes input as a plain string. The adapter must wrap it in a HumanMessage."""
+    from unittest.mock import MagicMock
+    from langgraph.checkpoint.memory import MemorySaver
+
+    child_app = Application(
+        name='child', description='child', application=StaticApplication(),
+        return_type='str', client=None, is_subgraph=True,
+    )
+    swarm_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'main', 'tools': [], 'meta': {'internal_tools': ['swarm']},
+              'internal_tools': ['swarm']},
+        client=MagicMock(),
+        tools=[child_app],
+        memory=MemorySaver(),
+        app_type='agent',
+    )
+    adapter = swarm_assistant.runnable()
+
+    captured = {}
+    adapter._graph = MagicMock()
+    adapter._graph.invoke = lambda inp, cfg=None, **k: captured.setdefault('input', inp) or {'messages': []}
+    adapter._graph.get_state = lambda cfg: None
+
+    adapter.invoke({'input': 'plain task string'}, config={'configurable': {'thread_id': 't'}})
+
+    msgs = captured['input'].get('messages') or []
+    assert msgs, 'string input was not translated to a HumanMessage list'
+    assert isinstance(msgs[0], HumanMessage)
+    assert msgs[0].content == 'plain task string'
+
+
 # --- TASK_DELEGATION_ADDON injection ------------------------------------------
 
 
