@@ -55,6 +55,11 @@ class MockArtifactWrapper:
             "rows": [row.copy() for row in self._rows]
         })
 
+    @staticmethod
+    def _fnmatch_nocase(filename: str, pattern: str) -> bool:
+        """Case-insensitive fnmatch for cross-platform consistency."""
+        return fnmatch.fnmatch(filename.lower(), pattern.lower())
+
     def list_files(self, bucket_name=None, folder=None, recursive=False,
                    include=None, skip=None, return_as_string=True):
         """Replicate the actual list_files implementation for testing."""
@@ -83,12 +88,12 @@ class MockArtifactWrapper:
             if file_info.get('type') == 'file':
                 full_key = file_info.get('key', prefix + file_info['name'])
 
-                # Check skip patterns first
-                if skip and any(fnmatch.fnmatch(full_key, pattern) for pattern in skip):
+                # Check skip patterns first (case-insensitive)
+                if skip and any(self._fnmatch_nocase(full_key, pattern) for pattern in skip):
                     continue
 
-                # Check include patterns
-                if include and not any(fnmatch.fnmatch(full_key, pattern) for pattern in include):
+                # Check include patterns (case-insensitive)
+                if include and not any(self._fnmatch_nocase(full_key, pattern) for pattern in include):
                     continue
 
                 # Add S3 download link
@@ -490,16 +495,30 @@ class TestART_EDGE_EdgeCases:
         file_rows = [r for r in rows if r["type"] == "file"]
         assert file_rows == []
 
-    def test_EDGE04_case_sensitivity(self):
-        """fnmatch is case-sensitive by default."""
+    def test_EDGE04_case_insensitivity(self):
+        """Pattern matching is case-insensitive for backward compatibility."""
         wrapper = make_wrapper([
             {"key": "file.MD"},
+            {"key": "file.Md"},
             {"key": "file.md"},
+            {"key": "FILE.MD"},
         ])
         rows = list_files(wrapper, include=["*.md"])
         keys = get_file_keys(rows)
-        # Only lowercase matches
-        assert keys == {"file.md"}
+        # All case variations should match
+        assert keys == {"file.MD", "file.Md", "file.md", "FILE.MD"}
+
+    def test_EDGE04b_case_insensitive_skip(self):
+        """Skip patterns are also case-insensitive."""
+        wrapper = make_wrapper([
+            {"key": "temp.TMP"},
+            {"key": "file.txt"},
+            {"key": "cache.Tmp"},
+        ])
+        rows = list_files(wrapper, skip=["*.tmp"])
+        keys = get_file_keys(rows)
+        # .TMP and .Tmp should also be skipped
+        assert keys == {"file.txt"}
 
     def test_EDGE05_special_characters_in_filename(self):
         """Files with special characters in names."""
@@ -510,3 +529,115 @@ class TestART_EDGE_EdgeCases:
         ])
         rows = list_files(wrapper, include=["*.txt"])
         assert len(rows) == 3
+
+
+# ---------------------------------------------------------------------------
+# ART_CASE — Additional case-insensitivity tests
+# ---------------------------------------------------------------------------
+
+class TestART_CASE_CaseInsensitivity:
+
+    def test_CASE01_folder_pattern_case_insensitive(self):
+        """Folder patterns should match case-insensitively."""
+        wrapper = make_wrapper([
+            {"key": "DOCS/file.txt"},
+            {"key": "docs/file.txt"},
+            {"key": "Docs/file.txt"},
+            {"key": "other/file.txt"},
+        ])
+        rows = list_files(wrapper, include=["docs/*"])
+        keys = get_file_keys(rows)
+        # All case variations of 'docs/' should match
+        assert keys == {"DOCS/file.txt", "docs/file.txt", "Docs/file.txt"}
+
+    def test_CASE02_pattern_itself_is_case_insensitive(self):
+        """Pattern with uppercase should match lowercase files."""
+        wrapper = make_wrapper([
+            {"key": "readme.md"},
+            {"key": "guide.md"},
+        ])
+        # Pattern uses uppercase
+        rows = list_files(wrapper, include=["*.MD"])
+        keys = get_file_keys(rows)
+        # Should still match lowercase .md files
+        assert keys == {"readme.md", "guide.md"}
+
+    def test_CASE03_full_path_case_insensitive(self):
+        """Full path patterns match case-insensitively."""
+        wrapper = make_wrapper([
+            {"key": "_Shared/Config.MD"},
+            {"key": "_shared/config.md"},
+            {"key": "_SHARED/CONFIG.MD"},
+        ])
+        rows = list_files(wrapper, include=["_shared/*.md"])
+        keys = get_file_keys(rows)
+        # All variations should match
+        assert keys == {"_Shared/Config.MD", "_shared/config.md", "_SHARED/CONFIG.MD"}
+
+    def test_CASE04_combined_pattern_case_insensitive(self):
+        """Combined folder/extension patterns with mixed case."""
+        wrapper = make_wrapper([
+            {"key": "TEMP/draft.PDF"},
+            {"key": "temp/draft.pdf"},
+            {"key": "Temp/Draft.Pdf"},
+        ])
+        # Pattern in lowercase, files in various cases
+        rows = list_files(wrapper, skip=["temp/*.pdf"])
+        keys = get_file_keys(rows)
+        # All should be skipped despite case differences
+        assert len(keys) == 0
+
+    def test_CASE05_filename_mixed_case(self):
+        """Filenames with mixed case throughout."""
+        wrapper = make_wrapper([
+            {"key": "MyDocument.TXT"},
+            {"key": "myDocument.txt"},
+            {"key": "MYDOCUMENT.TXT"},
+        ])
+        rows = list_files(wrapper, include=["*document*.txt"])
+        keys = get_file_keys(rows)
+        assert keys == {"MyDocument.TXT", "myDocument.txt", "MYDOCUMENT.TXT"}
+
+
+# ---------------------------------------------------------------------------
+# ART_META — Glob metacharacter behavior tests
+# ---------------------------------------------------------------------------
+
+class TestART_META_Metacharacters:
+
+    def test_META01_bracket_pattern_matches_character_set(self):
+        """file[123].txt matches file1.txt, file2.txt, file3.txt."""
+        wrapper = make_wrapper([
+            {"key": "file1.txt"},
+            {"key": "file2.txt"},
+            {"key": "file4.txt"},
+        ])
+        rows = list_files(wrapper, include=["file[123].txt"])
+        keys = get_file_keys(rows)
+        # Only 1, 2, 3 should match; 4 excluded
+        assert keys == {"file1.txt", "file2.txt"}
+
+    def test_META02_question_mark_matches_single_char(self):
+        """file?.txt matches single character after 'file'."""
+        wrapper = make_wrapper([
+            {"key": "file1.txt"},
+            {"key": "file12.txt"},
+            {"key": "fileA.txt"},
+        ])
+        rows = list_files(wrapper, include=["file?.txt"])
+        keys = get_file_keys(rows)
+        # Only single character matches
+        assert keys == {"file1.txt", "fileA.txt"}
+
+    def test_META03_bracket_in_actual_filename(self):
+        """Files with literal brackets in names."""
+        wrapper = make_wrapper([
+            {"key": "report[v2].txt"},
+            {"key": "report.txt"},
+        ])
+        # Using * to match everything - brackets in filename itself
+        rows = list_files(wrapper, include=["*.txt"])
+        keys = get_file_keys(rows)
+        # Both should be included (wildcard matches any characters)
+        assert "report[v2].txt" in keys
+        assert "report.txt" in keys

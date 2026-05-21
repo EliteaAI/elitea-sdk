@@ -290,10 +290,19 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         values["artifact"] = values['elitea'].artifact(values['bucket'])
         return super().validate_toolkit(values)
 
+    @staticmethod
+    def _fnmatch_nocase(filename: str, pattern: str) -> bool:
+        """Case-insensitive fnmatch for cross-platform consistency.
+
+        Provides backward compatibility with the old regex-based filtering
+        that used re.IGNORECASE flag.
+        """
+        return fnmatch.fnmatch(filename.lower(), pattern.lower())
+
     def list_files(self, bucket_name=None, folder: str = None, recursive: bool = False,
                    include: List[str] = None, skip: List[str] = None, return_as_string=True):
         """List files in the artifact bucket with S3 download links.
-        
+
         Args:
             bucket_name: Bucket name (uses default if None)
             folder: Folder/prefix to scope the listing (e.g., '_shared' for subfolder)
@@ -304,7 +313,9 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                      - Folder patterns: ['docs/*', 'reports/*'] (when folder=None)
                      - Combined: ['docs/*.md']
                      If None/empty, all files are included (except those matching skip).
+                     Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
             skip: Glob patterns to exclude. Same syntax as include.
+                  Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
             return_as_string: If True, returns str(result), else returns dict
         
         Returns:
@@ -332,28 +343,53 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         # Apply include/skip pattern filtering
         include = include or []
         skip = skip or []
+
+        # Log filtering start if patterns are provided
+        total_before = len([r for r in result.get('rows', []) if r.get('type') == 'file'])
+        if include or skip:
+            self._log_tool_event(
+                message=f"Filtering {total_before} files - include={include}, skip={skip}",
+                tool_name="list_files"
+            )
+
         filtered_files = []
+        skipped_by_skip = 0
+        skipped_by_include = 0
 
         for file_info in result.get('rows', []):
             if file_info.get('type') == 'file':
                 # Use full key for pattern matching
                 full_key = file_info.get('key', prefix + file_info['name'])
 
-                # Check skip patterns first
-                if skip and any(fnmatch.fnmatch(full_key, pattern) for pattern in skip):
+                # Check skip patterns first (case-insensitive)
+                if skip and any(self._fnmatch_nocase(full_key, pattern) for pattern in skip):
+                    skipped_by_skip += 1
                     continue
 
-                # Check include patterns (if specified, must match)
-                if include and not any(fnmatch.fnmatch(full_key, pattern) for pattern in include):
+                # Check include patterns (case-insensitive, if specified must match)
+                if include and not any(self._fnmatch_nocase(full_key, pattern) for pattern in include):
+                    skipped_by_include += 1
                     continue
 
                 # Add S3 download link
                 encoded_key = quote(full_key, safe='/')
                 file_info['link'] = f"{base_url}/s3/{bucket}/{encoded_key}?project_id={project_id}"
+
+                # Keep 'key' field in response - useful for callers to avoid URL parsing
+                # (previously removed, but key is already visible in 'link' URL)
                 filtered_files.append(file_info)
             elif file_info.get('type') == 'folder':
                 # Folders are not filtered, always included for navigation
                 filtered_files.append(file_info)
+
+        # Log filtering results if patterns were applied
+        if include or skip:
+            total_after = len([f for f in filtered_files if f.get('type') == 'file'])
+            self._log_tool_event(
+                message=f"Filtered to {total_after}/{total_before} files "
+                        f"(skipped: {skipped_by_skip} by skip, {skipped_by_include} by include)",
+                tool_name="list_files"
+            )
 
         result['rows'] = filtered_files
         result['total'] = len(filtered_files)
@@ -749,15 +785,17 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                             "Leave empty to index from bucket root.",
                 default=None)),
             'include_extensions': (Optional[List[str]], Field(
-                description="Patterns to include when processing. Supports glob-style matching:\n"
+                description="Patterns to include when processing. Supports glob-style matching (case-insensitive):\n"
                             "- Extension patterns: ['*.png', '*.jpg'] - matches files at any depth\n"
                             "- Folder patterns: ['_shared/*', 'docs/*'] - for multi-folder when folder=None\n"
                             "- Combined: ['docs/*.md', 'reports/*.pdf'] - folder + extension filter\n"
-                            "If empty, all files are processed (except skip_extensions).",
+                            "If empty, all files are processed (except skip_extensions).\n"
+                            "Note: [, ], and ? are glob metacharacters.",
                 default=[])),
             'skip_extensions': (Optional[List[str]], Field(
-                description="Patterns to skip when processing. Same glob-style syntax as include_extensions.\n"
-                            "Examples: ['temp/*', '*.tmp', 'draft/*']",
+                description="Patterns to skip when processing. Same glob-style syntax as include_extensions (case-insensitive).\n"
+                            "Examples: ['temp/*', '*.tmp', 'draft/*']\n"
+                            "Note: [, ], and ? are glob metacharacters.",
                 default=[])),
         }
 
@@ -846,7 +884,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             {
                 "ref": self.list_files,
                 "name": "list_files",
-                "description": "List files in the artifact bucket. By default lists immediate children (files and subfolders). Use folder parameter to scope listing to a specific prefix/path. Use include/skip patterns to filter files by glob patterns (e.g., '*.md', 'docs/*').",
+                "description": "List files in the artifact bucket. By default lists immediate children (files and subfolders). Use folder parameter to scope listing to a specific prefix/path. Use include/skip patterns to filter files by glob patterns (e.g., '*.md', 'docs/*'). Note: Patterns are case-insensitive; [, ], and ? are glob metacharacters.",
                 "args_schema": create_model(
                     "list_files",
                     bucket_name=bucket_name,
@@ -859,14 +897,16 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                         default=False
                     )),
                     include=(Optional[List[str]], Field(
-                        description="Glob patterns to include. Supports extension patterns (['*.md', '*.pdf']), "
+                        description="Glob patterns to include (case-insensitive). Supports extension patterns (['*.md', '*.pdf']), "
                                     "folder patterns (['docs/*', 'reports/*']), or combined (['docs/*.md']). "
-                                    "If empty, all files are included (except those matching skip).",
+                                    "If empty, all files are included (except those matching skip). "
+                                    "Note: [, ], and ? are glob metacharacters (e.g., 'file[123].txt' matches file1.txt, file2.txt, file3.txt).",
                         default=None
                     )),
                     skip=(Optional[List[str]], Field(
-                        description="Glob patterns to exclude. Same syntax as include. "
-                                    "Examples: ['temp/*', '*.tmp', 'draft/*'].",
+                        description="Glob patterns to exclude (case-insensitive). Same syntax as include. "
+                                    "Examples: ['temp/*', '*.tmp', 'draft/*']. "
+                                    "Note: [, ], and ? are glob metacharacters.",
                         default=None
                     ))
                 )
