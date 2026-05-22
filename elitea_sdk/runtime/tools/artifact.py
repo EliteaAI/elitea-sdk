@@ -846,12 +846,21 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
     def _extend_data(self, documents: Generator[Document, None, None]):
         for document in documents:
             try:
-                page_content = self.artifact.get_content_bytes(artifact_name=document.metadata['name'])
+                # Use 'key' (full S3 path) for download, not 'name' (relative display name)
+                # When folder param is used, 'name' is relative (e.g., "file.txt")
+                # but 'key' has full path (e.g., "folder/file.txt")
+                artifact_key = document.metadata.get('key') or document.metadata['name']
+                page_content = self.artifact.get_content_bytes(artifact_name=artifact_key)
+                # get_content_bytes returns dict with 'error' key on failure
+                if isinstance(page_content, dict) and 'error' in page_content:
+                    logging.error(f"Failed to download file '{artifact_key}': {page_content['error']}")
+                    yield document
+                    continue
                 document.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = page_content
                 document.metadata[IndexerKeywords.CONTENT_FILE_NAME.value] = document.metadata['name']
                 yield document
             except Exception as e:
-                logging.error(f"Failed while parsing the file '{document.metadata['name']}': {e}")
+                logging.error(f"Failed while parsing the file '{document.metadata.get('key', document.metadata['name'])}': {e}")
                 yield document
 
     @staticmethod
