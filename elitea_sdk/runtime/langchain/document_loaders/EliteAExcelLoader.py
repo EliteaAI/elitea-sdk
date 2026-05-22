@@ -235,6 +235,7 @@ class EliteAExcelLoader(EliteATableLoader):
     max_tokens: int = LOADER_MAX_TOKENS_DEFAULT
     add_header_to_chunks: bool = False
     header_row_number: int = 1
+    evaluate_formulas: bool = False
 
     @classmethod
     def get_file_metadata(cls, *, filename: str,
@@ -277,6 +278,11 @@ class EliteAExcelLoader(EliteATableLoader):
                 "header_row": (
                     "integer (default 1) — 1-indexed row treated as the header."
                 ),
+                "evaluate_formulas": (
+                    "boolean (default false) — when true, formulas without "
+                    "cached values are evaluated using a Python engine. "
+                    "This can be slow for large workbooks."
+                ),
             },
             "notes": (
                 "For large workbooks, call read_file with a small "
@@ -303,6 +309,7 @@ class EliteAExcelLoader(EliteATableLoader):
         self.end_row = kwargs.get('end_row')
         self.include_headers = kwargs.get('include_headers', True)
         self.header_row = kwargs.get('header_row', 1)
+        self.evaluate_formulas = bool(kwargs.get('evaluate_formulas', False))
         # Set and validate chunking parameters only once
         self.max_tokens = int(kwargs.get('max_tokens', LOADER_MAX_TOKENS_DEFAULT))
         self.add_header_to_chunks = bool(kwargs.get('add_header_to_chunks', False))
@@ -357,7 +364,6 @@ class EliteAExcelLoader(EliteATableLoader):
             xl_model = formulas.ExcelModel().loads(file_path).finish()
             solution = xl_model.calculate()
             books = xl_model.write(solution=solution)
-            # books: {'FILENAME.XLSX': {Book: <openpyxl.Workbook>}}
             computed = {}
             for book_data in books.values():
                 for wb in book_data.values():
@@ -375,12 +381,11 @@ class EliteAExcelLoader(EliteATableLoader):
             return {}
 
     def _read_xlsx(self):
-        """Reads .xlsx files using openpyxl, with formula evaluation fallback."""
+        """Reads .xlsx files using openpyxl, with optional formula evaluation."""
         workbook = load_workbook(self.file_path, data_only=True)
 
-        # Compute formula values for cells where openpyxl returns None
         computed_values = {}
-        if isinstance(self.file_path, str):
+        if self.evaluate_formulas and isinstance(self.file_path, str):
             computed_values = self._compute_formula_values(self.file_path)
 
         sheets = workbook.sheetnames
