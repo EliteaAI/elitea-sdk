@@ -40,6 +40,7 @@ on:
           - indexer_rag
           - custom
           - csv
+          - email
           - image
           - json
           - markdown
