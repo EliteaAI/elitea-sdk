@@ -13,7 +13,8 @@ from .langraph_agent import create_graph, normalize_message_content
 from .constants import (
     USER_ADDON, QA_ASSISTANT, NERDY_ASSISTANT, QUIRKY_ASSISTANT, CYNICAL_ASSISTANT,
     DEFAULT_ASSISTANT, PLAN_ADDON, PYODITE_ADDON, DATA_ANALYSIS_ADDON,
-    SEARCH_INDEX_ADDON, FILE_HANDLING_INSTRUCTIONS, DEAULT_AGENT_NAME
+    SEARCH_INDEX_ADDON, FILE_HANDLING_INSTRUCTIONS, DEAULT_AGENT_NAME,
+    TASK_DELEGATION_ADDON,
 )
 from ..middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from ..middleware.base import Middleware, MiddlewareManager
@@ -29,15 +30,19 @@ APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
 def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = None):
-    """Build a swarm handoff tool that REQUIRES a `task: str` argument.
+    """Build a swarm handoff tool with a strongly-recommended `task` argument.
 
     Mirrors langgraph_swarm.create_handoff_tool's routing semantics
     (Command(goto=agent_name, graph=Command.PARENT) + a "Successfully
-    transferred" ToolMessage), but adds a mandatory ``task`` parameter so
-    the LLM is forced by the tool schema to write a self-contained task
-    description for the peer. The peer's ``invoke_application`` reads
-    ``task`` directly from the assigning AIMessage's tool_call args —
-    deterministic, no message-walking heuristics needed.
+    transferred" ToolMessage). The ``task`` parameter is described as
+    REQUIRED in the docstring (which becomes the LLM-visible field
+    description), but the type is Optional with an empty default —
+    schema-required crashed cleanly when Anthropic emitted an empty-args
+    tool_call (Pydantic validation fails before _run, so the downstream
+    ``_extract_task_from_assigning_tool_call`` fallback never gets a
+    chance). OpenAI honors the description-as-required and keeps filling
+    task; Anthropic's empty-args edge case now degrades to the fallback
+    instead of crashing.
     """
     from typing import Annotated, Any
     from langchain_core.tools import tool, InjectedToolCallId
@@ -50,18 +55,18 @@ def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = 
 
     @tool(tool_name, description=tool_description)
     def handoff_to_agent(
-        task: str,
         state: Annotated[Any, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
+        task: str = "",
     ) -> Any:
         """Transfer control with a self-contained task for the receiving agent.
 
         Args:
-            task: Complete task description for the peer with all data inlined
-                (full JSON/text/lists they must operate on, expected return
-                shape). Do not use anaphora — the peer does not see the rest
-                of the conversation. Treat them as a fresh agent who only
-                sees this string.
+            task: REQUIRED — complete task description for the peer with all
+                data inlined (full JSON/text/lists they must operate on,
+                expected return shape). Do not use anaphora — the peer does
+                not see the rest of the conversation. Treat them as a fresh
+                agent who only sees this string.
         """
         existing = (
             state.get("messages", []) if isinstance(state, dict)
@@ -617,6 +622,7 @@ class Assistant:
         data_analysis_addon = DATA_ANALYSIS_ADDON if 'pandas_analyze_data' in tool_names else ""
         pyodite_addon = PYODITE_ADDON if 'pyodide_sandbox' in tool_names else ""
         search_index_addon = SEARCH_INDEX_ADDON if 'stepback_summary_index' in tool_names else ""
+        task_delegation_addon = TASK_DELEGATION_ADDON if agent_tools else ""
 
         # Select assistant template based on persona
         persona_templates = {
@@ -636,7 +642,8 @@ class Assistant:
                 search_index_addon,
                 FILE_HANDLING_INSTRUCTIONS if simple_tools else "",
                 pyodite_addon,
-                data_analysis_addon
+                data_analysis_addon,
+                task_delegation_addon,
             ]))
             escaped_prompt = f"{prompt_instructions}\n\n---\n\n{addons}" if addons else str(prompt_instructions)
             logger.info(f"Using agent's own instructions directly (app_type={self.app_type})")
@@ -651,18 +658,8 @@ class Assistant:
                 search_index_addon=search_index_addon,
                 file_handling_instructions=FILE_HANDLING_INSTRUCTIONS
             )
-
-        if agent_tools:
-            logger.info(
-                "Using ToolNode react runtime for %d application tool(s): %s",
-                len(agent_tools),
-                [tool.name for tool in agent_tools],
-            )
-            return self._create_toolnode_react_agent(
-                simple_tools=simple_tools,
-                system_prompt=escaped_prompt,
-                checkpointer=checkpointer,
-            )
+            if task_delegation_addon:
+                escaped_prompt = f"{escaped_prompt}\n\n---\n\n{task_delegation_addon}"
 
         # Properly setup the prompt for YAML
         import yaml
@@ -777,150 +774,6 @@ class Assistant:
         if hasattr(original, 'application') and original.application is not None:
             return True
         return False
-
-    def _create_toolnode_react_agent(self, simple_tools: list, system_prompt: str, checkpointer: Any):
-        """Build a simpler model -> ToolNode -> model loop for agents with Application tools."""
-        from langgraph.graph import END, START, StateGraph
-        from langgraph.prebuilt import ToolNode
-
-        from .langraph_agent import prepare_output_schema
-        from .utils import create_state
-
-        middleware_mgr = self.middleware_manager
-
-        toolnode_tools = [tool for tool in simple_tools if isinstance(tool, BaseTool)]
-        if len(toolnode_tools) != len(simple_tools):
-            logger.info(
-                "Ignoring %d non-BaseTool entries in ToolNode runtime: %s",
-                len(simple_tools) - len(toolnode_tools),
-                [type(tool).__name__ for tool in simple_tools if not isinstance(tool, BaseTool)],
-            )
-
-        if self.lazy_tools_mode:
-            logger.warning(
-                "ToolNode react runtime bypasses lazy tools optimization; binding %d tools directly",
-                len(toolnode_tools),
-            )
-
-        if not toolnode_tools:
-            raise ToolException("ToolNode react runtime requires at least one BaseTool.")
-
-        renamed = deduplicate_tool_names(toolnode_tools, context="toolnode-react")
-        if renamed:
-            logger.info("Deduplicated %s tool names for ToolNode react agent", renamed)
-
-        state_class = create_state({
-            'input': {'type': 'str'},
-            'messages': {'type': 'list'},
-        })
-        builder = StateGraph(state_class)
-
-        def filter_orphaned_tool_calls(messages: list) -> list:
-            if not messages:
-                return messages
-
-            tool_result_ids = set()
-            for msg in messages:
-                if hasattr(msg, 'tool_call_id') and getattr(msg, 'tool_call_id', None):
-                    tool_result_ids.add(msg.tool_call_id)
-
-            cleaned_messages = []
-            for msg in messages:
-                if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
-                    valid_calls = [tc for tc in msg.tool_calls if tc.get('id') in tool_result_ids]
-                    if valid_calls:
-                        cleaned_messages.append(AIMessage(content=msg.content, tool_calls=valid_calls))
-                    elif msg.content:
-                        cleaned_messages.append(AIMessage(content=msg.content))
-                else:
-                    cleaned_messages.append(msg)
-
-            return cleaned_messages
-
-        model_with_tools = self.client.bind_tools(toolnode_tools)
-
-        def model_node(state, config=None):
-            messages = state.get('messages', [])
-            filtered_messages = [msg for msg in messages if not isinstance(msg, SystemMessage)]
-            filtered_messages = filter_orphaned_tool_calls(filtered_messages)
-            current_input = state.get('input')
-            if current_input not in (None, ''):
-                current_user_message = HumanMessage(content=current_input)
-
-                insert_at = len(filtered_messages)
-                while insert_at > 0:
-                    previous_message = filtered_messages[insert_at - 1]
-                    if isinstance(previous_message, ToolMessage):
-                        insert_at -= 1
-                        continue
-                    if isinstance(previous_message, AIMessage) and getattr(previous_message, 'tool_calls', None):
-                        insert_at -= 1
-                        continue
-                    break
-
-                boundary_message = filtered_messages[insert_at - 1] if insert_at > 0 else None
-                if not (
-                    isinstance(boundary_message, HumanMessage)
-                    and boundary_message.content == current_user_message.content
-                ):
-                    filtered_messages = (
-                        filtered_messages[:insert_at]
-                        + [current_user_message]
-                        + filtered_messages[insert_at:]
-                    )
-
-            # Run before_model middleware (summarization/context trimming)
-            middleware_updates = []
-            if middleware_mgr is not None:
-                before_state = {**state, 'messages': filtered_messages}
-                before_state, middleware_updates = middleware_mgr.run_before_model(before_state, config or {})
-                filtered_messages = before_state.get('messages', filtered_messages)
-
-            response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + filtered_messages, config)
-            result_messages = [response]
-            if middleware_updates:
-                result_messages = list(middleware_updates) + result_messages
-            result = {'messages': result_messages}
-
-            # Run after_model middleware (context_info calculation)
-            if middleware_mgr is not None:
-                final_messages = filtered_messages + [response]
-                final_state = {**state, 'messages': final_messages}
-                middleware_mgr.run_after_model(final_state, config or {})
-                result['context_info'] = middleware_mgr.get_context_info()
-
-            return result
-
-        def should_continue(state):
-            messages = state.get('messages', [])
-            if messages:
-                last = messages[-1]
-                if isinstance(last, AIMessage) and getattr(last, 'tool_calls', None):
-                    return 'tools'
-            return END
-
-        builder.add_node('model', model_node)
-        builder.add_node('tools', ToolNode(toolnode_tools))
-        builder.add_edge(START, 'model')
-        builder.add_conditional_edges('model', should_continue, {'tools': 'tools', END: END})
-        builder.add_edge('tools', 'model')
-
-        if self.is_subgraph:
-            return builder.compile(checkpointer=True, store=self.store, debug=False)
-
-        return prepare_output_schema(
-            builder,
-            checkpointer,
-            self.store,
-            debug=False,
-            interrupt_before=[],
-            interrupt_after=[],
-            interrupt_after_successors=set(),
-            state_class={state_class: None},
-            output_variables=['messages'],
-            tool_registry=None,
-        )
-
 
     def _create_swarm_agent(self, all_tools: list, agent_tools: list):
         """
@@ -1481,6 +1334,19 @@ class Assistant:
                 self._graph = compiled_graph
 
             def invoke(self, input, config=None, **kwargs):
+                # Normalize input shape: swarm uses MessagesState (key "messages"),
+                # but Application._run / formulate_query produces {"input": [...]}
+                # when invoked as a sub-agent of another agent. Without this
+                # translation, state["messages"] stays empty on the swarm's first
+                # turn and the peer's agent_node calls Anthropic with [SystemMessage]
+                # only — 500 "messages is required" (#4949 chat/nested-agent path).
+                if isinstance(input, dict) and not input.get("messages"):
+                    raw_input = input.get("input")
+                    if isinstance(raw_input, list) and raw_input:
+                        input = {**input, "messages": list(raw_input)}
+                    elif isinstance(raw_input, str) and raw_input:
+                        input = {**input, "messages": [HumanMessage(content=raw_input)]}
+
                 thread_id = (
                     config.get("configurable", {}).get("thread_id")
                     if isinstance(config, dict) else None
