@@ -1,3 +1,4 @@
+import fnmatch
 import hashlib
 import json
 import logging
@@ -289,14 +290,32 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
         values["artifact"] = values['elitea'].artifact(values['bucket'])
         return super().validate_toolkit(values)
 
-    def list_files(self, bucket_name = None, folder: str = None, recursive: bool = False, return_as_string = True):
+    @staticmethod
+    def _fnmatch_nocase(filename: str, pattern: str) -> bool:
+        """Case-insensitive fnmatch for cross-platform consistency.
+
+        Provides backward compatibility with the old regex-based filtering
+        that used re.IGNORECASE flag.
+        """
+        return fnmatch.fnmatch(filename.lower(), pattern.lower())
+
+    def list_files(self, bucket_name=None, folder: str = None, recursive: bool = False,
+                   include: List[str] = None, skip: List[str] = None, return_as_string=True):
         """List files in the artifact bucket with S3 download links.
-        
+
         Args:
             bucket_name: Bucket name (uses default if None)
-            folder: Folder/prefix to scope the listing (e.g., conversation_id for attachments)
+            folder: Folder/prefix to scope the listing (e.g., '_shared' for subfolder)
             recursive: If True, returns all files under prefix recursively.
                       If False (default), lists only immediate children (files and subfolders).
+            include: Glob patterns to include. Supports:
+                     - Extension patterns: ['*.md', '*.pdf']
+                     - Folder patterns: ['docs/*', 'reports/*'] (when folder=None)
+                     - Combined: ['docs/*.md']
+                     If None/empty, all files are included (except those matching skip).
+                     Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
+            skip: Glob patterns to exclude. Same syntax as include.
+                  Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
             return_as_string: If True, returns str(result), else returns dict
         
         Returns:
@@ -321,20 +340,60 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             # Return empty list for non-existent folder/bucket
             return "[]" if return_as_string else {"total": 0, "rows": []}
         
-        # Add S3 download links to files (not folders)
+        # Apply include/skip pattern filtering
+        include = include or []
+        skip = skip or []
+
+        # Log filtering start if patterns are provided
+        total_before = len([r for r in result.get('rows', []) if r.get('type') == 'file'])
+        if include or skip:
+            self._log_tool_event(
+                message=f"Filtering {total_before} files - include={include}, skip={skip}",
+                tool_name="list_files"
+            )
+
+        filtered_files = []
+        skipped_by_skip = 0
+        skipped_by_include = 0
+
         for file_info in result.get('rows', []):
             if file_info.get('type') == 'file':
-                # Use full key for S3 download link
+                # Use full key for pattern matching
                 full_key = file_info.get('key', prefix + file_info['name'])
-                # S3 GET URL format: /s3/{bucket}/{key}?project_id={project_id}
+
+                # Check skip patterns first (case-insensitive)
+                if skip and any(self._fnmatch_nocase(full_key, pattern) for pattern in skip):
+                    skipped_by_skip += 1
+                    continue
+
+                # Check include patterns (case-insensitive, if specified must match)
+                if include and not any(self._fnmatch_nocase(full_key, pattern) for pattern in include):
+                    skipped_by_include += 1
+                    continue
+
+                # Add S3 download link
                 encoded_key = quote(full_key, safe='/')
                 file_info['link'] = f"{base_url}/s3/{bucket}/{encoded_key}?project_id={project_id}"
+
+                # Keep 'key' field in response - useful for callers to avoid URL parsing
+                # (previously removed, but key is already visible in 'link' URL)
+                filtered_files.append(file_info)
             elif file_info.get('type') == 'folder':
-                # Folders don't have download links
-                pass
-            # Remove internal 'key' field from response (keep it clean)
-            file_info.pop('key', None)
-        
+                # Folders are not filtered, always included for navigation
+                filtered_files.append(file_info)
+
+        # Log filtering results if patterns were applied
+        if include or skip:
+            total_after = len([f for f in filtered_files if f.get('type') == 'file'])
+            self._log_tool_event(
+                message=f"Filtered to {total_after}/{total_before} files "
+                        f"(skipped: {skipped_by_skip} by skip, {skipped_by_include} by include)",
+                tool_name="list_files"
+            )
+
+        result['rows'] = filtered_files
+        result['total'] = len(filtered_files)
+
         return str(result) if return_as_string else result
 
     def create_file(self, filename: str, bucket_name = None, filedata: str = None, filepath: str = None):
@@ -718,57 +777,63 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
 
     def _index_tool_params(self):
         return {
+            'folder': (Optional[str], Field(
+                description="Folder path to scope indexing to. Only files within this folder "
+                            "(and subfolders) will be indexed. More efficient for single-folder "
+                            "use cases as filtering happens at S3 level. "
+                            "Example: '_shared' or 'documents/reports'. "
+                            "Leave empty to index from bucket root.",
+                default=None)),
             'include_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to include when processing: i.e. ['*.png', '*.jpg']. "
-                            "If empty, all files will be processed (except skip_extensions).",
+                description="Patterns to include when processing. Supports glob-style matching (case-insensitive):\n"
+                            "- Extension patterns: ['*.png', '*.jpg'] - matches files at any depth\n"
+                            "- Folder patterns: ['_shared/*', 'docs/*'] - for multi-folder when folder=None\n"
+                            "- Combined: ['docs/*.md', 'reports/*.pdf'] - folder + extension filter\n"
+                            "If empty, all files are processed (except skip_extensions).\n"
+                            "Note: [, ], and ? are glob metacharacters.",
                 default=[])),
             'skip_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to skip when processing: i.e. ['*.png', '*.jpg']",
+                description="Patterns to skip when processing. Same glob-style syntax as include_extensions (case-insensitive).\n"
+                            "Examples: ['temp/*', '*.tmp', 'draft/*']\n"
+                            "Note: [, ], and ? are glob metacharacters.",
                 default=[])),
         }
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._init_indexing_stats()
         self._log_tool_event(message=f"Loading the files from artifact's bucket. {kwargs=}", tool_name="loader")
+
+        # Extract filtering params
+        folder = kwargs.get('folder', None)
+        include_extensions = kwargs.get('include_extensions', [])
+        skip_extensions = kwargs.get('skip_extensions', [])
+
+        self._log_tool_event(
+            message=f"Files filtering: folder={folder}, include={include_extensions}, skip={skip_extensions}",
+            tool_name="loader")
+
         try:
-            all_files = self.list_files(self.bucket, return_as_string=False, recursive=True)['rows']
+            # Filtering happens in list_files via include/skip params
+            all_files = self.list_files(
+                self.bucket,
+                folder=folder,
+                recursive=True,
+                include=include_extensions,
+                skip=skip_extensions,
+                return_as_string=False
+            )['rows']
         except Exception as e:
             raise ToolException(f"Unable to extract files: {e}")
 
-        include_extensions = kwargs.get('include_extensions', [])
-        skip_extensions = kwargs.get('skip_extensions', [])
-        chunking_config = kwargs.get('chunking_config', {})
-        
-        self._log_tool_event(message=f"Files filtering started. Include extensions: {include_extensions}. "
-                                     f"Skip extensions: {skip_extensions}", tool_name="loader")
-        # show the progress of filtering
-        total_files = len(all_files) if isinstance(all_files, list) else 0
-        filtered_files_count = 0
+        self._log_tool_event(message=f"Found {len(all_files)} files after filtering", tool_name="loader")
+
         for file in all_files:
-            filtered_files_count += 1
-            if filtered_files_count % 10 == 0 or filtered_files_count == total_files:
-                self._log_tool_event(message=f"Files filtering progress: {filtered_files_count}/{total_files}",
-                                     tool_name="loader")
-            file_name = file['name']
-
-            # Check if file should be skipped based on skip_extensions
-            if any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', file_name, re.IGNORECASE)
-                   for pattern in skip_extensions):
-                self._track_skipped_attachment(file_name, reason="extension")
-                continue
-
-            # Check if file should be included based on include_extensions
-            # If include_extensions is empty, process all files (that weren't skipped)
-            if include_extensions and not (any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', file_name, re.IGNORECASE)
-                                               for pattern in include_extensions)):
-                self._track_skipped_attachment(file_name, reason="extension")
-                continue
-
             self._track_processed_item()
             metadata = {
                 ("updated_on" if k == "modified" else k): str(v)
                 for k, v in file.items()
             }
+            file_name = file['name']
             metadata['id'] = self.get_hash_from_bucket_and_file_name(self.bucket, file_name)
             yield Document(page_content="", metadata=metadata)
 
@@ -819,7 +884,7 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
             {
                 "ref": self.list_files,
                 "name": "list_files",
-                "description": "List files in the artifact bucket. By default lists immediate children (files and subfolders). Use folder parameter to scope listing to a specific prefix/path. Use recursive=True to get all files under the path.",
+                "description": "List files in the artifact bucket. By default lists immediate children (files and subfolders). Use folder parameter to scope listing to a specific prefix/path. Use include/skip patterns to filter files by glob patterns (e.g., '*.md', 'docs/*'). Note: Patterns are case-insensitive; [, ], and ? are glob metacharacters.",
                 "args_schema": create_model(
                     "list_files",
                     bucket_name=bucket_name,
@@ -830,6 +895,19 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                     recursive=(Optional[bool], Field(
                         description="If True, returns all files recursively under the path. If False (default), returns only immediate children (files and subfolders).",
                         default=False
+                    )),
+                    include=(Optional[List[str]], Field(
+                        description="Glob patterns to include (case-insensitive). Supports extension patterns (['*.md', '*.pdf']), "
+                                    "folder patterns (['docs/*', 'reports/*']), or combined (['docs/*.md']). "
+                                    "If empty, all files are included (except those matching skip). "
+                                    "Note: [, ], and ? are glob metacharacters (e.g., 'file[123].txt' matches file1.txt, file2.txt, file3.txt).",
+                        default=None
+                    )),
+                    skip=(Optional[List[str]], Field(
+                        description="Glob patterns to exclude (case-insensitive). Same syntax as include. "
+                                    "Examples: ['temp/*', '*.tmp', 'draft/*']. "
+                                    "Note: [, ], and ? are glob metacharacters.",
+                        default=None
                     ))
                 )
             },
