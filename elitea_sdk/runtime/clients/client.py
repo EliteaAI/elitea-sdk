@@ -454,20 +454,17 @@ class EliteAClient:
                                     "Authorization": f"Bearer {self.auth_token}"},
             }
             
-            # TODO": Check on ChatAnthropic client when they get "effort" support back
             if model_config.get("reasoning_effort"):
-                if model_config["reasoning_effort"].lower() == "low":
-                    target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": 2048}
+                effort = model_config["reasoning_effort"].lower()
+                if "opus-4-7" in model_name_lower or "opus_4_7" in model_name_lower or "opus-4.7" in model_name_lower:
+                    # Opus 4.7 only supports adaptive thinking
+                    target_kwargs['thinking'] = {"type": "adaptive"}
+                    target_kwargs['effort'] = effort
+                else:
                     target_kwargs['temperature'] = 1
-                    target_kwargs["max_tokens"] = 2048 + target_kwargs["max_tokens"]
-                elif model_config["reasoning_effort"].lower() == "medium":
-                    target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": 4096}
-                    target_kwargs['temperature'] = 1
-                    target_kwargs["max_tokens"] = 4096 + target_kwargs["max_tokens"]
-                elif model_config["reasoning_effort"].lower() == "high":
-                    target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": 9092}
-                    target_kwargs['temperature'] = 1
-                    target_kwargs["max_tokens"] = 9092 + target_kwargs["max_tokens"]
+                    budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
+                    target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": budget}
+                    target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
                     
             # Add http_client if provided
             if "http_client" in model_config:
