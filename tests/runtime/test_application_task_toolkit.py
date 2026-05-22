@@ -436,10 +436,19 @@ def test_task_delegation_addon_injected_when_agent_tools_present():
         {'messages': [HumanMessage(content='go')]},
         config={'configurable': {'thread_id': 'addon-with'}},
     )
-    assert any(
-        'Sub-agent delegation' in p and 'task: str' in p
-        for p in captured.get('system_prompts', [])
-    ), 'TASK_DELEGATION_ADDON missing when Application tool is attached'
+    addon_prompts = [
+        p for p in captured.get('system_prompts', [])
+        if 'Sub-agent delegation' in p and 'task: str' in p
+    ]
+    assert addon_prompts, 'TASK_DELEGATION_ADDON missing when Application tool is attached'
+    # Anti-bias guidance: the LLM should prefer toolkit tools for direct actions
+    # and delegate only when the sub-agent's domain matches. Without this nudge,
+    # an LLM with a heterogeneous surface (registry-gated toolkit + direct-bound
+    # sub-agent) tends to over-delegate because the sub-agent path is 1-step.
+    assert any('Prefer toolkit tools' in p for p in addon_prompts), (
+        'TASK_DELEGATION_ADDON should steer the LLM toward toolkit tools for direct '
+        'actions and delegate only when the sub-agent description matches'
+    )
 
     # Without Application tool → addon absent
     captured.clear()
