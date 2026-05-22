@@ -373,11 +373,12 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         target_folder_url = f"{library_type}/{folder_name.strip('/')}"
                     else:
                         folder_path = folder_name.strip('/')
-                        expected_prefix = f'{full_path_prefix}/{library_type}'
-                        if folder_path.startswith(full_path_prefix):
-                            if folder_path.startswith(expected_prefix):
-                                target_folder_url = folder_path.removeprefix(
-                                    f'{full_path_prefix}/')
+                        folder_path_lower = folder_path.lower()
+                        full_path_prefix_lower = full_path_prefix.lower()
+                        expected_prefix_lower = f'{full_path_prefix}/{library_type}'.lower()
+                        if folder_path_lower.startswith(full_path_prefix_lower):
+                            if folder_path_lower.startswith(expected_prefix_lower):
+                                target_folder_url = folder_path[len(full_path_prefix) + 1:]
                             else:
                                 continue
                         else:
