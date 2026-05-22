@@ -60,6 +60,8 @@ DEFAULT_ALLOWED_CSV = {**DEFAULT_ALLOWED_BASE, 'add_header_to_chunks': False, 'h
 
 DEFAULT_ALLOWED_EXCEL = {**DEFAULT_ALLOWED_WITH_LLM, 'add_header_to_chunks': False, 'header_row_number': 1, 'max_tokens': -1, 'sheet_name': ''}
 
+DEFAULT_ALLOWED_EMAIL = {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True, 'max_attachment_depth': 2, 'max_attachment_size_mb': 10}
+
 # Image file loaders mapping - directly supported by LLM with image_url
 image_loaders_map = {
     '.png': {
@@ -301,7 +303,7 @@ document_loaders_map = {
             'max_attachment_depth': 2,
             'max_attachment_size_mb': 10
         },
-        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True, 'max_attachment_depth': True, 'max_attachment_size_mb': True}
+        'allowed_to_override': DEFAULT_ALLOWED_EMAIL
     },
     '.msg': {
         'class': EliteAEmailLoader,
@@ -313,7 +315,7 @@ document_loaders_map = {
             'max_attachment_depth': 2,
             'max_attachment_size_mb': 10
         },
-        'allowed_to_override': {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True, 'max_attachment_depth': True, 'max_attachment_size_mb': True}
+        'allowed_to_override': DEFAULT_ALLOWED_EMAIL
     },
 }
 
