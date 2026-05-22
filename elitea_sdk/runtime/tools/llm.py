@@ -2730,14 +2730,14 @@ class LLMNode(BaseTool):
     @staticmethod
     def _is_anthropic_thinking_client(client: Any) -> bool:
         """Return True when *client* is (or wraps) a langchain-anthropic
-        ChatAnthropic with ``thinking={"type": "enabled"}``.
+        ChatAnthropic with thinking enabled (type "enabled" or "adaptive").
         """
         for candidate in LLMNode._anthropic_candidates(client):
             module = getattr(type(candidate), '__module__', '') or ''
             if 'langchain_anthropic' not in module:
                 continue
             thinking = getattr(candidate, 'thinking', None)
-            if isinstance(thinking, dict) and thinking.get('type') == 'enabled':
+            if isinstance(thinking, dict) and thinking.get('type') in ('enabled', 'adaptive'):
                 return True
         return False
 
