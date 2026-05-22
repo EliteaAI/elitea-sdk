@@ -366,6 +366,37 @@ def test_swarm_subagent_input_translation_handles_string_task():
     assert msgs[0].content == 'plain task string'
 
 
+# --- Swarm handoff tool: empty-args tolerance (Anthropic compatibility) -------
+
+
+def test_swarm_handoff_tool_schema_tolerates_missing_task():
+    """Anthropic production crash: LLM emits transfer_to_* tool_call with empty
+    args. After LangGraph injects state and tool_call_id, BaseTool._parse_input
+    runs args_schema.model_validate({state, tool_call_id}) — no task. Pre-fix
+    that raised ValidationError; post-fix task defaults to '' and validation
+    passes. The receiving peer's _extract_task_from_assigning_tool_call still
+    reads whatever the LLM emitted on the assigning AIMessage."""
+    from elitea_sdk.runtime.langchain.assistant import _create_swarm_handoff_tool
+
+    handoff = _create_swarm_handoff_tool(agent_name='GuidedDeveloper')
+    schema = handoff.args_schema
+
+    # Exact production failure shape: state + tool_call_id injected, task missing.
+    instance = schema.model_validate({
+        'state': {'messages': [HumanMessage(content='go')]},
+        'tool_call_id': 'L3BqyxmeaWn6Vf0gIrKclJ',
+    })
+    assert getattr(instance, 'task', None) == ''
+
+    # OpenAI / well-behaved LLM: task is provided as expected.
+    instance = schema.model_validate({
+        'state': {'messages': []},
+        'tool_call_id': 'call-with-task-1',
+        'task': 'Find papers about X and return DOIs as JSON',
+    })
+    assert instance.task == 'Find papers about X and return DOIs as JSON'
+
+
 # --- TASK_DELEGATION_ADDON injection ------------------------------------------
 
 

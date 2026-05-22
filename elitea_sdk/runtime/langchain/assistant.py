@@ -30,15 +30,19 @@ APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
 def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = None):
-    """Build a swarm handoff tool that REQUIRES a `task: str` argument.
+    """Build a swarm handoff tool with a strongly-recommended `task` argument.
 
     Mirrors langgraph_swarm.create_handoff_tool's routing semantics
     (Command(goto=agent_name, graph=Command.PARENT) + a "Successfully
-    transferred" ToolMessage), but adds a mandatory ``task`` parameter so
-    the LLM is forced by the tool schema to write a self-contained task
-    description for the peer. The peer's ``invoke_application`` reads
-    ``task`` directly from the assigning AIMessage's tool_call args —
-    deterministic, no message-walking heuristics needed.
+    transferred" ToolMessage). The ``task`` parameter is described as
+    REQUIRED in the docstring (which becomes the LLM-visible field
+    description), but the type is Optional with an empty default —
+    schema-required crashed cleanly when Anthropic emitted an empty-args
+    tool_call (Pydantic validation fails before _run, so the downstream
+    ``_extract_task_from_assigning_tool_call`` fallback never gets a
+    chance). OpenAI honors the description-as-required and keeps filling
+    task; Anthropic's empty-args edge case now degrades to the fallback
+    instead of crashing.
     """
     from typing import Annotated, Any
     from langchain_core.tools import tool, InjectedToolCallId
@@ -51,18 +55,18 @@ def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = 
 
     @tool(tool_name, description=tool_description)
     def handoff_to_agent(
-        task: str,
         state: Annotated[Any, InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
+        task: str = "",
     ) -> Any:
         """Transfer control with a self-contained task for the receiving agent.
 
         Args:
-            task: Complete task description for the peer with all data inlined
-                (full JSON/text/lists they must operate on, expected return
-                shape). Do not use anaphora — the peer does not see the rest
-                of the conversation. Treat them as a fresh agent who only
-                sees this string.
+            task: REQUIRED — complete task description for the peer with all
+                data inlined (full JSON/text/lists they must operate on,
+                expected return shape). Do not use anaphora — the peer does
+                not see the rest of the conversation. Treat them as a fresh
+                agent who only sees this string.
         """
         existing = (
             state.get("messages", []) if isinstance(state, dict)
