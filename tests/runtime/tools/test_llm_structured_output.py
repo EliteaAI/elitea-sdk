@@ -53,6 +53,32 @@ def _make_completion(content):
     return mock
 
 
+_JSONVALUE_TYPES = {"string", "number", "integer", "boolean", "null", "object", "array"}
+
+
+def _schema_contains_inlined_jsonvalue_anyof(schema_dict) -> bool:
+    """Walk a JSON schema for an anyOf containing the 7 JsonValue types.
+
+    Originally the JsonValue patch put these under $defs.JsonValue.anyOf
+    as a single ref. Commit 00657c5 (Azure Foundry fix) inlined the refs
+    so the same anyOf now appears at every use site (e.g. an array's
+    items.anyOf). This walks the schema and returns True if any anyOf
+    contains the full JsonValue type set — the contract Anthropic's
+    transform_schema needs."""
+    def _walk(node):
+        if isinstance(node, dict):
+            any_of = node.get("anyOf")
+            if isinstance(any_of, list):
+                types = {item.get("type") for item in any_of if isinstance(item, dict)}
+                if _JSONVALUE_TYPES.issubset(types):
+                    return True
+            return any(_walk(v) for v in node.values())
+        if isinstance(node, list):
+            return any(_walk(item) for item in node)
+        return False
+    return _walk(schema_dict)
+
+
 # ---------------------------------------------------------------------------
 # _map_parsed_json_to_model: direct field match
 # ---------------------------------------------------------------------------
@@ -1132,12 +1158,13 @@ class TestGetStructOutputModelRouting:
 
     def test_anthropic_receives_patched_schema_dict_not_pydantic_class(self):
         """The whole point of the JsonValue revert: Anthropic gets a
-        patched schema **dict** (with concrete ``$defs.JsonValue``),
-        not the raw Pydantic class. Without this patch the empty
-        ``$defs.JsonValue`` would reach ``transform_schema`` and the
-        call would 400. Both thinking and non-thinking Anthropic go
-        through the patch — the only difference is the method override
-        for thinking mode."""
+        patched schema **dict** with concrete JsonValue types reaching
+        the API. Originally the patch concretized ``$defs.JsonValue``
+        with an explicit ``anyOf``; commit 00657c5 (Azure Foundry fix)
+        inlined those refs so the JsonValue ``anyOf`` now appears at
+        every use site instead of as a $defs reference. Both thinking
+        and non-thinking Anthropic go through the patch — the only
+        difference is the method override for thinking mode."""
         llm = _AnthropicThinkingLLM()
         node = self._make_node_with_client(llm)
         struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
@@ -1157,21 +1184,21 @@ class TestGetStructOutputModelRouting:
         assert isinstance(passed, dict), (
             f"Anthropic must receive a JSON-schema dict (patched), got {type(passed).__name__}"
         )
-        # The patch concretely defines $defs.JsonValue
-        assert "$defs" in passed
-        assert "JsonValue" in passed["$defs"]
-        assert "anyOf" in passed["$defs"]["JsonValue"], (
-            "patched JsonValue must have a concrete anyOf; the empty default is "
-            "what transform_schema rejects"
+        # The 7 inlined JsonValue types must reach the schema — empty/abstract
+        # JsonValue is what transform_schema rejects with a 400.
+        assert _schema_contains_inlined_jsonvalue_anyof(passed), (
+            "patched schema must contain an inlined anyOf with the JsonValue types "
+            "(string, number, integer, boolean, null, object, array); the empty "
+            "default is what transform_schema rejects"
         )
 
     def test_non_thinking_anthropic_also_receives_patched_dict(self):
-        """The patch applies to non-thinking Anthropic too — the empty
-        ``$defs.JsonValue`` is rejected regardless of which structured-
-        output method is used (function_calling translates it to a tool
-        spec; json_schema runs it through transform_schema). Patching
-        unconditionally for any Anthropic client is the simplest correct
-        rule."""
+        """The patch applies to non-thinking Anthropic too — empty/abstract
+        JsonValue is rejected regardless of which structured-output method
+        is used (function_calling translates it to a tool spec; json_schema
+        runs it through transform_schema). Patching unconditionally for any
+        Anthropic client is the simplest correct rule. Post-00657c5 the
+        JsonValue types appear inline at use sites instead of behind $defs."""
         llm = _AnthropicNonThinkingLLM()
         node = self._make_node_with_client(llm)
         struct_model = _make_struct_model({"question": {"type": "list"}})
@@ -1188,7 +1215,7 @@ class TestGetStructOutputModelRouting:
 
         assert len(captured_schemas) == 1
         assert isinstance(captured_schemas[0], dict)
-        assert captured_schemas[0]["$defs"]["JsonValue"]["anyOf"]
+        assert _schema_contains_inlined_jsonvalue_anyof(captured_schemas[0])
 
     def test_openai_receives_pydantic_class_unchanged(self):
         """OpenAI / Azure / Google / etc. continue to receive the

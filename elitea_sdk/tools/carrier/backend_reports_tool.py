@@ -84,6 +84,9 @@ class GetReportByIDTool(BaseTool):
     )
 
     def _run(self, report_id: str):
+        test_log_file_path = None
+        errors_log_file_path = None
+        zip_file_path = None
         try:
             report, test_log_file_path, errors_log_file_path = self.api_wrapper.get_report_file_name(report_id)
             try:
@@ -114,6 +117,20 @@ class GetReportByIDTool(BaseTool):
             stacktrace = traceback.format_exc()
             logger.error(f"Error downloading reports: {stacktrace}")
             raise ToolException(stacktrace)
+        finally:
+            # Clean up temporary merge files to prevent disk leaks
+            for path in (test_log_file_path, errors_log_file_path):
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except Exception as e:
+                    logger.debug(f"Could not delete temp file {path}: {e}")
+            # Clean up the zip archive
+            try:
+                if zip_file_path and os.path.exists(zip_file_path):
+                    os.remove(zip_file_path)
+            except Exception:
+                pass
 
 
 class AddTagToReportTool(BaseTool):

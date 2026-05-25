@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import requests
+import tempfile
 from typing import Any, Dict, List
 from pydantic import BaseModel, Field
 from .utils import get_latest_log_file
@@ -164,12 +166,14 @@ class CarrierClient(BaseModel):
         return report_info, test_log_file_path, errors_log_file_path
 
     def download_and_merge_reports(self, report_files_list: list, lg_type: str, bucket: str, extract_to: str = "/tmp"):
+        """Download, extract and merge report files into summary and error logs."""
+        tmp_dir = tempfile.gettempdir()
         if lg_type == "jmeter":
-            summary_log_file_path = f"summary_{bucket}_jmeter.jtl"
-            error_log_file_path = f"error_{bucket}_jmeter.log"
+            summary_log_file_path = os.path.join(tmp_dir, f"summary_{bucket}_jmeter.jtl")
+            error_log_file_path = os.path.join(tmp_dir, f"error_{bucket}_jmeter.log")
         else:
-            summary_log_file_path = f"summary_{bucket}_simulation.log"
-            error_log_file_path = f"error_{bucket}_simulation.log"
+            summary_log_file_path = os.path.join(tmp_dir, f"summary_{bucket}_simulation.log")
+            error_log_file_path = os.path.join(tmp_dir, f"error_{bucket}_simulation.log")
         extracted_reports = []
         for each in report_files_list:
             endpoint = f"api/v1/artifacts/artifact/{self.credentials.project_id}/{bucket}/{each}"

@@ -319,9 +319,17 @@ class Application(BaseTool):
             nested_metadata['parent_agent_name'] = _parent_name
         nested_config = {}
         if invoke_config and invoke_config.get('configurable'):
-            nested_config['configurable'] = dict(invoke_config['configurable'])
-            nested_config['configurable'].pop('selected_tools', None)
-            nested_config['configurable'].pop('selected_toolkits', None)
+            parent_configurable = dict(invoke_config['configurable'])
+            parent_configurable.pop('selected_tools', None)
+            parent_configurable.pop('selected_toolkits', None)
+            # Give the child its own thread_id namespace, derived from the parent
+            # thread + child name. Stable across parent turns (so a swarm child
+            # keeps its conversation history; non-swarm child can resume HITL),
+            # but isolated from the parent's namespace (no stale-mixing — #4949).
+            parent_thread_id = parent_configurable.get('thread_id')
+            if parent_thread_id and self.name:
+                parent_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
+            nested_config['configurable'] = parent_configurable
         if nested_metadata:
             nested_config['metadata'] = nested_metadata
         if not nested_config:
