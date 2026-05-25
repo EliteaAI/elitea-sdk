@@ -878,6 +878,15 @@ class Assistant:
                 # Filter orphaned tool_use blocks to avoid Anthropic API errors
                 filtered_messages = filter_orphaned_tool_calls(filtered_messages)
 
+                # Run before_model middleware (summarization/context trimming)
+                middleware_updates = []
+                _mw = self.middleware_manager
+                if _mw is not None and _mw._middleware:
+                    before_state, middleware_updates = _mw.run_before_model(
+                        {'messages': filtered_messages}, config or {}
+                    )
+                    filtered_messages = before_state.get('messages', filtered_messages)
+
                 # Emit swarm agent start event
                 if config:
                     try:
@@ -949,7 +958,7 @@ class Assistant:
                     except Exception as e:
                         logger.debug(f"[SWARM] Failed to emit swarm event: {e}")
 
-                return {"messages": [response]}
+                return {"messages": list(middleware_updates) + [response]}
 
             return agent_node
 
@@ -1330,8 +1339,9 @@ class Assistant:
         # --- Adapter to convert swarm output to {"output": ...} format ---
         class SwarmResultAdapter:
             """Wraps a compiled swarm graph to return {"output": ...} format expected by pylon."""
-            def __init__(self, compiled_graph):
+            def __init__(self, compiled_graph, middleware_manager=None):
                 self._graph = compiled_graph
+                self._middleware_manager = middleware_manager
 
             def invoke(self, input, config=None, **kwargs):
                 # Normalize input shape: swarm uses MessagesState (key "messages"),
@@ -1396,6 +1406,13 @@ class Assistant:
                         output = text
                         break
 
+                # Compute context_info (message/token counts) via after_model middleware
+                context_info = None
+                _mw = self._middleware_manager
+                if _mw is not None and _mw._middleware and messages:
+                    _mw.run_after_model({'messages': messages}, config or {})
+                    context_info = _mw.get_context_info()
+
                 # Swarm has no interrupt_before/after, so a top-level invoke always
                 # reaches END. thread_id is therefore None on completion (matches the
                 # LangGraphAgentRunnable contract for finished runs).
@@ -1404,6 +1421,7 @@ class Assistant:
                     messages=messages,
                     thread_id=None,
                     execution_finished=True,
+                    context_info=context_info,
                 ).to_dict()
 
         # --- Wire with official create_swarm() ---
@@ -1418,7 +1436,7 @@ class Assistant:
                 f"{[cfg['name'] for cfg in peer_configs]}, "
                 f"default_active_agent='{main_agent_name}'"
             )
-            return SwarmResultAdapter(compiled)
+            return SwarmResultAdapter(compiled, middleware_manager=self.middleware_manager)
         except Exception as e:
             logger.error(f"[SWARM] Failed to compile swarm: {type(e).__name__}: {e}", exc_info=True)
             raise
