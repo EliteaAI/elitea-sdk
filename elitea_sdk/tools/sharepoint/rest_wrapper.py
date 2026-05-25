@@ -373,11 +373,14 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         target_folder_url = f"{library_type}/{folder_name.strip('/')}"
                     else:
                         folder_path = folder_name.strip('/')
-                        expected_prefix = f'{full_path_prefix}/{library_type}'
-                        if folder_path.startswith(full_path_prefix):
-                            if folder_path.startswith(expected_prefix):
-                                target_folder_url = folder_path.removeprefix(
-                                    f'{full_path_prefix}/')
+                        folder_path_lower = folder_path.lower()
+                        full_path_prefix_lower = full_path_prefix.lower()
+                        if folder_path_lower.startswith(full_path_prefix_lower):
+                            root_folder = lib.root_folder.get().execute_query()
+                            root_folder_url = root_folder.properties.get(
+                                'ServerRelativeUrl', '').strip('/')
+                            if folder_path_lower.startswith(root_folder_url.lower()):
+                                target_folder_url = folder_path[len(full_path_prefix) + 1:]
                             else:
                                 continue
                         else:
@@ -647,4 +650,3 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                 raise ToolException(
                     f"Attachment failed via both REST and Graph API. "
                     f"REST error: {base_e} | Graph error: {graph_e}")
-
