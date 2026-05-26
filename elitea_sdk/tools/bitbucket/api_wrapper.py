@@ -521,6 +521,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: The file decoded as a string
         """
+        branch = branch.strip() if branch and branch.strip() else self._active_branch
         try:
             return self._bitbucket.get_file(file_path=file_path, branch=branch)
         except Exception as e:
