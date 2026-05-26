@@ -46,6 +46,10 @@ state:
     type: str
   updated_body:
     type: str
+  update_successful:
+    type: bool
+  content_updated:
+    type: bool
 entry_point: generate_test_data
 interrupt_after: []
 nodes:
@@ -206,19 +210,22 @@ nodes:
           4. has_labels: update result mentions "label", "automation", or "updated"
 
           Return ONLY this JSON (no markdown, no extra text):
-          {{"validation_results": {{"update_successful": boolean, "page_id_in_result": boolean, "content_updated": boolean, "has_labels": boolean}}}}
+          {{"update_successful": boolean, "page_id_in_result": boolean, "content_updated": boolean, "has_labels": boolean}}
     model: gpt-4o
     output:
-      - test_results
+      - update_successful
+      - content_updated
     structured_output: true
     structured_output_dict:
-      test_results: dict
+      update_successful: bool
+      content_updated: bool
     transition: delete_page
   - id: process_results
     type: llm
     input:
       - delete_result
-      - test_results
+      - update_successful
+      - content_updated
     input_mapping:
       chat_history:
         type: fixed
@@ -232,18 +239,22 @@ nodes:
           Analyze the complete workflow results. Keep response under 300 tokens.
 
           Delete Result: {delete_result}
-          Validation Results: {test_results}
+          Update Successful: {update_successful}
+          Content Updated: {content_updated}
 
-          Checks:
-          1. Page deleted successfully (delete result contains success/deleted message).
-          2. Update was successful (validation_results.update_successful is true).
-          3. Content was verified (validation_results.content_updated is true).
+          Rules:
+          - page_deleted = true if delete result contains "success" or "deleted", else false.
+          - page_updated = the boolean value of Update Successful ({update_successful}).
+          - content_verified = the boolean value of Content Updated ({content_updated}).
+          - test_passed = true only if page_deleted AND page_updated AND content_verified are ALL true.
+          - failed_checks = list of condition names that are false (empty [] if all true).
 
           Return ONLY this JSON (no markdown, no extra text):
           {{"test_passed": boolean, "tool_executed": true, "page_created": true, "page_updated": boolean, "content_verified": boolean, "page_deleted": boolean, "failed_checks": []}}
     model: gpt-4o
     output:
       - test_results
+    structured_output: true
     structured_output_dict:
       test_results: dict
     transition: END
