@@ -1601,7 +1601,7 @@ class GitHubClient(BaseModel):
         """
         import time
         
-        branch = branch or self.active_branch
+        branch = branch.strip() if branch and branch.strip() else self.active_branch
         last_exception = None
         
         for attempt in range(max_retries):
