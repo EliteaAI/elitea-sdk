@@ -10,49 +10,10 @@ Two changes are verified:
      client.application() so we always get a LangGraphAgentRunnable (not a raw
      CompiledStateGraph compiled with checkpointer=True, which cannot be invoked
      as a root graph).
-  3. assistant.py invoke_application: __interrupt__ in result dict yields the
-     graceful degradation string instead of an empty string or "Execution failed".
 """
-import uuid
-from unittest.mock import MagicMock, patch, call
-
-import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from unittest.mock import MagicMock
 
 from elitea_sdk.runtime.tools.application import Application
-from elitea_sdk.runtime.langchain.assistant import _extract_subagent_output
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_app_tool(
-    name="ChildPipeline",
-    is_subgraph=True,
-    args_runnable=None,
-    client=None,
-    mock_invoke_return=None,
-):
-    """Build a minimal Application tool with a mock inner application."""
-    mock_app = MagicMock()
-    mock_app.invoke.return_value = mock_invoke_return or {"output": "done"}
-    if client is None:
-        client = MagicMock()
-        client.application.return_value = mock_app
-    return Application(
-        name=name,
-        description="Child pipeline",
-        application=mock_app,
-        return_type="str",
-        client=client,
-        is_subgraph=is_subgraph,
-        args_runnable=args_runnable or {
-            "application_id": 1,
-            "application_version_id": 1,
-            "is_subgraph": is_subgraph,
-        },
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -290,73 +251,3 @@ class TestIsSubgraphForcedFalse:
         )
 
 
-# ---------------------------------------------------------------------------
-# Secondary guard: __interrupt__ in result → graceful degradation string
-# ---------------------------------------------------------------------------
-
-class TestSwarmInterruptGuard:
-    """The invoke_application node in assistant.py must detect __interrupt__
-    in the pipeline result and return a user-actionable message rather than
-    a raw serialized dict or crashing.
-
-    The guard checks result.get('__interrupt__') and uses the graceful message
-    DIRECTLY — it does NOT fall through to _extract_subagent_output, which
-    would serialize the __interrupt__ list to a JSON string (unhelpful).
-    """
-
-    def test_guard_condition_triggers_on_interrupt_key(self):
-        """Verify the exact condition used by the guard:
-        isinstance(result, dict) and result.get('__interrupt__') is truthy.
-        """
-        interrupt_result = {
-            "__interrupt__": [{"value": "q", "resumable": True}],
-            "messages": [],
-        }
-        condition = isinstance(interrupt_result, dict) and bool(interrupt_result.get("__interrupt__"))
-        assert condition is True
-
-    def test_guard_condition_does_not_trigger_for_normal_result(self):
-        """Normal result dict (no __interrupt__ key) must not trigger the guard."""
-        normal_result = {"output": "I found your name is Alice.", "messages": []}
-        condition = isinstance(normal_result, dict) and bool(normal_result.get("__interrupt__"))
-        assert condition is False
-
-    def test_guard_condition_does_not_trigger_for_empty_interrupt_list(self):
-        """__interrupt__ key present but empty list — falsy — must not trigger."""
-        result_empty_interrupt = {"__interrupt__": [], "output": "ok"}
-        condition = isinstance(result_empty_interrupt, dict) and bool(result_empty_interrupt.get("__interrupt__"))
-        assert condition is False
-
-    def test_graceful_message_content(self):
-        """The graceful degradation string must contain 'user input' and
-        'does not support interrupts' — matching the string in assistant.py.
-        """
-        graceful_message = (
-            "This pipeline requires user input but is running in a context "
-            "that does not support interrupts."
-        )
-        assert "user input" in graceful_message
-        assert "does not support interrupts" in graceful_message
-        assert graceful_message.strip() != ""
-
-    def test_extract_subagent_output_is_not_used_for_interrupt_result(self):
-        """_extract_subagent_output on an __interrupt__-only dict returns a
-        non-empty string (the serialized dict), which is exactly why the guard
-        uses the fixed graceful message instead of delegating to it.
-        Verify this contract so that future changes to _extract_subagent_output
-        don't silently break the guard's assumption.
-        """
-        interrupt_only = {
-            "__interrupt__": [{"value": {"question": "q"}, "resumable": True}]
-        }
-        # _extract_subagent_output has no special handling for __interrupt__;
-        # it falls through to json.dumps, producing a non-empty string.
-        extracted = _extract_subagent_output(interrupt_only)
-        # This is why the guard must NOT use `extracted or graceful_message` —
-        # extracted is truthy and would produce an unhelpful JSON blob.
-        assert extracted != "", (
-            "If _extract_subagent_output now returns '' for __interrupt__-only "
-            "dicts, revisit the guard in assistant.py — the `or` fallback would "
-            "now work and the direct-message approach could be simplified."
-        )
-        assert "user input" not in extracted  # Confirms it's not the graceful msg

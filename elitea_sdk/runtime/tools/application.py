@@ -308,35 +308,15 @@ class Application(BaseTool):
             logger.debug(f"[APP_RUN] Variable defaults: {self.variable_defaults}")
             logger.debug(f"[APP_RUN] Merged variables: {list(merged_vars.keys())}")
 
-            # Always build a LangGraphAgentRunnable (is_subgraph=False) regardless
-            # of how the tool was registered. When is_subgraph=True, create_graph
-            # returns a raw CompiledStateGraph compiled with checkpointer=True, which
-            # LangGraph refuses to invoke as a root graph (raises RuntimeError:
-            # "checkpointer=True cannot be used for root graphs"). Application._run
-            # always invokes the child pipeline standalone — not embedded as a
-            # structural subgraph — so it must always receive a LangGraphAgentRunnable
-            # with its own real checkpointer. (#5046)
+            # Force is_subgraph=False: the child runs standalone here, so it
+            # must be a LangGraphAgentRunnable, not a CompiledStateGraph
+            # (checkpointer=True) which langgraph rejects as a root graph. (#5046)
             runnable_args = {**self.args_runnable, 'is_subgraph': False}
             self.application = self.client.application(**runnable_args, application_variables=application_variables)
         # Forward checkpoint-bearing config to the nested application so child
         # applications participate in the same durable execution tree.
         # Keep callbacks and other non-essential runtime baggage stripped to
         # avoid duplicate events and accidental parent-side config leakage.
-        #
-        # Two invocation modes for the child:
-        #   A) Pre-built structural subgraph (client=None): the child graph was
-        #      compiled with checkpointer=True and runs embedded inside the parent
-        #      graph's execution tree. The full parent configurable — including
-        #      __pregel_task_id — must be forwarded so LangGraph can wire the
-        #      shared checkpointer correctly.
-        #   B) Standalone tool call (client+args_runnable set, rebuilt above):
-        #      the child is always a fresh LangGraphAgentRunnable with its own real
-        #      checkpointer. Forwarding __pregel_task_id would cause LangGraph to
-        #      set is_nested=True on the child's execution loop, which prevents
-        #      GraphInterrupt suppression (langgraph _loop.py:
-        #      suppress = isinstance(exc_value, GraphInterrupt) and not self.is_nested).
-        #      Strip it so the child always runs as a root graph. (#5046)
-        is_standalone = bool(self.client and self.args_runnable)
         _parent_name = self.metadata.get('original_name') or self.metadata.get('display_name')
         nested_metadata = dict(invoke_config['metadata']) if invoke_config and invoke_config.get('metadata') else {}
         if _parent_name:
@@ -346,9 +326,10 @@ class Application(BaseTool):
             parent_configurable = dict(invoke_config['configurable'])
             parent_configurable.pop('selected_tools', None)
             parent_configurable.pop('selected_toolkits', None)
-            if is_standalone:
-                # Mode B: child runs as a root graph — strip LangGraph-internal
-                # task keys so the child loop sees is_nested=False. (#5046)
+            if self.client and self.args_runnable:
+                # Standalone child runs as a root graph — strip langgraph's
+                # task-id so its loop sees is_nested=False, otherwise
+                # GraphInterrupt is not suppressed. (#5046)
                 parent_configurable.pop('__pregel_task_id', None)
                 parent_configurable.pop('__pregel_task_ids', None)
             # Give the child its own thread_id namespace, derived from the parent
