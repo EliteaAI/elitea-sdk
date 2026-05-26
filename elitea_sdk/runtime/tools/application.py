@@ -359,7 +359,15 @@ class Application(BaseTool):
                 "[APP_RUN] Child '%s' paused at HITL interrupt (tool=%s), bubbling to parent",
                 self.name, child_hitl.get('tool_name', ''),
             )
-            resume_value = interrupt(child_hitl)
+            # Tag with parent tool identity so the parent's resume handler
+            # builds _hitl_resume_context referencing THIS tool (Application),
+            # not the child's leaf tool which doesn't exist in the parent graph.
+            child_hitl_for_parent = {
+                **child_hitl,
+                '_parent_tool_name': self.name,
+                '_parent_tool_args': {'task': kwargs.get('task', '')},
+            }
+            resume_value = interrupt(child_hitl_for_parent)
             logger.info("[APP_RUN] Resuming child '%s' with: %s", self.name, resume_value)
             response = self.application.invoke(
                 {

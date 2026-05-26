@@ -309,7 +309,12 @@ class TestHitlBubbleUp:
                 assert False, "Should have raised GraphInterrupt"
             except GraphInterrupt:
                 pass
-            mock_interrupt.assert_called_once_with(hitl_payload)
+            # interrupt() receives the payload annotated with parent tool identity
+            called_payload = mock_interrupt.call_args[0][0]
+            assert called_payload["type"] == "hitl"
+            assert called_payload["tool_name"] == "jira_create_issue"
+            assert called_payload["_parent_tool_name"] == "ChildAgent"
+            assert called_payload["_parent_tool_args"] == {"task": "do work"}
 
     def test_resume_routes_to_child(self):
         """On resume, interrupt() returns the user's decision which is
@@ -340,8 +345,11 @@ class TestHitlBubbleUp:
             mock_interrupt.return_value = resume_value
             result = tool._run(task="do work", config=config)
 
-        # Verify interrupt was called with child's payload
-        mock_interrupt.assert_called_once_with(hitl_payload)
+        # Verify interrupt was called with annotated payload
+        called_payload = mock_interrupt.call_args[0][0]
+        assert called_payload["tool_name"] == "jira_create_issue"
+        assert called_payload["_parent_tool_name"] == "ChildAgent"
+        assert called_payload["_parent_tool_args"] == {"task": "do work"}
 
         # Verify child was re-invoked with resume
         assert mock_app.invoke.call_count == 2
