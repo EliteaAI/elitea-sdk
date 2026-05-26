@@ -1064,7 +1064,23 @@ class Assistant:
                 # required context through task; chat_history is not forwarded.
                 try:
                     result = application_tool.invoke({"task": task}, config=config)
-                    content = _extract_subagent_output(result)
+                    # Secondary guard: if the pipeline paused at a printer/interrupt
+                    # node despite the __pregel_task_id fix (e.g. a caller that
+                    # bypasses Application._run), return a user-actionable message
+                    # rather than a raw __interrupt__ dict serialized to string.
+                    # Full printer-node HITL in SWARM mode is not supported and
+                    # tracked separately. (#5046)
+                    if isinstance(result, dict) and result.get('__interrupt__'):
+                        logger.warning(
+                            f"[SWARM] Pipeline '{agent_name}' paused at an interrupt node. "
+                            "Printer-node HITL is not supported in SWARM mode."
+                        )
+                        content = (
+                            "This pipeline requires user input but is running in a context "
+                            "that does not support interrupts."
+                        )
+                    else:
+                        content = _extract_subagent_output(result)
                 except Exception as e:
                     logger.error(f"[SWARM] Direct invocation of '{agent_name}' failed: {e}", exc_info=True)
                     content = f"Execution failed: {e}"
