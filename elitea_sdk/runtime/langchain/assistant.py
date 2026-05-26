@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from jinja2 import Environment, DebugUndefined
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage, ToolMessage
@@ -1065,6 +1066,8 @@ class Assistant:
                 try:
                     result = application_tool.invoke({"task": task}, config=config)
                     content = _extract_subagent_output(result)
+                except GraphBubbleUp:
+                    raise
                 except Exception as e:
                     logger.error(f"[SWARM] Direct invocation of '{agent_name}' failed: {e}", exc_info=True)
                     content = f"Execution failed: {e}"

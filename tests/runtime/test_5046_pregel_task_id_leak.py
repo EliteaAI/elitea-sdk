@@ -3,15 +3,19 @@ Tests for the fix in #5046: __pregel_task_id leaks from SWARM context into
 child pipeline config, causing LangGraph to treat the pipeline as nested
 (is_nested=True) and not suppress GraphInterrupt.
 
-Two changes are verified:
+Changes verified:
   1. application.py _run: __pregel_task_id / __pregel_task_ids are stripped
      from parent_configurable before building nested_config.
   2. application.py _run: is_subgraph is forced to False when calling
      client.application() so we always get a LangGraphAgentRunnable (not a raw
      CompiledStateGraph compiled with checkpointer=True, which cannot be invoked
      as a root graph).
+  3. application.py _run: child HITL interrupts bubble to parent via interrupt(),
+     and resume values are routed back to the child.
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from langgraph.errors import GraphInterrupt
 
 from elitea_sdk.runtime.tools.application import Application
 
@@ -251,3 +255,154 @@ class TestIsSubgraphForcedFalse:
         )
 
 
+# ---------------------------------------------------------------------------
+# HITL bubble-up: child interrupt propagates to parent via interrupt()
+# ---------------------------------------------------------------------------
+
+class TestHitlBubbleUp:
+    """When a child agent/pipeline pauses at an HITL interrupt, Application._run
+    must call interrupt() to bubble it to the parent graph. On resume, the
+    user's decision is routed back to the child."""
+
+    def _make_tool(self):
+        mock_app = MagicMock()
+        mock_client = MagicMock()
+        mock_client.application.return_value = mock_app
+        tool = Application(
+            name="ChildAgent",
+            description="Child",
+            application=mock_app,
+            return_type="str",
+            client=mock_client,
+            is_subgraph=True,
+            args_runnable={
+                "application_id": 1,
+                "application_version_id": 1,
+                "is_subgraph": True,
+            },
+        )
+        return tool, mock_app, mock_client
+
+    def test_child_interrupt_raises_graph_interrupt(self):
+        """When child returns hitl_interrupt, interrupt() is called which
+        raises GraphInterrupt in the parent graph context."""
+        tool, mock_app, _ = self._make_tool()
+
+        hitl_payload = {
+            "type": "hitl",
+            "tool_name": "jira_create_issue",
+            "message": "Approve creating JIRA ticket?",
+            "guardrail_type": "sensitive_tool",
+        }
+        mock_app.invoke.return_value = {
+            "output": "Awaiting human review...",
+            "execution_finished": False,
+            "hitl_interrupt": hitl_payload,
+        }
+
+        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+
+        with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
+            mock_interrupt.side_effect = GraphInterrupt([{"value": hitl_payload}])
+            try:
+                tool._run(task="do work", config=config)
+                assert False, "Should have raised GraphInterrupt"
+            except GraphInterrupt:
+                pass
+            mock_interrupt.assert_called_once_with(hitl_payload)
+
+    def test_resume_routes_to_child(self):
+        """On resume, interrupt() returns the user's decision which is
+        forwarded to the child as an HITL resume invocation."""
+        tool, mock_app, _ = self._make_tool()
+
+        hitl_payload = {
+            "type": "hitl",
+            "tool_name": "jira_create_issue",
+            "message": "Approve?",
+            "guardrail_type": "sensitive_tool",
+        }
+        # First invocation: child returns interrupt
+        # On resume: interrupt() returns the user's decision
+        mock_app.invoke.side_effect = [
+            {
+                "output": "Awaiting human review...",
+                "execution_finished": False,
+                "hitl_interrupt": hitl_payload,
+            },
+            {"output": "Ticket created", "execution_finished": True},
+        ]
+
+        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+        resume_value = {"action": "approve", "value": ""}
+
+        with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = resume_value
+            result = tool._run(task="do work", config=config)
+
+        # Verify interrupt was called with child's payload
+        mock_interrupt.assert_called_once_with(hitl_payload)
+
+        # Verify child was re-invoked with resume
+        assert mock_app.invoke.call_count == 2
+        resume_call_args = mock_app.invoke.call_args_list[1]
+        resume_input = resume_call_args[0][0]
+        assert resume_input["hitl_resume"] is True
+        assert resume_input["hitl_action"] == "approve"
+        assert resume_input["hitl_value"] == ""
+
+        # Verify final result reflects resumed child output
+        assert result["output"] == "Ticket created"
+        assert result["execution_finished"] is True
+
+    def test_resume_with_reject_action(self):
+        """Reject action is correctly routed to child."""
+        tool, mock_app, _ = self._make_tool()
+
+        hitl_payload = {"type": "hitl", "tool_name": "dangerous_tool", "message": "Allow?"}
+        mock_app.invoke.side_effect = [
+            {"output": "Awaiting...", "execution_finished": False, "hitl_interrupt": hitl_payload},
+            {"output": "Operation cancelled", "execution_finished": True},
+        ]
+
+        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+
+        with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = {"action": "reject", "value": "not allowed"}
+            result = tool._run(task="do work", config=config)
+
+        resume_input = mock_app.invoke.call_args_list[1][0][0]
+        assert resume_input["hitl_action"] == "reject"
+        assert resume_input["hitl_value"] == "not allowed"
+        assert result["output"] == "Operation cancelled"
+
+    def test_no_interrupt_passes_through(self):
+        """Normal responses without hitl_interrupt pass through unchanged."""
+        tool, mock_app, _ = self._make_tool()
+
+        mock_app.invoke.return_value = {"output": "All done", "execution_finished": True}
+        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+
+        with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
+            result = tool._run(task="do work", config=config)
+            mock_interrupt.assert_not_called()
+
+        assert result["output"] == "All done"
+        assert result["execution_finished"] is True
+
+    def test_empty_hitl_interrupt_not_triggered(self):
+        """Empty/falsy hitl_interrupt does not trigger bubble-up."""
+        tool, mock_app, _ = self._make_tool()
+
+        mock_app.invoke.return_value = {
+            "output": "Done",
+            "execution_finished": True,
+            "hitl_interrupt": None,
+        }
+        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+
+        with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
+            result = tool._run(task="work", config=config)
+            mock_interrupt.assert_not_called()
+
+        assert result["output"] == "Done"

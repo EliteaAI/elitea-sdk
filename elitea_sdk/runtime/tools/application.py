@@ -6,6 +6,7 @@ from ..utils.utils import clean_string
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt
 from typing import Any, Type, Optional
 from pydantic import create_model, model_validator, BaseModel
 from pydantic.fields import FieldInfo
@@ -348,6 +349,27 @@ class Application(BaseTool):
             formulate_query(kwargs, is_subgraph=self.is_subgraph),
             config=nested_config,
         )
+
+        # HITL bubble-up: when the child pauses at an interrupt, propagate it
+        # to the parent graph so the indexer_worker can surface the dialog.
+        # On resume, interrupt() returns the user's decision; route it to child.
+        if isinstance(response, dict) and response.get('hitl_interrupt'):
+            child_hitl = response['hitl_interrupt']
+            logger.info(
+                "[APP_RUN] Child '%s' paused at HITL interrupt (tool=%s), bubbling to parent",
+                self.name, child_hitl.get('tool_name', ''),
+            )
+            resume_value = interrupt(child_hitl)
+            logger.info("[APP_RUN] Resuming child '%s' with: %s", self.name, resume_value)
+            response = self.application.invoke(
+                {
+                    "hitl_resume": True,
+                    "hitl_action": resume_value.get("action", "approve"),
+                    "hitl_value": resume_value.get("value", ""),
+                },
+                config=nested_config,
+            )
+
         normalized_output = extract_application_response_output(response)
 
         # Build standardized AgentResponse
