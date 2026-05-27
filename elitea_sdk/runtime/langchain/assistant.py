@@ -689,10 +689,6 @@ class Assistant:
                     'task': {
                         'type': 'variable',
                         'value': 'input'
-                    },
-                    'chat_history': {
-                        'type': 'variable',
-                        'value': 'messages'
                     }
                 },
                 'step_limit': self.max_iterations,
@@ -702,6 +698,14 @@ class Assistant:
             }],
             'entry_point': 'agent'
         }
+
+        # handler for agent_node in graph: keeps chat_history for react agents and ignores for subgraphs
+        if not self.is_subgraph:
+            schema_dict['nodes'][0]['input_mapping']['chat_history'] = {
+                'type': 'variable',
+                'value': 'messages'
+            }
+
         
         # Add tool-specific parameters only if tools exist and NOT in lazy mode
         # In lazy mode, we don't bind tool_names so the LLMNode uses meta-tools instead
