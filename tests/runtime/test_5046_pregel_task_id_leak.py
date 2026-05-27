@@ -1,17 +1,18 @@
 """
-Tests for the fix in #5046: __pregel_task_id leaks from SWARM context into
-child pipeline config, causing LangGraph to treat the pipeline as nested
-(is_nested=True) and not suppress GraphInterrupt.
+Tests for #5046: standalone Application child config handling.
 
 Changes verified:
-  1. application.py _run: __pregel_task_id / __pregel_task_ids are stripped
-     from parent_configurable before building nested_config.
+  1. application.py _run: __pregel_task_id is STRIPPED in standalone mode so the
+     child runs as a root pregel. The child's LangGraphAgentRunnable.invoke()
+     handles interrupts internally and returns hitl_interrupt in its response
+     dict (dict-bridge path).
   2. application.py _run: is_subgraph is forced to False when calling
      client.application() so we always get a LangGraphAgentRunnable (not a raw
      CompiledStateGraph compiled with checkpointer=True, which cannot be invoked
      as a root graph).
-  3. application.py _run: child HITL interrupts bubble to parent via interrupt(),
-     and resume values are routed back to the child.
+  3. application.py _run: child HITL interrupts returned in response dict
+     are bubbled to the parent via interrupt(), and resume values are routed
+     back to the child.
 """
 from unittest.mock import MagicMock, patch
 
@@ -21,19 +22,21 @@ from elitea_sdk.runtime.tools.application import Application
 
 
 # ---------------------------------------------------------------------------
-# Primary fix: __pregel_task_id is NOT forwarded to child configurable
+# Primary fix: __pregel_task_id is STRIPPED for standalone children
 # ---------------------------------------------------------------------------
 
 class TestPregelTaskIdStrip:
-    """__pregel_task_id must be stripped in standalone-tool mode (client+args_runnable set)
-    and preserved in structural-subgraph mode (client=None, pre-built application).
+    """__pregel_task_id must be STRIPPED in standalone mode (child runs as root).
 
-    Standalone mode: child is rebuilt as a root LangGraphAgentRunnable. Forwarding
-    __pregel_task_id sets is_nested=True → GraphInterrupt not suppressed (#5046).
+    Standalone mode: child is rebuilt as a root LangGraphAgentRunnable. Stripping
+    __pregel_task_id ensures is_nested=False → the child's pregel handles
+    interrupts internally (stores them, terminates loop, returns result dict)
+    rather than re-raising GraphInterrupt.
 
-    Structural subgraph mode: child was compiled with checkpointer=True and runs
-    embedded in the parent graph's execution tree. The full config (including
-    __pregel_task_id) must be forwarded so LangGraph can wire the shared checkpointer.
+    Structural subgraph mode (client=None): child was compiled with
+    checkpointer=True and runs embedded in the parent graph's execution tree.
+    The full config (including __pregel_task_id) must be forwarded so LangGraph
+    can wire the shared checkpointer.
     """
 
     def _make_standalone_tool(self, name="ChildPipeline"):
@@ -66,14 +69,15 @@ class TestPregelTaskIdStrip:
             description="Child",
             application=mock_app,
             return_type="str",
-            client=None,   # No client — pre-built application
+            client=None,
             is_subgraph=True,
             args_runnable={},
         )
         return tool, mock_app
 
     def test_standalone_pregel_task_id_stripped(self):
-        """In standalone mode, __pregel_task_id must NOT reach the child's config."""
+        """In standalone mode, __pregel_task_id must NOT reach the child so the
+        child runs as root (handles interrupts internally, returns result dict)."""
         tool, mock_app = self._make_standalone_tool()
 
         parent_config = {
@@ -98,10 +102,7 @@ class TestPregelTaskIdStrip:
 
         child_cfg = captured.get("config", {}).get("configurable", {})
         assert "__pregel_task_id" not in child_cfg, (
-            f"__pregel_task_id must NOT be forwarded to standalone child; got: {child_cfg}"
-        )
-        assert "__pregel_task_ids" not in child_cfg, (
-            f"__pregel_task_ids must NOT be forwarded to standalone child; got: {child_cfg}"
+            f"__pregel_task_id must be stripped for standalone child; got: {child_cfg}"
         )
 
     def test_subgraph_pregel_task_id_preserved(self):
@@ -151,7 +152,7 @@ class TestPregelTaskIdStrip:
         parent_config = {
             "configurable": {
                 "thread_id": "t1",
-                "__pregel_task_id": "should-go",
+                "__pregel_task_id": "should-be-stripped",
                 "my_custom_key": "keep-this",
             },
             "metadata": {},
@@ -170,6 +171,7 @@ class TestPregelTaskIdStrip:
         child_cfg = captured.get("config", {}).get("configurable", {})
         assert "my_custom_key" in child_cfg
         assert child_cfg["my_custom_key"] == "keep-this"
+        assert "__pregel_task_id" not in child_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +200,7 @@ class TestIsSubgraphForcedFalse:
             args_runnable={
                 "application_id": 99,
                 "application_version_id": 7,
-                "is_subgraph": True,       # registered as True
+                "is_subgraph": True,
             },
         )
 
@@ -209,10 +211,8 @@ class TestIsSubgraphForcedFalse:
 
         app_tool._run(task="run", config=config)
 
-        # The call to client.application() must have is_subgraph=False
         call_kwargs = mock_client.application.call_args
         assert call_kwargs is not None, "client.application() was not called"
-        # is_subgraph can be positional or keyword — check both
         passed_is_subgraph = call_kwargs.kwargs.get("is_subgraph")
         assert passed_is_subgraph is False, (
             f"client.application() must be called with is_subgraph=False, "
@@ -249,20 +249,19 @@ class TestIsSubgraphForcedFalse:
 
         app_tool._run(task="run", config=config)
 
-        # Original must still have True
         assert app_tool.args_runnable["is_subgraph"] is True, (
             "_run must not mutate self.args_runnable; original is_subgraph must remain True"
         )
 
 
 # ---------------------------------------------------------------------------
-# HITL bubble-up: child interrupt propagates to parent via interrupt()
+# HITL bubble-up via dict-bridge: child returns hitl_interrupt in response
 # ---------------------------------------------------------------------------
 
 class TestHitlBubbleUp:
-    """When a child agent/pipeline pauses at an HITL interrupt, Application._run
-    must call interrupt() to bubble it to the parent graph. On resume, the
-    user's decision is routed back to the child."""
+    """When a child agent/pipeline returns hitl_interrupt in its response dict,
+    Application._run must call interrupt() to bubble it to the parent graph.
+    On resume, the user's decision is routed back to the child."""
 
     def _make_tool(self):
         mock_app = MagicMock()
@@ -309,7 +308,6 @@ class TestHitlBubbleUp:
                 assert False, "Should have raised GraphInterrupt"
             except GraphInterrupt:
                 pass
-            # interrupt() receives the payload annotated with parent tool identity
             called_payload = mock_interrupt.call_args[0][0]
             assert called_payload["type"] == "hitl"
             assert called_payload["tool_name"] == "jira_create_issue"
@@ -327,8 +325,6 @@ class TestHitlBubbleUp:
             "message": "Approve?",
             "guardrail_type": "sensitive_tool",
         }
-        # First invocation: child returns interrupt
-        # On resume: interrupt() returns the user's decision
         mock_app.invoke.side_effect = [
             {
                 "output": "Awaiting human review...",
@@ -345,13 +341,11 @@ class TestHitlBubbleUp:
             mock_interrupt.return_value = resume_value
             result = tool._run(task="do work", config=config)
 
-        # Verify interrupt was called with annotated payload
         called_payload = mock_interrupt.call_args[0][0]
         assert called_payload["tool_name"] == "jira_create_issue"
         assert called_payload["_parent_tool_name"] == "ChildAgent"
         assert called_payload["_parent_tool_args"] == {"task": "do work"}
 
-        # Verify child was re-invoked with resume
         assert mock_app.invoke.call_count == 2
         resume_call_args = mock_app.invoke.call_args_list[1]
         resume_input = resume_call_args[0][0]
@@ -359,7 +353,6 @@ class TestHitlBubbleUp:
         assert resume_input["hitl_action"] == "approve"
         assert resume_input["hitl_value"] == ""
 
-        # Verify final result reflects resumed child output
         assert result["output"] == "Ticket created"
         assert result["execution_finished"] is True
 
@@ -414,3 +407,25 @@ class TestHitlBubbleUp:
             mock_interrupt.assert_not_called()
 
         assert result["output"] == "Done"
+
+    def test_non_dict_resume_value_defaults_to_approve(self):
+        """If interrupt() returns a non-dict (langgraph drift), _run coerces
+        to empty dict so child still gets hitl_action='approve'."""
+        tool, mock_app, _ = self._make_tool()
+
+        hitl_payload = {"type": "hitl", "tool_name": "x", "guardrail_type": "sensitive_tool"}
+        mock_app.invoke.side_effect = [
+            {"output": "Awaiting...", "execution_finished": False, "hitl_interrupt": hitl_payload},
+            {"output": "done", "execution_finished": True},
+        ]
+
+        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+
+        with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = "unexpected-string-not-dict"
+            tool._run(task="do work", config=config)
+
+        resume_input = mock_app.invoke.call_args_list[1][0][0]
+        assert resume_input["hitl_resume"] is True
+        assert resume_input["hitl_action"] == "approve"
+        assert resume_input["hitl_value"] == ""

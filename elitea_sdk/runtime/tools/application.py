@@ -328,15 +328,15 @@ class Application(BaseTool):
             parent_configurable.pop('selected_tools', None)
             parent_configurable.pop('selected_toolkits', None)
             if self.client and self.args_runnable:
-                # Standalone child runs as a root graph — strip langgraph's
-                # task-id so its loop sees is_nested=False, otherwise
-                # GraphInterrupt is not suppressed. (#5046)
-                parent_configurable.pop('__pregel_task_id', None)
-                parent_configurable.pop('__pregel_task_ids', None)
-            # Give the child its own thread_id namespace, derived from the parent
-            # thread + child name. Stable across parent turns (so a swarm child
-            # keeps its conversation history; non-swarm child can resume HITL),
-            # but isolated from the parent's namespace (no stale-mixing — #4949).
+                # Standalone child runs as a root graph with its own checkpointer.
+                # Strip ALL parent pregel internals so the child doesn't inherit
+                # the parent's checkpoint tree, scratchpad, or task tracking.
+                _pregel_keys = [k for k in parent_configurable
+                                if k.startswith('__pregel_') or k in (
+                                    'checkpoint_id', 'checkpoint_ns', 'checkpoint_map',
+                                )]
+                for k in _pregel_keys:
+                    parent_configurable.pop(k, None)
             parent_thread_id = parent_configurable.get('thread_id')
             if parent_thread_id and self.name:
                 parent_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
@@ -350,9 +350,9 @@ class Application(BaseTool):
             config=nested_config,
         )
 
-        # HITL bubble-up: when the child pauses at an interrupt, propagate it
-        # to the parent graph so the indexer_worker can surface the dialog.
-        # On resume, interrupt() returns the user's decision; route it to child.
+        # HITL bubble-up (dict-bridge): when the child returns hitl_interrupt
+        # in its state (e.g. subgraph mode or legacy path), propagate it to
+        # the parent graph. On resume, interrupt() returns the user's decision.
         if isinstance(response, dict) and response.get('hitl_interrupt'):
             child_hitl = response['hitl_interrupt']
             logger.info(
@@ -368,6 +368,17 @@ class Application(BaseTool):
                 '_parent_tool_args': {'task': kwargs.get('task', '')},
             }
             resume_value = interrupt(child_hitl_for_parent)
+            # Defensive: a non-dict resume value (LangGraph version drift, test
+            # harness, or malformed Command(resume=...) payload) would raise
+            # AttributeError on .get() inside the parent pregel loop. Coerce
+            # so the bubble-up path degrades to a default-approve instead.
+            if not isinstance(resume_value, dict):
+                logger.warning(
+                    "[APP_RUN] Non-dict resume value for child '%s' (type=%s), "
+                    "defaulting to approve",
+                    self.name, type(resume_value).__name__,
+                )
+                resume_value = {}
             logger.info("[APP_RUN] Resuming child '%s' with: %s", self.name, resume_value)
             response = self.application.invoke(
                 {
@@ -395,7 +406,9 @@ class Application(BaseTool):
         if isinstance(response, dict):
             # Keys that are internal/output-related and should not be propagated as state
             excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types',
-                           'thread_id', 'execution_finished', ELITEA_RS, PRINTER_NODE_RS}
+                           'thread_id', 'execution_finished',
+                           'hitl_decisions', 'hitl_interrupt',
+                           ELITEA_RS, PRINTER_NODE_RS}
             for key, value in response.items():
                 if key not in excluded_keys:
                     extra_state[key] = value

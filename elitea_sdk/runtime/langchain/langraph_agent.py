@@ -1687,10 +1687,16 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         # Persist decision to state so blocked tools stay
                         # excluded across HITL resumes and an audit trail is
                         # available in the checkpoint.  The reducer appends.
+                        # When the interrupt bubbled up from a child Application,
+                        # attribute the decision to the parent tool — the child's
+                        # leaf tool does not exist in this graph, so recording
+                        # its name would poison the parent's blocked-tool set
+                        # and produce a misleading audit trail.
                         decision = {
-                            'tool_name': hitl_interrupt.get('tool_name', ''),
-                            'toolkit_name': hitl_interrupt.get('toolkit_name', ''),
-                            'toolkit_type': hitl_interrupt.get('toolkit_type', ''),
+                            'tool_name': ctx_tool_name,
+                            'toolkit_name': ctx_toolkit_name,
+                            'toolkit_type': '' if hitl_interrupt.get('_parent_tool_name')
+                                            else hitl_interrupt.get('toolkit_type', ''),
                             'action': hitl_resume_value.get('action', 'approve'),
                             'action_label': hitl_interrupt.get('action_label', ''),
                             'user_feedback': hitl_resume_value.get('value', ''),
