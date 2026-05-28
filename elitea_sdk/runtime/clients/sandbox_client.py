@@ -342,7 +342,7 @@ class SandboxClient:
     def unsecret(self, secret_name: str):
         url = f'{self.secrets_url}/{secret_name}'
         data = requests.get(url, headers=self.headers, verify=False).json()
-        logger.info(f'Unsecret response: {data}')
+        logger.debug(f'Unsecret response: {data}')
         return data.get('value', None)
 
     def artifact(self, bucket_name):

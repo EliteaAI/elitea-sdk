@@ -416,7 +416,7 @@ class ConditionalEdge(Runnable):
             logger.warning("[PIPELINE] _pipeline_blocked — ConditionalEdge routing to END")
             return END
 
-        logger.info(f"Current state in condition edge - {state}")
+        logger.debug(f"Current state in condition edge - {state}")
         input_data = {}
         for field in self.condition_inputs:
             if field == 'messages':
@@ -488,7 +488,7 @@ Answer only with step name, no need to add descrip in case none of the steps are
         else:
             result = clean_string(str(completion).strip())
 
-        logger.info(f"Plan to transition to: {result}")
+        logger.debug(f"Plan to transition to: {result}")
         if result not in self.steps:
             result = self.default_output
         dispatch_custom_event(
@@ -515,7 +515,7 @@ class TransitionalEdge(Runnable):
             )
             return END
 
-        logger.info(f'Transitioning to: {self.next_step}')
+        logger.debug(f'Transitioning to: {self.next_step}')
         dispatch_custom_event(
             "on_transitional_edge", {"next_step": self.next_step, "state": state}, config=config
         )
@@ -528,7 +528,7 @@ class StateDefaultNode(Runnable):
         self.default_vars = default_vars
 
     def invoke(self, state: BaseStore, config: Optional[RunnableConfig] = None) -> dict:
-        logger.info("Setting default state variables")
+        logger.debug("Setting default state variables")
         result = {}
         for key, value in self.default_vars.items():
             # Sub-graph flow
@@ -563,7 +563,7 @@ class PrinterNode(Runnable):
             self.final_message = self.DEFAULT_FINAL_MSG
 
     def invoke(self, state: BaseStore, config: Optional[RunnableConfig] = None) -> dict:
-        logger.info(f"Printer Node - Current state variables: {state}")
+        logger.debug(f"Printer Node - Current state variables: {state}")
         result = {}
         logger.debug(f"Initial text pattern: {self.input_mapping}")
         mapping = propagate_the_input_mapping(self.input_mapping, [], state)
@@ -598,7 +598,7 @@ class StateModifierNode(Runnable):
         self.output_variables = output_variables or []
 
     def invoke(self, state: Annotated[BaseStore, InjectedStore()], config: Optional[RunnableConfig] = None) -> dict:
-        logger.info(f"Modifying state with template: {self.template}")
+        logger.debug(f"Modifying state with template: {self.template}")
 
         # Collect input variables from state
         input_data = {}
@@ -701,7 +701,7 @@ class StateModifierNode(Runnable):
                 else:
                     # For other types, set to None
                     result[var] = None
-        logger.info(f"State modifier result: {result}")
+        logger.debug(f"State modifier result: {result}")
         return result
 
 
@@ -924,12 +924,12 @@ def create_graph(
     if for_subgraph:
         # Sanitization for sub-graphs
         yaml_schema = _filter_printer_nodes_from_yaml(yaml_schema)
-        logger.info("Filtered PrinterNodes from subgraph YAML in create_graph")
+        logger.debug("Filtered PrinterNodes from subgraph YAML in create_graph")
 
     schema = yaml.safe_load(yaml_schema)
     logger.debug(f"Schema: {schema}")
     logger.debug(f"Tools: {tools}")
-    logger.info(f"Tools: {[tool.name for tool in tools]}")
+    logger.debug(f"Tools: {[tool.name for tool in tools]}")
     state = schema.get('state', {})
     state_class = create_state(state)
     lg_builder = StateGraph(state_class)
@@ -945,7 +945,7 @@ def create_graph(
             toolkit_name = node.get('toolkit_name')
             tool_name = clean_string(node.get('tool', ''))
             # Tool names are now clean (no prefix needed)
-            logger.info(f"Node: {node_id} : {node_type} - {tool_name}")
+            logger.debug(f"Node: {node_id} : {node_type} - {tool_name}")
             if node_type in ['function', 'toolkit', 'mcp', 'tool', 'loop', 'loop_from_tool', 'indexer', 'subgraph', 'pipeline', 'agent']:
                 if node_type in ['mcp', 'toolkit', 'agent'] and not tool_name:
                     # tool is not specified
@@ -1147,7 +1147,7 @@ def create_graph(
                         input_variables=node.get('input', ['messages'])
                     ))
                 elif node_type == 'decision':
-                    logger.info(f'Adding decision: {node["nodes"]}')
+                    logger.debug(f'Adding decision: {node["nodes"]}')
                     # fallback to old-style decision node
                     decisional_inputs = node.get('decisional_inputs')
                     decisional_inputs = node.get('input', ['messages']) if not decisional_inputs else decisional_inputs
@@ -1233,11 +1233,11 @@ def create_graph(
                 )
             if node.get('transition'):
                 next_step = clean_string(node['transition'])
-                logger.info(f'Adding transition: {next_step}')
+                logger.debug(f'Adding transition: {next_step}')
                 lg_builder.add_conditional_edges(node_id, TransitionalEdge(next_step))
                 node_successors[node_id] = [next_step]
             elif node.get('decision'):
-                logger.info(f'Adding decision: {node["decision"]["nodes"]}')
+                logger.debug(f'Adding decision: {node["decision"]["nodes"]}')
                 decision_nodes = node['decision']['nodes']
                 lg_builder.add_conditional_edges(node_id, DecisionEdge(
                     client, decision_nodes,
@@ -1248,7 +1248,7 @@ def create_graph(
                     clean_string(n) for n in decision_nodes
                 ] + [node['decision'].get('default_output', 'END')]
             elif node.get('condition') and node_type != 'router':
-                logger.info(f'Adding condition: {node["condition"]}')
+                logger.debug(f'Adding condition: {node["condition"]}')
                 condition_input = node['condition'].get('condition_input', ['messages'])
                 condition_definition = node['condition'].get('condition_definition', '')
                 cond_outputs = node['condition'].get('conditional_outputs', [])
@@ -1415,7 +1415,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
                *args, **kwargs):
-        logger.info(f"Incoming Input: {input}")
+        logger.debug(f"Incoming Input: {input}")
 
         # Dynamic tool selection based on user query
         if self.tool_registry is not None:
@@ -1458,7 +1458,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # Empty list means "use meta-tools"
                 if selected_toolkits:
                     selected_tools = self.tool_registry.get_tools_for_toolkits(selected_toolkits)
-                    logger.info(f"[DynamicToolSelection] Query: '{query[:100]}...' -> Binding {len(selected_toolkits)} toolkits, {len(selected_tools)} tools directly")
+                    logger.debug(f"[DynamicToolSelection] Query: '{query[:100]}...' -> Binding {len(selected_toolkits)} toolkits, {len(selected_tools)} tools directly")
 
                     # Store selection in config for LLMNode to use
                     if config is None:
@@ -1468,7 +1468,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     config['configurable']['selected_tools'] = selected_tools
                     config['configurable']['selected_toolkits'] = selected_toolkits
                 else:
-                    logger.info(f"[DynamicToolSelection] Query: '{query[:100]}...' -> Using meta-tools (no targeted selection)")
+                    logger.debug(f"[DynamicToolSelection] Query: '{query[:100]}...' -> Using meta-tools (no targeted selection)")
         if config is None:
             config = RunnableConfig()
         if not config.get("configurable", {}).get("thread_id", ""):
@@ -1594,7 +1594,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # (pipeline LLM nodes may only see a subset via their input_mapping).
         _full_conversation_messages = list(input.get('messages') or [])
 
-        logger.info(f"Input: {thread_id} - {input}")
+        logger.debug(f"Input: {thread_id} - {input}")
         hitl_resume_ctx = None
         try:
             checkpoint_tuple = self.checkpointer.get_tuple(config) if self.checkpointer else None

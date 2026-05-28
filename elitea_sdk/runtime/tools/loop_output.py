@@ -125,12 +125,12 @@ Answer must be JSON only extractable by JSON.LOADS."""
                 logger.error(f'Tool results expected to be List[dict], but got {type(tool_result)} {tool_result=}')
                 raise TypeError(f'Tool results expected to be List[dict], but got {type(tool_result)} {tool_result=}')
             #     tool_inputs.append({list(self.variables_mapping.keys())[0]: tool_result})
-            logger.info(f"Loop tool inputs: {tool_inputs}")
+            logger.debug(f"Loop tool inputs: {tool_inputs}")
             output_variables = dict()
             if len(self.output_variables) > 0:
                 output_variables = {self.output_variables[0]: ""}
             for tool_input in tool_inputs:
-                logger.info(f"LoopToolNode step input: {tool_input}")
+                logger.debug(f"LoopToolNode step input: {tool_input}")
                 try:
                     tool_run = self.loop_tool.invoke(tool_input, config=config, kwargs=kwargs)
                     if len(self.output_variables) > 0:

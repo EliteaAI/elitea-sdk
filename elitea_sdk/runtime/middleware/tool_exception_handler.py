@@ -116,7 +116,7 @@ class ToolExceptionHandlerMiddleware(Middleware):
         # Wrapped tools cache to avoid double-wrapping (keyed by object id)
         self._wrapped_tools_cache: Dict[int, BaseTool] = {}
 
-        logger.info(
+        logger.debug(
             f"ToolExceptionHandlerMiddleware initialized with {len(strategies)} strategies: "
             f"{[s.__class__.__name__ for s in strategies]}"
         )

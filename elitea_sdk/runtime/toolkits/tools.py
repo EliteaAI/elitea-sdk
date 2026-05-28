@@ -416,7 +416,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     # Add community tools (only for unhandled tools)
     community_loaded = community_tools(unhandled_tools, elitea_client, llm)
     tools += community_loaded
-    logger.info(f"[RUNTIME_TOOLS] Community tools loaded: {len(community_loaded)} tools")
+    logger.debug(f"[RUNTIME_TOOLS] Community tools loaded: {len(community_loaded)} tools")
 
     # Add elitea tools (only for unhandled tools)
     # set tokens to tools in order to handle case when token is required for authentication
@@ -426,18 +426,18 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             tool['settings']['tokens'] = mcp_tokens
     elitea_loaded = elitea_tools(unhandled_tools, elitea_client, llm, memory_store)
     tools += elitea_loaded
-    logger.info(f"[RUNTIME_TOOLS] EliteA tools loaded: {len(elitea_loaded)} tools")
+    logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {len(elitea_loaded)} tools")
 
     # Add MCP tools registered via elitea-mcp CLI (static registry)
     # Note: Tools with type='mcp' are already handled in main loop above
     mcp_loaded = _mcp_tools(unhandled_tools, elitea_client)
     tools += mcp_loaded
-    logger.info(f"[RUNTIME_TOOLS] MCP tools loaded: {len(mcp_loaded)} tools")
+    logger.debug(f"[RUNTIME_TOOLS] MCP tools loaded: {len(mcp_loaded)} tools")
 
     # Final logging of all tools being returned
     all_tool_names = [t.name if hasattr(t, 'name') else str(type(t)) for t in tools]
-    logger.info(f"[RUNTIME_TOOLS] Total tools being returned: {len(tools)}")
-    logger.info(f"[RUNTIME_TOOLS] All tool names: {all_tool_names}")
+    logger.debug(f"[RUNTIME_TOOLS] Total tools being returned: {len(tools)}")
+    logger.debug(f"[RUNTIME_TOOLS] All tool names: {all_tool_names}")
 
     # Defence-in-depth: final blocked-tool sweep across ALL tools regardless of source.
     # Earlier filters cover main-loop toolkits; this catches community / elitea / MCP tools.

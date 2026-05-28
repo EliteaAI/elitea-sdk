@@ -169,7 +169,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         self._last_fitting_count = 0
         self.summarization_enabled = summarization_enabled
 
-        logger.info(
+        logger.debug(
             f"SummarizationMiddleware initialized "
             f"(trigger={self.trigger}, keep={self.keep}, summarization_enabled={self.summarization_enabled})"
         )
@@ -322,7 +322,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         if last_summary_idx >= 0:
             existing_summary = non_system_messages[last_summary_idx]
             messages_since_summary = non_system_messages[last_summary_idx + 1:]
-            logger.info(
+            logger.debug(
                 f"Found existing summary at index {last_summary_idx}, "
                 f"processing {len(messages_since_summary)} messages since summary"
             )

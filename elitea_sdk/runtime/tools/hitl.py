@@ -158,7 +158,7 @@ class HITLNode(Runnable):
         3. Receive user's decision via Command(resume=...)
         4. Route accordingly
         """
-        logger.info(f"HITL Node '{self.name}' - Building user message from state")
+        logger.debug(f"HITL Node '{self.name}' - Building user message from state")
 
         # Build the user-facing message
         user_message = self._build_user_message(state)
