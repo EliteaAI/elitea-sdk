@@ -88,14 +88,12 @@ JiraInput = create_model(
     "JiraInput",
     method=(str, Field(description="The HTTP method to use for the request (GET, POST, PUT, DELETE, etc.)."
                                    " Required parameter.")),
-    relative_url=(str, Field(description="""
-         Required parameter: The relative URI for JIRA REST API V2.
-         URI must start with a forward slash and '/rest/api/2/...'.
-         Do not include query parameters in the URL, they must be provided separately in 'params'.
-         For search/read operations, you MUST always get "key", "summary", "status", "assignee", "issuetype" and
-         set maxResult, until users ask explicitly for more fields.
-         """
-    )),
+    relative_url=(str, Field(description="""Required parameter: The relative URI for Jira REST API.
+ URI must start with a forward slash and use either '/rest/api/2/...' or '/rest/api/3/...'.
+ Do not include query parameters in the URL, they must be provided separately in 'params'.
+ For search/read operations, you MUST always get "key", "summary", "status", "assignee", "issuetype"
+ and set maxResult, until users ask explicitly for more fields.
+ """)),
     params=(Optional[str], Field(
         default="",
         description="""
