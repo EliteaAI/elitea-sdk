@@ -296,7 +296,7 @@ class Assistant:
             self.lazy_tools_mode = data.get('meta', {}).get('lazy_tools_mode', False)
 
         logger.debug("Data for agent creation: %s", data)
-        logger.info("App type: %s", app_type)
+        logger.debug("App type: %s", app_type)
 
         self.elitea_client = elitea
         self.client = client
@@ -418,7 +418,7 @@ class Assistant:
             if conversation_id:
                 context_messages = self.middleware_manager.start_conversation(conversation_id)
                 if context_messages:
-                    logger.info(f"Middleware context: {context_messages}")
+                    logger.debug(f"Middleware context: {context_messages}")
 
             # Validate only one ToolExceptionHandlerMiddleware
             exception_handlers = [mw for mw in middleware if isinstance(mw, ToolExceptionHandlerMiddleware)]
@@ -445,7 +445,7 @@ class Assistant:
         if not self.lazy_tools_mode:
             deduplicate_tool_names(self.tools, context="init")
 
-        logger.info(f"Tools initialized: {len(self.tools)} tools (lazy_mode={self.lazy_tools_mode})")
+        logger.debug(f"Tools initialized: {len(self.tools)} tools (lazy_mode={self.lazy_tools_mode})")
 
         # All supported agent types (agent, pipeline, predict) use instructions directly
         # LangGraph handles message construction internally
@@ -610,9 +610,9 @@ class Assistant:
         if simple_tools:
             tool_names = [tool.name for tool in simple_tools]
             if self.lazy_tools_mode:
-                logger.info(f"Available tools: {len(tool_names)} (lazy mode - will use meta-tools)")
+                logger.debug(f"Available tools: {len(tool_names)} (lazy mode - will use meta-tools)")
             else:
-                logger.info("Binding tools: %s", tool_names)
+                logger.debug("Binding tools: %s", tool_names)
 
         user_addon = USER_ADDON.format(prompt=str(prompt_instructions)) if prompt_instructions else ""
         # Check for planning tools (any of them indicates planning capability)
@@ -646,7 +646,7 @@ class Assistant:
                 task_delegation_addon,
             ]))
             escaped_prompt = f"{prompt_instructions}\n\n---\n\n{addons}" if addons else str(prompt_instructions)
-            logger.info(f"Using agent's own instructions directly (app_type={self.app_type})")
+            logger.debug(f"Using agent's own instructions directly (app_type={self.app_type})")
         else:
             # Fallback to persona-based template wrapping
             base_assistant = persona_templates.get(self.persona, DEFAULT_ASSISTANT)

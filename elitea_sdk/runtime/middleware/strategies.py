@@ -150,7 +150,7 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
         self.llm = llm
         self.return_detailed_errors = return_detailed_errors
 
-        logger.info(
+        logger.debug(
             f"TransformErrorStrategy initialized: "
             f"detailed={self.return_detailed_errors}"
         )
@@ -461,7 +461,7 @@ class LoggingStrategy(ExceptionHandlerStrategy):
         # Total error count per tool (never resets)
         self.error_counts: Dict[str, int] = {}
 
-        logger.info("LoggingStrategy initialized")
+        logger.debug("LoggingStrategy initialized")
 
     def handle_exception(self, context: ExceptionContext) -> ExceptionContext:
         """Log error and update statistics."""

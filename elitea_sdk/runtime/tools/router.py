@@ -23,7 +23,7 @@ class RouterNode(BaseTool):
         # if input_data is empty, we can also pass the whole state as input for backward compatibility
         template = EvaluateTemplate(self.condition, input_data if input_data else state)
         result = template.evaluate()
-        logger.info(f"RouterNode evaluated condition '{self.condition}' with input {input_data} => {result}")
+        logger.debug(f"RouterNode evaluated condition '{self.condition}' with input {input_data} => {result}")
         result = clean_string(str(result))
         if result == '__end__' and "END" in self.routes:
             return {"router_output": "END"}

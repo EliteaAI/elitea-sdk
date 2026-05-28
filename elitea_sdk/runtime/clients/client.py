@@ -416,7 +416,7 @@ class EliteAClient:
         model_name_lower = model_name.lower()
         is_anthropic = "anthropic" in model_name_lower or "claude" in model_name_lower
 
-        logger.info(f"Creating {'ChatAnthropic' if is_anthropic else 'ChatOpenAI'} model: {model_name} with config: {model_config}")
+        logger.debug(f"Creating {'ChatAnthropic' if is_anthropic else 'ChatOpenAI'} model: {model_name} with config: {model_config}")
 
         try:
             from tools import this  # pylint: disable=E0401,C0415
@@ -552,7 +552,7 @@ class EliteAClient:
         selected_model = low_tier_models[0]
         model_name = selected_model['name']
 
-        logger.info(f"Selected low-tier model: {model_name} (display_name: {selected_model.get('display_name', 'N/A')})")
+        logger.debug(f"Selected low-tier model: {model_name} (display_name: {selected_model.get('display_name', 'N/A')})")
 
         # Build model configuration
         model_config = {
@@ -647,7 +647,7 @@ class EliteAClient:
     def unsecret(self, secret_name: str):
         url = f"{self.secrets_url}/{secret_name}"
         data = requests.get(url, headers=self.headers, verify=False).json()
-        logger.info(f"Unsecret response: {data}")
+        logger.debug(f"Unsecret response: {data}")
         return data.get('value', None)
 
     def _inject_summarization(
