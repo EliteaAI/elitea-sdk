@@ -1192,7 +1192,7 @@ class LLMNode(BaseTool):
                 # that prefixed/aliased names (e.g. github___tool) still
                 # match the base name from the HITL interrupt payload.
                 own_tool_names = {normalize_tool_name(t.name) for t in (self.available_tools or [])}
-                if ctx_tool not in own_tool_names:
+                if normalize_tool_name(ctx_tool) not in own_tool_names:
                     logger.info(
                         "[HITL] Ignoring stale _hitl_resume_context for tool '%s' "
                         "— not in this LLM node's tools %s",
