@@ -1625,7 +1625,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 if hitl_interrupt and not self._is_hitl_resume(input):
                     hitl_for_ui = {
                         k: v for k, v in hitl_interrupt.items()
-                        if k not in ('tool_args_raw', '_pending_messages')
+                        if k not in ('tool_args_raw', '_pending_messages',
+                                     '_parent_tool_name', '_parent_tool_args')
                     }
                     logger.warning(
                         "[HITL] Stale HITL interrupt detected for tool '%s'. "
@@ -1660,10 +1661,21 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # where re-executing the LLM produces a different response.
                     guardrail_type = hitl_interrupt.get('guardrail_type')
                     if guardrail_type == 'sensitive_tool':
-                        tool_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args', {})
+                        # When the interrupt bubbled up from a child Application
+                        # tool, reference the PARENT tool so the LLMNode builds
+                        # a synthetic AIMessage calling the Application wrapper
+                        # (not the child's leaf tool which doesn't exist here).
+                        if hitl_interrupt.get('_parent_tool_name'):
+                            ctx_tool_name = hitl_interrupt['_parent_tool_name']
+                            ctx_toolkit_name = ''
+                            tool_args = hitl_interrupt.get('_parent_tool_args', {})
+                        else:
+                            ctx_tool_name = hitl_interrupt.get('tool_name', '')
+                            ctx_toolkit_name = hitl_interrupt.get('toolkit_name', '')
+                            tool_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args', {})
                         resume_ctx = {
-                            'tool_name': hitl_interrupt.get('tool_name', ''),
-                            'toolkit_name': hitl_interrupt.get('toolkit_name', ''),
+                            'tool_name': ctx_tool_name,
+                            'toolkit_name': ctx_toolkit_name,
                             'tool_args': tool_args if isinstance(tool_args, dict) else {},
                             'tool_call_id': f"call_{uuid4().hex[:24]}",
                             'action': hitl_resume_value.get('action', 'approve'),
@@ -1675,10 +1687,16 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         # Persist decision to state so blocked tools stay
                         # excluded across HITL resumes and an audit trail is
                         # available in the checkpoint.  The reducer appends.
+                        # When the interrupt bubbled up from a child Application,
+                        # attribute the decision to the parent tool — the child's
+                        # leaf tool does not exist in this graph, so recording
+                        # its name would poison the parent's blocked-tool set
+                        # and produce a misleading audit trail.
                         decision = {
-                            'tool_name': hitl_interrupt.get('tool_name', ''),
-                            'toolkit_name': hitl_interrupt.get('toolkit_name', ''),
-                            'toolkit_type': hitl_interrupt.get('toolkit_type', ''),
+                            'tool_name': ctx_tool_name,
+                            'toolkit_name': ctx_toolkit_name,
+                            'toolkit_type': '' if hitl_interrupt.get('_parent_tool_name')
+                                            else hitl_interrupt.get('toolkit_type', ''),
                             'action': hitl_resume_value.get('action', 'approve'),
                             'action_label': hitl_interrupt.get('action_label', ''),
                             'user_feedback': hitl_resume_value.get('value', ''),
@@ -1870,7 +1888,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
                 # Strip internal-only fields (e.g. unmasked tool args) before logging
                 # or returning results that will be emitted to UI clients.
-                hitl_for_ui = {k: v for k, v in hitl_interrupt.items() if k not in ('tool_args_raw', '_pending_messages')}
+                hitl_for_ui = {k: v for k, v in hitl_interrupt.items() if k not in ('tool_args_raw', '_pending_messages', '_parent_tool_name', '_parent_tool_args')}
                 logger.info(f"[HITL] Execution paused at HITL node: {hitl_for_ui}")
 
                 result_with_state = {
