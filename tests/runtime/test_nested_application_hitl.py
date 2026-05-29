@@ -963,6 +963,412 @@ def test_standalone_application_path_bubbles_hitl_through_rebuild_cycle():
     reset_sensitive_tools()
 
 
+class TwoSensitiveChildLLM:
+    """Child LLM that calls two DISTINCT sensitive tools in sequence.
+
+    First turn (no tool results) → call ``create_file``.
+    After ``create_file`` ran     → call the SECOND distinct tool ``delete_file``.
+    After ``delete_file`` ran      → finish with ``child-graph-complete``.
+
+    This exercises Issue 1: a single subagent triggering a SECOND distinct
+    sensitive-tool approval after the first was approved. The second dialog
+    must NOT be swallowed by the standalone (dict-bridge) path in
+    ``Application._run``.
+    """
+
+    temperature = 0
+    max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _TwoSensitiveChildLLMBound(tools)
+
+    def invoke(self, messages, config=None):
+        return _TwoSensitiveChildLLMBound([]).invoke(messages, config=config)
+
+
+class _TwoSensitiveChildLLMBound:
+    def __init__(self, tools):
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        contents = [
+            str(message.content)
+            for message in messages
+            if isinstance(message, ToolMessage)
+        ]
+        if 'file-deleted' in contents:
+            return AIMessage(content='child-graph-complete')
+        if 'file-created' in contents:
+            return AIMessage(
+                content='',
+                tool_calls=[
+                    {
+                        'name': 'delete_file',
+                        'args': {'path': '/tmp/test.txt'},
+                        'id': 'call-child-tool-2',
+                        'type': 'tool_call',
+                    }
+                ],
+            )
+        return AIMessage(
+            content='',
+            tool_calls=[
+                {
+                    'name': 'create_file',
+                    'args': {'path': '/tmp/test.txt'},
+                    'id': 'call-child-tool-1',
+                    'type': 'tool_call',
+                }
+            ],
+        )
+
+
+def test_standalone_subagent_second_distinct_sensitive_tool_is_not_swallowed():
+    """Issue 1 regression — one subagent, two DISTINCT sensitive tools.
+
+    After the first sensitive tool (``create_file``) is approved, the same
+    subagent calls a SECOND distinct sensitive tool (``delete_file``). The
+    dict-bridge path in ``Application._run`` must surface a fresh interrupt
+    for the second tool rather than silently swallowing it (the bug fixed by
+    converting the single-shot ``if`` into a ``while`` loop).
+
+    Flow:
+      1. initial invoke           → pause at create_file (interrupt #1)
+      2. resume(approve) #1        → create_file runs, pause at delete_file (#2)
+      3. resume(approve) #2        → delete_file runs, child completes
+    Both side-effecting tools execute exactly once.
+    """
+    reset_sensitive_tools()
+    configure_sensitive_tools({'filesystem': ['create_file', 'delete_file']})
+
+    created = []
+    deleted = []
+
+    def create_file(**kwargs):
+        created.append(kwargs)
+        return 'file-created'
+
+    def delete_file(**kwargs):
+        deleted.append(kwargs)
+        return 'file-deleted'
+
+    create_tool = StructuredTool.from_function(
+        func=create_file,
+        name='create_file',
+        description='create file',
+        metadata={
+            'toolkit_type': 'filesystem',
+            'toolkit_name': 'filesystem',
+            'tool_name': 'create_file',
+        },
+    )
+    delete_tool = StructuredTool.from_function(
+        func=delete_file,
+        name='delete_file',
+        description='delete file',
+        metadata={
+            'toolkit_type': 'filesystem',
+            'toolkit_name': 'filesystem',
+            'tool_name': 'delete_file',
+        },
+    )
+
+    child_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'child', 'tools': [], 'meta': {}},
+        client=TwoSensitiveChildLLM(),
+        tools=[create_tool, delete_tool],
+        memory=None,
+        app_type='predict',
+        is_subgraph=False,
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    child_runnable = child_assistant.runnable()
+
+    fake_client = FakeApplicationClient(child_runnable)
+
+    parent_tool = Application(
+        name='child_graph',
+        description='Nested child graph (rebuilt per _run via client)',
+        application=child_runnable,
+        return_type='str',
+        client=fake_client,
+        is_subgraph=True,
+        args_runnable={
+            'application_id': 99,
+            'application_version_id': 1,
+            'is_subgraph': True,
+        },
+    )
+
+    parent_memory = MemorySaver()
+    thread_config = {
+        'configurable': {'thread_id': 'two-sensitive-standalone-thread'}
+    }
+
+    # --- 1. initial invoke: pause at the FIRST sensitive tool ---
+    initial_llm = ParentResultAwareLLM(target_tool_name='child_graph')
+    initial_runnable = _build_parent_runnable(
+        parent_memory, initial_llm, [parent_tool]
+    )
+    initial_result = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate this task')]},
+        config=thread_config,
+    )
+
+    assert initial_result['execution_finished'] is False
+    assert initial_result['hitl_interrupt']['tool_name'] == 'create_file'
+    assert created == []
+    assert deleted == []
+
+    # --- 2. resume #1 (approve create_file): pause at the SECOND tool ---
+    resume1_llm = ParentResultAwareLLM(target_tool_name='child_graph')
+    resume1_runnable = _build_parent_runnable(
+        parent_memory, resume1_llm, [parent_tool]
+    )
+    resume1_result = resume1_runnable.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+
+    # The second distinct sensitive tool must surface its OWN interrupt —
+    # this is the bug: previously it was swallowed and execution finished.
+    assert resume1_result['execution_finished'] is False, (
+        'second distinct sensitive tool was swallowed instead of pausing'
+    )
+    assert resume1_result['hitl_interrupt']['tool_name'] == 'delete_file'
+    # First tool ran once; second has not run yet (still pending approval).
+    assert len(created) == 1
+    assert deleted == []
+
+    # --- 3. resume #2 (approve delete_file): child completes ---
+    resume2_llm = ParentResultAwareLLM(target_tool_name='child_graph')
+    resume2_runnable = _build_parent_runnable(
+        parent_memory, resume2_llm, [parent_tool]
+    )
+    resume2_result = resume2_runnable.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+
+    assert resume2_result['execution_finished'] is True
+    assert resume2_result['output'] == 'parent-graph-complete'
+    # Both side-effecting tools ran exactly once across the whole cycle.
+    assert len(created) == 1
+    assert len(deleted) == 1
+
+    reset_sensitive_tools()
+
+
+class RetryThenDistinctChildLLM:
+    """Child LLM modelling: create_issue (interrupt) → create_issue retry
+    (auto-approved via batch/decision token, NO interrupt) → delete_issue
+    (must interrupt on its first call).
+
+    Turn logic, driven by how many ToolMessages have already landed:
+      0× 'issue-created'  → call create_issue   (first attempt → interrupt #1)
+      1× 'issue-created'  → call create_issue   (retry → auto-approved)
+      2× 'issue-created'  → call delete_issue   (distinct → interrupt #2)
+      'issue-deleted'     → finish
+    """
+
+    temperature = 0
+    max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _RetryThenDistinctChildLLMBound(tools)
+
+    def invoke(self, messages, config=None):
+        return _RetryThenDistinctChildLLMBound([]).invoke(messages, config=config)
+
+
+class _RetryThenDistinctChildLLMBound:
+    def __init__(self, tools):
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        contents = [
+            str(message.content)
+            for message in messages
+            if isinstance(message, ToolMessage)
+        ]
+        if any('issue-deleted' in c for c in contents):
+            return AIMessage(content='child-graph-complete')
+
+        created_count = sum(1 for c in contents if 'issue-created' in c)
+        if created_count >= 2:
+            return AIMessage(
+                content='',
+                tool_calls=[
+                    {
+                        'name': 'delete_issue',
+                        'args': {'key': 'PROJ-1'},
+                        'id': 'call-delete',
+                        'type': 'tool_call',
+                    }
+                ],
+            )
+        # First attempt and the single retry both target create_issue.
+        return AIMessage(
+            content='',
+            tool_calls=[
+                {
+                    'name': 'create_issue',
+                    'args': {'summary': 'bug'},
+                    'id': f'call-create-{created_count + 1}',
+                    'type': 'tool_call',
+                }
+            ],
+        )
+
+
+def test_create_retry_auto_approves_then_distinct_delete_still_interrupts():
+    """Batch-token interaction with the Issue 1 fix.
+
+    After ``create_issue`` is approved, a SECOND identical ``create_issue``
+    call (a retry) must be auto-approved by the batch/decision token — no
+    second dialog for the same tool. But the subsequent DISTINCT
+    ``delete_issue`` call must STILL raise its own interrupt; the create
+    approval token must not leak into the distinct tool.
+
+    Sequence:
+      1. initial invoke      → pause at create_issue          (interrupt #1)
+      2. resume(approve) #1   → create_issue runs, retry create_issue
+                               auto-approves & runs, then pause at delete_issue
+                               (interrupt #2 — NOT auto-approved, NOT swallowed)
+      3. resume(approve) #2   → delete_issue runs, child completes
+    create_issue executes twice; delete_issue executes once.
+    """
+    reset_sensitive_tools()
+    configure_sensitive_tools({'github': ['create_issue', 'delete_issue']})
+
+    created = []
+    deleted = []
+
+    def create_issue(**kwargs):
+        created.append(kwargs)
+        return 'issue-created'
+
+    def delete_issue(**kwargs):
+        deleted.append(kwargs)
+        return 'issue-deleted'
+
+    create_tool = StructuredTool.from_function(
+        func=create_issue,
+        name='create_issue',
+        description='create issue',
+        metadata={
+            'toolkit_type': 'github',
+            'toolkit_name': 'github',
+            'tool_name': 'create_issue',
+        },
+    )
+    delete_tool = StructuredTool.from_function(
+        func=delete_issue,
+        name='delete_issue',
+        description='delete issue',
+        metadata={
+            'toolkit_type': 'github',
+            'toolkit_name': 'github',
+            'tool_name': 'delete_issue',
+        },
+    )
+
+    child_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'child', 'tools': [], 'meta': {}},
+        client=RetryThenDistinctChildLLM(),
+        tools=[create_tool, delete_tool],
+        memory=None,
+        app_type='predict',
+        is_subgraph=False,
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    child_runnable = child_assistant.runnable()
+
+    fake_client = FakeApplicationClient(child_runnable)
+
+    parent_tool = Application(
+        name='child_graph',
+        description='Nested child graph (rebuilt per _run via client)',
+        application=child_runnable,
+        return_type='str',
+        client=fake_client,
+        is_subgraph=True,
+        args_runnable={
+            'application_id': 99,
+            'application_version_id': 1,
+            'is_subgraph': True,
+        },
+    )
+
+    parent_memory = MemorySaver()
+    thread_config = {
+        'configurable': {'thread_id': 'retry-then-distinct-thread'}
+    }
+
+    # --- 1. initial invoke: pause at create_issue ---
+    initial_llm = ParentResultAwareLLM(target_tool_name='child_graph')
+    initial_runnable = _build_parent_runnable(
+        parent_memory, initial_llm, [parent_tool]
+    )
+    initial_result = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate this task')]},
+        config=thread_config,
+    )
+
+    assert initial_result['execution_finished'] is False
+    assert initial_result['hitl_interrupt']['tool_name'] == 'create_issue'
+    assert created == []
+    assert deleted == []
+
+    # --- 2. resume #1: create runs + retry auto-approves, pause at delete ---
+    resume1_llm = ParentResultAwareLLM(target_tool_name='child_graph')
+    resume1_runnable = _build_parent_runnable(
+        parent_memory, resume1_llm, [parent_tool]
+    )
+    resume1_result = resume1_runnable.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+
+    # The distinct delete_issue must surface its own interrupt; the create
+    # approval token must NOT auto-approve a different tool.
+    assert resume1_result['execution_finished'] is False, (
+        'distinct delete_issue was incorrectly auto-approved or swallowed'
+    )
+    assert resume1_result['hitl_interrupt']['tool_name'] == 'delete_issue'
+    # create_issue ran TWICE (first approval + auto-approved retry); delete
+    # has not run yet (still awaiting its own approval).
+    assert len(created) == 2
+    assert deleted == []
+
+    # --- 3. resume #2: delete runs, child completes ---
+    resume2_llm = ParentResultAwareLLM(target_tool_name='child_graph')
+    resume2_runnable = _build_parent_runnable(
+        parent_memory, resume2_llm, [parent_tool]
+    )
+    resume2_result = resume2_runnable.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+
+    assert resume2_result['execution_finished'] is True
+    assert resume2_result['output'] == 'parent-graph-complete'
+    assert len(created) == 2
+    assert len(deleted) == 1
+
+    reset_sensitive_tools()
+
+
 def test_swarm_result_adapter_hitl_interrupt_and_resume():
     """SwarmResultAdapter detects HITL interrupts and resumes correctly.
 
@@ -1265,3 +1671,314 @@ def test_swarm_peer_subgraph_with_application_tool_hitl():
     )
     assert 'Peer completed with approve' in resume_result['output']
     assert call_count[0] == 2
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Bug #5046 follow-up — Bug 2: second sequential subagent loses
+# parent's intermediate messages when its child triggers a HITL
+# interrupt that bubbles up via Application._run dict-bridge.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _TwoSubagentParentLLMBound:
+    """Parent LLM that calls subagent_A first, then subagent_B sequentially."""
+
+    def __init__(self, root, tools):
+        self.root = root
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        tool_contents = [str(m.content) for m in tool_messages]
+        self.root.calls.append(tool_contents)
+
+        # Both subagents finished — final answer.
+        if 'subagent-B-result' in tool_contents:
+            return AIMessage(content='parent-done')
+
+        # subagent_A finished — call subagent_B next.
+        if tool_contents == ['subagent-A-result']:
+            return AIMessage(
+                content='',
+                tool_calls=[{
+                    'name': 'subagent_B',
+                    'args': {'task': 'Run B'},
+                    'id': 'call-subagent-B',
+                    'type': 'tool_call',
+                }],
+            )
+
+        # No tool messages yet — call subagent_A first.
+        if not tool_contents:
+            return AIMessage(
+                content='',
+                tool_calls=[{
+                    'name': 'subagent_A',
+                    'args': {'task': 'Run A'},
+                    'id': 'call-subagent-A',
+                    'type': 'tool_call',
+                }],
+            )
+
+        return AIMessage(content=f'unexpected:{tool_contents}')
+
+
+class TwoSubagentParentLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _TwoSubagentParentLLMBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _TwoSubagentParentLLMBound(self, []).invoke(messages, config=config)
+
+
+class _SafeChildLLMBound:
+    """Subagent_A's LLM: just produces a final answer (no tool calls)."""
+
+    def __init__(self, tools):
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        return AIMessage(content='subagent-A-result')
+
+
+class SafeChildLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _SafeChildLLMBound(tools)
+
+    def invoke(self, messages, config=None):
+        return _SafeChildLLMBound([]).invoke(messages, config=config)
+
+
+class _SensitiveChildLLMBound:
+    """Subagent_B's LLM: calls a sensitive tool (which fires guard), then completes."""
+
+    def __init__(self, tools):
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        if any(isinstance(m, ToolMessage) for m in messages):
+            return AIMessage(content='subagent-B-result')
+        return AIMessage(
+            content='',
+            tool_calls=[{
+                'name': 'sensitive_op',
+                'args': {'payload': 'x'},
+                'id': 'call-sensitive-B',
+                'type': 'tool_call',
+            }],
+        )
+
+
+class SensitiveChildLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _SensitiveChildLLMBound(tools)
+
+    def invoke(self, messages, config=None):
+        return _SensitiveChildLLMBound([]).invoke(messages, config=config)
+
+
+def test_second_sequential_subagent_preserves_parent_pending_on_hitl_resume():
+    """Bug #5046 follow-up — Bug 2.
+
+    When a parent invokes two Application-tool subagents sequentially and the
+    SECOND subagent triggers a HITL interrupt (sensitive tool), the parent's
+    intermediate messages (the first subagent's tool_call + tool_result)
+    must survive the pause/resume cycle so the parent's LLM does not re-plan
+    from scratch and re-invoke the first subagent.
+
+    Before the fix, ``Application._run`` bubbled up the CHILD's
+    ``_pending_messages`` (which describe the child's internal state, not the
+    parent's) — the parent's resume saw only ``[Human]`` and re-invoked
+    ``subagent_A`` from scratch.
+    """
+    reset_sensitive_tools()
+    configure_sensitive_tools({'demo_kit': ['sensitive_op']})
+
+    sensitive_executions = []
+
+    def sensitive_op(**kwargs):
+        sensitive_executions.append(kwargs)
+        return 'sensitive-op-done'
+
+    sensitive_tool = StructuredTool.from_function(
+        func=sensitive_op,
+        name='sensitive_op',
+        description='Sensitive op',
+        metadata={
+            'toolkit_type': 'demo_kit',
+            'toolkit_name': 'demo_kit',
+            'tool_name': 'sensitive_op',
+        },
+    )
+
+    # Subagent A: no sensitive tools, produces 'subagent-A-result'.
+    child_a_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'A', 'tools': [], 'meta': {}},
+        client=SafeChildLLM(),
+        tools=[],
+        memory=None,
+        app_type='predict',
+        is_subgraph=True,
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    child_a_runnable = child_a_assistant.runnable()
+
+    # Subagent B: has a sensitive tool, child guard will fire.
+    child_b_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'B', 'tools': [], 'meta': {}},
+        client=SensitiveChildLLM(),
+        tools=[sensitive_tool],
+        memory=None,
+        app_type='predict',
+        is_subgraph=True,
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    child_b_runnable = child_b_assistant.runnable()
+
+    subagent_a_tool = Application(
+        name='subagent_A',
+        description='First sequential subagent',
+        application=child_a_runnable,
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+    )
+    subagent_b_tool = Application(
+        name='subagent_B',
+        description='Second sequential subagent',
+        application=child_b_runnable,
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+    )
+
+    parent_memory = MemorySaver()
+    thread_config = {
+        'configurable': {'thread_id': 'two-sequential-subagents-thread'}
+    }
+
+    # Initial run — should pause at subagent_B's sensitive tool.
+    initial_llm = TwoSubagentParentLLM()
+    initial_runnable = _build_parent_runnable(
+        parent_memory, initial_llm, [subagent_a_tool, subagent_b_tool]
+    )
+    initial_result = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Run both')]},
+        config=thread_config,
+    )
+
+    assert initial_result['execution_finished'] is False, (
+        f'Expected pause, got: {initial_result}'
+    )
+    assert initial_result['hitl_interrupt']['tool_name'] == 'sensitive_op'
+    # Sensitive tool must NOT have run yet.
+    assert sensitive_executions == []
+
+    # The bubbled interrupt must carry PARENT's intermediates (call to
+    # subagent_A + its result) so the parent's history survives the resume.
+    # ``_pending_messages`` is intentionally stripped from the UI-facing
+    # ``initial_result['hitl_interrupt']`` copy, but the full value is
+    # persisted in the checkpoint — that is what the resume path reads.
+    def _persisted_interrupt_value(runnable, cfg):
+        snapshot = runnable.get_state(cfg)
+        for task in getattr(snapshot, 'tasks', None) or []:
+            for intr in getattr(task, 'interrupts', None) or []:
+                value = getattr(intr, 'value', None)
+                if isinstance(value, dict) and value.get('type') == 'hitl':
+                    return value
+        return {}
+
+    persisted_interrupt = _persisted_interrupt_value(initial_runnable, thread_config)
+    bubbled_pending = persisted_interrupt.get('_pending_messages') or []
+    pending_kinds = []
+    pending_tool_names = []
+    pending_tool_contents = []
+    for msg in bubbled_pending:
+        msg_type = msg.get('type', '') if isinstance(msg, dict) else ''
+        pending_kinds.append(msg_type)
+        data = msg.get('data', {}) if isinstance(msg, dict) else {}
+        if msg_type == 'ai':
+            for tc in data.get('tool_calls') or []:
+                pending_tool_names.append(tc.get('name'))
+        elif msg_type == 'tool':
+            pending_tool_contents.append(str(data.get('content', '')))
+
+    assert 'subagent_A' in pending_tool_names, (
+        f'Bubbled _pending_messages must contain the AIMessage that '
+        f'invoked subagent_A so the parent LLM can see preceding work. '
+        f'Got tool calls in pending: {pending_tool_names}'
+    )
+    assert 'subagent-A-result' in pending_tool_contents, (
+        f'Bubbled _pending_messages must contain the ToolMessage with '
+        f'subagent_A\'s result so the parent LLM can see what A returned. '
+        f'Got tool contents in pending: {pending_tool_contents}'
+    )
+
+    # Resume.
+    resumed_llm = TwoSubagentParentLLM()
+    resumed_runnable = _build_parent_runnable(
+        parent_memory, resumed_llm, [subagent_a_tool, subagent_b_tool]
+    )
+    resume_result = resumed_runnable.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+
+    # Sensitive tool must have run exactly once.
+    assert len(sensitive_executions) == 1, (
+        f'Sensitive tool should run exactly once on approve; got '
+        f'{len(sensitive_executions)} executions'
+    )
+
+    # Parent must complete with the expected final answer.
+    assert resume_result['execution_finished'] is True
+    assert resume_result['output'] == 'parent-done'
+
+    # The parent LLM on resume must NOT see an empty tool history (which
+    # would mean subagent_A's preceding work was lost). The first turn on
+    # resume should already see subagent_A's result, then proceed straight
+    # to call subagent_B.
+    last_call_tool_contents = resumed_llm.calls[-1]
+    assert 'subagent-B-result' in last_call_tool_contents, (
+        f'Parent LLM final turn should observe subagent_B result. '
+        f'Got resumed_llm.calls={resumed_llm.calls}'
+    )
+    # On resume, the very first parent LLM turn must already have access to
+    # subagent_A's prior result. If parent's pending was lost, the LLM would
+    # see [] and re-issue the call to subagent_A, doubling its execution.
+    # Capturing every parent LLM invocation:
+    first_resume_call = resumed_llm.calls[0] if resumed_llm.calls else []
+    assert 'subagent-A-result' in first_resume_call, (
+        f'Parent LLM first resume turn must see subagent_A\'s result in its '
+        f'tool history (otherwise the parent re-plans from scratch and '
+        f're-invokes subagent_A). Got first resume call tool history: '
+        f'{first_resume_call}'
+    )
+
+    reset_sensitive_tools()

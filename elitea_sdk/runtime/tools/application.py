@@ -314,6 +314,29 @@ class Application(BaseTool):
             # (checkpointer=True) which langgraph rejects as a root graph. (#5046)
             runnable_args = {**self.args_runnable, 'is_subgraph': False}
             self.application = self.client.application(**runnable_args, application_variables=application_variables)
+        # Capture parent's pending intermediate messages BEFORE invoking the
+        # child application. The child runs in the same thread/asyncio context
+        # and its own __perform_tool_calling overwrites the shared
+        # ``_PENDING_TOOL_MESSAGES`` ContextVar (llm.py:2111 resets it to []).
+        # If the child triggers a HITL bubble-up, we need the parent's pending
+        # — captured here — to merge into ``child_hitl_for_parent`` so the
+        # parent's resume restores the parent's preceding tool calls/results
+        # (e.g. the first subagent's call + result when the SECOND sequential
+        # subagent triggers the interrupt).
+        _parent_pending_serialized: list[dict] = []
+        try:
+            from langchain_core.messages import message_to_dict
+            from .llm import _PENDING_TOOL_MESSAGES
+            for _m in _PENDING_TOOL_MESSAGES.get([]):
+                try:
+                    _parent_pending_serialized.append(message_to_dict(_m))
+                except Exception:
+                    pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[APP_RUN] Failed to capture parent pending messages: %s", exc,
+            )
+
         # Forward checkpoint-bearing config to the nested application so child
         # applications participate in the same durable execution tree.
         # Keep callbacks and other non-essential runtime baggage stripped to
@@ -345,15 +368,58 @@ class Application(BaseTool):
             nested_config['metadata'] = nested_metadata
         if not nested_config:
             nested_config = None
-        response = self.application.invoke(
-            formulate_query(kwargs, is_subgraph=self.is_subgraph),
-            config=nested_config,
-        )
+        try:
+            response = self.application.invoke(
+                formulate_query(kwargs, is_subgraph=self.is_subgraph),
+                config=nested_config,
+            )
+        except Exception as gb:
+            # GraphInterrupt propagation path (typically is_subgraph=True child,
+            # or any child whose interrupt() raises directly without being
+            # absorbed by an inner pregel). The exception's payload is already
+            # in flight to the parent's pregel; mutate its value dict in place
+            # so the parent's checkpoint records (a) parent tool identity and
+            # (b) the PARENT's intermediate messages — without those, on resume
+            # the parent's LLM history is restored from the child's view (or
+            # nothing) and the parent re-plans from scratch, re-invoking
+            # earlier sequential subagents.
+            from langgraph.errors import GraphBubbleUp, GraphInterrupt
+            if not isinstance(gb, GraphBubbleUp):
+                raise
+            if isinstance(gb, GraphInterrupt) and gb.args:
+                for interrupts in gb.args:
+                    if not isinstance(interrupts, (tuple, list)):
+                        continue
+                    for it in interrupts:
+                        value = getattr(it, 'value', None)
+                        if not isinstance(value, dict):
+                            continue
+                        if value.get('guardrail_type') != 'sensitive_tool':
+                            continue
+                        value.setdefault('_parent_tool_name', self.name)
+                        value.setdefault('_parent_tool_args', {'task': kwargs.get('task', '')})
+                        if _parent_pending_serialized:
+                            value['_pending_messages'] = _parent_pending_serialized
+                            logger.info(
+                                "[APP_RUN] Augmented bubbled HITL interrupt with %d "
+                                "parent intermediate messages (tool=%s)",
+                                len(_parent_pending_serialized), self.name,
+                            )
+            raise
 
         # HITL bubble-up (dict-bridge): when the child returns hitl_interrupt
         # in its state (e.g. subgraph mode or legacy path), propagate it to
         # the parent graph. On resume, interrupt() returns the user's decision.
-        if isinstance(response, dict) and response.get('hitl_interrupt'):
+        #
+        # A single child can pause MULTIPLE times — e.g. it calls two distinct
+        # sensitive tools in sequence. Each resume re-invokes the child, which
+        # may surface a *new* hitl_interrupt for the next sensitive tool. Loop
+        # until the child completes without pausing so every distinct approval
+        # dialog is surfaced (the second interrupt was previously swallowed).
+        # LangGraph replays the resume values positionally per node task, so
+        # each interrupt() call resolves against its own scratchpad slot when
+        # this tool re-executes on a later parent resume.
+        while isinstance(response, dict) and response.get('hitl_interrupt'):
             child_hitl = response['hitl_interrupt']
             logger.info(
                 "[APP_RUN] Child '%s' paused at HITL interrupt (tool=%s), bubbling to parent",
@@ -362,11 +428,24 @@ class Application(BaseTool):
             # Tag with parent tool identity so the parent's resume handler
             # builds _hitl_resume_context referencing THIS tool (Application),
             # not the child's leaf tool which doesn't exist in the parent graph.
+            #
+            # Replace the CHILD's _pending_messages (which describe the child's
+            # internal state) with the PARENT's pending captured BEFORE the
+            # child invocation — only the parent's pending is meaningful when
+            # restored into the parent's LLM history on resume. The child
+            # preserves its own pending in its own checkpoint for its own
+            # resume cycle.
             child_hitl_for_parent = {
                 **child_hitl,
                 '_parent_tool_name': self.name,
                 '_parent_tool_args': {'task': kwargs.get('task', '')},
             }
+            if _parent_pending_serialized:
+                child_hitl_for_parent['_pending_messages'] = _parent_pending_serialized
+                logger.info(
+                    "[APP_RUN] Captured %d parent intermediate messages for HITL bubble-up",
+                    len(_parent_pending_serialized),
+                )
             resume_value = interrupt(child_hitl_for_parent)
             # Defensive: a non-dict resume value (LangGraph version drift, test
             # harness, or malformed Command(resume=...) payload) would raise
