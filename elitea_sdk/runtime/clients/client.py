@@ -645,9 +645,10 @@ class EliteAClient:
         return data
 
     def unsecret(self, secret_name: str):
+        from elitea_sdk.runtime.utils.logging import mask_sensitive_value
         url = f"{self.secrets_url}/{secret_name}"
         data = requests.get(url, headers=self.headers, verify=False).json()
-        logger.debug(f"Unsecret response: {data}")
+        logger.debug(f"Unsecret response for '{secret_name}': value={mask_sensitive_value(data.get('value', ''))}")
         return data.get('value', None)
 
     def _inject_summarization(
@@ -1458,7 +1459,7 @@ class EliteAClient:
             # Create LLM instance using the client's get_llm method
             try:
                 llm = self.get_llm(llm_model, llm_config)
-                logger.info(f"Created LLM instance: {llm_model} with config: {llm_config}")
+                logger.debug(f"Created LLM instance: {llm_model} with config: {llm_config}")
             except Exception as llm_error:
                 logger.error(f"Failed to create LLM instance: {str(llm_error)}")
                 return {

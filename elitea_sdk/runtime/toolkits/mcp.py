@@ -229,16 +229,11 @@ class McpToolkit(BaseToolkit):
         if isinstance(headers, str) and headers.strip():
             try:
                 import json
-                logger.debug(f"Raw headers string length: {len(headers)} chars")
-                logger.debug(f"Raw headers string (first 100 chars): {headers[:100]}")
-                logger.debug(f"Raw headers string (last 100 chars): {headers[-100:]}")
                 parsed_headers = json.loads(headers)
-                logger.info(f"Parsed headers from JSON string successfully")
-                logger.debug(f"Parsed headers: {parsed_headers}")
+                logger.debug(f"Parsed headers from JSON string successfully, keys: {list(parsed_headers.keys())}")
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse headers JSON: {e}")
                 logger.error(f"Headers string length: {len(headers)}")
-                logger.error(f"Headers string content: {repr(headers)}")
                 raise ValueError(f"Invalid headers JSON format: {e}")
         elif headers is not None and not isinstance(headers, dict):
             logger.error(f"Headers must be a dictionary or JSON string, got: {type(headers)}")

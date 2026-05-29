@@ -101,7 +101,8 @@ class SlackApiWrapper(BaseToolApiWrapper):
         try:
 
             client = self._get_client()
-            logger.info(f"auth test: {client.auth_test()}")
+            auth_result = client.auth_test()
+            logger.debug(f"Slack auth test ok: team={auth_result.get('team')}, user={auth_result.get('user')}")
             # Use the passed channel_id if provided, else use self.channel_id
             channel = channel_id if channel_id else self.channel_id
             # Fetch conversation history
