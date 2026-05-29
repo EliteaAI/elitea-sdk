@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote, urlparse, quote
 import base64
 import logging
+import re
 
 import jwt
 import requests
@@ -92,9 +93,31 @@ class SharepointAuthorizationHelper:
             site_path = parsed.path.strip('/')
             if not domain or not site_path:
                 raise ValueError(f"site_url missing domain or site path: {site_url}")
-            app_name = domain.split('.')[0]
-            openid_config_url = f"https://login.microsoftonline.com/{app_name}.onmicrosoft.com/v2.0/.well-known/openid-configuration"
-            response = requests.get(openid_config_url)
+            # Discover tenant ID from SharePoint realm endpoint, falling back to
+            # custom domain and onmicrosoft.com candidates (same logic as check_connection).
+            tenant_id = None
+            try:
+                realm_resp = requests.get(f"https://{domain}/_vti_bin/client.svc", timeout=10)
+                www_auth = realm_resp.headers.get("WWW-Authenticate", "")
+                realm_match = re.search(r'realm="([^"]+)"', www_auth)
+                if realm_match:
+                    tenant_id = realm_match.group(1)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                pass
+            prefix = domain.split(".")[0]
+            candidates = [tenant_id] if tenant_id else [f"{prefix}.com", f"{prefix}.onmicrosoft.com"]
+            response = None
+            for candidate in candidates:
+                url = f"https://login.microsoftonline.com/{candidate}/v2.0/.well-known/openid-configuration"
+                try:
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code == 200:
+                        response = resp
+                        break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    pass
+            if response is None:
+                raise RuntimeError("Failed to resolve Azure AD OpenID configuration for tenant")
             token_url = self._validate_response(response, required_field="token_endpoint", error_prefix="OpenID config")
             token_data = {
                 "grant_type": "client_credentials",
