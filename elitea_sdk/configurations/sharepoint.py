@@ -38,7 +38,7 @@ class SharepointConfiguration(BaseModel):
     # Client credentials (shared by both app_auth and delegated flows)
     client_id: str = Field(description="SharePoint Client ID")
     client_secret: SecretStr = Field(description="SharePoint Client Secret")
-    site_url: str = Field(description="SharePoint Site URL")
+    site_url: str = Field(description="SharePoint tenant or site URL")
 
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
@@ -459,10 +459,18 @@ class SharepointConfiguration(BaseModel):
             parsed = urlparse(site_url)
             hostname = parsed.netloc
             if not hostname:
-                return "Failed to parse SharePoint URL - ensure it is in format: https://<tenant>.sharepoint.com/sites/<site>"
+                return (
+                    "Failed to parse SharePoint URL - use https://<tenant>.sharepoint.com, "
+                    "https://<tenant>.sharepoint.com/sites/<site>, or "
+                    "https://<tenant>.sharepoint.com/teams/<team>"
+                )
             tenant = hostname.split(".")[0]
         except Exception:
-            return "Failed to parse SharePoint URL - ensure it is in format: https://<tenant>.sharepoint.com/sites/<site>"
+            return (
+                "Failed to parse SharePoint URL - use https://<tenant>.sharepoint.com, "
+                "https://<tenant>.sharepoint.com/sites/<site>, or "
+                "https://<tenant>.sharepoint.com/teams/<team>"
+            )
 
         try:
             # Step 1: discover token endpoint via Azure AD v2.0 OpenID config
