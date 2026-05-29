@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from jinja2 import Environment, DebugUndefined
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage, ToolMessage
@@ -1069,6 +1070,8 @@ class Assistant:
                 try:
                     result = application_tool.invoke({"task": task}, config=config)
                     content = _extract_subagent_output(result)
+                except GraphBubbleUp:
+                    raise
                 except Exception as e:
                     logger.error(f"[SWARM] Direct invocation of '{agent_name}' failed: {e}", exc_info=True)
                     content = f"Execution failed: {e}"
@@ -1348,6 +1351,8 @@ class Assistant:
                 self._middleware_manager = middleware_manager
 
             def invoke(self, input, config=None, **kwargs):
+                from langgraph.types import Command
+
                 # Normalize input shape: swarm uses MessagesState (key "messages"),
                 # but Application._run / formulate_query produces {"input": [...]}
                 # when invoked as a sub-agent of another agent. Without this
@@ -1366,40 +1371,88 @@ class Assistant:
                     if isinstance(config, dict) else None
                 )
 
-                # On a continuation (the thread already has checkpoint state),
-                # pylon's input["messages"] is its UI-tracked chat_history dicts
-                # + the new HumanMessage. That history does NOT contain raw
-                # sub-agent outputs from prior turns — pylon only stores
-                # user-facing assistant turns. The langgraph checkpoint already
-                # holds the COMPLETE message stream including those outputs, so
-                # we trust it as the source of truth and pass only the new
-                # HumanMessage. add_messages then appends it without disturbing
-                # the prior state, and the orchestrator sees turn N-1's
-                # sub-agent results.
-                if thread_id and checkpointer and isinstance(input, dict):
-                    try:
-                        prior_state = self._graph.get_state(config)
-                        prior_msgs = (
-                            prior_state.values.get("messages", []) if prior_state else []
-                        )
-                    except Exception as e:
-                        logger.debug("[SWARM] Could not read prior checkpoint: %s", e)
-                        prior_msgs = []
-                    if prior_msgs:
-                        in_msgs = input.get("messages") or []
-                        new_human = None
-                        for msg in reversed(in_msgs):
-                            if isinstance(msg, HumanMessage):
-                                new_human = msg
-                                break
-                        if new_human is not None:
-                            input = dict(input)
-                            input["messages"] = [new_human]
-                            logger.info(
-                                "[SWARM] Continuation: keeping checkpoint state, "
-                                "appending only the new HumanMessage"
+                # HITL resume: pylon passes hitl_resume=True when the user
+                # approves/rejects. Resume the swarm via Command(resume=...) so
+                # the interrupted node's interrupt() call returns the decision.
+                if isinstance(input, dict) and input.get('hitl_resume'):
+                    resume_value = {
+                        'action': input.get('hitl_action', 'approve'),
+                        'value': input.get('hitl_value', ''),
+                    }
+                    logger.info("[SWARM] Resuming HITL with: %s", resume_value)
+                    result = self._graph.invoke(
+                        Command(resume=resume_value), config, **kwargs
+                    )
+                else:
+                    # On a continuation (the thread already has checkpoint state),
+                    # pylon's input["messages"] is its UI-tracked chat_history dicts
+                    # + the new HumanMessage. That history does NOT contain raw
+                    # sub-agent outputs from prior turns — pylon only stores
+                    # user-facing assistant turns. The langgraph checkpoint already
+                    # holds the COMPLETE message stream including those outputs, so
+                    # we trust it as the source of truth and pass only the new
+                    # HumanMessage. add_messages then appends it without disturbing
+                    # the prior state, and the orchestrator sees turn N-1's
+                    # sub-agent results.
+                    if thread_id and checkpointer and isinstance(input, dict):
+                        try:
+                            prior_state = self._graph.get_state(config)
+                            prior_msgs = (
+                                prior_state.values.get("messages", []) if prior_state else []
                             )
-                result = self._graph.invoke(input, config, **kwargs)
+                        except Exception as e:
+                            logger.debug("[SWARM] Could not read prior checkpoint: %s", e)
+                            prior_msgs = []
+                        if prior_msgs:
+                            in_msgs = input.get("messages") or []
+                            new_human = None
+                            for msg in reversed(in_msgs):
+                                if isinstance(msg, HumanMessage):
+                                    new_human = msg
+                                    break
+                            if new_human is not None:
+                                input = dict(input)
+                                input["messages"] = [new_human]
+                                logger.info(
+                                    "[SWARM] Continuation: keeping checkpoint state, "
+                                    "appending only the new HumanMessage"
+                                )
+                    result = self._graph.invoke(input, config, **kwargs)
+
+                # Check for HITL interrupt: when a peer's Application tool calls
+                # interrupt(), the swarm pregel suppresses GraphInterrupt and
+                # stores it in the checkpoint. Detect it here so pylon surfaces
+                # the approval dialog instead of treating the run as completed.
+                try:
+                    state_snapshot = self._graph.get_state(config)
+                    hitl_interrupt = None
+                    if hasattr(state_snapshot, 'tasks') and state_snapshot.tasks:
+                        for task in state_snapshot.tasks:
+                            if hasattr(task, 'interrupts') and task.interrupts:
+                                for intr in task.interrupts:
+                                    if hasattr(intr, 'value') and isinstance(intr.value, dict):
+                                        if intr.value.get('type') == 'hitl':
+                                            hitl_interrupt = intr.value
+                                            break
+                            if hitl_interrupt:
+                                break
+                    if hitl_interrupt:
+                        hitl_for_ui = {
+                            k: v for k, v in hitl_interrupt.items()
+                            if k not in ('tool_args_raw', '_pending_messages',
+                                         '_parent_tool_name', '_parent_tool_args')
+                        }
+                        logger.info("[SWARM] Execution paused at HITL: %s", hitl_for_ui)
+                        return AgentResponse(
+                            output=hitl_interrupt.get("message", "Awaiting human review..."),
+                            messages=result.get("messages", []),
+                            thread_id=thread_id,
+                            execution_finished=False,
+                            hitl_interrupt=hitl_for_ui,
+                        ).to_dict()
+                except Exception as e:
+                    logger.debug("[SWARM] Could not check for HITL interrupt: %s", e)
+
                 messages = result.get("messages", [])
                 output = ""
                 for msg in reversed(messages):
@@ -1417,9 +1470,6 @@ class Assistant:
                     _mw.run_after_model({'messages': messages}, config or {})
                     context_info = _mw.get_context_info()
 
-                # Swarm has no interrupt_before/after, so a top-level invoke always
-                # reaches END. thread_id is therefore None on completion (matches the
-                # LangGraphAgentRunnable contract for finished runs).
                 return AgentResponse(
                     output=output,
                     messages=messages,
