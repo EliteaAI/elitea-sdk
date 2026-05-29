@@ -124,10 +124,17 @@ def load_nodes_with_continue_on_error(pipeline_name: str, logger: Optional[TestL
                     # "296c5eff_GH20 - Create Pull Request") that the YAML doesn't have.
                     # Match if the YAML name is a suffix of the pipeline name (case-insensitive).
                     # Guard against empty yaml_name — str.endswith("") is always True.
+                    # Also match by filename stem (e.g. "test_case_10_invalid_jql") since
+                    # local execution uses the filename as the pipeline_name.
                     yaml_name = data.get("name", "")
-                    if not yaml_name:
-                        continue
-                    if yaml_name != pipeline_name and not pipeline_name.endswith(yaml_name):
+                    file_stem = yaml_file.stem  # filename without extension
+                    name_match = (
+                        (yaml_name and yaml_name == pipeline_name)
+                        or (yaml_name and pipeline_name.endswith(yaml_name))
+                        or file_stem == pipeline_name
+                        or pipeline_name.endswith(file_stem)
+                    )
+                    if not name_match:
                         continue
                     
                     # Found the right file - extract nodes with continue_on_error
@@ -532,6 +539,13 @@ def process_pipeline_result(
                                         logger.debug(f"Skipping Python warning in tool '{tool_name}' output: {error_msg[:100]}...")
                                     continue  # Skip this warning, don't treat as error
                                 
+                                # Check if this error came from a node with continue_on_error: true
+                                node_name = tool_call.get("metadata", {}).get("langgraph_node", "unknown")
+                                if node_name in nodes_with_continue_on_error:
+                                    if logger:
+                                        logger.debug(f"JSON error field from node '{node_name}' with continue_on_error: true - not treating as failure")
+                                    continue  # Skip this error, don't mark test as failed
+
                                 # Extract meaningful error from tracebacks
                                 if "Traceback" in error_msg:
                                     # Get last line of traceback (usually the actual error)
@@ -553,6 +567,13 @@ def process_pipeline_result(
                             elif parsed_output.get("status") == "Execution failed":
                                 tool_name = tool_call.get("tool_meta", {}).get("name", "unknown_tool")
                                 error_msg = parsed_output.get("error", "Execution failed")
+
+                                # Check if this error came from a node with continue_on_error: true
+                                node_name = tool_call.get("metadata", {}).get("langgraph_node", "unknown")
+                                if node_name in nodes_with_continue_on_error:
+                                    if logger:
+                                        logger.debug(f"Execution failed from node '{node_name}' with continue_on_error: true - not treating as failure")
+                                    continue  # Skip this error, don't mark test as failed
                                 
                                 if "Traceback" in error_msg:
                                     lines = error_msg.strip().split('\n')
@@ -577,6 +598,14 @@ def process_pipeline_result(
                             "Tool '",
                             "failed",
                         ]):
+                            # Check if this error came from a node with continue_on_error: true
+                            # (e.g., negative tests that intentionally trigger tool errors)
+                            node_name = tool_call.get("metadata", {}).get("langgraph_node", "unknown")
+                            if node_name in nodes_with_continue_on_error:
+                                if logger:
+                                    logger.debug(f"Plain-text error from node '{node_name}' with continue_on_error: true - not treating as failure")
+                                continue  # Skip this error, don't mark test as failed
+
                             # Extract tool name and error message
                             tool_name = tool_call.get("tool_meta", {}).get("name", "unknown_tool")
                             
