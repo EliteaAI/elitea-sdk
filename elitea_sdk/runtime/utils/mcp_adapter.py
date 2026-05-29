@@ -133,7 +133,7 @@ class UnifiedMcpClient:
         # Note: SSL verification is handled via httpx_client_factory in _build_server_config
         server_config = self._build_server_config(detected_transport)
 
-        logger.debug(f"[Unified MCP] Connecting with config: {server_config}")
+        logger.debug(f"[Unified MCP] Connecting to server: {self._server_name} (transport={detected_transport})")
 
         # Create MultiServerMCPClient with single server
         self._client = MultiServerMCPClient({self._server_name: server_config})

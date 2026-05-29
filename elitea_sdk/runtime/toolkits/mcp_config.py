@@ -606,7 +606,7 @@ class McpConfigToolkit(BaseToolkit):
         if not token_data:
             token_data = mcp_tokens.get(server_name) or mcp_tokens.get(toolkit_name)
 
-        logger.debug(f"[MCP Config] MCP Server {server_name} loaded: {token_data}")
+        logger.debug(f"[MCP Config] MCP Server {server_name} token_data present: {token_data is not None}")
         if not token_data:
             # Try to find by URL match
             for token_key, token_info in mcp_tokens.items():
@@ -624,7 +624,7 @@ class McpConfigToolkit(BaseToolkit):
                 headers['Authorization'] = f"{token_type} {access_token}"
                 logger.info(f"[MCP Config] Applied OAuth token for HTTP server {server_name}")
 
-        logger.debug(f"[MCP Config] Connecting to HTTP server {server_name} at {url} (ssl_verify={ssl_verify}) with headers: {headers})")
+        logger.debug(f"[MCP Config] Connecting to HTTP server {server_name} at {url} (ssl_verify={ssl_verify})")
 
 
         # Use existing McpToolkit for HTTP servers

@@ -237,7 +237,7 @@ def substitute_mcp_placeholders(value: Any, user_config: Dict[str, Any]) -> Any:
         result = re.sub(r'(?<!\{)\{(\w+)\}(?!\})', param_replacer, value)
 
         if result != original_value:
-            logger.debug(f"[MCP] Placeholder substitution: '{original_value}' -> '{result}'")
+            logger.debug(f"[MCP] Placeholder substitution applied for value with {len(original_value)} chars")
 
         return result
     elif isinstance(value, dict):

@@ -57,7 +57,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store=None)
                 all_tools.extend(toolkit_instance.get_tools())
             except Exception as e:
                 logger.error(f"Error in data analysis toolkit get_tools: {e}")
-                logger.error(f"Tool config: {tool}")
+                logger.debug(f"Tool config: {tool}")
                 raise
 
     return all_tools

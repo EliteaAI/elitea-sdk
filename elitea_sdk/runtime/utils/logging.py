@@ -1,5 +1,41 @@
 import logging
+import re
 from functools import wraps
+from urllib.parse import urlparse
+
+
+def mask_sensitive_value(value: str, visible_chars: int = 4) -> str:
+    """Mask a sensitive string, showing only first and last few characters."""
+    if not value or not isinstance(value, str):
+        return "****"
+    if len(value) <= visible_chars * 2 + 4:
+        return "****"
+    return f"{value[:visible_chars]}****{value[-visible_chars:]}"
+
+
+def mask_connection_string(conn_str: str) -> str:
+    """Mask credentials in a database connection string."""
+    if not conn_str or not isinstance(conn_str, str):
+        return "****"
+    try:
+        prefix = ""
+        url_part = conn_str
+        if "://" in conn_str:
+            prefix, url_part = conn_str.split("://", 1)
+            prefix += "://"
+        parsed = urlparse(f"//{url_part}")
+        masked_user = "***" if parsed.username else ""
+        masked_pass = "***" if parsed.password else ""
+        userinfo = ""
+        if masked_user:
+            userinfo = f"{masked_user}:{masked_pass}@" if masked_pass else f"{masked_user}@"
+        host_part = parsed.hostname or ""
+        if parsed.port:
+            host_part += f":{parsed.port}"
+        path = parsed.path or ""
+        return f"{prefix}{userinfo}{host_part}{path}"
+    except Exception:
+        return "****"
 
 try:
     from langchain_core.callbacks import dispatch_custom_event

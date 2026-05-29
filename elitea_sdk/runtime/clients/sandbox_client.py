@@ -342,8 +342,9 @@ class SandboxClient:
     def unsecret(self, secret_name: str):
         url = f'{self.secrets_url}/{secret_name}'
         data = requests.get(url, headers=self.headers, verify=False).json()
-        logger.debug(f'Unsecret response: {data}')
-        return data.get('value', None)
+        value = data.get('value', None)
+        logger.debug(f"Unsecret '{secret_name}': has_value={value is not None}")
+        return value
 
     def artifact(self, bucket_name):
         return SandboxArtifact(self, bucket_name)
