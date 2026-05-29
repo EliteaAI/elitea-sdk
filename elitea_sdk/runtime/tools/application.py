@@ -398,6 +398,11 @@ class Application(BaseTool):
                             continue
                         value.setdefault('_parent_tool_name', self.name)
                         value.setdefault('_parent_tool_args', {'task': kwargs.get('task', '')})
+                        # Always drop the CHILD's pending messages so they can
+                        # never leak into the parent checkpoint and pollute the
+                        # parent LLM's resume history; attach the parent's
+                        # captured pending (if any) in their place.
+                        value.pop('_pending_messages', None)
                         if _parent_pending_serialized:
                             value['_pending_messages'] = _parent_pending_serialized
                             logger.info(
@@ -440,6 +445,11 @@ class Application(BaseTool):
                 '_parent_tool_name': self.name,
                 '_parent_tool_args': {'task': kwargs.get('task', '')},
             }
+            # The {**child_hitl} spread copies the CHILD's own _pending_messages.
+            # Always drop them so they can't leak into the parent checkpoint;
+            # only the parent's pending is meaningful when restored into the
+            # parent's LLM history on resume.
+            child_hitl_for_parent.pop('_pending_messages', None)
             if _parent_pending_serialized:
                 child_hitl_for_parent['_pending_messages'] = _parent_pending_serialized
                 logger.info(

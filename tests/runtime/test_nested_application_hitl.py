@@ -1916,12 +1916,10 @@ def test_second_sequential_subagent_preserves_parent_pending_on_hitl_resume():
 
     persisted_interrupt = _persisted_interrupt_value(initial_runnable, thread_config)
     bubbled_pending = persisted_interrupt.get('_pending_messages') or []
-    pending_kinds = []
     pending_tool_names = []
     pending_tool_contents = []
     for msg in bubbled_pending:
         msg_type = msg.get('type', '') if isinstance(msg, dict) else ''
-        pending_kinds.append(msg_type)
         data = msg.get('data', {}) if isinstance(msg, dict) else {}
         if msg_type == 'ai':
             for tc in data.get('tool_calls') or []:
