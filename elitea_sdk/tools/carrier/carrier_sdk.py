@@ -141,7 +141,6 @@ class CarrierClient(BaseModel):
         import zipfile
         with zipfile.ZipFile(local_file_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
-        import os
         if os.path.exists(local_file_path):
             os.remove(local_file_path)
 
@@ -190,7 +189,6 @@ class CarrierClient(BaseModel):
             import zipfile
             with zipfile.ZipFile(local_file_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
-            import os
             if os.path.exists(local_file_path):
                 os.remove(local_file_path)
             extracted_reports.append(extract_dir)
