@@ -3,6 +3,8 @@ import atexit
 import logging
 from urllib.parse import urlparse, unquote
 
+from elitea_sdk.runtime.utils.logging import mask_connection_string
+
 logger = logging.getLogger(__name__)
 
 class StoreManager:
@@ -40,7 +42,7 @@ class StoreManager:
         
         store = self._stores.get(conn_str)
         if store is None:
-            logger.info(f"Creating new PostgresStore for connection: {conn_str}")
+            logger.debug(f"Creating new PostgresStore for connection: {mask_connection_string(conn_str)}")
             conn_params = self._parse_connection_string(conn_str)
             conn_params.update({'autocommit': True, 'prepare_threshold': 0})
             conn = Connection.connect(**conn_params)

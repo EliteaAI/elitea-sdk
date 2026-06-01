@@ -1192,7 +1192,7 @@ class LLMNode(BaseTool):
                 # that prefixed/aliased names (e.g. github___tool) still
                 # match the base name from the HITL interrupt payload.
                 own_tool_names = {normalize_tool_name(t.name) for t in (self.available_tools or [])}
-                if ctx_tool not in own_tool_names:
+                if normalize_tool_name(ctx_tool) not in own_tool_names:
                     logger.info(
                         "[HITL] Ignoring stale _hitl_resume_context for tool '%s' "
                         "— not in this LLM node's tools %s",
@@ -1878,7 +1878,7 @@ class LLMNode(BaseTool):
     
     def _run_async_in_sync_context(self, coro):
         """Run async coroutine from sync context.
-        
+
         For MCP tools with persistent sessions, we reuse the same event loop
         that was used to create the MCP client and sessions (set by CLI).
 
@@ -1890,6 +1890,7 @@ class LLMNode(BaseTool):
         2. Called from sync context with persistent loop - reuses persistent loop
         3. Called from sync context without loop - creates new persistent loop
         """
+        import contextvars
         import threading
 
         # Check if there's a running loop
@@ -1905,6 +1906,12 @@ class LLMNode(BaseTool):
             result_container = []
             exception_container = []
 
+            # Capture the current context (including LangGraph's
+            # var_child_runnable_config) so interrupt() works inside the
+            # spawned thread. Without this, ContextVars are not inherited
+            # by plain threading.Thread targets.
+            parent_ctx = contextvars.copy_context()
+
             # Try to capture Streamlit context from current thread for propagation
             streamlit_ctx = None
             try:
@@ -1916,18 +1923,23 @@ class LLMNode(BaseTool):
                 logger.debug(f"Streamlit context not available or failed to capture: {e}")
 
             def run_in_thread():
-                """Run coroutine in a new thread with its own event loop."""
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    result = new_loop.run_until_complete(coro)
-                    result_container.append(result)
-                except Exception as e:
-                    logger.debug(f"Exception in async thread: {e}")
-                    exception_container.append(e)
-                finally:
-                    new_loop.close()
-                    asyncio.set_event_loop(None)
+                """Run coroutine in a new thread with its own event loop,
+                inheriting the parent's ContextVars."""
+                def _inner():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        result = new_loop.run_until_complete(coro)
+                        result_container.append(result)
+                    except GraphBubbleUp as gb:
+                        exception_container.append(gb)
+                    except Exception as e:
+                        logger.debug(f"Exception in async thread: {e}")
+                        exception_container.append(e)
+                    finally:
+                        new_loop.close()
+                        asyncio.set_event_loop(None)
+                parent_ctx.run(_inner)
 
             thread = threading.Thread(target=run_in_thread, daemon=False)
 
@@ -1969,6 +1981,7 @@ class LLMNode(BaseTool):
 
                 result_container = []
                 exception_container = []
+                parent_ctx = contextvars.copy_context()
 
                 # Try to capture Streamlit context from current thread for propagation
                 streamlit_ctx = None
@@ -1981,22 +1994,23 @@ class LLMNode(BaseTool):
                     logger.debug(f"Streamlit context not available or failed to capture: {e}")
 
                 def run_in_thread():
-                    """Run coroutine in a new thread with its own event loop."""
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        result = new_loop.run_until_complete(coro)
-                        result_container.append(result)
-                    except GraphBubbleUp as gb:
-                        # GraphInterrupt must propagate — store and re-raise
-                        # from the calling thread via exception_container.
-                        exception_container.append(gb)
-                    except Exception as ex:
-                        logger.debug(f"Exception in async thread: {ex}")
-                        exception_container.append(ex)
-                    finally:
-                        new_loop.close()
-                        asyncio.set_event_loop(None)
+                    """Run coroutine in a new thread with its own event loop,
+                    inheriting the parent's ContextVars."""
+                    def _inner():
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(coro)
+                            result_container.append(result)
+                        except GraphBubbleUp as gb:
+                            exception_container.append(gb)
+                        except Exception as ex:
+                            logger.debug(f"Exception in async thread: {ex}")
+                            exception_container.append(ex)
+                        finally:
+                            new_loop.close()
+                            asyncio.set_event_loop(None)
+                    parent_ctx.run(_inner)
 
                 thread = threading.Thread(target=run_in_thread, daemon=False)
 

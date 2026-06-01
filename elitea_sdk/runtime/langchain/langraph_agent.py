@@ -22,7 +22,7 @@ from langgraph.prebuilt import InjectedStore
 from langgraph.store.base import BaseStore
 from langgraph.types import Command
 
-from .constants import PRINTER_NODE_RS, PRINTER, PRINTER_COMPLETED_STATE, DEAULT_AGENT_NAME
+from .constants import ELITEA_RS, PRINTER_NODE_RS, PRINTER, PRINTER_COMPLETED_STATE, DEAULT_AGENT_NAME
 from .mixedAgentRenderes import convert_message_to_json
 from .utils import (
     args_match_normalized,
@@ -74,6 +74,163 @@ def normalize_message_content(content: Any) -> str:
         return ''.join(text_parts)
     # Fallback for other types
     return str(content)
+
+
+# Internal graph-I/O, HITL, and summarization-metadata state keys that must never
+# be surfaced as a pipeline's final ``output`` when falling back to state values
+# (see issue #5056). These are not user-meaningful results.
+_INTERNAL_STATE_KEYS = {
+    'messages', 'output', 'input', 'chat_history',
+    'thread_id', 'execution_finished',
+    'context_info', 'state_types',
+    'hitl_decisions', 'hitl_interrupt',
+    ELITEA_RS, PRINTER_NODE_RS,
+}
+
+
+def extract_state_fallback_output(state_values: Any) -> Optional[str]:
+    """Derive a pipeline's final output from state when no message was produced.
+
+    No-LLM pipelines whose terminal node writes only to a named output variable
+    (e.g. ``final_summary``) never append to the ``messages`` channel. The
+    message-scan in :meth:`LangGraphAgentRunnable.invoke` then yields ``None`` and
+    the user sees the unhelpful "output is None" sentinel (issue #5056). As a last
+    resort we surface the most recently written non-internal state value,
+    normalized to a string.
+
+    Returns ``None`` when there is no usable candidate, leaving the caller's
+    existing sentinel behaviour intact.
+    """
+    if not isinstance(state_values, dict):
+        return None
+    candidate = None
+    for key, value in state_values.items():
+        if key in _INTERNAL_STATE_KEYS:
+            continue
+        normalized = normalize_message_content(value)
+        if normalized and normalized.strip():
+            # Keep the last non-empty candidate: terminal-node variables are
+            # typically declared after upstream ones, so the final write is the
+            # closest available proxy for the pipeline's result.
+            candidate = normalized
+    return candidate
+
+
+# Node types that produce their result in named state variables rather than the
+# ``messages`` channel. LLM/agent nodes (which write AIMessages) and pure
+# control-flow nodes (router/decision/hitl/printer) are intentionally excluded.
+_VALUE_PRODUCING_NODE_TYPES = {
+    'function', 'toolkit', 'mcp', 'tool', 'loop',
+    'loop_from_tool', 'indexer', 'code', 'state_modifier',
+}
+
+
+def _node_routes_to_end(node: dict) -> bool:
+    """Return True if a schema node's routing explicitly targets ``END``."""
+    def _is_end(value: Any) -> bool:
+        return isinstance(value, str) and value.strip().upper() == 'END'
+
+    transition = node.get('transition')
+    if _is_end(transition):
+        return True
+
+    decision = node.get('decision')
+    if isinstance(decision, dict):
+        if any(_is_end(t) for t in (decision.get('nodes') or [])):
+            return True
+        if _is_end(decision.get('default_output')):
+            return True
+
+    condition = node.get('condition')
+    if isinstance(condition, dict):
+        for out in (condition.get('conditional_outputs') or []):
+            target = out.get('node', out) if isinstance(out, dict) else out
+            if _is_end(target):
+                return True
+        if _is_end(condition.get('default_output')):
+            return True
+
+    return False
+
+
+def collect_terminal_output_variables(schema: Any) -> list:
+    """Collect output variables of value-producing non-LLM nodes that end the graph.
+
+    A pipeline's "real" output lives in the named state variable written by its
+    terminal node whenever that node is a non-LLM node (issue #5056). By reading
+    the schema's routing we can identify those variables up front and prefer them
+    over the (potentially unrelated) ``messages`` channel at extraction time —
+    without any UI or platform changes.
+
+    Declaration order is preserved so that, for branching graphs, the variable of
+    whichever terminal branch actually ran (and is therefore populated) wins.
+    """
+    if not isinstance(schema, dict):
+        return []
+    terminal_vars = []
+    seen = set()
+    for node in (schema.get('nodes') or []):
+        if not isinstance(node, dict):
+            continue
+        if node.get('type', 'function') not in _VALUE_PRODUCING_NODE_TYPES:
+            continue
+        if not _node_routes_to_end(node):
+            continue
+        for var in (node.get('output') or []):
+            # Skip internal channels (notably ``messages``): when a node declares
+            # ``messages`` as its output, its result lives as AIMessages in that
+            # channel and must go through the existing last-AIMessage scan, not a
+            # raw normalize of the message-object list.
+            if isinstance(var, str) and var and var not in _INTERNAL_STATE_KEYS and var not in seen:
+                seen.add(var)
+                terminal_vars.append(var)
+    return terminal_vars
+
+
+def extract_terminal_state_output(state_values: Any, terminal_output_variables: Any) -> Optional[str]:
+    """Return the value of the pipeline's terminal output variable as a string.
+
+    Several value-producing non-LLM nodes may route to ``END`` (e.g. behind a
+    RouterNode/DecisionEdge), so the set of *declared* terminal variables is not
+    deterministic up front. At runtime, however, only the branch that actually
+    executed writes its variable, so we disambiguate by inspecting which declared
+    terminal variables are actually populated in the final state:
+
+    * **Exactly one populated** — unambiguous; return it. This covers the common
+      single-terminal pipeline and the branching case where only the executed
+      branch's variable is set (issue #5056).
+    * **More than one populated** — genuinely ambiguous (e.g. an upstream node
+      wrote a variable that another branch also declares as terminal). We cannot
+      know which produced the final result, so we fall back to the last-declared
+      populated variable as a best effort and log a warning for diagnosis.
+    * **None populated** — return ``None`` so the caller's existing extraction /
+      sentinel behaviour stays intact.
+
+    Note: a single variable mutated several times across the pipeline is *not*
+    ambiguous — :func:`collect_terminal_output_variables` dedupes by name, so it
+    counts once and resolves to its final value.
+    """
+    if not terminal_output_variables or not isinstance(state_values, dict):
+        return None
+    populated = []
+    for var in terminal_output_variables:
+        if var not in state_values:
+            continue
+        normalized = normalize_message_content(state_values.get(var))
+        if normalized and normalized.strip():
+            populated.append((var, normalized))
+    if not populated:
+        return None
+    if len(populated) > 1:
+        logger.warning(
+            "[OUTPUT] Multiple terminal output variables are populated (%s); "
+            "cannot deterministically pick the pipeline result, using last "
+            "declared ('%s'). Consider a single terminal node or unique output "
+            "variable names per branch.",
+            [var for var, _ in populated],
+            populated[-1][0],
+        )
+    return populated[-1][1]
 
 
 def _args_match_normalized(args_a: dict, args_b: dict) -> bool:
@@ -707,7 +864,7 @@ class StateModifierNode(Runnable):
 
 def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_before=None, interrupt_after=None,
                           interrupt_after_successors=None, state_class=None, output_variables=None,
-                          tool_registry=None, middleware_manager=None):
+                          tool_registry=None, middleware_manager=None, terminal_output_variables=None):
     # prepare output channels
     if interrupt_after is None:
         interrupt_after = []
@@ -759,6 +916,7 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
         output_variables=output_variables,
         tool_registry=tool_registry,
         middleware_manager=middleware_manager,
+        terminal_output_variables=terminal_output_variables,
     )
 
     compiled.attach_node(START, None)
@@ -1335,6 +1493,7 @@ def create_graph(
         output_variables=node.get('output', []),
         tool_registry=tool_registry,
         middleware_manager=middleware_manager,
+        terminal_output_variables=collect_terminal_output_variables(schema),
     )
     return compiled.validate()
 
@@ -1405,12 +1564,14 @@ def convert_dict_to_message(msg_dict):
 
 class LangGraphAgentRunnable(CompiledStateGraph):
     def __init__(self, *args, output_variables=None, tool_registry=None,
-                 interrupt_after_successors=None, middleware_manager=None, **kwargs):
+                 interrupt_after_successors=None, middleware_manager=None,
+                 terminal_output_variables=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_variables = output_variables
         self.tool_registry = tool_registry
         self._interrupt_after_successors = interrupt_after_successors or set()
         self._middleware_manager = middleware_manager
+        self._terminal_output_variables = terminal_output_variables or []
 
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
@@ -1625,7 +1786,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 if hitl_interrupt and not self._is_hitl_resume(input):
                     hitl_for_ui = {
                         k: v for k, v in hitl_interrupt.items()
-                        if k not in ('tool_args_raw', '_pending_messages')
+                        if k not in ('tool_args_raw', '_pending_messages',
+                                     '_parent_tool_name', '_parent_tool_args')
                     }
                     logger.warning(
                         "[HITL] Stale HITL interrupt detected for tool '%s'. "
@@ -1660,10 +1822,21 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # where re-executing the LLM produces a different response.
                     guardrail_type = hitl_interrupt.get('guardrail_type')
                     if guardrail_type == 'sensitive_tool':
-                        tool_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args', {})
+                        # When the interrupt bubbled up from a child Application
+                        # tool, reference the PARENT tool so the LLMNode builds
+                        # a synthetic AIMessage calling the Application wrapper
+                        # (not the child's leaf tool which doesn't exist here).
+                        if hitl_interrupt.get('_parent_tool_name'):
+                            ctx_tool_name = hitl_interrupt['_parent_tool_name']
+                            ctx_toolkit_name = ''
+                            tool_args = hitl_interrupt.get('_parent_tool_args', {})
+                        else:
+                            ctx_tool_name = hitl_interrupt.get('tool_name', '')
+                            ctx_toolkit_name = hitl_interrupt.get('toolkit_name', '')
+                            tool_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args', {})
                         resume_ctx = {
-                            'tool_name': hitl_interrupt.get('tool_name', ''),
-                            'toolkit_name': hitl_interrupt.get('toolkit_name', ''),
+                            'tool_name': ctx_tool_name,
+                            'toolkit_name': ctx_toolkit_name,
                             'tool_args': tool_args if isinstance(tool_args, dict) else {},
                             'tool_call_id': f"call_{uuid4().hex[:24]}",
                             'action': hitl_resume_value.get('action', 'approve'),
@@ -1675,10 +1848,16 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         # Persist decision to state so blocked tools stay
                         # excluded across HITL resumes and an audit trail is
                         # available in the checkpoint.  The reducer appends.
+                        # When the interrupt bubbled up from a child Application,
+                        # attribute the decision to the parent tool — the child's
+                        # leaf tool does not exist in this graph, so recording
+                        # its name would poison the parent's blocked-tool set
+                        # and produce a misleading audit trail.
                         decision = {
-                            'tool_name': hitl_interrupt.get('tool_name', ''),
-                            'toolkit_name': hitl_interrupt.get('toolkit_name', ''),
-                            'toolkit_type': hitl_interrupt.get('toolkit_type', ''),
+                            'tool_name': ctx_tool_name,
+                            'toolkit_name': ctx_toolkit_name,
+                            'toolkit_type': '' if hitl_interrupt.get('_parent_tool_name')
+                                            else hitl_interrupt.get('toolkit_type', ''),
                             'action': hitl_resume_value.get('action', 'approve'),
                             'action_label': hitl_interrupt.get('action_label', ''),
                             'user_feedback': hitl_resume_value.get('value', ''),
@@ -1870,7 +2049,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
                 # Strip internal-only fields (e.g. unmasked tool args) before logging
                 # or returning results that will be emitted to UI clients.
-                hitl_for_ui = {k: v for k, v in hitl_interrupt.items() if k not in ('tool_args_raw', '_pending_messages')}
+                hitl_for_ui = {k: v for k, v in hitl_interrupt.items() if k not in ('tool_args_raw', '_pending_messages', '_parent_tool_name', '_parent_tool_args')}
                 logger.info(f"[HITL] Execution paused at HITL node: {hitl_for_ui}")
 
                 result_with_state = {
@@ -1929,6 +2108,24 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         is_execution_finished = not config_state.next
         if is_execution_finished:
             thread_id = None
+
+        state_values = config_state.values if (hasattr(config_state, 'values') and config_state.values) else {}
+
+        # Prefer an explicitly declared terminal output variable over the
+        # message-scan result (issue #5056). Pipelines that end in a non-LLM node
+        # keep their real result in a named state variable rather than the
+        # ``messages`` channel. This also covers pipelines whose upstream LLM
+        # nodes (e.g. a task classifier) left unrelated messages behind: the
+        # reversed message-scan would otherwise surface that intermediate message
+        # instead of the terminal node's actual output.
+        terminal_output = extract_terminal_state_output(state_values, getattr(self, '_terminal_output_variables', None))
+        if terminal_output is not None:
+            output = terminal_output
+        elif output is None:
+            # Last-resort fallback when no terminal output variable is declared:
+            # surface the most recently written non-internal state value before
+            # falling back to the sentinel string.
+            output = extract_state_fallback_output(state_values)
 
         final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and output is None else output
 

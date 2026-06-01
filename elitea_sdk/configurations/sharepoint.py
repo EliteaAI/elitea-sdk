@@ -1,3 +1,4 @@
+import re
 import requests
 import logging
 from typing import Optional, List, Tuple, Dict
@@ -38,7 +39,7 @@ class SharepointConfiguration(BaseModel):
     # Client credentials (shared by both app_auth and delegated flows)
     client_id: str = Field(description="SharePoint Client ID")
     client_secret: SecretStr = Field(description="SharePoint Client Secret")
-    site_url: str = Field(description="SharePoint tenant or site URL")
+    site_url: str = Field(description="SharePoint Site URL")
 
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
@@ -55,43 +56,40 @@ class SharepointConfiguration(BaseModel):
         """
         Test the connection to SharePoint API.
 
-        Two authentication flows are supported:
+        Two authentication flows are supported, selected by the presence of
+        ``oauth_discovery_endpoint``:
 
-        **Delegated flow** (when ``oauth_discovery_endpoint`` is present):
-            An ``access_token`` must be supplied in *settings*.  If it is absent,
-            ``McpAuthorizationRequired`` is raised so the caller can trigger the
-            OAuth authorization dance and retry with the obtained token.
-            The health-check uses the Microsoft Graph API
-            (``graph.microsoft.com/v1.0/sites/{host}:{path}``) because delegated
-            tokens issued by Azure AD are Graph tokens and are **not** accepted by
-            the SharePoint REST ``/_api/web`` endpoint.
+        **SharePoint ACS / app-only** (no ``oauth_discovery_endpoint``):
+            Uses ``office365-rest-python-client`` with ``ClientCredential``
+            (the same path as the toolkit).  No Azure AD tenant discovery is
+            needed — the library handles ACS token acquisition internally.
 
-        **App-auth / client-credentials flow** (when ``oauth_discovery_endpoint`` is absent):
-            ``client_id``, ``client_secret``, and ``site_url`` are used to obtain a
-            token from the SharePoint legacy ACS endpoint, which is then verified
-            against the SharePoint REST ``/_api/web`` endpoint.
+        **Delegated flow** (``oauth_discovery_endpoint`` present):
+            Verifies the existing ``access_token`` via Microsoft Graph Sites
+            API.  If the token is absent or expired, ``McpAuthorizationRequired``
+            is raised so the caller can restart the OAuth dance.
 
         Args:
             settings: Dictionary that may contain:
                 - site_url (required for both flows)
                 - oauth_discovery_endpoint: activates the delegated flow
-                - access_token: pre-obtained OAuth bearer token (delegated flow only)
-                - client_id / client_secret: app credentials (client-credentials flow only)
+                - access_token: pre-obtained OAuth bearer token (delegated flow)
+                - client_id / client_secret: app credentials
 
         Returns:
             None if connection is successful, error message string otherwise.
 
         Raises:
-            McpAuthorizationRequired: when the delegated flow is required but no
-                ``access_token`` has been provided yet, or when the provided token
-                is invalid / expired.
+            McpAuthorizationRequired: delegated flow only, when token is absent
+                or invalid/expired.
         """
-        log.debug(f"Checking SharePoint connection with settings: {settings}")
+        safe_settings = {k: "***" if k in ("client_secret", "access_token", "refresh_token") else v for k, v in settings.items()}
+        log.debug(f"Checking SharePoint connection with settings: {safe_settings}")
         oauth_discovery_endpoint = settings.get("oauth_discovery_endpoint")
         if oauth_discovery_endpoint:
-            log.info(f"Using OAuth discovery endpoint: {oauth_discovery_endpoint}")
+            log.info("Using delegated flow (oauth_discovery_endpoint present)")
             return SharepointConfiguration._check_connection_delegated(settings, oauth_discovery_endpoint)
-        log.info("Using legacy SharePoint ACS endpoint")
+        log.info("Using SharePoint ACS app-only flow (client_id + client_secret)")
         return SharepointConfiguration._check_connection_client_credentials(settings)
 
     # ------------------------------------------------------------------
@@ -412,25 +410,13 @@ class SharepointConfiguration(BaseModel):
 
     @staticmethod
     def _check_connection_client_credentials(settings: dict) -> str | None:
-        """App-only / client-credentials flow.
+        """SharePoint ACS app-only flow.
 
-        Uses the same authentication mechanism as the actual SharePoint toolkit:
-        Microsoft Graph API with Azure AD v2.0 client-credentials grant.
-
-        The legacy SharePoint ACS endpoint (accounts.accesscontrol.windows.net)
-        is intentionally NOT used here because the toolkit tools authenticate via
-        Graph, and using a different flow for the health-check caused a
-        false-negative: test connection reported "invalid token" while tools
-        executed successfully with the exact same credentials.
-
-        Steps:
-            1. Derive the tenant name from the site URL hostname.
-            2. Fetch the Azure AD v2.0 OpenID configuration to obtain the token
-               endpoint.
-            3. Request a Graph-scoped access token via client_credentials grant.
-            4. Verify the token by calling the Microsoft Graph Sites API.
+        Uses ``office365-rest-python-client`` with ``ClientCredential``,
+        identical to the toolkit's primary authentication path when
+        ``client_id`` + ``client_secret`` are supplied without an
+        ``oauth_discovery_endpoint``.
         """
-        # Validate client_id
         client_id = settings.get("client_id")
         if client_id is None or client_id == "":
             return "Client ID cannot be empty" if client_id == "" else "Client ID is required"
@@ -440,7 +426,6 @@ class SharepointConfiguration(BaseModel):
         if not client_id:
             return "Client ID cannot be empty"
 
-        # Validate client_secret
         client_secret = settings.get("client_secret")
         if client_secret is None:
             return "Client secret is required"
@@ -449,105 +434,41 @@ class SharepointConfiguration(BaseModel):
         if not client_secret or not client_secret.strip():
             return "Client secret cannot be empty"
 
-        # Validate site_url
         site_url, err = SharepointConfiguration._validate_site_url(settings)
         if err:
             return err
 
-        # Derive tenant name from hostname (e.g. "5clkvm" from 5clkvm.sharepoint.com)
         try:
-            parsed = urlparse(site_url)
-            hostname = parsed.netloc
-            if not hostname:
-                return (
-                    "Failed to parse SharePoint URL - use https://<tenant>.sharepoint.com, "
-                    "https://<tenant>.sharepoint.com/sites/<site>, or "
-                    "https://<tenant>.sharepoint.com/teams/<team>"
-                )
-            tenant = hostname.split(".")[0]
-        except Exception:
+            from office365.runtime.auth.client_credential import ClientCredential
+            from office365.sharepoint.client_context import ClientContext
+
+            credentials = ClientCredential(client_id, client_secret)
+            ctx = ClientContext(site_url).with_credentials(credentials)
+            ctx.load(ctx.web)
+            ctx.execute_query()
+            return None
+
+        except ImportError:
             return (
-                "Failed to parse SharePoint URL - use https://<tenant>.sharepoint.com, "
-                "https://<tenant>.sharepoint.com/sites/<site>, or "
-                "https://<tenant>.sharepoint.com/teams/<team>"
+                "office365-rest-python-client is not installed. "
+                "Run: pip install office365-rest-python-client"
             )
-
-        try:
-            # Step 1: discover token endpoint via Azure AD v2.0 OpenID config
-            openid_config_url = (
-                f"https://login.microsoftonline.com/{tenant}.onmicrosoft.com"
-                f"/v2.0/.well-known/openid-configuration"
-            )
-            try:
-                oidc_resp = requests.get(openid_config_url, timeout=10)
-            except requests.exceptions.Timeout:
-                return "Connection timeout - Microsoft login endpoint is not responding"
-            except requests.exceptions.ConnectionError:
-                return "Connection error - unable to reach Microsoft login endpoint"
-
-            if oidc_resp.status_code != 200:
-                return (
-                    f"Failed to retrieve Azure AD OpenID configuration "
-                    f"(status {oidc_resp.status_code}). "
-                    "Check that the tenant name is correct."
-                )
-            try:
-                token_url = oidc_resp.json().get("token_endpoint")
-            except Exception:
-                return "Failed to parse Azure AD OpenID configuration response"
-            if not token_url:
-                return "Azure AD OpenID configuration did not contain a token endpoint"
-
-            # Step 2: obtain Graph-scoped token via client_credentials grant
-            token_response = requests.post(
-                token_url,
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "scope": "https://graph.microsoft.com/.default",
-                },
-                timeout=10,
-            )
-
-            if token_response.status_code == 400:
-                try:
-                    error_data = token_response.json()
-                    error_desc = error_data.get("error_description", "")
-                    error_code = error_data.get("error", "")
-                    if "not found in the directory" in error_desc.lower() or error_code == "unauthorized_client":
-                        return "Invalid client ID. Please check if you provide a correct client ID and try again."
-                    elif "invalid_client" in error_code or "client_secret" in error_desc.lower():
-                        return "Invalid client secret. Please check if you provide a correct client secret and try again."
-                    else:
-                        return f"OAuth2 authentication failed: {error_desc or error_code}"
-                except Exception:
-                    return "Invalid client credentials"
-            elif token_response.status_code == 401:
-                return "Invalid client secret provided. Please check if you provide a correct client secret and try again."
-            elif token_response.status_code != 200:
-                return f"Failed to obtain access token (status {token_response.status_code})"
-
-            try:
-                access_token = token_response.json().get("access_token")
-                if not access_token:
-                    return "No access token received from Microsoft identity platform"
-            except Exception:
-                return "Failed to parse token response"
-
-            # Step 3: verify via Microsoft Graph Sites API (same as toolkit tools)
-            return SharepointConfiguration._call_graph_api(
-                site_url=site_url,
-                access_token=access_token,
-                oauth_discovery_endpoint=None,  # app-only: no re-auth dance on 401
-                scopes=None,
-            )
-
-        except requests.exceptions.Timeout:
-            return "Connection timeout - SharePoint is not responding"
-        except requests.exceptions.ConnectionError:
-            return "Connection error - unable to reach SharePoint"
-        except requests.exceptions.RequestException as e:
-            return f"Request failed: {str(e)}"
         except Exception as e:
-            return f"Unexpected error: {str(e)}"
+            error_msg = str(e)
+            error_lower = error_msg.lower()
+            if "401" in error_msg or "unauthorized" in error_lower:
+                return (
+                    "Authentication failed - invalid client ID or client secret. "
+                    "Verify the app is registered in SharePoint with the correct permissions."
+                )
+            if "403" in error_msg or "forbidden" in error_lower:
+                return (
+                    "Access denied - the app does not have permission to access this site. "
+                    "Ensure the SharePoint app principal has been granted site collection access."
+                )
+            if "timeout" in error_lower:
+                return "Connection timeout - SharePoint is not responding"
+            if "connection" in error_lower or "name or service not known" in error_lower:
+                return "Connection error - unable to reach SharePoint"
+            return f"SharePoint ACS connection failed: {error_msg}"
+
