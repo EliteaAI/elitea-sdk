@@ -30,6 +30,34 @@ APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
 
 
+def _is_anthropic_model(model: Any) -> bool:
+    """Return True when *model* is (or wraps) a langchain-anthropic ChatAnthropic.
+
+    Mirrors LLMNode._is_anthropic_client — duplicated here to avoid importing the
+    heavy llm.py module into assistant.py. Checks both the model directly and one
+    level of .bound (RunnableBinding wrapping) so that bound-tools wrappers are
+    detected correctly.
+    """
+    for candidate in [model, getattr(model, 'bound', None)]:
+        if candidate is None:
+            continue
+        module = getattr(type(candidate), '__module__', '') or ''
+        if 'langchain_anthropic' in module:
+            return True
+    return False
+
+
+def _make_anthropic_system_content(text: str, model: Any) -> Any:
+    """Return the SystemMessage content appropriate for *model*.
+
+    Anthropic: content-block list with cache_control breakpoint (ephemeral).
+    All others: plain string — no behavior change.
+    """
+    if _is_anthropic_model(model):
+        return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+    return text
+
+
 def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = None):
     """Build a swarm handoff tool with a strongly-recommended `task` argument.
 
@@ -517,12 +545,17 @@ class Assistant:
             return template_str
 
         try:
-            # Build context with system variables
+            # Build context with system variables.
+            # NOTE: current_time and current_datetime are intentionally omitted — injecting
+            # sub-minute timestamps into the system prompt guaranteed a cache miss on every
+            # call AND incurred the Anthropic cache-write surcharge with zero benefit.
+            # current_date (day granularity) is retained: one cache rotation per day is
+            # acceptable. Agents authored with {{current_time}}/{{current_datetime}} will
+            # render those as literal unresolved Jinja2 tokens (DebugUndefined); no shipped
+            # templates use these variables (grep-confirmed in #5113 RCA).
             now = datetime.now()
             context = {
                 'current_date': now.strftime('%Y-%m-%d'),
-                'current_time': now.strftime('%H:%M:%S'),
-                'current_datetime': now.strftime('%Y-%m-%d %H:%M:%S'),
             }
 
             # Add variables from prompt configuration
@@ -907,7 +940,13 @@ class Assistant:
                     except Exception as e:
                         logger.debug(f"[SWARM] Failed to emit swarm_agent_start event: {e}")
 
-                system_msg = SystemMessage(content=prompt)
+                # Gate on `model` (the raw LLM passed to make_agent_node), NOT on
+                # `model_with_tools` (a RunnableBinding after .bind_tools) — the binding
+                # wraps the original ChatAnthropic and _is_anthropic_model would return
+                # False for it because RunnableBinding's __module__ is not langchain_anthropic.
+                system_msg = SystemMessage(
+                    content=_make_anthropic_system_content(prompt, model)
+                )
                 response = model_with_tools.invoke([system_msg] + filtered_messages, config)
 
                 # Guard against multiple simultaneous handoff tool calls.
