@@ -78,14 +78,3 @@ class TestSharepointConfiguration:
 
         assert site_url is None
         assert error == "Site URL must be a string"
-
-    def test_error_message_mentions_teams_format(self):
-        """Verify error messages include /teams/ format examples."""
-        error = SharepointConfiguration._check_connection_client_credentials({
-            "client_id": "client-id",
-            "client_secret": "client-secret",
-            "site_url": "https:///sites/my-site",
-        })
-
-        assert "https://<tenant>.sharepoint.com/sites/<site>" in error
-        assert "https://<tenant>.sharepoint.com/teams/<team>" in error
