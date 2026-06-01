@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 log = logging.getLogger(__name__)
 
-
 class SharepointConfiguration(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
@@ -497,4 +496,3 @@ class SharepointConfiguration(BaseModel):
             if "connection" in error_lower or "name or service not known" in error_lower:
                 return "Connection error - unable to reach SharePoint"
             return f"SharePoint connection failed: {acs_error} | Graph API fallback: {graph_e}"
-

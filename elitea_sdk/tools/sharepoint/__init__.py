@@ -1,7 +1,8 @@
 import logging
 from typing import List, Literal, Optional
+from urllib.parse import urlparse
 
-from langchain_core.tools import BaseToolkit, BaseTool
+from langchain_core.tools import BaseToolkit, BaseTool, ToolException
 from pydantic import create_model, BaseModel, ConfigDict, Field
 
 from .api_wrapper import SharepointApiWrapper
@@ -17,11 +18,44 @@ logger = logging.getLogger(__name__)
 
 name = "sharepoint"
 
+SITE_PATH_ERROR = (
+    "SharePoint site_path must be relative and start with 'sites/' or 'teams/', "
+    "for example 'sites/my-site' or 'teams/my-team'."
+)
+
+
+def _resolve_sharepoint_site_url(sp_config: dict, site_path: Optional[str]) -> dict:
+    """Return a SharePoint config with site_url resolved from site_path when provided."""
+    resolved_config = dict(sp_config)
+    if site_path is None:
+        return resolved_config
+
+    normalized_path = site_path.strip().strip('/')
+    if not normalized_path:
+        return resolved_config
+
+    parsed_path = urlparse(normalized_path)
+    if parsed_path.scheme or parsed_path.netloc:
+        raise ToolException(SITE_PATH_ERROR)
+
+    path_parts = normalized_path.split('/', 1)
+    if len(path_parts) != 2 or path_parts[0] not in {'sites', 'teams'} or not path_parts[1].strip('/'):
+        raise ToolException(SITE_PATH_ERROR)
+
+    site_url = resolved_config.get('site_url', '').rstrip('/')
+    parsed_site_url = urlparse(site_url)
+    tenant_url = f"{parsed_site_url.scheme}://{parsed_site_url.netloc}"
+    resolved_config['site_url'] = f"{tenant_url}/{normalized_path}"
+    logger.debug(f"[SP site_path] Resolved site_url: {tenant_url} + {normalized_path} → {resolved_config['site_url']}")
+    return resolved_config
+
+
 def get_tools(tool):
     return (SharepointToolkit()
             .get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         sharepoint_configuration=tool['settings']['sharepoint_configuration'],
+        site_path=tool['settings'].get('site_path'),
         tokens = tool['settings'].get('tokens', {}),
         toolkit_name=tool.get('toolkit_name'),
         toolkit_id=tool.get('id'),
@@ -45,6 +79,15 @@ class SharepointToolkit(BaseToolkit):
             name,
             sharepoint_configuration=(SharepointConfiguration, Field(description=get_credentials_tooltip("SharePoint"), json_schema_extra={'configuration_types': ['sharepoint']})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            site_path=(Optional[str], Field(
+                default=None,
+                description=(
+                    "SharePoint site path relative to the tenant URL. "
+                    "Use when the credential site_url is only the tenant URL. "
+                    "Examples: sites/site-name or teams/team-name. "
+                    "Leave empty for credentials where site_url already includes the site path."
+                ),
+            )),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None,
                                                                            description=PGVECTOR_CONFIGURATION_TOOLTIP,
@@ -68,14 +111,19 @@ class SharepointToolkit(BaseToolkit):
         # Extract toolkit_id from kwargs before constructing wrapper_payload
         toolkit_id = kwargs.get('toolkit_id')
 
+        # Resolve site URL: combine credential site_url + toolkit site_path if provided.
+        sp_config = _resolve_sharepoint_site_url(
+            kwargs.get('sharepoint_configuration', {}),
+            kwargs.get('site_path'),
+        )
+
         wrapper_payload = {
             **kwargs,
-            **kwargs.get('sharepoint_configuration', {}),
+            **sp_config,
             **(kwargs.get('pgvector_configuration') or {}),
         }
 
         # handle OAuth flow: specific for Sharepoint (dependent on oauth_discovery_endpoint), can be extended to other tools in the future if needed
-        sp_config = kwargs.get('sharepoint_configuration', {})
         logger.debug(f"[SP OAuth] tokens keys={list(kwargs.get('tokens', {}).keys())}, sp_config site_url={sp_config.get('site_url')}, oauth_endpoint={sp_config.get('oauth_discovery_endpoint')}, config_uuid={sp_config.get('configuration_uuid')}")
         if kwargs.get('tokens') and sp_config.get('oauth_discovery_endpoint'):
             logger.debug(f"Sharepoint configuration includes OAuth discovery endpoint and tokens are provided. Attempting to retrieve access token.")

@@ -91,9 +91,10 @@ UploadFile = create_model(
         description=(
             "Server-relative folder path for upload, including the document-library name. "
             "Accepted formats:\n"
-            "  - Default library with subfolder: '/sites/MySite/Shared Documents/folder'\n"
-            "  - Non-default library with subfolder: '/sites/MySite/EliteA_test/folder'\n"
-            "  - Non-default library root: '/sites/MySite/EliteA_test'\n"
+            "  - Site default library: '/sites/MySite/Shared Documents/folder'\n"
+            "  - Team default library: '/teams/MyTeam/Shared Documents/folder'\n"
+            "  - Site non-default library: '/sites/MySite/EliteA_test/folder'\n"
+            "  - Team non-default library: '/teams/MyTeam/PrivateDocs/folder'\n"
             "The document-library segment (e.g. 'Shared Documents', 'EliteA_test') is "
             "resolved automatically to the correct drive."
         )
@@ -846,7 +847,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             'path': (Optional[str], Field(
                 description="Folder path. "
                             "Accepts either a full server-relative path "
-                            "(e.g., '/sites/SiteName/...') or a relative path. "
+                            "(e.g., '/sites/SiteName/...' or '/teams/TeamName/...') or a relative path. "
                             "If a relative path is provided, the search will be "
                             "performed recursively under 'Shared Documents' and "
                             "other private libraries. "

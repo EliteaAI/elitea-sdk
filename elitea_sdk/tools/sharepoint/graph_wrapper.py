@@ -35,7 +35,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
     Args:
         site_url: Full SharePoint site URL, e.g.
-                  ``https://contoso.sharepoint.com/sites/MyTeam``.
+                  ``https://contoso.sharepoint.com/sites/MySite`` or
+                  ``https://contoso.sharepoint.com/teams/MyTeam``.
         token: Plain-text OAuth bearer token (delegated, user-context).
         scopes: List of OAuth scopes that were granted for this token.
                 Stored for informational purposes; not used at runtime.
@@ -247,7 +248,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         pass a drive-relative path continue to work.
         """
         # Derive the site-relative path portion of the site URL
-        # e.g. "https://tenant.sharepoint.com/sites/MyTeam" → "sites/MyTeam"
+        # e.g. "https://tenant.sharepoint.com/sites/MySite" → "sites/MySite"
+        #      "https://tenant.sharepoint.com/teams/MyTeam" → "teams/MyTeam"
         site_path = re.sub(r'^https?://[^/]+', '', self.site_url).strip('/')
 
         # Clean the incoming folder_path (strip leading slash, decode percent-encoding)
