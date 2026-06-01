@@ -645,9 +645,23 @@ class LLMNode(BaseTool):
 
         for msg in messages:
             if isinstance(msg, SystemMessage) and not index_injected:
-                # Append tool index to system message
-                new_content = f"{msg.content}\n\n{tool_index}"
-                modified_messages.append(SystemMessage(content=new_content))
+                # Extract plain text from content regardless of whether it arrived as a
+                # str or as an Anthropic-style content-block list (cache_control markup).
+                # Without this guard, f"{list}\n\n{tool_index}" would stringify a Python
+                # list object and corrupt the prompt.
+                _existing_text = (
+                    msg.content if isinstance(msg.content, str)
+                    else next(
+                        (b["text"] for b in msg.content if isinstance(b, dict) and b.get("type") == "text"),
+                        ""
+                    )
+                )
+                new_text = f"{_existing_text}\n\n{tool_index}"
+                # Re-apply cache_control if this is an Anthropic client so that caching
+                # is preserved after the tool-index injection.
+                modified_messages.append(
+                    SystemMessage(content=self._anthropic_system_content(new_text, self.client))
+                )
                 index_injected = True
                 logger.debug("[LazyTools] Injected tool index into existing system message")
             else:
@@ -655,7 +669,9 @@ class LLMNode(BaseTool):
 
         # If no system message found, prepend one with just the tool index
         if not index_injected:
-            modified_messages.insert(0, SystemMessage(content=tool_index))
+            modified_messages.insert(0, SystemMessage(
+                content=self._anthropic_system_content(tool_index, self.client)
+            ))
             logger.debug("[LazyTools] Added new system message with tool index")
 
         return modified_messages
@@ -1221,7 +1237,11 @@ class LLMNode(BaseTool):
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
                 task_content = str(task_content) if task_content is not None else ""
-            messages = [SystemMessage(content=system_content), *func_args.get('chat_history', []), HumanMessage(content=task_content)]
+            messages = [
+                SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                *func_args.get('chat_history', []),
+                HumanMessage(content=task_content),
+            ]
             # Remove pre-last item if last two messages are same type and content
             if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
                 -2].content:
@@ -2754,6 +2774,24 @@ class LLMNode(BaseTool):
             if isinstance(thinking, dict) and thinking.get('type') in ('enabled', 'adaptive'):
                 return True
         return False
+
+    @staticmethod
+    def _anthropic_system_content(text: str, client: Any) -> Any:
+        """Return the SystemMessage content value appropriate for *client*.
+
+        For Anthropic clients: a content-block list with a cache_control breakpoint
+        so that langchain-anthropic 1.4.1+ forwards it to the Anthropic API and the
+        system prompt is eligible for prompt caching.
+
+        For all other clients: the plain string, unchanged — no behavior change.
+
+        Args:
+            text: The resolved system prompt text.
+            client: The raw LLM client (NOT a bound-tools wrapper).
+        """
+        if LLMNode._is_anthropic_client(client):
+            return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+        return text
 
     def __get_struct_output_model(
         self,

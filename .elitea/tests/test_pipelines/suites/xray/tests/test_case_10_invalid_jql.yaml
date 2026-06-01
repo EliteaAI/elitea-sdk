@@ -23,8 +23,6 @@ state:
     value: "project = AND testType INVALID SYNTAX ((("
   get_tests_result:
     type: str
-  trimmed_error:
-    type: str
   expected_error_indicators:
     type: list
     value: ["Unable to get tests", "error", "failed", "exception", "syntax", "parse"]
@@ -50,46 +48,12 @@ nodes:
     tool: get_tests
     toolkit_name: ${XRAY_TOOLKIT_NAME}
     continue_on_error: true
-    transition: trim_error_output
-
-  - id: trim_error_output
-    type: code
-    code:
-      type: fixed
-      value: |
-        # Extract only the error message line, not the full stack trace
-        # This prevents LLM token overflow
-        result = elitea_state.get('get_tests_result', '')
-        
-        # Extract just the error message (first 300 chars)
-        if 'Error Message:' in result:
-            # Find the error message line
-            lines = result.split('\n')
-            error_msg = ''
-            for i, line in enumerate(lines):
-                if 'Error Message:' in line:
-                    # Get this line and maybe next line
-                    error_msg = line
-                    if i + 1 < len(lines) and lines[i + 1].strip():
-                        error_msg += ' ' + lines[i + 1].strip()
-                    break
-            trimmed_error = error_msg[:300] if error_msg else result[:300]
-        else:
-            # Fallback: just take first 300 chars
-            trimmed_error = result[:300]
-        
-        {"trimmed_error": trimmed_error}
-    input:
-      - get_tests_result
-    output:
-      - trimmed_error
-    structured_output: true
     transition: validate_error_handling
 
   - id: validate_error_handling
     type: llm
     input:
-      - trimmed_error
+      - get_tests_result
       - invalid_jql_query
       - expected_error_indicators
       - unexpected_success_indicators
@@ -104,23 +68,24 @@ nodes:
         type: fstring
         value: |
           Analyze the result from executing 'get_tests' with invalid JQL syntax.
-          
+          Use only the first 300 characters of the result for analysis.
+
           CONTEXT:
           - The Xray tool handles JQL errors by returning error information
           - For this NEGATIVE test, we expect the tool to reject malformed JQL
           - Evidence: Either error message present OR no successful test data returned
-          
-          Get Tests Result: {trimmed_error}
+
+          Get Tests Result (first 300 chars): {get_tests_result}
           Invalid JQL Query Used: {invalid_jql_query}
           Expected Error Indicators: {expected_error_indicators}
           Unexpected Success Indicators: {unexpected_success_indicators}
 
           VALIDATION LOGIC:
-          
+
           CRITICAL REQUIREMENT:
           This is a NEGATIVE test - we expect a proper error message, NOT empty/null output.
           Empty or null error messages indicate BROKEN error handling and should FAIL the test.
-          
+
           This negative test PASSES only if the tool returns a proper error message.
 
           Validation Criteria (ALL must pass for test_passed=true):
@@ -155,64 +120,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: extract_json_result
-
-  - id: extract_json_result
-    type: code
-    code:
-      type: fixed
-      value: |
-        import json
-        import re
-
-        # Extract JSON from LLM response which may contain prose + JSON block
-        raw = elitea_state.get("test_results", "")
-        result_dict = {}
-
-        def extract_json_from_text(text):
-            if not text or not isinstance(text, str):
-                return {}
-            try:
-                return json.loads(text.strip())
-            except Exception:
-                pass
-            m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-            if not m:
-                m = re.search(r'(\{[^{}]*"test_passed"[^{}]*\})', text, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(1))
-                except Exception:
-                    pass
-            return {}
-
-        if isinstance(raw, dict) and "test_passed" in raw:
-            result_dict = raw
-        elif isinstance(raw, str) and raw.strip():
-            result_dict = extract_json_from_text(raw)
-
-        # Fallback: scan chat_history for LLM JSON response
-        if not result_dict or "test_passed" not in result_dict:
-            chat_history = elitea_state.get("chat_history", [])
-            for msg in reversed(chat_history):
-                content = ""
-                if isinstance(msg, dict):
-                    content = msg.get("content", "")
-                elif hasattr(msg, "content"):
-                    content = msg.content
-                if isinstance(content, str) and "test_passed" in content:
-                    result_dict = extract_json_from_text(content)
-                    if result_dict and "test_passed" in result_dict:
-                        break
-
-        if not result_dict or "test_passed" not in result_dict:
-            result_dict = {"test_passed": None, "error": "Could not extract JSON from LLM response"}
-
-        # Wrap in test_results so framework finds it via result.test_results.test_passed path
-        {"test_results": result_dict}
-    input:
-      - test_results
-    output:
-      - test_results
-    structured_output: true
     transition: END

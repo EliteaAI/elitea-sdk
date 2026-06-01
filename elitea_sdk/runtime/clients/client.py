@@ -451,7 +451,8 @@ class EliteAClient:
                 "temperature": model_config.get("temperature"),
                 "max_retries": model_config.get("max_retries", 3),
                 "default_headers": {"openai-organization": str(self.project_id),
-                                    "Authorization": f"Bearer {self.auth_token}"},
+                                    "Authorization": f"Bearer {self.auth_token}",
+                                    "anthropic-beta": "prompt-caching-2024-07-31"},
             }
             
             if model_config.get("reasoning_effort"):
