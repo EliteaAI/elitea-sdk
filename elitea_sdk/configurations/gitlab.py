@@ -1,5 +1,3 @@
-from typing import Optional
-
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 
@@ -112,8 +110,8 @@ class GitlabConfiguration(BaseModel):
             if 'Hostname mismatch' in str(e):
                 return "GitLab API endpoint not found: verify the GitLab URL"
             return f"SSL certificate verification failed: {str(e)}"
-        except requests.exceptions.ConnectionError:
-            return f"Cannot connect to GitLab at {url}: connection refused"
+        except requests.exceptions.ConnectionError as e:
+            return f"Cannot connect to GitLab at {url}: {str(e)}"
         except requests.exceptions.Timeout:
             return f"Connection to GitLab at {url} timed out"
         except requests.exceptions.RequestException as e:
