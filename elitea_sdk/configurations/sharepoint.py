@@ -409,12 +409,15 @@ class SharepointConfiguration(BaseModel):
 
     @staticmethod
     def _check_connection_client_credentials(settings: dict) -> str | None:
-        """SharePoint ACS app-only flow.
+        """SharePoint app-only flow with Graph API fallback.
 
-        Uses ``office365-rest-python-client`` with ``ClientCredential``,
-        identical to the toolkit's primary authentication path when
-        ``client_id`` + ``client_secret`` are supplied without an
-        ``oauth_discovery_endpoint``.
+        Tries ``office365-rest-python-client`` with ``ClientCredential`` first
+        (legacy ACS path).  When that fails — e.g. because the tenant has ACS
+        disabled (``DisableCustomAppAuthentication = True``) or the app is an
+        Azure AD registration rather than a SharePoint ACS principal — falls back
+        to the Azure AD ``client_credentials`` grant scoped to
+        ``https://graph.microsoft.com/.default``, identical to the fallback used
+        by the toolkit tools themselves.
         """
         client_id = settings.get("client_id")
         if client_id is None or client_id == "":
@@ -437,6 +440,7 @@ class SharepointConfiguration(BaseModel):
         if err:
             return err
 
+        acs_error = None
         try:
             from office365.runtime.auth.client_credential import ClientCredential
             from office365.sharepoint.client_context import ClientContext
@@ -448,25 +452,47 @@ class SharepointConfiguration(BaseModel):
             return None
 
         except ImportError:
-            return (
-                "office365-rest-python-client is not installed. "
-                "Run: pip install office365-rest-python-client"
-            )
+            acs_error = "office365-rest-python-client is not installed"
         except Exception as e:
-            error_msg = str(e)
+            acs_error = e
+            log.warning(
+                "SharePoint ACS connection check failed: %s. Trying Graph API fallback.", e)
+
+        # Graph API fallback — same path the toolkit tools use when ACS fails.
+        try:
+            from urllib.parse import urlparse
+            from ..tools.sharepoint.authorization_helper import SharepointAuthorizationHelper
+
+            parsed = urlparse(site_url)
+            tenant = parsed.hostname.split('.')[0] if parsed.hostname else ""
+            helper = SharepointAuthorizationHelper(
+                client_id=client_id,
+                client_secret=client_secret,
+                tenant=tenant,
+                scope="",
+                token_json="",
+            )
+            helper.generate_token_and_site_id(site_url)
+            log.info("SharePoint Graph API fallback connection check succeeded.")
+            return None
+
+        except Exception as graph_e:
+            log.error("Graph API fallback connection check failed: %s", graph_e)
+            error_msg = str(acs_error)
             error_lower = error_msg.lower()
             if "401" in error_msg or "unauthorized" in error_lower:
                 return (
                     "Authentication failed - invalid client ID or client secret. "
-                    "Verify the app is registered in SharePoint with the correct permissions."
+                    "Verify the app is registered in Azure AD with the correct Graph permissions."
                 )
             if "403" in error_msg or "forbidden" in error_lower:
                 return (
                     "Access denied - the app does not have permission to access this site. "
-                    "Ensure the SharePoint app principal has been granted site collection access."
+                    "Ensure the Azure AD app has been granted the required Graph permissions "
+                    "(e.g. Sites.Read.All) and that admin consent has been granted."
                 )
             if "timeout" in error_lower:
                 return "Connection timeout - SharePoint is not responding"
             if "connection" in error_lower or "name or service not known" in error_lower:
                 return "Connection error - unable to reach SharePoint"
-            return f"SharePoint ACS connection failed: {error_msg}"
+            return f"SharePoint connection failed: {acs_error} | Graph API fallback: {graph_e}"
