@@ -341,3 +341,32 @@ class TestSwarmGateBoundTools:
         binding.__class__ = BindingClass
         binding.bound = inner
         assert not _is_anthropic_model(binding)
+
+
+class TestAnthropicBetaHeader:
+    """get_llm() sends the prompt-caching beta header only for Anthropic models."""
+
+    def _make_client(self):
+        from elitea_sdk.runtime.clients.client import EliteAClient
+
+        client = EliteAClient.__new__(EliteAClient)
+        client.base_url = "http://proxy"
+        client.allm_path = "/anthropic"
+        client.llm_path = "/openai"
+        client.auth_token = "tok"
+        client.project_id = "1"
+        return client
+
+    def test_anthropic_model_gets_beta_header(self):
+        client = self._make_client()
+        with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
+            client.get_llm("claude-sonnet-4-6", {})
+        headers = mock_anthropic.call_args.kwargs["default_headers"]
+        assert headers.get("anthropic-beta") == "prompt-caching-2024-07-31"
+
+    def test_openai_model_has_no_anthropic_header(self):
+        client = self._make_client()
+        with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai:
+            client.get_llm("gpt-4o", {})
+        kwargs = mock_openai.call_args.kwargs
+        assert "anthropic-beta" not in kwargs.get("default_headers", {})
