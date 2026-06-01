@@ -105,7 +105,14 @@ JiraInput = create_model(
 
 JiraSearch = create_model(
     "JiraSearchModel",
-    jql=(str, Field(description="Jira Query Language (JQL) query string")))
+    jql=(str, Field(description="Jira Query Language (JQL) query string")),
+    limit=(Optional[int], Field(
+        default=None,
+        description=(
+            "Maximum number of issues to return. Overrides the toolkit's default `limit`. "
+            "Pagination is handled internally — set this above 100 to retrieve more than one page."
+        ),
+    )))
 
 JiraCreateIssue = create_model(
     "JiraCreateIssueModel",
@@ -593,14 +600,17 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             )
         return self._client
 
-    def _parse_issues(self, issues: Dict) -> List[dict]:
+    def _parse_issues(self, issues: Dict, limit: Optional[int] = None) -> List[dict]:
         parsed: List[dict] = []
         issues_list = issues.get("issues") if isinstance(issues, dict) else None
         if not isinstance(issues_list, list):
             return parsed
 
+        # Per-call `limit` overrides the toolkit-level `self.limit`. `0` means "no cap".
+        effective_limit = limit if limit is not None else self.limit
+
         for issue in issues_list:
-            if self.limit and len(parsed) >= self.limit:
+            if effective_limit and len(parsed) >= effective_limit:
                 break
 
             issue_fields = issue.get("fields") or {}
@@ -717,10 +727,22 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """)
 
 
-    def search_using_jql(self, jql: str):
-        """ Search for Jira issues using JQL."""
+    def search_using_jql(self, jql: str, limit: Optional[int] = None):
+        """ Search for Jira issues using JQL.
+
+        Paginates internally so `limit` can exceed Jira's 100-per-request server cap.
+        If `limit` is not provided, falls back to the toolkit-level `self.limit`.
+        """
         client = self._get_client()
-        parsed = self._parse_issues(client.jql(jql))
+        effective_limit = limit if limit is not None else self.limit
+
+        aggregated: List[dict] = []
+        for batch in self._jql_get_tickets(client, jql, fields="*all", limit=effective_limit):
+            aggregated.extend(batch)
+            if effective_limit and len(aggregated) >= effective_limit:
+                break
+
+        parsed = self._parse_issues({"issues": aggregated}, limit=effective_limit)
         if len(parsed) == 0:
             return "No Jira issues found"
         return "Found " + str(len(parsed)) + " Jira issues:\n" + str(parsed)
@@ -1939,12 +1961,21 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
     def _jql_get_tickets(self, client: Jira, jql, fields="*all", start=0, limit=None, expand=None, validate_query=None):
         """
         Generator that yields batches of Jira issues based on JQL query.
+
+        Jira caps `maxResults` per request (typically 100), so this method paginates
+        until either `limit` issues have been yielded or no more issues are available.
+        Uses `nextPageToken` pagination for the v3 `search/jql` endpoint and `startAt`
+        pagination for the legacy v2 `search` endpoint.
         """
         from atlassian.errors import ApiError
 
-        params = {}
+        # Per-request page size — Jira's server caps maxResults regardless of what we ask
+        # (typically at 100), so requesting the total `limit` yields only one page.
+        page_size = 100
         if limit is not None:
-            params["maxResults"] = int(limit)
+            page_size = min(page_size, int(limit))
+
+        params = {"maxResults": page_size}
         if fields is not None:
             if isinstance(fields, (list, tuple, set)):
                 fields = ",".join(fields)
@@ -1956,10 +1987,22 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if validate_query is not None:
             params["validateQuery"] = validate_query
 
-        url = client.resource_url("search/jql" if self.api_version == '3' else "search")
+        use_token_pagination = self.api_version == '3'
+        url = client.resource_url("search/jql" if use_token_pagination else "search")
+
+        fetched = 0
+        next_page_token: Optional[str] = None
+        current_start = int(start)
 
         while True:
-            params["startAt"] = int(start)
+            if use_token_pagination:
+                if next_page_token is not None:
+                    params["nextPageToken"] = next_page_token
+                else:
+                    params.pop("nextPageToken", None)
+            else:
+                params["startAt"] = current_start
+
             try:
                 response = client.get(url, params=params)
                 if not response:
@@ -1968,15 +2011,29 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 error_message = f"Jira API error: {str(e)}"
                 raise ValueError(f"Failed to fetch issues from Jira: {error_message}")
 
-            issues = response["issues"]
+            issues = response.get("issues") or []
+            if not issues:
+                break
+
+            # Honor the total `limit` even if Jira returned more on the final page
+            if limit is not None and fetched + len(issues) > limit:
+                issues = issues[: limit - fetched]
+
             yield issues
-            if limit is not None and len(response["issues"]) + start >= limit:
+            fetched += len(issues)
+
+            if limit is not None and fetched >= limit:
                 break
-            if not response["issues"]:
-                break
-            if len(issues) < limit:
-                break
-            start += len(issues)
+
+            if use_token_pagination:
+                next_page_token = response.get("nextPageToken")
+                if response.get("isLast") or not next_page_token:
+                    break
+            else:
+                current_start += len(issues)
+                # No more pages: server returned fewer than the page we asked for
+                if len(issues) < page_size:
+                    break
 
     def _process_issue_for_indexing(self, issue: dict, fields_to_index=None) -> Document:
         """
