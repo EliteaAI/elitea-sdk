@@ -7,6 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 log = logging.getLogger(__name__)
 
+SITE_URL_FORMAT_ERROR = (
+    "Failed to parse SharePoint URL - use https://<tenant>.sharepoint.com, "
+    "https://<tenant>.sharepoint.com/sites/<site>, or "
+    "https://<tenant>.sharepoint.com/teams/<team>"
+)
+
 
 class SharepointConfiguration(BaseModel):
     model_config = ConfigDict(
@@ -39,7 +45,7 @@ class SharepointConfiguration(BaseModel):
     # Client credentials (shared by both app_auth and delegated flows)
     client_id: str = Field(description="SharePoint Client ID")
     client_secret: SecretStr = Field(description="SharePoint Client Secret")
-    site_url: str = Field(description="SharePoint Site URL")
+    site_url: str = Field(description="SharePoint tenant or site URL")
 
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
@@ -113,6 +119,8 @@ class SharepointConfiguration(BaseModel):
             return None, "Site URL cannot be empty"
         if not site_url.startswith(("http://", "https://")):
             return None, "Site URL must start with http:// or https://"
+        if not urlparse(site_url).netloc:
+            return None, SITE_URL_FORMAT_ERROR
         return site_url.rstrip("/"), None
 
     @staticmethod
@@ -471,4 +479,3 @@ class SharepointConfiguration(BaseModel):
             if "connection" in error_lower or "name or service not known" in error_lower:
                 return "Connection error - unable to reach SharePoint"
             return f"SharePoint ACS connection failed: {error_msg}"
-
