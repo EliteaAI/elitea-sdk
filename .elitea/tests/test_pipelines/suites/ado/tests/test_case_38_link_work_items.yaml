@@ -128,6 +128,38 @@ nodes:
     structured_output: false
     tool: link_work_items
     toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
+    transition: cleanup_source_work_item
+
+  - id: cleanup_source_work_item
+    type: toolkit
+    input:
+      - source_work_item_id
+    input_mapping:
+      id:
+        type: variable
+        value: source_work_item_id
+    output:
+      - cleanup_source_result
+    structured_output: false
+    continue_on_error: true
+    tool: delete_work_item
+    toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
+    transition: cleanup_target_work_item
+
+  - id: cleanup_target_work_item
+    type: toolkit
+    input:
+      - target_work_item_id
+    input_mapping:
+      id:
+        type: variable
+        value: target_work_item_id
+    output:
+      - cleanup_target_result
+    structured_output: false
+    continue_on_error: true
+    tool: delete_work_item
+    toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
     transition: validate_results
 
   - id: validate_results
@@ -174,34 +206,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: cleanup_source_work_item
-
-  - id: cleanup_source_work_item
-    type: toolkit
-    input:
-      - source_work_item_id
-    input_mapping:
-      id:
-        type: variable
-        value: source_work_item_id
-    output:
-      - cleanup_source_result
-    structured_output: false
-    tool: delete_work_item
-    toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
-    transition: cleanup_target_work_item
-
-  - id: cleanup_target_work_item
-    type: toolkit
-    input:
-      - target_work_item_id
-    input_mapping:
-      id:
-        type: variable
-        value: target_work_item_id
-    output:
-      - cleanup_target_result
-    structured_output: false
-    tool: delete_work_item
-    toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
     transition: END
