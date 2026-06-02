@@ -130,6 +130,45 @@ nodes:
       - read_result
     structured_output: true
     continue_on_error: true
+    transition: delete_file
+
+  - id: delete_file
+    type: toolkit
+    tool: delete_file
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
+    input:
+      - target_branch
+      - file_path
+    input_mapping:
+      branch:
+        type: variable
+        value: target_branch
+      file_path:
+        type: variable
+        value: file_path
+    output:
+      - create_result
+    structured_output: true
+    continue_on_error: true
+    transition: delete_branch
+
+  - id: delete_branch
+    type: toolkit
+    tool: delete_branch
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
+    input:
+      - target_branch
+    input_mapping:
+      branch_name:
+        type: variable
+        value: target_branch
+      force:
+        type: fixed
+        value: true
+    output:
+      - create_result
+    structured_output: true
+    continue_on_error: true
     transition: validate_result
 
   - id: validate_result
@@ -176,43 +215,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: delete_file
-
-  - id: delete_file
-    type: toolkit
-    tool: delete_file
-    toolkit_name: ${GITHUB_TOOLKIT_NAME}
-    input:
-      - target_branch
-      - file_path
-    input_mapping:
-      branch:
-        type: variable
-        value: target_branch
-      file_path:
-        type: variable
-        value: file_path
-    output:
-      - create_result
-    structured_output: true
-    continue_on_error: true
-    transition: delete_branch
-
-  - id: delete_branch
-    type: toolkit
-    tool: delete_branch
-    toolkit_name: ${GITHUB_TOOLKIT_NAME}
-    input:
-      - target_branch
-    input_mapping:
-      branch_name:
-        type: variable
-        value: target_branch
-      force:
-        type: fixed
-        value: true
-    output:
-      - create_result
-    structured_output: true
-    continue_on_error: true
     transition: END
