@@ -145,13 +145,12 @@ nodes:
           1. Check all result structures are valid (not error/exception)
           2. Verify baseline result is non-empty (if empty, test fails - missing test data)
           3. Extract file extensions from each result
-          4. Verify Test 1 has NO .txt files (zero .txt files)
-          5. Verify Test 2 has NO .pdf files (zero .pdf files)
-          6. Verify Test 2 has NO .docx files (zero .docx files)
-          7. Verify Test 2 has NO .png files (zero .png files)
-          8. Verify Test 1 count <= Baseline count
-          9. Verify Test 2 count <= Baseline count
-          10. Calculate how many files were filtered in each test
+          4. Test 1 (skip_extensions=["txt"]): Verify NO files with .txt extension are present. Files with .pdf, .docx, .png, and other extensions ARE expected to remain.
+          5. Test 2 (skip_extensions=[".pdf", ".docx", ".png"]): Verify NO files with .pdf extension are present. Verify NO files with .docx extension are present. Verify NO files with .png extension are present. Files with .txt and other non-skipped extensions ARE expected to remain in the result.
+          6. Verify Test 1 count <= Baseline count
+          7. Verify Test 2 count <= Baseline count
+          8. Calculate how many files were filtered in each test
+          IMPORTANT: Do NOT check for .txt absence in Test 2. .txt files are expected in Test 2 because .txt is not in the skip list for Test 2.
 
           return a json object with:
           {{
