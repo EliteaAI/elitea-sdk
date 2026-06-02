@@ -11,6 +11,7 @@
     "update_case",
     "add_file_to_case",
     "get_suites",
-    "delete_case"
+    "delete_case",
+    "get_sections"
   ]
 }
