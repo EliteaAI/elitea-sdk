@@ -309,14 +309,19 @@ class SharepointRestWrapper(BaseSharepointWrapper):
         If form_name is specified alone, only files from the specified form will be returned.
         If both form_name and folder_name are specified, form_name pins the document library
         and folder_name is treated as a subfolder path relative to that library's root.
-        If include_extensions is specified, only files with matching extensions are returned.
-        If skip_extensions is specified, files with matching extensions are excluded.
-        Extensions accept both 'pdf' and '.pdf' forms and are matched case-insensitively.
+        If include_extensions is specified, only files whose name matches one of
+        the extension, filename, or glob-style patterns are returned.
+        If skip_extensions is specified, matching files are excluded. Patterns
+        accept forms like 'pdf', '.pdf', '*.pdf', or 'report.pdf' and are matched
+        case-insensitively.
         Note:
             * URL anatomy: https://epam.sharepoint.com/sites/{some_site}/{form_name}/Forms/AllItems.aspx
             * Example of folders syntax: `{form_name} / Hello / inner-folder` - 1st folder is commonly form_name
         """
-        from .base_wrapper import _normalize_extensions, _matches_extension
+        from .file_filters import (
+            matches_extension_filter,
+            normalize_extension_filters,
+        )
         try:
             _t_start = time.perf_counter()
 
@@ -349,8 +354,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
 
             result = []
             limit_files = limit_files or 100
-            norm_include = _normalize_extensions(include_extensions)
-            norm_skip = _normalize_extensions(skip_extensions)
+            norm_include = normalize_extension_filters(include_extensions)
+            norm_skip = normalize_extension_filters(skip_extensions)
 
             site_segments = [s for s in self.site_url.strip('/').split('/') if s][-2:]
             full_path_prefix = '/'.join(site_segments)
@@ -404,9 +409,9 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                     if len(result) >= limit_files:
                         break
                     file_name = file.properties['Name']
-                    if norm_skip and _matches_extension(file_name, norm_skip):
+                    if norm_skip and matches_extension_filter(file_name, norm_skip):
                         continue
-                    if norm_include and not _matches_extension(file_name, norm_include):
+                    if norm_include and not matches_extension_filter(file_name, norm_include):
                         continue
                     # Convert datetime to ISO string for JSON serialization
                     created = file.properties['TimeCreated']
@@ -448,7 +453,7 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             if len(str(result)) > 50_000:
                 logging.warning(
                     "[SP-REST][get_files_list] Large response (%d chars) — "
-                    "consider reducing limit_files or adding extension filters.",
+                    "consider reducing limit_files or adding filename filters.",
                     len(str(result)))
 
             return result

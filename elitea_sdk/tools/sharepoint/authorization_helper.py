@@ -8,6 +8,11 @@ import jwt
 import requests
 from botocore.response import get_response
 
+from .file_filters import (
+    matches_extension_filter,
+    normalize_extension_filters,
+)
+
 
 class SharepointAuthorizationHelper:
 
@@ -142,33 +147,8 @@ class SharepointAuthorizationHelper:
         if limit_files is not None and (not isinstance(limit_files, int) or limit_files <= 0):
             raise ValueError(f"limit_files must be a positive integer, got: {limit_files}")
 
-        # Normalize extension filters: accept 'pdf', '.pdf', or '*.pdf',
-        # always producing a lowercase dot-prefixed form (e.g. '.pdf').
-        def _norm(exts):
-            if not exts:
-                return []
-            result = []
-            for e in exts:
-                if not e or not e.strip():
-                    continue
-                e = e.strip()
-                # Strip glob prefix: '*.pdf' → '.pdf', '*pdf' → 'pdf'
-                if e.startswith('*'):
-                    e = e.lstrip('*')
-                # Strip leading dot(s): '.pdf' → 'pdf'
-                e = e.lstrip('.')
-                if e:
-                    result.append(f'.{e.lower()}')
-            return result
-
-        def _ext_match(filename, norm_exts):
-            if not norm_exts:
-                return False
-            ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-            return ext in norm_exts
-
-        norm_include = _norm(include_extensions)
-        norm_skip = _norm(skip_extensions)
+        norm_include = normalize_extension_filters(include_extensions)
+        norm_skip = normalize_extension_filters(skip_extensions)
         try:
             access_token, site_id = self.generate_token_and_site_id(site_url)
             headers = {"Authorization": f"Bearer {access_token}"}
@@ -216,10 +196,10 @@ class SharepointAuthorizationHelper:
                             inner_files = _recurse_drive(drive_id, drive_path, inner_folder, limit_files)
                             files.extend(inner_files)
                         else:
-                            # Apply extension filters
-                            if norm_skip and _ext_match(file_name, norm_skip):
+                            # Apply extension, filename, and glob-style filters.
+                            if norm_skip and matches_extension_filter(file_name, norm_skip):
                                 continue
-                            if norm_include and not _ext_match(file_name, norm_include):
+                            if norm_include and not matches_extension_filter(file_name, norm_include):
                                 continue
                             files.append(temp_props)
                         if limit_files is not None and len(result) + len(files) >= limit_files:
