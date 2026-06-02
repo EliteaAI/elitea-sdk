@@ -37,6 +37,8 @@ state:
     type: dict
   search_large_txt_result:
     type: dict
+  search_stats:
+    type: dict
   test_results:
     type: dict
 
@@ -116,6 +118,45 @@ nodes:
     output:
       - search_large_txt_result
     structured_output: true
+    transition: compute_search_stats
+
+  - id: compute_search_stats
+    type: code
+    input:
+      - search_all_result
+      - search_large_txt_result
+    code:
+      type: fstring
+      value: |
+        import json
+
+        raw_large = elitea_state.get('search_large_txt_result', [])
+        large_txt_items = raw_large if isinstance(raw_large, list) else []
+        large_txt_chunk_count = len(large_txt_items)
+        all_large_txt = all(
+            item.get("metadata", {}).get("Name") == "text_large.txt"
+            for item in large_txt_items
+        ) if large_txt_items else False
+
+        raw_all = elitea_state.get('search_all_result', [])
+        all_docs = raw_all if isinstance(raw_all, list) else []
+        png_files_found = [
+            item.get("metadata", {}).get("Name", "")
+            for item in all_docs
+            if item.get("metadata", {}).get("Name", "").lower().endswith(".png")
+        ]
+        search_all_non_empty = len(all_docs) > 0
+
+        {
+          "large_txt_chunk_count": large_txt_chunk_count,
+          "large_txt_chunks_all_correct_file": all_large_txt,
+          "search_all_non_empty": search_all_non_empty,
+          "png_files_found": png_files_found,
+          "png_files_present": len(png_files_found) > 0
+        }
+    output:
+      - search_stats
+    structured_output: true
     transition: validate_result
 
   - id: validate_result
@@ -123,9 +164,7 @@ nodes:
     model: gpt-4o-2024-11-20
     input:
       - index_result
-      - search_all_result
-      - search_large_txt_result
-      - skip_extensions
+      - search_stats
     input_mapping:
       system:
         type: fixed
@@ -133,29 +172,29 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the indexing and search results for SharePoint documents.
+          Analyze the indexing and search statistics for SharePoint documents.
 
           Index Result: {index_result}
-          Search All Docs: {search_all_result}
-          Search text_large.txt (filtered): {search_large_txt_result}
-          Skip Extensions: {skip_extensions}
+          Search Statistics (pre-computed): {search_stats}
 
-          Expected behavior:
-          1. Indexing completed successfully (status: ok)
-          2. Search returns indexed documents (non-empty results)
-          3. search_large_txt_result must contain EXACTLY 4 items (4 chunks)
-          4. ALL items in search_large_txt_result must be for text_large.txt (no other files)
-          5. No png files should be in indexed documents (they were skipped)
+          The search_stats object contains:
+          - large_txt_chunk_count: number of chunks returned for text_large.txt (must be exactly 4)
+          - large_txt_chunks_all_correct_file: true if all filtered results are for text_large.txt
+          - search_all_non_empty: true if general search returned results
+          - png_files_found: list of any .png file names found in general search (must be empty)
+          - png_files_present: true if any .png files were found (must be false)
+
+          Note: search_all_result is a general search across ALL indexed documents and is expected
+          to contain multiple document types (docx, pdf, txt). This is correct behavior.
 
           Validation rules:
-          1. Check index_result has "status": "ok"
-          2. Check index_result message indicates successful indexing
-          3. Verify search_all_result is not empty and contains document list
-          4. Count total items in search_large_txt_result array - must be EXACTLY 4
-          5. Verify every item in search_large_txt_result has Name == "text_large.txt"
-          6. If count != 4 or any item is not text_large.txt, test fails
-          7. Verify no .png files appear in search_all_result (check "Name" field in metadata)
-          8. All validations must pass for test to pass
+          1. index_result must have "status": "ok"
+          2. index_result message must indicate successful indexing
+          3. search_all_non_empty must be true
+          4. large_txt_chunk_count must be exactly 4
+          5. large_txt_chunks_all_correct_file must be true
+          6. png_files_present must be false (no png files indexed)
+          7. All validations must pass for test to pass
 
           Return a json object with:
           {{
