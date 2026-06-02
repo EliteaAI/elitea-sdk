@@ -111,6 +111,12 @@ class GithubConfiguration(BaseModel):
         app_id = settings.get('app_id')
         app_private_key = settings.get('app_private_key')
 
+        # Check for partial auth configuration (one field provided but not the other)
+        if (username and not password) or (password and not username):
+            return "Authentication misconfigured: both username and password must be provided together"
+        if (app_id and not app_private_key) or (app_private_key and not app_id):
+            return "Authentication misconfigured: both app_id and app_private_key must be provided together"
+
         # if all auth methods are None or empty, allow anonymous access
         if not any([access_token, (username and password), (app_id and app_private_key)]):
             return None
@@ -122,9 +128,31 @@ class GithubConfiguration(BaseModel):
             # Determine authentication method
             if access_token:
                 headers['Authorization'] = f'token {access_token}'
+                response = requests.get(f'{base_url}/user', headers=headers, timeout=10)
             elif username and password:
                 auth = HTTPBasicAuth(username, password)
+                response = requests.get(f'{base_url}/user', headers=headers, auth=auth, timeout=10)
             elif app_id and app_private_key:
+                # Normalize the private key to proper PEM format
+                # Handles: keys without headers, keys as single line with headers,
+                # keys with spaces instead of newlines, etc.
+                header = "-----BEGIN RSA PRIVATE KEY-----"
+                footer = "-----END RSA PRIVATE KEY-----"
+
+                key = app_private_key.strip()
+
+                if header in key:
+                    key = key.replace(header, "").replace(footer, "").strip()
+
+                # Normalize whitespace: replace spaces with newlines, collapse multiple newlines
+                key_body = key.replace(" ", "\n")
+                # Remove any blank lines
+                key_lines = [line.strip() for line in key_body.split("\n") if line.strip()]
+                key_body = "\n".join(key_lines)
+
+                # Reconstruct proper PEM format
+                app_private_key = f"{header}\n{key_body}\n{footer}"
+
                 # Generate JWT for GitHub App authentication
                 payload = {
                     'iat': int(time.time()),
@@ -134,8 +162,21 @@ class GithubConfiguration(BaseModel):
                 jwt_token = jwt.encode(payload, app_private_key, algorithm='RS256')
                 headers['Authorization'] = f'Bearer {jwt_token}'
 
-            # Test connection with user endpoint
-            response = requests.get(f'{base_url}/user', headers=headers, auth=auth, timeout=10)
+                # GitHub App JWT tokens must use /app endpoint, not /user
+                # The /user endpoint requires user-level authentication
+                response = requests.get(f'{base_url}/app', headers=headers, timeout=10)
+
+                if response.status_code == 200:
+                    # /app returning 200 proves credentials are valid
+                    return None
+                elif response.status_code == 401:
+                    return "Authentication failed: Invalid GitHub App credentials (app_id or private_key)"
+                elif response.status_code == 403:
+                    return "Access forbidden: Check your GitHub App permissions"
+                elif response.status_code == 404:
+                    return "GitHub API endpoint not found"
+                else:
+                    return f"Connection failed with status {response.status_code}: {response.text}"
 
             if response.status_code == 200:
                 return None
