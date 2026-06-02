@@ -210,6 +210,25 @@ nodes:
     output:
       - verified_content
     structured_output: true
+    transition: cleanup_branch
+
+  - id: cleanup_branch
+    type: toolkit
+    tool: delete_branch
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
+    input:
+      - target_branch
+    input_mapping:
+      branch_name:
+        type: variable
+        value: target_branch
+      force:
+        type: fixed
+        value: true
+    output:
+      - create_result
+    structured_output: true
+    continue_on_error: true
     transition: validate_result
 
   - id: validate_result
@@ -255,23 +274,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: cleanup_branch
-
-  - id: cleanup_branch
-    type: toolkit
-    tool: delete_branch
-    toolkit_name: ${GITHUB_TOOLKIT_NAME}
-    input:
-      - target_branch
-    input_mapping:
-      branch_name:
-        type: variable
-        value: target_branch
-      force:
-        type: fixed
-        value: true
-    output:
-      - create_result
-    structured_output: true
-    continue_on_error: true
     transition: END
