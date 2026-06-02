@@ -94,6 +94,53 @@ class GithubConfiguration(BaseModel):
         )
 
     @staticmethod
+    def _normalize_private_key(private_key: str) -> str:
+        """
+        Normalize private key to proper PEM format.
+        Supports both PKCS#1 (RSA PRIVATE KEY) and PKCS#8 (PRIVATE KEY).
+        Handles keys with or without headers, single-line formatted keys, etc.
+
+        Args:
+            private_key: Raw private key string in any format
+
+        Returns:
+            Normalized PEM-formatted private key string
+        """
+        # Supported PEM formats
+        pkcs1_header = "-----BEGIN RSA PRIVATE KEY-----"
+        pkcs1_footer = "-----END RSA PRIVATE KEY-----"
+        pkcs8_header = "-----BEGIN PRIVATE KEY-----"
+        pkcs8_footer = "-----END PRIVATE KEY-----"
+
+        key = private_key.strip()
+
+        # Detect format and extract body
+        detected_header = None
+        detected_footer = None
+
+        if pkcs1_header in key:
+            detected_header = pkcs1_header
+            detected_footer = pkcs1_footer
+            key = key.replace(pkcs1_header, "").replace(pkcs1_footer, "").strip()
+        elif pkcs8_header in key:
+            detected_header = pkcs8_header
+            detected_footer = pkcs8_footer
+            key = key.replace(pkcs8_header, "").replace(pkcs8_footer, "").strip()
+
+        # Normalize whitespace: replace spaces with newlines, collapse multiple newlines
+        key_body = key.replace(" ", "\n")
+        # Remove any blank lines
+        key_lines = [line.strip() for line in key_body.split("\n") if line.strip()]
+        key_body = "\n".join(key_lines)
+
+        # Reconstruct with original format (default to PKCS#1 if no headers)
+        if detected_header is None:
+            detected_header = pkcs1_header
+            detected_footer = pkcs1_footer
+
+        return f"{detected_header}\n{key_body}\n{detected_footer}"
+
+    @staticmethod
     def check_connection(settings: dict) -> str | None:
         """
         Check GitHub connection using provided settings.
@@ -134,24 +181,7 @@ class GithubConfiguration(BaseModel):
                 response = requests.get(f'{base_url}/user', headers=headers, auth=auth, timeout=10)
             elif app_id and app_private_key:
                 # Normalize the private key to proper PEM format
-                # Handles: keys without headers, keys as single line with headers,
-                # keys with spaces instead of newlines, etc.
-                header = "-----BEGIN RSA PRIVATE KEY-----"
-                footer = "-----END RSA PRIVATE KEY-----"
-
-                key = app_private_key.strip()
-
-                if header in key:
-                    key = key.replace(header, "").replace(footer, "").strip()
-
-                # Normalize whitespace: replace spaces with newlines, collapse multiple newlines
-                key_body = key.replace(" ", "\n")
-                # Remove any blank lines
-                key_lines = [line.strip() for line in key_body.split("\n") if line.strip()]
-                key_body = "\n".join(key_lines)
-
-                # Reconstruct proper PEM format
-                app_private_key = f"{header}\n{key_body}\n{footer}"
+                app_private_key = GithubConfiguration._normalize_private_key(app_private_key)
 
                 # Generate JWT for GitHub App authentication
                 payload = {

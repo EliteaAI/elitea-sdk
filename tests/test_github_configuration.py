@@ -5,6 +5,7 @@ Issue #3986: GitHub App private key credential test fails with error message
 """
 import pytest
 from unittest.mock import patch, MagicMock
+from urllib.parse import urlparse
 
 from elitea_sdk.configurations.github import GithubConfiguration
 
@@ -64,6 +65,36 @@ ftK7Q+IETUMfLJUPQ+a+WS4lqYx42AZwaTOYt0SYbfoomlqXN37QYpa0/6JRuhuZ
 Z4ENDQKBgCmSkMoEwCfYmirGXlSz3bm8SRBRuw6rigy2+9eeyfAE1MgPYVYTj9Ba
 kYWNdLCJdoN9db6x/5J+5vFsCKrooFxdNLdT8y/IXwN7Toau6oWfvAPey4ecIuwQ
 PzbRu77QKe3K92EMPjzNCR6zZi/l7Wdw1UUjHXuUDXCkSkfk8siL"""
+
+# PKCS#8 format key for testing (converted from TEST_PRIVATE_KEY)
+TEST_PKCS8_KEY = """-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCZjyn+TkxBYXFj
+4EoFzcHptMhx13zv0plSH4bQfjjFEOf92z0cfXSB5TW8unvMyf5GA96m9n7epwlw
+CNX/dJSHMNJ6dKDfOLAzCGnvUAeLiqc0jP4n2aJyQYDwqJk/UmpDuJjK04bm0xrk
+G8r5Nu+xm4BjZHbAxmWBiG8i+gLFOQOE256r+0Vtvfe83gJvEYV8d4FBFH0XBqJA
+ypM+MWPxgPE48t15I6ILIa+6vXqAio+gTR/PwioW7tVdU8TzzLPMVmzaN+UEddwc
+4c5jmIS9BY/F84ySz1cn3WzGxWXbIuk17RNehaXh2McocZxoCS0bR/00QM61k+wZ
+huQOq60dAgMBAAECggEAGIki/RK2pXWz3/D88ttzAewUYPg86rbcL56A9HxOhtJS
+NyIaLByxinW8tdiYIlseCULiBwx4rgvDesa2prgSaV14K//JmpEcujK8dnPzmKzB
+Vai3jVd9WMM1nn5Z6h+5gfOTWkkdE3GkqND2CAbqmpbNl1P8k4W/v0g09cI7whZA
+GI7+Sdmmbs6R/Ci2R3A9ZNYkP6tdNPMbj7HoK7KO1Kw98cWDyykNhLQNL375m2cV
+I/kaKm7IxCfpvIsorqHW2ldBh6PZcQoh+eR0CsNy1dHUf+HswlEFGRKy2q029NmK
+37Ib8tBN6MIVE/1kou6hLqT6J2ee96aDHIvCEfn5gQKBgQDPZB8jHAVXVug0NH8j
+gro8VXJx7hFYDthPV4MIVEjRnQN8WX6IJYSUei6ZmLD0BgmTSokXyrO6l7DMBan4
+3R1z/pavB66LJ+P5nYoQvXKJcrfUmVC/hH3j9GGBV6/malGF7dXSh4j6HuSK7WW9
+Igg8674xyQ4CzKaTMWVMP6bKwQKBgQC9jQX/3N+XKveg3374vGMZEAz3a18LjNlL
+vaRMi8sAe+W4sHrb8QRPM3L5GcUDsDwBrOb5sVmbLHJ3ZJ92dG1gVrM9ZzpfOwIM
+cspv3VahHBs9WeCmNAiWPnpku3fI88H7BS3Qiv+ixo9rJ86ap3TT8T4cVHrrUWpa
+KhS+O+5FXQKBgQCkznuv+uSDs5xzYARow8obiAuaXgWKZMGgy3pldBUp/gx3FOdo
+aegh1baSeLSmNuYFFoY7UenhrgnhF98q1QxC0V4NWZ1rGBgilP7SrroGYBOV7wAs
+Ma2ZKOsTTguKn5KJS6dP1kUT/ti/Tkg7NIA3aV+LUKrBrr/w2KAXJ730AQKBgApV
+hu81JoeCUy/VH4IGG00BgAN5OhxSGIK1myCFOpMTLioMjRYypK6AupL0IbaaxBq/
+R3Rzg9Qe7zqtJLh7jn8DGxCM8TTB7dGp7Hl+0rtD4gRNQx8slQ9D5r5ZLiWpjHjY
+BnBpM5i3RJht+iiaWpc3ftBilrT/olG6G5lngQ0NAoGAKZKQygTAJ9iaKsZeVLPd
+ubxJEFG7DquKDLb7157J8ATUyA9hVhOP0FqRhY10sIl2g311vrH/kn7m8WwIquig
+XF00t1PzL8hfA3tOhq7qhZ+8A97Lh5wi7BA/NtG7vtAp7cr3YQw+PM0JHrNmL+Xt
+Z3DVRSMde5QNcKRKR+TyyIs=
+-----END PRIVATE KEY-----"""
 
 
 class TestGithubConfigurationCheckConnectionPartialAuth:
@@ -304,6 +335,85 @@ class TestGithubConfigurationCheckConnectionGitHubApp:
         # Should succeed because the code normalizes the key format
         assert error is None
 
+    @patch('requests.get')
+    def test_check_connection_app_accepts_pkcs8_format(self, mock_get):
+        """GitHub App auth should accept PKCS#8 format private keys.
+
+        Issue #3986: PKCS#8 keys (-----BEGIN PRIVATE KEY-----) should work
+        without being corrupted by the normalization code.
+        """
+        mock_app_response = MagicMock()
+        mock_app_response.status_code = 200
+        mock_get.return_value = mock_app_response
+
+        error = GithubConfiguration.check_connection({
+            'base_url': 'https://api.github.com',
+            'app_id': '123456',
+            'app_private_key': TEST_PKCS8_KEY,
+        })
+
+        # Should succeed with PKCS#8 format key
+        assert error is None
+
+    @patch('requests.get')
+    def test_check_connection_app_formats_single_line_pkcs8_key(self, mock_get):
+        """PKCS#8 key as single line should be normalized correctly."""
+        mock_app_response = MagicMock()
+        mock_app_response.status_code = 200
+        mock_get.return_value = mock_app_response
+
+        # Simulate PKCS#8 key pasted as a single line with headers
+        single_line_pkcs8_key = TEST_PKCS8_KEY.replace("\n", " ")
+
+        error = GithubConfiguration.check_connection({
+            'base_url': 'https://api.github.com',
+            'app_id': '123456',
+            'app_private_key': single_line_pkcs8_key,
+        })
+
+        # Should succeed because the code normalizes the key format
+        assert error is None
+
+
+class TestGithubConfigurationNormalizePrivateKey:
+    """Test _normalize_private_key method directly."""
+
+    def test_normalize_pkcs1_key_with_headers(self):
+        """PKCS#1 key with headers should be preserved."""
+        normalized = GithubConfiguration._normalize_private_key(TEST_PRIVATE_KEY)
+        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
+        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
+        assert "-----BEGIN PRIVATE KEY-----" not in normalized
+
+    def test_normalize_pkcs8_key_with_headers(self):
+        """PKCS#8 key with headers should be preserved."""
+        normalized = GithubConfiguration._normalize_private_key(TEST_PKCS8_KEY)
+        assert normalized.startswith("-----BEGIN PRIVATE KEY-----")
+        assert normalized.endswith("-----END PRIVATE KEY-----")
+        assert "-----BEGIN RSA PRIVATE KEY-----" not in normalized
+
+    def test_normalize_key_body_without_headers(self):
+        """Key body without headers should default to PKCS#1."""
+        normalized = GithubConfiguration._normalize_private_key(TEST_KEY_BODY)
+        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
+        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
+
+    def test_normalize_single_line_pkcs1_key(self):
+        """Single-line PKCS#1 key should be normalized to multi-line."""
+        single_line = TEST_PRIVATE_KEY.replace("\n", " ")
+        normalized = GithubConfiguration._normalize_private_key(single_line)
+        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
+        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
+        assert "\n" in normalized  # Should have newlines
+
+    def test_normalize_single_line_pkcs8_key(self):
+        """Single-line PKCS#8 key should be normalized to multi-line."""
+        single_line = TEST_PKCS8_KEY.replace("\n", " ")
+        normalized = GithubConfiguration._normalize_private_key(single_line)
+        assert normalized.startswith("-----BEGIN PRIVATE KEY-----")
+        assert normalized.endswith("-----END PRIVATE KEY-----")
+        assert "\n" in normalized  # Should have newlines
+
 
 class TestGithubConfigurationCheckConnectionErrors:
     """Test error handling scenarios."""
@@ -365,4 +475,5 @@ class TestGithubConfigurationCheckConnectionErrors:
 
         assert error is None
         call_url = mock_get.call_args[0][0]
-        assert 'github.mycompany.com' in call_url
+        parsed_url = urlparse(call_url)
+        assert parsed_url.hostname == 'github.mycompany.com'
