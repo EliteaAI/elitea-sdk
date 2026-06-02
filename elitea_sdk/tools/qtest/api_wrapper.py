@@ -1092,29 +1092,35 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         # Determine effective max_results (default to 20 if not specified)
         effective_max = max_results if max_results is not None else 20
         unlimited = effective_max <= 0
-        
+
+        current_page = self.page
+
         try:
             api_response = search_instance.search_artifact(self.qtest_project_id, body, append_test_steps=append_test_steps,
                                                            include_external_properties=include_external_properties,
-                                                           page_size=self.no_of_items_per_page, page=self.page)
+                                                           page_size=self.no_of_items_per_page, page=current_page)
             self.__parse_data(api_response, parsed_data, extract_images, prompt)
-            
+
             # Check if we've reached the limit after first page
             if not unlimited and len(parsed_data) >= effective_max:
                 return parsed_data[:effective_max]
 
-            if api_response['links']:
-                while api_response['links'][0]['rel'] == 'next':
-                    # Safety check: stop if limit reached
-                    if not unlimited and len(parsed_data) >= effective_max:
-                        break
-                    
-                    next_page = self.page + 1
-                    api_response = search_instance.search_artifact(self.qtest_project_id, body,
-                                                                   append_test_steps=append_test_steps,
-                                                                   include_external_properties=include_external_properties,
-                                                                   page_size=self.no_of_items_per_page, page=next_page)
-                    self.__parse_data(api_response, parsed_data, extract_images, prompt)
+            # Check for next page using safer pattern that handles any link order
+            links = api_response.get('links', [])
+            while any(link.get('rel') == 'next' for link in links):
+                # Safety check: stop if limit reached
+                if not unlimited and len(parsed_data) >= effective_max:
+                    break
+
+                # Increment page counter for next iteration
+                current_page += 1
+                api_response = search_instance.search_artifact(self.qtest_project_id, body,
+                                                               append_test_steps=append_test_steps,
+                                                               include_external_properties=include_external_properties,
+                                                               page_size=self.no_of_items_per_page, page=current_page)
+                self.__parse_data(api_response, parsed_data, extract_images, prompt)
+                # Update links for next iteration
+                links = api_response.get('links', [])
         except ApiException as e:
             stacktrace = format_exc()
             logger.error(f"Exception when calling SearchApi->search_artifact: \n {stacktrace}")
