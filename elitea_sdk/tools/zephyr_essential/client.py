@@ -1,6 +1,9 @@
 import requests
 from langchain_core.tools import ToolException
 
+from ..exceptions import ToolkitConfigurationError
+
+
 class ZephyrEssentialAPI:
     def __init__(self, base_url: str, token: str):
         self.base_url = base_url.rstrip("/")
@@ -19,9 +22,14 @@ class ZephyrEssentialAPI:
                 if resp.headers.get("Content-Type", "").startswith("application/json"):
                     return resp.json()
                 return resp.text
-            return ToolException(f"Unexpected status code {resp.status_code} for {method} {api_path}: {resp.content}")
+            if resp.status_code in (401, 403):
+                raise ToolkitConfigurationError(
+                    user_message="Authentication failed: invalid API token. Please check your Zephyr Essential credentials configuration.",
+                    cause=RuntimeError(f"HTTP {resp.status_code} for {method} {api_path}: {resp.content}")
+                )
+            raise ToolException(f"Unexpected status code {resp.status_code} for {method} {api_path}: {resp.content}")
         except requests.RequestException as e:
-            raise Exception(f"Unexpected error while performing request {method} {api_path}: {str(e)}")
+            raise ToolException(f"Network error while performing request {method} {api_path}: {str(e)}")
 
     # Test Cases
     def list_test_cases(self, project_key=None, folder_id=None, max_results=10, start_at=0):

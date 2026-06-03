@@ -74,10 +74,7 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
 
     def get_test_case_test_script(self, test_case_key: str):
         """Retrieve the test script of a test case."""
-        try:
-            return self._client.get_test_case_test_script(test_case_key)
-        except Exception as e:
-            return ToolException(f"Failed while receiving test steps: {e}")
+        return self._client.get_test_case_test_script(test_case_key)
 
     def create_test_case_test_script(self, test_case_key: str, json: str):
         """Create a test script for a test case."""
@@ -86,10 +83,8 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
 
     def get_test_case_test_steps(self, test_case_key: str, max_results: int = None, start_at: int = None):
         """List test steps of a test case."""
-        try:
-            return self._client.get_test_case_test_steps(test_case_key, max_results=max_results, start_at=start_at)["values"]
-        except Exception as e:
-            return ToolException(f"Failed while receiving test steps: {e}")
+        result = self._client.get_test_case_test_steps(test_case_key, max_results=max_results, start_at=start_at)
+        return result["values"]
 
     def create_test_case_test_steps(self, test_case_key: str, json: str):
         """Create test steps for a test case."""
@@ -190,11 +185,9 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
                 parent_folder_name = folder_data['parentName']
 
                 parent_folder = self.find_folder_by_name(parent_folder_name)
-
-                if isinstance(parent_folder, ToolException):
-                    return ToolException(f"Folder with name '{parent_folder_name}' not found.")
-                else:
-                    folder_data['parentId'] = parent_folder['id']
+                if parent_folder is None:
+                    raise ToolException(f"Parent folder with name '{parent_folder_name}' not found.")
+                folder_data['parentId'] = parent_folder['id']
 
         return self._client.create_folder(folder_data)
 
@@ -218,9 +211,7 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
         for folder in folders['values']:
             if folder.get('name', '').lower() == name.lower():
                 return folder
-
-        # Return None if no folder is found
-        return ToolException(f"Folder with name {name} was not found")
+        return None
 
     def delete_link(self, link_id: str):
         """Delete a specific link."""
