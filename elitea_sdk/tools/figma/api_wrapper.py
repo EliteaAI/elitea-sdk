@@ -488,22 +488,37 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_ids_include = document.metadata.pop('figma_pages_include', [])
         node_ids_exclude = document.metadata.pop('figma_pages_exclude', [])
         self._log_tool_event(f"Included pages: {node_ids_include}. Excluded pages: {node_ids_exclude}.")
+
         if node_ids_include:
-            # try to fetch only specified pages/nodes in one request
-            file = self._get_file_nodes(file_key,','.join(node_ids_include)) # attempt to fetch only specified pages/nodes in one request
-            if file:
-                return [
-                    node["document"]
-                    for node in (file.get("nodes") or {}).values()
-                    if node is not None and "document" in node
-                ]
+            # Try to fetch specified pages/nodes in one request
+            try:
+                file = self._get_file_nodes(file_key, ','.join(node_ids_include))
+                if file:
+                    return [
+                        node["document"]
+                        for node in (file.get("nodes") or {}).values()
+                        if node is not None and "document" in node
+                    ]
+            except ToolException as e:
+                if "too large" in str(e).lower() or "400" in str(e):
+                    self._log_tool_event(f"Bulk request too large, falling back to per-page fetching")
+                else:
+                    raise
         else:
-            # 
-            file = self._client.get_file(file_key)
-            if file:
-                figma_pages = file.document.get('children', [])
-                return [node for node in figma_pages if ('id' in node and node['id'].replace(':', '-') not in node_ids_exclude)]
-        # fallback to loading all pages and filtering them one by one
+            # Try to fetch full file
+            try:
+                file = self._client.get_file(file_key)
+                if file:
+                    figma_pages = file.document.get('children', [])
+                    return [node for node in figma_pages if ('id' in node and node['id'].replace(':', '-') not in node_ids_exclude)]
+            except ToolException as e:
+                if "too large" in str(e).lower() or "400" in str(e):
+                    self._log_tool_event(f"Bulk request too large, falling back to per-page fetching")
+                else:
+                    raise
+
+        # Fallback: fetch pages one by one (safe for large files)
+        self._log_tool_event(f"Using per-page fetching strategy for file {file_key}")
         file = self._client.get_file(file_key, geometry='depth=1')
         if not file:
             raise ToolException(
@@ -528,12 +543,17 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             node_id: str,
             image_url: str,
             prompt: str,
+            page_id: str = "",
     ) -> Optional[Document]:
         """Download and process a single Figma image node.
         This helper is used by `_process_document` (optionally in parallel via threads).
         """
+        # Build item name for tracking: file_key/page_id/node_id
+        item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
+
         if not image_url:
             logging.warning(f"Image URL not found for node_id {node_id} in file {file_key}. Skipping.")
+            self._track_skipped_file_read_error(item_name)
             return None
 
         logging.info(f"File {file_key}: downloading image node {node_id}.")
@@ -542,6 +562,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             response = requests.get(image_url)
         except Exception as exc:
             logging.warning(f"Failed to download image for node {node_id} in file {file_key}: {exc}")
+            self._track_skipped_file_read_error(item_name)
             return None
 
         if response.status_code != 200:
@@ -549,11 +570,13 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 f"Unexpected status code {response.status_code} when downloading image "
                 f"for node {node_id} in file {file_key}."
             )
+            self._track_skipped_file_read_error(item_name)
             return None
 
         content_type = response.headers.get('Content-Type', '')
         if 'text/html' in content_type.lower():
             logging.warning(f"Received HTML instead of image content for node {node_id} in file {file_key}.")
+            self._track_skipped_file_read_error(item_name)
             return None
 
         extension = (f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.txt')
@@ -579,6 +602,111 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             },
         )
 
+    def _is_volume_error(self, e: ToolException) -> bool:
+        """Check if error is volume/timeout related."""
+        error_str = str(e).lower()
+        return "timeout" in error_str or "too large" in error_str or "400" in str(e)
+
+    def _fetch_images_chunked(
+        self,
+        file_key: str,
+        nodes: List[str],
+        chunk_size: int,
+        node_to_page: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Fetch images in chunks, skip failed chunks."""
+        all_images: Dict[str, str] = {}
+        total_chunks = (len(nodes) + chunk_size - 1) // chunk_size
+        for i in range(0, len(nodes), chunk_size):
+            chunk = nodes[i:i + chunk_size]
+            chunk_num = (i // chunk_size) + 1
+            self._log_tool_event(
+                f"File {file_key}: fetching chunk {chunk_num}/{total_chunks} ({len(chunk)} nodes)"
+            )
+            try:
+                file_images = self._client.get_file_images(file_key, chunk)
+                if file_images and file_images.images:
+                    all_images.update(file_images.images)
+            except ToolException as e:
+                if self._is_volume_error(e):
+                    logging.warning(f"File {file_key}: chunk {chunk_num} skipped: {e}")
+                    self._log_tool_event(
+                        f"File {file_key}: chunk {chunk_num} failed (nodes: {chunk[:3]}...), skipping"
+                    )
+                    # Track each node in the failed chunk as skipped due to API fetch error
+                    for node_id in chunk:
+                        page_id = node_to_page.get(node_id, "") if node_to_page else ""
+                        item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
+                        self._track_runtime_skipped(item_name, reason="error")
+                else:
+                    raise
+        return all_images
+
+    def _get_file_images_with_fallback(
+        self,
+        file_key: str,
+        image_nodes: List[str],
+        page_node_mapping: Optional[Dict[str, List[str]]] = None,
+        chunk_size: int = 10,
+    ) -> Dict[str, str]:
+        """
+        Fetch image URLs with cascading fallback:
+        1. Try bulk request for all nodes
+        2. On failure, try per-page requests
+        3. If a page fails, chunk that page's nodes
+        """
+        # Build reverse mapping: node_id -> page_id for tracking
+        node_to_page: Dict[str, str] = {}
+        if page_node_mapping:
+            for page_id, node_ids in page_node_mapping.items():
+                for node_id in node_ids:
+                    node_to_page[node_id] = page_id
+
+        # Level 1: Try ALL images at once
+        try:
+            self._log_tool_event(f"File {file_key}: bulk image request for {len(image_nodes)} nodes")
+            file_images = self._client.get_file_images(file_key, image_nodes)
+            if file_images and file_images.images:
+                return file_images.images
+            return {}
+        except ToolException as e:
+            if not self._is_volume_error(e):
+                raise
+            self._log_tool_event(
+                f"File {file_key}: bulk failed ({len(image_nodes)} nodes), falling back to per-page"
+            )
+
+        # Level 2: Try per-page
+        if not page_node_mapping:
+            # No page mapping provided, fall back to chunking all nodes
+            self._log_tool_event(f"File {file_key}: no page mapping, chunking all nodes")
+            return self._fetch_images_chunked(file_key, image_nodes, chunk_size, node_to_page)
+
+        all_images: Dict[str, str] = {}
+        total_pages = len(page_node_mapping)
+        for page_idx, (page_id, page_nodes) in enumerate(page_node_mapping.items(), 1):
+            try:
+                self._log_tool_event(
+                    f"File {file_key}: page {page_idx}/{total_pages} ({page_id}) - {len(page_nodes)} images"
+                )
+                file_images = self._client.get_file_images(file_key, page_nodes)
+                if file_images and file_images.images:
+                    all_images.update(file_images.images)
+            except ToolException as e:
+                if not self._is_volume_error(e):
+                    raise
+                # Level 3: Chunk this page's nodes
+                # Use smaller chunks or one-by-one for small sets to isolate problematic images
+                effective_chunk_size = 1 if len(page_nodes) < 2 * chunk_size else chunk_size
+                self._log_tool_event(
+                    f"File {file_key}: page {page_id} failed ({len(page_nodes)} nodes), "
+                    f"chunking with size={effective_chunk_size}"
+                )
+                page_images = self._fetch_images_chunked(file_key, page_nodes, effective_chunk_size, node_to_page)
+                all_images.update(page_images)
+
+        return all_images
+
     def _process_document(
         self,
         document: Document,
@@ -592,7 +720,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         image_nodes = []
         text_nodes = {}
+        page_node_mapping: Dict[str, List[str]] = {}  # {page_id: [image_node_ids]}
+        node_to_page: Dict[str, str] = {}  # {node_id: page_id} for tracking
         for page in figma_pages:
+            page_id = page.get('id', '')
+            page_image_nodes: List[str] = []
             for node in page.get('children', []):
                 # filter by node_type if specified any include or exclude
                 node_type = node.get('type', '').lower()
@@ -605,8 +737,12 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     if node_id:
                         if self.has_image_representation(node):
                             image_nodes.append(node['id'])
+                            page_image_nodes.append(node['id'])
+                            node_to_page[node['id']] = page_id
                         else:
                             text_nodes[node['id']] = self.get_texts_recursive(node)
+            if page_image_nodes:
+                page_node_mapping[page_id] = page_image_nodes
         total_nodes = len(image_nodes) + len(text_nodes)
         # mutable counter so it can be updated from helper calls (even when used in threads)
         counted_nodes_ref: Dict[str, int] = {"value": 0}
@@ -624,8 +760,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         # --- Process image nodes (potential bottleneck) with optional threading ---
         if image_nodes:
-            file_images = self._client.get_file_images(file_key, image_nodes)
-            images = self._client.get_file_images(file_key, image_nodes).images or {} if file_images else {}
+            self._log_tool_event(f"File {file_key}: requesting images for {len(image_nodes)} nodes across {len(page_node_mapping)} pages")
+            images = self._get_file_images_with_fallback(file_key, image_nodes, page_node_mapping)
             total_images = len(images)
             if total_images == 0:
                 logging.info(f"No images found for file {file_key}.")
@@ -647,6 +783,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                             node_id=node_id,
                             image_url=image_url,
                             prompt=prompt,
+                            page_id=node_to_page.get(node_id, ""),
                         )
                         counted_nodes_ref["value"] += 1
                         if doc is not None:
@@ -669,6 +806,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                                 node_id,
                                 image_url,
                                 prompt,
+                                node_to_page.get(node_id, ""),
                             ): node_id
                             for node_id, image_url in images.items()
                         }
