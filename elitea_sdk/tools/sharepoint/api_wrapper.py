@@ -57,14 +57,16 @@ GetFiles = create_model(
                     "Use default value if not specified in a query WITH NO EXTRA "
                     "CONFIRMATION FROM A USER", default=100, gt=0)),
     include_extensions=(Optional[List[str]], Field(
-        description="If provided, only files whose extension matches one of these values "
-                    "are returned. Accepts 'pdf' or '.pdf' form; matched case-insensitively. "
-                    "Example: ['pdf', 'docx'] or ['.pdf', '.docx'].",
+        description="If provided, only files whose name matches one of these extension, "
+                    "filename, or glob-style patterns are returned. Accepts forms like "
+                    "'pdf', '.pdf', '*.pdf', or 'report.pdf'; matched case-insensitively. "
+                    "Example: ['pdf', '*.docx'] or ['report.pdf'].",
         default=None)),
     skip_extensions=(Optional[List[str]], Field(
-        description="If provided, files whose extension matches any of these values are "
-                    "excluded. Accepts 'pdf' or '.pdf' form; matched case-insensitively. "
-                    "Example: ['png', 'jpg'] or ['.png', '.jpg'].",
+        description="If provided, files whose name matches any of these extension, "
+                    "filename, or glob-style patterns are excluded. Accepts forms like "
+                    "'png', '.jpg', '*.tmp', or 'testdata.csv'; matched case-insensitively. "
+                    "Example: ['png', '*.jpg'] or ['testdata.csv'].",
         default=None)),
 )
 
@@ -533,9 +535,11 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         Number of files is limited by limit_files (default is 100).
 
         If form_name is specified, only files from specified form will be returned.
-        If include_extensions is specified, only files with matching extensions are returned.
-        If skip_extensions is specified, files with matching extensions are excluded.
-        Extensions accept both 'pdf' and '.pdf' forms and are matched case-insensitively.
+        If include_extensions is specified, only files whose name matches one of
+        the extension, filename, or glob-style patterns are returned.
+        If skip_extensions is specified, matching files are excluded. Patterns
+        accept forms like 'pdf', '.pdf', '*.pdf', or 'report.pdf' and are matched
+        case-insensitively.
         Note:
             * URL anatomy: https://epam.sharepoint.com/sites/{some_site}/{form_name}/Forms/AllItems.aspx
             * Example of folders syntax: `{form_name} / Hello / inner-folder` - 1st folder is commonly form_name
@@ -1380,4 +1384,3 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 "ref": self.onenote_read_attachment,
             },
         ]
-

@@ -624,14 +624,19 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         Number of files is limited by limit_files (default is 100).
 
         If form_name is specified alone, only files from the specified form will be returned.
-        If include_extensions is specified, only files with matching extensions are returned.
-        If skip_extensions is specified, files with matching extensions are excluded.
-        Extensions accept both 'pdf' and '.pdf' forms and are matched case-insensitively.
+        If include_extensions is specified, only files whose name matches one of
+        the extension, filename, or glob-style patterns are returned.
+        If skip_extensions is specified, matching files are excluded. Patterns
+        accept forms like 'pdf', '.pdf', '*.pdf', or 'report.pdf' and are matched
+        case-insensitively.
         Note:
             * URL anatomy: https://epam.sharepoint.com/sites/{some_site}/{form_name}/Forms/AllItems.aspx
             * Example of folders syntax: `{form_name} / Hello / inner-folder` - 1st folder is commonly form_name
         """
-        from .base_wrapper import _normalize_extensions, _matches_extension
+        from .file_filters import (
+            matches_extension_filter,
+            normalize_extension_filters,
+        )
         from urllib.parse import unquote as _unquote
         try:
             _t_start = time.perf_counter()
@@ -640,8 +645,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 "limit_files=%d include_extensions=%r skip_extensions=%r",
                 folder_name, form_name, limit_files, include_extensions, skip_extensions)
 
-            norm_include = _normalize_extensions(include_extensions)
-            norm_skip = _normalize_extensions(skip_extensions)
+            norm_include = normalize_extension_filters(include_extensions)
+            norm_skip = normalize_extension_filters(skip_extensions)
 
             params = {
                 "$top": 999,
@@ -731,9 +736,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         if 'file' not in item:
                             continue
                         file_name = item.get('name', '')
-                        if norm_skip and _matches_extension(file_name, norm_skip):
+                        if norm_skip and matches_extension_filter(file_name, norm_skip):
                             continue
-                        if norm_include and not _matches_extension(file_name, norm_include):
+                        if norm_include and not matches_extension_filter(file_name, norm_include):
                             continue
                         parent_path = item.get('parentReference', {}).get('path', '')
                         result.append({
@@ -1897,4 +1902,3 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise ToolException(
                 f"Failed to delete OneNote page '{page_id}': {e}"
             ) from e
-

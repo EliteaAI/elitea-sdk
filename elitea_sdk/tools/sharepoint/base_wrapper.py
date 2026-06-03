@@ -10,36 +10,6 @@ from typing import List, Optional
 from langchain_core.tools import ToolException
 
 
-def _normalize_extensions(extensions):
-    """Normalize extension filters to lowercase dot-prefixed form.
-
-    Accepts ``'pdf'``, ``'.pdf'``, or ``'*.pdf'``; returns e.g. ``['.pdf', '.docx']``.
-    An empty / None input returns an empty list.
-    """
-    if not extensions:
-        return []
-    normalized = []
-    for e in extensions:
-        if not e or not e.strip():
-            continue
-        e = e.strip()
-        # Strip glob prefix: '*.pdf' -> 'pdf', '*pdf' -> 'pdf'
-        if e.startswith('*'):
-            e = e.lstrip('*')
-        # Strip leading dot(s): '.pdf' -> 'pdf'
-        e = e.lstrip('.')
-        if e:
-            normalized.append(f'.{e.lower()}')
-    return normalized
-
-def _matches_extension(filename: str, normalized_extensions: list) -> bool:
-    """Return True if *filename*'s extension is in *normalized_extensions*."""
-    if not normalized_extensions:
-        return False
-    ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    return ext in normalized_extensions
-
-
 class BaseSharepointWrapper(ABC):
     """Abstract base defining the SharePoint operations contract.
 
@@ -103,11 +73,13 @@ class BaseSharepointWrapper(ABC):
             folder_name: Optional sub-folder path to restrict listing.
             limit_files: Maximum number of files to return.
             form_name: Optional Document Library name filter.
-            include_extensions: If provided, only files whose extension matches
-                one of these values are returned.  Accepts ``'pdf'`` or ``'.pdf'``
-                form; matched case-insensitively.
-            skip_extensions: If provided, files whose extension matches any of
-                these values are excluded.  Same format as *include_extensions*.
+            include_extensions: If provided, only files whose name matches one
+                of these extension, filename, or glob-style patterns are returned.
+                Accepts values such as ``'pdf'``, ``'.pdf'``, ``'*.pdf'``, or
+                ``'report.pdf'``; matched case-insensitively.
+            skip_extensions: If provided, files whose name matches any of these
+                extension, filename, or glob-style patterns are excluded. Same
+                format as *include_extensions*.
 
         Returns:
             list[dict] on success, :class:`ToolException` on failure.
@@ -230,4 +202,3 @@ class BaseSharepointWrapper(ABC):
 
     def onenote_delete_page(self, page_id: str) -> str:
         raise ToolException(self._ONENOTE_NOT_SUPPORTED)
-
