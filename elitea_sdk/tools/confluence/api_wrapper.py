@@ -135,6 +135,17 @@ pageId = create_model(
     "pageId",
     page_id=(str, Field(description="Id of page to be read")),
     skip_images=(Optional[bool], Field(description="Whether we need to skip existing images or not", default=False)),
+    content_format=(Optional[Literal['view', 'storage', 'export_view', 'editor', 'anonymous', 'styled_view', 'atlas_doc_format']], Field(
+        description=(
+            "Override the toolkit-level content_format for this call. Controls the Confluence `expand` "
+            "body format used to fetch and render the page. "
+            "Use 'storage' for pages relying on structured macros that render empty in 'view'. "
+            "'styled_view' returns export-styled HTML. "
+            "'atlas_doc_format' (Cloud-only) returns the page as ADF JSON — useful for downstream "
+            "structured processing; not suitable for Server/Data Center. "
+            "Defaults to the toolkit setting."
+        ),
+        default=None)),
 )
 
 сonfluenceInput = create_model(
@@ -185,6 +196,31 @@ def parse_payload_params(params: Optional[str]) -> Dict[str, Any]:
             stacktrace = traceback.format_exc()
             return ToolException(f"Confluence tool exception. Passed params are not valid JSON. {stacktrace}")
     return {}
+
+
+class _AtlasDocFormat:
+    """Shim that duck-types langchain ContentFormat for Confluence ADF.
+
+    Confluence Cloud returns Atlas Document Format as a JSON string under
+    body.atlas_doc_format.value. langchain's ContentFormat enum doesn't include
+    it, so we expose the same `value` / `name` / `get_content` surface here.
+    """
+    value = "body.atlas_doc_format"
+    name = "ATLAS_DOC_FORMAT"
+
+    @staticmethod
+    def get_content(page: dict) -> str:
+        return page["body"]["atlas_doc_format"]["value"]
+
+
+class _StyledView:
+    """Shim that duck-types langchain ContentFormat for Confluence styled_view (HTML with inline CSS)."""
+    value = "body.styled_view"
+    name = "STYLED_VIEW"
+
+    @staticmethod
+    def get_content(page: dict) -> str:
+        return page["body"]["styled_view"]["value"]
 
 
 class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
@@ -636,8 +672,9 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 and not restrictions["read"]["restrictions"]["group"]["results"]
         )
 
-    def get_pages_by_id(self, page_ids: List[str], skip_images: bool = False):
+    def get_pages_by_id(self, page_ids: List[str], skip_images: bool = False, content_format: Optional[Any] = None):
         """ Gets pages by id in the Confluence space."""
+        effective_format = content_format or self.content_format
         for page_id in page_ids:
             get_page = retry(
                 reraise=True,
@@ -653,7 +690,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             )(self.client.get_page_by_id)
             try:
                 page = get_page(
-                    page_id=page_id, expand=f"{self.content_format.value},version"
+                    page_id=page_id, expand=f"{effective_format.value},version"
                 )
             except (ApiError, HTTPError) as e:
                 logger.error(f"Error fetching page with ID {page_id}: {e}")
@@ -667,16 +704,47 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             # TODO: update on toolkit advanced settings level as a separate feature
             # if not self.include_restricted_content and not self.is_public_page(page):
             #     continue
-            yield self.process_page(page, skip_images)
+            yield self.process_page(page, skip_images, content_format=effective_format)
 
     def _log_errors(self):
         """ Log errors encountered during toolkit execution. """
         if self._errors:
             logger.info(f"Errors encountered during toolkit execution: {self._errors}")
 
-    def read_page_by_id(self, page_id: str, skip_images: bool = False):
-        """Reads a page by its id in the Confluence space. If id is not available, but there is a title - use get_page_id first."""
-        result = list(self.get_pages_by_id([page_id], skip_images))
+    def _resolve_content_format(self, content_format: Optional[str]):
+        """Map a string content_format override to a ContentFormat-compatible object, or None to fall back to toolkit default.
+
+        Returns either a langchain `ContentFormat` enum value or one of the duck-typed shims
+        (`_AtlasDocFormat`, `_StyledView`) for formats not present in the langchain enum.
+        """
+        if not content_format:
+            return None
+        mapping = {
+            'view': ContentFormat.VIEW,
+            'storage': ContentFormat.STORAGE,
+            'export_view': ContentFormat.EXPORT_VIEW,
+            'editor': ContentFormat.EDITOR,
+            'anonymous': ContentFormat.ANONYMOUS_EXPORT_VIEW,
+            'styled_view': _StyledView,
+            'atlas_doc_format': _AtlasDocFormat,
+        }
+        return mapping.get(content_format.lower())
+
+    def read_page_by_id(self, page_id: str, skip_images: bool = False,
+                        content_format: Optional[Literal['view', 'storage', 'export_view', 'editor', 'anonymous', 'styled_view', 'atlas_doc_format']] = None):
+        """Reads a page by its id in the Confluence space. If id is not available, but there is a title - use get_page_id first.
+
+        Optional `content_format` overrides the toolkit-level setting for this single call:
+          * 'view' (default) — server-rendered HTML, may render empty for some structured macros.
+          * 'storage' — XHTML with macro markup preserved; use for pages with macros like rw-ui-tabs-macro.
+          * 'export_view' — export-style HTML.
+          * 'editor' — editor-time XHTML.
+          * 'anonymous' — anonymous export view.
+          * 'styled_view' — export-styled HTML with inline CSS.
+          * 'atlas_doc_format' — ADF JSON document (Confluence Cloud only; returned verbatim).
+        """
+        format_override = self._resolve_content_format(content_format)
+        result = list(self.get_pages_by_id([page_id], skip_images, content_format=format_override))
         if not result:
             return f"Pages not found. Errors: {self._errors}" if self._errors \
                 else "Pages not found or you do not have access to them."
@@ -783,7 +851,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             content.append(page_data)
         return '---'.join([str(page_data) for page_data in content])
 
-    def process_page(self, page: dict, skip_images: bool = False) -> Document:
+    def process_page(self, page: dict, skip_images: bool = False, content_format: Optional[Any] = None) -> Document:
         if self.keep_markdown_format:
             try:
                 from markdownify import markdownify
@@ -805,11 +873,15 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         else:
             attachment_texts = []
 
-        content = self.content_format.get_content(page)
-        if self.keep_markdown_format:
+        effective_format = content_format or self.content_format
+        content = effective_format.get_content(page)
+        if effective_format is _AtlasDocFormat:
+            # ADF is a JSON document, not HTML. Returning it verbatim preserves
+            # structure for downstream parsing; markdownify/BeautifulSoup would mangle it.
+            text = content + "".join(attachment_texts)
+        elif self.keep_markdown_format:
             # Use markdownify to keep the page Markdown style
             text = markdownify(content, heading_style="ATX") + "".join(attachment_texts)
-
         else:
             if self.keep_newlines:
                 text = BeautifulSoup(
