@@ -94,6 +94,53 @@ class GithubConfiguration(BaseModel):
         )
 
     @staticmethod
+    def _normalize_private_key(private_key: str) -> str:
+        """
+        Normalize private key to proper PEM format.
+        Supports both PKCS#1 (RSA PRIVATE KEY) and PKCS#8 (PRIVATE KEY).
+        Handles keys with or without headers, single-line formatted keys, etc.
+
+        Args:
+            private_key: Raw private key string in any format
+
+        Returns:
+            Normalized PEM-formatted private key string
+        """
+        # Supported PEM formats
+        pkcs1_header = "-----BEGIN RSA PRIVATE KEY-----"
+        pkcs1_footer = "-----END RSA PRIVATE KEY-----"
+        pkcs8_header = "-----BEGIN PRIVATE KEY-----"
+        pkcs8_footer = "-----END PRIVATE KEY-----"
+
+        key = private_key.strip()
+
+        # Detect format and extract body
+        detected_header = None
+        detected_footer = None
+
+        if pkcs1_header in key:
+            detected_header = pkcs1_header
+            detected_footer = pkcs1_footer
+            key = key.replace(pkcs1_header, "").replace(pkcs1_footer, "").strip()
+        elif pkcs8_header in key:
+            detected_header = pkcs8_header
+            detected_footer = pkcs8_footer
+            key = key.replace(pkcs8_header, "").replace(pkcs8_footer, "").strip()
+
+        # Normalize whitespace: replace spaces with newlines, collapse multiple newlines
+        key_body = key.replace(" ", "\n")
+        # Remove any blank lines
+        key_lines = [line.strip() for line in key_body.split("\n") if line.strip()]
+        key_body = "\n".join(key_lines)
+
+        # Reconstruct with original format (default to PKCS#1 if no headers)
+        if detected_header is None:
+            detected_header = pkcs1_header
+            detected_footer = pkcs1_footer
+
+        return f"{detected_header}\n{key_body}\n{detected_footer}"
+
+    @staticmethod
     def check_connection(settings: dict) -> str | None:
         """
         Check GitHub connection using provided settings.
@@ -111,6 +158,12 @@ class GithubConfiguration(BaseModel):
         app_id = settings.get('app_id')
         app_private_key = settings.get('app_private_key')
 
+        # Check for partial auth configuration (one field provided but not the other)
+        if (username and not password) or (password and not username):
+            return "Authentication misconfigured: both username and password must be provided together"
+        if (app_id and not app_private_key) or (app_private_key and not app_id):
+            return "Authentication misconfigured: both app_id and app_private_key must be provided together"
+
         # if all auth methods are None or empty, allow anonymous access
         if not any([access_token, (username and password), (app_id and app_private_key)]):
             return None
@@ -122,9 +175,14 @@ class GithubConfiguration(BaseModel):
             # Determine authentication method
             if access_token:
                 headers['Authorization'] = f'token {access_token}'
+                response = requests.get(f'{base_url}/user', headers=headers, timeout=10)
             elif username and password:
                 auth = HTTPBasicAuth(username, password)
+                response = requests.get(f'{base_url}/user', headers=headers, auth=auth, timeout=10)
             elif app_id and app_private_key:
+                # Normalize the private key to proper PEM format
+                app_private_key = GithubConfiguration._normalize_private_key(app_private_key)
+
                 # Generate JWT for GitHub App authentication
                 payload = {
                     'iat': int(time.time()),
@@ -134,8 +192,21 @@ class GithubConfiguration(BaseModel):
                 jwt_token = jwt.encode(payload, app_private_key, algorithm='RS256')
                 headers['Authorization'] = f'Bearer {jwt_token}'
 
-            # Test connection with user endpoint
-            response = requests.get(f'{base_url}/user', headers=headers, auth=auth, timeout=10)
+                # GitHub App JWT tokens must use /app endpoint, not /user
+                # The /user endpoint requires user-level authentication
+                response = requests.get(f'{base_url}/app', headers=headers, timeout=10)
+
+                if response.status_code == 200:
+                    # /app returning 200 proves credentials are valid
+                    return None
+                elif response.status_code == 401:
+                    return "Authentication failed: Invalid GitHub App credentials (app_id or private_key)"
+                elif response.status_code == 403:
+                    return "Access forbidden: Check your GitHub App permissions"
+                elif response.status_code == 404:
+                    return "GitHub API endpoint not found"
+                else:
+                    return f"Connection failed with status {response.status_code}: {response.text}"
 
             if response.status_code == 200:
                 return None

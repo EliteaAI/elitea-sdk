@@ -62,6 +62,54 @@ nodes:
     output:
       - tool_result
     structured_output: true
+    transition: extract_issue_number
+
+  - id: extract_issue_number
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+        import re
+
+        tool_result = elitea_state.get('tool_result', '')
+        issue_number = None
+        if isinstance(tool_result, dict):
+            issue_number = tool_result.get('number')
+        elif isinstance(tool_result, str):
+            try:
+                parsed = json.loads(tool_result)
+                issue_number = parsed.get('number')
+            except Exception:
+                match = re.search(r'ID[:\s]+(\d+)', tool_result)
+                if match:
+                    issue_number = int(match.group(1))
+
+        {"issue_number": issue_number}
+    input:
+      - tool_result
+    output:
+      - issue_number
+    structured_output: true
+    transition: close_issue
+
+  - id: close_issue
+    type: toolkit
+    tool: update_issue
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
+    input:
+      - issue_number
+    input_mapping:
+      issue_id:
+        type: variable
+        value: issue_number
+      state:
+        type: fixed
+        value: closed
+    output:
+      - tool_result
+    structured_output: true
+    continue_on_error: true
     transition: validate_result
 
   - id: validate_result
@@ -105,58 +153,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: extract_issue_number
-
-  - id: extract_issue_number
-    type: code
-    code:
-      type: fixed
-      value: |
-        import json
-        import re
-
-        test_results = elitea_state.get('test_results', {})
-        issue_number = None
-        if isinstance(test_results, dict):
-            issue_number = test_results.get('issue_number')
-
-        if not issue_number:
-            tool_result = elitea_state.get('tool_result', '')
-            if isinstance(tool_result, dict):
-                issue_number = tool_result.get('number')
-            elif isinstance(tool_result, str):
-                try:
-                    parsed = json.loads(tool_result)
-                    issue_number = parsed.get('number')
-                except Exception:
-                    match = re.search(r'ID[:\s]+(\d+)', tool_result)
-                    if match:
-                        issue_number = int(match.group(1))
-
-        {"issue_number": issue_number}
-    input:
-      - test_results
-      - tool_result
-    output:
-      - issue_number
-    structured_output: true
-    transition: close_issue
-
-  - id: close_issue
-    type: toolkit
-    tool: update_issue
-    toolkit_name: ${GITHUB_TOOLKIT_NAME}
-    input:
-      - issue_number
-    input_mapping:
-      issue_id:
-        type: variable
-        value: issue_number
-      state:
-        type: fixed
-        value: closed
-    output:
-      - tool_result
-    structured_output: true
-    continue_on_error: true
     transition: END

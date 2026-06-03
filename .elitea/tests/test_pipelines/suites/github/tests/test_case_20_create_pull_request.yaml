@@ -24,6 +24,8 @@ state:
     type: int
   tool_result:
     type: str
+  pr_create_result:
+    type: str
   test_results:
     type: dict
 
@@ -146,50 +148,8 @@ nodes:
         value: base_branch
     output:
       - tool_result
+      - pr_create_result
     structured_output: true
-    transition: validate_result
-
-  - id: validate_result
-    type: llm
-    model: gpt-4o-2024-11-20
-    input:
-      - tool_result
-      - pr_title
-    input_mapping:
-      system:
-        type: fixed
-        value: "you are a quality assurance validator."
-      task:
-        type: fstring
-        value: |
-          analyze the create_pull_request operation results.
-
-          tool result: {tool_result}
-          expected title: {pr_title}
-
-          perform the following checks:
-
-          1. verify pr was created (result contains pr number or "PR #" pattern)
-          2. extract pr number from result (look for "PR #NNN" pattern in string responses)
-          3. confirm no error text in response
-          4. note: tool returns a success string like "Pull request created successfully! PR #NNN, URL: ..." - this is the expected format
-
-          return a json object with:
-          {{
-            "test_passed": true/false,
-            "pr_number": integer or null,
-            "summary": "brief outcome description",
-            "error": null or "error description"
-          }}
-
-          return **only** the json object. no markdown formatting, no additional text.
-      chat_history:
-        type: fixed
-        value: []
-    output:
-      - test_results
-    structured_output_dict:
-      test_results: "dict"
     transition: extract_pr_number
 
   - id: extract_pr_number
@@ -200,30 +160,26 @@ nodes:
         import json
         import re
 
-        test_results = elitea_state.get('test_results', {})
+        tool_result = elitea_state.get('tool_result', '')
         pr_number = None
-        if isinstance(test_results, dict):
-            pr_number = test_results.get('pr_number')
+        if isinstance(tool_result, dict):
+            pr_number = tool_result.get('number')
+        elif isinstance(tool_result, str):
+            try:
+                parsed = json.loads(tool_result)
+                pr_number = parsed.get('number')
+            except Exception:
+                match = re.search(r'PR\s*#(\d+)', tool_result)
+                if match:
+                    pr_number = int(match.group(1))
 
-        if not pr_number:
-            tool_result = elitea_state.get('tool_result', '')
-            if isinstance(tool_result, dict):
-                pr_number = tool_result.get('number')
-            elif isinstance(tool_result, str):
-                try:
-                    parsed = json.loads(tool_result)
-                    pr_number = parsed.get('number')
-                except Exception:
-                    match = re.search(r'PR\s*#(\d+)', tool_result)
-                    if match:
-                        pr_number = int(match.group(1))
-
-        {"pr_number": pr_number}
+        pr_create_result = tool_result
+        {"pr_number": pr_number, "pr_create_result": pr_create_result}
     input:
-      - test_results
       - tool_result
     output:
       - pr_number
+      - pr_create_result
     structured_output: true
     transition: close_pr
 
@@ -263,4 +219,47 @@ nodes:
       - tool_result
     structured_output: true
     continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - pr_create_result
+      - pr_title
+    input_mapping:
+      system:
+        type: fixed
+        value: "you are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          analyze the create_pull_request operation results.
+
+          tool result: {pr_create_result}
+          expected title: {pr_title}
+
+          perform the following checks:
+
+          1. verify pr was created (result contains pr number or "PR #" pattern)
+          2. extract pr number from result (look for "PR #NNN" pattern in string responses)
+          3. confirm no error text in response
+          4. note: tool returns a success string like "Pull request created successfully! PR #NNN, URL: ..." - this is the expected format
+
+          return a json object with:
+          {{
+            "test_passed": true/false,
+            "pr_number": integer or null,
+            "summary": "brief outcome description",
+            "error": null or "error description"
+          }}
+
+          return **only** the json object. no markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
     transition: END
