@@ -456,9 +456,17 @@ class EliteAClient:
             
             if model_config.get("reasoning_effort"):
                 effort = model_config["reasoning_effort"].lower()
-                if "opus-4-7" in model_name_lower or "opus_4_7" in model_name_lower or "opus-4.7" in model_name_lower:
-                    # Opus 4.7 only supports adaptive thinking
-                    target_kwargs['thinking'] = {"type": "adaptive"}
+                # Opus 4.7+ only supports adaptive thinking (not "enabled").
+                # display="summarized" is required so the API returns the
+                # thinking text alongside the signature; without it the
+                # default is "omitted" (signature only), and re-sending such
+                # a thinking block on the next tool-loop iteration is
+                # rejected by Anthropic/Bedrock with
+                # "messages.X.content.Y.thinking.thinking: Field required".
+                _adaptive_only = ("opus-4-7", "opus_4_7", "opus-4.7",
+                                  "opus-4-8", "opus_4_8", "opus-4.8")
+                if any(p in model_name_lower for p in _adaptive_only):
+                    target_kwargs['thinking'] = {"type": "adaptive", "display": "summarized"}
                     target_kwargs['effort'] = effort
                 else:
                     target_kwargs['temperature'] = 1
