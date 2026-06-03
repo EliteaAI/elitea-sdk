@@ -217,6 +217,13 @@ BaseSearchParams = create_model(
         description="Reranking configuration. Can be a dictionary with reranking settings.",
         default=None
     )),
+    output_fields=(Optional[List[str]], Field(
+        description="Fields to include in output. Supports: 'page_content', 'score', 'metadata' (all metadata), "
+                    "or 'metadata.<field>' for specific metadata fields (e.g., 'metadata.source'). "
+                    "If None or empty, returns all fields.",
+        default=None,
+        examples=[["metadata", "score"], ["page_content", "metadata.source"], ["metadata.id", "metadata.source"]]
+    )),
 )
 
 BaseStepbackSearchParams = create_model(
@@ -706,10 +713,31 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                      full_text_search: Optional[Dict[str, Any]] = None,
                      reranking_config: Optional[Dict[str, Dict[str, Any]]] = None,
                      extended_search: Optional[List[str]] = None,
+                     output_fields: Optional[List[str]] = None,
                      **kwargs):
-        """ Searches indexed documents in the vector store."""
-        # build filter on top of index_name
+        """Searches indexed documents in the vector store.
 
+        Args:
+            query: Search query string.
+            index_name: Collection/index name to search in.
+            filter: Filter criteria for search.
+            cut_off: Minimum similarity score threshold.
+            search_top: Maximum number of results to return.
+            reranker: Legacy reranking configuration.
+            full_text_search: Full-text search configuration.
+            reranking_config: Advanced reranking configuration.
+            extended_search: Extended search chunk types.
+            output_fields: Fields to include in output. Supports:
+                - "page_content": document content
+                - "score": similarity score
+                - "metadata": all metadata fields
+                - "metadata.<field>": specific metadata field (e.g., "metadata.source")
+                If None or empty list, returns all fields (backward compatible).
+                If all specified fields are invalid, returns all fields.
+
+        Returns:
+            List of documents with requested fields, or error message string.
+        """
         available_collections = super().list_collections()
         if index_name and index_name not in available_collections:
             return f"Collection '{index_name}' not found. Available collections: {available_collections}"
@@ -726,7 +754,90 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             reranking_config=reranking_config,
             extended_search=extended_search
         )
+
+        # Apply field filtering if specified (non-empty list)
+        if output_fields and isinstance(found_docs, list):
+            found_docs = self._filter_result_fields(found_docs, output_fields)
+
         return found_docs if found_docs else f"No documents found by query '{query}' and filter '{filter}'"
+
+    def _filter_result_fields(
+        self,
+        docs: List[Dict[str, Any]],
+        include_fields: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Filter document results to include only specified fields.
+
+        Args:
+            docs: List of document dicts with page_content, metadata, score.
+            include_fields: Fields to include. Supports:
+                - "page_content", "score", "metadata" (top-level)
+                - "metadata.<field>" (specific metadata field, split by first dot only)
+
+        Returns:
+            Filtered list of documents. If no valid fields found, returns original docs.
+        """
+        if not include_fields or not docs:
+            return docs
+
+        # Parse field specifications
+        top_level_fields = set()  # page_content, score, metadata
+        metadata_fields = set()   # specific metadata fields (without "metadata." prefix)
+        include_full_metadata = False
+
+        for field in include_fields:
+            if field == "metadata":
+                include_full_metadata = True
+            elif field.startswith("metadata."):
+                # Split by first dot only: "metadata.config.timeout" -> "config.timeout"
+                metadata_field = field.split(".", 1)[1] if len(field) > 9 else None
+                if metadata_field:
+                    metadata_fields.add(metadata_field)
+            elif field in ("page_content", "score"):
+                top_level_fields.add(field)
+
+        # If no valid fields specified, return original docs (backward compatible)
+        if not top_level_fields and not include_full_metadata and not metadata_fields:
+            return docs
+
+        filtered_docs = []
+        any_field_found = False
+
+        for doc in docs:
+            filtered = {}
+
+            # Include top-level fields
+            if "page_content" in top_level_fields and "page_content" in doc:
+                filtered["page_content"] = doc["page_content"]
+                any_field_found = True
+
+            if "score" in top_level_fields and "score" in doc:
+                filtered["score"] = doc["score"]
+                any_field_found = True
+
+            # Handle metadata
+            if include_full_metadata:
+                if "metadata" in doc:
+                    filtered["metadata"] = doc["metadata"]
+                    any_field_found = True
+            elif metadata_fields:
+                if "metadata" in doc and doc["metadata"]:
+                    filtered_metadata = {}
+                    for mfield in metadata_fields:
+                        if mfield in doc["metadata"]:
+                            filtered_metadata[mfield] = doc["metadata"][mfield]
+                            any_field_found = True
+
+                    if filtered_metadata:
+                        filtered["metadata"] = filtered_metadata
+
+            filtered_docs.append(filtered)
+
+        # If no valid fields were actually found in any doc, return original docs
+        if not any_field_found:
+            return docs
+
+        return filtered_docs
 
     def stepback_search_index(self,
                      query: str,
