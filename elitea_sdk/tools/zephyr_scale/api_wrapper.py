@@ -138,8 +138,9 @@ ZephyrCreateWebLinks = create_model(
     "ZephyrCreateWebLinks",
     test_case_key=(str, Field(description="The key of the test case")),
     url=(str, Field(description="The URL to link")),
+    description=(str, Field(description="The text to display for the link")),
     additional_fields=(str, Field(
-        description="JSON string containing any additional fields for the web link",
+        description="JSON string containing any additional optional fields for the web link",
         default="{}")
     )
 )
@@ -496,19 +497,21 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Unable to create issue link for test case with key: {test_case_key}:\n{str(e)}")
     
-    def create_web_links(self, test_case_key: str, url: str, additional_fields: str) -> str:
+    def create_web_links(self, test_case_key: str, url: str, description: str, additional_fields: str = "{}") -> str:
         """Creates a link between a test case and a generic URL
-        
+
         Args:
             test_case_key: The key of the test case
             url: The URL to link
-            additional_fields: JSON string containing any additional fields for the web link
+            description: The text to display for the link
+            additional_fields: JSON string containing any additional optional fields for the web link
         """
-        
+
         try:
             additional_params = json.loads(additional_fields) if additional_fields else {}
+            additional_params['description'] = description
             web_link_response = self._api.test_cases.create_web_links(test_case_key, url, **additional_params)
-            return f"Web link created for test case `{test_case_key}` with URL `{url}`: {str(web_link_response)}"
+            return f"Web link created for test case `{test_case_key}` with URL `{url}` and link text `{description}`: {str(web_link_response)}"
         except Exception as e:
             return ToolException(f"Unable to create web link for test case with key: {test_case_key}:\n{str(e)}")
 
