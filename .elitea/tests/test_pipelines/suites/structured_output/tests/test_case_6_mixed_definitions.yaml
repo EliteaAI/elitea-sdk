@@ -139,7 +139,6 @@ nodes:
       - count
       - description
     output:
-
-      - messages
+      - test_results
     structured_output: false
     transition: END
