@@ -458,7 +458,82 @@ def process_pipeline_result(
                                 logger.debug(f"Full HTML content: {content[:500]}...")
                             
                             break
-    
+
+    # PRIORITY 1b: Scan thinking_steps for test_passed (only if not already determined)
+    # On the dev/stage/prod platform the LLM validation node emits its JSON response into
+    # thinking_steps[*].text rather than into chat_history content.  The chat_history
+    # assistant message is empty or contains only the raw graph output string, so the
+    # PRIORITY 1 chat_history scan above never finds test_passed.  We therefore also
+    # scan thinking_steps here, using the same JSON-parsing logic.
+    if test_passed is None and isinstance(result_data, dict) and "thinking_steps" in result_data:
+        thinking_steps = result_data.get("thinking_steps", [])
+        if isinstance(thinking_steps, list):
+            for step in thinking_steps:
+                if not isinstance(step, dict):
+                    continue
+                text = step.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                # Strip markdown fences if present
+                json_text = text.strip()
+                if json_text.startswith("```"):
+                    lines = json_text.split("\n")
+                    lines = lines[1:] if lines[0].startswith("```") else lines
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    json_text = "\n".join(lines).strip()
+                if not json_text.startswith("{"):
+                    continue
+                try:
+                    parsed = json.loads(json_text)
+                    if not isinstance(parsed, dict):
+                        continue
+                    # Direct test_passed in thinking step JSON
+                    if "test_passed" in parsed:
+                        test_passed = parsed["test_passed"]
+                        if isinstance(output, dict):
+                            output["result"] = parsed
+                        else:
+                            output = parsed
+                        if logger:
+                            logger.debug(f"Found test_passed={test_passed} in thinking_steps")
+                        # Don't break — continue to find the latest value
+                    # test_results wrapper
+                    elif "test_results" in parsed:
+                        tr = parsed.get("test_results", {})
+                        if isinstance(tr, dict) and "test_passed" in tr:
+                            test_passed = tr.get("test_passed")
+                            if isinstance(output, dict):
+                                output["result"] = tr
+                            else:
+                                output = tr
+                            if logger:
+                                logger.debug(f"Found test_passed={test_passed} in thinking_steps.test_results")
+                    # result wrapper
+                    elif "result" in parsed:
+                        nested = parsed.get("result", {})
+                        if isinstance(nested, dict):
+                            if "test_passed" in nested:
+                                test_passed = nested.get("test_passed")
+                                if isinstance(output, dict):
+                                    output["result"] = nested
+                                else:
+                                    output = nested
+                                if logger:
+                                    logger.debug(f"Found test_passed={test_passed} in thinking_steps.result")
+                            elif "test_results" in nested:
+                                tr = nested.get("test_results", {})
+                                if isinstance(tr, dict) and "test_passed" in tr:
+                                    test_passed = tr.get("test_passed")
+                                    if isinstance(output, dict):
+                                        output["result"] = tr
+                                    else:
+                                        output = tr
+                                    if logger:
+                                        logger.debug(f"Found test_passed={test_passed} in thinking_steps.result.test_results")
+                except json.JSONDecodeError:
+                    pass
+
     # PRIORITY 2: Check for tool execution errors (only if test_passed not already determined)
     # This prevents false positives where LLM says "test passed" but a tool actually failed
     # However, for negative tests, validation nodes set test_passed first, so we skip error detection
