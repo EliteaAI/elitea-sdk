@@ -120,7 +120,6 @@ nodes:
       - notes
       - status
     output:
-
-      - messages
+      - test_results
     structured_output: false
     transition: END
