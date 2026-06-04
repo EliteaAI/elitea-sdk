@@ -73,7 +73,7 @@ nodes:
             "computed_message": results.get('message')
         }
         test_results = final_result
-        test_results
+        {"test_results": test_results}
     input:
       - test_results
       - html_content

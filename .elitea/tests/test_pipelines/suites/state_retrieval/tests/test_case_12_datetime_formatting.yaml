@@ -44,7 +44,7 @@ nodes:
             "message_length": len(output_string)
         }
         test_results = result
-        test_results
+        {"test_results": test_results}
     input: []
     output:
       - messages

@@ -50,7 +50,7 @@ nodes:
         }
         test_results = result
 
-        test_results
+        {"test_results": test_results}
     input:
       - code_snippet
       - multiline_text
