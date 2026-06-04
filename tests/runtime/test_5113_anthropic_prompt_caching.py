@@ -372,25 +372,102 @@ class TestAnthropicBetaHeader:
         assert "anthropic-beta" not in kwargs.get("default_headers", {})
 
     def test_claude_openai_compatible_uses_chatopenai(self):
-        """Claude model with openai_compatible=True must use ChatOpenAI, not ChatAnthropic."""
+        """Claude + openai_compatible=True must route to ChatOpenAI, never ChatAnthropic.
+
+        These models are served via an OpenAI-passthrough LiteLLM backend. ChatAnthropic
+        POSTs to the Anthropic-native /v1/messages endpoint, where tool_use blocks are
+        dropped in translation (stop_reason=tool_use but content=[] / tool_calls=[]).
+        ChatOpenAI talks the backend's native /chat/completions dialect, so tool calls
+        parse correctly.
+        """
         client = self._make_client()
-        with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai, \
-             patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
+        with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic, \
+             patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai:
             client.get_llm("claude-3-5-sonnet-20241022", {"openai_compatible": True})
         mock_anthropic.assert_not_called()
         mock_openai.assert_called_once()
 
-    def test_claude_openai_compatible_has_no_caching_header(self):
-        """Claude model with openai_compatible=True must not carry the prompt-caching beta header."""
+    def test_claude_openai_compatible_has_no_anthropic_beta_header(self):
+        """Claude + openai_compatible=True (ChatOpenAI) must not carry the Anthropic beta header."""
         client = self._make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai:
             client.get_llm("claude-3-5-sonnet-20241022", {"openai_compatible": True})
         kwargs = mock_openai.call_args.kwargs
         assert "anthropic-beta" not in kwargs.get("default_headers", {})
 
-    def test_claude_default_still_uses_chatanthropic(self):
-        """Claude model without the flag still routes to ChatAnthropic (backward compat)."""
+    def test_claude_openai_compatible_hits_chat_completions_path(self):
+        """Claude + openai_compatible=True must use the OpenAI chat-completions base_url."""
+        client = self._make_client()
+        with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai:
+            client.get_llm("claude-3-5-sonnet-20241022", {"openai_compatible": True})
+        base_url = mock_openai.call_args.kwargs.get("base_url")
+        assert base_url == "http://proxy/openai"
+
+    def test_claude_default_still_uses_chatanthropic_with_beta_header(self):
+        """Claude model without the flag uses ChatAnthropic with the full beta header."""
         client = self._make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
             client.get_llm("claude-3-5-sonnet-20241022", {})
-        mock_anthropic.assert_called_once()
+        headers = mock_anthropic.call_args.kwargs.get("default_headers", {})
+        assert headers.get("anthropic-beta") == "prompt-caching-2024-07-31"
+
+
+class TestApplicationOpenAICompatibleParam:
+    """application() honors the explicit openai_compatible param, which is
+    authoritative over llm_settings.
+
+    llm_settings is absent when version_details is refetched (API-endpoint
+    requests), so relying on it alone silently defaults the flag to False and
+    re-enables caching for openai-compat proxy models. The explicit param —
+    always available from the request's llm kwargs — closes that gap.
+    """
+
+    def _make_client(self):
+        from elitea_sdk.runtime.clients.client import EliteAClient
+
+        client = EliteAClient.__new__(EliteAClient)
+        client.base_url = "http://proxy"
+        client.allm_path = "/anthropic"
+        client.llm_path = "/openai"
+        client.auth_token = "tok"
+        client.project_id = "1"
+        return client
+
+    def _capture_model_config(self, *, version_details, **app_kwargs):
+        client = self._make_client()
+        captured = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _fake_get_llm(model_name, model_config):
+            captured["model_config"] = model_config
+            raise _Stop()
+
+        client.get_llm = _fake_get_llm
+        with pytest.raises(_Stop):
+            client.application(
+                application_id=1,
+                application_version_id=1,
+                version_details=version_details,
+                **app_kwargs,
+            )
+        return captured["model_config"]
+
+    @staticmethod
+    def _llm_settings(**extra):
+        base = {"model_name": "claude-3-5-sonnet-20241022", "temperature": 0.0, "max_tokens": 4000}
+        base.update(extra)
+        return {"llm_settings": base}
+
+    def test_explicit_param_overrides_absent_llm_settings(self):
+        cfg = self._capture_model_config(version_details=self._llm_settings(), openai_compatible=True)
+        assert cfg["openai_compatible"] is True
+
+    def test_falls_back_to_llm_settings_when_param_omitted(self):
+        cfg = self._capture_model_config(version_details=self._llm_settings(openai_compatible=True))
+        assert cfg["openai_compatible"] is True
+
+    def test_defaults_false_when_absent_everywhere(self):
+        cfg = self._capture_model_config(version_details=self._llm_settings())
+        assert cfg["openai_compatible"] is False
