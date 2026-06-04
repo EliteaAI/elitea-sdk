@@ -103,6 +103,6 @@ nodes:
       - pi_value
       - sky_is_blue
     output:
-      - messages
+      - test_results
     structured_output: false
     transition: END
