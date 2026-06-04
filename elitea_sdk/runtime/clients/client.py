@@ -412,9 +412,14 @@ class EliteAClient:
         if not model_name:
             raise ValueError("Model name must be provided")
 
-        # Determine if this is an Anthropic model
+        # Determine if this is an Anthropic model.
+        # openai_compatible=True forces ChatOpenAI even when the model name looks like Anthropic
+        # (e.g. Claude routed through a LiteLLM OpenAI-passthrough endpoint).
         model_name_lower = model_name.lower()
-        is_anthropic = "anthropic" in model_name_lower or "claude" in model_name_lower
+        openai_compat = bool(model_config.get("openai_compatible", False))
+        is_anthropic = (not openai_compat) and (
+            "anthropic" in model_name_lower or "claude" in model_name_lower
+        )
 
         logger.debug(f"Creating {'ChatAnthropic' if is_anthropic else 'ChatOpenAI'} model: {model_name} with config: {model_config}")
 

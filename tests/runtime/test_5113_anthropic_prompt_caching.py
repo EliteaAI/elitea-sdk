@@ -370,3 +370,27 @@ class TestAnthropicBetaHeader:
             client.get_llm("gpt-4o", {})
         kwargs = mock_openai.call_args.kwargs
         assert "anthropic-beta" not in kwargs.get("default_headers", {})
+
+    def test_claude_openai_compatible_uses_chatopenai(self):
+        """Claude model with openai_compatible=True must use ChatOpenAI, not ChatAnthropic."""
+        client = self._make_client()
+        with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai, \
+             patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
+            client.get_llm("claude-3-5-sonnet-20241022", {"openai_compatible": True})
+        mock_anthropic.assert_not_called()
+        mock_openai.assert_called_once()
+
+    def test_claude_openai_compatible_has_no_caching_header(self):
+        """Claude model with openai_compatible=True must not carry the prompt-caching beta header."""
+        client = self._make_client()
+        with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai:
+            client.get_llm("claude-3-5-sonnet-20241022", {"openai_compatible": True})
+        kwargs = mock_openai.call_args.kwargs
+        assert "anthropic-beta" not in kwargs.get("default_headers", {})
+
+    def test_claude_default_still_uses_chatanthropic(self):
+        """Claude model without the flag still routes to ChatAnthropic (backward compat)."""
+        client = self._make_client()
+        with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
+            client.get_llm("claude-3-5-sonnet-20241022", {})
+        mock_anthropic.assert_called_once()
