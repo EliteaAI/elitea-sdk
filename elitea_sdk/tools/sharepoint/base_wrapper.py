@@ -202,3 +202,27 @@ class BaseSharepointWrapper(ABC):
 
     def onenote_delete_page(self, page_id: str) -> str:
         raise ToolException(self._ONENOTE_NOT_SUPPORTED)
+
+    # ------------------------------------------------------------------ #
+    #  Sharing Links  (Graph API only — delegated access required)       #
+    # ------------------------------------------------------------------ #
+
+    _SHARING_LINK_NOT_SUPPORTED = (
+        "Reading files from sharing links requires Graph API delegated access. "
+        "Provide token + scopes to enable sharing link support."
+    )
+
+    def read_file_from_sharing_link(self, sharing_url: str) -> str:
+        """Read a file from a SharePoint/OneDrive sharing link.
+
+        Args:
+            sharing_url: Full sharing URL (e.g., https://company-my.sharepoint.com/:x:/...)
+
+        Returns:
+            Parsed text content of the file
+
+        Raises:
+            ToolException: If sharing links are not supported by this backend
+        """
+        raise ToolException(self._SHARING_LINK_NOT_SUPPORTED)
+
