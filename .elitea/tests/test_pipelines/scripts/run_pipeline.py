@@ -276,12 +276,6 @@ def process_pipeline_result(
         _crash_in_coe_node = bool(_crashing_node and _crashing_node in _nodes_coe)
 
         if _crash_in_coe_node:
-            # The crash happened in a cleanup/optional node that is allowed to fail.
-            # The actual validation (test_passed) ran BEFORE this node and its result
-            # was in chat_history — but the platform wipes chat_history on a hard crash,
-            # so we cannot recover it.
-            # Keep test_passed=None (indeterminate) rather than forcing False, so the
-            # caller knows the test result is unknown — not that the test failed.
             if logger:
                 logger.debug(
                     f"Hard crash from continue_on_error node '{_crashing_node}' — "
@@ -300,7 +294,6 @@ def process_pipeline_result(
                 error=error_str
             )
         else:
-            # Crash in a core test node — definitively a failure.
             if logger and _crashing_node:
                 logger.debug(f"Hard crash from core node '{_crashing_node}' — marking test_passed=False.")
             return PipelineResult(
@@ -325,11 +318,6 @@ def process_pipeline_result(
         logger.debug(f"Loaded {len(nodes_with_continue_on_error)} nodes with continue_on_error: {nodes_with_continue_on_error}")
 
     # PRIORITY 1: Comprehensive chat_history scan (validation + errors + nested structures)
-    # This single pass checks for:
-    # 1. Explicit test_passed from validation nodes (highest priority)
-    # 2. Plain-text errors and HTML error pages (fail immediately if no validation)
-    # 3. All nested JSON structures with test_passed
-    # This must be checked FIRST, as negative tests expect errors but should still pass (via validation)
     if isinstance(result_data, dict) and "chat_history" in result_data:
         chat_history = result_data.get("chat_history", [])
         for msg in chat_history:
@@ -458,85 +446,8 @@ def process_pipeline_result(
                                 logger.debug(f"Full HTML content: {content[:500]}...")
                             
                             break
-
-    # PRIORITY 1b: Scan thinking_steps for test_passed (only if not already determined)
-    # On the dev/stage/prod platform the LLM validation node emits its JSON response into
-    # thinking_steps[*].text rather than into chat_history content.  The chat_history
-    # assistant message is empty or contains only the raw graph output string, so the
-    # PRIORITY 1 chat_history scan above never finds test_passed.  We therefore also
-    # scan thinking_steps here, using the same JSON-parsing logic.
-    if test_passed is None and isinstance(result_data, dict) and "thinking_steps" in result_data:
-        thinking_steps = result_data.get("thinking_steps", [])
-        if isinstance(thinking_steps, list):
-            for step in thinking_steps:
-                if not isinstance(step, dict):
-                    continue
-                text = step.get("text", "")
-                if not isinstance(text, str) or not text.strip():
-                    continue
-                # Strip markdown fences if present
-                json_text = text.strip()
-                if json_text.startswith("```"):
-                    lines = json_text.split("\n")
-                    lines = lines[1:] if lines[0].startswith("```") else lines
-                    if lines and lines[-1].strip() == "```":
-                        lines = lines[:-1]
-                    json_text = "\n".join(lines).strip()
-                if not json_text.startswith("{"):
-                    continue
-                try:
-                    parsed = json.loads(json_text)
-                    if not isinstance(parsed, dict):
-                        continue
-                    # Direct test_passed in thinking step JSON
-                    if "test_passed" in parsed:
-                        test_passed = parsed["test_passed"]
-                        if isinstance(output, dict):
-                            output["result"] = parsed
-                        else:
-                            output = parsed
-                        if logger:
-                            logger.debug(f"Found test_passed={test_passed} in thinking_steps")
-                        # Don't break — continue to find the latest value
-                    # test_results wrapper
-                    elif "test_results" in parsed:
-                        tr = parsed.get("test_results", {})
-                        if isinstance(tr, dict) and "test_passed" in tr:
-                            test_passed = tr.get("test_passed")
-                            if isinstance(output, dict):
-                                output["result"] = tr
-                            else:
-                                output = tr
-                            if logger:
-                                logger.debug(f"Found test_passed={test_passed} in thinking_steps.test_results")
-                    # result wrapper
-                    elif "result" in parsed:
-                        nested = parsed.get("result", {})
-                        if isinstance(nested, dict):
-                            if "test_passed" in nested:
-                                test_passed = nested.get("test_passed")
-                                if isinstance(output, dict):
-                                    output["result"] = nested
-                                else:
-                                    output = nested
-                                if logger:
-                                    logger.debug(f"Found test_passed={test_passed} in thinking_steps.result")
-                            elif "test_results" in nested:
-                                tr = nested.get("test_results", {})
-                                if isinstance(tr, dict) and "test_passed" in tr:
-                                    test_passed = tr.get("test_passed")
-                                    if isinstance(output, dict):
-                                        output["result"] = tr
-                                    else:
-                                        output = tr
-                                    if logger:
-                                        logger.debug(f"Found test_passed={test_passed} in thinking_steps.result.test_results")
-                except json.JSONDecodeError:
-                    pass
-
+    
     # PRIORITY 2: Check for tool execution errors (only if test_passed not already determined)
-    # This prevents false positives where LLM says "test passed" but a tool actually failed
-    # However, for negative tests, validation nodes set test_passed first, so we skip error detection
     if test_passed is None and isinstance(result_data, dict) and "tool_calls_dict" in result_data:
         tool_calls = result_data.get("tool_calls_dict", {})
         if isinstance(tool_calls, dict):
@@ -588,7 +499,6 @@ def process_pipeline_result(
                     break
                 
                 # Also check tool output content for error patterns (e.g., pyodide_sandbox errors)
-                # Some tools complete successfully but return error information in their output
                 tool_output = tool_call.get("tool_output") or tool_call.get("content")
                 if isinstance(tool_output, str) and tool_output.strip():
                     # Try to parse as JSON to detect structured error responses
@@ -601,7 +511,6 @@ def process_pipeline_result(
                                 error_msg = parsed_output["error"]
                                 
                                 # Skip Python warnings - they are not actual errors
-                                # Common warning patterns: DeprecationWarning, FutureWarning, UserWarning, RequestsDependencyWarning
                                 if "Warning:" in error_msg or "warnings.warn" in error_msg:
                                     if logger:
                                         logger.debug(f"Skipping Python warning in tool '{tool_name}' output: {error_msg[:100]}...")
@@ -609,7 +518,6 @@ def process_pipeline_result(
                                 
                                 # Extract meaningful error from tracebacks
                                 if "Traceback" in error_msg:
-                                    # Get last line of traceback (usually the actual error)
                                     lines = error_msg.strip().split('\n')
                                     error_summary = lines[-1] if lines else error_msg
                                 else:
@@ -652,27 +560,18 @@ def process_pipeline_result(
                             "Tool '",
                             "failed",
                         ]):
-                            # Extract tool name and error message
                             tool_name = tool_call.get("tool_meta", {}).get("name", "unknown_tool")
-                            
-                            # Try to extract a meaningful error summary
                             error_summary = tool_output
                             
-                            # If there's a traceback, get the last line (the actual error)
                             if "Traceback" in tool_output:
                                 lines = tool_output.strip().split('\n')
-                                # Find the last non-empty line
                                 for line in reversed(lines):
                                     if line.strip() and not line.strip().startswith("^"):
                                         error_summary = line.strip()
                                         break
-                            
-                            # If tool output starts with "Tool 'X' failed", extract that
                             elif tool_output.strip().startswith("Tool '"):
                                 lines = tool_output.strip().split('\n')
                                 error_summary = lines[0] if lines else tool_output
-                            
-                            # Otherwise use first 200 chars
                             else:
                                 error_summary = tool_output[:200] + "..." if len(tool_output) > 200 else tool_output
                             
@@ -822,7 +721,8 @@ def process_pipeline_result(
                     if not isinstance(tool_call, dict):
                         continue
                     
-                    tool_name = tool_call.get("tool_meta", {}).get("name", "")
+                    # Support both "tool_name" (direct field) and "tool_meta.name" (nested)
+                    tool_name = tool_call.get("tool_name") or tool_call.get("tool_meta", {}).get("name", "")
                     if tool_name != "pyodide_sandbox":
                         continue
                     
@@ -832,18 +732,28 @@ def process_pipeline_result(
                         try:
                             parsed = json.loads(tool_output)
                             if isinstance(parsed, dict):
-                                # Check result.test_results.test_passed
+                                # Check result.test_passed (direct) or result.test_results.test_passed (nested)
                                 if "result" in parsed:
                                     result_obj = parsed.get("result", {})
-                                    if isinstance(result_obj, dict) and "test_results" in result_obj:
-                                        tr = result_obj.get("test_results", {})
-                                        if isinstance(tr, dict) and "test_passed" in tr:
-                                            test_passed = tr.get("test_passed")
+                                    if isinstance(result_obj, dict):
+                                        if "test_passed" in result_obj:
+                                            # Direct: result.test_passed
+                                            test_passed = result_obj.get("test_passed")
                                             if isinstance(output, dict):
                                                 output["result"] = result_obj
                                             else:
                                                 output = result_obj
                                             break
+                                        elif "test_results" in result_obj:
+                                            # Nested: result.test_results.test_passed
+                                            tr = result_obj.get("test_results", {})
+                                            if isinstance(tr, dict) and "test_passed" in tr:
+                                                test_passed = tr.get("test_passed")
+                                                if isinstance(output, dict):
+                                                    output["result"] = result_obj
+                                                else:
+                                                    output = result_obj
+                                                break
                         except json.JSONDecodeError:
                             pass
         
@@ -982,13 +892,10 @@ def _extract_hitl_thread_id(result_data: dict) -> Optional[str]:
 
         # Detect sensitive_tool_guard interrupt signature
         # BOTH GraphInterrupt AND sensitive_tool must be present (not OR)
-        # This prevents false positives from ToolException crashes that mention
-        # GraphInterrupt in their traceback.
         if "GraphInterrupt" not in error_text or "sensitive_tool" not in error_text:
             continue
 
         # Additional safeguard: exclude ToolException/ValidationError crashes
-        # These are NOT HITL interrupts even if they contain GraphInterrupt text
         if "ToolException" in error_text or "ValidationError" in error_text:
             continue
 
@@ -1120,11 +1027,6 @@ def execute_pipeline(
         )
 
     # Auto-resume HITL sensitive_tool_guard interrupts.
-    # The platform's sensitive_tool_guard middleware interrupts execution to request
-    # human approval before write operations (create_issue, update_file, etc.).
-    # A pipeline may contain multiple sensitive tools, each requiring a separate approval.
-    # We loop until no more HITL interrupts are present in the response.
-    # MAX_HITL_APPROVALS guards against infinite loops (e.g., a mis-configured pipeline).
     MAX_HITL_APPROVALS = 10
     hitl_approvals = 0
 
@@ -1181,10 +1083,6 @@ def execute_pipeline(
         if resume_response.status_code not in (200, 201):
             error_text = resume_response.text if resume_response.text else "No response body"
             
-            # Special handling for HTTP 400: Check if this is a ToolException/ValidationError
-            # being incorrectly interpreted as a HITL interrupt.
-            # If the error body contains ToolException or ValidationError traceback,
-            # this is NOT a HITL interrupt - it's a pipeline crash that should be reported.
             if resume_response.status_code == 400:
                 if "ToolException" in error_text or "ValidationError" in error_text:
                     if logger:
@@ -1193,10 +1091,8 @@ def execute_pipeline(
                             f"this is a pipeline crash, not a HITL interrupt. "
                             f"Returning error to caller."
                         )
-                    # Parse the original error from the response if possible
                     try:
                         error_data = resume_response.json()
-                        # Return the original error, not the HITL resume failure
                         return process_pipeline_result(
                             result_data=error_data,
                             pipeline_id=pipeline_id,
