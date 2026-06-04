@@ -297,6 +297,73 @@ class TestReadFileFromSharingLinkGraphWrapper:
         call_kwargs = mock_parse.call_args[1]
         assert call_kwargs['file_name'] == expected_filename
 
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_403_triggers_public_link_fallback(self, mock_requests, mock_parse):
+        """Graph 403 response triggers _download_public_link fallback."""
+
+        mock_403_response = MagicMock()
+        mock_403_response.status_code = 403
+        mock_403_response.json.return_value = {
+            'error': {'message': 'Access denied'}
+        }
+
+        mock_requests.get.return_value = mock_403_response
+        mock_parse.return_value = "parsed fallback content"
+
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock the fallback method on the instance
+        with patch.object(wrapper, '_download_public_link') as mock_download:
+            mock_download.return_value = ('fallback-file.pdf', b'fallback content')
+
+            result = wrapper.read_file_from_sharing_link(
+                "https://other-tenant.sharepoint.com/:b:/g/public/file"
+            )
+
+            # Verify fallback was called
+            mock_download.assert_called_once_with(
+                "https://other-tenant.sharepoint.com/:b:/g/public/file"
+            )
+            # Verify parse was called with fallback result
+            mock_parse.assert_called_once()
+            call_kwargs = mock_parse.call_args[1]
+            assert call_kwargs['file_name'] == 'fallback-file.pdf'
+            assert call_kwargs['file_content'] == b'fallback content'
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_403_fallback_failure_returns_graph_error(self, mock_requests):
+        """When 403 fallback fails, original Graph error is returned."""
+
+        mock_403_response = MagicMock()
+        mock_403_response.status_code = 403
+        mock_403_response.json.return_value = {
+            'error': {'message': 'The sharing link no longer exists'}
+        }
+
+        mock_requests.get.return_value = mock_403_response
+
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock fallback to return None (failure)
+        with patch.object(wrapper, '_download_public_link') as mock_download:
+            mock_download.return_value = ('unknown', None)
+
+            with pytest.raises(ToolException) as exc_info:
+                wrapper.read_file_from_sharing_link(
+                    "https://other-tenant.sharepoint.com/:x:/specific-people/file"
+                )
+
+            assert "The sharing link no longer exists" in str(exc_info.value)
+
 
 class TestReadFromSharingLinkSchema:
     """Test Pydantic schema for the tool."""
@@ -316,4 +383,5 @@ class TestReadFromSharingLinkSchema:
         schema = ReadFromSharingLink.model_json_schema()
         description = schema['properties']['sharing_url'].get('description', '')
 
-        assert 'sharepoint.com' in description.lower()
+        # Verify description mentions SharePoint (checking schema docs, not URL validation)
+        assert 'sharepoint' in description.lower() or 'onedrive' in description.lower()

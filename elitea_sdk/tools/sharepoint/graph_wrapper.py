@@ -1935,7 +1935,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
         if resp.status_code == 403:
             # Graph API can't access cross-tenant public links, try direct download
-            file_name, file_bytes = _download_public_link(sharing_url)
+            file_name, file_bytes = self._download_public_link(sharing_url)
             if file_bytes:
                 return parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
             try:
