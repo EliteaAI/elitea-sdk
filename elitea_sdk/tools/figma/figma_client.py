@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import requests
 from FigmaPy import FigmaPy
@@ -71,3 +71,20 @@ class EliteAFigmaPy(FigmaPy):
         except (requests.HTTPError, requests.exceptions.SSLError, requests.RequestException) as e:
             # Network / transport-level issues
             raise ToolException(f"Figma API request failed: {e}") from e
+
+    def post_comment(
+        self,
+        file_key: str,
+        message: str,
+        client_meta: Optional[Union[Dict, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a comment on a file. Fixes payload formatting bugs in FigmaPy."""
+        payload: Dict[str, Any] = {"message": message}
+        if client_meta is not None:
+            payload["client_meta"] = client_meta
+
+        return self.api_request(
+            f"files/{file_key}/comments",
+            method="post",
+            payload=json.dumps(payload),
+        )

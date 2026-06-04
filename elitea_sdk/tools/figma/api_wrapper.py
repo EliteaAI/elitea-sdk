@@ -909,33 +909,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             )),
         }
 
-    def _send_request(
-        self,
-        method: str,
-        url: str,
-        payload: Optional[Dict] = None,
-        extra_headers: Optional[Dict[str, str]] = None,
-    ):
-        """Send HTTP request to a specified URL with automated headers."""
-        headers = {"Content-Type": "application/json"}
-
-        if self.oauth2:
-            headers["Authorization"] = f"Bearer {self.oauth2}"
-        else:
-            headers["X-Figma-Token"] = self.token
-
-        if extra_headers:
-            headers.update(extra_headers)
-
-        try:
-            response = requests.request(method, url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as e:
-            msg = f"HTTP request failed: {e}"
-            logging.error(msg)
-            raise ToolException(msg)
-
     @model_validator(mode='before')
     @classmethod
     def check_before(cls, values):
@@ -1273,22 +1246,10 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
     @process_output
     def post_file_comment(
-        self, file_key: str, message: str, client_meta: Optional[dict] = None
+        self, file_key: str, message: str, client_meta: Optional[dict] = None, **kwargs
     ):
         """Posts a comment to a specific file in Figma."""
-        payload = {"message": message}
-        if client_meta:
-            payload["client_meta"] = client_meta
-
-        url = f"{self._client.api_uri}files/{file_key}/comments"
-
-        try:
-            response = self._send_request("POST", url, payload)
-            return response.json()
-        except ToolException as e:
-            msg = f"Failed to post comment. Error: {str(e)}"
-            logging.error(msg)
-            return ToolException(msg)
+        return self._client.post_comment(file_key, message, client_meta)
 
     @process_output
     def get_file_images(
