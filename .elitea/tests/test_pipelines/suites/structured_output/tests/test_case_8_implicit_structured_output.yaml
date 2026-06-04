@@ -95,7 +95,6 @@ nodes:
       - items
       - count
     output:
-
-      - messages
+      - test_results
     structured_output: false
     transition: END
