@@ -201,5 +201,43 @@ nodes:
     model: gpt-4o-2024-11-20
     output:
       - test_results
-    structured_output: false
+    structured_output_dict:
+      test_results: dict
+    transition: extract_json_result
+
+  - id: extract_json_result
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+        import re
+
+        raw = elitea_state.get("test_results", "")
+        result_dict = {}
+
+        if isinstance(raw, dict) and "test_passed" in raw:
+            result_dict = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                result_dict = json.loads(raw.strip())
+            except Exception:
+                m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+                if not m:
+                    m = re.search(r'(\{[^{}]*"test_passed"[^{}]*\})', raw, re.DOTALL)
+                if m:
+                    try:
+                        result_dict = json.loads(m.group(1))
+                    except Exception:
+                        pass
+
+        if not result_dict or "test_passed" not in result_dict:
+            result_dict = {"test_passed": None, "error": "Could not extract JSON from LLM response"}
+
+        {"test_results": result_dict}
+    input:
+      - test_results
+    output:
+      - test_results
+    structured_output: true
     transition: END

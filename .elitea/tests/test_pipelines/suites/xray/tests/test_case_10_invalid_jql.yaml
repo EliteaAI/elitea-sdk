@@ -29,8 +29,10 @@ state:
   unexpected_success_indicators:
     type: list
     value: ["Extracted tests", "total.*results", "issueId.*16"]
+  get_tests_result_trimmed:
+    type: str
   test_results:
-    type: dict
+    type: str
 
 entry_point: get_tests_with_invalid_jql
 nodes:
@@ -51,73 +53,39 @@ nodes:
     transition: validate_error_handling
 
   - id: validate_error_handling
-    type: llm
+    type: code
+    code:
+      type: fixed
+      value: |
+        result_str = elitea_state.get("get_tests_result", "") or ""
+        error_indicators = ["Unable to get tests", "error", "failed", "exception", "syntax", "parse", "Tool execution error"]
+        success_indicators = ["Extracted tests"]
+
+        has_error_message = len(result_str) > 10
+        error_indicator_found = next((ind for ind in error_indicators if ind.lower() in result_str.lower()), "none")
+        error_message_meaningful = error_indicator_found != "none"
+        no_test_data = "Extracted tests" not in result_str and "issueId" not in result_str
+        no_success_message = "Extracted tests" not in result_str
+
+        test_passed = has_error_message and error_message_meaningful and no_test_data and no_success_message
+
+        result_dict = {
+            "test_passed": test_passed,
+            "tool_executed": True,
+            "has_error_message": has_error_message,
+            "error_message_meaningful": error_message_meaningful,
+            "no_test_data": no_test_data,
+            "no_success_message": no_success_message,
+            "error_indicator_found": error_indicator_found,
+            "result_length": len(result_str),
+            "result_preview": result_str[:150] if result_str else "EMPTY/NULL - ERROR HANDLING BROKEN",
+            "error": None
+        }
+
+        {"test_results": result_dict}
     input:
       - get_tests_result
-      - invalid_jql_query
-      - expected_error_indicators
-      - unexpected_success_indicators
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fixed
-        value: You are a strict quality assurance validator. Only return valid JSON.
-      task:
-        type: fstring
-        value: |
-          Analyze the result from executing 'get_tests' with invalid JQL syntax.
-          Use only the first 300 characters of the result for analysis.
-
-          CONTEXT:
-          - The Xray tool handles JQL errors by returning error information
-          - For this NEGATIVE test, we expect the tool to reject malformed JQL
-          - Evidence: Either error message present OR no successful test data returned
-
-          Get Tests Result (first 300 chars): {get_tests_result}
-          Invalid JQL Query Used: {invalid_jql_query}
-          Expected Error Indicators: {expected_error_indicators}
-          Unexpected Success Indicators: {unexpected_success_indicators}
-
-          VALIDATION LOGIC:
-
-          CRITICAL REQUIREMENT:
-          This is a NEGATIVE test - we expect a proper error message, NOT empty/null output.
-          Empty or null error messages indicate BROKEN error handling and should FAIL the test.
-
-          This negative test PASSES only if the tool returns a proper error message.
-
-          Validation Criteria (ALL must pass for test_passed=true):
-          1. tool_executed: Always true (we reached this validation node)
-          2. has_error_message: Result is NOT empty/null/None (length > 10 characters)
-          3. error_message_meaningful: Result contains at least one expected error indicator
-          4. no_test_data: Output does NOT contain actual test data (i.e. does NOT start with "Extracted tests" or contain numeric issueId values like "issueId: 12345")
-          5. no_success_message: Output does NOT contain the literal phrase "Extracted tests" at the start of the response
-
-          FAILURE CONDITIONS:
-          - If result is empty, null, or < 10 characters: has_error_message = false, TEST FAILS
-          - If result does not contain any expected error indicators: error_message_meaningful = false, TEST FAILS
-          - If result starts with "Extracted tests" or contains actual numeric issueId data: TEST FAILS
-          - NOTE: The error message body may reference field names like "results", "jira", "issueId" as part of explaining the error — this is NOT a success indicator
-
-          Return JSON test_results:
-          {{
-            "test_passed": boolean (true only if ALL criteria pass),
-            "tool_executed": true,
-            "has_error_message": boolean (true if result is non-empty with length > 10),
-            "error_message_meaningful": boolean (true if contains expected error indicators),
-            "no_test_data": boolean (true if no issueId/jira fields found),
-            "no_success_message": boolean (true if no 'Extracted tests' message),
-            "error_indicator_found": "which error indicator was found or 'none'",
-            "result_length": number (character count of result),
-            "result_preview": "first 150 chars of result or 'EMPTY/NULL - ERROR HANDLING BROKEN'"
-          }}
-
-          Return ONLY the JSON object.
-    model: ${DEFAULT_LLM_MODEL}
     output:
       - test_results
-    structured_output_dict:
-      test_results: dict
+    structured_output: true
     transition: END
