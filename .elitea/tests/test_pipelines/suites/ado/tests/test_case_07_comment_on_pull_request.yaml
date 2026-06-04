@@ -106,29 +106,16 @@ nodes:
       test_results: dict
     transition: END
   - id: LLM 1
-    type: llm
+    type: code
     input: []
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fstring
-        value: You are data generator
-      task:
-        type: fstring
-        value: |-
-          Create a test data string
-
-          11 
-
-          Test comment ${current_date}${current_time}
-
-          You have to replace the variables yourself
-
-
-          Return result as test_string only, do not do any summarization, and do not wrapp it with any kind of markup
+    code:
+      type: fixed
+      value: |
+        from datetime import datetime
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        generated_comment = "11\n\nTest comment " + ts
+        {"generated_comment": generated_comment}
     output:
       - generated_comment
-    structured_output: false
+    structured_output: true
     transition: invoke_comment_on_pr
