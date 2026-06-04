@@ -158,6 +158,42 @@ nodes:
     structured_output: true
     tool: link_work_items_to_wiki_page
     toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
+    transition: cleanup_work_item
+
+  - id: cleanup_work_item
+    type: toolkit
+    continue_on_error: true
+    input:
+      - work_item_id
+    input_mapping:
+      id:
+        type: variable
+        value: work_item_id
+    output:
+      - cleanup_work_item_result
+    structured_output: false
+    tool: delete_work_item
+    toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
+    transition: cleanup_wiki_page
+
+  - id: cleanup_wiki_page
+    type: toolkit
+    continue_on_error: true
+    input:
+      - wiki_identifier
+      - page_name
+    input_mapping:
+      page_name:
+        type: variable
+        value: page_name
+      wiki_identified:
+        type: variable
+        value: wiki_identifier
+    output:
+      - cleanup_wiki_result
+    structured_output: true
+    tool: delete_page_by_path
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: validate_results
 
   - id: validate_results
@@ -198,38 +234,4 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: dict
-    transition: cleanup_work_item
-
-  - id: cleanup_work_item
-    type: toolkit
-    input:
-      - work_item_id
-    input_mapping:
-      id:
-        type: variable
-        value: work_item_id
-    output:
-      - cleanup_work_item_result
-    structured_output: false
-    tool: delete_work_item
-    toolkit_name: ${ADO_BOARDS_TOOLKIT_NAME}
-    transition: cleanup_wiki_page
-
-  - id: cleanup_wiki_page
-    type: toolkit
-    input:
-      - wiki_identifier
-      - page_name
-    input_mapping:
-      page_name:
-        type: variable
-        value: page_name
-      wiki_identified:
-        type: variable
-        value: wiki_identifier
-    output:
-      - cleanup_wiki_result
-    structured_output: true
-    tool: delete_page_by_path
-    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: END
