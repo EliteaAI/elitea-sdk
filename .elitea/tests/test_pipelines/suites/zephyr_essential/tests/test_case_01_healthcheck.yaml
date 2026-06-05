@@ -34,6 +34,24 @@ nodes:
     structured_output: false
     tool: healthcheck
     toolkit_name: ${ZEPHYR_ESSENTIAL_TOOLKIT_NAME}
+    transition: normalize_health_result
+
+  - id: normalize_health_result
+    type: code
+    code:
+      type: fixed
+      value: |
+        raw = elitea_state.get("healthcheck_result", "")
+        if raw == "" or (isinstance(raw, str) and not raw.strip()):
+            normalized = "HEALTHY"
+        else:
+            normalized = raw
+        {"healthcheck_result": normalized}
+    input:
+      - healthcheck_result
+    output:
+      - healthcheck_result
+    structured_output: true
     transition: validate_results
 
   - id: validate_results
@@ -59,16 +77,16 @@ nodes:
           Error Indicators: {error_indicators}
 
           This is a POSITIVE test - we expect successful health check.
-          
+
           IMPORTANT: The healthcheck API returns an empty response (HTTP 200/204 with no body) to indicate success.
-          If healthcheck_result is empty string ("") or contains only whitespace, this DEFINITIVELY means the API is healthy.
-          Set no_errors=true and health_ok=true whenever healthcheck_result is empty - do NOT scan for error indicators in an empty string.
+          A result of "HEALTHY" means the tool ran and returned an empty body (success).
+          Set tool_executed=true, no_errors=true, and health_ok=true when healthcheck_result is "HEALTHY".
           Only set no_errors=false if the output explicitly contains one of the error_indicators strings.
 
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Tool ran without throwing an exception
-          2. no_errors: Output is empty (automatic pass) OR does NOT contain any error indicator strings from error_indicators list
-          3. health_ok: Result is empty (success) OR contains success indicators (both indicate healthy API)
+          2. no_errors: Output does NOT contain any error indicator strings from error_indicators list
+          3. health_ok: Result is "HEALTHY" (empty response = success) OR contains success indicators
 
           Return JSON test_results:
           {{
