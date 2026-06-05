@@ -204,6 +204,22 @@ class TestAnthropicSystemContent:
         )
         assert result[0]["cache_control"] == {"type": "ephemeral"}
 
+    # --- issue #5163: empty system string must not get cache_control ---
+
+    def test_llm_empty_string_returns_empty_string(self):
+        """Empty system prompt must not produce a cache_control block (issue #5163)."""
+        from elitea_sdk.runtime.tools.llm import LLMNode
+
+        result = LLMNode._anthropic_system_content("", _make_fake_anthropic_client())
+        assert result == "", "Empty system text must return plain empty string, not a block-list"
+
+    def test_assistant_empty_string_returns_empty_string(self):
+        """Empty system prompt must not produce a cache_control block (issue #5163)."""
+        from elitea_sdk.runtime.langchain.assistant import _make_anthropic_system_content
+
+        result = _make_anthropic_system_content("", _make_fake_anthropic_client())
+        assert result == "", "Empty system text must return plain empty string, not a block-list"
+
 
 # ---------------------------------------------------------------------------
 # 3. _inject_tool_index_into_messages — consumer-contract guard
