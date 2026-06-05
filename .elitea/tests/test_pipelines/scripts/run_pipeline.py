@@ -968,7 +968,8 @@ def execute_pipeline(
     predict_url = f"{base_url}/api/v2/elitea_core/predict/prompt_lib/{project_id}/{version_id}"
     payload = {
         "chat_history": [],
-        "user_input": input_message or "execute"
+        "user_input": input_message or "execute",
+        "return_chat_history": True,  # Request chat_history in response for test validation
     }
 
     if logger:
