@@ -53,7 +53,7 @@ def _make_anthropic_system_content(text: str, model: Any) -> Any:
     Anthropic: content-block list with cache_control breakpoint (ephemeral).
     All others: plain string — no behavior change.
     """
-    if _is_anthropic_model(model):
+    if _is_anthropic_model(model) and text:
         return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
     return text
 
