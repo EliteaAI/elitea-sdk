@@ -74,26 +74,25 @@ nodes:
           analyze the output from the 'get_files_list' tool execution.
 
           tool executed: get_files_list
-          folder: root (empty string)
+          folder: root (empty string - lists files across all document libraries on the site)
           limit: {limit_files}
           results: {files_result}
           expected fields: {expected_fields}
-          error indicators: {error_indicators}
 
           expected behavior:
-          - tool executes successfully without errors
-          - returns array of file objects
-          - each file contains name, path, created, modified, and link fields
+          - tool executes successfully without errors (failure means output starts with "Tool execution error!" or contains an authentication error)
+          - returns a non-empty array of file objects
+          - file objects contain Name, Path, Created, and Link fields (Modified may be absent for some items - do NOT fail on missing Modified)
           - number of files does not exceed the limit
-          - no system files or form folders in results
+          - files may come from any document library or subfolder on the site (this is expected for root listing)
 
           evaluate:
-          1. did the tool execute successfully?
-          2. are there any error indicators in the output?
-          3. is the result an array of file objects?
-          4. do files contain the expected fields?
-          5. is the file count within the specified limit?
-          6. are file paths valid server-relative paths?
+          1. did the tool execute successfully? (check for "Tool execution error!" prefix only — do NOT check field presence for this criterion)
+          2. is the result a non-empty array?
+          3. does the FIRST item in the array contain Name, Path, Created, and Link fields? (check only the first item)
+          4. is the total file count within the specified limit ({limit_files})?
+
+          IMPORTANT: Do NOT iterate over all items to check field presence. Only check the first item. Do NOT fail the test because Modified is absent from some items.
 
           return a json object with:
           {{

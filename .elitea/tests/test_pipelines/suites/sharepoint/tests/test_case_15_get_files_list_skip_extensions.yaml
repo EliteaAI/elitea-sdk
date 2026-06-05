@@ -134,24 +134,23 @@ nodes:
           Result: {files_result_skip_multiple}
 
           Expected behavior:
-          - All tool executions succeed without errors
+          - All tool executions succeed without errors (failure means output starts with "Tool execution error!" or contains an authentication error)
           - Baseline MUST return files (test data should exist)
-          - Test 1 returns all files EXCEPT .txt files
-          - Test 2 returns all files EXCEPT .pdf, .docx, .png files (NONE of these should be present)
-          - Extensions are matched case-insensitively
+          - Test 1 returns all files EXCEPT .txt files (zero .txt files allowed)
+          - Test 2 returns all files EXCEPT .pdf, .docx, .png files (zero .pdf, zero .docx, zero .png files allowed; other extensions like .txt are fine)
           - Filtered results should have <= files than baseline
 
           Validation rules:
-          1. Check all result structures are valid (not error/exception)
+          1. Check all result structures are valid (not starting with "Tool execution error!")
           2. Verify baseline result is non-empty (if empty, test fails - missing test data)
-          3. Extract file extensions from each result
-          4. Verify Test 1 has NO .txt files (zero .txt files)
-          5. Verify Test 2 has NO .pdf files (zero .pdf files)
-          6. Verify Test 2 has NO .docx files (zero .docx files)
-          7. Verify Test 2 has NO .png files (zero .png files)
+          3. Extract file extensions from the Name field of each result item
+          4. Verify Test 1 has NO files ending in .txt (case-insensitive) — PASS if count of .txt files is 0
+          5. Verify Test 2 has NO files ending in .pdf (case-insensitive) — PASS if count of .pdf files is 0
+          6. Verify Test 2 has NO files ending in .docx (case-insensitive) — PASS if count of .docx files is 0
+          7. Verify Test 2 has NO files ending in .png (case-insensitive) — PASS if count of .png files is 0
           8. Verify Test 1 count <= Baseline count
           9. Verify Test 2 count <= Baseline count
-          10. Calculate how many files were filtered in each test
+          10. Test 2 PASSES if rules 5, 6, 7 are all satisfied — the presence of .txt or other non-excluded files in Test 2 is CORRECT and expected
 
           return a json object with:
           {{

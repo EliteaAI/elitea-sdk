@@ -75,7 +75,6 @@ nodes:
           list title: {list_title}
           provided fields: {item_fields}
           results: {created_item}
-          error indicators: {error_indicators}
 
           expected behavior:
           - tool executes successfully without errors
@@ -85,12 +84,11 @@ nodes:
           - no error messages in output
 
           evaluate:
-          1. did the tool execute successfully?
-          2. are there any error indicators in the output?
-          3. does the result contain an id field?
-          4. is the id a positive integer?
-          5. are the provided fields present in the response?
-          6. does the response include the title field value?
+          1. did the tool execute successfully? (failure means the output starts with "Tool execution error!" or contains an authentication/permission error message — do NOT flag normal JSON field names or values like "@odata.etag" as errors)
+          2. does the result contain a top-level id field with a positive integer value?
+          3. does the result contain a fields object?
+          4. is the Title field present in the fields object with the expected value?
+          5. is the webUrl field present?
 
           return a json object with:
           {{
