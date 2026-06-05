@@ -3026,7 +3026,7 @@ class LLMNode(BaseTool):
             text: The resolved system prompt text.
             client: The raw LLM client (NOT a bound-tools wrapper).
         """
-        if LLMNode._is_anthropic_client(client):
+        if LLMNode._is_anthropic_client(client) and text:
             return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
         return text
 

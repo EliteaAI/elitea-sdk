@@ -127,6 +127,10 @@ class ApplicationToolkit(BaseToolkit):
                 "max_tokens": llm_settings.get('max_tokens'),
                 "reasoning_effort": llm_settings.get('reasoning_effort'),
                 "temperature": llm_settings.get('temperature'),
+                # Honor this sub-agent's own OpenAI-passthrough routing. Without it the child
+                # defaulted to ChatAnthropic, which drops tool_use blocks against an
+                # OpenAI-passthrough backend (no tool calls -> no sensitive-tool HITL interrupts).
+                "openai_compatible": llm_settings.get('openai_compatible', False),
             }
             resolved_llm = client.get_llm(_model_name, model_settings)
         else:
