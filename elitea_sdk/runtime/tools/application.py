@@ -228,6 +228,13 @@ class Application(BaseTool):
         # input (no tool_call_id in _prep_run_args), so we must wrap the result ourselves.
         result = super().invoke(all_kwargs, config=config)
 
+        # Parallel fan-out: a deferred-interrupt sentinel must pass through
+        # UNCOLLAPSED so the LLMNode can aggregate it into one parent interrupt.
+        # Collapsing it (below) would stringify the sentinel into a ToolMessage
+        # and the pause would be silently lost.
+        if isinstance(result, dict) and result.get('__hitl_deferred__'):
+            return result
+
         # When invoked from LangGraph's ToolNode, wrap plain str/dict results in a ToolMessage.
         # ToolNode (langgraph >= 0.3) rejects any return type that is not ToolMessage or Command,
         # raising: TypeError: Tool <name> returned unexpected type: <class 'str'>
@@ -285,6 +292,28 @@ class Application(BaseTool):
             if k not in kwargs:
                 kwargs[k] = v
                 logger.debug(f"[APP_RUN] Added extra '{k}' to kwargs")
+
+        # Parallel fan-out signalling, injected by LLMNode.__perform_tool_calling
+        # when 2+ Application calls share one assistant turn. These pertain to
+        # THIS invocation only; pop them so they never propagate into the child
+        # config (the grandchild must not run in deferred mode itself).
+        #   __hitl_deferred_mode__  : if True, a child HITL pause is RETURNED as a
+        #                             sentinel instead of calling interrupt() here
+        #                             (interrupt() inside an executor thread would be
+        #                             captured by asyncio.gather and break the pause).
+        #   __hitl_parallel_call_id__: this tool_call's id — suffixes the child
+        #                             thread_id so same-name parallel siblings don't
+        #                             collide, and tags the deferred sentinel.
+        #   __hitl_parallel_resume__ : on resume, the {action, value} decision for
+        #                             this child — triggers a checkpoint resume invoke
+        #                             instead of a fresh invoke.
+        _hitl_deferred_mode = False
+        _hitl_parallel_call_id = None
+        _hitl_parallel_resume = None
+        if invoke_config and invoke_config.get('configurable'):
+            _hitl_deferred_mode = invoke_config['configurable'].pop('__hitl_deferred_mode__', False)
+            _hitl_parallel_call_id = invoke_config['configurable'].pop('__hitl_parallel_call_id__', None)
+            _hitl_parallel_resume = invoke_config['configurable'].pop('__hitl_parallel_resume__', None)
 
         if self.client and self.args_runnable:
             # Recreate new LanggraphAgentRunnable in order to reflect the current input_mapping (it can be dynamic for pipelines).
@@ -362,55 +391,83 @@ class Application(BaseTool):
                     parent_configurable.pop(k, None)
             parent_thread_id = parent_configurable.get('thread_id')
             if parent_thread_id and self.name:
-                parent_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
+                # Two parallel calls to the SAME sub-agent in one turn would
+                # collide on f"{parent}:{name}". On the parallel fan-out path
+                # the call id is injected, so suffix with it to isolate the
+                # siblings' checkpoints. Sequential/single path is unchanged.
+                if _hitl_parallel_call_id:
+                    parent_configurable['thread_id'] = (
+                        f"{parent_thread_id}:{self.name}:{_hitl_parallel_call_id}"
+                    )
+                else:
+                    parent_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
             nested_config['configurable'] = parent_configurable
         if nested_metadata:
             nested_config['metadata'] = nested_metadata
         if not nested_config:
             nested_config = None
-        try:
+        if _hitl_parallel_resume is not None:
+            # Parallel fan-out resume: this child paused earlier (a deferred
+            # sentinel was returned). Resume it directly from its checkpoint with
+            # the user's decision instead of starting a fresh invocation. The
+            # derived thread_id matches the deferred run (same call id), so the
+            # child's checkpointer holds the paused state.
+            logger.info(
+                "[APP_RUN] Resuming deferred child '%s' (parallel batch) with: %s",
+                self.name, _hitl_parallel_resume,
+            )
             response = self.application.invoke(
-                formulate_query(kwargs, is_subgraph=self.is_subgraph),
+                {
+                    "hitl_resume": True,
+                    "hitl_action": _hitl_parallel_resume.get("action", "approve"),
+                    "hitl_value": _hitl_parallel_resume.get("value", ""),
+                },
                 config=nested_config,
             )
-        except Exception as gb:
-            # GraphInterrupt propagation path (typically is_subgraph=True child,
-            # or any child whose interrupt() raises directly without being
-            # absorbed by an inner pregel). The exception's payload is already
-            # in flight to the parent's pregel; mutate its value dict in place
-            # so the parent's checkpoint records (a) parent tool identity and
-            # (b) the PARENT's intermediate messages — without those, on resume
-            # the parent's LLM history is restored from the child's view (or
-            # nothing) and the parent re-plans from scratch, re-invoking
-            # earlier sequential subagents.
-            from langgraph.errors import GraphBubbleUp, GraphInterrupt
-            if not isinstance(gb, GraphBubbleUp):
+        else:
+            try:
+                response = self.application.invoke(
+                    formulate_query(kwargs, is_subgraph=self.is_subgraph),
+                    config=nested_config,
+                )
+            except Exception as gb:
+                # GraphInterrupt propagation path (typically is_subgraph=True child,
+                # or any child whose interrupt() raises directly without being
+                # absorbed by an inner pregel). The exception's payload is already
+                # in flight to the parent's pregel; mutate its value dict in place
+                # so the parent's checkpoint records (a) parent tool identity and
+                # (b) the PARENT's intermediate messages — without those, on resume
+                # the parent's LLM history is restored from the child's view (or
+                # nothing) and the parent re-plans from scratch, re-invoking
+                # earlier sequential subagents.
+                from langgraph.errors import GraphBubbleUp, GraphInterrupt
+                if not isinstance(gb, GraphBubbleUp):
+                    raise
+                if isinstance(gb, GraphInterrupt) and gb.args:
+                    for interrupts in gb.args:
+                        if not isinstance(interrupts, (tuple, list)):
+                            continue
+                        for it in interrupts:
+                            value = getattr(it, 'value', None)
+                            if not isinstance(value, dict):
+                                continue
+                            if value.get('guardrail_type') != 'sensitive_tool':
+                                continue
+                            value.setdefault('_parent_tool_name', self.name)
+                            value.setdefault('_parent_tool_args', {'task': kwargs.get('task', '')})
+                            # Always drop the CHILD's pending messages so they can
+                            # never leak into the parent checkpoint and pollute the
+                            # parent LLM's resume history; attach the parent's
+                            # captured pending (if any) in their place.
+                            value.pop('_pending_messages', None)
+                            if _parent_pending_serialized:
+                                value['_pending_messages'] = _parent_pending_serialized
+                                logger.info(
+                                    "[APP_RUN] Augmented bubbled HITL interrupt with %d "
+                                    "parent intermediate messages (tool=%s)",
+                                    len(_parent_pending_serialized), self.name,
+                                )
                 raise
-            if isinstance(gb, GraphInterrupt) and gb.args:
-                for interrupts in gb.args:
-                    if not isinstance(interrupts, (tuple, list)):
-                        continue
-                    for it in interrupts:
-                        value = getattr(it, 'value', None)
-                        if not isinstance(value, dict):
-                            continue
-                        if value.get('guardrail_type') != 'sensitive_tool':
-                            continue
-                        value.setdefault('_parent_tool_name', self.name)
-                        value.setdefault('_parent_tool_args', {'task': kwargs.get('task', '')})
-                        # Always drop the CHILD's pending messages so they can
-                        # never leak into the parent checkpoint and pollute the
-                        # parent LLM's resume history; attach the parent's
-                        # captured pending (if any) in their place.
-                        value.pop('_pending_messages', None)
-                        if _parent_pending_serialized:
-                            value['_pending_messages'] = _parent_pending_serialized
-                            logger.info(
-                                "[APP_RUN] Augmented bubbled HITL interrupt with %d "
-                                "parent intermediate messages (tool=%s)",
-                                len(_parent_pending_serialized), self.name,
-                            )
-            raise
 
         # HITL bubble-up (dict-bridge): when the child returns hitl_interrupt
         # in its state (e.g. subgraph mode or legacy path), propagate it to
@@ -456,6 +513,24 @@ class Application(BaseTool):
                     "[APP_RUN] Captured %d parent intermediate messages for HITL bubble-up",
                     len(_parent_pending_serialized),
                 )
+            if _hitl_deferred_mode:
+                # Parallel fan-out: do NOT call interrupt() here. This runs inside
+                # an executor thread under asyncio.gather; a raised GraphInterrupt
+                # would be captured as a plain exception and the pause would be
+                # lost. Instead RETURN a sentinel so the LLMNode can aggregate all
+                # paused siblings into ONE parent-level interrupt() call. On resume
+                # the LLMNode re-invokes this child with __hitl_parallel_resume__.
+                logger.info(
+                    "[APP_RUN] Deferring HITL interrupt for child '%s' (parallel "
+                    "batch, tool=%s)",
+                    self.name, child_hitl.get('tool_name', ''),
+                )
+                return {
+                    "__hitl_deferred__": True,
+                    "hitl_interrupt": child_hitl_for_parent,
+                    "nested_config": nested_config,
+                    "tool_call_id": _hitl_parallel_call_id,
+                }
             resume_value = interrupt(child_hitl_for_parent)
             # Defensive: a non-dict resume value (LangGraph version drift, test
             # harness, or malformed Command(resume=...) payload) would raise

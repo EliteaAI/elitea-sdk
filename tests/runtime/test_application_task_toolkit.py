@@ -37,6 +37,37 @@ class FailingApplication:
         raise RuntimeError('child blew up')
 
 
+class DictBridgeInterruptingApplication:
+    """Child whose inner graph ABSORBS the sensitive-tool interrupt and RETURNS
+    it in state (the dict-bridge path that a real standalone
+    LangGraphAgentRunnable takes), rather than letting interrupt() raise.
+
+    This is the only child shape compatible with the parallel deferred-interrupt
+    aggregation (issue #4993): the executor thread must get a returned sentinel,
+    not a raised GraphInterrupt that asyncio.gather would capture.
+    """
+
+    def __init__(self, output, tool_name):
+        self.output = output
+        self.tool_name = tool_name
+        self.calls = []
+
+    def invoke(self, payload, config=None):
+        self.calls.append({'payload': payload, 'config': config})
+        if isinstance(payload, dict) and payload.get('hitl_resume'):
+            return {'output': self.output, 'execution_finished': True}
+        return {
+            'output': 'Need approval',
+            'execution_finished': False,
+            'hitl_interrupt': {
+                'type': 'hitl',
+                'guardrail_type': 'sensitive_tool',
+                'message': f'approve {self.tool_name}?',
+                'tool_name': self.tool_name,
+            },
+        }
+
+
 class _ParentLLMBound:
     def __init__(self, root, tools):
         self.root = root
@@ -465,3 +496,334 @@ def test_task_delegation_addon_injected_when_agent_tools_present():
         'Sub-agent delegation' in p
         for p in captured.get('system_prompts', [])
     ), 'TASK_DELEGATION_ADDON should not appear when no Application tools are attached'
+
+
+# --- #4993: parallel sub-agent fan-out + multi-interrupt HITL -----------------
+
+
+class _MultiAppParentBound:
+    def __init__(self, root, tools):
+        self.root = root
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        self.root.invoke_calls.append(list(messages))
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if tool_messages:
+            joined = ' | '.join(str(m.content) for m in tool_messages)
+            return AIMessage(content=f'parent saw: {joined}')
+        return AIMessage(
+            content='',
+            tool_calls=[
+                {'name': self.root.tool_a, 'args': {'task': 'Run A'},
+                 'id': self.root.id_a, 'type': 'tool_call'},
+                {'name': self.root.tool_b, 'args': {'task': 'Run B'},
+                 'id': self.root.id_b, 'type': 'tool_call'},
+            ],
+        )
+
+
+class MultiAppParentLLM:
+    """Parent LLM that fans out: emits TWO Application tool_calls in one
+    assistant message, then finishes once both ToolMessages are in scope."""
+
+    def __init__(self, tool_a='child_a', tool_b='child_b',
+                 id_a='call-A', id_b='call-B'):
+        self.tool_a = tool_a
+        self.tool_b = tool_b
+        self.id_a = id_a
+        self.id_b = id_b
+        self.invoke_calls = []
+        self.temperature = 0
+        self.max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _MultiAppParentBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _MultiAppParentBound(self, []).invoke(messages, config=config)
+
+
+def _app(name, application, **kw):
+    return Application(
+        name=name, description=kw.pop('description', f'{name} worker'),
+        application=application, return_type='str', client=None,
+        is_subgraph=True, **kw,
+    )
+
+
+# --- deferred-interrupt mode (the parallel-safe child contract) ---------------
+
+
+def test_deferred_mode_returns_sentinel_instead_of_raising():
+    """In deferred mode a paused child must RETURN a sentinel (not call
+    interrupt()): inside an asyncio.gather executor thread a raised
+    GraphInterrupt is captured as a plain exception and the pause is lost."""
+    child = DictBridgeInterruptingApplication(output='ok', tool_name='create_file')
+    app = _app('worker', child)
+
+    result = app._run(
+        task='do work',
+        config={'configurable': {
+            'thread_id': 'parent-1',
+            '__hitl_deferred_mode__': True,
+            '__hitl_parallel_call_id__': 'call-X',
+        }},
+    )
+
+    assert isinstance(result, dict) and result.get('__hitl_deferred__') is True
+    assert result['tool_call_id'] == 'call-X'
+    assert result['hitl_interrupt']['tool_name'] == 'create_file'
+    assert result['hitl_interrupt']['_parent_tool_name'] == 'worker'
+    assert 'nested_config' in result
+
+
+def test_deferred_resume_invokes_child_with_resume_payload():
+    """On the parallel resume path the child is re-invoked from its checkpoint
+    with {hitl_resume, hitl_action, hitl_value} instead of a fresh task."""
+    child = DictBridgeInterruptingApplication(output='approved-result', tool_name='create_file')
+    app = _app('worker', child)
+
+    result = app._run(
+        task='do work',
+        config={'configurable': {
+            'thread_id': 'parent-1',
+            '__hitl_parallel_call_id__': 'call-X',
+            '__hitl_parallel_resume__': {'action': 'approve', 'value': 'go'},
+        }},
+    )
+
+    # Child got the resume envelope, not a fresh task.
+    resume_payload = child.calls[-1]['payload']
+    assert resume_payload.get('hitl_resume') is True
+    assert resume_payload.get('hitl_action') == 'approve'
+    assert resume_payload.get('hitl_value') == 'go'
+    assert result['output'] == 'approved-result'
+
+
+def test_parallel_call_id_isolates_same_name_sibling_thread_ids():
+    """Two parallel calls to the SAME sub-agent must get distinct child
+    thread_ids — the parallel path suffixes with tool_call_id so the two
+    checkpoints don't collide. The sequential/single path is unchanged
+    (covered by the existing :name-only thread_id tests)."""
+    captured = StaticApplication(output='ok')
+    app = _app('analyst', captured)
+
+    app._run(task='a', config={'configurable': {
+        'thread_id': 'parent-chat-42', '__hitl_parallel_call_id__': 'call-A'}})
+    app._run(task='b', config={'configurable': {
+        'thread_id': 'parent-chat-42', '__hitl_parallel_call_id__': 'call-B'}})
+
+    thread_ids = [c['config']['configurable']['thread_id'] for c in captured.calls]
+    assert thread_ids == ['parent-chat-42:analyst:call-A',
+                          'parent-chat-42:analyst:call-B']
+
+
+# --- _collect_parallel_application_specs partition ----------------------------
+
+
+def _bare_llmnode(tools):
+    from elitea_sdk.runtime.tools.llm import LLMNode
+    return LLMNode(client=None, available_tools=list(tools), lazy_tools_mode=False)
+
+
+def test_collect_specs_pure_application_batch_returns_specs():
+    node = _bare_llmnode([_app('child_a', StaticApplication()),
+                          _app('child_b', StaticApplication())])
+    tool_calls = [
+        {'name': 'child_a', 'args': {'task': 'x'}, 'id': 'call-A'},
+        {'name': 'child_b', 'args': {'task': 'y'}, 'id': 'call-B'},
+    ]
+    specs = node._collect_parallel_application_specs(
+        tool_calls, [], {'configurable': {}}, {})
+    assert specs is not None and len(specs) == 2
+    assert {s[2] for s in specs} == {'call-A', 'call-B'}
+
+
+def test_collect_specs_mixed_batch_stays_sequential():
+    """A turn mixing an Application call with a regular toolkit call must NOT
+    fan out — returns None so the sequential loop runs."""
+    from langchain_core.tools import StructuredTool
+    regular = StructuredTool.from_function(
+        func=lambda x: x, name='regular', description='regular tool')
+    node = _bare_llmnode([_app('child_a', StaticApplication()), regular])
+    tool_calls = [
+        {'name': 'child_a', 'args': {'task': 'x'}, 'id': 'call-A'},
+        {'name': 'regular', 'args': {'x': '1'}, 'id': 'call-R'},
+    ]
+    assert node._collect_parallel_application_specs(
+        tool_calls, [], {'configurable': {}}, {}) is None
+
+
+def test_collect_specs_single_application_stays_sequential():
+    node = _bare_llmnode([_app('child_a', StaticApplication())])
+    tool_calls = [{'name': 'child_a', 'args': {'task': 'x'}, 'id': 'call-A'}]
+    assert node._collect_parallel_application_specs(
+        tool_calls, [], {'configurable': {}}, {}) is None
+
+
+def test_collect_specs_resume_single_remaining_with_decision():
+    """Resume edge case: one sibling completed (its ToolMessage restored), the
+    other paused. The lone remaining call was checkpointed under the suffixed
+    thread_id, so it MUST stay on the parallel path even as a 1-spec batch —
+    detected by matching the resume hitl_decisions."""
+    node = _bare_llmnode([_app('child_a', StaticApplication()),
+                          _app('child_b', StaticApplication())])
+    tool_calls = [
+        {'name': 'child_a', 'args': {'task': 'x'}, 'id': 'call-A'},
+        {'name': 'child_b', 'args': {'task': 'y'}, 'id': 'call-B'},
+    ]
+    completed = [ToolMessage(content='A-done', tool_call_id='call-A')]
+    specs = node._collect_parallel_application_specs(
+        tool_calls, completed, {'configurable': {}}, {},
+        hitl_decisions=[{'tool_call_id': 'call-B', 'action': 'approve'}],
+    )
+    assert specs is not None and len(specs) == 1 and specs[0][2] == 'call-B'
+
+
+# --- end-to-end fan-out through the full parent graph -------------------------
+
+
+def test_two_application_calls_fan_out_and_both_complete():
+    """Two independent Application calls in one turn run concurrently and both
+    results return to the parent. Distinct suffixed child thread_ids confirm
+    the parallel path (not the sequential :name-only path) executed."""
+    child_a = StaticApplication(output='A-done')
+    child_b = StaticApplication(output='B-done')
+    app_a = _app('child_a', child_a)
+    app_b = _app('child_b', child_b)
+
+    parent = MultiAppParentLLM(tool_a='child_a', tool_b='child_b',
+                               id_a='call-A', id_b='call-B')
+    runnable = _build_assistant(parent, [app_a, app_b]).runnable()
+    runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'fan-out-thread'}},
+    )
+
+    assert child_a.calls and child_b.calls, 'both children must run'
+    assert child_a.calls[0]['config']['configurable']['thread_id'] == \
+        'fan-out-thread:child_a:call-A'
+    assert child_b.calls[0]['config']['configurable']['thread_id'] == \
+        'fan-out-thread:child_b:call-B'
+
+    follow_up = [msgs for msgs in parent.invoke_calls
+                 if any(isinstance(m, ToolMessage) for m in msgs)]
+    assert follow_up, 'parent must be re-invoked with both ToolMessages'
+    contents = {m.content for m in follow_up[0] if isinstance(m, ToolMessage)}
+    assert contents == {'A-done', 'B-done'}
+
+
+def test_parallel_fan_out_runs_children_concurrently():
+    """Concurrency proof via a shared barrier: each child blocks until BOTH
+    have entered. Sequential execution would never release the barrier (the
+    first child waits forever) → BrokenBarrierError → error ToolMessages.
+    Concurrent execution lets both pass and return their outputs."""
+    import threading
+
+    barrier = threading.Barrier(2, timeout=8)
+
+    class BarrierApplication:
+        def __init__(self, output):
+            self.output = output
+            self.calls = []
+
+        def invoke(self, payload, config=None):
+            self.calls.append({'payload': payload, 'config': config})
+            barrier.wait()  # only returns if a sibling reached it concurrently
+            return {'output': self.output}
+
+    child_a = BarrierApplication('A-done')
+    child_b = BarrierApplication('B-done')
+    parent = MultiAppParentLLM(tool_a='child_a', tool_b='child_b',
+                               id_a='call-A', id_b='call-B')
+    runnable = _build_assistant(
+        parent, [_app('child_a', child_a), _app('child_b', child_b)]).runnable()
+    runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'concurrent-thread'}},
+    )
+
+    follow_up = [msgs for msgs in parent.invoke_calls
+                 if any(isinstance(m, ToolMessage) for m in msgs)]
+    assert follow_up, 'children did not run concurrently (barrier never released)'
+    contents = {m.content for m in follow_up[0] if isinstance(m, ToolMessage)}
+    assert contents == {'A-done', 'B-done'}
+
+
+def test_one_child_fails_does_not_cancel_sibling():
+    """When one parallel sub-agent raises, the sibling still completes and the
+    parent receives an error ToolMessage for the failure + the good result for
+    the sibling."""
+    good = StaticApplication(output='B-done')
+    parent = MultiAppParentLLM(tool_a='child_a', tool_b='child_b',
+                               id_a='call-A', id_b='call-B')
+    runnable = _build_assistant(
+        parent, [_app('child_a', FailingApplication()),
+                 _app('child_b', good)]).runnable()
+    runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'fail-isolation-thread'}},
+    )
+
+    assert good.calls, 'sibling must still run when one child fails'
+    follow_up = [msgs for msgs in parent.invoke_calls
+                 if any(isinstance(m, ToolMessage) for m in msgs)]
+    assert follow_up
+    by_id = {m.tool_call_id: m for m in follow_up[0] if isinstance(m, ToolMessage)}
+    assert by_id['call-B'].content == 'B-done'
+    assert 'Error' in by_id['call-A'].content or 'child blew up' in by_id['call-A'].content
+
+
+def test_hitl_batch_approved_set_shared_across_parallel_gather():
+    """The mutable _HITL_BATCH_APPROVED set must be shared BY REFERENCE into the
+    executor threads (via contextvars.copy_context), so same-name auto-approve
+    keeps working across the fan-out. Children mutate the set; the parent sees
+    both marks after gather."""
+    import asyncio
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
+        begin_hitl_batch, end_hitl_batch, _HITL_BATCH_APPROVED,
+    )
+
+    class _BatchMutatingApplication:
+        def __init__(self, mark):
+            self.mark = mark
+            self.calls = []
+
+        def invoke(self, payload, config=None):
+            self.calls.append({'payload': payload, 'config': config})
+            batch = _HITL_BATCH_APPROVED.get(None)
+            if batch is not None:
+                batch.add(self.mark)
+            return {'output': f'{self.mark}-done'}
+
+    app_a = _app('child_a', _BatchMutatingApplication('A'))
+    app_b = _app('child_b', _BatchMutatingApplication('B'))
+    node = _bare_llmnode([app_a, app_b])
+    specs = [
+        ('child_a', {'task': 'x'}, 'call-A', app_a),
+        ('child_b', {'task': 'y'}, 'call-B', app_b),
+    ]
+
+    async def _drive():
+        token = begin_hitl_batch()
+        shared = _HITL_BATCH_APPROVED.get()
+        try:
+            new_messages = []
+            await node._run_parallel_application_calls(
+                specs, new_messages, {'configurable': {'thread_id': 'shared-batch'}})
+            return shared, new_messages
+        finally:
+            end_hitl_batch(token)
+
+    shared, new_messages = asyncio.run(_drive())
+    assert {'A', 'B'}.issubset(shared), (
+        'children did not mutate the SAME batch set — copy_context did not share '
+        'the mutable approval set by reference into the executor threads'
+    )
+    contents = {m.content for m in new_messages if isinstance(m, ToolMessage)}
+    assert contents == {'A-done', 'B-done'}

@@ -1980,3 +1980,182 @@ def test_second_sequential_subagent_preserves_parent_pending_on_hitl_resume():
     )
 
     reset_sensitive_tools()
+
+
+# --- #4993: parallel sub-agent fan-out + aggregated multi-interrupt HITL ------
+
+
+class _MultiAppParentBound:
+    def __init__(self, root, tools):
+        self.root = root
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        tool_contents = [str(m.content) for m in tool_messages]
+        self.root.calls.append(tool_contents)
+        if tool_messages:
+            return AIMessage(content='parent-done')
+        return AIMessage(
+            content='',
+            tool_calls=[
+                {'name': self.root.tool_a, 'args': {'task': 'Run A'},
+                 'id': self.root.id_a, 'type': 'tool_call'},
+                {'name': self.root.tool_b, 'args': {'task': 'Run B'},
+                 'id': self.root.id_b, 'type': 'tool_call'},
+            ],
+        )
+
+
+class MultiAppParentLLM:
+    """Parent LLM that fans out two Application tool_calls in one turn (#4993)."""
+
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self, tool_a='child_a', tool_b='child_b',
+                 id_a='call-A', id_b='call-B'):
+        self.tool_a = tool_a
+        self.tool_b = tool_b
+        self.id_a = id_a
+        self.id_b = id_b
+        self.calls = []
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _MultiAppParentBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _MultiAppParentBound(self, []).invoke(messages, config=config)
+
+
+class DictBridgeInterruptingApplication:
+    """Child whose inner graph ABSORBS the sensitive-tool interrupt and RETURNS
+    it in state (the dict-bridge path a real standalone LangGraphAgentRunnable
+    takes), so the parallel deferred-aggregation can collect a sentinel rather
+    than catching a raised GraphInterrupt. Records the resume action so routing
+    can be asserted."""
+
+    def __init__(self, output, tool_name):
+        self.output = output
+        self.tool_name = tool_name
+        self.calls = []
+
+    def invoke(self, payload, config=None):
+        self.calls.append({'payload': payload, 'config': config})
+        if isinstance(payload, dict) and payload.get('hitl_resume'):
+            return {'output': self.output, 'execution_finished': True}
+        return {
+            'output': 'Need approval',
+            'execution_finished': False,
+            'hitl_interrupt': {
+                'type': 'hitl',
+                'guardrail_type': 'sensitive_tool',
+                'message': f'approve {self.tool_name}?',
+                'tool_name': self.tool_name,
+            },
+        }
+
+
+def _subagent(name, application):
+    return Application(
+        name=name, description=f'{name} worker', application=application,
+        return_type='str', client=None, is_subgraph=True,
+    )
+
+
+def test_two_parallel_children_pause_aggregate_into_one_interrupt():
+    """Both fanned-out children pause on a sensitive tool → ONE aggregated
+    parent interrupt (guardrail_type=parallel_sensitive_tools) whose unpacked
+    hitl_interrupts list holds one entry per paused child, each keyed by its
+    parent Application tool_call_id."""
+    parent_memory = MemorySaver()
+    child_a = DictBridgeInterruptingApplication('A-done', 'create_file')
+    child_b = DictBridgeInterruptingApplication('B-done', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+
+    llm = MultiAppParentLLM(tool_a='child_a', tool_b='child_b',
+                            id_a='call-A', id_b='call-B')
+    runnable = _build_parent_runnable(parent_memory, llm, tools)
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'parallel-pause-thread'}},
+    )
+
+    assert result['execution_finished'] is False
+    interrupts = result['hitl_interrupts']
+    assert len(interrupts) == 2, f'expected 2 stacked interrupts, got {interrupts}'
+    by_id = {i['tool_call_id']: i for i in interrupts}
+    assert set(by_id) == {'call-A', 'call-B'}
+    assert by_id['call-A']['tool_name'] == 'create_file'
+    assert by_id['call-B']['tool_name'] == 'delete_file'
+    # Internal-only keys must be stripped before reaching the UI/transport.
+    for entry in interrupts:
+        assert '_pending_messages' not in entry
+        assert 'nested_config' not in entry
+
+
+def test_parallel_resume_routes_decisions_to_correct_children():
+    """A single resume carrying a hitl_decisions map routes approve→A and
+    reject→B to the right children (each resumes from its own checkpoint), both
+    ToolMessages return, and the parent completes."""
+    parent_memory = MemorySaver()
+    child_a = DictBridgeInterruptingApplication('A-done', 'create_file')
+    child_b = DictBridgeInterruptingApplication('B-done', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+    thread_config = {'configurable': {'thread_id': 'parallel-resume-thread'}}
+
+    initial_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    initial_runnable = _build_parent_runnable(parent_memory, initial_llm, tools)
+    initial_result = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config=thread_config,
+    )
+    assert initial_result['execution_finished'] is False
+    assert len(initial_result['hitl_interrupts']) == 2
+
+    resumed_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    resumed_runnable = _build_parent_runnable(parent_memory, resumed_llm, tools)
+    resume_result = resumed_runnable.invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-A', 'action': 'approve', 'value': ''},
+            {'tool_call_id': 'call-B', 'action': 'reject', 'value': 'no'},
+        ]},
+        config=thread_config,
+    )
+
+    # Each child got resumed with ITS decision.
+    assert child_a.calls[-1]['payload'].get('hitl_action') == 'approve'
+    assert child_b.calls[-1]['payload'].get('hitl_action') == 'reject'
+
+    # Both ToolMessages reached the parent's final LLM turn, and it completed.
+    assert resume_result['execution_finished'] is True
+    assert resume_result['output'] == 'parent-done'
+    final_contents = resumed_llm.calls[-1]
+    assert 'A-done' in final_contents and 'B-done' in final_contents
+
+
+def test_one_parallel_child_completes_other_pauses():
+    """Mixed fan-out outcome: one child finishes, the other pauses. The single
+    aggregated interrupt holds ONLY the paused child; the completed sibling's
+    ToolMessage is preserved in the interrupt's _pending_messages for restore."""
+    parent_memory = MemorySaver()
+    child_a = StaticApplication(output='A-done')                       # completes
+    child_b = DictBridgeInterruptingApplication('B-done', 'delete_file')  # pauses
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+
+    llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable(parent_memory, llm, tools)
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'one-pause-thread'}},
+    )
+
+    assert result['execution_finished'] is False
+    interrupts = result['hitl_interrupts']
+    assert len(interrupts) == 1, f'only the paused child should surface; got {interrupts}'
+    assert interrupts[0]['tool_call_id'] == 'call-B'
+    assert interrupts[0]['tool_name'] == 'delete_file'

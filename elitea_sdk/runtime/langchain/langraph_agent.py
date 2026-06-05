@@ -1784,11 +1784,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # user's new message is effectively deferred — they must
                 # resolve the pending action first, then re-send.
                 if hitl_interrupt and not self._is_hitl_resume(input):
-                    hitl_for_ui = {
-                        k: v for k, v in hitl_interrupt.items()
-                        if k not in ('tool_args_raw', '_pending_messages',
-                                     '_parent_tool_name', '_parent_tool_args')
-                    }
+                    hitl_interrupts_for_ui = self._strip_hitl_ui_keys(
+                        self._get_hitl_interrupts(checkpoint_state)
+                    )
+                    hitl_for_ui = (
+                        hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
+                    )
                     logger.warning(
                         "[HITL] Stale HITL interrupt detected for tool '%s'. "
                         "Returning interrupt to caller for resolution "
@@ -1803,6 +1804,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         "thread_id": thread_id,
                         "execution_finished": False,
                         "hitl_interrupt": hitl_for_ui,
+                        "hitl_interrupts": hitl_interrupts_for_ui,
                     }
                     if hasattr(checkpoint_state, 'values') and checkpoint_state.values:
                         for key, value in checkpoint_state.values.items():
@@ -1921,6 +1923,65 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
+
+                    elif guardrail_type == 'parallel_sensitive_tools':
+                        # Parallel sub-agent fan-out resume (issue #4993).
+                        # The aggregate interrupt paused N children at once; the
+                        # caller returns a decision per child as hitl_decisions.
+                        # We rebuild the original N-tool-call AIMessage so the
+                        # LLMNode re-fans-out, but each paused child resumes from
+                        # ITS OWN checkpoint (via __hitl_parallel_resume__) so no
+                        # non-sensitive side effects are replayed; completed
+                        # siblings are restored from _pending_messages and skipped
+                        # by _tool_call_already_completed.
+                        decisions = hitl_resume_value.get('hitl_decisions') or []
+                        if not isinstance(decisions, list):
+                            decisions = []
+
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        original_ai_dict = self._extract_last_ai_message_dict(pending_msgs_dicts)
+                        parallel_calls = []
+                        if original_ai_dict is not None:
+                            parallel_calls = original_ai_dict.get('tool_calls') \
+                                or original_ai_dict.get('data', {}).get('tool_calls') \
+                                or []
+
+                        resume_ctx = {
+                            'parallel_calls': list(parallel_calls),
+                            'content': (original_ai_dict or {}).get('content', '')
+                                if isinstance(original_ai_dict, dict) else '',
+                            'hitl_decisions': list(decisions),
+                        }
+                        if original_ai_dict is not None:
+                            resume_ctx['original_ai_message'] = original_ai_dict
+                        if pending_msgs_dicts:
+                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                            if trimmed:
+                                resume_ctx['pending_messages'] = trimmed
+                        hitl_resume_ctx = resume_ctx
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+
+                        # Persist each per-child decision to state for the
+                        # blocked-tool set + audit trail (reducer appends).
+                        persisted = []
+                        for d in decisions:
+                            if not isinstance(d, dict):
+                                continue
+                            persisted.append({
+                                'tool_name': d.get('tool_name', ''),
+                                'toolkit_name': d.get('toolkit_name', ''),
+                                'toolkit_type': d.get('toolkit_type', ''),
+                                'action': d.get('action', 'approve'),
+                                'action_label': d.get('action_label', ''),
+                                'user_feedback': d.get('value', ''),
+                                'tool_call_id': d.get('tool_call_id', ''),
+                            })
+                        if persisted:
+                            self.update_state(config, {'hitl_decisions': persisted})
+                        logger.info(
+                            "[HITL] Resuming %d parallel sub-agent decision(s)",
+                            len(persisted),
+                        )
 
                     result = super().invoke(
                         Command(resume=hitl_resume_value),
@@ -2048,8 +2109,17 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # execution path, but override the output and attach HITL metadata.
 
                 # Strip internal-only fields (e.g. unmasked tool args) before logging
-                # or returning results that will be emitted to UI clients.
-                hitl_for_ui = {k: v for k, v in hitl_interrupt.items() if k not in ('tool_args_raw', '_pending_messages', '_parent_tool_name', '_parent_tool_args')}
+                # or returning results that will be emitted to UI clients. The
+                # plural form (issue #4993) unpacks a parallel sub-agent
+                # aggregate into one entry per paused child; for a single
+                # interrupt it is a one-element list and hitl_interrupt stays the
+                # first element for back-compat.
+                hitl_interrupts_for_ui = self._strip_hitl_ui_keys(
+                    self._get_hitl_interrupts(config_state)
+                )
+                hitl_for_ui = (
+                    hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
+                )
                 logger.info(f"[HITL] Execution paused at HITL node: {hitl_for_ui}")
 
                 result_with_state = {
@@ -2057,6 +2127,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     "thread_id": thread_id,
                     "execution_finished": False,
                     "hitl_interrupt": hitl_for_ui,
+                    "hitl_interrupts": hitl_interrupts_for_ui,
                 }
 
                 if hasattr(config_state, 'values') and config_state.values:
@@ -2203,6 +2274,65 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     if hasattr(intr, 'value') and isinstance(intr.value, dict):
                         if intr.value.get('type') == 'hitl':
                             return intr.value
+        return None
+
+    @classmethod
+    def _get_hitl_interrupts(cls, state_snapshot) -> list[dict]:
+        """Return all pending HITL interrupts as a flat list (issue #4993).
+
+        A parallel sub-agent fan-out raises ONE aggregated interrupt with
+        ``guardrail_type='parallel_sensitive_tools'`` whose ``pending`` list
+        holds one single-shape payload per paused child. Unpack it so callers
+        (and the UI) can treat single and parallel pauses uniformly. A normal
+        single interrupt is wrapped into a one-element list. Returns [] when no
+        interrupt is pending.
+        """
+        interrupt_value = cls._get_hitl_interrupt(state_snapshot)
+        if not interrupt_value:
+            return []
+        if interrupt_value.get('guardrail_type') == 'parallel_sensitive_tools':
+            pending = interrupt_value.get('pending') or []
+            return [p for p in pending if isinstance(p, dict)]
+        return [interrupt_value]
+
+    # Internal payload keys that must never leak to the UI/transport layer.
+    _HITL_INTERNAL_KEYS = (
+        'tool_args_raw', '_pending_messages',
+        '_parent_tool_name', '_parent_tool_args', 'nested_config',
+    )
+
+    @classmethod
+    def _strip_hitl_ui_keys(cls, interrupts: list) -> list:
+        """Drop internal-only keys from each interrupt before returning to caller.
+
+        Internal keys (captured intermediate messages, nested resume config,
+        parent-tool back-references) are needed by the resume path but must not
+        be serialized to the indexer/UI.
+        """
+        cleaned = []
+        for entry in interrupts:
+            if not isinstance(entry, dict):
+                continue
+            cleaned.append({
+                k: v for k, v in entry.items()
+                if k not in cls._HITL_INTERNAL_KEYS
+            })
+        return cleaned
+
+    @staticmethod
+    def _extract_last_ai_message_dict(pending_msgs_dicts: list) -> Optional[dict]:
+        """Return the last serialized AIMessage dict from captured pending messages.
+
+        Used to rebuild the synthetic N-tool-call completion on a parallel
+        sub-agent resume — that AIMessage owns all the fanned-out Application
+        tool_calls. Returns None when none is present.
+        """
+        if not pending_msgs_dicts:
+            return None
+        for i in range(len(pending_msgs_dicts) - 1, -1, -1):
+            msg_dict = pending_msgs_dicts[i]
+            if isinstance(msg_dict, dict) and msg_dict.get('type') == 'ai':
+                return msg_dict
         return None
 
     @staticmethod
@@ -2369,6 +2499,10 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if input_data.get('hitl_resume') is True:
             return True
 
+        # Parallel multi-interrupt resume: a list of per-child decisions.
+        if isinstance(input_data.get('hitl_decisions'), list) and input_data['hitl_decisions']:
+            return True
+
         action = input_data.get('hitl_action') or input_data.get('action')
         if not isinstance(action, str):
             return False
@@ -2395,10 +2529,19 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if value is None:
             value = input_data.get("value", "")
 
-        return {
+        resume = {
             "action": action,
             "value": value,
         }
+
+        # Parallel multi-interrupt resume (issue #4993): carry the per-child
+        # decision map through so __perform_tool_calling can route each
+        # approve/reject back to the correct paused sub-agent.
+        decisions = input_data.get("hitl_decisions")
+        if isinstance(decisions, list) and decisions:
+            resume["hitl_decisions"] = decisions
+
+        return resume
 
     def _is_at_static_interrupt(self, checkpoint_state) -> bool:
         """Check if the graph is paused at a compile-time static interrupt.
