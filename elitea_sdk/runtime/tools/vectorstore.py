@@ -235,19 +235,23 @@ class VectorStoreWrapper(BaseToolApiWrapper):
             return {"collections": [], "message": "No indexed collections"}
         return cols
 
-    def _clean_collection(self, index_name: str = ''):
+    def _clean_collection(self, index_name: str = '') -> int:
         """
         Clean the vectorstore collection by deleting all indexed data.
+
+        Returns:
+            int: Number of deleted records.
         """
         self._log_data(
             f"Cleaning collection '{self.dataset}'",
             tool_name="_clean_collection"
         )
-        self.vector_adapter.clean_collection(self, index_name)
+        deleted_count = self.vector_adapter.clean_collection(self, index_name)
         self._log_data(
-            f"Collection '{self.dataset}' has been cleaned. ",
+            f"Collection '{self.dataset}' has been cleaned. Deleted {deleted_count} records.",
             tool_name="_clean_collection"
         )
+        return deleted_count
 
     def _get_code_indexed_data(self, index_name: str) -> Dict[str, Dict[str, Any]]:
         """ Get all indexed data from vectorstore for code content """

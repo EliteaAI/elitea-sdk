@@ -272,20 +272,24 @@ class VectorStoreWrapperBase(BaseToolApiWrapper):
                 )
             ).count()
 
-    def _clean_collection(self, index_name: str = '', including_index_meta: bool = False):
+    def _clean_collection(self, index_name: str = '', including_index_meta: bool = False) -> int:
         """
         Clean the vectorstore collection by deleting all indexed data.
+
+        Returns:
+            int: Number of deleted records.
         """
         self._ensure_vectorstore_initialized()
         self._log_tool_event(
             f"Cleaning collection '{self.dataset}'",
             tool_name="_clean_collection"
         )
-        self.vector_adapter.clean_collection(self, index_name, including_index_meta)
+        deleted_count = self.vector_adapter.clean_collection(self, index_name, including_index_meta)
         self._log_tool_event(
-            f"Collection '{self.dataset}' has been cleaned. ",
+            f"Collection '{self.dataset}' has been cleaned. Deleted {deleted_count} records.",
             tool_name="_clean_collection"
         )
+        return deleted_count
 
     def index_documents(self, documents: Generator[Document, None, None], index_name: str, progress_step: int = 20, clean_index: bool = True):
         """ Index documents in the vectorstore.
