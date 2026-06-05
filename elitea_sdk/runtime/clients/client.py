@@ -412,9 +412,18 @@ class EliteAClient:
         if not model_name:
             raise ValueError("Model name must be provided")
 
-        # Determine if this is an Anthropic model
+        # Determine if this is an Anthropic model.
+        # openai_compatible=True forces ChatOpenAI even when the model name looks like
+        # Anthropic (e.g. Claude served via a LiteLLM OpenAI-passthrough endpoint).
+        # ChatAnthropic talks the Anthropic-native /v1/messages dialect; against an
+        # OpenAI-passthrough backend the tool_use blocks are dropped in translation
+        # (stop_reason=tool_use but content=[] / tool_calls=[]). ChatOpenAI talks the
+        # backend's native /chat/completions dialect, so tool calls parse correctly.
         model_name_lower = model_name.lower()
-        is_anthropic = "anthropic" in model_name_lower or "claude" in model_name_lower
+        openai_compat = bool(model_config.get("openai_compatible", False))
+        is_anthropic = (not openai_compat) and (
+            "anthropic" in model_name_lower or "claude" in model_name_lower
+        )
 
         logger.info(f"Creating {'ChatAnthropic' if is_anthropic else 'ChatOpenAI'} model: {model_name} with config: {model_config}")
 
@@ -450,9 +459,11 @@ class EliteAClient:
                 "max_tokens": llm_max_tokens,  # Always an integer now
                 "temperature": model_config.get("temperature"),
                 "max_retries": model_config.get("max_retries", 3),
-                "default_headers": {"openai-organization": str(self.project_id),
-                                    "Authorization": f"Bearer {self.auth_token}",
-                                    "anthropic-beta": "prompt-caching-2024-07-31"},
+                "default_headers": {
+                    "openai-organization": str(self.project_id),
+                    "Authorization": f"Bearer {self.auth_token}",
+                    "anthropic-beta": "prompt-caching-2024-07-31",
+                },
             }
             
             if model_config.get("reasoning_effort"):
@@ -730,7 +741,8 @@ class EliteAClient:
                     conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None,
                     is_subgraph: bool = False, middleware: Optional[list] = None,
                     exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
-                    auto_approve_sensitive_actions: bool = False):
+                    auto_approve_sensitive_actions: bool = False,
+                    openai_compatible: Optional[bool] = None):
         if tools is None:
             tools = []
         if chat_history is None:
@@ -754,6 +766,11 @@ class EliteAClient:
             if max_tokens == -1:
                 # default nuber for case when auto is selected for agent
                 max_tokens = 4000
+            # The explicit param is authoritative — it is always available from the
+            # request's llm kwargs, whereas llm_settings is absent when version_details
+            # is refetched (e.g. API-endpoint requests), where it would default to False.
+            if openai_compatible is None:
+                openai_compatible = data['llm_settings'].get('openai_compatible', False)
             llm = self.get_llm(
                 model_name=data['llm_settings']['model_name'],
                 model_config={
@@ -761,6 +778,7 @@ class EliteAClient:
                     "reasoning_effort": data['llm_settings'].get('reasoning_effort'),
                     "temperature": data['llm_settings']['temperature'],
                     "model_project_id": data['llm_settings'].get('model_project_id'),
+                    "openai_compatible": openai_compatible,
                 }
             )
         # Normalize app_type to canonical value (agent, pipeline, or predict)
