@@ -83,8 +83,6 @@ class SharepointConfiguration(BaseModel):
             McpAuthorizationRequired: delegated flow only, when token is absent
                 or invalid/expired.
         """
-        safe_settings = {k: "***" if k in ("client_secret", "access_token", "refresh_token") else v for k, v in settings.items()}
-        log.debug(f"Checking SharePoint connection with settings: {safe_settings}")
         oauth_discovery_endpoint = settings.get("oauth_discovery_endpoint")
         if oauth_discovery_endpoint:
             log.info("Using delegated flow (oauth_discovery_endpoint present)")
