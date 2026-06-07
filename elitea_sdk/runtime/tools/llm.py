@@ -2862,7 +2862,7 @@ class LLMNode(BaseTool):
         ``/chat/completions`` endpoint as a ``ChatOpenAI``.
 
         The signal is stamped on the client at build time in
-        ``RuntimeClient.get_llm`` (``_elitea_openai_compatible``). Such backends
+        ``EliteAClient.get_llm`` (``_elitea_openai_compatible``). Such backends
         reject the parallel_tool_calls / json_schema / output_format transforms
         litellm derives for Bedrock, so block-continuation and structured-output
         routing avoid those transforms for these clients.
