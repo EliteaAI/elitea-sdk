@@ -557,6 +557,12 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         node = _make_llm_node()
         struct_model = self._struct_model_with_question_list()
 
+        # These tests exercise the NATIVE structured-output path. node.client is a
+        # bare MagicMock whose auto-attribute would make the openai-compatible
+        # stamp-check read truthy; pin the discriminator to False so routing stays
+        # on the native with_structured_output branch.
+        node._client_is_openai_compatible = lambda client: False
+
         first_completion = _ai_with_tool_calls("planning", tool_calls=[
             {"id": "tc_1", "name": "search", "args": {}, "type": "tool_call"}
         ])
@@ -1546,3 +1552,154 @@ class TestHandleStructuredOutputFallbackThinkingModel:
         assert "function_calling" in method_calls, (
             "Non-thinking Anthropic fallback must attempt function_calling"
         )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible / proxy structured-output routing
+#
+# Covers the safety net for structured output behind passthrough proxies that
+# reject the with_structured_output transform (Bedrock: tool_choice.type;
+# Azure: tool_choice.function). Two avoidances:
+#   - proactive for openai-compatible clients (Claude via LiteLLM)
+#   - reactive for native clients when the proxy 400-rejects the transform
+# ---------------------------------------------------------------------------
+
+class _FakeBadRequest(Exception):
+    """Mimics openai/litellm BadRequestError: type name carries 'BadRequest'."""
+
+
+class _StampedClient:
+    """Bare client carrying the openai-compatible stamp (no auto-attrs)."""
+
+    def __init__(self, compatible: bool):
+        self._elitea_openai_compatible = compatible
+
+
+class _PlainClient:
+    """Bare client with no stamp at all."""
+
+
+class _BoundWrapper:
+    """RunnableBinding-like wrapper exposing the real model via .bound."""
+
+    def __init__(self, bound):
+        self.bound = bound
+
+
+class TestStructuredTransformRejectionDetector:
+    """_is_structured_transform_rejection — message/type signature matching."""
+
+    def test_bedrock_tool_choice_type(self):
+        exc = _FakeBadRequest(
+            "Error code: 400 - BedrockException - tool_choice.type: Field required"
+        )
+        assert LLMNode._is_structured_transform_rejection(exc) is True
+
+    def test_azure_tool_choice_function(self):
+        exc = _FakeBadRequest(
+            "Error code: 400 - AzureException BadRequestError - "
+            "Unknown parameter: 'tool_choice.function'"
+        )
+        assert LLMNode._is_structured_transform_rejection(exc) is True
+
+    def test_response_format_rejection(self):
+        exc = _FakeBadRequest("400 invalid_request_error: response_format not supported")
+        assert LLMNode._is_structured_transform_rejection(exc) is True
+
+    def test_message_attribute_is_inspected(self):
+        # openai errors carry the human text on .message, not necessarily str(exc)
+        exc = _FakeBadRequest("opaque")
+        exc.message = "400 BadRequestError: unknown parameter tool_choice.function"
+        assert LLMNode._is_structured_transform_rejection(exc) is True
+
+    def test_bad_request_without_transform_marker_is_not_rejection(self):
+        exc = _FakeBadRequest("Error code: 400 - context length exceeded")
+        assert LLMNode._is_structured_transform_rejection(exc) is False
+
+    def test_non_bad_request_is_not_rejection(self):
+        # Transform marker present but not a 400 / bad-request → not our case
+        exc = RuntimeError("tool_choice handling failed internally")
+        assert LLMNode._is_structured_transform_rejection(exc) is False
+
+
+class TestClientIsOpenAICompatible:
+    """_client_is_openai_compatible — reads the stamp on client and .bound."""
+
+    def test_stamped_true(self):
+        assert LLMNode._client_is_openai_compatible(_StampedClient(True)) is True
+
+    def test_stamped_false(self):
+        assert LLMNode._client_is_openai_compatible(_StampedClient(False)) is False
+
+    def test_unstamped_plain_client(self):
+        assert LLMNode._client_is_openai_compatible(_PlainClient()) is False
+
+    def test_stamp_on_bound_layer(self):
+        wrapped = _BoundWrapper(_StampedClient(True))
+        assert LLMNode._client_is_openai_compatible(wrapped) is True
+
+
+class TestSynthesizeStructuredRouting:
+    """_synthesize_structured — proactive + reactive JSON-prompt routing."""
+
+    def test_openai_compatible_skips_with_structured_output(self):
+        """Compatible client must go straight to the JSON-prompt path."""
+        node = _make_llm_node()
+        node.client = _StampedClient(True)
+        struct_model = _make_struct_model({"answer": {"type": "str", "description": "A"}})
+
+        # If with_structured_output were used this would be invoked — assert it isn't.
+        def fail_get_struct(client, model, method="function_calling"):
+            raise AssertionError("must not call __get_struct_output_model for compatible client")
+
+        node._LLMNode__get_struct_output_model = fail_get_struct
+
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(content='{"answer": "hi", "rs": ""}')
+
+        result = node._synthesize_structured(
+            llm_client, [HumanMessage(content="q")], struct_model, {}
+        )
+        assert result.answer == "hi"
+
+    def test_native_falls_back_on_transform_rejection(self):
+        """Native client whose proxy rejects the transform falls back to JSON-prompt."""
+        node = _make_llm_node()
+        node.client = _PlainClient()
+        struct_model = _make_struct_model({"answer": {"type": "str", "description": "A"}})
+
+        class _RejectingStruct:
+            def invoke(self, messages, config=None):
+                raise _FakeBadRequest(
+                    "400 AzureException BadRequestError - "
+                    "Unknown parameter: 'tool_choice.function'"
+                )
+
+        node._LLMNode__get_struct_output_model = lambda c, m: _RejectingStruct()
+
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(content='{"answer": "recovered", "rs": ""}')
+
+        result = node._synthesize_structured(
+            llm_client, [HumanMessage(content="q")], struct_model, {}
+        )
+        assert result.answer == "recovered"
+        # the plain (non-structured) client was used for the JSON-prompt retry
+        assert llm_client.invoke.called
+
+    def test_native_propagates_non_transform_error(self):
+        """A non-transform 400 (e.g. context length) must NOT be swallowed."""
+        node = _make_llm_node()
+        node.client = _PlainClient()
+        struct_model = _make_struct_model({"answer": {"type": "str", "description": "A"}})
+
+        class _OtherFailure:
+            def invoke(self, messages, config=None):
+                raise _FakeBadRequest("Error code: 400 - context length exceeded")
+
+        node._LLMNode__get_struct_output_model = lambda c, m: _OtherFailure()
+
+        with pytest.raises(_FakeBadRequest):
+            node._synthesize_structured(
+                MagicMock(), [HumanMessage(content="q")], struct_model, {}
+            )
