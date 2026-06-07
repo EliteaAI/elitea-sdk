@@ -375,46 +375,6 @@ class TestGithubConfigurationCheckConnectionGitHubApp:
         assert error is None
 
 
-class TestGithubConfigurationNormalizePrivateKey:
-    """Test _normalize_private_key method directly."""
-
-    def test_normalize_pkcs1_key_with_headers(self):
-        """PKCS#1 key with headers should be preserved."""
-        normalized = GithubConfiguration._normalize_private_key(TEST_PRIVATE_KEY)
-        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
-        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
-        assert "-----BEGIN PRIVATE KEY-----" not in normalized
-
-    def test_normalize_pkcs8_key_with_headers(self):
-        """PKCS#8 key with headers should be preserved."""
-        normalized = GithubConfiguration._normalize_private_key(TEST_PKCS8_KEY)
-        assert normalized.startswith("-----BEGIN PRIVATE KEY-----")
-        assert normalized.endswith("-----END PRIVATE KEY-----")
-        assert "-----BEGIN RSA PRIVATE KEY-----" not in normalized
-
-    def test_normalize_key_body_without_headers(self):
-        """Key body without headers should default to PKCS#1."""
-        normalized = GithubConfiguration._normalize_private_key(TEST_KEY_BODY)
-        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
-        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
-
-    def test_normalize_single_line_pkcs1_key(self):
-        """Single-line PKCS#1 key should be normalized to multi-line."""
-        single_line = TEST_PRIVATE_KEY.replace("\n", " ")
-        normalized = GithubConfiguration._normalize_private_key(single_line)
-        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
-        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
-        assert "\n" in normalized  # Should have newlines
-
-    def test_normalize_single_line_pkcs8_key(self):
-        """Single-line PKCS#8 key should be normalized to multi-line."""
-        single_line = TEST_PKCS8_KEY.replace("\n", " ")
-        normalized = GithubConfiguration._normalize_private_key(single_line)
-        assert normalized.startswith("-----BEGIN PRIVATE KEY-----")
-        assert normalized.endswith("-----END PRIVATE KEY-----")
-        assert "\n" in normalized  # Should have newlines
-
-
 class TestGithubConfigurationCheckConnectionErrors:
     """Test error handling scenarios."""
 

@@ -230,3 +230,49 @@ def detect_mime_type(file_bytes: bytes, filename: str) -> str:
     
     # Default fallback
     return 'application/octet-stream'
+
+
+def normalize_pem_key(private_key: str) -> str:
+    """
+    Normalize a PEM private key to proper format.
+
+    Handles keys with or without headers/footers, single-line keys,
+    and mixed formats. Supports both PKCS#1 (RSA PRIVATE KEY) and
+    PKCS#8 (PRIVATE KEY) formats.
+
+    Args:
+        private_key: Raw private key string in any format
+
+    Returns:
+        Normalized PEM-formatted private key string
+    """
+    pkcs1_header = "-----BEGIN RSA PRIVATE KEY-----"
+    pkcs1_footer = "-----END RSA PRIVATE KEY-----"
+    pkcs8_header = "-----BEGIN PRIVATE KEY-----"
+    pkcs8_footer = "-----END PRIVATE KEY-----"
+
+    key = private_key.strip()
+
+    detected_header = None
+    detected_footer = None
+
+    if pkcs1_header in key:
+        detected_header = pkcs1_header
+        detected_footer = pkcs1_footer
+        key = key.replace(pkcs1_header, "").replace(pkcs1_footer, "").strip()
+    elif pkcs8_header in key:
+        detected_header = pkcs8_header
+        detected_footer = pkcs8_footer
+        key = key.replace(pkcs8_header, "").replace(pkcs8_footer, "").strip()
+    else:
+        key = key.replace(pkcs1_footer, "").replace(pkcs8_footer, "").strip()
+
+    key_body = key.replace(" ", "\n")
+    key_lines = [line.strip() for line in key_body.split("\n") if line.strip()]
+    key_body = "\n".join(key_lines)
+
+    if detected_header is None:
+        detected_header = pkcs1_header
+        detected_footer = pkcs1_footer
+
+    return f"{detected_header}\n{key_body}\n{detected_footer}"
