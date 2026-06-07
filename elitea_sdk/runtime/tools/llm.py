@@ -346,8 +346,7 @@ class LLMNode(BaseTool):
             return False
         return any(
             marker in msg for marker in (
-                'tool_choice', 'response_format', 'json_schema',
-                'output_format', 'unknown parameter',
+                'tool_choice', 'response_format', 'json_schema', 'output_format',
             )
         )
 
