@@ -264,8 +264,14 @@ def normalize_pem_key(private_key: str) -> str:
         detected_header = pkcs8_header
         detected_footer = pkcs8_footer
         key = key.replace(pkcs8_header, "").replace(pkcs8_footer, "").strip()
-    else:
-        key = key.replace(pkcs1_footer, "").replace(pkcs8_footer, "").strip()
+    elif pkcs8_footer in key:
+        detected_header = pkcs8_header
+        detected_footer = pkcs8_footer
+        key = key.replace(pkcs8_footer, "").replace(pkcs1_footer, "").strip()
+    elif pkcs1_footer in key:
+        detected_header = pkcs1_header
+        detected_footer = pkcs1_footer
+        key = key.replace(pkcs1_footer, "").strip()
 
     key_body = key.replace(" ", "\n")
     key_lines = [line.strip() for line in key_body.split("\n") if line.strip()]

@@ -139,9 +139,9 @@ class TestNormalizePemKey:
         assert normalized.count("-----END RSA PRIVATE KEY-----") == 1
 
     def test_footer_only_pkcs8(self):
-        """Key with only PKCS#8 footer should be sanitized."""
+        """Key with only PKCS#8 footer should use PKCS#8 format."""
         key_with_footer_only = TEST_KEY_BODY + "\n-----END PRIVATE KEY-----"
         normalized = normalize_pem_key(key_with_footer_only)
-        assert normalized.startswith("-----BEGIN RSA PRIVATE KEY-----")
-        assert normalized.endswith("-----END RSA PRIVATE KEY-----")
-        assert "-----END PRIVATE KEY-----" not in normalized
+        assert normalized.startswith("-----BEGIN PRIVATE KEY-----")
+        assert normalized.endswith("-----END PRIVATE KEY-----")
+        assert normalized.count("-----END PRIVATE KEY-----") == 1
