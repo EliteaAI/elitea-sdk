@@ -163,7 +163,6 @@ class PGVectorAdapter(VectorStoreAdapter):
         """Get all indexed data from PGVector for non-code content per index_name."""
         from sqlalchemy.orm import Session
         from sqlalchemy import func
-        from ...runtime.utils.utils import IndexerKeywords
 
         result = {}
         try:
@@ -351,7 +350,6 @@ class ChromaAdapter(VectorStoreAdapter):
 
     def clean_collection(self, vectorstore_wrapper, index_name: str = '', including_index_meta: bool = False) -> int:
         """Clean the vectorstore collection by deleting indexed data filtered by index_name."""
-        from ...runtime.utils.utils import IndexerKeywords
 
         if index_name:
             data = vectorstore_wrapper.vectorstore.get(
@@ -378,7 +376,6 @@ class ChromaAdapter(VectorStoreAdapter):
 
     def get_indexed_data(self, vectorstore_wrapper):
         """Get all indexed data from Chroma for non-code content"""
-        from ...runtime.utils.utils import IndexerKeywords
 
         result = {}
         try:
