@@ -516,6 +516,11 @@ class EliteAClient:
                 target_kwargs["use_responses_api"] = True
 
             llm = ChatOpenAI(**target_kwargs)
+        # Stamp the openai-compatible signal on the client so downstream nodes
+        # (LLMNode block-continuation + structured-output routing) can tell a
+        # Claude-via-LiteLLM-passthrough ChatOpenAI apart from a native client.
+        # object.__setattr__ bypasses the pydantic field guard on the chat model.
+        object.__setattr__(llm, '_elitea_openai_compatible', bool(openai_compat))
         return llm
 
     def get_low_tier_llm(self, max_tokens: int = 1024, temperature: float = 0.7,

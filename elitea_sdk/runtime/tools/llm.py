@@ -286,13 +286,96 @@ class LLMNode(BaseTool):
                 self.__perform_tool_calling(initial_completion, messages, llm_client, config)
             )
             clean_messages = self._build_clean_messages_for_structured_output(new_messages)
-            llm = self.__get_struct_output_model(llm_client, struct_model)
-            completion = llm.invoke(clean_messages, config=config)
+            completion = self._synthesize_structured(llm_client, clean_messages, struct_model, config)
             return completion, initial_completion, new_messages
 
-        llm = self.__get_struct_output_model(llm_client, struct_model)
-        completion = llm.invoke(messages, config=config)
+        completion = self._synthesize_structured(llm_client, messages, struct_model, config)
         return completion, initial_completion, messages
+
+    def _synthesize_structured(self, llm_client: Any, synth_messages: List, struct_model: Any, config: RunnableConfig) -> Any:
+        """Produce a structured completion from ``synth_messages``.
+
+        ``with_structured_output`` makes the provider emit a ``tool_choice`` /
+        ``response_format`` / ``json_schema`` transform. Some passthrough proxies
+        reject that transform with a 400 (Bedrock: ``tool_choice.type``; Azure:
+        ``Unknown parameter: 'tool_choice.function'``). We avoid it two ways:
+
+        - **Proactively** for OpenAI-compatible passthrough clients (Claude via
+          LiteLLM) — they always reject, so go straight to the JSON-prompt path.
+        - **Reactively** for native clients — try ``with_structured_output`` and,
+          if the proxy rejects the transform, fall back to the JSON-prompt path
+          rather than leaking a 400 to the UI.
+
+        The JSON-prompt path reuses the same extraction machinery as the
+        fallback path: instruct the model to emit a JSON object, then parse it
+        from the text response.
+        """
+        if self._client_is_openai_compatible(self.client):
+            return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
+
+        try:
+            llm = self.__get_struct_output_model(llm_client, struct_model)
+            return llm.invoke(synth_messages, config=config)
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            if not self._is_structured_transform_rejection(exc):
+                raise
+            logger.warning(
+                "Structured-output transform rejected by provider (%s); "
+                "retrying via JSON-prompt parsing", type(exc).__name__
+            )
+            return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
+
+    @staticmethod
+    def _is_structured_transform_rejection(exc: Exception) -> bool:
+        """True when a provider 400-rejected the ``with_structured_output`` transform.
+
+        Detects the bad-request signatures proxies raise when they don't support
+        the ``tool_choice`` / ``response_format`` / ``json_schema`` shape litellm
+        derives (e.g. Bedrock ``tool_choice.type``, Azure ``tool_choice.function``).
+        """
+        msg = str(getattr(exc, 'message', '') or exc).lower()
+        is_bad_request = (
+            'badrequest' in type(exc).__name__.lower()
+            or 'badrequesterror' in msg
+            or '400' in msg
+            or 'invalid_request_error' in msg
+        )
+        if not is_bad_request:
+            return False
+        return any(
+            marker in msg for marker in (
+                'tool_choice', 'response_format', 'json_schema', 'output_format',
+            )
+        )
+
+    def _structured_via_json_prompt(self, llm_client: Any, synth_messages: List, struct_model: Any, config: RunnableConfig) -> Any:
+        """Prompt for a JSON object and parse it from the text response.
+
+        Provider-agnostic structured-output path: no ``with_structured_output``
+        transform, so it works on any proxy that rejects that transform.
+        """
+        json_instruction = self._build_json_instruction(struct_model)
+        prompt_messages = list(synth_messages)
+        last = prompt_messages[-1] if prompt_messages else None
+        if isinstance(last, HumanMessage) and isinstance(last.content, str):
+            prompt_messages[-1] = HumanMessage(content=last.content + json_instruction)
+        else:
+            prompt_messages.append(HumanMessage(content=json_instruction))
+
+        completion = llm_client.invoke(prompt_messages, config=config)
+        extracted = self._extract_structured_from_content(completion, struct_model)
+        if extracted is not None:
+            return extracted
+
+        content = completion.content if hasattr(completion, 'content') else str(completion)
+        if isinstance(content, list):
+            content = ''.join(
+                b.get('text', '') for b in content
+                if isinstance(b, dict) and b.get('type') == 'text'
+            )
+        return self._create_fallback_completion(str(content).strip(), struct_model)
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -980,6 +1063,16 @@ class LLMNode(BaseTool):
         return forced_tools
 
     def _build_forced_followup_client(self, followup_tools: List[BaseTool]) -> Any:
+        # OpenAI-compatible passthrough (Claude via LiteLLM) rejects the
+        # tool_choice litellm derives from parallel_tool_calls=False for Bedrock
+        # ("tool_choice.type: Field required"). The block is still honored — the
+        # blocked tools are already excluded from followup_tools — so bind plain.
+        if self._client_is_openai_compatible(self.client):
+            logger.info(
+                "Blocked-tool continuation: openai-compatible client, binding allowed tools without parallel_tool_calls [%s]",
+                ', '.join(tool.name for tool in followup_tools),
+            )
+            return self.client.bind_tools(followup_tools)
         try:
             logger.info(
                 "Blocked-tool continuation: constraining LLM to allowed tools [%s]",
@@ -2758,6 +2851,23 @@ class LLMNode(BaseTool):
         for candidate in LLMNode._anthropic_candidates(client):
             module = getattr(type(candidate), '__module__', '') or ''
             if 'langchain_anthropic' in module:
+                return True
+        return False
+
+    @staticmethod
+    def _client_is_openai_compatible(client: Any) -> bool:
+        """Return True when *client* is (or wraps) an OpenAI-compatible
+        passthrough client — e.g. Claude served via a LiteLLM
+        ``/chat/completions`` endpoint as a ``ChatOpenAI``.
+
+        The signal is stamped on the client at build time in
+        ``EliteAClient.get_llm`` (``_elitea_openai_compatible``). Such backends
+        reject the parallel_tool_calls / json_schema / output_format transforms
+        litellm derives for Bedrock, so block-continuation and structured-output
+        routing avoid those transforms for these clients.
+        """
+        for candidate in LLMNode._anthropic_candidates(client):
+            if getattr(candidate, '_elitea_openai_compatible', False):
                 return True
         return False
 
