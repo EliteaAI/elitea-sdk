@@ -48,7 +48,7 @@ def test_load_returns_single_doc_when_content_fits_max_tokens():
     assert len(docs) == 1
     # When not actually split, metadata must stay clean (no chunker-added keys).
     assert "chunk_id" not in docs[0].metadata
-    assert docs[0].metadata.get("processing_method") == "ocr"
+    assert docs[0].metadata.get("processing_method") == "none"
 
 
 @pytest.mark.parametrize("disabled_value", [-1, 0, None])
