@@ -147,7 +147,7 @@ nodes:
     output:
       - list_result_recursive
     structured_output: true
-    transition: validate_results
+    transition: cleanup_delete_branch
 
   - id: validate_results
     type: llm
@@ -199,7 +199,7 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: cleanup_delete_branch
+    transition: END
 
   - id: cleanup_delete_branch
     type: toolkit
@@ -219,4 +219,4 @@ nodes:
     output:
      - cleanup_result
     structured_output: true
-    transition: END
+    transition: validate_results
