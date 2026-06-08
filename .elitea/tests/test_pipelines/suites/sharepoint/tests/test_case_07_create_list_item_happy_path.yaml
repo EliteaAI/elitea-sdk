@@ -86,11 +86,11 @@ nodes:
 
           evaluate:
           1. did the tool execute successfully?
-          2. are there any error indicators in the output?
-          3. does the result contain an id field?
-          4. is the id a positive integer?
-          5. are the provided fields present in the response?
-          6. does the response include the title field value?
+          2. does the result contain an id field with a valid positive integer value?
+          3. are the provided fields present in the response?
+          4. does the response include the title field value matching the provided title?
+          5. is there an explicit error message string (not just a JSON key named 'error') indicating failure?
+          note: the raw JSON output may contain keys named 'error' as part of normal field metadata (e.g. @odata fields). only flag as failed if the value of such a key contains an actual error message string.
 
           return a json object with:
           {{
@@ -99,7 +99,7 @@ nodes:
             "error": "error details if failed, null if passed"
           }}
 
-          return **only** the json object. no markdown formatting, no additional text.
+          return **only** the json object. no markdown formatting, no additional text. keep response under 300 tokens.
       chat_history:
         type: fixed
         value: []
