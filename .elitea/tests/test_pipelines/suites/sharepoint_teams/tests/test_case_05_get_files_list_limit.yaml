@@ -1,0 +1,138 @@
+name: "SPT05 - get_files_list: Limit parameter validation"
+priority: High
+description: |
+  Verify the SharePoint 'get_files_list' tool respects the limit_files parameter
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully without errors on teams site
+  - Returns exactly N files where N = min(limit_files, total_files_available)
+  - Files are not duplicated
+  - File paths contain /teams/ prefix
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  folder_path:
+    type: str
+    value: "Shared Documents/${SHAREPOINT_TEAMS_TEST_FOLDER}"
+  limit_small:
+    type: int
+    value: 1
+  limit_medium:
+    type: int
+    value: 5
+  files_result_small:
+    type: dict
+  files_result_medium:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_files_list_small
+
+nodes:
+  - id: invoke_get_files_list_small
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_small
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_small
+    output:
+      - files_result_small
+    structured_output: true
+    transition: invoke_get_files_list_medium
+
+  - id: invoke_get_files_list_medium
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_medium
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_medium
+    output:
+      - files_result_medium
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result_small
+      - files_result_medium
+      - limit_small
+      - limit_medium
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the 'get_files_list' tool execution with different limit values on a /teams/ site.
+
+          Test 1 - Limit={limit_small}:
+          Result: {files_result_small}
+
+          Test 2 - Limit={limit_medium}:
+          Result: {files_result_medium}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. Both tool executions succeed without errors
+          2. Both results are valid JSON arrays (not null, not error messages)
+          3. Result 1 is NOT EMPTY - must contain exactly {limit_small} file(s)
+             (test data: test-document.txt, test-data.xlsx exist in folder)
+          4. Result 2 is NOT EMPTY - must contain at least {limit_small} file(s)
+          5. Result 1 count equals exactly {limit_small} (limit enforced)
+          6. Result 2 count is between {limit_small} and {limit_medium} inclusive
+          7. Result 2 count >= Result 1 count (more files with higher limit)
+          8. Each file object MUST have: Name, Path, Created, Modified, Link
+          9. All file paths MUST contain '/teams/' substring
+          10. No duplicate files within each result (check by Name or Path)
+
+          TEST FAILS if:
+          - Either result is empty [] (missing test data - need 2+ files in folder)
+          - Result 1 doesn't have exactly {limit_small} file
+          - Result 2 has fewer files than Result 1
+          - Any file missing required fields
+          - Paths don't contain '/teams/'
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "result1_count": <number of files in result 1>,
+            "result2_count": <number of files in result 2>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END

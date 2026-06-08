@@ -1,0 +1,89 @@
+name: sharepoint_teams
+description: |
+  SharePoint Teams site_path integration tests
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+
+  Tests verify that the site_path field correctly resolves 'teams/<name>' URLs
+  and that toolkit operations work against /teams/ SharePoint spaces.
+
+  Test Structure:
+  - SPT01: get_files_list from teams site
+  - SPT02: read_document from teams site
+  - SPT03: get_lists (verify connection)
+
+env_mapping:
+  SHAREPOINT_TENANT_URL: ${SHAREPOINT_TENANT_URL:https://5clkvm.sharepoint.com}
+  SHAREPOINT_CLIENT_ID: ${SHAREPOINT_CLIENT_ID:84c01a1e-1ebc-40c0-b55a-8b3fae194e41}
+  SHAREPOINT_CLIENT_SECRET: ${SHAREPOINT_CLIENT_SECRET}
+  SHAREPOINT_TEAMS_SITE_PATH: ${SHAREPOINT_TEAMS_SITE_PATH:teams/epam_3}
+  SHAREPOINT_TEAMS_TEST_FOLDER: ${SHAREPOINT_TEAMS_TEST_FOLDER:DO_NOT_DELETE_TeamsTestFiles}
+  SHAREPOINT_TEAMS_TEST_FILE: ${SHAREPOINT_TEAMS_TEST_FILE:test-document.txt}
+  SHAREPOINT_TEAMS_DOCUMENT_PATH: ${SHAREPOINT_TEAMS_DOCUMENT_PATH:/teams/epam_3/Shared Documents/DO_NOT_DELETE_TeamsTestFiles}
+
+setup:
+  - name: Setup SharePoint Configuration (Tenant URL)
+    type: configuration
+    config:
+      config_type: sharepoint
+      elitea_title: ${SHAREPOINT_SECRET_NAME:sharepoint-teams}
+      data:
+        site_url: ${SHAREPOINT_TENANT_URL:https://5clkvm.sharepoint.com}
+        client_id: ${SHAREPOINT_CLIENT_ID:84c01a1e-1ebc-40c0-b55a-8b3fae194e41}
+        client_secret: ${SHAREPOINT_CLIENT_SECRET}
+
+  - name: Create SharePoint Teams Toolkit (site_path)
+    type: toolkit
+    action: create_or_update
+    config:
+      config_file: ../../configs/sharepoint-teams-config.json
+      toolkit_type: sharepoint
+      overrides:
+        sharepoint_configuration:
+          private: false
+          elitea_title: ${SHAREPOINT_SECRET_NAME:sharepoint-teams}
+        site_path: ${SHAREPOINT_TEAMS_SITE_PATH:teams/epam_3}
+      toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME:sharepoint-teams-testing}
+    save_to_env:
+      - key: SHAREPOINT_TEAMS_TOOLKIT_ID
+        value: $.id
+      - key: SHAREPOINT_TEAMS_TOOLKIT_NAME
+        value: $.name
+
+composable_pipelines: []
+
+execution:
+  test_directory: tests
+  order:
+    - test_case_*.yaml
+
+  substitutions:
+    SHAREPOINT_TEAMS_TOOLKIT_ID: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    SHAREPOINT_TEAMS_TOOLKIT_NAME: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    SHAREPOINT_TEAMS_SITE_PATH: ${SHAREPOINT_TEAMS_SITE_PATH:teams/epam_3}
+    SHAREPOINT_TEAMS_TEST_FOLDER: ${SHAREPOINT_TEAMS_TEST_FOLDER:DO_NOT_DELETE_TeamsTestFiles}
+    SHAREPOINT_TEAMS_TEST_FILE: ${SHAREPOINT_TEAMS_TEST_FILE:test-document.txt}
+    SHAREPOINT_TEAMS_DOCUMENT_PATH: ${SHAREPOINT_TEAMS_DOCUMENT_PATH:/teams/epam_3/Shared Documents/DO_NOT_DELETE_TeamsTestFiles}
+    TIMESTAMP: ${TIMESTAMP}
+    DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:gpt-4o-2024-11-20}
+
+  settings:
+    timeout: 180
+    parallel: 3
+    stop_on_failure: false
+
+exclude_tests: []
+
+cleanup:
+  - name: Delete Test Pipelines
+    type: pipeline
+    config:
+      pattern: "SPT*"
+    continue_on_error: true
+
+  - name: Delete SharePoint Teams Toolkit
+    type: toolkit
+    config:
+      toolkit_id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    enabled: true
+    continue_on_error: true

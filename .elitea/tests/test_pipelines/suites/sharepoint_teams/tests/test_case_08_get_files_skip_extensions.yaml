@@ -1,0 +1,173 @@
+name: "SPT08 - get_files_list: Skip specific file extensions"
+priority: High
+description: |
+  Verify the SharePoint 'get_files_list' tool filters out files using skip_extensions parameter
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully on teams site
+  - Returns all files EXCEPT those with extensions in skip_extensions list
+  - Extensions are matched case-insensitively
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  folder_path:
+    type: str
+    value: "Shared Documents/${SHAREPOINT_TEAMS_TEST_FOLDER}"
+  limit_files:
+    type: int
+    value: 50
+  skip_txt:
+    type: list
+    value: ["txt"]
+  skip_xlsx:
+    type: list
+    value: [".xlsx"]
+  files_result_all:
+    type: dict
+  files_result_skip_txt:
+    type: dict
+  files_result_skip_xlsx:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_files_all
+
+nodes:
+  - id: invoke_get_files_all
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+    output:
+      - files_result_all
+    structured_output: true
+    transition: invoke_get_files_skip_txt
+
+  - id: invoke_get_files_skip_txt
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - skip_txt
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      skip_extensions:
+        type: variable
+        value: skip_txt
+    output:
+      - files_result_skip_txt
+    structured_output: true
+    transition: invoke_get_files_skip_xlsx
+
+  - id: invoke_get_files_skip_xlsx
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - skip_xlsx
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      skip_extensions:
+        type: variable
+        value: skip_xlsx
+    output:
+      - files_result_skip_xlsx
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result_all
+      - files_result_skip_txt
+      - files_result_skip_xlsx
+      - skip_txt
+      - skip_xlsx
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the 'get_files_list' tool execution with skip_extensions filter on /teams/ site.
+
+          Baseline - No filter:
+          Result: {files_result_all}
+
+          Test 1 - Skip extensions: {skip_txt}
+          Result: {files_result_skip_txt}
+
+          Test 2 - Skip extensions: {skip_xlsx}
+          Result: {files_result_skip_xlsx}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. All tool executions succeed without errors
+          2. Baseline is NOT EMPTY - must contain at least 2 files
+             (test data: test-document.txt and test-data.xlsx)
+          3. Test 1 has NO .txt files (zero .txt files)
+          4. Test 1 has at least 1 file (the .xlsx should remain)
+          5. Test 2 has NO .xlsx files (zero .xlsx files)
+          6. Test 2 has at least 1 file (the .txt should remain)
+          7. Both filtered results have fewer files than baseline
+          8. All file paths contain '/teams/' substring
+          9. Each file has Name, Path, Created, Modified, Link fields
+
+          TEST FAILS if:
+          - Baseline is empty [] (missing test data)
+          - Test 1 contains any .txt files
+          - Test 2 contains any .xlsx files
+          - Either filtered result is empty (both file types should exist)
+          - Paths don't contain '/teams/'
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "baseline_count": <number of files in baseline>,
+            "skip_txt_count": <number of files after skipping txt>,
+            "skip_xlsx_count": <number of files after skipping xlsx>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END

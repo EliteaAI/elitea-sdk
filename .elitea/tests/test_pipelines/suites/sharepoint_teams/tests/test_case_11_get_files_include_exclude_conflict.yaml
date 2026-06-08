@@ -1,0 +1,198 @@
+name: "SPT11 - get_files_list: Include/Exclude conflict (edge case)"
+priority: High
+description: |
+  Verify the SharePoint 'get_files_list' tool handles conflicting include/skip extensions correctly
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully on teams site
+  - When extension is in BOTH include and skip, skip takes precedence
+  - Demonstrates that exclusion rules always override inclusion rules
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  folder_path:
+    type: str
+    value: "Shared Documents/${SHAREPOINT_TEAMS_TEST_FOLDER}"
+  limit_files:
+    type: int
+    value: 50
+  include_all:
+    type: list
+    value: ["txt", "xlsx"]
+  include_txt_xlsx:
+    type: list
+    value: ["txt", "xlsx"]
+  skip_txt:
+    type: list
+    value: ["txt"]
+  include_same:
+    type: list
+    value: ["txt", "xlsx"]
+  skip_same:
+    type: list
+    value: ["txt", "xlsx"]
+  files_result_baseline:
+    type: dict
+  files_result_conflict:
+    type: dict
+  files_result_equal_conflict:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_baseline
+
+nodes:
+  - id: invoke_baseline
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - include_all
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      include_extensions:
+        type: variable
+        value: include_all
+    output:
+      - files_result_baseline
+    structured_output: true
+    transition: invoke_conflict_test
+
+  - id: invoke_conflict_test
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - include_txt_xlsx
+      - skip_txt
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      include_extensions:
+        type: variable
+        value: include_txt_xlsx
+      skip_extensions:
+        type: variable
+        value: skip_txt
+    output:
+      - files_result_conflict
+    structured_output: true
+    transition: invoke_equal_conflict_test
+
+  - id: invoke_equal_conflict_test
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - include_same
+      - skip_same
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      include_extensions:
+        type: variable
+        value: include_same
+      skip_extensions:
+        type: variable
+        value: skip_same
+    output:
+      - files_result_equal_conflict
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result_baseline
+      - files_result_conflict
+      - files_result_equal_conflict
+      - include_txt_xlsx
+      - skip_txt
+      - include_same
+      - skip_same
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the 'get_files_list' tool with conflicting include/skip extensions on /teams/ site.
+
+          Baseline - Include: ['txt', 'xlsx']
+          Result: {files_result_baseline}
+
+          Test 1 (Partial Conflict) - Include: {include_txt_xlsx}, Skip: {skip_txt}
+          Result: {files_result_conflict}
+
+          Test 2 (Full Conflict) - Include: {include_same}, Skip: {skip_same}
+          Result: {files_result_equal_conflict}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. All tool executions succeed without errors
+          2. Baseline is NOT EMPTY - must contain at least 2 files
+             (test data: test-document.txt and test-data.xlsx)
+
+          Test 1 (Partial Conflict):
+          3. Includes 'txt' and 'xlsx' BUT also skips 'txt'
+          4. Skip takes precedence: result contains ONLY .xlsx files (NO .txt)
+          5. Result is NOT empty (should have .xlsx file)
+
+          Test 2 (Full Conflict - skip == include):
+          6. Include and skip lists are IDENTICAL: ['txt', 'xlsx']
+          7. Skip takes precedence for ALL extensions
+          8. Result should be EMPTY [] (no files match after skip)
+
+          TEST FAILS if:
+          - Baseline is empty [] (missing test data)
+          - Test 1 contains any .txt files (skip should exclude them)
+          - Test 1 is empty (should have .xlsx)
+          - Test 2 is NOT empty (all extensions are skipped)
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "baseline_count": <number of files in baseline>,
+            "conflict_count": <number of files in partial conflict test>,
+            "equal_conflict_count": <number of files in full conflict test>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END
