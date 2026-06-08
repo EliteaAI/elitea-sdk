@@ -101,7 +101,6 @@ runtime = [
     "opentelemetry_instrumentation>=0.46b0",
     "grpcio_status>=1.63.0rc1",
     "protobuf>=4.25.7",
-    "streamlit>=1.28.0",
 ]
 
 tools = [
@@ -179,6 +178,7 @@ dev = [
     "mypy",
     "deepeval>=3.4.6",
     "testcontainers[postgres]>=4.0.0",
+    "streamlit>=1.28.0",
 ]
 
 reporting = [
