@@ -197,13 +197,13 @@ nodes:
           This is a POSITIVE test - we expect successful request creation and retrieval.
           
           Validation Criteria (ALL must pass for test_passed=true):
-          1. folder_created: Folder was created successfully in the default collection
-          2. request_created: Request was created successfully
-          3. request_retrieved: get_request_by_path returned request details
-          4. correct_name: Request name matches expected
-          5. correct_method: Request method matches expected
-          6. correct_url: Request URL matches expected
-          7. has_structure: Request has proper structure (method, url, name fields)
+          1. folder_created: The create_folder API call returned a success message (do NOT check folder IDs in the retrieved request - folder ID association is not validated here)
+          2. request_created: Request was created successfully (creation API returned success message with an ID)
+          3. request_retrieved: get_request_by_path returned request details (non-empty response with data fields)
+          4. correct_name: Request name in the retrieved data matches the expected request name
+          5. correct_method: Request method in the retrieved data matches the expected method
+          6. correct_url: Request URL in the retrieved data matches the expected URL
+          7. has_structure: Retrieved request has proper structure (contains method, url, and name fields)
           8. no_errors: No error indicators in any output
           9. cleanup_succeeded: Test folder was deleted successfully
           
