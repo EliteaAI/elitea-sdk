@@ -106,6 +106,7 @@ nodes:
     output:
       - result_read_elitea
     structured_output: true
+    continue_on_error: true
     tool: read_file
     toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
     transition: switch_to_main_branch
@@ -161,9 +162,9 @@ nodes:
           1. active_switch_success: Switch to ActiveBranchTest succeeded
           2. active_read_success: Read file on ActiveBranchTest returned content (file exists)
           3. elitea_switch_success: Switch to EliteaTest succeeded
-          4. elitea_read_expected_fail: Read file on EliteaTest failed (file doesn't exist - this is expected)
+          4. elitea_read_expected_fail: Read file on EliteaTest failed (file doesn't exist - this is expected and correct)
           5. main_switch_success: Switch to main succeeded
-          6. no_unexpected_errors: No unexpected errors in any operation
+          6. no_unexpected_errors: No unexpected errors in any operation EXCEPT the expected read failure on EliteaTest (criterion 4) - that error is intentional and must NOT count against this criterion
 
           Return a JSON object with structure:
           {{
