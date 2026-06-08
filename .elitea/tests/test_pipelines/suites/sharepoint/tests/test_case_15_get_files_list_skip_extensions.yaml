@@ -124,34 +124,36 @@ nodes:
         value: |
           Analyze the 'get_files_list' tool execution with skip_extensions filter.
 
-          Baseline - No filter:
+          Baseline - No filter (all files returned):
           Result: {files_result_all}
 
-          Test 1 - Skip extensions: {skip_txt}
+          Test 1 - skip_extensions={skip_txt} (skip .txt files, keep all others):
           Result: {files_result_skip_txt}
 
-          Test 2 - Skip extensions: {skip_multiple}
+          Test 2 - skip_extensions={skip_multiple} (skip .pdf/.docx/.png files, keep all others):
           Result: {files_result_skip_multiple}
 
-          Expected behavior:
-          - All tool executions succeed without errors
-          - Baseline MUST return files (test data should exist)
-          - Test 1 returns all files EXCEPT .txt files
-          - Test 2 returns all files EXCEPT .pdf, .docx, .png files (NONE of these should be present)
-          - Extensions are matched case-insensitively
-          - Filtered results should have <= files than baseline
+          How skip_extensions works:
+          - Files whose extension matches any entry in skip_extensions are EXCLUDED from results
+          - Files whose extension does NOT match are INCLUDED (kept) in results
+          - Both "txt" and ".txt" formats are accepted (dot is optional)
 
-          Validation rules:
-          1. Check all result structures are valid (not error/exception)
-          2. Verify baseline result is non-empty (if empty, test fails - missing test data)
-          3. Extract file extensions from each result
-          4. Verify Test 1 has NO .txt files (zero .txt files)
-          5. Verify Test 2 has NO .pdf files (zero .pdf files)
-          6. Verify Test 2 has NO .docx files (zero .docx files)
-          7. Verify Test 2 has NO .png files (zero .png files)
-          8. Verify Test 1 count <= Baseline count
-          9. Verify Test 2 count <= Baseline count
-          10. Calculate how many files were filtered in each test
+          Validation rules (check each independently):
+          1. Baseline result must be a valid list (not an error string) and non-empty
+          2. Test 1 result must be a valid list (not an error string)
+          3. Test 2 result must be a valid list (not an error string)
+          4. Test 1: count the .txt files in the result — there must be ZERO .txt files
+          5. Test 1: count must be less than baseline count (at least one .txt was filtered)
+          6. Test 2: count the .pdf files in the result — there must be ZERO .pdf files
+          7. Test 2: count the .docx files in the result — there must be ZERO .docx files
+          8. Test 2: count the .png files in the result — there must be ZERO .png files
+          9. Test 2: count must be less than baseline count (at least one file was filtered)
+          10. Test 1 MAY contain .docx, .pdf, .png files — those are expected and correct (they were NOT skipped)
+          11. Test 2 MAY contain .txt files — those are expected and correct (they were NOT skipped)
+
+          Determine test_passed:
+          - true if ALL rules 1-9 pass
+          - false if ANY rule fails
 
           return a json object with:
           {{
