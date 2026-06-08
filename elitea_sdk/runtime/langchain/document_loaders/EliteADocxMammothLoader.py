@@ -5,8 +5,6 @@ import uuid
 from io import BytesIO
 
 import mammoth.images
-import pytesseract
-from PIL import Image
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 from mammoth import convert_to_html
@@ -152,9 +150,9 @@ class EliteADocxMammothLoader(BaseLoader):
     def __handle_image(self, image) -> dict:
         """Handles image processing with dedup cache.
 
-        On first encounter of unique image bytes: process via LLM/Tesseract,
-        cache result, return transcript with filename.  On duplicate bytes:
-        return back-reference placeholder.
+        On first encounter of unique image bytes: transcribe via the LLM
+        vision model, cache result, return transcript with filename.  On
+        duplicate bytes: return back-reference placeholder.
         """
         from elitea_sdk.tools.utils.content_parser import image_processing_prompt
 
@@ -180,11 +178,7 @@ class EliteADocxMammothLoader(BaseLoader):
                     transcript = None
 
             if transcript is None:
-                try:
-                    img = Image.open(BytesIO(image_bytes))
-                    transcript = pytesseract.image_to_string(image=img)
-                except Exception:
-                    transcript = "Transcript is not available"
+                transcript = "Transcript is not available"
 
             self._image_cache[img_hash] = transcript
             return {"src": f"Image: {image_name}, {transcript}"}
@@ -581,8 +575,7 @@ class EliteADocxMammothLoader(BaseLoader):
                         image_bytes, self.llm,
                         self.prompt if self.prompt else image_processing_prompt)
                 else:
-                    img = Image.open(BytesIO(image_bytes))
-                    transcript = pytesseract.image_to_string(image=img)
+                    transcript = "Transcript is not available"
                 results[name] = transcript
             except Exception as exc:
                 results[name] = f"Error: {exc}"

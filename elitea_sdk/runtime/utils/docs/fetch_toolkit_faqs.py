@@ -47,7 +47,7 @@ TOOLKITS = [
     # Data
     'elastic', 'google', 'pandas', 'sql',
     # Documents
-    'powerpoint', 'ocr'
+    'powerpoint'
 ]
 
 
