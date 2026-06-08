@@ -1,0 +1,82 @@
+name: "SPT02 - site_path teams: read_document"
+priority: Critical
+description: |
+  Verify SharePoint toolkit configured with site_path='teams/<name>'
+  can read document content from a /teams/ SharePoint space.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Toolkit with site_path=teams/epam_3 connects successfully
+  - read_document retrieves and parses file content
+  - Content matches uploaded test document
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  file_path:
+    type: str
+    value: "${SHAREPOINT_TEAMS_DOCUMENT_PATH}/${SHAREPOINT_TEAMS_TEST_FILE}"
+  read_result:
+    type: str
+  error_indicators:
+    type: list
+    value: ["error", "failed", "exception", "not found", "access denied", "403", "401"]
+  test_results:
+    type: dict
+
+entry_point: invoke_read_document
+
+nodes:
+  - id: invoke_read_document
+    type: toolkit
+    tool: read_document
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - file_path
+    input_mapping:
+      path:
+        type: variable
+        value: file_path
+    output:
+      - read_result
+    structured_output: false
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - read_result
+      - error_indicators
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Validate read_document output for SharePoint /teams/ site.
+
+          Result: {read_result}
+
+          PASS if ALL true:
+          - Result is non-empty string (>10 chars)
+          - No error keywords: {error_indicators}
+          - Contains readable text (not binary)
+
+          FAIL if result is empty, contains errors, or is binary.
+
+          Return JSON only:
+          {{"test_passed": true/false, "summary": "brief outcome", "content_length": <chars>, "error": "details or null"}}
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

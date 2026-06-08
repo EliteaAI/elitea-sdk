@@ -1,0 +1,128 @@
+name: "SPT10 - get_files_list: Combined filters (folder + extensions)"
+priority: Critical
+description: |
+  Verify the SharePoint 'get_files_list' tool correctly applies multiple filters simultaneously
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully on teams site
+  - All filters are applied simultaneously (AND logic)
+  - Results match ALL filter criteria
+  - Must return files in baseline
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  folder_path:
+    type: str
+    value: "Shared Documents/${SHAREPOINT_TEAMS_TEST_FOLDER}"
+  include_extensions:
+    type: list
+    value: ["txt", "xlsx"]
+  skip_extensions:
+    type: list
+    value: ["xlsx"]
+  limit_files:
+    type: int
+    value: 50
+  files_result_baseline:
+    type: dict
+  files_result_filtered:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_baseline
+
+nodes:
+  - id: invoke_baseline
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+    output:
+      - files_result_baseline
+    structured_output: true
+    transition: invoke_combined_filters
+
+  - id: invoke_combined_filters
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - include_extensions
+      - skip_extensions
+      - limit_files
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      include_extensions:
+        type: variable
+        value: include_extensions
+      skip_extensions:
+        type: variable
+        value: skip_extensions
+      limit_files:
+        type: variable
+        value: limit_files
+    output:
+      - files_result_filtered
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result_baseline
+      - files_result_filtered
+      - folder_path
+      - include_extensions
+      - skip_extensions
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Validate combined extension filters on /teams/ site.
+
+          Baseline (no extension filter): {files_result_baseline}
+          Filtered (include: {include_extensions}, skip: {skip_extensions}): {files_result_filtered}
+
+          PASS if ALL true:
+          1. Baseline is NOT empty (has files)
+          2. Filtered result has ONLY .txt files (no .xlsx - skip takes precedence)
+          3. Filtered result has at least 1 file
+          4. Filtered count <= baseline count
+          5. All paths contain '/teams/'
+
+          FAIL if: baseline empty, filtered has .xlsx files, filtered empty, no /teams/ in paths.
+
+          Return JSON only:
+          {{"test_passed": true/false, "summary": "outcome", "baseline_count": N, "filtered_count": N, "error": "details or null"}}
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END

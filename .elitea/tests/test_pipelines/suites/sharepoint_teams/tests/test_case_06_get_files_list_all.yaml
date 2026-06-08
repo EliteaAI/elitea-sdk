@@ -1,0 +1,108 @@
+name: "SPT06 - get_files_list: List all files from root"
+priority: High
+description: |
+  Verify the SharePoint 'get_files_list' tool lists all files from root Shared Documents
+  on a /teams/ site using site_path (no folder filter).
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully on teams site via site_path
+  - Returns array of file objects from entire Shared Documents library
+  - Each file contains Name, Path, Created, Modified, Link fields
+  - Paths contain /teams/ prefix (not /sites/)
+  - Should include files from root AND subfolders
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  limit_files:
+    type: int
+    value: 50
+  files_result:
+    type: dict
+  expected_fields:
+    type: list
+    value: ["Name", "Path", "Created", "Modified", "Link"]
+  error_indicators:
+    type: list
+    value: ["error", "failed", "exception", "denied", "401", "403"]
+  test_results:
+    type: dict
+
+entry_point: invoke_get_files_list
+
+nodes:
+  - id: invoke_get_files_list
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - limit_files
+    input_mapping:
+      limit_files:
+        type: variable
+        value: limit_files
+    output:
+      - files_result
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result
+      - expected_fields
+      - error_indicators
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the 'get_files_list' output for a SharePoint /teams/ site root (all files).
+
+          Tool executed: get_files_list (no folder filter - returns all files)
+          Results: {files_result}
+          Expected fields: {expected_fields}
+          Error indicators: {error_indicators}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. Tool executed successfully without errors
+          2. Result is a valid JSON array (not null, not empty string)
+          3. No error indicators present in the result
+          4. Array is NOT EMPTY - must contain at least 1 file
+          5. Each file object MUST have ALL these fields: Name, Path, Created, Modified, Link
+          6. All file paths MUST contain '/teams/' substring (not '/sites/')
+          7. Name field must be non-empty string for each file
+          8. Path field must start with '/' for each file
+
+          TEST FAILS if:
+          - Result is empty array [] (no files in Shared Documents)
+          - Result contains error indicators
+          - Any file missing required fields (Name, Path, Created, Modified, Link)
+          - Any file path doesn't contain '/teams/'
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "files_count": <number of files returned>,
+            "file_names": [<list of first 5 file names>],
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

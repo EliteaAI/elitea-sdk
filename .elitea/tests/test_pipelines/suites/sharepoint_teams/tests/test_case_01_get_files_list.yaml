@@ -1,0 +1,99 @@
+name: "SPT01 - site_path teams: get_files_list"
+priority: Critical
+description: |
+  Verify SharePoint toolkit configured with site_path='teams/<name>'
+  can list files from a /teams/ SharePoint space.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Toolkit with site_path=teams/epam_3 connects successfully
+  - get_files_list returns files from the teams site
+  - No URL resolution errors
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  folder_path:
+    type: str
+    value: "Shared Documents/${SHAREPOINT_TEAMS_TEST_FOLDER}"
+  files_result:
+    type: dict
+  error_indicators:
+    type: list
+    value: ["error", "failed", "exception", "not found", "access denied", "403", "401"]
+  test_results:
+    type: dict
+
+entry_point: invoke_get_files
+
+nodes:
+  - id: invoke_get_files
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+    output:
+      - files_result
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result
+      - error_indicators
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the get_files_list output for a SharePoint /teams/ site using site_path.
+
+          Tool Result: {files_result}
+          Error Indicators: {error_indicators}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. Tool executed successfully without errors
+          2. Result is a valid JSON array (not null, not empty string, not error message)
+          3. No error indicators present in the result
+          4. Array is NOT EMPTY - must contain at least 1 file (test data: test-document.txt, test-data.xlsx)
+          5. Each file object MUST have these fields: Name, Path, Created, Modified, Link
+          6. All file paths MUST contain '/teams/' substring (not '/sites/')
+          7. Name field must be non-empty string
+          8. Path field must be non-empty string starting with '/'
+
+          TEST FAILS if:
+          - Result is empty array [] (missing test data - ensure DO_NOT_DELETE_TeamsTestFiles folder has files)
+          - Result contains error indicators
+          - Any file object missing required fields
+          - File paths don't contain '/teams/'
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description - did site_path teams/ work correctly?",
+            "files_count": <number of files returned>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

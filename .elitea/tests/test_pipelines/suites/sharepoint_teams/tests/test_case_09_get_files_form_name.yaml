@@ -1,0 +1,104 @@
+name: "SPT09 - get_files_list: Document library (form_name) filtering"
+priority: High
+description: |
+  Verify the SharePoint 'get_files_list' tool filters files by document library using form_name
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully on teams site
+  - Returns only files from the specified document library
+  - Works with library name 'Shared Documents'
+  - Must return at least one file
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  form_name_shared:
+    type: str
+    value: "Shared Documents"
+  limit_files:
+    type: int
+    value: 50
+  files_result_shared:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_files_shared
+
+nodes:
+  - id: invoke_get_files_shared
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - form_name_shared
+      - limit_files
+    input_mapping:
+      form_name:
+        type: variable
+        value: form_name_shared
+      limit_files:
+        type: variable
+        value: limit_files
+    output:
+      - files_result_shared
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result_shared
+      - form_name_shared
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the 'get_files_list' tool execution with form_name filter on /teams/ site.
+
+          Test - Form name: '{form_name_shared}'
+          Result: {files_result_shared}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. Tool executed successfully without errors
+          2. Result is a valid JSON array (not null, not error message)
+          3. Result is NOT EMPTY - must contain at least 1 file
+             (test data should exist in Shared Documents library)
+          4. Each file has required fields: Name, Path, Created, Modified, Link
+          5. All file paths contain '/teams/' substring
+          6. All file paths contain 'Shared Documents' (the library name)
+          7. Name field is non-empty string for each file
+
+          TEST FAILS if:
+          - Result is empty [] (missing test data in Shared Documents)
+          - Result contains error indicators
+          - Any file missing required fields
+          - Paths don't contain '/teams/' or 'Shared Documents'
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "files_count": <number of files returned>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END
