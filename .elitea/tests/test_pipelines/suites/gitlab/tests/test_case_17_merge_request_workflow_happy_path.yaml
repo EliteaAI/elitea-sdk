@@ -192,7 +192,7 @@ nodes:
     output:
       - comment_result
     structured_output: true
-    transition: process_results
+    transition: cleanup_delete_branch
 
   - id: process_results
     type: llm
@@ -253,7 +253,7 @@ nodes:
       - test_results
     structured_output_dict:
       test_results: "dict"
-    transition: cleanup_delete_branch
+    transition: END
 
   - id: cleanup_delete_branch
     type: toolkit
@@ -273,4 +273,4 @@ nodes:
     output:
      - cleanup_result
     structured_output: true
-    transition: END
+    transition: process_results
