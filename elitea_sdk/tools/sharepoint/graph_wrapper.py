@@ -17,13 +17,14 @@ import logging
 import re
 import time
 from typing import Optional, List, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse, parse_qs
 
 import requests
 from langchain_core.tools import ToolException
 
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
+from ..utils.content_parser import parse_file_content
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _SMALL_FILE_THRESHOLD = 4 * 1024 * 1024   # 4 MB — simple PUT
@@ -781,7 +782,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                   page_number: Optional[int] = None, sheet_name: Optional[str] = None,
                   excel_by_sheets: bool = False):
         """Reads file located at the specified server-relative path."""
-        from ..utils.content_parser import parse_file_content
         try:
             file_bytes = self.load_file_content_in_bytes(path)
             file_name = path.split('/')[-1]
@@ -1353,7 +1353,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         This is the canonical image-processing helper. Both the read-page formatter
         and the indexing pipeline call this so the image is only downloaded once.
         """
-        from ..utils.content_parser import parse_file_content
 
         description = f"[image: {alt or 'no description'}]"
         if not src or "graph.microsoft.com" not in src:
@@ -1902,3 +1901,114 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise ToolException(
                 f"Failed to delete OneNote page '{page_id}': {e}"
             ) from e
+
+    # ------------------------------------------------------------------ #
+    #  Sharing Links                                                      #
+    # ------------------------------------------------------------------ #
+
+    def read_file_from_sharing_link(self, sharing_url: str) -> str:
+        """Read a file from a SharePoint/OneDrive sharing link.
+
+        Supports:
+        - Personal OneDrive: https://company-my.sharepoint.com/:x:/p/user/...
+        - SharePoint sites: https://company.sharepoint.com/:x:/s/site/...
+
+        Args:
+            sharing_url: Full HTTPS sharing link URL
+
+        Returns:
+            Parsed text content of the file
+        """
+        if not sharing_url or not sharing_url.startswith('https://'):
+            raise ToolException("Invalid sharing URL. Must be a full HTTPS URL.")
+
+        # Encode URL for Graph /shares endpoint (base64url with u! prefix)
+        encoded = base64.b64encode(sharing_url.encode('utf-8')).decode('utf-8')
+        share_id = 'u!' + encoded.rstrip('=').replace('/', '_').replace('+', '-')
+        url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem"
+        headers = {**self._auth_headers(), "Prefer": "redeemSharingLinkIfNecessary"}
+
+        resp = requests.get(url, headers=headers, timeout=60)
+        if resp.status_code == 401 and self._try_refresh_token():
+            headers = {**self._auth_headers(), "Prefer": "redeemSharingLinkIfNecessary"}
+            resp = requests.get(url, headers=headers, timeout=60)
+
+        if resp.status_code == 403:
+            # Graph API can't access cross-tenant public links, try direct download
+            file_name, file_bytes = self._download_public_link(sharing_url)
+            if file_bytes:
+                return parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
+            try:
+                error_msg = resp.json().get('error', {}).get('message', '')
+            except Exception:
+                error_msg = ''
+            raise ToolException(error_msg or "Access denied to sharing link")
+
+        self._raise_with_body(resp)
+        data = resp.json()
+
+        file_name = data.get('name', 'unknown')
+        download_url = data.get('@microsoft.graph.downloadUrl')
+        if download_url:
+            content_resp = requests.get(download_url, timeout=120)
+            content_resp.raise_for_status()
+            file_bytes = content_resp.content
+        else:
+            content_url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem/content"
+            content_resp = self._get_raw(content_url, timeout=120, allow_redirects=True)
+            content_resp.raise_for_status()
+            file_bytes = content_resp.content
+
+        return parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
+
+
+    def _download_public_link(self, sharing_url: str) -> Tuple[str, Optional[bytes]]:
+        """Download a file from a public sharing link directly.
+    
+        Fallback for cross-tenant public links that Graph API returns 403 for.
+        Returns (filename, bytes) on success, (filename, None) on failure.
+        """
+    
+        try:
+            # Get FedAuth cookie from initial redirect
+            resp = requests.get(sharing_url, allow_redirects=False, timeout=30)
+            if resp.status_code not in (301, 302):
+                return 'unknown', None
+    
+            fedauth = None
+            for cookie in resp.cookies:
+                if cookie.name == 'FedAuth':
+                    fedauth = cookie.value
+                    break
+            if not fedauth:
+                match = re.search(r'FedAuth=([^;]+)', resp.headers.get('Set-Cookie', ''))
+                if match:
+                    fedauth = match.group(1)
+            if not fedauth:
+                return 'unknown', None
+    
+            # Extract file path from redirect URL
+            location = resp.headers.get('Location', '')
+            if not location:
+                return 'unknown', None
+    
+            parsed = urlparse(location)
+            file_path = parse_qs(parsed.query).get('id', [None])[0]
+            if not file_path:
+                return 'unknown', None
+    
+            file_path = unquote(file_path)
+            file_name = file_path.rsplit('/', 1)[-1] if '/' in file_path else 'unknown'
+    
+            # Download using FedAuth cookie
+            download_url = f"{parsed.scheme}://{parsed.netloc}{file_path}"
+            download_resp = requests.get(download_url, cookies={'FedAuth': fedauth}, timeout=120)
+            download_resp.raise_for_status()
+    
+            if len(download_resp.content) == 0:
+                return file_name, None
+    
+            return file_name, download_resp.content
+        except Exception as e:
+            logging.warning("Public link download failed: %s", e)
+            return 'unknown', None
