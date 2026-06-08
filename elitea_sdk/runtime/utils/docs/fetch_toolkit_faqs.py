@@ -15,7 +15,7 @@ from pathlib import Path
 import sys
 
 # Base URL for toolkit documentation
-BASE_URL = "https://raw.githubusercontent.com/EliteaAI/elitea.github.io/main/docs/integrations/toolkits"
+BASE_URL = "https://raw.githubusercontent.com/EliteaAI/elitea.github.io/mintlify/docs/integrations/toolkits"
 
 # All toolkits to fetch FAQ for
 TOOLKITS = [
@@ -29,7 +29,7 @@ TOOLKITS = [
     'jira', 'advanced_jira_mining',
     # Test management
     'qtest', 'testrail', 'xray', 'zephyr', 'zephyr_scale', 'zephyr_squad',
-    'zephyr_enterprise', 'zephyr_essential', 'testio', 'rally', 'report_portal',
+    'zephyr_enterprise', 'zephyr_essential', 'testio', 'rally', 'reportportal',
     # Documentation
     'confluence', 'sharepoint',
     # Communication
@@ -47,7 +47,7 @@ TOOLKITS = [
     # Data
     'elastic', 'google', 'pandas', 'sql',
     # Documents
-    'pptx', 'ocr'
+    'powerpoint', 'ocr'
 ]
 
 
@@ -61,16 +61,17 @@ def fetch_faq(toolkit_name):
     Returns:
         FAQ content as string, or None if not found
     """
-    doc_url = f"{BASE_URL}/{toolkit_name}_toolkit.md"
+    doc_url = f"{BASE_URL}/{toolkit_name}_toolkit.mdx"
 
     try:
         with urllib.request.urlopen(doc_url, timeout=10) as response:
             if response.status == 200:
                 content = response.read().decode('utf-8')
 
-                # Extract FAQ or FAQs section
-                # Updated regex to match both "## FAQ" and "## FAQs"
-                faq_pattern = r'##\s+FAQs?\s*\n(.*?)(?=\n##\s+|\Z)'
+                # Extract FAQ, FAQs, or Troubleshooting and Support section
+                # Updated regex to match "## FAQ", "## FAQs", "## Troubleshooting and Support"
+                # Also matches MDX format: "##  <Icon icon="circle-question" size={24} /> FAQ"
+                faq_pattern = r'##\s+(?:(?:<[^>]+>\s*)*(?:FAQs?|Troubleshooting and Support))\s*\n(.*?)(?=\n##\s+|\Z)'
                 match = re.search(faq_pattern, content, re.IGNORECASE | re.DOTALL)
 
                 if match:
