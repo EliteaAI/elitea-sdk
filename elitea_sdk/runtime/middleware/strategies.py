@@ -193,7 +193,17 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
             from .faq_fetcher import get_toolkit_faq, get_fallback_faq
 
             toolkit_type = tool_metadata.get('toolkit_type') if tool_metadata else None
-            faq_content = get_toolkit_faq(toolkit_type)
+
+            # Aliases: map internal toolkit_type names to FAQ file names
+            # pptx toolkit uses "pptx" internally but FAQ is stored as "powerpoint"
+            # report_portal toolkit uses "report_portal" internally but FAQ is stored as "reportportal"
+            _TOOLKIT_TYPE_ALIASES = {
+                "pptx": "powerpoint",
+                "report_portal": "reportportal",
+            }
+            faq_toolkit_type = _TOOLKIT_TYPE_ALIASES.get(toolkit_type, toolkit_type)
+
+            faq_content = get_toolkit_faq(faq_toolkit_type)
 
             # Use fallback FAQ if toolkit-specific FAQ unavailable
             if not faq_content:
