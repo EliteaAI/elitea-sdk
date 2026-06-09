@@ -8,6 +8,7 @@ from typing import Any, Optional, List, Dict, Generator, Set
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
+from langchain_core.tools import ToolException
 from pydantic import create_model, Field, SecretStr
 
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
@@ -672,7 +673,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     def remove_index(self, index_name: str = ""):
         """Cleans the indexed data in the collection."""
-        super()._clean_collection(index_name=index_name, including_index_meta=True)
+        deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
+
+        if index_name and deleted_count == 0:
+            raise ToolException(f"Index '{index_name}' not found. Available collections: {self.list_collections()}")
+
         self._emit_index_data_removed_event(index_name)
         return (f"Collection '{index_name}' has been removed from the vector store.\n"
                 f"Available collections: {self.list_collections()}") if index_name \
