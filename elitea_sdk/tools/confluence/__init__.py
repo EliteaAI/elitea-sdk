@@ -101,13 +101,16 @@ class ConfluenceToolkit(BaseToolkit):
         model = create_model(
             name,
             space=(str, Field(description="Space")),
-            api_version=(Literal['Auto', '2', '3'], Field(
+            api_version=(Literal['Auto', '1', '2'], Field(
                 description="REST API version used for all Confluence operations.\n\n"
                         "• **Auto** (default) — automatically selected based on the Hosting setting "
-                        "in the linked credential (Cloud → V3, Server → V2)\n"
-                        "• **V3** — for Confluence Cloud (*.atlassian.net). Uses ADF for rich text content\n"
-                        "• **V2** — for Confluence Server / Data Center. Uses plain text and wiki markup\n\n"
-                        "⚠️ Using the wrong version may cause content formatting issues in pages and comments.",
+                        "in the linked credential (Cloud → V2, Server → V1)\n"
+                        "• **V2** — Confluence Cloud REST API v2 (`/wiki/api/v2`). Cloud-only; "
+                        "uses storage / atlas_doc_format body representation and cursor-based pagination\n"
+                        "• **V1** — Legacy Confluence REST API v1 (`/rest/api`). Required for "
+                        "Confluence Server / Data Center; also still supported on Cloud\n\n"
+                        "⚠️ Confluence does not provide a public API v3. Selecting v2 against a "
+                        "Server/Data Center instance will fail.",
                 default="Auto"
             )),
             limit=(int, Field(
