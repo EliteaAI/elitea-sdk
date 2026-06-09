@@ -23,7 +23,7 @@ from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from elitea_sdk.tools.utils.available_tools_decorator import extend_with_parent_available_tools
 from ..llm.img_utils import ImageDescriptionCache
 from ..utils import is_cookie_token, parse_cookie_string
-from ...configurations.utils import _resolve_api_version
+from ...configurations.utils import _resolve_confluence_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
@@ -281,8 +281,9 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             values['base_url'] = url
             logger.info(f"Normalized Confluence base_url by removing /wiki suffix: {url}")
 
-        # Resolve 'auto' api_version to concrete '2' or '3'
-        values['api_version'] = _resolve_api_version(
+        # Resolve 'auto' api_version to concrete '1' or '2'
+        # (Confluence offers REST API v1 and v2; there is no public v3)
+        values['api_version'] = _resolve_confluence_api_version(
             values.get('api_version', 'auto'),
             cloud,
             url,
@@ -354,8 +355,18 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 logger.warning(f"Could not retrieve space homepage: {e}. Creating page at space root level")
                 parent_id_filled = None
 
-        created_page = self.temp_create_page(space=user_space, title=title, body=body, status=status,
-                                             parent_id=parent_id_filled, representation=representation)
+        # The upstream atlassian-python-api Confluence.create_page is still v1-only
+        # (POST /rest/api/content/), so dispatch to our v2 helper when api_version=='2'.
+        if str(getattr(self, 'api_version', '1') or '1') == '2':
+            created_page = self._create_page_v2(
+                space=user_space, title=title, body=body, status=status,
+                parent_id=parent_id_filled, representation=representation,
+            )
+        else:
+            created_page = self.client.create_page(
+                space=user_space, title=title, body=body, status=status,
+                parent_id=parent_id_filled, representation=representation,
+            )
 
         webui_path = created_page['_links']['edit'] if status == 'draft' else created_page['_links']['webui']
         page_details = {
@@ -405,31 +416,109 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 created_pages.append(created_page)
         return str(created_pages)
 
-    # delete after https://github.com/atlassian-api/atlassian-python-api/pull/1452 will be merged
-    def temp_create_page(self, space, title, body, parent_id=None, type="page", representation="storage", editor=None,
-                         full_width=False, status='current'):
-        logger.info('Creating %s "%s" -> "%s"', type, space, title)
-        url = "rest/api/content/"
-        data = {
-            "type": type,
-            "title": title,
+    def _create_page_v2(self, space: str, title: str, body: str, parent_id: Optional[str],
+                        representation: str, status: str) -> dict:
+        """Create a page via Confluence Cloud REST API v2 (POST /api/v2/pages).
+
+        v2 differs from v1 in several ways:
+        - Endpoint: ``/api/v2/pages`` (not ``/rest/api/content``)
+        - Requires numeric ``spaceId`` (not space key)
+        - Body uses ``{"representation": ..., "value": ...}`` directly
+        - Allowed body representations: ``storage``, ``atlas_doc_format``, ``wiki``
+        - Response schema is flatter and lacks ``space.key``/``_links.webui``;
+          we adapt it to match v1's shape so downstream callers keep working.
+        """
+        space_id = self._resolve_space_id_v2(space)
+        if not space_id:
+            raise ToolException(
+                f"Could not resolve spaceId for space key '{space}' via v2 API. "
+                "Confirm the space exists and the credentials have access."
+            )
+
+        v2_representation = self._normalize_v2_representation(representation)
+        payload = {
+            "spaceId": str(space_id),
             "status": status,
-            "space": {"key": space},
-            "body": self.client._create_body(body, representation),
-            "metadata": {"properties": {}},
+            "title": title,
+            "body": {
+                "representation": v2_representation,
+                "value": body,
+            },
         }
         if parent_id:
-            data["ancestors"] = [{"type": type, "id": parent_id}]
-        if editor is not None and editor in ["v1", "v2"]:
-            data["metadata"]["properties"]["editor"] = {"value": editor}
-        if full_width is True:
-            data["metadata"]["properties"]["content-appearance-draft"] = {"value": "full-width"}
-            data["metadata"]["properties"]["content-appearance-published"] = {"value": "full-width"}
-        else:
-            data["metadata"]["properties"]["content-appearance-draft"] = {"value": "fixed-width"}
-            data["metadata"]["properties"]["content-appearance-published"] = {"value": "fixed-width"}
+            payload["parentId"] = str(parent_id)
 
-        return self.client.post(url, data=data)
+        response = self.client.post("api/v2/pages", data=payload)
+        return self._adapt_v2_page_response(response, space_key=space, representation=v2_representation)
+
+    def _resolve_space_id_v2(self, space_key: str) -> Optional[str]:
+        """Look up a space's numeric id by key using v2 API (with v1 fallback)."""
+        try:
+            result = self.client.get("api/v2/spaces", params={"keys": space_key, "limit": 1})
+            results = (result or {}).get("results") or []
+            if results:
+                return results[0].get("id")
+        except Exception as e:
+            logger.warning("v2 space lookup failed for key '%s': %s; falling back to v1", space_key, e)
+        try:
+            v1_space = self.client.get_space(space_key)
+            return (v1_space or {}).get("id")
+        except Exception as e:
+            logger.error("v1 space lookup also failed for key '%s': %s", space_key, e)
+            return None
+
+    @staticmethod
+    def _normalize_v2_representation(representation: Optional[str]) -> str:
+        """Map legacy/aliased representations to v2-accepted values."""
+        if not representation:
+            return "storage"
+        normalized = representation.strip().lower()
+        # 'view' / 'export_view' / 'editor' are read-only formats — fall back to storage on write.
+        if normalized in ("storage", "atlas_doc_format", "wiki"):
+            return normalized
+        if normalized == "adf":
+            return "atlas_doc_format"
+        return "storage"
+
+    def _adapt_v2_page_response(self, response: dict, space_key: str, representation: str) -> dict:
+        """Reshape a v2 page-create response so it looks like a v1 response.
+
+        Downstream code in ``create_page`` expects keys such as
+        ``_links.webui``, ``_links.edit``, ``space.key`` and
+        ``version.by.displayName``. The v2 response uses different keys.
+        """
+        if not isinstance(response, dict):
+            return response
+
+        page_id = response.get("id")
+        webui = (response.get("_links") or {}).get("webui") or (
+            f"/spaces/{space_key}/pages/{page_id}" if page_id else ""
+        )
+        edit = (response.get("_links") or {}).get("editui") or (
+            f"/pages/edit-v2.action?pageId={page_id}" if page_id else webui
+        )
+        author_name = (
+            (response.get("version") or {}).get("authorId")
+            or response.get("authorId")
+            or ""
+        )
+        return {
+            "id": page_id,
+            "title": response.get("title"),
+            "status": response.get("status"),
+            "space": {"key": space_key, "id": response.get("spaceId")},
+            "version": {
+                "number": (response.get("version") or {}).get("number", 1),
+                "by": {"displayName": author_name},
+            },
+            "body": {representation: {"value": (response.get("body") or {}).get(representation, {}).get("value", "")}},
+            "_links": {
+                "webui": webui,
+                "edit": edit,
+                "base": (response.get("_links") or {}).get("base", ""),
+            },
+            "_v2_raw": response,
+        }
 
     def delete_page(self, page_id: str = None, page_title: str = None):
         """ Deletes a page by its defined page_id or page_title """
@@ -2134,6 +2223,39 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             "bins_with_llm": (Optional[bool], Field(description="Use LLM for processing binary files.", default=False)),
         }
 
+    def _build_generic_tool_description(self) -> str:
+        """Return the description for execute_generic_confluence with the active API version.
+
+        The LLM uses this description to compose ``relative_url`` paths, so the
+        endpoint base must be accurate for whichever API version the toolkit is
+        configured for.
+        """
+        api_version = str(getattr(self, 'api_version', '1') or '1')
+        if api_version == '2':
+            endpoint_base = '/wiki/api/v2'
+            example_path = '/wiki/api/v2/pages'
+            version_note = (
+                "Confluence Cloud REST API v2. Request bodies use "
+                "{\"representation\": ..., \"value\": ...} for page content "
+                "and require numeric spaceId/parentId (not space key)."
+            )
+        else:
+            endpoint_base = '/rest/api'
+            example_path = '/rest/api/content'
+            version_note = (
+                "Confluence REST API v1 (legacy). Use space.key in request "
+                "bodies and the body wrapper {\"<representation>\": "
+                "{\"value\": ...}}."
+            )
+
+        base_doc = (self.execute_generic_confluence.__doc__ or '').strip()
+        return (
+            f"{base_doc}\n\n"
+            f"Active API version: v{api_version} (base path: {endpoint_base}).\n"
+            f"{version_note}\n"
+            f"`relative_url` MUST start with this base path (e.g. {example_path})."
+        )
+
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [
@@ -2235,7 +2357,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             },
             {
                 "name": "execute_generic_confluence",
-                "description": self.execute_generic_confluence.__doc__,
+                "description": self._build_generic_tool_description(),
                 "args_schema": сonfluenceInput,
                 "ref": self.execute_generic_confluence,
             },
