@@ -76,6 +76,8 @@ def _validate_atlassian_hosting_selection(
 def _resolve_api_version(api_version: Optional[str], cloud: Optional[bool], base_url: Optional[str]) -> str:
     """Resolve ``'auto'`` api_version to ``'2'`` or ``'3'`` based on cloud/hosting setting.
 
+    Used by Jira (which has REST API v2 and v3).
+
     Resolution order:
     1. If *api_version* is explicitly ``'2'`` or ``'3'``, return as-is.
     2. If *api_version* is ``'auto'`` (or ``None``/empty):
@@ -91,5 +93,28 @@ def _resolve_api_version(api_version: Optional[str], cloud: Optional[bool], base
     if base_url and '.atlassian.net' in base_url.lower():
         return '3'
     return '2'
+
+
+def _resolve_confluence_api_version(api_version: Optional[str], cloud: Optional[bool], base_url: Optional[str]) -> str:
+    """Resolve ``'auto'`` api_version to ``'1'`` or ``'2'`` for Confluence.
+
+    Confluence offers REST API v1 (legacy ``/rest/api``) and v2 (``/api/v2``,
+    Cloud only). There is no public Confluence REST API v3.
+
+    Resolution order:
+    1. If *api_version* is explicitly ``'1'`` or ``'2'``, return as-is.
+    2. If *api_version* is ``'auto'`` (or ``None``/empty):
+       - *cloud* is ``True``               → ``'2'``
+       - *base_url* contains ``.atlassian.net`` → ``'2'``
+       - Otherwise (Server / Data Center)  → ``'1'`` (v2 is Cloud-only)
+    """
+    if api_version and api_version in ('1', '2'):
+        return api_version
+    # Auto-resolve
+    if cloud is True:
+        return '2'
+    if base_url and '.atlassian.net' in base_url.lower():
+        return '2'
+    return '1'
 
 
