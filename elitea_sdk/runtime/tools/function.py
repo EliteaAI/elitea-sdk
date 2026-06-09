@@ -142,7 +142,7 @@ alita_client = elitea_client
         return self.tool.name.lower() == 'pyodide_sandbox'
 
     def _save_code_to_artifact(self, code: str, node_name: str) -> None:
-        """Save the assembled code to the 'code_debug' artifact bucket.
+        """Save the assembled code to the 'code-debug' artifact bucket.
 
         Filename is ``<node_name>.py``.  The bucket is created automatically if
         it does not yet exist (handled by SandboxArtifact.__init__).
@@ -155,17 +155,17 @@ alita_client = elitea_client
             result = artifact.create(filename, code.encode('utf-8'))
             if 'error' in result:
                 logger.warning(
-                    "[code_debug] Failed to save code artifact for node '%s': %s",
+                    "[code-debug] Failed to save code artifact for node '%s': %s",
                     node_name, result['error']
                 )
             else:
                 logger.debug(
-                    "[code_debug] Saved code for node '%s' → %s/%s",
+                    "[code-debug] Saved code for node '%s' → %s/%s",
                     node_name, bucket, filename
                 )
         except Exception as exc:
             logger.warning(
-                "[code_debug] Could not save code artifact for node '%s': %s",
+                "[code-debug] Could not save code artifact for node '%s': %s",
                 node_name, exc
             )
 
@@ -282,7 +282,7 @@ alita_client = elitea_client
         if self._is_pyodide_tool():
             func_args['code'] = f"{self._prepare_pyodide_input(state, self.input_variables)}\n{func_args['code']}"
             # When debug mode is enabled and an elitea_client is available, persist
-            # the full assembled code to the 'code_debug' artifact bucket so it can
+            # the full assembled code to the 'code-debug' artifact bucket so it can
             # be inspected after execution.
             if self.debug and self.elitea_client is not None:
                 self._save_code_to_artifact(func_args['code'], self.name)
