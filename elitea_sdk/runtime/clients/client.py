@@ -96,7 +96,6 @@ class EliteAClient:
         }
         if api_extra_headers is not None:
             self.headers.update(api_extra_headers)
-        self.predict_url = f"{self.base_url}{self.api_path}/prompt_lib/predict/prompt_lib/{self.project_id}"
         self.base_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/"
         self.base_public_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/public_application/prompt_lib/"
         self.app = f"{self.base_app_url}{self.project_id}"
@@ -1177,73 +1176,6 @@ class EliteAClient:
             "contentType": response.headers.get('Content-Type', ''),
             "etag": response.headers.get('ETag', '').strip('"')
         }
-
-    def _prepare_messages(self, messages: list[BaseMessage]):
-        chat_history = []
-        for message in messages:
-            if message.type == 'human':
-                chat_history.append({
-                    'role': 'user',
-                    'content': message.content
-                })
-            elif message.type == 'system':
-                chat_history.append({
-                    'role': 'system',
-                    'content': message.content
-                })
-            else:
-                chat_history.append({
-                    'role': 'assistant',
-                    'content': message.content
-                })
-        return chat_history
-
-    def _prepare_payload(self, messages: list[BaseMessage], model_settings: dict, variables: list[dict]):
-        chat_history = self._prepare_messages(messages)
-        if not variables:
-            variables = []
-        return {
-            "type": "chat",
-            "project_id": self.project_id,
-            "context": '',
-            "model_settings": model_settings,
-            "user_input": '',
-            "messages": chat_history,
-            "variables": variables,
-            "format_response": True
-        }
-
-    def async_predict(self, messages: list[BaseMessage], model_settings: dict, variables: list[dict] = None):
-        # TODO: Modify to make it appropriate stream response
-        prompt_data = self._prepare_payload(messages, model_settings, variables)
-        response = requests.post(self.predict_url, headers=self.headers, json=prompt_data, verify=False)
-        logger.info(response.content)
-        response_data = response.json()
-        for message in response_data['messages']:
-            if message.get('role') == 'user':
-                yield HumanMessage(content=message['content'])
-            else:
-                yield AIMessage(content=message['content'])
-
-    def predict(self, messages: list[BaseMessage], model_settings: dict, variables: list[dict] = None):
-        prompt_data = self._prepare_payload(messages, model_settings, variables)
-        response = requests.post(self.predict_url, headers=self.headers, json=prompt_data, verify=False)
-
-        if response.status_code != 200:
-            logger.error(f"Error in response of predict: {response.content}")
-            raise requests.exceptions.HTTPError(response.content)
-        try:
-            response_data = response.json()
-            response_messages = []
-            for message in response_data['messages']:
-                if message.get('role') == 'user':
-                    response_messages.append(HumanMessage(content=message['content']))
-                else:
-                    response_messages.append(AIMessage(content=message['content']))
-            return response_messages
-        except TypeError:
-            logger.error(f"TypeError in response of predict: {response.content}")
-            raise
 
     def predict_agent(self, llm: ChatOpenAI, instructions: str = "You are a helpful assistant.",
                       tools: Optional[list] = None, chat_history: Optional[List[Any]] = None,

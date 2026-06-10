@@ -11,9 +11,6 @@ from elitea_sdk.runtime.utils.utils import clean_string
 from elitea_sdk.runtime.utils.save_dataframe import save_dataframe_to_artifact
 from elitea_sdk.runtime.utils.evaluate import EvaluateTemplate, END, TransformationError, MyABC
 from elitea_sdk.runtime.llms.preloaded import PreloadedChatModel
-from elitea_sdk.runtime.clients.prompt import EliteAPrompt
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import AIMessage
 
 def test_clean_string():
     assert clean_string('hello world!') == 'helloworld'
@@ -67,18 +64,6 @@ def test_count_tokens():
     single = PreloadedChatModel._count_tokens("hello") + PreloadedChatModel._count_tokens("world")
     assert tokens == single
 
-
-class FakeEliteA:
-    def predict(self, messages, llm_settings, variables=None):
-        return [AIMessage(content="one"), AIMessage(content="two")]
-
-def test_elitea_prompt():
-    prompt = ChatPromptTemplate.from_messages([("human", "{text}")])
-    ap = EliteAPrompt(FakeEliteA(), prompt, "name", "desc", {})
-    Model = ap.create_pydantic_model()
-    assert set(Model.__fields__.keys()) == {"text", "input"}
-    result = ap.predict({"text": "foo", "input": "bar"})
-    assert result == "one\n\ntwo"
 
 def test_evaluate_template_invalid():
     et = EvaluateTemplate('{% for x in %}', {})
@@ -265,19 +250,6 @@ def test_save_dataframe_comprehensive():
         assert result is None
         mock_wrapper.create_file.assert_called_once()
         mock_wrapper.reset_mock()
-
-
-def test_elitea_prompt_edge_cases():
-    """Test EliteAPrompt edge cases"""
-    class ErrorEliteA:
-        def predict(self, messages, llm_settings, variables=None):
-            raise ValueError("Prediction failed")
-    
-    prompt = ChatPromptTemplate.from_messages([("human", "test")])
-    ap = EliteAPrompt(ErrorEliteA(), prompt, "test", "desc", {})
-    
-    with pytest.raises(ValueError):
-        ap.predict({})
 
 
 def test_clean_string_comprehensive():
