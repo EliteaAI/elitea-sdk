@@ -1220,7 +1220,8 @@ def create_graph(
                     input_mapping={'code': code_data},
                     input_variables=node.get('input', ['messages']),
                     structured_output=node.get('structured_output', False),
-                    elitea_client=kwargs.get('elitea_client', None)
+                    elitea_client=kwargs.get('elitea_client', None),
+                    debug=node.get('debug', False),
                 ))
             elif node_type == 'llm':
                 output_vars = node.get('output', [])
