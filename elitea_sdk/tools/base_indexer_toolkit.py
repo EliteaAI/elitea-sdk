@@ -610,7 +610,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             doc_name = self._extract_doc_name(meta)
             self._log_tool_event(message=f"Collecting the dependencies for document "
                                          f"'{doc_name}' (ID: '{doc_id}') to collect dependencies if any...")
-            dependencies = self._process_document(document)
+            # Collect all dependencies first so that document.metadata (e.g., dependent_docs)
+            # is fully populated before yielding the parent document
+            dependencies = list(self._process_document(document))
             yield document
             for dep in dependencies:
                 dep.metadata[IndexerKeywords.PARENT.value] = document.metadata.get('id', None)
