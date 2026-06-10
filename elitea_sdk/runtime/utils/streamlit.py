@@ -443,17 +443,8 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                                 logger.warning(f"Could not retrieve pgvector connection string: {str(e)}")
                                 st.session_state.project_secrets = {}
                             
-                            integrations = st.session_state.client.all_models_and_integrations()
-                            unique_models = set()
-                            models_list = []
-                            for entry in integrations:
-                                models = entry.get('settings', {}).get('models', [])
-                                for model in models:
-                                    if model.get('capabilities', {}).get('chat_completion') and model['name'] not in unique_models:
-                                        unique_models.add(model['name'])
-                                        models_list.append({'name': model['name'], 'integration_id': entry['uid']})
                             st.session_state.agents = st.session_state.client.get_list_of_apps()
-                            st.session_state.models = models_list
+                            st.session_state.models = [{'name': m['name']} for m in st.session_state.client.get_available_models()]
                             clear_chat_history()
                             
                             # Show immediate success message
