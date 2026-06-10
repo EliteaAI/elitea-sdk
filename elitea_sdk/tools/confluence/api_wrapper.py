@@ -2232,8 +2232,8 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         """
         api_version = str(getattr(self, 'api_version', '1') or '1')
         if api_version == '2':
-            endpoint_base = '/wiki/api/v2'
-            example_path = '/wiki/api/v2/pages'
+            endpoint_base = '/api/v2'
+            example_path = '/api/v2/pages'
             version_note = (
                 "Confluence Cloud REST API v2. Request bodies use "
                 "{\"representation\": ..., \"value\": ...} for page content "
