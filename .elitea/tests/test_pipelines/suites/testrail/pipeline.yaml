@@ -71,6 +71,8 @@ execution:
     - test_case_18_*.yaml  # TR18 - Get Cases Empty Project CSV
     - test_case_19_*.yaml  # TR19 - Get Cases By Filter Empty Project
     - test_case_20_*.yaml  # TR20 - Get Cases By Filter Empty Project With Keys
+    - test_case_21_*.yaml  # TR21 - Get Sections Happy Path
+    - test_case_22_*.yaml  # TR22 - Get Sections Output Formats
 
   # Variables to substitute in test YAML files
   substitutions:
