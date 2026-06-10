@@ -151,14 +151,14 @@ class TestToolkitsList:
         "ado_work_item", "ado_test_plan", "localgit", "advanced_jira_mining",
         "zephyr", "zephyr_squad", "zephyr_essential", "testio", "gmail",
         "yagmail", "custom_open_api", "aws", "azure_ai", "carrier",
-        "keycloak", "elastic", "google", "pandas", "ocr",
+        "keycloak", "elastic", "google", "pandas",
     ])
     def test_no_faq_toolkits_also_in_list(self, toolkit):
         assert toolkit in ftf.TOOLKITS
 
-    def test_total_count_is_44(self):
-        """Run log shows 44 total toolkits."""
-        assert len(ftf.TOOLKITS) == 44
+    def test_total_count_is_43(self):
+        """Run log shows 43 total toolkits (after ocr/tesseract removal)."""
+        assert len(ftf.TOOLKITS) == 43
 
     def test_base_url_uses_mintlify_branch(self):
         assert "mintlify" in ftf.BASE_URL
