@@ -1906,6 +1906,62 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     #  Sharing Links                                                      #
     # ------------------------------------------------------------------ #
 
+    _SHARING_LINK_MAX_SIZE = 20 * 1024 * 1024
+
+    def _validate_sharing_link_file(self, file_name: str, file_size: Optional[int]) -> None:
+        """Validate file type and size before downloading from sharing link.
+
+        Args:
+            file_name: Name of the file from Graph API metadata
+            file_size: Size of the file in bytes (may be None if unavailable)
+
+        Raises:
+            ToolException: If file type is unsupported or file is too large
+        """
+        from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
+
+        # Check file size
+        if file_size is not None and file_size > self._SHARING_LINK_MAX_SIZE:
+            size_mb = file_size / (1024 * 1024)
+            max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
+            raise ToolException(
+                f"File '{file_name}' is too large ({size_mb:.1f} MB). "
+                f"Maximum supported size for sharing links is {max_mb:.0f} MB."
+            )
+
+        # Check file extension against loaders_map
+        ext = ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
+
+        if not ext:
+            # Files without extensions cannot be reliably processed
+            raise ToolException(
+                f"File '{file_name}' has no extension. "
+                f"Cannot determine file type for processing."
+            )
+
+        if ext not in loaders_map:
+            raise ToolException(
+                f"File type '{ext}' is not supported. "
+                f"Supported formats include documents (PDF, DOCX, XLSX, PPTX), "
+                f"text files, images (PNG, JPG), and common code files."
+            )
+
+        # Check for double-extension attack (e.g., malware.zip.pdf)
+        # Split on all dots and check if any intermediate extension is dangerous
+        dangerous_extensions = {'.zip', '.rar', '.7z', '.tar', '.gz', '.exe', '.msi',
+                                '.bat', '.cmd', '.sh', '.mp4', '.avi', '.mov', '.mp3',
+                                '.wav', '.dll', '.so', '.bin'}
+        name_lower = file_name.lower()
+        parts = name_lower.split('.')
+        if len(parts) > 2:  # Has multiple extensions
+            for part in parts[1:-1]:  # Check intermediate extensions (not first/last)
+                intermediate_ext = '.' + part
+                if intermediate_ext in dangerous_extensions:
+                    raise ToolException(
+                        f"File '{file_name}' has suspicious double extension. "
+                        f"Files with intermediate extensions like '{intermediate_ext}' are not allowed."
+                    )
+
     def read_file_from_sharing_link(self, sharing_url: str) -> str:
         """Read a file from a SharePoint/OneDrive sharing link.
 
@@ -1913,11 +1969,21 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         - Personal OneDrive: https://company-my.sharepoint.com/:x:/p/user/...
         - SharePoint sites: https://company.sharepoint.com/:x:/s/site/...
 
+        File validation:
+        - Maximum file size: 20 MB
+        - Supported formats: documents (PDF, DOCX, XLSX, etc.), text files,
+          images, and code files
+        - Unsupported: archives (ZIP, RAR), videos (MP4), audio files, executables
+
         Args:
             sharing_url: Full HTTPS sharing link URL
 
         Returns:
             Parsed text content of the file
+
+        Raises:
+            ToolException: If URL is invalid, file type is unsupported, or file
+                          exceeds size limit
         """
         if not sharing_url or not sharing_url.startswith('https://'):
             raise ToolException("Invalid sharing URL. Must be a full HTTPS URL.")
@@ -1935,9 +2001,13 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
         if resp.status_code == 403:
             # Graph API can't access cross-tenant public links, try direct download
+            # Note: _download_public_link validates file type/size via HEAD request before downloading
             file_name, file_bytes = self._download_public_link(sharing_url)
             if file_bytes:
-                return parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
+                result = parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
+                if isinstance(result, ToolException):
+                    raise result
+                return result
             try:
                 error_msg = resp.json().get('error', {}).get('message', '')
             except Exception:
@@ -1948,6 +2018,11 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         data = resp.json()
 
         file_name = data.get('name', 'unknown')
+        file_size = data.get('size')  # Graph API returns file size in bytes
+
+        # Validate file type and size BEFORE downloading content
+        self._validate_sharing_link_file(file_name, file_size)
+
         download_url = data.get('@microsoft.graph.downloadUrl')
         if download_url:
             content_resp = requests.get(download_url, timeout=120)
@@ -1959,22 +2034,39 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             content_resp.raise_for_status()
             file_bytes = content_resp.content
 
-        return parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
+        # Safety check: verify actual size matches metadata (Graph API size could be stale)
+        actual_size = len(file_bytes)
+        if actual_size > self._SHARING_LINK_MAX_SIZE:
+            size_mb = actual_size / (1024 * 1024)
+            max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
+            raise ToolException(
+                f"File '{file_name}' is too large ({size_mb:.1f} MB). "
+                f"Maximum supported size for sharing links is {max_mb:.0f} MB."
+            )
+
+        result = parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
+        if isinstance(result, ToolException):
+            raise result
+        return result
 
 
     def _download_public_link(self, sharing_url: str) -> Tuple[str, Optional[bytes]]:
         """Download a file from a public sharing link directly.
-    
+
         Fallback for cross-tenant public links that Graph API returns 403 for.
+        Validates file size via Content-Length header BEFORE downloading content.
         Returns (filename, bytes) on success, (filename, None) on failure.
+
+        Raises:
+            ToolException: If file exceeds size limit or has unsupported type
         """
-    
+
         try:
             # Get FedAuth cookie from initial redirect
             resp = requests.get(sharing_url, allow_redirects=False, timeout=30)
             if resp.status_code not in (301, 302):
                 return 'unknown', None
-    
+
             fedauth = None
             for cookie in resp.cookies:
                 if cookie.name == 'FedAuth':
@@ -1986,29 +2078,49 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     fedauth = match.group(1)
             if not fedauth:
                 return 'unknown', None
-    
+
             # Extract file path from redirect URL
             location = resp.headers.get('Location', '')
             if not location:
                 return 'unknown', None
-    
+
             parsed = urlparse(location)
             file_path = parse_qs(parsed.query).get('id', [None])[0]
             if not file_path:
                 return 'unknown', None
-    
+
             file_path = unquote(file_path)
             file_name = file_path.rsplit('/', 1)[-1] if '/' in file_path else 'unknown'
-    
-            # Download using FedAuth cookie
+
+            # First, do a HEAD request to check Content-Length before downloading
             download_url = f"{parsed.scheme}://{parsed.netloc}{file_path}"
+            head_resp = requests.head(download_url, cookies={'FedAuth': fedauth}, timeout=30)
+
+            # Validate file type and size BEFORE downloading content
+            content_length = head_resp.headers.get('Content-Length')
+            file_size = int(content_length) if content_length else None
+            self._validate_sharing_link_file(file_name, file_size)
+
+            # Now download the actual content
             download_resp = requests.get(download_url, cookies={'FedAuth': fedauth}, timeout=120)
             download_resp.raise_for_status()
-    
+
             if len(download_resp.content) == 0:
                 return file_name, None
-    
+
+            # Safety check: verify actual size doesn't exceed limit (server could lie in HEAD)
+            actual_size = len(download_resp.content)
+            if actual_size > self._SHARING_LINK_MAX_SIZE:
+                size_mb = actual_size / (1024 * 1024)
+                max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
+                raise ToolException(
+                    f"File '{file_name}' is too large ({size_mb:.1f} MB). "
+                    f"Maximum supported size for sharing links is {max_mb:.0f} MB."
+                )
+
             return file_name, download_resp.content
+        except ToolException:
+            raise  # Re-raise validation errors
         except Exception as e:
             logging.warning("Public link download failed: %s", e)
             return 'unknown', None

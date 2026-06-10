@@ -365,6 +365,417 @@ class TestReadFileFromSharingLinkGraphWrapper:
             assert "The sharing link no longer exists" in str(exc_info.value)
 
 
+class TestSharingLinkFileValidation:
+    """Test file type and size validation for sharing links."""
+
+    def test_rejects_unsupported_file_type_zip(self):
+        """ZIP files are rejected with clear error message."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("archive.zip", 1024)
+
+        assert "not supported" in str(exc_info.value).lower()
+        assert ".zip" in str(exc_info.value)
+
+    def test_rejects_unsupported_file_type_mp4(self):
+        """MP4 video files are rejected with clear error message."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("video.mp4", 1024)
+
+        assert "not supported" in str(exc_info.value).lower()
+        assert ".mp4" in str(exc_info.value)
+
+    def test_rejects_file_exceeding_size_limit(self):
+        """Files exceeding 20 MB are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 25 MB file
+        file_size = 25 * 1024 * 1024
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("large_file.pdf", file_size)
+
+        assert "too large" in str(exc_info.value).lower()
+        assert "25.0 MB" in str(exc_info.value)
+        assert "20 MB" in str(exc_info.value)
+
+    def test_accepts_supported_file_type_pdf(self):
+        """PDF files are accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Should not raise
+        wrapper._validate_sharing_link_file("document.pdf", 5 * 1024 * 1024)
+
+    def test_accepts_supported_file_type_docx(self):
+        """DOCX files are accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Should not raise
+        wrapper._validate_sharing_link_file("report.docx", 1024 * 1024)
+
+    def test_accepts_supported_file_type_xlsx(self):
+        """XLSX files are accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Should not raise
+        wrapper._validate_sharing_link_file("data.xlsx", 2 * 1024 * 1024)
+
+    def test_accepts_image_files(self):
+        """Image files (PNG, JPG) are accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Should not raise
+        wrapper._validate_sharing_link_file("screenshot.png", 500 * 1024)
+        wrapper._validate_sharing_link_file("photo.jpg", 1024 * 1024)
+
+    def test_accepts_file_at_size_limit(self):
+        """File exactly at 20 MB limit is accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Exactly 20 MB
+        file_size = 20 * 1024 * 1024
+
+        # Should not raise
+        wrapper._validate_sharing_link_file("large_doc.pdf", file_size)
+
+    def test_handles_none_file_size(self):
+        """Validation works when file size is not available."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Size is None - should only check file type
+        wrapper._validate_sharing_link_file("document.pdf", None)
+
+    def test_rejects_rar_archive(self):
+        """RAR archives are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("archive.rar", 1024)
+
+        assert "not supported" in str(exc_info.value).lower()
+
+    def test_rejects_exe_file(self):
+        """Executable files are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("program.exe", 1024)
+
+        assert "not supported" in str(exc_info.value).lower()
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_validates_before_download(self, mock_requests, mock_parse):
+        """Validation happens BEFORE downloading file content."""
+        # Create a wrapper
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock metadata response with unsupported file type (small size to ensure type check triggers)
+        mock_metadata_response = MagicMock()
+        mock_metadata_response.ok = True
+        mock_metadata_response.status_code = 200
+        mock_metadata_response.json.return_value = {
+            'name': 'video.mp4',
+            'size': 5 * 1024 * 1024,  # 5 MB - under size limit, but unsupported type
+            '@microsoft.graph.downloadUrl': 'https://download.url/file'
+        }
+
+        mock_requests.get.return_value = mock_metadata_response
+
+        # Should raise before trying to download
+        with pytest.raises(ToolException) as exc_info:
+            wrapper.read_file_from_sharing_link(
+                "https://company.sharepoint.com/:v:/s/site/video"
+            )
+
+        # Verify error mentions file type
+        assert "not supported" in str(exc_info.value).lower()
+
+        # Verify only metadata call was made, not content download
+        # First call is metadata, no second call for content
+        assert mock_requests.get.call_count == 1
+
+    def test_rejects_file_without_extension(self):
+        """Files without extensions are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("malware", 1024)
+
+        assert "no extension" in str(exc_info.value).lower()
+        assert "malware" in str(exc_info.value)
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_public_link_validates_before_download(self, mock_requests):
+        """Public link path validates file via HEAD request BEFORE downloading content."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock the initial redirect response (for FedAuth cookie)
+        mock_redirect_response = MagicMock()
+        mock_redirect_response.status_code = 302
+        mock_redirect_response.cookies = [MagicMock(name='FedAuth', value='test-cookie')]
+        mock_redirect_response.headers = {
+            'Location': 'https://company.sharepoint.com/path?id=/personal/user/large_video.mp4',
+            'Set-Cookie': 'FedAuth=test-cookie'
+        }
+
+        # Mock the HEAD response with large file size
+        mock_head_response = MagicMock()
+        mock_head_response.headers = {'Content-Length': str(50 * 1024 * 1024)}  # 50 MB
+
+        # Configure mock to return different responses for different calls
+        def get_side_effect(url, **kwargs):
+            if kwargs.get('allow_redirects') is False:
+                return mock_redirect_response
+            return MagicMock()  # Should not reach here
+
+        mock_requests.get.side_effect = get_side_effect
+        mock_requests.head.return_value = mock_head_response
+
+        # Should raise ToolException before downloading content
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._download_public_link("https://company.sharepoint.com/:v:/p/user/video")
+
+        assert "too large" in str(exc_info.value).lower()
+        # Verify HEAD was called (validation) but no GET for content
+        assert mock_requests.head.call_count == 1
+        # Only the initial redirect GET should be called, not content download
+        assert mock_requests.get.call_count == 1
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_public_link_rejects_unsupported_type_before_download(self, mock_requests):
+        """Public link path rejects unsupported file types via HEAD before download."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock the initial redirect response
+        mock_redirect_response = MagicMock()
+        mock_redirect_response.status_code = 302
+        mock_redirect_response.cookies = [MagicMock(name='FedAuth', value='test-cookie')]
+        mock_redirect_response.headers = {
+            'Location': 'https://company.sharepoint.com/path?id=/personal/user/archive.zip',
+            'Set-Cookie': 'FedAuth=test-cookie'
+        }
+
+        # Mock the HEAD response with small file size (type check should trigger)
+        mock_head_response = MagicMock()
+        mock_head_response.headers = {'Content-Length': str(1024)}  # 1 KB
+
+        mock_requests.get.side_effect = lambda url, **kwargs: mock_redirect_response if kwargs.get('allow_redirects') is False else MagicMock()
+        mock_requests.head.return_value = mock_head_response
+
+        # Should raise ToolException for unsupported type
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._download_public_link("https://company.sharepoint.com/:u:/p/user/archive")
+
+        assert "not supported" in str(exc_info.value).lower()
+        assert ".zip" in str(exc_info.value)
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_public_link_rejects_oversized_download_despite_head_lie(self, mock_requests):
+        """Public link rejects file if actual download exceeds limit (server lied in HEAD)."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock the initial redirect response
+        mock_redirect_response = MagicMock()
+        mock_redirect_response.status_code = 302
+        mock_redirect_response.cookies = [MagicMock(name='FedAuth', value='test-cookie')]
+        mock_redirect_response.headers = {
+            'Location': 'https://company.sharepoint.com/path?id=/personal/user/document.pdf',
+            'Set-Cookie': 'FedAuth=test-cookie'
+        }
+
+        # Mock HEAD response claiming small file (server lies)
+        mock_head_response = MagicMock()
+        mock_head_response.headers = {'Content-Length': str(1024)}  # Claims 1 KB
+
+        # Mock GET response with actual large content (25 MB)
+        mock_download_response = MagicMock()
+        mock_download_response.content = b'x' * (25 * 1024 * 1024)  # Actually 25 MB
+        mock_download_response.raise_for_status = MagicMock()
+
+        def get_side_effect(url, **kwargs):
+            if kwargs.get('allow_redirects') is False:
+                return mock_redirect_response
+            return mock_download_response
+
+        mock_requests.get.side_effect = get_side_effect
+        mock_requests.head.return_value = mock_head_response
+
+        # Should raise ToolException after download when actual size is checked
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._download_public_link("https://company.sharepoint.com/:b:/p/user/doc")
+
+        assert "too large" in str(exc_info.value).lower()
+        assert "25.0 MB" in str(exc_info.value)
+
+    def test_rejects_double_extension_zip_pdf(self):
+        """Files with dangerous intermediate extensions like .zip.pdf are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("malware.zip.pdf", 1024)
+
+        assert "double extension" in str(exc_info.value).lower()
+        assert ".zip" in str(exc_info.value)
+
+    def test_rejects_double_extension_exe_docx(self):
+        """Files with .exe intermediate extension are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("virus.exe.docx", 1024)
+
+        assert "double extension" in str(exc_info.value).lower()
+        assert ".exe" in str(exc_info.value)
+
+    def test_rejects_double_extension_tar_gz_txt(self):
+        """Files with .tar.gz intermediate extensions are rejected."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("archive.tar.gz.txt", 1024)
+
+        assert "double extension" in str(exc_info.value).lower()
+
+    def test_allows_normal_dotted_filename(self):
+        """Files with dots in name but safe extensions are allowed."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Should not raise - "report" and "2024" are not dangerous extensions
+        wrapper._validate_sharing_link_file("quarterly.report.2024.pdf", 1024)
+
+    def test_allows_version_numbered_files(self):
+        """Files with version numbers like file.v2.pdf are allowed."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Should not raise
+        wrapper._validate_sharing_link_file("document.v2.final.pdf", 1024)
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_graph_api_rejects_oversized_download_despite_metadata(self, mock_requests, mock_parse):
+        """Graph API path rejects file if actual download exceeds limit (metadata was wrong)."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Mock metadata response claiming small file
+        mock_metadata_response = MagicMock()
+        mock_metadata_response.ok = True
+        mock_metadata_response.status_code = 200
+        mock_metadata_response.json.return_value = {
+            'name': 'document.pdf',
+            'size': 1024,  # Claims 1 KB
+            '@microsoft.graph.downloadUrl': 'https://download.url/file'
+        }
+
+        # Mock download response with large content
+        mock_download_response = MagicMock()
+        mock_download_response.content = b'x' * (25 * 1024 * 1024)  # Actually 25 MB
+        mock_download_response.raise_for_status = MagicMock()
+
+        mock_requests.get.side_effect = [mock_metadata_response, mock_download_response]
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper.read_file_from_sharing_link(
+                "https://company.sharepoint.com/:b:/s/site/doc"
+            )
+
+        assert "too large" in str(exc_info.value).lower()
+        assert "25.0 MB" in str(exc_info.value)
+        # parse_file_content should NOT be called since size check happens first
+        mock_parse.assert_not_called()
+
+
 class TestReadFromSharingLinkSchema:
     """Test Pydantic schema for the tool."""
 
