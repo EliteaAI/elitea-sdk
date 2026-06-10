@@ -2358,6 +2358,19 @@ class LLMNode(BaseTool):
             _tn, _ta, tool_call_id, _tool = spec
             entry = dict(sentinel.get('hitl_interrupt') or {})
             entry['tool_call_id'] = tool_call_id
+            # Label the paused card with the sub-agent it originated from so the
+            # UI can group N stacked approvals by sub-agent name (issue #4993).
+            # Falls back to the call name when metadata is absent.
+            sub_agent_name = ''
+            _app_meta = getattr(_tool, 'metadata', None) or {}
+            sub_agent_name = (
+                _app_meta.get('original_name')
+                or _app_meta.get('display_name')
+                or getattr(_tool, 'name', '')
+                or _tn
+            )
+            if sub_agent_name:
+                entry['parent_agent_name'] = sub_agent_name
             # Per-entry pending messages would duplicate the parent-level set
             # carried on the aggregate; drop them to keep the payload lean.
             entry.pop('_pending_messages', None)

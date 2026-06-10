@@ -2092,6 +2092,10 @@ def test_two_parallel_children_pause_aggregate_into_one_interrupt():
     assert set(by_id) == {'call-A', 'call-B'}
     assert by_id['call-A']['tool_name'] == 'create_file'
     assert by_id['call-B']['tool_name'] == 'delete_file'
+    # Each card is labelled with the sub-agent it originated from so the UI can
+    # group N stacked approvals by sub-agent name (issue #4993).
+    assert by_id['call-A']['parent_agent_name'] == 'child_a'
+    assert by_id['call-B']['parent_agent_name'] == 'child_b'
     # Internal-only keys must be stripped before reaching the UI/transport.
     for entry in interrupts:
         assert '_pending_messages' not in entry
