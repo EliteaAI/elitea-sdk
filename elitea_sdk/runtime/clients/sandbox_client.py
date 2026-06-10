@@ -246,7 +246,6 @@ class SandboxClient:
         self.bucket_url = f'{self.base_url}{self.api_path}/artifacts/buckets/{self.project_id}'
         self.s3_url = f'{self.base_url}/artifacts/s3'  # S3 API endpoint (same as EliteAClient)
         self.configurations_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=configurations&unsecret=true'
-        self.ai_section_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=ai'
         self.auth_user_url = f'{self.base_url}{self.api_path}/auth/user'
         self.configurations: list = configurations or []
         self.model_timeout = kwargs.get('model_timeout', 120)
@@ -309,12 +308,6 @@ class SandboxClient:
 
     def fetch_available_configurations(self) -> list:
         resp = requests.get(self.configurations_url, headers=self.headers, verify=False)
-        if resp.ok:
-            return resp.json()
-        return []
-
-    def all_models_and_integrations(self):
-        resp = requests.get(self.ai_section_url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         return []

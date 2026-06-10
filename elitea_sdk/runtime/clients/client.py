@@ -109,7 +109,6 @@ class EliteAClient:
         self.artifact_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}"
         self.bucket_url = f"{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}"
         self.configurations_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=configurations&unsecret=true'
-        self.ai_section_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=ai'
         self.models_url = f'{self.base_url}{self.api_path}/configurations/models/{self.project_id}?include_shared=true'
         self.image_generation_url = f"{self.base_url}{self.llm_path}/images/generations"
         self.s3_url = f"{self.base_url}/artifacts/s3"
@@ -216,12 +215,6 @@ class EliteAClient:
 
     def fetch_available_configurations(self) -> list:
         resp = requests.get(self.configurations_url, headers=self.headers, verify=False)
-        if resp.ok:
-            return resp.json()
-        return []
-
-    def all_models_and_integrations(self):
-        resp = requests.get(self.ai_section_url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         return []
