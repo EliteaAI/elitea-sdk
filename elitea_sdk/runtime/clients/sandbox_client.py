@@ -217,12 +217,10 @@ class SandboxClient:
                  project_id: int,
                  auth_token: str,
                  api_extra_headers: Optional[dict] = None,
-                 configurations: Optional[list] = None,
                  **kwargs):
 
         self.base_url = base_url.rstrip('/')
-        self.api_path = '/api/v1'
-        self.llm_path = '/llm/v1'
+        self.api_v2_path = '/api/v2'
         self.project_id = project_id
         self.auth_token = auth_token
         self.headers = {
@@ -231,55 +229,36 @@ class SandboxClient:
         }
         if api_extra_headers is not None:
             self.headers.update(api_extra_headers)
-        self.predict_url = f'{self.base_url}{self.api_path}/prompt_lib/predict/prompt_lib/{self.project_id}'
-        self.prompt_versions = f'{self.base_url}{self.api_path}/prompt_lib/version/prompt_lib/{self.project_id}'
-        self.prompts = f'{self.base_url}{self.api_path}/prompt_lib/prompt/prompt_lib/{self.project_id}'
-        self.app = f'{self.base_url}{self.api_path}/applications/application/prompt_lib/{self.project_id}'
-        self.mcp_tools_list = f'{self.base_url}{self.api_path}/mcp_sse/tools_list/{self.project_id}'
-        self.mcp_tools_call = f'{self.base_url}{self.api_path}/mcp_sse/tools_call/{self.project_id}'
-        self.application_versions = f'{self.base_url}{self.api_path}/applications/version/prompt_lib/{self.project_id}'
-        self.list_apps_url = f'{self.base_url}{self.api_path}/applications/applications/prompt_lib/{self.project_id}'
-        self.integration_details = f'{self.base_url}{self.api_path}/integrations/integration/{self.project_id}'
-        self.secrets_url = f'{self.base_url}{self.api_path}/secrets/secret/{self.project_id}'
-        self.artifacts_url = f'{self.base_url}{self.api_path}/artifacts/artifacts/default/{self.project_id}'
-        self.artifact_url = f'{self.base_url}{self.api_path}/artifacts/artifact/default/{self.project_id}'
-        self.bucket_url = f'{self.base_url}{self.api_path}/artifacts/buckets/{self.project_id}'
-        self.s3_url = f'{self.base_url}/artifacts/s3'  # S3 API endpoint (same as EliteAClient)
-        self.configurations_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=configurations&unsecret=true'
-        self.auth_user_url = f'{self.base_url}{self.api_path}/auth/user'
-        self.configurations: list = configurations or []
+        self.app = f'{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/{self.project_id}'
+        self.mcp_tools_list = f'{self.base_url}{self.api_v2_path}/elitea_core/tools_list/{self.project_id}'
+        self.mcp_tools_call = f'{self.base_url}{self.api_v2_path}/elitea_core/tools_call/{self.project_id}'
+        self.application_versions = f'{self.base_url}{self.api_v2_path}/elitea_core/version/prompt_lib/{self.project_id}'
+        self.list_apps_url = f'{self.base_url}{self.api_v2_path}/elitea_core/applications/prompt_lib/{self.project_id}'
+        self.secrets_url = f'{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}'
+        self.artifacts_url = f'{self.base_url}{self.api_v2_path}/artifacts/artifacts/default/{self.project_id}'
+        self.artifact_url = f'{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}'
+        self.bucket_url = f'{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}'
+        self.s3_url = f'{self.base_url}/artifacts/s3'
         self.model_timeout = kwargs.get('model_timeout', 120)
 
     def get_mcp_toolkits(self):
-        if user_id := self._get_real_user_id():
-            url = f'{self.mcp_tools_list}/{user_id}'
-            data = requests.get(url, headers=self.headers, verify=False).json()
-            return data
-        else:
-            return []
+        data = requests.get(self.mcp_tools_list, headers=self.headers, verify=False).json()
+        return data
 
     def mcp_tool_call(self, params: dict[str, Any]):
-        if user_id := self._get_real_user_id():
-            url = f'{self.mcp_tools_call}/{user_id}'
-            #
-            # This loop iterates over each key-value pair in the arguments dictionary,
-            # and if a value is a Pydantic object, it replaces it with its dictionary representation using .dict().
-            for arg_name, arg_value in params.get('params', {}).get('arguments', {}).items():
-                if isinstance(arg_value, list):
-                    params['params']['arguments'][arg_name] = [
-                        item.dict() if hasattr(item, 'dict') and callable(item.dict) else item
-                        for item in arg_value
-                    ]
-                elif hasattr(arg_value, 'dict') and callable(arg_value.dict):
-                    params['params']['arguments'][arg_name] = arg_value.dict()
-            #
-            response = requests.post(url, headers=self.headers, json=params, verify=False)
-            try:
-                return response.json()
-            except (ValueError, TypeError):
-                return response.text
-        else:
-            return f'Error: Could not determine user ID for MCP tool call'
+        for arg_name, arg_value in params.get('params', {}).get('arguments', {}).items():
+            if isinstance(arg_value, list):
+                params['params']['arguments'][arg_name] = [
+                    item.dict() if hasattr(item, 'dict') and callable(item.dict) else item
+                    for item in arg_value
+                ]
+            elif hasattr(arg_value, 'dict') and callable(arg_value.dict):
+                params['params']['arguments'][arg_name] = arg_value.dict()
+        response = requests.post(self.mcp_tools_call, headers=self.headers, json=params, verify=False)
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            return response.text
 
     def get_app_details(self, application_id: int):
         url = f'{self.app}/{application_id}'
@@ -306,31 +285,15 @@ class SandboxClient:
 
         return apps
 
-    def fetch_available_configurations(self) -> list:
-        resp = requests.get(self.configurations_url, headers=self.headers, verify=False)
-        if resp.ok:
-            return resp.json()
-        return []
-
     def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
         url = f'{self.application_versions}/{application_id}/{application_version_id}'
-        if self.configurations:
-            configs = self.configurations
-        else:
-            configs = self.fetch_available_configurations()
-
-        resp = requests.patch(url, headers=self.headers, verify=False, json={'configurations': configs})
+        resp = requests.patch(url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         logger.error(f'Failed to fetch application version details: {resp.status_code} - {resp.text}.'
                      f' Application ID: {application_id}, Version ID: {application_version_id}')
         raise ApiDetailsRequestError(
             f'Failed to fetch application version details for {application_id}/{application_version_id}.')
-
-    def get_integration_details(self, integration_id: str, format_for_model: bool = False):
-        url = f'{self.integration_details}/{integration_id}'
-        data = requests.get(url, headers=self.headers, verify=False).json()
-        return data
 
     def unsecret(self, secret_name: str):
         url = f'{self.secrets_url}/{secret_name}'
@@ -638,18 +601,4 @@ class SandboxClient:
             "etag": response.headers.get('ETag', '').strip('"')
         }
 
-    def get_user_data(self) -> Dict[str, Any]:
-        resp = requests.get(self.auth_user_url, headers=self.headers, verify=False)
-        if resp.ok:
-            return resp.json()
-        logger.error(f'Failed to fetch user data: {resp.status_code} - {resp.text}')
-        raise ApiDetailsRequestError(f'Failed to fetch user data with status code {resp.status_code}.')
 
-    def _get_real_user_id(self):
-        """Get real user ID from auth API for MCP calls."""
-        try:
-            user_data = self.get_user_data()
-            return user_data.get("id")
-        except Exception as e:
-            logger.debug(f"Error: Could not determine user ID for MCP tool: {e}")
-            return None
