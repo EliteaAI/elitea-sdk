@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import time
 from typing import Optional, List, Tuple
@@ -25,6 +26,12 @@ from langchain_core.tools import ToolException
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content
+from ..utils.http_utils import (
+    stream_download_to_tempfile,
+    FileSizeLimitExceeded,
+    EmptyFileError,
+    DownloadError,
+)
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _SMALL_FILE_THRESHOLD = 4 * 1024 * 1024   # 4 MB — simple PUT
@@ -1908,6 +1915,52 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
     _SHARING_LINK_MAX_SIZE = 20 * 1024 * 1024
 
+    def _stream_download_to_tempfile(
+        self,
+        url: str,
+        file_name: str,
+        timeout: int = 120,
+        headers: Optional[dict] = None,
+        cookies: Optional[dict] = None,
+    ) -> str:
+        """Stream download a file to a temporary file with size limit enforcement.
+
+        Downloads in chunks to minimize memory usage. Aborts early if size limit
+        is exceeded during download.
+
+        Args:
+            url: Download URL
+            file_name: Original file name (used for temp file extension)
+            timeout: Request timeout in seconds
+            headers: Optional request headers
+            cookies: Optional request cookies
+
+        Returns:
+            Path to temporary file containing downloaded content
+
+        Raises:
+            ToolException: If download exceeds size limit or fails
+        """
+        try:
+            return stream_download_to_tempfile(
+                url=url,
+                file_name=file_name,
+                max_size=self._SHARING_LINK_MAX_SIZE,
+                timeout=timeout,
+                headers=headers,
+                cookies=cookies,
+            )
+        except FileSizeLimitExceeded as e:
+            raise ToolException(
+                f"File '{e.file_name}' is too large (>{e.actual_size_mb:.1f} MB). "
+                f"Maximum supported size for sharing links is {e.max_size_mb:.0f} MB. "
+                f"Download aborted."
+            ) from e
+        except EmptyFileError as e:
+            raise ToolException(f"Downloaded file '{e.file_name}' is empty.") from e
+        except DownloadError as e:
+            raise ToolException(f"Failed to download file '{e.file_name}': {e.cause}") from e
+
     def _validate_sharing_link_file(self, file_name: str, file_size: Optional[int]) -> None:
         """Validate file type and size before downloading from sharing link.
 
@@ -2002,12 +2055,17 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if resp.status_code == 403:
             # Graph API can't access cross-tenant public links, try direct download
             # Note: _download_public_link validates file type/size via HEAD request before downloading
-            file_name, file_bytes = self._download_public_link(sharing_url)
-            if file_bytes:
-                result = parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
-                if isinstance(result, ToolException):
-                    raise result
-                return result
+            file_name, temp_path = self._download_public_link(sharing_url)
+            if temp_path:
+                try:
+                    result = parse_file_content(file_path=temp_path, llm=self.llm)
+                    if isinstance(result, ToolException):
+                        raise result
+                    return result
+                finally:
+                    # Always clean up temp file
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
             try:
                 error_msg = resp.json().get('error', {}).get('message', '')
             except Exception:
@@ -2024,38 +2082,39 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         self._validate_sharing_link_file(file_name, file_size)
 
         download_url = data.get('@microsoft.graph.downloadUrl')
-        if download_url:
-            content_resp = requests.get(download_url, timeout=120)
-            content_resp.raise_for_status()
-            file_bytes = content_resp.content
+        if not download_url:
+            download_url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem/content"
+            headers = self._auth_headers()
         else:
-            content_url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem/content"
-            content_resp = self._get_raw(content_url, timeout=120, allow_redirects=True)
-            content_resp.raise_for_status()
-            file_bytes = content_resp.content
+            headers = None
 
-        # Safety check: verify actual size matches metadata (Graph API size could be stale)
-        actual_size = len(file_bytes)
-        if actual_size > self._SHARING_LINK_MAX_SIZE:
-            size_mb = actual_size / (1024 * 1024)
-            max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
-            raise ToolException(
-                f"File '{file_name}' is too large ({size_mb:.1f} MB). "
-                f"Maximum supported size for sharing links is {max_mb:.0f} MB."
-            )
+        temp_path = self._stream_download_to_tempfile(
+            url=download_url,
+            file_name=file_name,
+            timeout=120,
+            headers=headers,
+        )
 
-        result = parse_file_content(file_name=file_name, file_content=file_bytes, llm=self.llm)
-        if isinstance(result, ToolException):
-            raise result
-        return result
+        try:
+            result = parse_file_content(file_path=temp_path, llm=self.llm)
+            if isinstance(result, ToolException):
+                raise result
+            return result
+        finally:
+            # Always clean up temp file
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
-    def _download_public_link(self, sharing_url: str) -> Tuple[str, Optional[bytes]]:
+    def _download_public_link(self, sharing_url: str) -> Tuple[str, Optional[str]]:
         """Download a file from a public sharing link directly.
 
         Fallback for cross-tenant public links that Graph API returns 403 for.
         Validates file size via Content-Length header BEFORE downloading content.
-        Returns (filename, bytes) on success, (filename, None) on failure.
+        Uses streaming download to minimize memory usage.
+
+        Returns (filename, temp_file_path) on success, (filename, None) on failure.
+        Caller is responsible for cleaning up the temp file.
 
         Raises:
             ToolException: If file exceeds size limit or has unsupported type
@@ -2101,24 +2160,14 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             file_size = int(content_length) if content_length else None
             self._validate_sharing_link_file(file_name, file_size)
 
-            # Now download the actual content
-            download_resp = requests.get(download_url, cookies={'FedAuth': fedauth}, timeout=120)
-            download_resp.raise_for_status()
+            temp_path = self._stream_download_to_tempfile(
+                url=download_url,
+                file_name=file_name,
+                timeout=120,
+                cookies={'FedAuth': fedauth},
+            )
 
-            if len(download_resp.content) == 0:
-                return file_name, None
-
-            # Safety check: verify actual size doesn't exceed limit (server could lie in HEAD)
-            actual_size = len(download_resp.content)
-            if actual_size > self._SHARING_LINK_MAX_SIZE:
-                size_mb = actual_size / (1024 * 1024)
-                max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
-                raise ToolException(
-                    f"File '{file_name}' is too large ({size_mb:.1f} MB). "
-                    f"Maximum supported size for sharing links is {max_mb:.0f} MB."
-                )
-
-            return file_name, download_resp.content
+            return file_name, temp_path
         except ToolException:
             raise  # Re-raise validation errors
         except Exception as e:

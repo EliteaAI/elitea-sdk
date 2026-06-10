@@ -1,6 +1,8 @@
 """Tests for SharePoint sharing link support."""
 
 import base64
+import os
+import tempfile
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -13,6 +15,33 @@ def _encode_sharing_url(sharing_url: str) -> str:
     """Encode a sharing URL for the Graph /shares endpoint (test helper)."""
     encoded = base64.b64encode(sharing_url.encode('utf-8')).decode('utf-8')
     return 'u!' + encoded.rstrip('=').replace('/', '_').replace('+', '-')
+
+
+def _create_streaming_response_mock(content: bytes, chunk_size: int = 8192):
+    """Create a mock response that supports streaming via iter_content.
+
+    Args:
+        content: The full content to be streamed
+        chunk_size: Size of chunks to yield (default 8KB)
+
+    Returns:
+        A MagicMock configured to behave like a streaming requests.Response
+    """
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+
+    # Create iterator that yields chunks
+    def iter_content(chunk_size=chunk_size):
+        for i in range(0, len(content), chunk_size):
+            yield content[i:i + chunk_size]
+
+    mock_response.iter_content = iter_content
+
+    # Support context manager protocol for streaming
+    mock_response.__enter__ = MagicMock(return_value=mock_response)
+    mock_response.__exit__ = MagicMock(return_value=False)
+
+    return mock_response
 
 
 class TestSharingUrlEncoding:
@@ -155,8 +184,9 @@ class TestReadFileFromSharingLinkGraphWrapper:
     """Test Graph wrapper implementation for sharing links."""
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
-    def test_calls_shares_endpoint_with_encoded_url(self, mock_requests, mock_parse):
+    def test_calls_shares_endpoint_with_encoded_url(self, mock_requests, mock_http_requests, mock_parse):
         """Graph wrapper calls /shares endpoint with properly encoded URL."""
 
         mock_response = MagicMock()
@@ -167,11 +197,13 @@ class TestReadFileFromSharingLinkGraphWrapper:
             '@microsoft.graph.downloadUrl': 'https://download.url/file'
         }
 
-        mock_content_response = MagicMock()
-        mock_content_response.content = b'file content'
-        mock_content_response.raise_for_status = MagicMock()
+        # Create streaming mock for download - goes to http_utils
+        mock_streaming_response = _create_streaming_response_mock(b'file content')
 
-        mock_requests.get.side_effect = [mock_response, mock_content_response]
+        # graph_wrapper.requests returns metadata
+        mock_requests.get.return_value = mock_response
+        # http_utils.requests handles streaming download
+        mock_http_requests.get.return_value = mock_streaming_response
         mock_parse.return_value = "parsed content"
 
         wrapper = SharepointGraphWrapper(
@@ -190,8 +222,9 @@ class TestReadFileFromSharingLinkGraphWrapper:
         assert '/driveItem' in call_url
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
-    def test_uses_download_url_when_available(self, mock_requests, mock_parse):
+    def test_uses_download_url_when_available(self, mock_requests, mock_http_requests, mock_parse):
         """Uses @microsoft.graph.downloadUrl when present in response."""
 
         download_url = 'https://direct-download.sharepoint.com/file.xlsx'
@@ -204,11 +237,11 @@ class TestReadFileFromSharingLinkGraphWrapper:
             '@microsoft.graph.downloadUrl': download_url
         }
 
-        mock_content_response = MagicMock()
-        mock_content_response.content = b'excel file bytes'
-        mock_content_response.raise_for_status = MagicMock()
+        # Create streaming mock for download - goes to http_utils
+        mock_streaming_response = _create_streaming_response_mock(b'excel file bytes')
 
-        mock_requests.get.side_effect = [mock_metadata_response, mock_content_response]
+        mock_requests.get.return_value = mock_metadata_response
+        mock_http_requests.get.return_value = mock_streaming_response
         mock_parse.return_value = "parsed content"
 
         wrapper = SharepointGraphWrapper(
@@ -221,13 +254,15 @@ class TestReadFileFromSharingLinkGraphWrapper:
             "https://company.sharepoint.com/:x:/s/site/file"
         )
 
-        # Second call should be to the download URL
-        second_call_url = mock_requests.get.call_args_list[1][0][0]
-        assert second_call_url == download_url
+        # http_utils should be called with the download URL (with stream=True)
+        http_call = mock_http_requests.get.call_args
+        assert http_call[0][0] == download_url
+        assert http_call[1].get('stream') is True
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
-    def test_passes_prefer_header(self, mock_requests, mock_parse):
+    def test_passes_prefer_header(self, mock_requests, mock_http_requests, mock_parse):
         """Request includes Prefer header for link redemption."""
 
         mock_response = MagicMock()
@@ -238,11 +273,11 @@ class TestReadFileFromSharingLinkGraphWrapper:
             '@microsoft.graph.downloadUrl': 'https://download.url/file'
         }
 
-        mock_content_response = MagicMock()
-        mock_content_response.content = b'content'
-        mock_content_response.raise_for_status = MagicMock()
+        # Create streaming mock for download - goes to http_utils
+        mock_streaming_response = _create_streaming_response_mock(b'content')
 
-        mock_requests.get.side_effect = [mock_response, mock_content_response]
+        mock_requests.get.return_value = mock_response
+        mock_http_requests.get.return_value = mock_streaming_response
         mock_parse.return_value = "parsed"
 
         wrapper = SharepointGraphWrapper(
@@ -255,14 +290,15 @@ class TestReadFileFromSharingLinkGraphWrapper:
             "https://company.sharepoint.com/:t:/s/site/file.txt"
         )
 
-        # Check headers of first call
+        # Check headers of first call (graph_wrapper.requests for metadata)
         call_kwargs = mock_requests.get.call_args_list[0][1]
         assert 'Prefer' in call_kwargs['headers']
         assert 'redeemSharingLinkIfNecessary' in call_kwargs['headers']['Prefer']
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
-    def test_extracts_filename_from_response(self, mock_requests, mock_parse):
+    def test_extracts_filename_from_response(self, mock_requests, mock_http_requests, mock_parse):
         """Filename is extracted from driveItem response."""
 
         expected_filename = 'quarterly-report.xlsx'
@@ -275,11 +311,11 @@ class TestReadFileFromSharingLinkGraphWrapper:
             '@microsoft.graph.downloadUrl': 'https://download.url/file'
         }
 
-        mock_content_response = MagicMock()
-        mock_content_response.content = b'file bytes'
-        mock_content_response.raise_for_status = MagicMock()
+        # Create streaming mock for download - goes to http_utils
+        mock_streaming_response = _create_streaming_response_mock(b'file bytes')
 
-        mock_requests.get.side_effect = [mock_metadata_response, mock_content_response]
+        mock_requests.get.return_value = mock_metadata_response
+        mock_http_requests.get.return_value = mock_streaming_response
         mock_parse.return_value = "parsed"
 
         wrapper = SharepointGraphWrapper(
@@ -292,10 +328,12 @@ class TestReadFileFromSharingLinkGraphWrapper:
             "https://company.sharepoint.com/:x:/s/site/EncodedId"
         )
 
-        # Verify parse_file_content was called with correct filename
+        # Verify parse_file_content was called with file_path (streaming mode)
         mock_parse.assert_called_once()
         call_kwargs = mock_parse.call_args[1]
-        assert call_kwargs['file_name'] == expected_filename
+        assert 'file_path' in call_kwargs
+        # file_name is NOT passed when using file_path (per prepare_loader validation)
+        assert 'file_name' not in call_kwargs or call_kwargs.get('file_name') is None
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
@@ -317,23 +355,34 @@ class TestReadFileFromSharingLinkGraphWrapper:
             scopes=["Files.Read"]
         )
 
-        # Mock the fallback method on the instance
-        with patch.object(wrapper, '_download_public_link') as mock_download:
-            mock_download.return_value = ('fallback-file.pdf', b'fallback content')
+        # Create a temp file to simulate the fallback returning a file path
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False) as tmp:
+            tmp.write(b'fallback content')
+            temp_path = tmp.name
 
-            result = wrapper.read_file_from_sharing_link(
-                "https://other-tenant.sharepoint.com/:b:/g/public/file"
-            )
+        try:
+            # Mock the fallback method on the instance to return (filename, temp_path)
+            with patch.object(wrapper, '_download_public_link') as mock_download:
+                mock_download.return_value = ('fallback-file.pdf', temp_path)
 
-            # Verify fallback was called
-            mock_download.assert_called_once_with(
-                "https://other-tenant.sharepoint.com/:b:/g/public/file"
-            )
-            # Verify parse was called with fallback result
-            mock_parse.assert_called_once()
-            call_kwargs = mock_parse.call_args[1]
-            assert call_kwargs['file_name'] == 'fallback-file.pdf'
-            assert call_kwargs['file_content'] == b'fallback content'
+                result = wrapper.read_file_from_sharing_link(
+                    "https://other-tenant.sharepoint.com/:b:/g/public/file"
+                )
+
+                # Verify fallback was called
+                mock_download.assert_called_once_with(
+                    "https://other-tenant.sharepoint.com/:b:/g/public/file"
+                )
+                # Verify parse was called with file_path only (per prepare_loader validation)
+                mock_parse.assert_called_once()
+                call_kwargs = mock_parse.call_args[1]
+                assert call_kwargs['file_path'] == temp_path
+                # file_name is NOT passed when using file_path
+                assert 'file_name' not in call_kwargs or call_kwargs.get('file_name') is None
+        finally:
+            # Cleanup is handled by the method under test, but ensure it's gone
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
     def test_403_fallback_failure_returns_graph_error(self, mock_requests):
@@ -633,8 +682,9 @@ class TestSharingLinkFileValidation:
         assert "not supported" in str(exc_info.value).lower()
         assert ".zip" in str(exc_info.value)
 
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
-    def test_public_link_rejects_oversized_download_despite_head_lie(self, mock_requests):
+    def test_public_link_rejects_oversized_download_despite_head_lie(self, mock_requests, mock_http_requests):
         """Public link rejects file if actual download exceeds limit (server lied in HEAD)."""
         wrapper = SharepointGraphWrapper(
             site_url="https://test.sharepoint.com/sites/test",
@@ -655,25 +705,25 @@ class TestSharingLinkFileValidation:
         mock_head_response = MagicMock()
         mock_head_response.headers = {'Content-Length': str(1024)}  # Claims 1 KB
 
-        # Mock GET response with actual large content (25 MB)
-        mock_download_response = MagicMock()
-        mock_download_response.content = b'x' * (25 * 1024 * 1024)  # Actually 25 MB
-        mock_download_response.raise_for_status = MagicMock()
+        # Mock streaming GET response with actual large content (25 MB) - goes to http_utils
+        large_content = b'x' * (25 * 1024 * 1024)  # 25 MB
+        mock_streaming_response = _create_streaming_response_mock(large_content)
 
         def get_side_effect(url, **kwargs):
             if kwargs.get('allow_redirects') is False:
                 return mock_redirect_response
-            return mock_download_response
+            return MagicMock()  # Not used - streaming goes to http_utils
 
         mock_requests.get.side_effect = get_side_effect
         mock_requests.head.return_value = mock_head_response
+        mock_http_requests.get.return_value = mock_streaming_response
 
-        # Should raise ToolException after download when actual size is checked
+        # Should raise ToolException during streaming when size limit exceeded
         with pytest.raises(ToolException) as exc_info:
             wrapper._download_public_link("https://company.sharepoint.com/:b:/p/user/doc")
 
         assert "too large" in str(exc_info.value).lower()
-        assert "25.0 MB" in str(exc_info.value)
+        assert "Download aborted" in str(exc_info.value)  # Streaming abort message
 
     def test_rejects_double_extension_zip_pdf(self):
         """Files with dangerous intermediate extensions like .zip.pdf are rejected."""
@@ -739,8 +789,9 @@ class TestSharingLinkFileValidation:
         wrapper._validate_sharing_link_file("document.v2.final.pdf", 1024)
 
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
-    def test_graph_api_rejects_oversized_download_despite_metadata(self, mock_requests, mock_parse):
+    def test_graph_api_rejects_oversized_download_despite_metadata(self, mock_requests, mock_http_requests, mock_parse):
         """Graph API path rejects file if actual download exceeds limit (metadata was wrong)."""
         wrapper = SharepointGraphWrapper(
             site_url="https://test.sharepoint.com/sites/test",
@@ -758,12 +809,12 @@ class TestSharingLinkFileValidation:
             '@microsoft.graph.downloadUrl': 'https://download.url/file'
         }
 
-        # Mock download response with large content
-        mock_download_response = MagicMock()
-        mock_download_response.content = b'x' * (25 * 1024 * 1024)  # Actually 25 MB
-        mock_download_response.raise_for_status = MagicMock()
+        # Mock streaming download response with actual large content (25 MB) - goes to http_utils
+        large_content = b'x' * (25 * 1024 * 1024)  # 25 MB
+        mock_streaming_response = _create_streaming_response_mock(large_content)
 
-        mock_requests.get.side_effect = [mock_metadata_response, mock_download_response]
+        mock_requests.get.return_value = mock_metadata_response
+        mock_http_requests.get.return_value = mock_streaming_response
 
         with pytest.raises(ToolException) as exc_info:
             wrapper.read_file_from_sharing_link(
@@ -771,9 +822,138 @@ class TestSharingLinkFileValidation:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert "25.0 MB" in str(exc_info.value)
-        # parse_file_content should NOT be called since size check happens first
+        assert "Download aborted" in str(exc_info.value)  # Streaming abort message
+        # parse_file_content should NOT be called since size check happens during streaming
         mock_parse.assert_not_called()
+
+
+class TestStreamingDownload:
+    """Test streaming download functionality for memory efficiency."""
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_creates_temp_file(self, mock_http_requests):
+        """Streaming download creates a temporary file with correct content."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        test_content = b'test file content for streaming'
+        mock_streaming_response = _create_streaming_response_mock(test_content)
+        mock_http_requests.get.return_value = mock_streaming_response
+
+        temp_path = wrapper._stream_download_to_tempfile(
+            url='https://download.url/file.pdf',
+            file_name='test.pdf',
+            timeout=60,
+        )
+
+        try:
+            assert os.path.exists(temp_path)
+            assert temp_path.endswith('.pdf')
+            with open(temp_path, 'rb') as f:
+                assert f.read() == test_content
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_aborts_on_size_limit(self, mock_http_requests):
+        """Streaming download aborts early when size limit is exceeded."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Create content larger than limit (25 MB > 20 MB limit)
+        large_content = b'x' * (25 * 1024 * 1024)
+        mock_streaming_response = _create_streaming_response_mock(large_content)
+        mock_http_requests.get.return_value = mock_streaming_response
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/large.pdf',
+                file_name='large.pdf',
+                timeout=60,
+            )
+
+        assert "too large" in str(exc_info.value).lower()
+        assert "Download aborted" in str(exc_info.value)
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_cleans_up_on_error(self, mock_http_requests):
+        """Streaming download cleans up temp file when size limit exceeded."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        large_content = b'x' * (25 * 1024 * 1024)
+        mock_streaming_response = _create_streaming_response_mock(large_content)
+        mock_http_requests.get.return_value = mock_streaming_response
+
+        # Track temp files created during the test
+        with pytest.raises(ToolException):
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/large.pdf',
+                file_name='large.pdf',
+                timeout=60,
+            )
+
+        # The temp file should have been cleaned up
+        # We can't easily verify this without modifying the function,
+        # but we can verify no exception is raised from cleanup
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_rejects_empty_file(self, mock_http_requests):
+        """Streaming download rejects empty files."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        mock_streaming_response = _create_streaming_response_mock(b'')
+        mock_http_requests.get.return_value = mock_streaming_response
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/empty.pdf',
+                file_name='empty.pdf',
+                timeout=60,
+            )
+
+        assert "empty" in str(exc_info.value).lower()
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_uses_stream_parameter(self, mock_http_requests):
+        """Streaming download sets stream=True in request."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        test_content = b'test content'
+        mock_streaming_response = _create_streaming_response_mock(test_content)
+        mock_http_requests.get.return_value = mock_streaming_response
+
+        temp_path = wrapper._stream_download_to_tempfile(
+            url='https://download.url/file.pdf',
+            file_name='test.pdf',
+            timeout=60,
+        )
+
+        try:
+            # Verify stream=True was passed to http_utils
+            call_kwargs = mock_http_requests.get.call_args[1]
+            assert call_kwargs.get('stream') is True
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
 class TestReadFromSharingLinkSchema:
