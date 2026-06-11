@@ -1,6 +1,5 @@
 """Sensitive tool authorization guard middleware."""
 
-import contextvars
 import inspect
 import json
 import logging
@@ -15,28 +14,6 @@ from langgraph.types import interrupt
 from .base import Middleware
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Context-variable gate for auto-approving previously-authorized tools.
-# Set by the LLM node *after* the first tool-execution iteration so that
-# replay interrupts still consume their checkpoint resume values, while
-# subsequent iterations skip the interrupt for tools the user already
-# approved.
-# ---------------------------------------------------------------------------
-_HITL_APPROVED_TOOLS: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
-    '_hitl_approved_tools', default=frozenset(),
-)
-
-
-def set_hitl_approved_tools(tool_names: set) -> contextvars.Token:
-    """Activate auto-approve for *tool_names* in the current context."""
-    return _HITL_APPROVED_TOOLS.set(frozenset(tool_names))
-
-
-def reset_hitl_approved_tools(token: contextvars.Token) -> None:
-    """Deactivate auto-approve, restoring the previous context."""
-    _HITL_APPROVED_TOOLS.reset(token)
-
 
 from ..tools.application import Application
 from ..toolkits.security import (
@@ -249,24 +226,6 @@ class SensitiveToolGuardMiddleware(Middleware):
             )
             return {'action': 'approve', 'value': ''}
 
-        # Auto-approve tools that the user already authorized in this
-        # execution batch.  The context variable is activated by the
-        # LLM node *after* the first iteration so replay interrupts
-        # consume their checkpoint values correctly.
-        # Uses qualified identity (toolkit_name.tool_name) so that approving
-        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
-        from ..toolkits.security import qualified_tool_identity
-        tool_name = sensitive_tool_context['tool_name']
-        toolkit_name = sensitive_tool_context.get('toolkit_name')
-        qualified = qualified_tool_identity(tool_name, toolkit_name)
-        approved = _HITL_APPROVED_TOOLS.get(frozenset())
-        if qualified in approved:
-            logger.info(
-                "[HITL] Auto-approving '%s' (already authorized in this batch)",
-                qualified,
-            )
-            return {'action': 'approve', 'value': ''}
-
         # Capture intermediate messages accumulated by __perform_tool_calling
         # before the interrupt.  These will be stored in the checkpoint and
         # injected back into graph state on HITL resume so the LLM retains
@@ -310,6 +269,10 @@ class SensitiveToolGuardMiddleware(Middleware):
 
         resume_value = interrupt(interrupt_payload)
         if not isinstance(resume_value, dict):
+            # Non-dict resume payloads are treated as approve.  Each sensitive
+            # tool call is reviewed independently — approving one invocation
+            # never carries over to a later call of the same tool (issue
+            # #5245: prompt on EVERY sensitive invocation).
             return {'action': 'approve', 'value': str(resume_value or '')}
 
         action = str(resume_value.get('action', 'approve')).strip().lower()

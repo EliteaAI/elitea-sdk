@@ -1087,6 +1087,17 @@ class LLMNode(BaseTool):
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
 
+        # Count of durable base messages the graph re-supplies on every
+        # resume (the checkpointed state before this node ran, typically
+        # [system, human]).  Captured BEFORE restoring intermediate history so
+        # the pending-capture window in __perform_tool_calling extends back
+        # across the restored region and carries the FULL cumulative tool
+        # history forward to the next interrupt.  Without this, each resume
+        # cycle's pending would contain only that cycle's slice and earlier
+        # executed-tool results would be shed, causing the LLM to re-plan from
+        # scratch and re-invoke already-approved sensitive tools (#5245).
+        _durable_base_count = len(messages)
+
         if hitl_ctx and hitl_ctx.get('pending_messages'):
             from langchain_core.messages.utils import messages_from_dict
 
@@ -1261,6 +1272,7 @@ class LLMNode(BaseTool):
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
+                    pending_capture_base=_durable_base_count,
                 )
             )
 
@@ -1808,15 +1820,10 @@ class LLMNode(BaseTool):
         # Legacy async support
         return self.invoke(kwargs, **kwargs)
 
-    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None):
+    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
+                                     pending_capture_base=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
-
-        # Lazy import to avoid circular dependency (sensitive_tool_guard -> tools.application)
-        from ..middleware.sensitive_tool_guard import (
-            set_hitl_approved_tools,
-            reset_hitl_approved_tools,
-        )
 
         # Extract historically blocked tools from state-persisted HITL decisions.
         # These survive across checkpoint resumes and prevent the LLM from
@@ -1830,19 +1837,6 @@ class LLMNode(BaseTool):
                 "[HITL] Tools blocked by prior decisions (from state): %s",
                 ', '.join(sorted(_historically_blocked)),
             )
-
-        # Build set of tool names previously approved by the user.
-        # Used to auto-approve tools in the guard on iterations *after*
-        # the first one (the first must consume the checkpoint replay value).
-        # Uses qualified identity (toolkit_name.tool_name) so that approving
-        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
-        _approved_tool_names: set[str] = set()
-        for decision in (hitl_decisions or []):
-            if decision.get('action') == 'approve' and decision.get('tool_name'):
-                _approved_tool_names.add(qualified_tool_identity(
-                    decision['tool_name'], decision.get('toolkit_name'),
-                ))
-        _approved_token = None
 
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
@@ -1862,6 +1856,17 @@ class LLMNode(BaseTool):
         except ValueError:
             _completion_index = _input_msg_count
         _pending_capture_start = min(_completion_index, _input_msg_count)
+
+        # On an HITL resume, ``messages`` already has prior-cycle tool history
+        # appended (restored from the previous interrupt's pending_messages),
+        # so ``_input_msg_count`` sits PAST that region.  Anchor the capture
+        # window at the durable checkpoint base instead, so the pending we hand
+        # to the next interrupt is the FULL cumulative history — not just this
+        # cycle's slice.  Otherwise earlier executed-tool results are shed on
+        # each resume and the LLM re-plans from scratch, re-invoking
+        # already-approved sensitive tools (#5245).
+        if pending_capture_base is not None:
+            _pending_capture_start = min(_pending_capture_start, pending_capture_base)
 
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
@@ -2038,11 +2043,6 @@ class LLMNode(BaseTool):
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
-                        # Reset auto-approve context before propagating.
-                        # NOTE: _PENDING_TOOL_MESSAGES was set right before invoke
-                        # and already consumed by the middleware's interrupt() call.
-                        if _approved_token is not None:
-                            reset_hitl_approved_tools(_approved_token)
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
                     except McpAuthorizationRequired:
@@ -2073,13 +2073,6 @@ class LLMNode(BaseTool):
                         tool_call_id=tool_call_id
                     )
                     new_messages.append(tool_message)
-
-            # After the first iteration's tool calls are processed, activate
-            # auto-approve for tools the user already authorized.  We wait
-            # until now so the guard's interrupt() in the first iteration can
-            # consume the checkpoint replay value correctly.
-            if _approved_tool_names and _approved_token is None:
-                _approved_token = set_hitl_approved_tools(_approved_tool_names)
 
             # Call LLM again with tool results to get next response
             try:
@@ -2184,9 +2177,6 @@ class LLMNode(BaseTool):
             except GraphBubbleUp:
                 # Preserve GraphInterrupt and related graph-level signals raised
                 # anywhere in the tool iteration, including async-to-sync fallback.
-                # Reset auto-approve context before propagating.
-                if _approved_token is not None:
-                    reset_hitl_approved_tools(_approved_token)
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
@@ -2399,11 +2389,6 @@ class LLMNode(BaseTool):
                     error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
                     new_messages.append(AIMessage(content=error_msg))
                     break
-
-        # Reset auto-approve context on normal loop exit.
-        # GraphBubbleUp paths handle their own cleanup above.
-        if _approved_token is not None:
-            reset_hitl_approved_tools(_approved_token)
 
         # Handle max iterations
         if iteration >= self.steps_limit:
