@@ -1,6 +1,5 @@
 """Sensitive tool authorization guard middleware."""
 
-import contextvars
 import inspect
 import json
 import logging
@@ -15,63 +14,6 @@ from langgraph.types import interrupt
 from .base import Middleware
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Context-variable gate for auto-approving previously-authorized tools.
-# Set by the LLM node *after* the first tool-execution iteration so that
-# replay interrupts still consume their checkpoint resume values, while
-# subsequent iterations skip the interrupt for tools the user already
-# approved.
-# ---------------------------------------------------------------------------
-_HITL_APPROVED_TOOLS: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
-    '_hitl_approved_tools', default=frozenset(),
-)
-
-
-# Mutable batch-scoped approval set.  Unlike ``_HITL_APPROVED_TOOLS`` (which
-# holds an immutable ``frozenset`` swapped in/out via tokens), this var holds
-# a regular ``set`` whose membership is grown in-place whenever the user
-# approves a sensitive tool inside ``_review_sensitive_tool_call``.  The
-# reference is captured by ``copy_context()`` so child task contexts (e.g.
-# tools dispatched via ``run_in_executor``) see the SAME object — making
-# in-place ``.add()`` visible to subsequent tool calls in the same batch.
-# This is what allows multi-sibling auto-approve to work correctly: AI emits
-# ``create_file × 5`` → user approves the first one → middleware adds
-# ``github.create_file`` to this set → siblings 2-5 hit the auto-approve
-# path on entry and skip ``interrupt()``.  Different sensitive tool names
-# (e.g. ``github.create_pr``) intentionally remain outside the set and still
-# require explicit approval.
-# ---------------------------------------------------------------------------
-_HITL_BATCH_APPROVED: contextvars.ContextVar[set | None] = contextvars.ContextVar(
-    '_hitl_batch_approved', default=None,
-)
-
-
-def set_hitl_approved_tools(tool_names: set) -> contextvars.Token:
-    """Activate auto-approve for *tool_names* in the current context."""
-    return _HITL_APPROVED_TOOLS.set(frozenset(tool_names))
-
-
-def reset_hitl_approved_tools(token: contextvars.Token) -> None:
-    """Deactivate auto-approve, restoring the previous context."""
-    _HITL_APPROVED_TOOLS.reset(token)
-
-
-def begin_hitl_batch() -> contextvars.Token:
-    """Start a fresh batch-scoped approval set (mutable in-place by reference).
-
-    Called by ``__perform_tool_calling`` at the start of each LLM-driven
-    tool execution batch so that within-batch approvals (grown by the
-    middleware as the user approves each sensitive tool) propagate to
-    subsequent tool calls executed via ``run_in_executor`` child contexts.
-    """
-    return _HITL_BATCH_APPROVED.set(set())
-
-
-def end_hitl_batch(token: contextvars.Token) -> None:
-    """End the current batch-scoped approval set, restoring the previous one."""
-    _HITL_BATCH_APPROVED.reset(token)
-
 
 from ..tools.application import Application
 from ..toolkits.security import (
@@ -284,28 +226,6 @@ class SensitiveToolGuardMiddleware(Middleware):
             )
             return {'action': 'approve', 'value': ''}
 
-        # Auto-approve tools that the user already authorized in this
-        # execution batch.  The context variable is activated by the
-        # LLM node *after* the first iteration so replay interrupts
-        # consume their checkpoint values correctly.
-        # Uses qualified identity (toolkit_name.tool_name) so that approving
-        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
-        from ..toolkits.security import qualified_tool_identity
-        tool_name = sensitive_tool_context['tool_name']
-        toolkit_name = sensitive_tool_context.get('toolkit_name')
-        qualified = qualified_tool_identity(tool_name, toolkit_name)
-        approved = _HITL_APPROVED_TOOLS.get(frozenset())
-        batch_approved = _HITL_BATCH_APPROVED.get(None)
-        # Combine both: pre-batch (frozenset, set by LLMNode from prior
-        # decisions) and within-batch (mutable set, grown by this guard
-        # as the user approves siblings of the same qualified identity).
-        if qualified in approved or (batch_approved is not None and qualified in batch_approved):
-            logger.info(
-                "[HITL] Auto-approving '%s' (already authorized in this batch)",
-                qualified,
-            )
-            return {'action': 'approve', 'value': ''}
-
         # Capture intermediate messages accumulated by __perform_tool_calling
         # before the interrupt.  These will be stored in the checkpoint and
         # injected back into graph state on HITL resume so the LLM retains
@@ -349,28 +269,15 @@ class SensitiveToolGuardMiddleware(Middleware):
 
         resume_value = interrupt(interrupt_payload)
         if not isinstance(resume_value, dict):
-            # Non-dict resume payloads are treated as approve.  Grow the
-            # in-batch approval set so any sibling tool_calls of the SAME
-            # qualified identity in the same AI message auto-approve
-            # (issue #4333: AI emits create_file × 5 → user approves once,
-            # the other 4 should not re-prompt).  Different sensitive tool
-            # names (e.g. create_pr) intentionally remain outside the set.
-            batch = _HITL_BATCH_APPROVED.get(None)
-            if batch is not None:
-                batch.add(qualified)
+            # Non-dict resume payloads are treated as approve.  Each sensitive
+            # tool call is reviewed independently — approving one invocation
+            # never carries over to a later call of the same tool (issue
+            # #5245: prompt on EVERY sensitive invocation).
             return {'action': 'approve', 'value': str(resume_value or '')}
 
         action = str(resume_value.get('action', 'approve')).strip().lower()
         if action not in {'approve', 'reject'}:
             action = 'approve'
-
-        if action == 'approve':
-            # Grow the in-batch approval set so sibling tool_calls of the
-            # SAME qualified identity in the same AI message auto-approve.
-            # Different sensitive tool names still re-prompt (correct UX).
-            batch = _HITL_BATCH_APPROVED.get(None)
-            if batch is not None:
-                batch.add(qualified)
 
         return {
             'action': action,

@@ -10,7 +10,6 @@ from elitea_sdk.runtime.tools.function import (
 )
 from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
     SensitiveToolGuardMiddleware,
-    _HITL_APPROVED_TOOLS,
 )
 from elitea_sdk.runtime.langchain.langraph_agent import (
     TransitionalEdge,
@@ -176,28 +175,37 @@ class TestTransitionalEdgeBlocked:
 # ── P1: API Trust (trust_sensitive_tools) ────────────────────────────────
 
 class TestApiTrustModel:
-    def test_hitl_approved_tools_preapprove(self):
-        """set_hitl_approved_tools should cause auto-approve in _review_sensitive_tool_call."""
-        from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
-            set_hitl_approved_tools,
-            reset_hitl_approved_tools,
+    def test_no_preapproval_carry_over(self):
+        """#5245: there is no pre-approval carry-over.  With auto_approve=False,
+        every sensitive call must hit interrupt() — a prior approval never
+        suppresses a later prompt for the same tool."""
+        interrupt_called = []
+
+        def tracking_interrupt(payload):
+            interrupt_called.append(payload)
+            return {"action": "approve", "value": ""}
+
+        ctx = {
+            "tool_name": "create_issue",
+            "toolkit_name": "github",
+            "toolkit_type": "github",
+            "action_label": "github.create_issue",
+            "policy_message": "Approval required",
+            "tool_args": {},
+        }
+        guard = SensitiveToolGuardMiddleware.__new__(SensitiveToolGuardMiddleware)
+        guard._auto_approve = False
+
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=tracking_interrupt,
+        ):
+            assert guard._review_sensitive_tool_call(ctx)["action"] == "approve"
+            assert guard._review_sensitive_tool_call(ctx)["action"] == "approve"
+
+        assert len(interrupt_called) == 2, (
+            f"Every sensitive call must prompt; got {len(interrupt_called)}"
         )
-        token = set_hitl_approved_tools({"github.create_issue", "github.close_issue"})
-        try:
-            ctx = {
-                "tool_name": "create_issue",
-                "toolkit_name": "github",
-                "toolkit_type": "github",
-                "action_label": "github.create_issue",
-                "policy_message": "Approval required",
-                "tool_args": {},
-            }
-            guard = SensitiveToolGuardMiddleware.__new__(SensitiveToolGuardMiddleware)
-            guard._auto_approve = False
-            result = guard._review_sensitive_tool_call(ctx)
-            assert result["action"] == "approve"
-        finally:
-            reset_hitl_approved_tools(token)
 
 
 # ── Output extraction for _pipeline_blocked ──────────────────────────────
