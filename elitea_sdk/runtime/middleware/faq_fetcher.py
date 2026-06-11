@@ -26,7 +26,7 @@ from urllib.parse import quote
 logger = logging.getLogger(__name__)
 
 # Base URL for toolkit documentation
-TOOLKIT_DOCS_BASE_URL = "https://raw.githubusercontent.com/EliteaAI/elitea.github.io/refs/heads/main/docs/integrations/toolkits"
+TOOLKIT_DOCS_BASE_URL = "https://raw.githubusercontent.com/EliteaAI/elitea.github.io/refs/heads/mintlify/docs/integrations/toolkits"
 
 # Cache for FAQ content to avoid repeated file I/O and network calls
 _faq_cache: dict[str, Optional[str]] = {}
@@ -139,7 +139,7 @@ def _fetch_faq_from_github(toolkit_type: str) -> Optional[str]:
     """
     try:
         # Build documentation URL
-        doc_filename = f"{toolkit_type}_toolkit.md"
+        doc_filename = f"{toolkit_type}_toolkit.mdx"
         doc_url = f"{TOOLKIT_DOCS_BASE_URL}/{quote(doc_filename)}"
 
         logger.debug(f"Fetching FAQ for toolkit '{toolkit_type}' from {doc_url}")
@@ -207,7 +207,9 @@ def _parse_faq_section(markdown_content: str) -> Optional[str]:
     """
     Parse FAQ section from markdown documentation.
 
-    Extracts content after '## FAQ' or '## FAQs' heading until the next heading or end of file.
+    Extracts content after '## FAQ', '## FAQs', or '## Troubleshooting and Support'
+    heading (including Mintlify MDX icon-prefixed variants) until the next heading
+    or end of file.
 
     Args:
         markdown_content: Full markdown documentation content
@@ -215,10 +217,9 @@ def _parse_faq_section(markdown_content: str) -> Optional[str]:
     Returns:
         FAQ section content, or None if no FAQ section found
     """
-    # Pattern to match FAQ or FAQs section
-    # Matches: ## FAQ or ## FAQs (with optional whitespace/case variations)
-    # Captures everything after it until next ## heading or end of content
-    faq_pattern = r'##\s+FAQs?\s*\n(.*?)(?=\n##\s+|\Z)'
+    # Pattern to match FAQ, FAQs, or Troubleshooting and Support section.
+    # Also handles MDX format: '## <Icon icon="circle-question" size={24} /> FAQ'
+    faq_pattern = r'##\s+(?:(?:<[^>]+>\s*)*(?:FAQs?|Troubleshooting and Support))\s*\n(.*?)(?=\n##\s+|\Z)'
 
     match = re.search(faq_pattern, markdown_content, re.IGNORECASE | re.DOTALL)
 
