@@ -1380,6 +1380,17 @@ class LLMNode(BaseTool):
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
 
+        # Count of durable base messages the graph re-supplies on every
+        # resume (the checkpointed state before this node ran, typically
+        # [system, human]).  Captured BEFORE restoring intermediate history so
+        # the pending-capture window in __perform_tool_calling extends back
+        # across the restored region and carries the FULL cumulative tool
+        # history forward to the next interrupt.  Without this, each resume
+        # cycle's pending would contain only that cycle's slice and earlier
+        # executed-tool results would be shed, causing the LLM to re-plan from
+        # scratch and re-invoke already-approved sensitive tools (#5245).
+        _durable_base_count = len(messages)
+
         if hitl_ctx and hitl_ctx.get('pending_messages'):
             from langchain_core.messages.utils import messages_from_dict
 
@@ -1470,9 +1481,59 @@ class LLMNode(BaseTool):
             # __perform_tool_calling re-enters the fan-out: completed siblings
             # are skipped (their ToolMessages were restored above), and each
             # paused child is resumed from its own checkpoint via the matching
-            # hitl_decisions entry. The single-path replay-consumer is NOT run
-            # here — no parent-level interrupt() is re-issued on this resume, so
-            # there is no positional counter to realign.
+            # hitl_decisions entry.
+            #
+            # Multi-round parallel HITL: a resumed child whose LLM picks a new
+            # sensitive tool re-pauses, and _run_parallel_application_calls
+            # re-issues a fresh parent-level interrupt(aggregate). That aggregate
+            # is the FIRST interrupt() of THIS re-execution, so without help it
+            # consumes a still-pending resume value and RETURNS it instead of
+            # raising — swallowing the divergent child's new pause.
+            #
+            # LangGraph (1.x) delivers resume values two ways (see
+            # langgraph/pregel/_algo.py::_scratchpad + langgraph/types.py::interrupt):
+            #   * the scalar Command(resume=X) of THIS cycle arrives as the
+            #     "null resume" (one per cycle); the first interrupt() consumes it.
+            #   * values consumed by interrupt() in PRIOR cycles are persisted as
+            #     task-specific positional `scratchpad.resume` entries and replayed
+            #     by index on every later re-execution.
+            # So the count of pending values the aggregate would otherwise eat is
+            # len(scratchpad.resume) (positional, prior rounds) + 1 (this cycle's
+            # null). Consume them all here so the aggregate interrupt() lands past
+            # them and actually raises. Child decisions ride the SEPARATE
+            # `hitl_decisions` state channel, so consuming the parent's resume
+            # values never robs a child of its answer.
+            scratchpad = configurable.get(_SCRATCHPAD_KEY)
+            n_positional = (
+                len(scratchpad.resume)
+                if scratchpad is not None
+                and getattr(scratchpad, 'resume', None)
+                else 0
+            )
+            has_null = False
+            if scratchpad is not None and hasattr(scratchpad, 'get_null_resume'):
+                try:
+                    has_null = scratchpad.get_null_resume(False) is not None
+                except Exception:  # pragma: no cover - defensive
+                    has_null = False
+            n_prior = n_positional + (1 if has_null else 0)
+            if n_prior:
+                logger.info(
+                    "[HITL] Consuming %d pending parent resume value(s) before "
+                    "parallel sub-agent re-fanout (multi-round): %d positional "
+                    "+ %d null",
+                    n_prior, n_positional, 1 if has_null else 0,
+                )
+                for _i in range(n_prior):
+                    try:
+                        _langgraph_interrupt({'__replay_consumer__': True})
+                    except Exception as exc:
+                        logger.warning(
+                            "[HITL] Parallel replay consumer #%d raised %s — "
+                            "stopping replay consumption early",
+                            _i, exc,
+                        )
+                        break
             completion = None
             original_ai = hitl_ctx.get('original_ai_message')
             if isinstance(original_ai, dict):
@@ -1574,6 +1635,7 @@ class LLMNode(BaseTool):
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
+                    pending_capture_base=_durable_base_count,
                 )
             )
 
@@ -2267,10 +2329,10 @@ class LLMNode(BaseTool):
 
         Children run in worker threads under ``asyncio.gather`` so their
         (blocking) sub-graph invocations overlap (elapsed ≈ max, not sum).
-        ``contextvars.copy_context()`` is captured in the parent context so the
-        mutable ``_HITL_BATCH_APPROVED`` set is shared by reference (same-name
-        auto-approve keeps working) while each child gets an isolated
-        ``_PENDING_TOOL_MESSAGES`` slot.
+        ``contextvars.copy_context()`` is captured per child so each runs in an
+        isolated context (its own ``_PENDING_TOOL_MESSAGES`` slot). Per #5245
+        there is no shared approval set — every sensitive call interrupts on its
+        own, so each paused child surfaces its own approval independently.
 
         A child that pauses for sensitive-tool approval returns a deferred
         sentinel (it must NOT call ``interrupt()`` inside the executor thread —
@@ -2281,6 +2343,12 @@ class LLMNode(BaseTool):
         each decision back to the correct child via its ``tool_call_id``.
         Completed children's ``ToolMessage``s are appended to ``new_messages`` in
         tool_call order regardless of whether siblings paused. See issue #4993.
+
+        All children are awaited to settlement before the aggregate interrupt is
+        raised: ``interrupt()`` checkpoints and replays the WHOLE node on resume,
+        so a sibling cannot be left running across a human pause on a stateless
+        server — abandoning + re-running it desynchronises the resume-value
+        replay cadence and re-fires the same interrupt in a loop.
         """
         from langchain_core.messages import ToolMessage, message_to_dict
 
@@ -2307,30 +2375,37 @@ class LLMNode(BaseTool):
                     'action': decision.get('action', 'approve'),
                     'value': decision.get('value', decision.get('user_feedback', '')),
                 }
-            else:
-                # Fresh run in deferred mode: a HITL pause returns a sentinel.
-                child_config['configurable']['__hitl_deferred_mode__'] = True
+            # Deferred mode must stay sticky ACROSS resume, not just on the fresh
+            # run. A resumed child whose LLM picks a DIFFERENT sensitive tool on
+            # its next turn would otherwise call interrupt() inside this executor
+            # thread — where asyncio.gather captures the GraphInterrupt and the
+            # pause is lost. Keeping it on means a post-resume pause RETURNS a
+            # sentinel and re-aggregates into a fresh parent interrupt (multi-round
+            # parallel HITL — issue #4993 follow-up).
+            child_config['configurable']['__hitl_deferred_mode__'] = True
             child_config['configurable']['__hitl_parallel_call_id__'] = tool_call_id
             ctx = contextvars.copy_context()
             return await loop.run_in_executor(
                 None, lambda c=ctx, t=tool, e=envelope, cc=child_config: c.run(t.invoke, e, config=cc),
             )
 
+        # Run every child concurrently and wait for ALL to settle. A child that
+        # pauses for sensitive-tool approval returns a deferred sentinel (it must
+        # NOT call interrupt() inside the executor thread — gather would capture
+        # the GraphInterrupt and lose the pause). Completed siblings produce
+        # ToolMessages; paused siblings are aggregated into ONE parent interrupt
+        # below. return_exceptions keeps one child's failure from cancelling the
+        # rest (per-child isolation, issue #4993).
         results = await asyncio.gather(
-            *[_run_one(spec) for spec in app_specs],
-            return_exceptions=True,
+            *[_run_one(spec) for spec in app_specs], return_exceptions=True,
         )
 
         pending_deferred = []
         for spec, result in zip(app_specs, results):
-            tool_name, tool_args, tool_call_id, _tool = spec
+            tool_name, _tool_args, tool_call_id, _tool = spec
+            if isinstance(result, GraphBubbleUp):
+                raise result
             if isinstance(result, BaseException):
-                # A child raised an interrupt/bubble directly (e.g. is_subgraph
-                # edge case) — it cannot be aggregated as a live exception, so
-                # re-raise it; the wrapper handles batch cleanup. Other errors
-                # become a per-child error ToolMessage so siblings still finish.
-                if isinstance(result, GraphBubbleUp):
-                    raise result
                 logger.debug("Parallel sub-agent '%s' failed: %s", tool_name, result)
                 new_messages.append(ToolMessage(
                     content=f"Error executing {tool_name}: {result}",
@@ -2404,24 +2479,10 @@ class LLMNode(BaseTool):
         )
         _langgraph_interrupt(aggregate)  # raises GraphInterrupt → parent pregel
 
-    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None):
+    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
+                                     pending_capture_base=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
-
-        # Lazy import to avoid circular dependency (sensitive_tool_guard -> tools.application)
-        from ..middleware.sensitive_tool_guard import (
-            set_hitl_approved_tools,
-            reset_hitl_approved_tools,
-            begin_hitl_batch,
-            end_hitl_batch,
-        )
-
-        # Open a batch-scoped approval set (mutable, shared by reference
-        # across child task contexts).  The middleware grows this set as
-        # the user approves sensitive tools; subsequent siblings with the
-        # SAME qualified identity in the same AI message auto-approve,
-        # while different sensitive tool names still re-prompt (#4333).
-        _batch_token = begin_hitl_batch()
 
         # Extract historically blocked tools from state-persisted HITL decisions.
         # These survive across checkpoint resumes and prevent the LLM from
@@ -2435,19 +2496,6 @@ class LLMNode(BaseTool):
                 "[HITL] Tools blocked by prior decisions (from state): %s",
                 ', '.join(sorted(_historically_blocked)),
             )
-
-        # Build set of tool names previously approved by the user.
-        # Used to auto-approve tools in the guard on iterations *after*
-        # the first one (the first must consume the checkpoint replay value).
-        # Uses qualified identity (toolkit_name.tool_name) so that approving
-        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
-        _approved_tool_names: set[str] = set()
-        for decision in (hitl_decisions or []):
-            if decision.get('action') == 'approve' and decision.get('tool_name'):
-                _approved_tool_names.add(qualified_tool_identity(
-                    decision['tool_name'], decision.get('toolkit_name'),
-                ))
-        _approved_token = None
 
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
@@ -2467,6 +2515,17 @@ class LLMNode(BaseTool):
         except ValueError:
             _completion_index = _input_msg_count
         _pending_capture_start = min(_completion_index, _input_msg_count)
+
+        # On an HITL resume, ``messages`` already has prior-cycle tool history
+        # appended (restored from the previous interrupt's pending_messages),
+        # so ``_input_msg_count`` sits PAST that region.  Anchor the capture
+        # window at the durable checkpoint base instead, so the pending we hand
+        # to the next interrupt is the FULL cumulative history — not just this
+        # cycle's slice.  Otherwise earlier executed-tool results are shed on
+        # each resume and the LLM re-plans from scratch, re-invoking
+        # already-approved sensitive tools (#5245).
+        if pending_capture_base is not None:
+            _pending_capture_start = min(_pending_capture_start, pending_capture_base)
 
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
@@ -2512,9 +2571,6 @@ class LLMNode(BaseTool):
                 except GraphBubbleUp:
                     # The aggregated parallel interrupt() raised — mirror the
                     # sequential path's cleanup before propagating to the executor.
-                    if _approved_token is not None:
-                        reset_hitl_approved_tools(_approved_token)
-                    end_hitl_batch(_batch_token)
                     _PENDING_TOOL_MESSAGES.set([])
                     raise
                 tool_calls = []  # handled in bulk; skip the sequential loop below
@@ -2659,10 +2715,6 @@ class LLMNode(BaseTool):
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
-                        # Reset auto-approve context before propagating.
-                        if _approved_token is not None:
-                            reset_hitl_approved_tools(_approved_token)
-                        end_hitl_batch(_batch_token)
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
                     except McpAuthorizationRequired:
@@ -2693,13 +2745,6 @@ class LLMNode(BaseTool):
                         tool_call_id=tool_call_id
                     )
                     new_messages.append(tool_message)
-
-            # After the first iteration's tool calls are processed, activate
-            # auto-approve for tools the user already authorized.  We wait
-            # until now so the guard's interrupt() in the first iteration can
-            # consume the checkpoint replay value correctly.
-            if _approved_tool_names and _approved_token is None:
-                _approved_token = set_hitl_approved_tools(_approved_tool_names)
 
             # Call LLM again with tool results to get next response
             try:
@@ -2804,10 +2849,6 @@ class LLMNode(BaseTool):
             except GraphBubbleUp:
                 # Preserve GraphInterrupt and related graph-level signals raised
                 # anywhere in the tool iteration, including async-to-sync fallback.
-                # Reset auto-approve context before propagating.
-                if _approved_token is not None:
-                    reset_hitl_approved_tools(_approved_token)
-                end_hitl_batch(_batch_token)
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
@@ -3020,12 +3061,6 @@ class LLMNode(BaseTool):
                     error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
                     new_messages.append(AIMessage(content=error_msg))
                     break
-
-        # Reset auto-approve context on normal loop exit.
-        # GraphBubbleUp paths handle their own cleanup above.
-        if _approved_token is not None:
-            reset_hitl_approved_tools(_approved_token)
-        end_hitl_batch(_batch_token)
 
         # Handle max iterations
         if iteration >= self.steps_limit:

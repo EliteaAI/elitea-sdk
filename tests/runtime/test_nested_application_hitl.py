@@ -757,13 +757,34 @@ def test_nested_child_graph_resume_restores_pending_messages_locally():
     assert initial_result['execution_finished'] is False
     assert initial_result['hitl_interrupt']['tool_name'] == 'create_issue'
 
-    resumed_llm = PendingAwareParentLLM()
-    resumed_runnable = _build_parent_runnable(parent_memory, resumed_llm, [parent_tool])
-    resume_result = resumed_runnable.invoke(
-        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
-        config=thread_config,
-    )
+    # The child emits create_issue x3 in one AI message.  Under #5245 each
+    # sensitive call re-prompts (no batch auto-approve), so we approve once
+    # per interrupt until the run finishes.  Pending-message restore must keep
+    # working across every resume.
+    resume_result = initial_result
+    resumed_llm = None
+    interrupts = 1  # the initial interrupt already counted above
+    for _ in range(10):
+        resumed_llm = PendingAwareParentLLM()
+        resumed_runnable = _build_parent_runnable(parent_memory, resumed_llm, [parent_tool])
+        resume_result = resumed_runnable.invoke(
+            {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+            config=thread_config,
+        )
+        if resume_result['execution_finished']:
+            break
+        assert resume_result['hitl_interrupt']['tool_name'] == 'create_issue', (
+            'Each create_issue invocation must re-prompt (per-call, #5245)'
+        )
+        interrupts += 1
 
+    # Three distinct create_issue invocations → three separate prompts
+    # (per-call #5245; no batch auto-approve carry-over).  Exact tool-exec
+    # counts are not asserted here because the child subgraph has no
+    # checkpointer and replays from scratch on each bubble-resume cycle —
+    # this test's invariant is per-call prompting + clean completion + the
+    # pending-message restore exercised by the child LLM's history checks.
+    assert interrupts == 3, f'Expected one prompt per create_issue call; got {interrupts}'
     assert ('create_issue', {}) in executed
     assert resumed_llm.calls[-1] == ['child-finished']
     assert resume_result['execution_finished'] is True
@@ -1164,209 +1185,16 @@ def test_standalone_subagent_second_distinct_sensitive_tool_is_not_swallowed():
     reset_sensitive_tools()
 
 
-class RetryThenDistinctChildLLM:
-    """Child LLM modelling: create_issue (interrupt) → create_issue retry
-    (auto-approved via batch/decision token, NO interrupt) → delete_issue
-    (must interrupt on its first call).
-
-    Turn logic, driven by how many ToolMessages have already landed:
-      0× 'issue-created'  → call create_issue   (first attempt → interrupt #1)
-      1× 'issue-created'  → call create_issue   (retry → auto-approved)
-      2× 'issue-created'  → call delete_issue   (distinct → interrupt #2)
-      'issue-deleted'     → finish
-    """
-
-    temperature = 0
-    max_tokens = 1000
-
-    @property
-    def _get_model_default_parameters(self):
-        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
-
-    def bind_tools(self, tools, **kwargs):
-        return _RetryThenDistinctChildLLMBound(tools)
-
-    def invoke(self, messages, config=None):
-        return _RetryThenDistinctChildLLMBound([]).invoke(messages, config=config)
-
-
-class _RetryThenDistinctChildLLMBound:
-    def __init__(self, tools):
-        self.tools = list(tools)
-
-    def invoke(self, messages, config=None):
-        contents = [
-            str(message.content)
-            for message in messages
-            if isinstance(message, ToolMessage)
-        ]
-        if any('issue-deleted' in c for c in contents):
-            return AIMessage(content='child-graph-complete')
-
-        created_count = sum(1 for c in contents if 'issue-created' in c)
-        if created_count >= 2:
-            return AIMessage(
-                content='',
-                tool_calls=[
-                    {
-                        'name': 'delete_issue',
-                        'args': {'key': 'PROJ-1'},
-                        'id': 'call-delete',
-                        'type': 'tool_call',
-                    }
-                ],
-            )
-        # First attempt and the single retry both target create_issue.
-        return AIMessage(
-            content='',
-            tool_calls=[
-                {
-                    'name': 'create_issue',
-                    'args': {'summary': 'bug'},
-                    'id': f'call-create-{created_count + 1}',
-                    'type': 'tool_call',
-                }
-            ],
-        )
-
-
-def test_create_retry_auto_approves_then_distinct_delete_still_interrupts():
-    """Batch-token interaction with the Issue 1 fix.
-
-    After ``create_issue`` is approved, a SECOND identical ``create_issue``
-    call (a retry) must be auto-approved by the batch/decision token — no
-    second dialog for the same tool. But the subsequent DISTINCT
-    ``delete_issue`` call must STILL raise its own interrupt; the create
-    approval token must not leak into the distinct tool.
-
-    Sequence:
-      1. initial invoke      → pause at create_issue          (interrupt #1)
-      2. resume(approve) #1   → create_issue runs, retry create_issue
-                               auto-approves & runs, then pause at delete_issue
-                               (interrupt #2 — NOT auto-approved, NOT swallowed)
-      3. resume(approve) #2   → delete_issue runs, child completes
-    create_issue executes twice; delete_issue executes once.
-    """
-    reset_sensitive_tools()
-    configure_sensitive_tools({'github': ['create_issue', 'delete_issue']})
-
-    created = []
-    deleted = []
-
-    def create_issue(**kwargs):
-        created.append(kwargs)
-        return 'issue-created'
-
-    def delete_issue(**kwargs):
-        deleted.append(kwargs)
-        return 'issue-deleted'
-
-    create_tool = StructuredTool.from_function(
-        func=create_issue,
-        name='create_issue',
-        description='create issue',
-        metadata={
-            'toolkit_type': 'github',
-            'toolkit_name': 'github',
-            'tool_name': 'create_issue',
-        },
-    )
-    delete_tool = StructuredTool.from_function(
-        func=delete_issue,
-        name='delete_issue',
-        description='delete issue',
-        metadata={
-            'toolkit_type': 'github',
-            'toolkit_name': 'github',
-            'tool_name': 'delete_issue',
-        },
-    )
-
-    child_assistant = Assistant(
-        elitea=DummyEliteARuntime(),
-        data={'instructions': 'child', 'tools': [], 'meta': {}},
-        client=RetryThenDistinctChildLLM(),
-        tools=[create_tool, delete_tool],
-        memory=None,
-        app_type='predict',
-        is_subgraph=False,
-        middleware=[SensitiveToolGuardMiddleware()],
-    )
-    child_runnable = child_assistant.runnable()
-
-    fake_client = FakeApplicationClient(child_runnable)
-
-    parent_tool = Application(
-        name='child_graph',
-        description='Nested child graph (rebuilt per _run via client)',
-        application=child_runnable,
-        return_type='str',
-        client=fake_client,
-        is_subgraph=True,
-        args_runnable={
-            'application_id': 99,
-            'application_version_id': 1,
-            'is_subgraph': True,
-        },
-    )
-
-    parent_memory = MemorySaver()
-    thread_config = {
-        'configurable': {'thread_id': 'retry-then-distinct-thread'}
-    }
-
-    # --- 1. initial invoke: pause at create_issue ---
-    initial_llm = ParentResultAwareLLM(target_tool_name='child_graph')
-    initial_runnable = _build_parent_runnable(
-        parent_memory, initial_llm, [parent_tool]
-    )
-    initial_result = initial_runnable.invoke(
-        {'messages': [HumanMessage(content='Delegate this task')]},
-        config=thread_config,
-    )
-
-    assert initial_result['execution_finished'] is False
-    assert initial_result['hitl_interrupt']['tool_name'] == 'create_issue'
-    assert created == []
-    assert deleted == []
-
-    # --- 2. resume #1: create runs + retry auto-approves, pause at delete ---
-    resume1_llm = ParentResultAwareLLM(target_tool_name='child_graph')
-    resume1_runnable = _build_parent_runnable(
-        parent_memory, resume1_llm, [parent_tool]
-    )
-    resume1_result = resume1_runnable.invoke(
-        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
-        config=thread_config,
-    )
-
-    # The distinct delete_issue must surface its own interrupt; the create
-    # approval token must NOT auto-approve a different tool.
-    assert resume1_result['execution_finished'] is False, (
-        'distinct delete_issue was incorrectly auto-approved or swallowed'
-    )
-    assert resume1_result['hitl_interrupt']['tool_name'] == 'delete_issue'
-    # create_issue ran TWICE (first approval + auto-approved retry); delete
-    # has not run yet (still awaiting its own approval).
-    assert len(created) == 2
-    assert deleted == []
-
-    # --- 3. resume #2: delete runs, child completes ---
-    resume2_llm = ParentResultAwareLLM(target_tool_name='child_graph')
-    resume2_runnable = _build_parent_runnable(
-        parent_memory, resume2_llm, [parent_tool]
-    )
-    resume2_result = resume2_runnable.invoke(
-        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
-        config=thread_config,
-    )
-
-    assert resume2_result['execution_finished'] is True
-    assert resume2_result['output'] == 'parent-graph-complete'
-    assert len(created) == 2
-    assert len(deleted) == 1
-
-    reset_sensitive_tools()
+# NOTE: The former ``test_create_retry_auto_approves_then_distinct_delete_
+# still_interrupts`` validated the now-removed within-batch auto-approve
+# carry-over in the nested-subgraph path.  Under #5245 every sensitive call
+# prompts individually; the nested Application path here has no child
+# checkpointer, so the child cannot durably re-pause for a second sensitive
+# call within one parent resume.  Per-call prompting + replay-safety is
+# covered by tests/runtime/test_sensitive_tool_guard.py::
+# test_5245_same_tool_prompts_every_call_across_resumes (single-graph,
+# checkpointed) instead.  Durable nested/parallel multi-prompt HITL is
+# tracked separately (parallel HITL dispatch redesign).
 
 
 def test_swarm_result_adapter_hitl_interrupt_and_resume():
@@ -2163,3 +1991,174 @@ def test_one_parallel_child_completes_other_pauses():
     assert len(interrupts) == 1, f'only the paused child should surface; got {interrupts}'
     assert interrupts[0]['tool_call_id'] == 'call-B'
     assert interrupts[0]['tool_name'] == 'delete_file'
+
+
+# ---------------------------------------------------------------------------
+# Multi-round parallel HITL (issue #4993 follow-up)
+#
+# The single-round parallel design assumed: all children pause once -> one
+# aggregated interrupt -> resume once -> done. But each child is a full agent
+# that can pause AGAIN after its decision (its LLM picks a DIFFERENT sensitive
+# tool on the next turn). These tests pin the multi-round behaviour: a resumed
+# child that re-pauses must re-aggregate into a FRESH parent interrupt instead
+# of (a) losing the pause inside the gather executor thread or (b) having the
+# parent interrupt() return a stale positional-replay value instead of raising.
+# ---------------------------------------------------------------------------
+
+
+class MultiRoundDivergingApplication:
+    """Round 1: pauses on ``first_tool``. When that round is REJECTED the child's
+    model diverges to ``second_tool`` (also sensitive) and pauses AGAIN. On the
+    next (approve) resume it completes. Models the real "block tool X, the LLM
+    then tries tool Y" multi-round flow that the single-round design swallowed."""
+
+    def __init__(self, output, first_tool, second_tool):
+        self.output = output
+        self.first_tool = first_tool
+        self.second_tool = second_tool
+        self.calls = []
+        self._diverged = False
+
+    def _pause(self, tool_name):
+        return {
+            'output': 'need approval',
+            'execution_finished': False,
+            'hitl_interrupt': {
+                'type': 'hitl',
+                'guardrail_type': 'sensitive_tool',
+                'message': f'approve {tool_name}?',
+                'tool_name': tool_name,
+            },
+        }
+
+    def invoke(self, payload, config=None):
+        self.calls.append({'payload': payload, 'config': config})
+        is_resume = isinstance(payload, dict) and payload.get('hitl_resume')
+        if not is_resume:
+            return self._pause(self.first_tool)
+        action = payload.get('hitl_action', 'approve') if isinstance(payload, dict) else 'approve'
+        if action == 'reject' and not self._diverged:
+            self._diverged = True
+            return self._pause(self.second_tool)
+        return {'output': self.output, 'execution_finished': True}
+
+
+def test_parallel_reject_round1_both_diverge_into_second_aggregate():
+    """Both children pause on the SAME sensitive tool (round 1). After the user
+    BLOCKS both, each child's model diverges to a DIFFERENT sensitive tool and
+    re-pauses. A SECOND aggregated parent interrupt MUST fire
+    (guardrail_type=parallel_sensitive_tools) with one entry per still-pending
+    child — the multi-round case the single-round design dropped."""
+    parent_memory = MemorySaver()
+    child_a = MultiRoundDivergingApplication('A-done', 'create_file', 'edit_file')
+    child_b = MultiRoundDivergingApplication('B-done', 'create_file', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+    thread_config = {'configurable': {'thread_id': 'parallel-multiround-thread'}}
+
+    # Round 1: fan out, both pause on create_file.
+    r1 = _build_parent_runnable(parent_memory, MultiAppParentLLM(), tools).invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config=thread_config,
+    )
+    assert r1['execution_finished'] is False
+    by_id_1 = {i['tool_call_id']: i for i in r1['hitl_interrupts']}
+    assert set(by_id_1) == {'call-A', 'call-B'}
+    assert by_id_1['call-A']['tool_name'] == 'create_file'
+    assert by_id_1['call-B']['tool_name'] == 'create_file'
+
+    # Reject BOTH -> each child diverges to a distinct sensitive tool and
+    # re-pauses -> a fresh aggregated interrupt is raised (NOT swallowed).
+    r2 = _build_parent_runnable(parent_memory, MultiAppParentLLM(), tools).invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-A', 'action': 'reject', 'value': 'no'},
+            {'tool_call_id': 'call-B', 'action': 'reject', 'value': 'no'},
+        ]},
+        config=thread_config,
+    )
+
+    assert r2['execution_finished'] is False, (
+        'round-2 divergent sensitive tools must re-fire HITL, not run/lose silently'
+    )
+    interrupts_2 = r2['hitl_interrupts']
+    assert len(interrupts_2) == 2, f'expected a SECOND 2-card aggregate, got {interrupts_2}'
+    by_id_2 = {i['tool_call_id']: i for i in interrupts_2}
+    assert by_id_2['call-A']['tool_name'] == 'edit_file'
+    assert by_id_2['call-B']['tool_name'] == 'delete_file'
+    assert by_id_2['call-A']['parent_agent_name'] == 'child_a'
+    assert by_id_2['call-B']['parent_agent_name'] == 'child_b'
+
+
+def test_parallel_round2_holds_only_still_pending_child():
+    """Round 1: both pause. On resume one child is APPROVED (completes in the
+    background) while the other is REJECTED and diverges to a new sensitive tool.
+    The second aggregated interrupt holds ONLY the still-pending child; the
+    completed sibling does not resurface."""
+    parent_memory = MemorySaver()
+    child_a = DictBridgeInterruptingApplication('A-done', 'create_file')  # completes on resume
+    child_b = MultiRoundDivergingApplication('B-done', 'create_file', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+    thread_config = {'configurable': {'thread_id': 'parallel-mixed-multiround-thread'}}
+
+    r1 = _build_parent_runnable(parent_memory, MultiAppParentLLM(), tools).invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config=thread_config,
+    )
+    assert len(r1['hitl_interrupts']) == 2
+
+    r2 = _build_parent_runnable(parent_memory, MultiAppParentLLM(), tools).invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-A', 'action': 'approve', 'value': ''},
+            {'tool_call_id': 'call-B', 'action': 'reject', 'value': 'no'},
+        ]},
+        config=thread_config,
+    )
+
+    assert r2['execution_finished'] is False
+    interrupts_2 = r2['hitl_interrupts']
+    assert len(interrupts_2) == 1, f'only the re-paused child should surface; got {interrupts_2}'
+    assert interrupts_2[0]['tool_call_id'] == 'call-B'
+    assert interrupts_2[0]['tool_name'] == 'delete_file'
+
+
+def test_parallel_multi_round_resolves_to_completion():
+    """Full multi-round drive on a real MemorySaver: round-1 reject -> round-2
+    fires (proves the stale positional-replay value was consumed so the second
+    interrupt RAISES instead of returning) -> round-2 approve -> both children
+    complete and the parent finishes with both outputs."""
+    parent_memory = MemorySaver()
+    child_a = MultiRoundDivergingApplication('A-done', 'create_file', 'edit_file')
+    child_b = MultiRoundDivergingApplication('B-done', 'create_file', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+    thread_config = {'configurable': {'thread_id': 'parallel-multiround-complete-thread'}}
+
+    _build_parent_runnable(parent_memory, MultiAppParentLLM(), tools).invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config=thread_config,
+    )
+
+    r2 = _build_parent_runnable(parent_memory, MultiAppParentLLM(), tools).invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-A', 'action': 'reject', 'value': 'no'},
+            {'tool_call_id': 'call-B', 'action': 'reject', 'value': 'no'},
+        ]},
+        config=thread_config,
+    )
+    assert r2['execution_finished'] is False
+    assert len(r2['hitl_interrupts']) == 2
+
+    final_llm = MultiAppParentLLM()
+    r3 = _build_parent_runnable(parent_memory, final_llm, tools).invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-A', 'action': 'approve', 'value': ''},
+            {'tool_call_id': 'call-B', 'action': 'approve', 'value': ''},
+        ]},
+        config=thread_config,
+    )
+
+    assert r3['execution_finished'] is True, (
+        'after both rounds resolve the parent must complete (stale-replay '
+        'consumption let round-2 raise and round-3 resume route correctly)'
+    )
+    assert r3['output'] == 'parent-done'
+    final_contents = final_llm.calls[-1]
+    assert 'A-done' in final_contents and 'B-done' in final_contents

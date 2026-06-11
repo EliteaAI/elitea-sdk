@@ -177,6 +177,122 @@ def test_hitl_resume_restores_pending_messages_before_replaying_llm():
     )
 
 
+class _TwoDeleteFilesLLM:
+    """Emits two distinct ``delete_file`` tool_calls on the first turn, then
+    returns FINAL once both have produced ToolMessages.  Used to prove #5245
+    per-call prompting across resumes with a real graph + checkpointer.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.temperature = 0
+        self.max_tokens = 1000
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def invoke(self, messages, config=None):
+        tool_contents = [
+            str(m.content) for m in messages if isinstance(m, ToolMessage)
+        ]
+        self.calls.append(tool_contents)
+        # Both delete_file calls completed → finish.
+        if tool_contents.count('deleted') >= 2:
+            return AIMessage(content='FINAL')
+        # First turn: request two distinct delete_file calls.
+        return AIMessage(
+            content='',
+            tool_calls=[
+                {'name': 'delete_file', 'args': {'path': 'a.txt'}, 'id': 'del-a'},
+                {'name': 'delete_file', 'args': {'path': 'b.txt'}, 'id': 'del-b'},
+            ],
+        )
+
+
+def _build_delete_files_runnable(memory, llm, executed):
+    def _delete_file(path):
+        executed.append(path)
+        return 'deleted'
+
+    assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'Use tools', 'tools': [], 'meta': {}},
+        client=llm,
+        tools=[
+            StructuredTool.from_function(
+                func=_delete_file,
+                name='delete_file',
+                description='delete a file',
+                metadata={
+                    'toolkit_type': 'fs', 'toolkit_name': 'fs', 'tool_name': 'delete_file',
+                },
+            ),
+        ],
+        memory=memory,
+        app_type='predict',
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    return assistant.runnable()
+
+
+def test_5245_same_tool_prompts_every_call_across_resumes():
+    """Regression guard for #5245 + replay-safety.
+
+    An AI message emits ``delete_file`` x2 (distinct args).  The guard must
+    interrupt for call #1, then — after approve+execute — interrupt AGAIN for
+    call #2 (no auto-approve carry-over).  Already-completed calls must NOT
+    re-interrupt on replay.  Net result: exactly 2 interrupts, each delete_file
+    executed exactly once.
+    """
+    configure_sensitive_tools({'fs': ['delete_file']})
+
+    memory = MemorySaver()
+    thread_config = {'configurable': {'thread_id': '5245-per-call-thread'}}
+    executed = []
+
+    # First run → interrupt for delete_file call #1.
+    r1 = _build_delete_files_runnable(memory, _TwoDeleteFilesLLM(), executed)
+    res1 = r1.invoke(
+        {'messages': [HumanMessage(content='delete a.txt and b.txt')]},
+        config=thread_config,
+    )
+    assert res1['execution_finished'] is False
+    assert res1['hitl_interrupt']['tool_name'] == 'delete_file'
+    assert executed == [], 'No tool should execute before the first approval'
+
+    # Resume approve → call #1 executes, then interrupt fires AGAIN for call #2.
+    r2 = _build_delete_files_runnable(memory, _TwoDeleteFilesLLM(), executed)
+    res2 = r2.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+    assert res2['execution_finished'] is False, (
+        'Second delete_file must re-prompt, not auto-approve'
+    )
+    assert res2['hitl_interrupt']['tool_name'] == 'delete_file'
+    assert executed == ['a.txt'], (
+        f'Only the first call should have executed so far; got {executed}'
+    )
+
+    # Resume approve → call #2 executes, run completes.
+    r3 = _build_delete_files_runnable(memory, _TwoDeleteFilesLLM(), executed)
+    res3 = r3.invoke(
+        {'hitl_resume': True, 'hitl_action': 'approve', 'hitl_value': ''},
+        config=thread_config,
+    )
+    assert res3['execution_finished'] is True
+    assert res3['output'] == 'FINAL'
+
+    # Exactly 2 distinct files deleted, each exactly once (no replay re-exec).
+    assert sorted(executed) == ['a.txt', 'b.txt'], (
+        f'Each delete_file must execute exactly once; got {executed}'
+    )
+
+
 def test_hitl_reject_continues_tool_loop():
     tool = StructuredTool.from_function(
         func=lambda repo: SensitiveToolGuardMiddleware._build_blocked_tool_result(
@@ -1542,29 +1658,19 @@ def test_state_persisted_hitl_decisions_exclude_blocked_tools():
     )
 
 
-def test_auto_approve_skips_interrupt_for_already_authorized_tool():
-    """After a tool is authorized, subsequent calls to the same tool in the same
-    execution batch must NOT trigger a new interrupt.  The guard should auto-
-    approve based on *_HITL_BATCH_APPROVED* context variable so the user is not
-    stuck in an infinite Authorize -> Execute -> Authorize loop.
-
-    NOTE: as of #4333 the middleware itself grows a per-batch approval set on
-    every successful approve so multi-sibling tool_calls in a single AI message
-    auto-approve correctly.  The batch lifecycle is owned by
-    ``__perform_tool_calling`` via ``begin_hitl_batch`` / ``end_hitl_batch``.
+def test_same_tool_reprompts_on_every_call():
+    """#5245: every sensitive invocation must prompt — approving one call of a
+    tool must NOT auto-approve a later call of the SAME qualified tool, whether
+    in the same AI message (batch) or a separate one.  There is no carry-over.
     """
     from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
         SensitiveToolGuardMiddleware,
-        set_hitl_approved_tools,
-        reset_hitl_approved_tools,
-        begin_hitl_batch,
-        end_hitl_batch,
     )
 
     interrupt_called = []
 
     def tracking_interrupt(payload):
-        """Record every interrupt() call.  Should NOT fire for auto-approved tools."""
+        """Record every interrupt() call.  Must fire on EVERY sensitive call."""
         interrupt_called.append(payload)
         return {'action': 'approve', 'value': ''}
 
@@ -1586,72 +1692,42 @@ def test_auto_approve_skips_interrupt_for_already_authorized_tool():
             'tool_args': {'method': 'GET', 'endpoint': '/repos'},
         }
 
-        # Open a batch (mimics __perform_tool_calling's lifecycle).
-        batch_token = begin_hitl_batch()
-        try:
-            # 1) Empty batch set → interrupt fires.  The middleware grows
-            #    the batch set on a successful approve so subsequent calls
-            #    in the same batch with the SAME qualified identity skip
-            #    interrupt().
-            review1 = guard._review_sensitive_tool_call(ctx)
-            assert review1['action'] == 'approve'
-            assert len(interrupt_called) == 1, 'Expected exactly 1 interrupt call before auto-approve'
+        # 1) First call → interrupt fires.
+        review1 = guard._review_sensitive_tool_call(ctx)
+        assert review1['action'] == 'approve'
+        assert len(interrupt_called) == 1, 'Expected exactly 1 interrupt on first call'
 
-            # 2) Same tool again in the same batch → auto-approved by the
-            #    grown batch set; no further interrupt.
-            interrupt_called.clear()
-            review2 = guard._review_sensitive_tool_call(ctx)
-            assert review2['action'] == 'approve'
-            assert len(interrupt_called) == 0, (
-                f'Auto-approve should skip interrupt(), but got {len(interrupt_called)} call(s)'
-            )
+        # 2) Same tool again → interrupt fires AGAIN (no auto-approve carry-over).
+        review2 = guard._review_sensitive_tool_call(ctx)
+        assert review2['action'] == 'approve'
+        assert len(interrupt_called) == 2, (
+            f'Second call of the same tool must re-prompt; got {len(interrupt_called)} total'
+        )
 
-            # 3) A DIFFERENT sensitive tool in the same batch must still
-            #    re-prompt — only the SAME qualified identity auto-approves.
-            interrupt_called.clear()
-            review_pr = guard._review_sensitive_tool_call({
-                **ctx, 'tool_name': 'create_pr', 'action_label': 'github.create_pr',
-            })
-            assert review_pr['action'] == 'approve'
-            assert len(interrupt_called) == 1, (
-                'Different sensitive tool name must re-prompt; got '
-                f'{len(interrupt_called)} interrupt call(s)'
-            )
+        # 3) A DIFFERENT sensitive tool also prompts.
+        review_pr = guard._review_sensitive_tool_call({
+            **ctx, 'tool_name': 'create_pr', 'action_label': 'github.create_pr',
+        })
+        assert review_pr['action'] == 'approve'
+        assert len(interrupt_called) == 3, (
+            f'Different sensitive tool must prompt; got {len(interrupt_called)} total'
+        )
 
-            # 4) The pre-batch ``_HITL_APPROVED_TOOLS`` frozenset (set by
-            #    the LLM node from prior hitl_decisions) is still honored
-            #    independently of the batch set.
-            token = set_hitl_approved_tools({'github.list_issues'})
-            try:
-                interrupt_called.clear()
-                review_list = guard._review_sensitive_tool_call({
-                    **ctx, 'tool_name': 'list_issues',
-                    'action_label': 'github.list_issues',
-                })
-                assert review_list['action'] == 'approve'
-                assert len(interrupt_called) == 0, 'Pre-approved list_issues should auto-approve'
-            finally:
-                reset_hitl_approved_tools(token)
-        finally:
-            end_hitl_batch(batch_token)
-
-        # 5) Outside any batch, a fresh call re-prompts (no batch set
-        #    persists across batch boundaries).
-        interrupt_called.clear()
-        review_fresh = guard._review_sensitive_tool_call(ctx)
-        assert review_fresh['action'] == 'approve'
-        assert len(interrupt_called) == 1, 'Expected interrupt to fire outside batch scope'
+        # 4) Back to the first tool → prompts yet again.
+        review3 = guard._review_sensitive_tool_call(ctx)
+        assert review3['action'] == 'approve'
+        assert len(interrupt_called) == 4, (
+            f'Every invocation must prompt; got {len(interrupt_called)} total'
+        )
 
 
-def test_auto_approve_disambiguates_across_toolkits():
-    """Approving create_issue for jira must NOT auto-approve create_issue for
-    github.  The approved set uses qualified identity (toolkit_name.tool_name)
-    so identically-named tools in different toolkits remain independent.
+def test_distinct_toolkits_each_reprompt():
+    """create_issue for jira and create_issue for github each prompt
+    independently — there is no auto-approve, so identically-named tools in
+    different toolkits both interrupt on every call.
     """
     from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
         SensitiveToolGuardMiddleware,
-        set_hitl_approved_tools,
-        reset_hitl_approved_tools,
     )
 
     interrupt_called = []
@@ -1684,26 +1760,13 @@ def test_auto_approve_disambiguates_across_toolkits():
             'tool_args': {'repo': 'org/repo'},
         }
 
-        # Auto-approve only jira.create_issue
-        token = set_hitl_approved_tools({'jira.create_issue'})
-        try:
-            # Jira's create_issue should be auto-approved (no interrupt)
-            review_jira = guard._review_sensitive_tool_call(jira_ctx)
-            assert review_jira['action'] == 'approve'
-            assert len(interrupt_called) == 0, (
-                'Jira create_issue should be auto-approved without interrupt'
-            )
+        review_jira = guard._review_sensitive_tool_call(jira_ctx)
+        assert review_jira['action'] == 'approve'
+        assert len(interrupt_called) == 1, 'Jira create_issue must prompt'
 
-            # GitHub's create_issue must still trigger an interrupt
-            interrupt_called.clear()
-            review_github = guard._review_sensitive_tool_call(github_ctx)
-            assert review_github['action'] == 'approve'
-            assert len(interrupt_called) == 1, (
-                'GitHub create_issue should NOT be auto-approved '
-                'when only jira.create_issue was approved'
-            )
-        finally:
-            reset_hitl_approved_tools(token)
+        review_github = guard._review_sensitive_tool_call(github_ctx)
+        assert review_github['action'] == 'approve'
+        assert len(interrupt_called) == 2, 'GitHub create_issue must also prompt'
 
 
 def test_auto_approve_flag_bypasses_interrupt():
