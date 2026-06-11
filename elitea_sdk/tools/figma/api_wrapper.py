@@ -12,6 +12,8 @@ from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import Field, PrivateAttr, create_model, model_validator, SecretStr
 
+from elitea_sdk.runtime.utils.utils import IndexerKeywords
+
 
 # User-friendly error messages for common Figma API errors
 FIGMA_ERROR_MESSAGES = {
@@ -64,6 +66,10 @@ from .toon_tools import (
     infer_cta_destination,
     FrameDetailTOONSchema,
     AnalyzeFileSchema,
+)
+from .chunking_strategy import (
+    BisectionChunkingStrategy,
+    ChunkResult,
 )
 
 GLOBAL_LIMIT = 1000000
@@ -368,6 +374,20 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 f"Original error: {e}"
             )
 
+    def _remove_metadata_keys(self) -> List[str]:
+        """Remove internal keys from document metadata before indexing.
+
+        Extends base class to remove Figma-specific keys that are only used
+        during document loading and should not be persisted to vectorstore.
+        """
+        base_keys = super()._remove_metadata_keys()
+        figma_keys = [
+            'number_of_threads_override', # Internal concurrency setting
+            'figma_nodes_include',       # Already processed during loading
+            'figma_nodes_exclude',       # Already processed during loading
+        ]
+        return base_keys + figma_keys
+
     def _base_loader(
         self,
         urls_or_file_keys: Optional[str] = None,
@@ -483,58 +503,102 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 texts.extend(self.get_texts_recursive(child))
         return texts
     
-    def _load_pages(self, document: Document):
+    def _load_pages(
+        self,
+        document: Document,
+    ) -> List[dict]:
+        """
+        Load pages from a Figma file using bisection chunking strategy.
+
+        Args:
+            document: Document with file metadata
+
+        Returns:
+            List of page content dictionaries
+        """
         file_key = document.metadata.get('id', '')
         node_ids_include = document.metadata.pop('figma_pages_include', [])
         node_ids_exclude = document.metadata.pop('figma_pages_exclude', [])
         self._log_tool_event(f"Included pages: {node_ids_include}. Excluded pages: {node_ids_exclude}.")
 
-        if node_ids_include:
-            # Try to fetch specified pages/nodes in one request
-            try:
-                file = self._get_file_nodes(file_key, ','.join(node_ids_include))
-                if file:
-                    return [
-                        node["document"]
-                        for node in (file.get("nodes") or {}).values()
-                        if node is not None and "document" in node
-                    ]
-            except ToolException as e:
-                if "too large" in str(e).lower() or "400" in str(e):
-                    self._log_tool_event(f"Bulk request too large, falling back to per-page fetching")
-                else:
-                    raise
-        else:
-            # Try to fetch full file
-            try:
-                file = self._client.get_file(file_key)
-                if file:
-                    figma_pages = file.document.get('children', [])
-                    return [node for node in figma_pages if ('id' in node and node['id'].replace(':', '-') not in node_ids_exclude)]
-            except ToolException as e:
-                if "too large" in str(e).lower() or "400" in str(e):
-                    self._log_tool_event(f"Bulk request too large, falling back to per-page fetching")
-                else:
-                    raise
+        strategy = BisectionChunkingStrategy()
 
-        # Fallback: fetch pages one by one (safe for large files)
-        self._log_tool_event(f"Using per-page fetching strategy for file {file_key}")
-        file = self._client.get_file(file_key, geometry='depth=1')
-        if not file:
+        # First, get shallow file structure to know all page IDs
+        shallow_file = self._client.get_file(file_key, geometry='depth=1')
+        if not shallow_file:
             raise ToolException(
-                f"Unexpected error while retrieving file {file_key}. Please try specifying the node-id of an inner page.")
-        figma_pages_raw = file.document.get('children', [])
-        # extract pages one by one
+                f"Unexpected error while retrieving file {file_key}. "
+                "Please try specifying the node-id of an inner page."
+            )
+        all_page_ids = [
+            page['id'] for page in shallow_file.document.get('children', [])
+            if 'id' in page
+        ]
+
+        # Determine which pages to fetch
         if node_ids_include:
-            return [self._get_file_nodes(file_key, node_id) for node_id in node_ids_include]
+            pages_to_fetch = node_ids_include
         else:
-            # return [self._get_file_nodes(file_key, page["id"]) for page in figma_pages_raw if ('id' in page and page['id'].replace(':', '-') not in node_ids_exclude)]
-            result = []
-            for page in figma_pages_raw:
-                if 'id' in page and page['id'].replace(':', '-') not in node_ids_exclude:
-                    page_res = self._get_file_nodes(file_key, page["id"]).get('nodes', {}).get(page["id"], {}).get("document", {})
-                    result.append(page_res)
-            return result
+            # Exclude specified pages
+            pages_to_fetch = [
+                pid for pid in all_page_ids
+                if pid.replace(':', '-') not in node_ids_exclude
+            ]
+
+        if not pages_to_fetch:
+            logging.info(f"File {file_key}: no pages to fetch after filtering")
+            return []
+
+        # Define fetch function for pages
+        def fetch_pages(page_ids: List[str]) -> Dict[str, dict]:
+            """Fetch page content for given page IDs."""
+            logging.debug(f"fetch_pages: requesting {len(page_ids)} pages: {page_ids}")
+            try:
+                result = self._get_file_nodes(file_key, ','.join(page_ids))
+            except Exception as e:
+                logging.debug(f"fetch_pages: _get_file_nodes raised {type(e).__name__}: {e}")
+                raise
+            if not result:
+                logging.debug("fetch_pages: result is empty/None")
+                return {}
+            nodes = result.get("nodes") or {}
+            logging.debug(f"fetch_pages: got {len(nodes)} nodes in response")
+            output = {}
+            for page_id, node in nodes.items():
+                if node is None:
+                    logging.debug(f"Page {page_id}: node is None (skipped by Figma)")
+                    continue
+                if "document" not in node:
+                    logging.debug(f"Page {page_id}: no 'document' key in node: {list(node.keys())}")
+                    continue
+                output[page_id] = node["document"]
+            logging.debug(f"fetch_pages: returning {len(output)} pages")
+            return output
+
+        # Execute with strategy
+        chunk_result = strategy.execute(
+            items=pages_to_fetch,
+            fetch_fn=fetch_pages,
+            is_retriable_error=self._is_volume_error,
+        )
+
+        # Log summary at INFO level
+        logging.info(
+            f"File {file_key}: loaded {len(chunk_result.successful)} pages, "
+            f"{len(chunk_result.failed)} failed"
+        )
+
+        # Track failed pages
+        for page_id in chunk_result.failed:
+            self._track_runtime_skipped(f"{file_key}/{page_id}", reason="error")
+
+        # Return page content in order (preserve original order where possible)
+        pages = []
+        for page_id in pages_to_fetch:
+            if page_id in chunk_result.successful:
+                pages.append(chunk_result.successful[page_id])
+
+        return pages
 
     def _process_single_image(
             self,
@@ -602,110 +666,122 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             },
         )
 
-    def _is_volume_error(self, e: ToolException) -> bool:
-        """Check if error is volume/timeout related."""
-        error_str = str(e).lower()
-        return "timeout" in error_str or "too large" in error_str or "400" in str(e)
+    def _is_volume_error(self, e: Exception) -> bool:
+        """
+        Check if error is volume/timeout/network related (retriable).
 
-    def _fetch_images_chunked(
-        self,
-        file_key: str,
-        nodes: List[str],
-        chunk_size: int,
-        node_to_page: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, str]:
-        """Fetch images in chunks, skip failed chunks."""
-        all_images: Dict[str, str] = {}
-        total_chunks = (len(nodes) + chunk_size - 1) // chunk_size
-        for i in range(0, len(nodes), chunk_size):
-            chunk = nodes[i:i + chunk_size]
-            chunk_num = (i // chunk_size) + 1
-            self._log_tool_event(
-                f"File {file_key}: fetching chunk {chunk_num}/{total_chunks} ({len(chunk)} nodes)"
-            )
-            try:
-                file_images = self._client.get_file_images(file_key, chunk)
-                if file_images and file_images.images:
-                    all_images.update(file_images.images)
-            except ToolException as e:
-                if self._is_volume_error(e):
-                    logging.warning(f"File {file_key}: chunk {chunk_num} skipped: {e}")
-                    self._log_tool_event(
-                        f"File {file_key}: chunk {chunk_num} failed (nodes: {chunk[:3]}...), skipping"
-                    )
-                    # Track each node in the failed chunk as skipped due to API fetch error
-                    for node_id in chunk:
-                        page_id = node_to_page.get(node_id, "") if node_to_page else ""
-                        item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
-                        self._track_runtime_skipped(item_name, reason="error")
-                else:
-                    raise
-        return all_images
+        These errors indicate the request was too large, took too long,
+        or failed due to network issues - all can be retried with smaller chunks.
+
+        Args:
+            e: Exception to check
+
+        Returns:
+            True if error is retriable (volume/timeout/network), False otherwise
+        """
+        error_str = str(e).lower()
+
+        # Volume-related patterns (size issues)
+        volume_patterns = ["timeout", "too large", "request entity too large", "payload too large"]
+        if any(p in error_str for p in volume_patterns):
+            return True
+
+        # Network/connection errors - often caused by large responses
+        network_patterns = [
+            "response ended prematurely",
+            "chunkedencodingerror",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "broken pipe",
+            "protocol error",
+            "incomplete read",
+            "remote disconnected",
+        ]
+        if any(p in error_str for p in network_patterns):
+            return True
+
+        # 400 only if it looks volume-related, not for invalid IDs
+        if "400" in str(e) and ("size" in error_str or "large" in error_str):
+            return True
+
+        # Generic 400 - treat as potentially volume-related for backward compatibility
+        if "400" in str(e):
+            return True
+
+        return False
 
     def _get_file_images_with_fallback(
         self,
         file_key: str,
         image_nodes: List[str],
         page_node_mapping: Optional[Dict[str, List[str]]] = None,
-        chunk_size: int = 10,
     ) -> Dict[str, str]:
         """
-        Fetch image URLs with cascading fallback:
-        1. Try bulk request for all nodes
-        2. On failure, try per-page requests
-        3. If a page fails, chunk that page's nodes
+        Fetch image URLs using bisection chunking strategy.
+
+        Always bisects the flat list of all image nodes (no per-page grouping).
+
+        Args:
+            file_key: Figma file key
+            image_nodes: List of node IDs to fetch images for
+            page_node_mapping: Optional mapping of page_id -> [node_ids] for tracking
+
+        Returns:
+            Dict mapping node_id -> image_url
         """
-        # Build reverse mapping: node_id -> page_id for tracking
+        if not image_nodes:
+            return {}
+
+        strategy = BisectionChunkingStrategy()
+
+        # Build reverse mapping for tracking: node_id -> page_id
         node_to_page: Dict[str, str] = {}
         if page_node_mapping:
             for page_id, node_ids in page_node_mapping.items():
                 for node_id in node_ids:
                     node_to_page[node_id] = page_id
 
-        # Level 1: Try ALL images at once
-        try:
-            self._log_tool_event(f"File {file_key}: bulk image request for {len(image_nodes)} nodes")
-            file_images = self._client.get_file_images(file_key, image_nodes)
+        # Define fetch function for images
+        def fetch_images(node_ids: List[str]) -> Dict[str, str]:
+            """Fetch image URLs for given node IDs."""
+            file_images = self._client.get_file_images(file_key, node_ids)
             if file_images and file_images.images:
                 return file_images.images
             return {}
-        except ToolException as e:
-            if not self._is_volume_error(e):
-                raise
-            self._log_tool_event(
-                f"File {file_key}: bulk failed ({len(image_nodes)} nodes), falling back to per-page"
-            )
 
-        # Level 2: Try per-page
-        if not page_node_mapping:
-            # No page mapping provided, fall back to chunking all nodes
-            self._log_tool_event(f"File {file_key}: no page mapping, chunking all nodes")
-            return self._fetch_images_chunked(file_key, image_nodes, chunk_size, node_to_page)
+        # Execute with strategy (always flat list, no per-page grouping)
+        chunk_result = strategy.execute(
+            items=image_nodes,
+            fetch_fn=fetch_images,
+            is_retriable_error=self._is_volume_error,
+        )
 
-        all_images: Dict[str, str] = {}
-        total_pages = len(page_node_mapping)
-        for page_idx, (page_id, page_nodes) in enumerate(page_node_mapping.items(), 1):
-            try:
-                self._log_tool_event(
-                    f"File {file_key}: page {page_idx}/{total_pages} ({page_id}) - {len(page_nodes)} images"
-                )
-                file_images = self._client.get_file_images(file_key, page_nodes)
-                if file_images and file_images.images:
-                    all_images.update(file_images.images)
-            except ToolException as e:
-                if not self._is_volume_error(e):
-                    raise
-                # Level 3: Chunk this page's nodes
-                # Use smaller chunks or one-by-one for small sets to isolate problematic images
-                effective_chunk_size = 1 if len(page_nodes) < 2 * chunk_size else chunk_size
-                self._log_tool_event(
-                    f"File {file_key}: page {page_id} failed ({len(page_nodes)} nodes), "
-                    f"chunking with size={effective_chunk_size}"
-                )
-                page_images = self._fetch_images_chunked(file_key, page_nodes, effective_chunk_size, node_to_page)
-                all_images.update(page_images)
+        # Log summary at INFO level
+        logging.info(
+            f"File {file_key}: fetched {len(chunk_result.successful)} image URLs, "
+            f"{len(chunk_result.failed)} failed"
+        )
 
-        return all_images
+        # Log detailed debug info after bisection completes
+        logging.debug(
+            f"Bisection complete for file {file_key}:\n"
+            f"  - Total items requested: {len(image_nodes)}\n"
+            f"  - API calls made: {chunk_result.api_calls}\n"
+            f"  - Splits performed: {chunk_result.splits}\n"
+            f"  - Successful: {len(chunk_result.successful)}\n"
+            f"  - Failed: {len(chunk_result.failed)}\n"
+            f"  - Successful IDs: {list(chunk_result.successful.keys())}\n"
+            f"  - Failed IDs: {chunk_result.failed}"
+        )
+
+        # Track failed items for reporting
+        for node_id in chunk_result.failed:
+            page_id = node_to_page.get(node_id, "")
+            item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
+            self._track_runtime_skipped(item_name, reason="error")
+
+        return chunk_result.successful
 
     def _process_document(
         self,
@@ -714,6 +790,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
     ) -> Generator[Document, None, None]:
         file_key = document.metadata.get('id', '')
         self._log_tool_event(f"Loading details (images) for `{file_key}`")
+
         figma_pages = self._load_pages(document)
         node_types_include = [t.strip().lower() for t in document.metadata.pop('figma_nodes_include', [])]
         node_types_exclude = [t.strip().lower() for t in document.metadata.pop('figma_nodes_exclude', [])]
@@ -761,7 +838,9 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         # --- Process image nodes (potential bottleneck) with optional threading ---
         if image_nodes:
             self._log_tool_event(f"File {file_key}: requesting images for {len(image_nodes)} nodes across {len(page_node_mapping)} pages")
-            images = self._get_file_images_with_fallback(file_key, image_nodes, page_node_mapping)
+            images = self._get_file_images_with_fallback(
+                file_key, image_nodes, page_node_mapping
+            )
             total_images = len(images)
             if total_images == 0:
                 logging.info(f"No images found for file {file_key}.")
@@ -787,6 +866,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                         )
                         counted_nodes_ref["value"] += 1
                         if doc is not None:
+                            # Track dependent document for proper reindex cleanup (semicolon-separated string)
+                            existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                            document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                                f"{existing};{node_id}" if existing else node_id
+                            )
                             self._log_tool_event(
                                 f"File {file_key}: processing image node {node_id} "
                                 f"({counted_nodes_ref['value']}/{total_nodes} in {max_workers} threads)."
@@ -825,6 +909,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                                 counted_nodes_ref["value"] += 1
 
                             if doc is not None:
+                                # Track dependent document for proper reindex cleanup (semicolon-separated string)
+                                existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                                document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                                    f"{existing};{node_id}" if existing else node_id
+                                )
                                 self._log_tool_event(
                                     f"File {file_key}: processing image node {node_id} "
                                     f"({counted_nodes_ref['value']}/{total_nodes} in {max_workers} threads)."
@@ -841,6 +930,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 counted_nodes_ref["value"] += 1
                 current_index = counted_nodes_ref["value"]
                 if texts:
+                    # Track dependent document for proper reindex cleanup (semicolon-separated string)
+                    existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                    document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                        f"{existing};{node_id}" if existing else node_id
+                    )
                     self._log_tool_event(
                         f"File {file_key} : processing text node {node_id} ({current_index}/{total_nodes})."
                     )
