@@ -2160,21 +2160,6 @@ class LLMNode(BaseTool):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
 
-        # Lazy import to avoid circular dependency (sensitive_tool_guard -> tools.application)
-        from ..middleware.sensitive_tool_guard import (
-            set_hitl_approved_tools,
-            reset_hitl_approved_tools,
-            begin_hitl_batch,
-            end_hitl_batch,
-        )
-
-        # Open a batch-scoped approval set (mutable, shared by reference
-        # across child task contexts).  The middleware grows this set as
-        # the user approves sensitive tools; subsequent siblings with the
-        # SAME qualified identity in the same AI message auto-approve,
-        # while different sensitive tool names still re-prompt (#4333).
-        _batch_token = begin_hitl_batch()
-
         # Extract historically blocked tools from state-persisted HITL decisions.
         # These survive across checkpoint resumes and prevent the LLM from
         # re-offering a tool the user already blocked.
@@ -2187,19 +2172,6 @@ class LLMNode(BaseTool):
                 "[HITL] Tools blocked by prior decisions (from state): %s",
                 ', '.join(sorted(_historically_blocked)),
             )
-
-        # Build set of tool names previously approved by the user.
-        # Used to auto-approve tools in the guard on iterations *after*
-        # the first one (the first must consume the checkpoint replay value).
-        # Uses qualified identity (toolkit_name.tool_name) so that approving
-        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
-        _approved_tool_names: set[str] = set()
-        for decision in (hitl_decisions or []):
-            if decision.get('action') == 'approve' and decision.get('tool_name'):
-                _approved_tool_names.add(qualified_tool_identity(
-                    decision['tool_name'], decision.get('toolkit_name'),
-                ))
-        _approved_token = None
 
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
@@ -2409,10 +2381,6 @@ class LLMNode(BaseTool):
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
-                        # Reset auto-approve context before propagating.
-                        if _approved_token is not None:
-                            reset_hitl_approved_tools(_approved_token)
-                        end_hitl_batch(_batch_token)
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
                     except McpAuthorizationRequired:
@@ -2443,13 +2411,6 @@ class LLMNode(BaseTool):
                         tool_call_id=tool_call_id
                     )
                     new_messages.append(tool_message)
-
-            # After the first iteration's tool calls are processed, activate
-            # auto-approve for tools the user already authorized.  We wait
-            # until now so the guard's interrupt() in the first iteration can
-            # consume the checkpoint replay value correctly.
-            if _approved_tool_names and _approved_token is None:
-                _approved_token = set_hitl_approved_tools(_approved_tool_names)
 
             # Call LLM again with tool results to get next response
             try:
@@ -2554,10 +2515,6 @@ class LLMNode(BaseTool):
             except GraphBubbleUp:
                 # Preserve GraphInterrupt and related graph-level signals raised
                 # anywhere in the tool iteration, including async-to-sync fallback.
-                # Reset auto-approve context before propagating.
-                if _approved_token is not None:
-                    reset_hitl_approved_tools(_approved_token)
-                end_hitl_batch(_batch_token)
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
@@ -2770,12 +2727,6 @@ class LLMNode(BaseTool):
                     error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
                     new_messages.append(AIMessage(content=error_msg))
                     break
-
-        # Reset auto-approve context on normal loop exit.
-        # GraphBubbleUp paths handle their own cleanup above.
-        if _approved_token is not None:
-            reset_hitl_approved_tools(_approved_token)
-        end_hitl_batch(_batch_token)
 
         # Handle max iterations
         if iteration >= self.steps_limit:
