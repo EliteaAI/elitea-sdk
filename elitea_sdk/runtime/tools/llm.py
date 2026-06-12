@@ -145,6 +145,15 @@ class LLMNode(BaseTool):
         description='MiddlewareManager instance for before_model/after_model hooks. '
                     'Used for context management like summarization and context editing.'
     )
+    child_dispatcher: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description='Optional parallel sub-agent dispatch seam (Track 2, issue #4993). '
+                    'When present and a turn contains 2+ Application (sub-agent) tool calls, '
+                    'the node PARKS by writing child specs to the parallel_tasks state channel '
+                    'and returning instead of running children in-process. When None, the '
+                    'node falls back to the in-process asyncio.gather fan-out (Track 1).'
+    )
     _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
 
     def _prepare_structured_output_params(self) -> dict:
@@ -1631,15 +1640,35 @@ class LLMNode(BaseTool):
             # __perform_tool_calling deduplicates the completion against
             # `messages` internally (multi-tool sibling HITL resume case),
             # so we can pass the full `messages` here unconditionally.
+            #
+            # parked_holder is a mutable hand-off for the Track 2 (#4993)
+            # park-by-returning path. It is passed by reference (NOT a contextvar)
+            # so the parked signal survives even when _run_async_in_sync_context
+            # runs the coroutine in a worker thread with copy_context() — the
+            # thread mutates the same dict object the caller holds.
+            parked_holder: Dict[str, Any] = {}
             new_messages, current_completion = self._run_async_in_sync_context(
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
                     pending_capture_base=_durable_base_count,
+                    parked_holder=parked_holder,
                 )
             )
 
             output_msgs = {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
+            if parked_holder.get('parked'):
+                # Parallel fan-out parked for durable dispatch. Write the child
+                # specs into the parallel_tasks state channel so they survive the
+                # checkpoint; the LangGraphAgentRunnable reads this back and emits
+                # the parked result shape (execution_finished=False). The fresh
+                # parallel_reconcile invocation later reads each child's own
+                # checkpoint to assemble ToolMessages and continue the loop.
+                output_msgs['parallel_tasks'] = {
+                    'parked': True,
+                    'children': parked_holder.get('children', {}),
+                }
+                return output_msgs
             if self.output_variables:
                 if self.output_variables[0] == 'messages':
                     return output_msgs
@@ -2321,6 +2350,48 @@ class LLMNode(BaseTool):
             return specs
         return specs if len(specs) >= 2 else None
 
+    def _build_parallel_dispatch_specs(self, app_specs, config):
+        """Turn gather specs into durable-dispatch child specs (Track 2, #4993).
+
+        Used when a ``child_dispatcher`` seam is present: instead of running the
+        sub-agents in-process via ``asyncio.gather``, the parent PARKS and hands
+        these specs to pylon_main, which launches each child as an independent
+        durable ``indexer_agent`` task. Each spec is a plain JSON-serialisable
+        dict (it must survive the checkpoint channel + an RPC round-trip), so it
+        carries NO live tool object — only the identity pylon_main needs to spawn
+        the child and the SDK needs to read its checkpoint back on reconcile.
+
+        The derived ``child_thread_id`` MUST match the in-process scheme in
+        ``application.py`` (``f"{parent}:{name}:{call_id}"``) so the reconcile
+        pass reads each child from the exact checkpoint the child wrote.
+        """
+        configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
+        parent_thread_id = configurable.get('thread_id')
+        specs = {}
+        for index, (tool_name, tool_args, tool_call_id, tool) in enumerate(app_specs):
+            app_name = getattr(tool, 'name', None) or tool_name
+            child_thread_id = (
+                f"{parent_thread_id}:{app_name}:{tool_call_id}"
+                if parent_thread_id else None
+            )
+            # Display label for the UI card, mirroring the gather aggregate's
+            # metadata precedence (original_name → display_name → name).
+            meta = getattr(tool, 'metadata', None) or {}
+            display_name = (
+                meta.get('original_name')
+                or meta.get('display_name')
+                or app_name
+            )
+            specs[tool_call_id] = {
+                'tool_call_id': tool_call_id,
+                'name': app_name,
+                'display_name': display_name,
+                'input': tool_args,
+                'child_thread_id': child_thread_id,
+                'index': index,
+            }
+        return specs
+
     async def _run_parallel_application_calls(
         self, app_specs, new_messages, config, hitl_decisions=None,
         pending_capture_start=0,
@@ -2480,7 +2551,7 @@ class LLMNode(BaseTool):
         _langgraph_interrupt(aggregate)  # raises GraphInterrupt → parent pregel
 
     async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
-                                     pending_capture_base=None):
+                                     pending_capture_base=None, parked_holder=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
 
@@ -2562,6 +2633,27 @@ class LLMNode(BaseTool):
                 hitl_decisions=hitl_decisions,
             )
             if app_specs is not None:
+                # ── Track 2 (#4993): durable park-by-returning ──────────────
+                # When a child_dispatcher seam is injected, do NOT run the
+                # children in-process. Build their dispatch specs, hand them to
+                # the caller via parked_holder, and RETURN immediately. The
+                # parent's AIMessage (with N dangling tool_calls) stays in
+                # new_messages; the LangGraph node ends, its task goes terminal,
+                # and pylon_main launches each child as an independent durable
+                # task. We must NOT fall through to the LLM re-invoke below —
+                # there are no ToolMessages yet, so re-invoking would error on a
+                # dangling-tool-call AIMessage. dispatcher None → fall through to
+                # today's in-process gather (Track 1 baseline, CLI/tests intact).
+                if self.child_dispatcher is not None and parked_holder is not None:
+                    children = self._build_parallel_dispatch_specs(app_specs, config)
+                    parked_holder['parked'] = True
+                    parked_holder['children'] = children
+                    logger.info(
+                        "[PARALLEL] child_dispatcher present — parking %d sub-agent(s) "
+                        "for durable dispatch instead of in-process gather", len(children),
+                    )
+                    _PENDING_TOOL_MESSAGES.set([])
+                    return new_messages, current_completion
                 try:
                     await self._run_parallel_application_calls(
                         app_specs, new_messages, config,

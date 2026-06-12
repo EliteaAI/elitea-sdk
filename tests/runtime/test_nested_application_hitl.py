@@ -2162,3 +2162,80 @@ def test_parallel_multi_round_resolves_to_completion():
     assert r3['output'] == 'parent-done'
     final_contents = final_llm.calls[-1]
     assert 'A-done' in final_contents and 'B-done' in final_contents
+
+
+# ── Track 2 (#4993): durable park-by-returning ──────────────────────────────
+
+def _build_parent_runnable_with_dispatcher(memory, llm, tools, dispatcher):
+    assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'Use tools', 'tools': [], 'meta': {}},
+        client=llm,
+        tools=tools,
+        memory=memory,
+        app_type='predict',
+        child_dispatcher=dispatcher,
+    )
+    return assistant.runnable()
+
+
+def test_parallel_fanout_parks_when_child_dispatcher_present():
+    """With a child_dispatcher seam injected, a multi-Application fan-out PARKS
+    instead of running in-process (Track 2). The runnable returns
+    execution_finished=False, parallel_parked=True, and one dispatch spec per
+    sub-agent — keyed by tool_call_id with a child_thread_id matching the
+    in-process scheme (parent:name:call_id). No child is invoked, and the
+    parent thread_id is preserved for the later parallel_reconcile re-invoke."""
+    parent_memory = MemorySaver()
+    child_a = DictBridgeInterruptingApplication('A-done', 'create_file')
+    child_b = DictBridgeInterruptingApplication('B-done', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+
+    llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable_with_dispatcher(
+        parent_memory, llm, tools, dispatcher=object(),
+    )
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'park-thread'}},
+    )
+
+    assert result['execution_finished'] is False
+    assert result['parallel_parked'] is True
+    specs = {s['tool_call_id']: s for s in result['parallel_dispatch']}
+    assert set(specs) == {'call-A', 'call-B'}
+    assert specs['call-A']['name'] == 'child_a'
+    assert specs['call-B']['name'] == 'child_b'
+    assert specs['call-A']['child_thread_id'] == 'park-thread:child_a:call-A'
+    assert specs['call-B']['child_thread_id'] == 'park-thread:child_b:call-B'
+    assert specs['call-A']['input'] == {'task': 'Run A'}
+    assert specs['call-B']['index'] == 1
+    # Parked = NOTHING ran in-process (durable dispatch is pylon_main's job).
+    assert child_a.calls == []
+    assert child_b.calls == []
+    # thread_id survives so the reconcile pass can re-invoke this exact parent.
+    assert result['thread_id'] == 'park-thread'
+
+
+def test_parallel_fanout_falls_back_to_gather_without_dispatcher():
+    """dispatcher absent (None) → the Track 1 in-process gather path runs
+    unchanged: children execute and a paused child still aggregates into the
+    parent interrupt. Guards the back-compat contract (CLI/tests unaffected)."""
+    parent_memory = MemorySaver()
+    child_a = DictBridgeInterruptingApplication('A-done', 'create_file')
+    child_b = DictBridgeInterruptingApplication('B-done', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+
+    llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable(parent_memory, llm, tools)
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'no-dispatcher-thread'}},
+    )
+
+    # No park markers; in-process gather produced the aggregated interrupt.
+    assert 'parallel_parked' not in result
+    assert result['execution_finished'] is False
+    assert len(result['hitl_interrupts']) == 2
+    # Children actually ran in-process.
+    assert child_a.calls and child_b.calls

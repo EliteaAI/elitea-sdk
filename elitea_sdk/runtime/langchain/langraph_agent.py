@@ -864,7 +864,8 @@ class StateModifierNode(Runnable):
 
 def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_before=None, interrupt_after=None,
                           interrupt_after_successors=None, state_class=None, output_variables=None,
-                          tool_registry=None, middleware_manager=None, terminal_output_variables=None):
+                          tool_registry=None, middleware_manager=None, terminal_output_variables=None,
+                          child_dispatcher=None):
     # prepare output channels
     if interrupt_after is None:
         interrupt_after = []
@@ -917,6 +918,7 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
         tool_registry=tool_registry,
         middleware_manager=middleware_manager,
         terminal_output_variables=terminal_output_variables,
+        child_dispatcher=child_dispatcher,
     )
 
     compiled.attach_node(START, None)
@@ -993,6 +995,7 @@ def create_graph(
         lazy_tools_mode: bool = False,
         always_bind_tools: Optional[list[BaseTool]] = None,
         middleware_manager: Optional[Any] = None,
+        child_dispatcher: Optional[Any] = None,
         **kwargs
 ):
     """
@@ -1293,6 +1296,9 @@ def create_graph(
                     always_bind_tools=always_bind_tools or [],
                     # Middleware manager for before_model/after_model hooks (summarization, context editing)
                     middleware_manager=middleware_manager,
+                    # Parallel sub-agent dispatch seam (Track 2, #4993). None → in-process
+                    # gather fan-out (Track 1); present → park-by-returning dispatch.
+                    child_dispatcher=child_dispatcher,
                 ))
             elif node_type in ['router', 'decision']:
                 if node_type == 'router':
@@ -1494,6 +1500,7 @@ def create_graph(
         tool_registry=tool_registry,
         middleware_manager=middleware_manager,
         terminal_output_variables=collect_terminal_output_variables(schema),
+        child_dispatcher=child_dispatcher,
     )
     return compiled.validate()
 
@@ -1565,13 +1572,14 @@ def convert_dict_to_message(msg_dict):
 class LangGraphAgentRunnable(CompiledStateGraph):
     def __init__(self, *args, output_variables=None, tool_registry=None,
                  interrupt_after_successors=None, middleware_manager=None,
-                 terminal_output_variables=None, **kwargs):
+                 terminal_output_variables=None, child_dispatcher=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_variables = output_variables
         self.tool_registry = tool_registry
         self._interrupt_after_successors = interrupt_after_successors or set()
         self._middleware_manager = middleware_manager
         self._terminal_output_variables = terminal_output_variables or []
+        self._child_dispatcher = child_dispatcher
 
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
@@ -2177,6 +2185,33 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     output = str(list(result.values())[-1]) if result else 'Output is undefined'
         config_state = self.get_state(config)
         is_execution_finished = not config_state.next
+
+        # ── Track 2 (#4993): parallel sub-agent park-by-returning ───────────
+        # The LLMNode parked a multi-Application fan-out: it wrote child specs
+        # into the parallel_tasks channel and returned without running them, so
+        # LangGraph routed to END (config_state.next is empty → looks finished).
+        # Override: this is NOT a finished run — the parent must be re-invoked
+        # with parallel_reconcile once its children settle. Preserve thread_id
+        # (the re-invocation keys off it) and surface the dispatch specs so the
+        # indexer can hand them to pylon_main. Intercept BEFORE the normal-path
+        # is_execution_finished/thread_id logic so the parked shape survives.
+        _pt_state = config_state.values if (hasattr(config_state, 'values') and config_state.values) else {}
+        _parked = _pt_state.get('parallel_tasks') or {}
+        if isinstance(_parked, dict) and _parked.get('parked'):
+            children = _parked.get('children') or {}
+            logger.info(
+                "[PARALLEL] parent parked with %d child(ren) for durable dispatch "
+                "(thread_id=%s)", len(children), thread_id,
+            )
+            return {
+                "output": None,
+                "thread_id": thread_id,
+                "execution_finished": False,
+                "parallel_parked": True,
+                "parallel_dispatch": list(children.values()),
+                "messages": _pt_state.get('messages', []),
+            }
+
         if is_execution_finished:
             thread_id = None
 

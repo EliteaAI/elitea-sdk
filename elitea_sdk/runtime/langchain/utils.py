@@ -24,6 +24,26 @@ def _hitl_decisions_reducer(current: list | None, update: list | None) -> list:
     return (current or []) + update
 
 
+def _parallel_tasks_reducer(current: dict | None, update: dict | None) -> dict:
+    """Reducer for the ``parallel_tasks`` state field (parallel sub-agent dispatch).
+
+    Holds the child-task coordination records the parent writes when it PARKS a
+    parallel ``Application`` fan-out (Track 2, issue #4993): a per-``tool_call_id``
+    map of small specs (child thread_id, name, args, index) — NOT child
+    transcripts. pylon_main reads these on the parked parent's terminal event to
+    launch the durable children; the reconcile re-invocation reads each child's
+    OWN Postgres checkpoint for output.
+
+    * Sending a ``dict`` **merges** per-key into the existing map.
+    * Sending ``None`` **clears** the map (epoch reconciled / fresh turn).
+    """
+    if update is None:
+        return {}
+    merged = dict(current or {})
+    merged.update(update)
+    return merged
+
+
 def _normalize_for_args_match(value: Any) -> Any:
     """Recursively normalize a value for HITL tool-args equality.
 
@@ -319,6 +339,12 @@ def create_state(data: Optional[dict] = None):
     # resumes so that blocked tools stay excluded and an audit trail is kept.
     # Uses a custom reducer: list → append, None → clear.
     state_dict["hitl_decisions"] = Annotated[list, _hitl_decisions_reducer]
+    # Parallel sub-agent dispatch coordination (Track 2, issue #4993). When the
+    # parent PARKS a multi-Application fan-out it writes per-tool_call_id child
+    # specs here (thread_id, name, args, index) so pylon_main can launch durable
+    # children; the reconcile re-invocation reads each child's own checkpoint for
+    # output. Custom reducer: dict → per-key merge, None → clear.
+    state_dict["parallel_tasks"] = Annotated[dict, _parallel_tasks_reducer]
     # Flag set by FunctionTool when a sensitive tool is blocked (rejected).
     # Carries the blocked-termination message string so the output extraction
     # can use it directly.  Checked by conditional edges (truthy) to route
