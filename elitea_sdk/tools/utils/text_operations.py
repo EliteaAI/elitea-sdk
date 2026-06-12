@@ -14,6 +14,33 @@ from typing import List, Tuple, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+_CHARDET_SAMPLE_SIZE = 10 * 1024
+_CHARDET_MIN_CONFIDENCE = 0.9
+
+
+def decode_text(data: bytes) -> str:
+    import chardet  # pylint: disable=C0415
+    if len(data) == 0:
+        return ""
+    detected = chardet.detect(data[:_CHARDET_SAMPLE_SIZE])
+    encoding = detected.get('encoding')
+    confidence = detected.get('confidence') or 0.0
+    if encoding is not None and confidence >= _CHARDET_MIN_CONFIDENCE:
+        try:
+            return data.decode(encoding)
+        except Exception as e:  # pylint: disable=broad-except
+            raise ValueError(
+                f"Could not decode bytes with detected encoding '{encoding}' "
+                f"(confidence {confidence:.2f}): {e}"
+            ) from e
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"Could not decode bytes: chardet confidence too low "
+            f"({confidence:.2f} for '{encoding}') and UTF-8 decoding failed: {e}"
+        ) from e
+
 # Text file extensions that support editing
 TEXT_EDITABLE_EXTENSIONS = {
     '.md', '.txt', '.csv', '.json', '.xml', '.html', 
