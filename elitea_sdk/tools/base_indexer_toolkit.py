@@ -29,9 +29,12 @@ class IndexingStats:
     Terminology:
     - total_fetched: All items initially fetched/considered from source
     - items_processed: Items successfully processed and yielded (after filtering)
-    - total_skipped: Items that were filtered out or failed
+    - total_skipped: Top-level items that were filtered out or failed entirely
+    - dependent_items_skipped: Child/sub-items that failed within a successful parent document
+      (e.g., individual images in a Figma file, attachments in a Confluence page)
 
     Invariant: total_fetched = items_processed + total_skipped
+    Note: dependent_items_skipped is NOT included in total_skipped since parent docs succeeded
     """
     # Common counters
     items_processed: int = 0
@@ -49,6 +52,10 @@ class IndexingStats:
     runtime_skipped_extension: Set[str] = field(default_factory=set)
     runtime_skipped_error: Set[str] = field(default_factory=set)
 
+    # Dependent/child items that failed within successful parent documents
+    # These are tracked separately since the parent document was still indexed
+    dependent_items_skipped: Set[str] = field(default_factory=set)
+
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
         # Calculate counts for each category
@@ -64,7 +71,9 @@ class IndexingStats:
             len(self.runtime_skipped_extension) +
             len(self.runtime_skipped_error)
         )
+        # total_skipped only includes top-level items, not dependent items
         total_skipped = files_skipped_count + documents_skipped_count + runtime_skipped_count
+        dependent_items_count = len(self.dependent_items_skipped)
 
         return {
             "items_processed": self.items_processed,
@@ -94,6 +103,10 @@ class IndexingStats:
                 "extension_filtered_count": len(self.runtime_skipped_extension),
                 "error": sorted(self.runtime_skipped_error),
                 "error_count": len(self.runtime_skipped_error),
+            },
+            "dependent_items_skipped": {
+                "count": dependent_items_count,
+                "items": sorted(self.dependent_items_skipped),
             }
         }
 
@@ -101,24 +114,26 @@ class IndexingStats:
         """Generate human-readable summary of skipped items."""
         lines = []
 
-        # Count file-related skips
+        # Count file-related skips (top-level)
         file_skips = (len(self.files_skipped_whitelist) +
                      len(self.files_skipped_blacklist) +
                      len(self.files_skipped_read_error) +
                      len(self.files_skipped_empty) +
                      len(self.files_unsupported_extension))
 
-        # Count document/runtime-related skips
+        # Count document/runtime-related skips (top-level)
         doc_skips = (len(self.documents_skipped_error) +
                     len(self.runtime_skipped_extension) +
                     len(self.runtime_skipped_error))
 
         total_skipped = file_skips + doc_skips
+        dependent_skipped = len(self.dependent_items_skipped)
 
-        if total_skipped == 0:
+        if total_skipped == 0 and dependent_skipped == 0:
             return ""
 
-        lines.append(f"\nSkipped items ({total_skipped} total):")
+        if total_skipped > 0:
+            lines.append(f"\nSkipped items ({total_skipped} total):")
 
         # File-related skips (for code toolkits)
         if self.files_skipped_whitelist:
@@ -169,6 +184,14 @@ class IndexingStats:
             lines.append(f"  - Runtime skipped (errors) ({len(sorted_runtime_err)}): {', '.join(sorted_runtime_err[:5])}")
             if len(sorted_runtime_err) > 5:
                 lines.append(f"    ... and {len(sorted_runtime_err) - 5} more")
+
+        # Dependent items (sub-items within successful parent documents)
+        if self.dependent_items_skipped:
+            sorted_dependent = sorted(self.dependent_items_skipped)
+            lines.append(f"\nSkipped sub-items ({len(sorted_dependent)} total, parent docs still indexed):")
+            lines.append(f"  - Failed sub-items: {', '.join(sorted_dependent[:5])}")
+            if len(sorted_dependent) > 5:
+                lines.append(f"    ... and {len(sorted_dependent) - 5} more")
 
         return "\n".join(lines)
 
