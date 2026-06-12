@@ -1751,7 +1751,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         
         # Validate that input is not empty after all processing.
         # HITL resume payloads may carry only action metadata with no text body.
-        if not input.get('input') and not self._is_hitl_resume(input):
+        if (not input.get('input')
+                and not self._is_hitl_resume(input)
+                and not self._is_parallel_reconcile(input)):
             raise RuntimeError(
                 "Empty input after processing. Cannot send empty string to LLM. "
                 "This likely means the message contained only non-text content "
@@ -1820,7 +1822,30 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 result_with_state[key] = value
                     return result_with_state
 
-                if hitl_interrupt and self._is_hitl_resume(input):
+                if self._is_parallel_reconcile(input):
+                    # ── Parallel sub-agent reconcile (Track 2, #4993) ──────
+                    # pylon_main re-invokes the parked parent with
+                    # parallel_reconcile=<epoch> once every child task is
+                    # terminal. The parked checkpoint sits at END (is_at_end),
+                    # so this MUST be checked before the is_at_end branch —
+                    # otherwise the parent would clear its checkpoint and
+                    # re-fan-out. We append one ToolMessage per child (read from
+                    # each child's own checkpoint) and resume the agent node so
+                    # the LLM synthesizes the final answer from the collected
+                    # sub-agent results.
+                    epoch = (input.pop('parallel_reconcile', None)
+                             or config.get('configurable', {}).get('parallel_reconcile'))
+                    logger.info(
+                        "[PARALLEL] reconcile epoch=%s for thread %s — "
+                        "assembling settled child results", epoch, thread_id,
+                    )
+                    result = self._resume_parallel_reconcile(
+                        config, thread_id, *args, **kwargs
+                    )
+                    # Read the LATEST checkpoint (the reconcile continuation)
+                    # below, not the stale parked one.
+                    config.get('configurable', {}).pop('checkpoint_id', None)
+                elif hitl_interrupt and self._is_hitl_resume(input):
                     # Resuming from an HITL dynamic interrupt - use Command(resume=...)
                     hitl_resume_value = self._extract_hitl_resume(input)
                     logger.info(f"[HITL] Resuming HITL interrupt with: {hitl_resume_value}")
@@ -2291,6 +2316,130 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         return result_with_state
 
     # =========================================================================
+    # Parallel sub-agent reconcile (Track 2, issue #4993)
+    # =========================================================================
+
+    def _read_child_result(self, child_thread_id):
+        """Read one parallel child's terminal output from its OWN checkpoint.
+
+        Track 2 (#4993) reconcile-assembly source. The child ran as an
+        independent durable task (a separate fork-pool process) but wrote to the
+        SAME checkpointer keyed by ``child_thread_id``, so the parent reads it
+        back here — NOT from the ephemeral arbiter result. Returns
+        ``(status, output)`` where status is ``'completed' | 'paused' | 'missing'``.
+        Output is taken from an explicit ``output`` channel when present, else
+        from the last non-Human message — mirroring how the runnable derives a
+        run's output, so it is robust whether or not ``output`` is a declared
+        state channel.
+        """
+        if not child_thread_id or not self.checkpointer:
+            return 'missing', None
+        child_config = {'configurable': {'thread_id': child_thread_id}}
+        try:
+            child_state = self.get_state(child_config)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "[PARALLEL] reconcile: failed to read child checkpoint %s: %s",
+                child_thread_id, e,
+            )
+            return 'missing', None
+        values = child_state.values if (hasattr(child_state, 'values') and child_state.values) else {}
+        if not values:
+            return 'missing', None
+        # A child still pending an interrupt has a non-empty next — NOT terminal.
+        # Post-gate this should not happen (pylon_main only reconciles once every
+        # child is terminal), but report it rather than fabricate an empty result.
+        if getattr(child_state, 'next', None):
+            return 'paused', None
+        output = values.get('output')
+        if not output:
+            messages = values.get('messages', []) or []
+            output = next(
+                (normalize_message_content(m.content) for m in reversed(messages)
+                 if hasattr(m, 'content') and not isinstance(m, HumanMessage)),
+                None,
+            )
+        return 'completed', output
+
+    def _assemble_parallel_reconcile(self, config):
+        """Build ToolMessages for a parked parent's settled children (#4993).
+
+        Reads the parent checkpoint's ``parallel_tasks`` channel for the child
+        specs, then reads EACH child's own checkpoint to collect its output,
+        producing one ToolMessage per child keyed by the PARENT Application
+        ``tool_call_id`` (so the parked AIMessage's dangling tool_calls are all
+        satisfied and the LLM can synthesize on the next turn). ToolMessages are
+        ordered by the original tool_call index. Returns
+        ``(tool_messages, all_terminal)``.
+        """
+        from langchain_core.messages import ToolMessage
+        parent_state = self.get_state(config)
+        values = parent_state.values if (hasattr(parent_state, 'values') and parent_state.values) else {}
+        parked = values.get('parallel_tasks') or {}
+        children = parked.get('children') or {}
+        ordered = sorted(children.values(), key=lambda c: c.get('index', 0))
+        tool_messages = []
+        all_terminal = True
+        for spec in ordered:
+            tool_call_id = spec.get('tool_call_id')
+            status, output = self._read_child_result(spec.get('child_thread_id'))
+            if status == 'paused':
+                all_terminal = False
+            if status == 'missing':
+                output = (
+                    f"Sub-agent '{spec.get('display_name') or spec.get('name')}' "
+                    "produced no result."
+                )
+            tool_messages.append(ToolMessage(
+                content=output if output is not None else '',
+                tool_call_id=tool_call_id,
+            ))
+        return tool_messages, all_terminal
+
+    def _resume_parallel_reconcile(self, config, thread_id, *args, **kwargs):
+        """Re-enter a parked parent after its children settled (#4993).
+
+        Appends one ToolMessage per child (assembled from child checkpoints),
+        clears the parked flag, and resumes the agent node so the LLM
+        synthesizes the final answer from the tool results. The parked
+        checkpoint is at END (the LLMNode returned without an interrupt), so the
+        update is recorded ``as_node`` the entry node to make the next superstep
+        re-run the agent. ``_tool_call_already_completed`` in the LLMNode skips
+        any duplicate tool_calls the LLM might re-emit, so re-entry is safe.
+        """
+        tool_messages, all_terminal = self._assemble_parallel_reconcile(config)
+        logger.info(
+            "[PARALLEL] reconcile: assembled %d child ToolMessage(s) "
+            "(all_terminal=%s) for thread %s",
+            len(tool_messages), all_terminal, thread_id,
+        )
+        entry_node = self._parallel_reconcile_entry_node()
+        self.update_state(
+            config,
+            {'messages': tool_messages, 'parallel_tasks': None},
+            as_node=entry_node,
+        )
+        return super().invoke(None, config=config, *args, **kwargs)
+
+    def _parallel_reconcile_entry_node(self):
+        """Node to attribute the reconcile state update to (#4993).
+
+        ``update_state(as_node=X)`` makes the next superstep run X's successors.
+        Recording against ``__start__`` routes the next step into the graph's
+        entry node — ``StateDefaultNode`` (which only fills MISSING declared
+        state vars, so it never clobbers the injected ToolMessages) and onward
+        to the agent (LLM) node, or directly to the agent when no
+        StateDefaultNode exists. Either path re-runs the LLM so it synthesizes
+        the final answer from the collected sub-agent ToolMessages.
+
+        NOTE: for a pipeline/flow parent whose fan-out LLM node is mid-graph,
+        re-entering from ``__start__`` would replay upstream nodes; that
+        multi-node-pipeline parent case is out of scope here (chat/predict
+        parents are the supported fan-out parents) and tracked separately.
+        """
+        return '__start__'
+
+    # =========================================================================
     # HITL (Human-in-the-Loop) helpers
     # =========================================================================
 
@@ -2544,6 +2693,20 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
         normalized_action = action.strip().lower()
         return normalized_action in {'approve', 'reject', 'edit'}
+
+    @staticmethod
+    def _is_parallel_reconcile(input_data) -> bool:
+        """True when this invocation is a parked-parent reconcile pass (#4993).
+
+        pylon_main re-invokes the parked parent with a ``parallel_reconcile``
+        marker (the reconcile epoch id) once every child sub-agent task is
+        terminal. The payload carries no message body, so — like an HITL resume
+        — it must bypass the empty-input guard and route to the reconcile
+        branch instead of starting a fresh turn.
+        """
+        if not isinstance(input_data, dict):
+            return False
+        return bool(input_data.get('parallel_reconcile'))
 
     @staticmethod
     def _extract_hitl_resume(input_data: dict) -> dict:

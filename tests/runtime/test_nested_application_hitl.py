@@ -2239,3 +2239,128 @@ def test_parallel_fanout_falls_back_to_gather_without_dispatcher():
     assert len(result['hitl_interrupts']) == 2
     # Children actually ran in-process.
     assert child_a.calls and child_b.calls
+
+
+# ── Track 2 (#4993): reconcile-resume assembly from child checkpoints ───────
+
+class _SimpleAnswerBound:
+    def __init__(self, answer):
+        self.answer = answer
+
+    def invoke(self, messages, config=None):
+        return AIMessage(content=self.answer)
+
+
+class SimpleAnswerLLM:
+    """Standalone child LLM that answers in one turn with no tool calls — used
+    to materialise a COMPLETED child checkpoint under a derived child_thread_id,
+    the durable source the parent reconcile reads back (#4993)."""
+
+    temperature = 0
+    max_tokens = 100
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _SimpleAnswerBound(self.answer)
+
+    def invoke(self, messages, config=None):
+        return AIMessage(content=self.answer)
+
+
+def _materialise_completed_child(memory, child_thread_id, answer):
+    """Run a real standalone child agent to completion on the SHARED checkpointer
+    under ``child_thread_id`` so the parent can read its result back during
+    reconcile — emulating a durable child task that ran in a separate process."""
+    child = _build_parent_runnable(memory, SimpleAnswerLLM(answer), [])
+    return child.invoke(
+        {'messages': [HumanMessage(content='do your part')]},
+        config={'configurable': {'thread_id': child_thread_id}},
+    )
+
+
+def test_parallel_reconcile_assembles_child_results_and_completes():
+    """End-to-end Track 2 reconcile: a parked parent re-invoked with
+    ``parallel_reconcile`` reads EACH child's own checkpoint (durable source,
+    not the ephemeral arbiter result), appends one ToolMessage per child keyed
+    by the parent Application tool_call_id, and resumes the agent so the LLM
+    synthesizes the final answer. Children are NOT re-run in-process. This
+    validates the novel ``update_state(as_node=__start__) + invoke(None)``
+    re-entry from an END (parked) checkpoint."""
+    parent_memory = MemorySaver()
+    parent_thread_id = 'reconcile-thread'
+
+    # 1. Children already ran durably (separate tasks) and wrote their own
+    #    checkpoints under the derived child_thread_ids.
+    a_done = _materialise_completed_child(
+        parent_memory, f'{parent_thread_id}:child_a:call-A', 'A-RESULT')
+    b_done = _materialise_completed_child(
+        parent_memory, f'{parent_thread_id}:child_b:call-B', 'B-RESULT')
+    assert a_done['execution_finished'] and b_done['execution_finished']
+
+    # 2. Parent fans out and PARKS (dispatcher present).
+    child_a = DictBridgeInterruptingApplication('unused', 'create_file')
+    child_b = DictBridgeInterruptingApplication('unused', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+    park_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    park_runnable = _build_parent_runnable_with_dispatcher(
+        parent_memory, park_llm, tools, dispatcher=object())
+    cfg = {'configurable': {'thread_id': parent_thread_id}}
+    parked = park_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]}, config=cfg)
+    assert parked['parallel_parked'] is True
+
+    # 3. pylon_main re-invokes the parked parent once both children settled.
+    reconcile_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    reconcile_runnable = _build_parent_runnable_with_dispatcher(
+        parent_memory, reconcile_llm, tools, dispatcher=object())
+    result = reconcile_runnable.invoke({'parallel_reconcile': 'epoch-1'}, config=cfg)
+
+    # Parent completed by synthesizing from BOTH child results.
+    assert result['execution_finished'] is True
+    assert result['output'] == 'parent-done'
+    final_tool_contents = reconcile_llm.calls[-1]
+    assert 'A-RESULT' in final_tool_contents and 'B-RESULT' in final_tool_contents
+    # The fan-out children were NOT executed in-process during reconcile.
+    assert child_a.calls == [] and child_b.calls == []
+    # Parked marker is cleared — not re-parked, not a spurious interrupt.
+    assert 'parallel_parked' not in result
+    assert not result.get('hitl_interrupts')
+
+
+def test_parallel_reconcile_reads_missing_child_as_placeholder():
+    """A child whose checkpoint is absent (never dispatched / lost) reconciles
+    to a non-empty placeholder ToolMessage rather than crashing or hanging, so
+    the parent can still close out the turn."""
+    parent_memory = MemorySaver()
+    parent_thread_id = 'reconcile-missing-thread'
+    # Only child_a materialised; child_b's checkpoint is intentionally absent.
+    _materialise_completed_child(
+        parent_memory, f'{parent_thread_id}:child_a:call-A', 'A-RESULT')
+
+    child_a = DictBridgeInterruptingApplication('unused', 'create_file')
+    child_b = DictBridgeInterruptingApplication('unused', 'delete_file')
+    tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
+    park_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    park_runnable = _build_parent_runnable_with_dispatcher(
+        parent_memory, park_llm, tools, dispatcher=object())
+    cfg = {'configurable': {'thread_id': parent_thread_id}}
+    park_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]}, config=cfg)
+
+    reconcile_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    reconcile_runnable = _build_parent_runnable_with_dispatcher(
+        parent_memory, reconcile_llm, tools, dispatcher=object())
+    result = reconcile_runnable.invoke({'parallel_reconcile': 'epoch-1'}, config=cfg)
+
+    assert result['execution_finished'] is True
+    final_tool_contents = reconcile_llm.calls[-1]
+    # child_a's real result and a non-empty placeholder for the missing child.
+    assert 'A-RESULT' in final_tool_contents
+    assert any('child_b' in c or 'no result' in c.lower()
+               for c in final_tool_contents)
