@@ -7,6 +7,7 @@ from langchain_community.document_loaders.helpers import detect_file_encodings
 from langchain_core.tools import ToolException
 
 from elitea_sdk.tools.chunkers import text_chunker
+from elitea_sdk.tools.utils.text_operations import decode_text
 
 
 class EliteATextLoader(BaseLoader):
@@ -48,13 +49,7 @@ class EliteATextLoader(BaseLoader):
                         except UnicodeDecodeError:
                             continue
                 elif hasattr(self, 'file_content') and self.file_content:
-                    detected_encodings = detect_file_encodings(self.file_content)
-                    for encoding in detected_encodings:
-                        try:
-                            text = self.file_content.decode(encoding.encoding)
-                            break
-                        except UnicodeDecodeError:
-                            continue
+                    text = decode_text(self.file_content)
                 else:
                     raise ValueError("Neither file_path nor file_content is provided for encoding detection.")
             else:
