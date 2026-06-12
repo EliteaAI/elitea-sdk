@@ -430,7 +430,11 @@ class BaseVectorStoreToolApiWrapper(BaseToolApiWrapper):
 
     def remove_index(self, index_name: str = ""):
         """Cleans the indexed data in the collection."""
-        self._init_vector_store()._clean_collection(index_name=index_name)
+        deleted_count = self._init_vector_store()._clean_collection(index_name=index_name)
+
+        if index_name and deleted_count == 0:
+            raise ToolException(f"Index '{index_name}' not found. Available collections: {self.list_collections()}")
+
         return (f"Collection '{index_name}' has been removed from the vector store.\n"
                 f"Available collections: {self.list_collections()}")
 

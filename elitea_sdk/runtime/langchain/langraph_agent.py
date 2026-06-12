@@ -42,6 +42,7 @@ from ..tools.lazy_tools import ToolRegistry
 from ..utils.evaluate import EvaluateTemplate
 from ..utils.utils import clean_string, deduplicate_tool_names
 from ..tools.router import RouterNode
+from ..exceptions import PipelineConfigurationError
 
 logger = logging.getLogger(__name__)
 
@@ -1088,6 +1089,17 @@ def create_graph(
         logger.debug("Filtered PrinterNodes from subgraph YAML in create_graph")
 
     schema = yaml.safe_load(yaml_schema)
+    if not schema or not isinstance(schema, dict):
+        raise PipelineConfigurationError(
+            "Pipeline has no nodes to execute. Please add at least one node "
+            "to the pipeline before running it."
+        )
+    nodes = schema.get('nodes')
+    if not nodes:
+        raise PipelineConfigurationError(
+            "Pipeline has no nodes to execute. Please add at least one node "
+            "to the pipeline before running it."
+        )
     logger.debug(f"Schema: {schema}")
     logger.debug(f"Tools: {tools}")
     logger.debug(f"Tools: {[tool.name for tool in tools]}")
@@ -1223,7 +1235,8 @@ def create_graph(
                     input_mapping={'code': code_data},
                     input_variables=node.get('input', ['messages']),
                     structured_output=node.get('structured_output', False),
-                    elitea_client=kwargs.get('elitea_client', None)
+                    elitea_client=kwargs.get('elitea_client', None),
+                    debug=node.get('debug', False),
                 ))
             elif node_type == 'llm':
                 output_vars = node.get('output', [])

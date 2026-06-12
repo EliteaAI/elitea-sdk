@@ -392,6 +392,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     _inject_display_metadata(tool, toolkit_tools)
                     tools.extend(toolkit_tools)
                     logger.info(f"✅ Successfully added {len(toolkit_tools)} tools from McpConfigToolkit ({server_name})")
+                except McpAuthorizationRequired as auth_err:
+                    # Annotate with toolkit type so the frontend stores the token under
+                    # the correct key (e.g. "mcp_Epam Staffing") that the backend can match.
+                    auth_err.toolkit_type = tool['type']
+                    raise
                 except Exception as e:
                     logger.error(f"❌ Failed to initialize McpConfigToolkit: {e}")
                     if not debug_mode:

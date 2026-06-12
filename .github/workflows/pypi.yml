@@ -32,13 +32,13 @@ jobs:
 
     - name: Install dependencies
       if: ${{ inputs.increment_version }}
-      run: pip install toml
+      run: pip install tomlkit
 
     - name: Set up script
       if: ${{ inputs.increment_version }}
       run: |
          cat > increment_version.py << 'EOF'
-         import toml
+         import tomlkit
  
          def increment_version(version):
              major, minor, patch = map(int, version.split('.'))
@@ -47,14 +47,14 @@ jobs:
  
          def main():
              with open('pyproject.toml', 'r') as fd:
-                 data = toml.load(fd)
+                 data = tomlkit.load(fd)
  
              current_version = data['project']['version']
              new_version = increment_version(current_version)
              data['project']['version'] = new_version
  
              with open('pyproject.toml', 'w') as fd:
-                 toml.dump(data, fd)
+                 tomlkit.dump(data, fd)
  
              print(f"Version incremented from {current_version} to {new_version}")
  
@@ -89,4 +89,3 @@ jobs:
 
     - name: Publish package distributions to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
-      

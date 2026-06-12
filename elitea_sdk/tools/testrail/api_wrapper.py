@@ -354,6 +354,27 @@ getSuites = create_model(
     ),
 )
 
+getSections = create_model(
+    "getSections",
+    project_id=(str, Field(description="Project id")),
+    suite_id=(
+        Optional[str],
+        Field(
+            default=None,
+            description="[Optional] Suite id for sections extraction in case "
+                        "project is in multiple suite mode (setting 2 or 3). "
+                        "If omitted in multi-suite mode, sections from all suites are returned.",
+        ),
+    ),
+    output_format=(
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    ),
+)
+
 SUPPORTED_KEYS = {
     "id", "title", "section_id", "template_id", "type_id", "priority_id", "milestone_id",
     "refs", "created_by", "created_on", "updated_by", "updated_on", "estimate",
@@ -822,6 +843,87 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except StatusCodeError as e:
             return ToolException(f"Unable to extract test suites: {e}")
 
+    def _fetch_sections_with_suite_handling(
+        self,
+        project_id: str,
+        suite_id: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Unified method to fetch sections with proper TestRail suite mode handling.
+
+        Args:
+            project_id: The TestRail project ID
+            suite_id: Optional suite ID to filter by
+
+        Returns:
+            List of section dictionaries
+        """
+        def _extract_sections_from_response(response):
+            """Extract sections from API response, supporting both old and new testrail_api versions."""
+            if isinstance(response, dict) and 'sections' in response:
+                return response['sections']
+            return response if isinstance(response, list) else []
+
+        suite_required = self._is_suite_id_required(project_id=project_id)
+        all_sections = []
+
+        if suite_required:
+            if suite_id:
+                response = self._client.sections.get_sections(
+                    project_id=project_id, suite_id=int(suite_id)
+                )
+                all_sections.extend(_extract_sections_from_response(response))
+            else:
+                suites = self._get_raw_suites(project_id)
+                suite_ids = [suite['id'] for suite in suites if 'id' in suite]
+                for current_suite_id in suite_ids:
+                    try:
+                        response = self._client.sections.get_sections(
+                            project_id=project_id, suite_id=int(current_suite_id)
+                        )
+                        all_sections.extend(_extract_sections_from_response(response))
+                    except StatusCodeError:
+                        continue
+        else:
+            try:
+                response = self._client.sections.get_sections(project_id=project_id)
+                all_sections.extend(_extract_sections_from_response(response))
+            except StatusCodeError as e:
+                logger.warning(f"Unable to fetch sections at project level: {e}")
+
+        return all_sections
+
+    def get_sections(
+        self, project_id: str, suite_id: Optional[str] = None, output_format: str = "json"
+    ) -> Union[str, ToolException]:
+        """Extracts a list of sections for a given project from Testrail.
+
+        For projects in multiple suite mode (suite_mode 2 or 3), pass a suite_id
+        to scope the result; if omitted, sections from all suites are returned.
+        """
+        try:
+            sections = self._fetch_sections_with_suite_handling(
+                project_id=project_id, suite_id=suite_id
+            )
+
+            if not sections:
+                return ToolException("No sections found for the specified project.")
+
+            section_dicts = []
+            for section in sections:
+                if isinstance(section, dict):
+                    section_dict = {}
+                    for field in ["id", "suite_id", "name", "description",
+                                  "parent_id", "display_order", "depth"]:
+                        if field in section:
+                            section_dict[field] = section[field]
+                    section_dicts.append(section_dict)
+                else:
+                    section_dicts.append({"section": str(section)})
+            return self._to_markup(section_dicts, output_format)
+        except StatusCodeError as e:
+            return ToolException(self._format_status_error(e))
+
     def _base_loader(self, project_id: str,
                      suite_id: Optional[str] = None,
                      section_id: Optional[int] = None,
@@ -1063,6 +1165,12 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 "ref": self.get_suites,
                 "description": self.get_suites.__doc__,
                 "args_schema": getSuites,
+            },
+            {
+                "name": "get_sections",
+                "ref": self.get_sections,
+                "description": self.get_sections.__doc__,
+                "args_schema": getSections,
             }
         ]
         return tools

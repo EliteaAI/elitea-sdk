@@ -2,7 +2,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import List
 
-import pytesseract
 from PIL import Image
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
@@ -18,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = 300_000_000
 
 
 class EliteAImageLoader(BaseLoader):
-    """Loads image files using pytesseract for OCR or optionally LLM for advanced analysis, including SVG support."""
+    """Loads image files using an LLM vision model for advanced analysis, including SVG support."""
 
     def __init__(self, file_path=None, **kwargs):
         # Handle both positional and keyword arguments for file_path
@@ -33,7 +32,6 @@ class EliteAImageLoader(BaseLoader):
             raise ValueError(
                 "Path parameter is required (either as 'file_path' positional argument or 'path' keyword argument)")
         self.llm = kwargs.get('llm', None)
-        self.ocr_language = kwargs.get('ocr_language', None)
         self.prompt = kwargs.get('prompt') if kwargs.get(
             'prompt') is not None else DEFAULT_MULTIMODAL_PROMPT  # Use provided prompt or default
         self.max_tokens = kwargs.get('max_tokens', 512)
@@ -45,8 +43,8 @@ class EliteAImageLoader(BaseLoader):
         """
         Retrieves the text content from the file or in-memory content.
 
-        Depending on the file type (SVG or raster image) and the availability of LLM,
-        processes the file appropriately using OCR or LLM.
+        Depending on the file type (SVG or raster image), processes the file
+        using the configured LLM vision model.
 
         Returns:
             str: Extracted text content from the file.
@@ -73,8 +71,6 @@ class EliteAImageLoader(BaseLoader):
             else:
                 raise ValueError("Either 'file_path' or 'file_content' and 'file_name' must be provided.")
 
-        except pytesseract.TesseractError as e:
-            raise ValueError(f"Error during OCR: {e}")
         except ImportError as e:
             raise ImportError(
                 f"Error: SVG processing dependencies not installed. Please install svglib and reportlab: {e}")
@@ -82,8 +78,7 @@ class EliteAImageLoader(BaseLoader):
             raise ValueError(f"Error opening image or processing SVG: {e}")
 
         if not text_content or not text_content.strip():
-            method = "LLM" if self.llm else "OCR"
-            text_content = f"[No readable text detected by {method}]"
+            text_content = "[No readable text detected by LLM]"
 
         return text_content
 
@@ -102,8 +97,7 @@ class EliteAImageLoader(BaseLoader):
             drawing = svg2rlg(BytesIO(svg_content))
             self._original_dimensions = (int(drawing.width), int(drawing.height))
             drawing, self._was_scaled = scale_svg_drawing(drawing)
-            image = self.__render_svg_drawing(drawing)
-            return pytesseract.image_to_string(image, lang=self.ocr_language)
+            return ""
 
     def _process_raster_image(self, image_source):
         """Processes a raster image with automatic upscaling for small images."""
@@ -111,13 +105,9 @@ class EliteAImageLoader(BaseLoader):
         self._original_dimensions = image.size
         image, self._was_scaled = ensure_min_image_size(image)
         if self.llm:
-            try:
-                return self.__perform_llm_prediction_for_image(image, self.llm, self.prompt)
-            except Exception as e:
-                print(f"Warning: Error during LLM processing of image: {e}. Falling back to OCR.")
-                return pytesseract.image_to_string(image, lang=self.ocr_language)
+            return self.__perform_llm_prediction_for_image(image, self.llm, self.prompt)
         else:
-            return pytesseract.image_to_string(image, lang=self.ocr_language)
+            return ""
 
     def __perform_llm_prediction_for_image(self, image: Image, llm, prompt: str) -> str:
         """Performs LLM prediction for image content."""
@@ -141,12 +131,12 @@ class EliteAImageLoader(BaseLoader):
         return Image.open(img_data).convert("RGBA")
 
     def load(self) -> List[Document]:
-        """Load text from image using OCR or LLM if llm is provided, supports SVG. Applies token-based chunking when max_tokens > 0."""
+        """Load text from image using an LLM vision model, supports SVG. Applies token-based chunking when max_tokens > 0."""
         text_content = self.get_content()
 
         metadata = {
             "source": str(self.file_path if hasattr(self, 'file_path') else self.file_name),
-            "processing_method": "llm" if self.llm else "ocr",
+            "processing_method": "llm" if self.llm else "none",
         }
         if self._original_dimensions is not None:
             metadata["original_dimensions"] = list(self._original_dimensions)

@@ -1,0 +1,148 @@
+name: "SPT07 - get_files_list: Include specific file extensions"
+priority: High
+description: |
+  Verify the SharePoint 'get_files_list' tool filters files by extension using include_extensions
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Expected Behavior:
+  - Tool executes successfully on teams site
+  - Returns only files with extensions matching include_extensions list
+  - Extensions are matched case-insensitively
+  - Must return at least one file per filter (test data required)
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  folder_path:
+    type: str
+    value: "Shared Documents/${SHAREPOINT_TEAMS_TEST_FOLDER}"
+  limit_files:
+    type: int
+    value: 50
+  include_txt:
+    type: list
+    value: ["txt"]
+  include_xlsx:
+    type: list
+    value: [".xlsx"]
+  files_result_txt:
+    type: dict
+  files_result_xlsx:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_files_txt
+
+nodes:
+  - id: invoke_get_files_txt
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - include_txt
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      include_extensions:
+        type: variable
+        value: include_txt
+    output:
+      - files_result_txt
+    structured_output: true
+    transition: invoke_get_files_xlsx
+
+  - id: invoke_get_files_xlsx
+    type: toolkit
+    tool: get_files_list
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - folder_path
+      - limit_files
+      - include_xlsx
+    input_mapping:
+      folder_path:
+        type: variable
+        value: folder_path
+      limit_files:
+        type: variable
+        value: limit_files
+      include_extensions:
+        type: variable
+        value: include_xlsx
+    output:
+      - files_result_xlsx
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - files_result_txt
+      - files_result_xlsx
+      - include_txt
+      - include_xlsx
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the 'get_files_list' tool execution with include_extensions filter on /teams/ site.
+
+          Test 1 - Include extensions: {include_txt}
+          Result: {files_result_txt}
+
+          Test 2 - Include extensions: {include_xlsx}
+          Result: {files_result_xlsx}
+
+          STRICT VALIDATION RULES (all must pass):
+          1. Both tool executions succeed without errors
+          2. Both results are valid JSON arrays (not null, not error messages)
+          3. Test 1 is NOT EMPTY - must contain at least 1 .txt file
+             (test data: test-document.txt exists in folder)
+          4. Test 2 is NOT EMPTY - must contain at least 1 .xlsx file
+             (test data: test-data.xlsx exists in folder)
+          5. Test 1 contains ONLY .txt files (no other extensions)
+          6. Test 2 contains ONLY .xlsx files (no other extensions)
+          7. All file paths contain '/teams/' substring
+          8. Each file has Name, Path, Created, Modified, Link fields
+
+          TEST FAILS if:
+          - Either result is empty [] (missing test data)
+          - Test 1 contains any non-.txt files
+          - Test 2 contains any non-.xlsx files
+          - Any file missing required fields
+          - Paths don't contain '/teams/'
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "txt_files_count": <number of .txt files>,
+            "xlsx_files_count": <number of .xlsx files>,
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **only** the JSON object. No markdown formatting.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: dict
+    transition: END
