@@ -4,7 +4,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
-from typing import Dict, List, Generator, Optional, Union
+from typing import Dict, List, Generator, Literal, Optional, Union
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -396,6 +396,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_types_include: Optional[List[str]] = None,
         node_types_exclude: Optional[List[str]] = None,
         number_of_threads: Optional[int] = None,
+        index_granularity: Optional[Literal['node', 'frame', 'page']] = None,
         **kwargs,
     ) -> Generator[Document, None, None]:
         """Base loader used by the indexer tool.
@@ -472,6 +473,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 'figma_pages_exclude': node_ids_exclude or [],
                 'figma_nodes_include': node_types_include or [],
                 'figma_nodes_exclude': node_types_exclude or [],
+                'index_granularity': index_granularity or 'node',
             }
 
             if metadata_threads_override is not None:
@@ -588,9 +590,9 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"{len(chunk_result.failed)} failed"
         )
 
-        # Track failed pages
+        # Track failed pages as dependent items (parent file still gets indexed)
         for page_id in chunk_result.failed:
-            self._track_runtime_skipped(f"{file_key}/{page_id}", reason="error")
+            self._track_dependent_item_skipped(f"{file_key}/{page_id}")
 
         # Return page content in order (preserve original order where possible)
         pages = []
@@ -617,7 +619,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         if not image_url:
             logging.warning(f"Image URL not found for node_id {node_id} in file {file_key}. Skipping.")
-            self._track_skipped_file_read_error(item_name)
+            self._track_dependent_item_skipped(item_name)
             return None
 
         logging.info(f"File {file_key}: downloading image node {node_id}.")
@@ -626,7 +628,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             response = requests.get(image_url)
         except Exception as exc:
             logging.warning(f"Failed to download image for node {node_id} in file {file_key}: {exc}")
-            self._track_skipped_file_read_error(item_name)
+            self._track_dependent_item_skipped(item_name)
             return None
 
         if response.status_code != 200:
@@ -634,13 +636,13 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 f"Unexpected status code {response.status_code} when downloading image "
                 f"for node {node_id} in file {file_key}."
             )
-            self._track_skipped_file_read_error(item_name)
+            self._track_dependent_item_skipped(item_name)
             return None
 
         content_type = response.headers.get('Content-Type', '')
         if 'text/html' in content_type.lower():
             logging.warning(f"Received HTML instead of image content for node {node_id} in file {file_key}.")
-            self._track_skipped_file_read_error(item_name)
+            self._track_dependent_item_skipped(item_name)
             return None
 
         extension = (f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.txt')
@@ -663,6 +665,170 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 'node_id': node_id,
                 'image_url': image_url,
                 'type': 'image',
+            },
+        )
+
+    def _describe_image(self, image_url: str, prompt: str) -> Optional[str]:
+        """
+        Download an image from URL and describe it using the LLM.
+
+        Used by page-level and frame-level processing to get visual descriptions
+        of aggregated content.
+
+        Args:
+            image_url: URL to download the image from
+            prompt: Prompt to guide the LLM's image description
+
+        Returns:
+            LLM-generated description of the image, or None if processing fails
+        """
+        if not image_url:
+            logging.warning("_describe_image called with empty image_url")
+            return None
+
+        if not self.llm:
+            logging.warning("_describe_image: no LLM configured, skipping image description")
+            return None
+
+        try:
+            response = requests.get(image_url)
+        except Exception as exc:
+            logging.warning(f"_describe_image: failed to download image: {exc}")
+            return None
+
+        if response.status_code != 200:
+            logging.warning(f"_describe_image: unexpected status code {response.status_code}")
+            return None
+
+        content_type = response.headers.get('Content-Type', '')
+        if 'text/html' in content_type.lower():
+            logging.warning("_describe_image: received HTML instead of image content")
+            return None
+
+        extension = f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.png'
+
+        try:
+            description = _load_content_from_bytes_with_prompt(
+                file_content=response.content,
+                extension=extension,
+                llm=self.llm,
+                prompt=prompt,
+            )
+            return description
+        except Exception as exc:
+            logging.warning(f"_describe_image: LLM processing failed: {exc}")
+            return None
+
+    def _process_single_frame(
+        self,
+        file_key: str,
+        frame_info: dict,
+        image_url: Optional[str],
+        prompt: str,
+    ) -> Optional[Document]:
+        """
+        Process a single frame and return a Document.
+
+        This helper is used by _process_frame_level for parallel processing.
+
+        Args:
+            file_key: Figma file key
+            frame_info: Dict with frame metadata (node_id, node_name, page_id, page_name, texts)
+            image_url: Pre-fetched image URL for this frame (or None)
+            prompt: LLM prompt for image description
+
+        Returns:
+            Document for this frame, or None if frame has no content
+        """
+        node_id = frame_info['node_id']
+        frame_name = frame_info['node_name']
+        page_id = frame_info['page_id']
+        page_name = frame_info['page_name']
+        texts = frame_info['texts']
+
+        frame_content_parts = []
+
+        # Add text content
+        if texts:
+            frame_content_parts.append("\n".join(texts))
+
+        # Process image with LLM if available and prompt provided
+        if image_url and prompt:
+            visual_description = self._describe_image(image_url, prompt)
+            if visual_description:
+                frame_content_parts.append(f"\n[Visual description]\n{visual_description}")
+
+        if not frame_content_parts:
+            return None
+
+        return Document(
+            page_content="\n".join(frame_content_parts),
+            metadata={
+                'id': node_id,
+                'file_key': file_key,
+                'frame_id': node_id,
+                'frame_name': frame_name,
+                'page_id': page_id,
+                'page_name': page_name,
+                'type': 'frame',
+                'granularity': 'frame',
+                'image_url': image_url or '',
+            },
+        )
+
+    def _process_single_page(
+        self,
+        file_key: str,
+        page_info: dict,
+        image_url: Optional[str],
+        prompt: str,
+    ) -> Optional[Document]:
+        """
+        Process a single page and return a Document.
+
+        This helper is used by _process_page_level for parallel processing.
+
+        Args:
+            file_key: Figma file key
+            page_info: Dict with page metadata (page_id, page_name, all_texts, frame_ids, has_image)
+            image_url: Pre-fetched image URL for this page (or None)
+            prompt: LLM prompt for image description
+
+        Returns:
+            Document for this page, or None if page has no content
+        """
+        page_id = page_info['page_id']
+        page_name = page_info['page_name']
+        all_texts = page_info['all_texts']
+        frame_ids = page_info['frame_ids']
+
+        page_content_parts = []
+
+        # Add text content
+        if all_texts:
+            page_content_parts.append("\n".join(all_texts))
+
+        # Process image with LLM if available and prompt provided
+        if image_url and prompt:
+            visual_description = self._describe_image(image_url, prompt)
+            if visual_description:
+                page_content_parts.append(f"\n[Visual description]\n{visual_description}")
+
+        if not page_content_parts:
+            return None
+
+        return Document(
+            page_content="\n".join(page_content_parts),
+            metadata={
+                'id': page_id,
+                'file_key': file_key,
+                'page_id': page_id,
+                'page_name': page_name,
+                'type': 'page',
+                'granularity': 'page',
+                'node_count': len(frame_ids),
+                'frame_ids': ';'.join(frame_ids),
+                'image_url': image_url or '',
             },
         )
 
@@ -775,11 +941,12 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"  - Failed IDs: {chunk_result.failed}"
         )
 
-        # Track failed items for reporting
+        # Track failed items as dependent items (not top-level docs)
+        # These are sub-items within a parent document that still gets indexed
         for node_id in chunk_result.failed:
             page_id = node_to_page.get(node_id, "")
             item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
-            self._track_runtime_skipped(item_name, reason="error")
+            self._track_dependent_item_skipped(item_name)
 
         return chunk_result.successful
 
@@ -794,6 +961,32 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         figma_pages = self._load_pages(document)
         node_types_include = [t.strip().lower() for t in document.metadata.pop('figma_nodes_include', [])]
         node_types_exclude = [t.strip().lower() for t in document.metadata.pop('figma_nodes_exclude', [])]
+
+        # Route based on granularity level
+        granularity = document.metadata.pop('index_granularity', 'node')
+        if granularity == 'page':
+            yield from self._process_page_level(
+                document, figma_pages, node_types_include, node_types_exclude, prompt
+            )
+        elif granularity == 'frame':
+            yield from self._process_frame_level(
+                document, figma_pages, node_types_include, node_types_exclude, prompt
+            )
+        else:
+            yield from self._process_node_level(
+                document, figma_pages, node_types_include, node_types_exclude, prompt
+            )
+
+    def _process_node_level(
+        self,
+        document: Document,
+        figma_pages: List[dict],
+        node_types_include: List[str],
+        node_types_exclude: List[str],
+        prompt: str = "",
+    ) -> Generator[Document, None, None]:
+        """Process document at node level - one document per node (image/text). Original behavior."""
+        file_key = document.metadata.get('id', '')
 
         image_nodes = []
         text_nodes = {}
@@ -873,7 +1066,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                             )
                             self._log_tool_event(
                                 f"File {file_key}: processing image node {node_id} "
-                                f"({counted_nodes_ref['value']}/{total_nodes} in {max_workers} threads)."
+                                f"({counted_nodes_ref['value']}/{total_nodes})."
                             )
                             yield doc
                 else:
@@ -920,10 +1113,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                                 )
                                 yield doc
 
-                logging.info(
-                    f"File {file_key}: completed processing of {total_images} image nodes."
-                )
-
         # --- Process text nodes (fast) ---
         if text_nodes:
             for node_id, texts in text_nodes.items():
@@ -948,6 +1137,367 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                             'type': 'text',
                         },
                     )
+
+    def _process_page_level(
+        self,
+        document: Document,
+        figma_pages: List[dict],
+        node_types_include: List[str],
+        node_types_exclude: List[str],
+        prompt: str = "",
+    ) -> Generator[Document, None, None]:
+        """
+        Process document at page level - one document per page.
+
+        Aggregates all text content from all frames within a page and renders
+        a single page-level image. Results in fewer, larger documents.
+        Uses parallel processing for image download and LLM analysis.
+        """
+        file_key = document.metadata.get('id', '')
+
+        # Resolve number_of_threads from document metadata or class field
+        override_threads = document.metadata.get('number_of_threads_override')
+        if isinstance(override_threads, int) and 1 <= override_threads <= 5:
+            number_of_threads = override_threads
+        else:
+            threads_cfg = getattr(self, "number_of_threads", DEFAULT_NUMBER_OF_THREADS)
+            if isinstance(threads_cfg, int) and 1 <= threads_cfg <= 5:
+                number_of_threads = threads_cfg
+            else:
+                number_of_threads = DEFAULT_NUMBER_OF_THREADS
+
+        total_pages = len(figma_pages)
+
+        # --- Phase 1: Collect all pages and their metadata ---
+        pages_to_process: List[dict] = []
+        page_node_ids: List[str] = []
+        page_node_mapping: Dict[str, List[str]] = {}
+
+        for page in figma_pages:
+            page_id = page.get('id', '')
+            page_name = page.get('name', '')
+
+            # Collect all text from all children recursively
+            all_texts = []
+            frame_ids = []
+            for node in page.get('children', []):
+                node_type = node.get('type', '').lower()
+                # Apply filters
+                include = node_types_include and node_type in node_types_include
+                exclude = node_types_exclude and node_type not in node_types_exclude
+                no_filter = not node_types_include and not node_types_exclude
+
+                if include or exclude or no_filter:
+                    node_id = node.get('id')
+                    if node_id:
+                        frame_ids.append(node_id)
+                        texts = self.get_texts_recursive(node)
+                        if texts:
+                            all_texts.extend(texts)
+
+            has_image = self.has_image_representation(page)
+
+            page_info = {
+                'page_id': page_id,
+                'page_name': page_name,
+                'all_texts': all_texts,
+                'frame_ids': frame_ids,
+                'has_image': has_image,
+            }
+            pages_to_process.append(page_info)
+
+            if has_image:
+                page_node_ids.append(page_id)
+                page_node_mapping[page_id] = [page_id]
+
+        self._log_tool_event(
+            f"File {file_key}: processing {total_pages} pages at page level with {number_of_threads} threads"
+        )
+
+        if total_pages == 0:
+            return
+
+        # --- Phase 2: Batch fetch all page images at once ---
+        images: Dict[str, str] = {}
+        if page_node_ids:
+            self._log_tool_event(
+                f"File {file_key}: requesting images for {len(page_node_ids)} pages"
+            )
+            images = self._get_file_images_with_fallback(
+                file_key, page_node_ids, page_node_mapping
+            )
+
+        # --- Phase 3: Process pages in parallel ---
+        counted_pages_ref: Dict[str, int] = {"value": 0}
+
+        if number_of_threads == 1:
+            # Sequential processing (single thread)
+            for page_info in pages_to_process:
+                page_id = page_info['page_id']
+                image_url = images.get(page_id) if page_info['has_image'] else None
+
+                doc = self._process_single_page(
+                    file_key=file_key,
+                    page_info=page_info,
+                    image_url=image_url,
+                    prompt=prompt,
+                )
+
+                counted_pages_ref["value"] += 1
+
+                if doc is not None:
+                    # Add updated_on from parent document
+                    doc.metadata['updated_on'] = document.metadata.get('updated_on', '')
+
+                    # Track dependent document
+                    existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                    document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                        f"{existing};{page_id}" if existing else page_id
+                    )
+
+                    self._log_tool_event(
+                        f"File {file_key}: processed page {page_info['page_name']} "
+                        f"({counted_pages_ref['value']}/{total_pages}), "
+                        f"{len(page_info['frame_ids'])} frames, {len(page_info['all_texts'])} text items"
+                    )
+                    yield doc
+                else:
+                    self._log_tool_event(
+                        f"File {file_key}: page {page_info['page_name']} "
+                        f"({counted_pages_ref['value']}/{total_pages}) has no content, skipping"
+                    )
+        else:
+            # Parallel processing with thread pool
+            self._log_tool_event(
+                f"File {file_key}: using {number_of_threads} worker threads for page processing."
+            )
+
+            with ThreadPoolExecutor(max_workers=number_of_threads) as executor:
+                # Submit all tasks and keep track of original order
+                futures = [
+                    executor.submit(
+                        self._process_single_page,
+                        file_key,
+                        page_info,
+                        images.get(page_info['page_id']) if page_info['has_image'] else None,
+                        prompt,
+                    )
+                    for page_info in pages_to_process
+                ]
+
+                # Process results in original submission order (preserves document order)
+                for idx, future in enumerate(futures):
+                    page_info = pages_to_process[idx]
+                    page_id = page_info['page_id']
+
+                    try:
+                        doc = future.result()
+                    except Exception as exc:
+                        logging.warning(
+                            f"File {file_key}: unexpected error while processing page {page_id}: {exc}"
+                        )
+                        counted_pages_ref["value"] += 1
+                        continue
+
+                    counted_pages_ref["value"] += 1
+
+                    if doc is not None:
+                        # Add updated_on from parent document
+                        doc.metadata['updated_on'] = document.metadata.get('updated_on', '')
+
+                        # Track dependent document
+                        existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                        document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                            f"{existing};{page_id}" if existing else page_id
+                        )
+
+                        self._log_tool_event(
+                            f"File {file_key}: processed page {page_info['page_name']} "
+                            f"({counted_pages_ref['value']}/{total_pages} in {number_of_threads} threads), "
+                            f"{len(page_info['frame_ids'])} frames, {len(page_info['all_texts'])} text items"
+                        )
+                        yield doc
+                    else:
+                        self._log_tool_event(
+                            f"File {file_key}: page {page_info['page_name']} "
+                            f"({counted_pages_ref['value']}/{total_pages}) has no content, skipping"
+                        )
+
+    def _process_frame_level(
+        self,
+        document: Document,
+        figma_pages: List[dict],
+        node_types_include: List[str],
+        node_types_exclude: List[str],
+        prompt: str = "",
+    ) -> Generator[Document, None, None]:
+        """
+        Process document at frame level - one document per top-level frame.
+
+        Each top-level frame (direct child of a page) becomes a document with
+        aggregated text and a single frame-level image. Uses parallel processing
+        for image download and LLM analysis.
+        """
+        file_key = document.metadata.get('id', '')
+
+        # Resolve number_of_threads from document metadata or class field
+        override_threads = document.metadata.get('number_of_threads_override')
+        if isinstance(override_threads, int) and 1 <= override_threads <= 5:
+            number_of_threads = override_threads
+        else:
+            threads_cfg = getattr(self, "number_of_threads", DEFAULT_NUMBER_OF_THREADS)
+            if isinstance(threads_cfg, int) and 1 <= threads_cfg <= 5:
+                number_of_threads = threads_cfg
+            else:
+                number_of_threads = DEFAULT_NUMBER_OF_THREADS
+
+        # --- Phase 1: Collect all frames and their metadata ---
+        frames_to_process: List[dict] = []
+        frame_node_ids: List[str] = []
+        page_node_mapping: Dict[str, List[str]] = {}
+
+        for page in figma_pages:
+            page_id = page.get('id', '')
+            page_name = page.get('name', '')
+            page_children = page.get('children', [])
+            page_frame_ids = []
+
+            for node in page_children:
+                node_type = node.get('type', '').lower()
+                node_id = node.get('id')
+                node_name = node.get('name', '')
+
+                if not node_id:
+                    continue
+
+                # Apply filters
+                include = node_types_include and node_type in node_types_include
+                exclude = node_types_exclude and node_type not in node_types_exclude
+                no_filter = not node_types_include and not node_types_exclude
+
+                if not (include or exclude or no_filter):
+                    continue
+
+                # Collect text from this frame recursively
+                texts = self.get_texts_recursive(node)
+                has_image = self.has_image_representation(node)
+
+                frame_info = {
+                    'node_id': node_id,
+                    'node_name': node_name,
+                    'page_id': page_id,
+                    'page_name': page_name,
+                    'texts': texts,
+                    'has_image': has_image,
+                }
+                frames_to_process.append(frame_info)
+
+                if has_image:
+                    frame_node_ids.append(node_id)
+                    page_frame_ids.append(node_id)
+
+            if page_frame_ids:
+                page_node_mapping[page_id] = page_frame_ids
+
+        total_frames = len(frames_to_process)
+        self._log_tool_event(f"File {file_key}: processing {total_frames} frames at frame level with {number_of_threads} threads")
+
+        if total_frames == 0:
+            return
+
+        # --- Phase 2: Batch fetch all images at once ---
+        images: Dict[str, str] = {}
+        if frame_node_ids:
+            self._log_tool_event(
+                f"File {file_key}: requesting images for {len(frame_node_ids)} frames across {len(page_node_mapping)} pages"
+            )
+            images = self._get_file_images_with_fallback(
+                file_key, frame_node_ids, page_node_mapping
+            )
+
+        # --- Phase 3: Process frames in parallel ---
+        counted_frames_ref: Dict[str, int] = {"value": 0}
+
+        if number_of_threads == 1:
+            # Sequential processing (single thread)
+            for frame_info in frames_to_process:
+                node_id = frame_info['node_id']
+                image_url = images.get(node_id) if frame_info['has_image'] else None
+
+                doc = self._process_single_frame(
+                    file_key=file_key,
+                    frame_info=frame_info,
+                    image_url=image_url,
+                    prompt=prompt,
+                )
+
+                counted_frames_ref["value"] += 1
+
+                if doc is not None:
+                    # Add updated_on from parent document
+                    doc.metadata['updated_on'] = document.metadata.get('updated_on', '')
+
+                    # Track dependent document
+                    existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                    document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                        f"{existing};{node_id}" if existing else node_id
+                    )
+
+                    self._log_tool_event(
+                        f"File {file_key}: processed frame {frame_info['node_name']} "
+                        f"({counted_frames_ref['value']}/{total_frames})."
+                    )
+                    yield doc
+        else:
+            # Parallel processing with thread pool
+            self._log_tool_event(
+                f"File {file_key}: using {number_of_threads} worker threads for frame processing."
+            )
+
+            with ThreadPoolExecutor(max_workers=number_of_threads) as executor:
+                # Submit all tasks and keep track of original order
+                futures = [
+                    executor.submit(
+                        self._process_single_frame,
+                        file_key,
+                        frame_info,
+                        images.get(frame_info['node_id']) if frame_info['has_image'] else None,
+                        prompt,
+                    )
+                    for frame_info in frames_to_process
+                ]
+
+                # Process results in original submission order (preserves document order)
+                for idx, future in enumerate(futures):
+                    frame_info = frames_to_process[idx]
+                    node_id = frame_info['node_id']
+
+                    try:
+                        doc = future.result()
+                    except Exception as exc:
+                        logging.warning(
+                            f"File {file_key}: unexpected error while processing frame {node_id}: {exc}"
+                        )
+                        counted_frames_ref["value"] += 1
+                        continue
+
+                    counted_frames_ref["value"] += 1
+
+                    if doc is not None:
+                        # Add updated_on from parent document
+                        doc.metadata['updated_on'] = document.metadata.get('updated_on', '')
+
+                        # Track dependent document
+                        existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+                        document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
+                            f"{existing};{node_id}" if existing else node_id
+                        )
+
+                        self._log_tool_event(
+                            f"File {file_key}: processed frame {frame_info['node_name']} "
+                            f"({counted_frames_ref['value']}/{total_frames} in {number_of_threads} threads)."
+                        )
+                        yield doc
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
@@ -1000,6 +1550,15 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     "urls_or_file_keys entry."
                 ),
                 default=None,
+            )),
+            'index_granularity': (Optional[Literal['node', 'frame', 'page']], Field(
+                description=(
+                    "Controls the level at which content is indexed. "
+                    "'node' (default): One document per node (image/text) - current behavior, most granular. "
+                    "'frame': One document per top-level frame, aggregating all text and a single frame image. "
+                    "'page': One document per page, aggregating all frames' text and a single page image."
+                ),
+                default='node',
             )),
         }
 
