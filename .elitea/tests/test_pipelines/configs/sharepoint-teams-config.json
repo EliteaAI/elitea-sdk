@@ -1,0 +1,9 @@
+{
+  "type": "sharepoint",
+  "toolkit_name": "sharepoint-teams-testing",
+  "selected_tools": [
+    "get_lists",
+    "get_files_list",
+    "read_document"
+  ]
+}

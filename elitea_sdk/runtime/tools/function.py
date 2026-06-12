@@ -40,6 +40,7 @@ class FunctionTool(BaseTool):
     output_variables: Optional[list[str]] = None
     structured_output: Optional[bool] = False
     elitea_client: Optional[Any] = None
+    debug: bool = False
 
     def _prepare_pyodide_input(self, state: Union[str, dict, ToolCall], input_variables: Optional[list[str]] = None) -> str:
         """Prepare input for PyodideSandboxTool by injecting state into the code block.
@@ -139,6 +140,34 @@ alita_client = elitea_client
     def _is_pyodide_tool(self) -> bool:
         """Check if the current tool is a PyodideSandboxTool."""
         return self.tool.name.lower() == 'pyodide_sandbox'
+
+    def _save_code_to_artifact(self, code: str, node_name: str) -> None:
+        """Save the assembled code to the 'code-debug' artifact bucket.
+
+        Filename is ``<node_name>.py``.  The bucket is created automatically if
+        it does not yet exist (handled by SandboxArtifact.__init__).
+        Failures are logged as warnings and never propagate to interrupt execution.
+        """
+        try:
+            bucket = "code-debug"
+            filename = f"{node_name}.py"
+            artifact = self.elitea_client.artifact(bucket)
+            result = artifact.create(filename, code.encode('utf-8'))
+            if 'error' in result:
+                logger.warning(
+                    "[code-debug] Failed to save code artifact for node '%s': %s",
+                    node_name, result['error']
+                )
+            else:
+                logger.debug(
+                    "[code-debug] Saved code for node '%s' → %s/%s",
+                    node_name, bucket, filename
+                )
+        except Exception as exc:
+            logger.warning(
+                "[code-debug] Could not save code artifact for node '%s': %s",
+                node_name, exc
+            )
 
     @staticmethod
     def _is_sensitive_tool_blocked(tool_result: Any) -> bool:
@@ -252,6 +281,11 @@ alita_client = elitea_client
         # special handler for PyodideSandboxTool
         if self._is_pyodide_tool():
             func_args['code'] = f"{self._prepare_pyodide_input(state, self.input_variables)}\n{func_args['code']}"
+            # When debug mode is enabled and an elitea_client is available, persist
+            # the full assembled code to the 'code-debug' artifact bucket so it can
+            # be inspected after execution.
+            if self.debug and self.elitea_client is not None:
+                self._save_code_to_artifact(func_args['code'], self.name)
 
         try:
             tool_result = self.tool.invoke(func_args, config, **kwargs)

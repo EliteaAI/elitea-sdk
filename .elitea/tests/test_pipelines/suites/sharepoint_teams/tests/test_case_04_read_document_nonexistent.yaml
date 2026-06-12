@@ -1,0 +1,87 @@
+name: "SPT04 - read_document: Non-existent file (Negative)"
+priority: High
+description: |
+  Verify the SharePoint 'read_document' tool handles non-existent files gracefully
+  on a /teams/ site using site_path.
+
+  Feature: Issue #2584 - Add Support for Additional SharePoint Spaces
+  Tags: feature:2584
+
+  Negative Test - Expected to fail gracefully:
+  - Tool receives path to non-existent file
+  - Returns meaningful error message
+  - No unhandled exceptions
+
+toolkits:
+  - id: ${SHAREPOINT_TEAMS_TOOLKIT_ID}
+    name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+
+state:
+  file_path:
+    type: str
+    value: "${SHAREPOINT_TEAMS_DOCUMENT_PATH}/NonExistent_File_12345.txt"
+  document_content:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_read_document
+
+nodes:
+  - id: invoke_read_document
+    type: toolkit
+    tool: read_document
+    toolkit_name: ${SHAREPOINT_TEAMS_TOOLKIT_NAME}
+    input:
+      - file_path
+    input_mapping:
+      path:
+        type: variable
+        value: file_path
+    output:
+      - document_content
+    structured_output: true
+    continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: ${DEFAULT_LLM_MODEL}
+    input:
+      - document_content
+      - file_path
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator for negative test cases."
+      task:
+        type: fstring
+        value: |
+          Validate error handling for non-existent file on /teams/ site.
+
+          File path: {file_path}
+          Result: {document_content}
+
+          NEGATIVE TEST - tool should fail gracefully.
+
+          PASS if:
+          - Result contains error indicator (error, not found, 404, 401, failed)
+          - Error message is non-empty and meaningful
+
+          FAIL if:
+          - Result contains actual file content (real document text)
+          - Result is completely empty with no error info
+
+          Note: Stack traces in error output are acceptable - focus on whether
+          the error message indicates the file was not found.
+
+          Return JSON only:
+          {{"test_passed": true/false, "summary": "brief outcome", "error": "details or null"}}
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

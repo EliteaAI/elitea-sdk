@@ -80,11 +80,9 @@ class EliteAClient:
                  project_id: int,
                  auth_token: str,
                  api_extra_headers: Optional[dict] = None,
-                 configurations: Optional[list] = None,
                  **kwargs):
 
         self.base_url = base_url.rstrip('/')
-        self.api_path = '/api/v1'
         self.api_v2_path = '/api/v2'
         self.llm_path = '/llm/v1'
         self.allm_path = '/llm'
@@ -96,25 +94,20 @@ class EliteAClient:
         }
         if api_extra_headers is not None:
             self.headers.update(api_extra_headers)
-        self.predict_url = f"{self.base_url}{self.api_path}/prompt_lib/predict/prompt_lib/{self.project_id}"
         self.base_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/"
         self.base_public_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/public_application/prompt_lib/"
         self.app = f"{self.base_app_url}{self.project_id}"
         self.mcp_tools_list = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_list/{self.project_id}"
         self.mcp_tools_call = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_call/{self.project_id}"
-        self.application_versions = f"{self.base_url}{self.api_path}/applications/version/prompt_lib/{self.project_id}"
-        self.list_apps_url = f"{self.base_url}{self.api_path}/applications/applications/prompt_lib/{self.project_id}"
-        self.integration_details = f"{self.base_url}{self.api_path}/integrations/integration/{self.project_id}"
-        self.secrets_url = f"{self.base_url}{self.api_path}/secrets/secret/{self.project_id}"
+        self.application_versions = f"{self.base_url}{self.api_v2_path}/elitea_core/version/prompt_lib/{self.project_id}"
+        self.list_apps_url = f"{self.base_url}{self.api_v2_path}/elitea_core/applications/prompt_lib/{self.project_id}"
+        self.secrets_url = f"{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}"
         self.artifacts_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifacts/default/{self.project_id}"
         self.artifact_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}"
         self.bucket_url = f"{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}"
-        self.configurations_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=configurations&unsecret=true'
-        self.ai_section_url = f'{self.base_url}{self.api_path}/integrations/integrations/default/{self.project_id}?section=ai'
-        self.models_url = f'{self.base_url}{self.api_path}/configurations/models/{self.project_id}?include_shared=true'
+        self.models_url = f'{self.base_url}{self.api_v2_path}/configurations/models/{self.project_id}?include_shared=true'
         self.image_generation_url = f"{self.base_url}{self.llm_path}/images/generations"
         self.s3_url = f"{self.base_url}/artifacts/s3"
-        self.configurations: list = configurations or []
         self.model_timeout = kwargs.get('model_timeout', 120)
         self.model_image_generation = kwargs.get('model_image_generation')
 
@@ -183,7 +176,7 @@ class EliteAClient:
         )
 
     def toolkit(self, toolkit_id: int):
-        url = f"{self.base_url}{self.api_path}/tool/prompt_lib/{self.project_id}/{toolkit_id}"
+        url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool/prompt_lib/{self.project_id}/{toolkit_id}"
         response = requests.get(url, headers=self.headers, verify=False)
         if not response.ok:
             raise ValueError(f"Failed to fetch toolkit {toolkit_id}: {response.text}")
@@ -214,18 +207,6 @@ class EliteAClient:
                 break
 
         return apps
-
-    def fetch_available_configurations(self) -> list:
-        resp = requests.get(self.configurations_url, headers=self.headers, verify=False)
-        if resp.ok:
-            return resp.json()
-        return []
-
-    def all_models_and_integrations(self):
-        resp = requests.get(self.ai_section_url, headers=self.headers, verify=False)
-        if resp.ok:
-            return resp.json()
-        return []
 
     def get_available_models(self):
         """Get list of available models from the configurations API.
@@ -651,23 +632,13 @@ class EliteAClient:
 
     def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
         """Get application version details for the client's project."""
-        url = f"{self.base_url}{self.api_path}/applications/version/prompt_lib/{self.project_id}/{application_id}/{application_version_id}"
-        if self.configurations:
-            configs = self.configurations
-        else:
-            configs = self.fetch_available_configurations()
-
-        resp = requests.patch(url, headers=self.headers, verify=False, json={'configurations': configs})
+        url = f"{self.application_versions}/{application_id}/{application_version_id}"
+        resp = requests.patch(url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         logger.error(f"Failed to fetch application version details: {resp.status_code} - {resp.text}."
                      f" Application ID: {application_id}, Version ID: {application_version_id}, Project ID: {self.project_id}")
         raise ApiDetailsRequestError(f"Failed to fetch application version details for {application_id}/{application_version_id}: {resp.status_code} - {resp.text}")
-
-    def get_integration_details(self, integration_id: str, format_for_model: bool = False):
-        url = f"{self.integration_details}/{integration_id}"
-        data = requests.get(url, headers=self.headers, verify=False).json()
-        return data
 
     def unsecret(self, secret_name: str):
         from elitea_sdk.runtime.utils.logging import mask_sensitive_value
@@ -1177,73 +1148,6 @@ class EliteAClient:
             "contentType": response.headers.get('Content-Type', ''),
             "etag": response.headers.get('ETag', '').strip('"')
         }
-
-    def _prepare_messages(self, messages: list[BaseMessage]):
-        chat_history = []
-        for message in messages:
-            if message.type == 'human':
-                chat_history.append({
-                    'role': 'user',
-                    'content': message.content
-                })
-            elif message.type == 'system':
-                chat_history.append({
-                    'role': 'system',
-                    'content': message.content
-                })
-            else:
-                chat_history.append({
-                    'role': 'assistant',
-                    'content': message.content
-                })
-        return chat_history
-
-    def _prepare_payload(self, messages: list[BaseMessage], model_settings: dict, variables: list[dict]):
-        chat_history = self._prepare_messages(messages)
-        if not variables:
-            variables = []
-        return {
-            "type": "chat",
-            "project_id": self.project_id,
-            "context": '',
-            "model_settings": model_settings,
-            "user_input": '',
-            "messages": chat_history,
-            "variables": variables,
-            "format_response": True
-        }
-
-    def async_predict(self, messages: list[BaseMessage], model_settings: dict, variables: list[dict] = None):
-        # TODO: Modify to make it appropriate stream response
-        prompt_data = self._prepare_payload(messages, model_settings, variables)
-        response = requests.post(self.predict_url, headers=self.headers, json=prompt_data, verify=False)
-        logger.info(response.content)
-        response_data = response.json()
-        for message in response_data['messages']:
-            if message.get('role') == 'user':
-                yield HumanMessage(content=message['content'])
-            else:
-                yield AIMessage(content=message['content'])
-
-    def predict(self, messages: list[BaseMessage], model_settings: dict, variables: list[dict] = None):
-        prompt_data = self._prepare_payload(messages, model_settings, variables)
-        response = requests.post(self.predict_url, headers=self.headers, json=prompt_data, verify=False)
-
-        if response.status_code != 200:
-            logger.error(f"Error in response of predict: {response.content}")
-            raise requests.exceptions.HTTPError(response.content)
-        try:
-            response_data = response.json()
-            response_messages = []
-            for message in response_data['messages']:
-                if message.get('role') == 'user':
-                    response_messages.append(HumanMessage(content=message['content']))
-                else:
-                    response_messages.append(AIMessage(content=message['content']))
-            return response_messages
-        except TypeError:
-            logger.error(f"TypeError in response of predict: {response.content}")
-            raise
 
     def predict_agent(self, llm: ChatOpenAI, instructions: str = "You are a helpful assistant.",
                       tools: Optional[list] = None, chat_history: Optional[List[Any]] = None,

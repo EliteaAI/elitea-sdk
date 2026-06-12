@@ -22,6 +22,7 @@ class McpAuthorizationRequired(ToolException):
         resource_metadata: Optional[Dict[str, Any]] = None,
         status: Optional[int] = None,
         tool_name: Optional[str] = None,
+        toolkit_type: Optional[str] = None,
     ):
         super().__init__(message)
         self.server_url = server_url
@@ -30,6 +31,7 @@ class McpAuthorizationRequired(ToolException):
         self.resource_metadata = resource_metadata
         self.status = status
         self.tool_name = tool_name
+        self.toolkit_type = toolkit_type
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -40,6 +42,7 @@ class McpAuthorizationRequired(ToolException):
             "resource_metadata": self.resource_metadata,
             "status": self.status,
             "tool_name": self.tool_name,
+            "toolkit_type": self.toolkit_type,
         }
 
 

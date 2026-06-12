@@ -3,8 +3,8 @@ Pytest tests for EliteADocxMammothLoader.
 
 These tests specifically verify:
 1. Image handling with LLM (use_llm=True) properly invokes the LLM with image bytes
-2. Image handling falls back to Tesseract OCR when LLM is not available
-3. Image handling falls back to "Transcript is not available" when both fail
+2. Image handling returns a placeholder transcript when no LLM is available
+3. Image handling returns "Transcript is not available" when the LLM call fails
 4. The fix for issue #4794 - ensuring image.open().read() is called correctly
 
 Run:
@@ -138,8 +138,8 @@ class TestDocxMammothLoaderImageHandling:
 
             assert 'A chart showing quarterly revenue growth' in result['src']
 
-    def test_handle_image_without_llm_uses_tesseract(self):
-        """Test that OCR is used when LLM is not available"""
+    def test_handle_image_without_llm_returns_placeholder(self):
+        """Without an LLM, no transcription backend exists → placeholder text."""
         from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
             EliteADocxMammothLoader
         )
@@ -150,19 +150,14 @@ class TestDocxMammothLoaderImageHandling:
 
         mock_image = MockMammothImage(MINIMAL_PNG_BYTES)
 
-        with patch('elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.pytesseract') as mock_tesseract, \
-             patch('elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.Image') as mock_pil:
-            mock_tesseract.image_to_string.return_value = 'OCR extracted text'
-            mock_pil.open.return_value = MagicMock()
+        result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
-            result = loader._EliteADocxMammothLoader__handle_image(mock_image)
+        # No LLM → no transcript available (Tesseract fallback removed)
+        assert 'Transcript is not available' in result['src']
+        assert 'Image: image_1' in result['src']
 
-            # Verify OCR was called
-            mock_tesseract.image_to_string.assert_called_once()
-            assert 'OCR extracted text' in result['src']
-
-    def test_handle_image_fallback_on_exception(self):
-        """Test that fallback message is returned when both LLM and OCR fail"""
+    def test_handle_image_fallback_on_llm_exception(self):
+        """When the LLM call fails, the placeholder transcript is returned."""
         from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
             EliteADocxMammothLoader
         )
@@ -176,14 +171,12 @@ class TestDocxMammothLoaderImageHandling:
 
         with patch(
             'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.perform_llm_prediction_for_image_bytes'
-        ) as mock_predict, \
-             patch('elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader.pytesseract') as mock_tesseract:
+        ) as mock_predict:
             mock_predict.side_effect = Exception('LLM service unavailable')
-            mock_tesseract.image_to_string.side_effect = Exception('Tesseract not installed')
 
             result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
-            # Both LLM and Tesseract failed → fallback transcript
+            # LLM failed and there is no OCR fallback → placeholder transcript
             assert 'Transcript is not available' in result['src']
 
     def test_handle_image_bug_reproduction_without_read(self):

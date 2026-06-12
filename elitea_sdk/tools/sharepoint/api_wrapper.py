@@ -87,6 +87,15 @@ ReadDocument = create_model(
         default=None))
 )
 
+ReadFromSharingLink = create_model(
+    "ReadFromSharingLink",
+    sharing_url=(str, Field(
+        description="SharePoint or OneDrive sharing link URL. "
+                    "Accepts personal OneDrive links (company-my.sharepoint.com/:x:/...) "
+                    "and SharePoint site sharing links (company.sharepoint.com/:x:/s/...). "
+                    "The link must be shared as 'Anyone with the link' or with your account.")),
+)
+
 UploadFile = create_model(
     "UploadFile",
     folder_path=(str, Field(
@@ -602,6 +611,29 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.add_attachment_to_list_item(
             list_title, item_id, filepath, filedata, filename, replace)
+
+    def read_file_from_sharing_link(self, sharing_url: str):
+        """Read a file from a SharePoint/OneDrive sharing link.
+
+        Use this tool when you have a sharing link URL to a file (typically from
+        ADO tickets, Jira issues, or shared via email/chat).
+
+        Supported URL formats:
+        - Personal OneDrive: https://company-my.sharepoint.com/:x:/p/user/...
+        - SharePoint sites: https://company.sharepoint.com/:x:/s/site/...
+
+        The link must be shared as 'Anyone with the link' (public) or explicitly
+        shared with your account. Cross-tenant 'specific people' links may require
+        opening in browser first to complete Microsoft's sharing validation.
+
+        Args:
+            sharing_url: Complete sharing link URL
+
+        Returns:
+            Parsed text content of the shared file
+        """
+        self._sync_backend_context()
+        return self._backend.read_file_from_sharing_link(sharing_url=sharing_url)
 
     # ------------------------------------------------------------------ #
     #  OneNote — delegates to backend                                     #
@@ -1286,6 +1318,12 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 "description": self.upload_file.__doc__,
                 "args_schema": UploadFile,
                 "ref": self.upload_file,
+            },
+            {
+                "name": "read_file_from_sharing_link",
+                "description": self.read_file_from_sharing_link.__doc__,
+                "args_schema": ReadFromSharingLink,
+                "ref": self.read_file_from_sharing_link,
             },
             # NOTE: add_attachment_to_list_item is intentionally excluded from available tools.
             # Microsoft Graph API has no endpoint for SharePoint list item attachments (v1.0 or beta),

@@ -15,6 +15,7 @@ from github.Consts import DEFAULT_BASE_URL
 from langchain_core.tools import ToolException
 
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
+from ..utils import normalize_pem_key
 
 from .schemas import (
     GitHubAuthConfig,
@@ -176,17 +177,10 @@ class GitHubClient(BaseModel):
                     password = password.get_secret_value()
                 auth = Auth.Login(auth_config.github_username, password)
             elif auth_config.github_app_id and auth_config.github_app_private_key:
-                # Format the private key correctly
                 private_key = auth_config.github_app_private_key
                 if hasattr(private_key, 'get_secret_value'):
                     private_key = private_key.get_secret_value()
-                header = "-----BEGIN RSA PRIVATE KEY-----"
-                footer = "-----END RSA PRIVATE KEY-----"
-
-                if header not in private_key:
-                    key_body = private_key
-                    body = key_body.replace(" ", "\n")
-                    private_key = f"{header}\n{body}\n{footer}"
+                private_key = normalize_pem_key(private_key)
 
                 auth = Auth.AppAuth(auth_config.github_app_id, private_key)
 

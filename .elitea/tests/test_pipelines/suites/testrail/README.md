@@ -19,8 +19,9 @@ This test suite validates the functionality of the TestRail toolkit, which provi
 | add_file_to_case | test_case_13, test_case_14 | High | ✅ Created (Critical test moved to Artifact suite) |
 | get_suites | test_case_15, test_case_16 | Critical, High | ✅ Created |
 | empty-result regression coverage | test_case_17, test_case_18, test_case_19, test_case_20 | Critical, High | ✅ Created |
+| get_sections | test_case_21, test_case_22 | Critical, High | ✅ Created |
 
-**Total:** 8 tools covered, 19 test files (Critical file attachment test migrated to Artifact suite as ART22)
+**Total:** 9 tools covered, 21 test files (Critical file attachment test migrated to Artifact suite as ART22)
 
 ## Test Scenarios
 
@@ -61,6 +62,10 @@ This test suite validates the functionality of the TestRail toolkit, which provi
 - **TR18** (High): `get_cases` returns empty CSV payload instead of `ToolException` for empty project `11`
 - **TR19** (Critical): `get_cases_by_filter` returns `Extracted data:\n[]` for empty project `11`
 - **TR20** (High): `get_cases_by_filter` with `keys` returns `Extracted data:\n[]` for empty project `11`
+
+### TR21-TR22: get_sections
+- **TR21** (Critical): Retrieve sections for a project in JSON format
+- **TR22** (High): Test markdown output format for sections
 
 ## Setup Artifacts
 
