@@ -91,3 +91,15 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
         self._indexing_stats.items_processed += 1
+
+    def _track_dependent_item_skipped(self, item_name: str):
+        """
+        Track a dependent/child item that failed within a successful parent document.
+
+        Use this for sub-items like individual images in a Figma file or attachments
+        in a Confluence page where the parent document was still indexed successfully.
+        These are tracked separately from top-level skipped items.
+        """
+        if not hasattr(self, '_indexing_stats'):
+            self._init_indexing_stats()
+        self._indexing_stats.dependent_items_skipped.add(item_name)
