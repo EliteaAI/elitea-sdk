@@ -23,6 +23,66 @@ def _hitl_decisions_reducer(current: list | None, update: list | None) -> list:
     return (current or []) + update
 
 
+def _normalize_for_args_match(value: Any) -> Any:
+    """Recursively normalize a value for HITL tool-args equality.
+
+    Handles type drift introduced by JSON round-tripping through LangGraph
+    checkpoints / interrupt payloads:
+
+    * ``int`` and ``float`` are coerced to ``float`` so ``1`` matches ``1.0``.
+    * ``bool`` is preserved (NOT coerced) so ``True`` does not match ``1.0``.
+    * Tuples are normalized as lists.
+    * Dict items with ``None`` values are dropped so a missing key matches an
+      explicit ``None`` (the LLM and the checkpoint commonly disagree on this).
+    * Other primitives are passed through.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        return {
+            k: _normalize_for_args_match(v)
+            for k, v in value.items()
+            if v is not None
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_args_match(v) for v in value]
+    return value
+
+
+def args_match_normalized(args_a: dict, args_b: dict) -> bool:
+    """Compare tool args with semantic equality across JSON round-trips.
+
+    This is shared by HITL resume matchers in both the runtime LLMNode and
+    the graph-level resume orchestrator. Semantic equivalences guaranteed:
+
+    * ``int`` vs ``float`` (e.g. ``1`` vs ``1.0``) — equal.
+    * Dict key ordering — irrelevant.
+    * Missing key vs explicit ``None`` — equal.
+    * Tuple vs list — equal when elements match.
+    * ``bool`` is NOT coerced to numeric — ``True`` does not match ``1``.
+
+    Returns ``False`` for non-JSON-serializable mismatches.
+    """
+    if args_a is args_b:
+        return True
+    if not args_a and not args_b:
+        return True
+    try:
+        norm_a = _normalize_for_args_match(args_a or {})
+        norm_b = _normalize_for_args_match(args_b or {})
+        # Use stable JSON serialization for the comparison: it correctly
+        # distinguishes bool (``true``/``false``) from numerics (``1.0``)
+        # while matching across int/float coercion done above.
+        return (
+            json.dumps(norm_a, sort_keys=True, default=str)
+            == json.dumps(norm_b, sort_keys=True, default=str)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def extract_text_from_completion(completion) -> str:
     """Extract text content from LLM completion, handling both string and list formats.
 

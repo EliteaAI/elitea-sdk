@@ -19,7 +19,11 @@ except ImportError:
     _SCRATCHPAD_KEY = '__pregel_scratchpad'
 
 from ..langchain.constants import ELITEA_RS
-from ..langchain.utils import create_pydantic_model, propagate_the_input_mapping
+from ..langchain.utils import (
+    args_match_normalized,
+    create_pydantic_model,
+    propagate_the_input_mapping,
+)
 from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
 if TYPE_CHECKING:
@@ -38,6 +42,16 @@ BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER = 'This is a continuation turn after the 
 _PENDING_TOOL_MESSAGES: contextvars.ContextVar[list] = contextvars.ContextVar(
     '_pending_tool_messages', default=[],
 )
+
+
+def _args_match_normalized(args_a: dict, args_b: dict) -> bool:
+    """Backwards-compatible alias to :func:`args_match_normalized` in utils.
+
+    Kept for any external callers that imported the leading-underscore name
+    from this module. New code should import ``args_match_normalized`` from
+    ``elitea_sdk.runtime.langchain.utils`` directly.
+    """
+    return args_match_normalized(args_a, args_b)
 
 
 # def _is_thinking_model(llm_client: Any) -> bool:
@@ -1073,6 +1087,17 @@ class LLMNode(BaseTool):
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
 
+        # Count of durable base messages the graph re-supplies on every
+        # resume (the checkpointed state before this node ran, typically
+        # [system, human]).  Captured BEFORE restoring intermediate history so
+        # the pending-capture window in __perform_tool_calling extends back
+        # across the restored region and carries the FULL cumulative tool
+        # history forward to the next interrupt.  Without this, each resume
+        # cycle's pending would contain only that cycle's slice and earlier
+        # executed-tool results would be shed, causing the LLM to re-plan from
+        # scratch and re-invoke already-approved sensitive tools (#5245).
+        _durable_base_count = len(messages)
+
         if hitl_ctx and hitl_ctx.get('pending_messages'):
             from langchain_core.messages.utils import messages_from_dict
 
@@ -1176,17 +1201,46 @@ class LLMNode(BaseTool):
                     n_prior,
                 )
                 for _i in range(n_prior):
-                    _langgraph_interrupt({'__replay_consumer__': True})
+                    try:
+                        _langgraph_interrupt({'__replay_consumer__': True})
+                    except Exception as exc:
+                        logger.warning(
+                            "[HITL] Replay consumer #%d raised %s — stopping "
+                            "replay consumption early (may indicate misaligned "
+                            "checkpoint state)",
+                            _i, exc,
+                        )
+                        break
 
             # Create synthetic AIMessage with the reviewed tool call.
-            completion = AIMessage(
-                content='',
-                tool_calls=[{
-                    'name': hitl_ctx['tool_name'],
-                    'args': hitl_ctx.get('tool_args', {}),
-                    'id': hitl_ctx.get('tool_call_id', 'hitl_resume_call'),
-                }],
-            )
+            #
+            # Anthropic tool-calling turns can carry provider-specific content
+            # blocks (for example thinking, redacted_thinking, or later text
+            # blocks preceding tool_use). Replacing the original tool-calling
+            # AIMessage with ``content=''`` strips that context and can cause
+            # resumed runs to lose continuity. The graph-level resume handler
+            # captures the original AIMessage into
+            # ``hitl_ctx['original_ai_message']``. When its tool_call matches
+            # the resumed tool, reuse it as the completion so the full original
+            # assistant message shape survives the resume. Only fall back to the
+            # empty synthetic AIMessage when the original cannot be reused.
+            completion = self._build_resume_completion(hitl_ctx, messages)
+            if completion is None:
+                # Fallback: preserve content from the original AIMessage when
+                # available.  For Anthropic thinking models, the original
+                # AIMessage carries thinking/redacted_thinking blocks that MUST
+                # be present in the content for the follow-up LLM call to
+                # succeed.  Using content='' causes the API to reject the
+                # request or the LLM to lose context and re-invoke all tools.
+                resume_content = self._extract_original_content_for_resume(hitl_ctx)
+                completion = AIMessage(
+                    content=resume_content,
+                    tool_calls=[{
+                        'name': hitl_ctx['tool_name'],
+                        'args': hitl_ctx.get('tool_args', {}),
+                        'id': hitl_ctx.get('tool_call_id', 'hitl_resume_call'),
+                    }],
+                )
         else:
             completion = llm_client.invoke(messages, config=config)
         logger.info(f"Initial completion: {completion}")
@@ -1195,10 +1249,30 @@ class LLMNode(BaseTool):
         if hasattr(completion, 'tool_calls') and completion.tool_calls:
             # Handle iterative tool-calling and execution
             hitl_decisions = state.get('hitl_decisions') if isinstance(state, dict) else None
+
+            # In nested-application / subgraph flows the persisted
+            # ``hitl_decisions`` lives only in the *parent* state, so the
+            # child LLM node cannot see the user's approve decision via
+            # state.  When the parent injected ``_hitl_resume_context``
+            # with an approve action, mirror it into a local decision so
+            # the auto-approve set covers any sibling sensitive tool_calls
+            # in the reused original AIMessage (issue #4333).
+            if hitl_ctx and hitl_ctx.get('action') == 'approve' and hitl_ctx.get('tool_name'):
+                synth_decision = {
+                    'tool_name': hitl_ctx.get('tool_name', ''),
+                    'toolkit_name': hitl_ctx.get('toolkit_name', ''),
+                    'action': 'approve',
+                }
+                hitl_decisions = list(hitl_decisions or []) + [synth_decision]
+
+            # __perform_tool_calling deduplicates the completion against
+            # `messages` internally (multi-tool sibling HITL resume case),
+            # so we can pass the full `messages` here unconditionally.
             new_messages, current_completion = self._run_async_in_sync_context(
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
+                    pending_capture_base=_durable_base_count,
                 )
             )
 
@@ -1329,7 +1403,220 @@ class LLMNode(BaseTool):
     def _run(self, *args, **kwargs):
         # Legacy support for old interface
         return self.invoke(kwargs, **kwargs)
-    
+
+    @staticmethod
+    def _tool_call_already_completed(tool_call_id: str, messages: list) -> bool:
+        """Return True if `messages` already contains a ToolMessage for ``tool_call_id``.
+
+        Used by ``__perform_tool_calling`` to skip tool_calls whose results
+        survived a HITL round-trip (see issue #4333). Without this, multi-tool
+        sibling cases re-execute non-sensitive tools every time the user
+        approves a sensitive sibling.
+        """
+        if not tool_call_id:
+            return False
+        from langchain_core.messages import ToolMessage
+        for msg in messages:
+            if isinstance(msg, ToolMessage) and getattr(msg, 'tool_call_id', None) == tool_call_id:
+                return True
+        return False
+
+    @staticmethod
+    def _append_completion_dedup(messages: list, completion: AIMessage) -> list:
+        """Append ``completion`` to ``messages`` unless it's already there by identity.
+
+        ``_build_resume_completion`` may return an AIMessage object that is
+        already present in the restored ``messages`` list (the multi-tool
+        sibling HITL resume case where the original AI sits between two
+        ToolMessages). Identity match is sufficient and safe — appending the
+        same object twice would corrupt the conversation, while distinct
+        AIMessage instances (e.g., a fresh deserialization with the same
+        tool_calls) must still be appended.
+        """
+        for msg in messages:
+            if msg is completion:
+                logger.info(
+                    "[HITL] Skipping duplicate AIMessage append "
+                    "(completion already present by identity)."
+                )
+                return messages
+        messages.append(completion)
+        return messages
+
+    @staticmethod
+    def _build_resume_completion(hitl_ctx: dict, messages: list) -> Optional[AIMessage]:
+        """Reuse the original tool-calling AIMessage as the resume completion.
+
+        Anthropic tool-calling turns can carry list-shaped ``content`` with
+        provider-specific blocks such as ``thinking``, ``redacted_thinking``,
+        and plain ``text`` immediately before ``tool_use``. Replacing that
+        original AIMessage with a synthetic ``AIMessage(content='',
+        tool_calls=[...])`` strips the original assistant message shape and can
+        make resumed runs lose continuity.
+
+        This helper deserializes ``hitl_ctx['original_ai_message']`` (captured at
+        interrupt time by the graph-level resume handler) and returns it when:
+            * a tool_call on the message matches the approved tool name + args, AND
+            * the original AIMessage carries meaningful assistant content that
+            would otherwise be lost (structured list content, or a non-empty
+            string), AND
+            * the same message is not already present in ``messages`` (which would
+            duplicate it for the multi-tool sibling case where ``_trim`` keeps
+            the AI in the restored history).
+
+        It also rewrites ``hitl_ctx['tool_call_id']`` to the original tool_call id
+        so the downstream ``ToolMessage`` uses a matching id.
+
+        Returns ``None`` to indicate that the caller should fall back to the
+        empty synthetic AIMessage (current behavior).
+        """
+        if not isinstance(hitl_ctx, dict):
+            return None
+        original_dict = hitl_ctx.get('original_ai_message')
+        if not isinstance(original_dict, dict):
+            return None
+
+        try:
+            from langchain_core.messages.utils import messages_from_dict
+            restored = messages_from_dict([original_dict])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[HITL] Failed to deserialize original AIMessage for resume: %s", exc,
+            )
+            return None
+        if not restored or not isinstance(restored[0], AIMessage):
+            return None
+
+        original_ai: AIMessage = restored[0]
+        # Always reuse the original AIMessage when a tool_call matches.  Even
+        # for non-thinking models with empty ``content``, the original carries
+        # the canonical tool_call ids that downstream sibling-skip logic
+        # (``_tool_call_already_completed``) relies on. Replacing it with a
+        # synthetic AIMessage that uses fresh UUIDs makes those ids drift, so
+        # if the LLM re-emits the original batch on the next iteration, the
+        # already-completed siblings cannot be matched and re-execute.
+        # (Issue #4333.)
+
+        target_tool = hitl_ctx.get('tool_name', '')
+        target_args = hitl_ctx.get('tool_args', {}) or {}
+        matching_tc = None
+        for tc in (original_ai.tool_calls or []):
+            tc_name = tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')
+            tc_args = tc.get('args', {}) if isinstance(tc, dict) else getattr(tc, 'args', {})
+            if tc_name == target_tool and args_match_normalized(tc_args, target_args):
+                matching_tc = tc
+                break
+        if matching_tc is None:
+            # Fallback: match by tool name only when there's exactly one
+            # tool_call with that name.  After JSON round-trip through the
+            # checkpoint, nested args can diverge (int vs float, key order).
+            name_matches = [
+                tc for tc in (original_ai.tool_calls or [])
+                if (tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')) == target_tool
+            ]
+            if len(name_matches) == 1:
+                matching_tc = name_matches[0]
+                logger.info(
+                    "[HITL] Matched original AIMessage tool_call by name-only "
+                    "fallback (tool=%s) — args comparison failed after JSON round-trip",
+                    target_tool,
+                )
+            else:
+                return None
+
+        original_tc_id = (
+            matching_tc.get('id', '') if isinstance(matching_tc, dict)
+            else getattr(matching_tc, 'id', '')
+        )
+
+        # If an AIMessage carrying the same tool_call id is already present
+        # in the restored history (multi-tool sibling case), reuse it as the
+        # completion. ``_append_completion_dedup`` in ``__perform_tool_calling``
+        # will skip the duplicate append, and ``_tool_call_already_completed``
+        # will skip re-executing siblings whose ToolMessage is already there.
+        # See issue #4333.
+        if original_tc_id:
+            for m in messages:
+                if isinstance(m, AIMessage):
+                    for tc in (m.tool_calls or []):
+                        existing_id = (
+                            tc.get('id', '') if isinstance(tc, dict)
+                            else getattr(tc, 'id', '')
+                        )
+                        if existing_id and existing_id == original_tc_id:
+                            hitl_ctx['tool_call_id'] = original_tc_id
+                            logger.info(
+                                "[HITL] Original AIMessage already present in "
+                                "restored history (tool_call_id=%s); reusing it "
+                                "as the resume completion.",
+                                original_tc_id,
+                            )
+                            return m
+
+        if original_tc_id:
+            hitl_ctx['tool_call_id'] = original_tc_id
+
+        content = original_ai.content
+        if isinstance(content, list):
+            content_kinds = []
+            for block in content:
+                if isinstance(block, dict):
+                    content_kinds.append(str(block.get('type', '<missing>')))
+                elif hasattr(block, 'type'):
+                    content_kinds.append(str(getattr(block, 'type', '<missing>')))
+                else:
+                    content_kinds.append(type(block).__name__)
+            content_shape = '[' + ','.join(content_kinds) + ']'
+        else:
+            content_shape = type(content).__name__
+
+        logger.info(
+            "[HITL] Reusing original AIMessage as resume completion "
+            "(tool=%s, tool_call_id=%s, content_shape=%s) — preserves the "
+            "original assistant message across resume",
+            target_tool,
+            original_tc_id or '<missing>',
+            content_shape,
+        )
+        return original_ai
+
+    @staticmethod
+    def _extract_original_content_for_resume(hitl_ctx: dict) -> Any:
+        """Extract content from original_ai_message for fallback synthetic AIMessage.
+
+        When ``_build_resume_completion`` returns None (e.g., args mismatch after
+        JSON round-trip), we still want to preserve the original AIMessage's
+        content in the synthetic completion.  For Anthropic thinking models, the
+        content is a list carrying ``thinking``/``redacted_thinking`` blocks that
+        MUST be present for the follow-up LLM call to succeed.
+
+        Without this, the synthetic AIMessage gets ``content=''`` which causes:
+        - Anthropic API to reject the request with a thinking-block format error, OR
+        - The LLM to lose context and re-plan from scratch (re-invoking all tools)
+
+        Returns:
+            The original content (list for thinking models, '' otherwise).
+        """
+        original_dict = hitl_ctx.get('original_ai_message') if isinstance(hitl_ctx, dict) else None
+        if not isinstance(original_dict, dict):
+            return ''
+        data = original_dict.get('data')
+        if isinstance(data, dict):
+            content = data.get('content', '')
+        else:
+            content = original_dict.get('content', '')
+        # Only preserve list content (which indicates structured blocks like
+        # thinking/redacted_thinking/text). Simple string content doesn't need
+        # special handling since content='' works fine for non-thinking models.
+        if isinstance(content, list) and content:
+            logger.info(
+                "[HITL] Preserving original AIMessage content (%d blocks) in "
+                "synthetic completion for thinking-model compatibility",
+                len(content),
+            )
+            return content
+        return ''
+
     @staticmethod
     def _extract_content_from_completion(completion) -> dict:
         """Extract thinking and text content from LLM completion.
@@ -1533,15 +1820,10 @@ class LLMNode(BaseTool):
         # Legacy async support
         return self.invoke(kwargs, **kwargs)
 
-    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None):
+    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
+                                     pending_capture_base=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
-
-        # Lazy import to avoid circular dependency (sensitive_tool_guard -> tools.application)
-        from ..middleware.sensitive_tool_guard import (
-            set_hitl_approved_tools,
-            reset_hitl_approved_tools,
-        )
 
         # Extract historically blocked tools from state-persisted HITL decisions.
         # These survive across checkpoint resumes and prevent the LLM from
@@ -1556,25 +1838,35 @@ class LLMNode(BaseTool):
                 ', '.join(sorted(_historically_blocked)),
             )
 
-        # Build set of tool names previously approved by the user.
-        # Used to auto-approve tools in the guard on iterations *after*
-        # the first one (the first must consume the checkpoint replay value).
-        # Uses qualified identity (toolkit_name.tool_name) so that approving
-        # e.g. jira.create_issue does NOT auto-approve github.create_issue.
-        _approved_tool_names: set[str] = set()
-        for decision in (hitl_decisions or []):
-            if decision.get('action') == 'approve' and decision.get('tool_name'):
-                _approved_tool_names.add(qualified_tool_identity(
-                    decision['tool_name'], decision.get('toolkit_name'),
-                ))
-        _approved_token = None
-
-        new_messages = messages + [completion]
+        new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
 
         # Track the number of input messages so we can compute intermediate
         # messages produced during this execution (for HITL checkpoint restore).
         _input_msg_count = len(messages)
+
+        # Index of the tool-calling AIMessage in ``new_messages``.  When the
+        # completion was deduplicated against ``messages`` (multi-tool sibling
+        # HITL resume case), this points to the existing AIMessage so the
+        # captured pending_messages always include the AIMessage that owns the
+        # tool_calls — without it, the restored ToolMessages would be orphaned
+        # and stripped by ``_filter_orphaned_tool_calls`` on the next resume.
+        try:
+            _completion_index = new_messages.index(completion)
+        except ValueError:
+            _completion_index = _input_msg_count
+        _pending_capture_start = min(_completion_index, _input_msg_count)
+
+        # On an HITL resume, ``messages`` already has prior-cycle tool history
+        # appended (restored from the previous interrupt's pending_messages),
+        # so ``_input_msg_count`` sits PAST that region.  Anchor the capture
+        # window at the durable checkpoint base instead, so the pending we hand
+        # to the next interrupt is the FULL cumulative history — not just this
+        # cycle's slice.  Otherwise earlier executed-tool results are shed on
+        # each resume and the LLM re-plans from scratch, re-invoking
+        # already-approved sensitive tools (#5245).
+        if pending_capture_base is not None:
+            _pending_capture_start = min(_pending_capture_start, pending_capture_base)
 
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
@@ -1609,6 +1901,21 @@ class LLMNode(BaseTool):
                                                                                                   {})
                 tool_call_id = tool_call.get('id', '') if isinstance(tool_call, dict) else getattr(
                     tool_call, 'id', '')
+
+                # HITL resume safety: skip any tool_call whose id already has a
+                # corresponding ToolMessage in the conversation history. This
+                # prevents already-completed sibling tools from being re-executed
+                # when the original AIMessage (with multiple tool_calls) is
+                # reused as the resume completion. See issue #4333.
+                if tool_call_id and self._tool_call_already_completed(
+                    tool_call_id, new_messages,
+                ):
+                    logger.info(
+                        "[HITL] Skipping tool_call '%s' (id=%s) — ToolMessage "
+                        "already present in history (sibling already completed).",
+                        tool_name, tool_call_id,
+                    )
+                    continue
 
                 # Find the tool in filtered tools
                 # Pass config to ensure dynamically selected tools are available
@@ -1649,7 +1956,7 @@ class LLMNode(BaseTool):
                         # the tool.  If the tool triggers a sensitive-tool interrupt,
                         # the guard reads this contextvar so the messages survive the
                         # checkpoint and can be restored on resume.
-                        _PENDING_TOOL_MESSAGES.set(list(new_messages[_input_msg_count:]))
+                        _PENDING_TOOL_MESSAGES.set(list(new_messages[_pending_capture_start:]))
 
                         # Try async invoke first (for MCP tools), fallback to sync
                         tool_result = None
@@ -1724,11 +2031,6 @@ class LLMNode(BaseTool):
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
                         # signals must propagate to the graph executor.
-                        # Reset auto-approve context before propagating.
-                        # NOTE: _PENDING_TOOL_MESSAGES was set right before invoke
-                        # and already consumed by the middleware's interrupt() call.
-                        if _approved_token is not None:
-                            reset_hitl_approved_tools(_approved_token)
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
                     except McpAuthorizationRequired:
@@ -1759,13 +2061,6 @@ class LLMNode(BaseTool):
                         tool_call_id=tool_call_id
                     )
                     new_messages.append(tool_message)
-
-            # After the first iteration's tool calls are processed, activate
-            # auto-approve for tools the user already authorized.  We wait
-            # until now so the guard's interrupt() in the first iteration can
-            # consume the checkpoint replay value correctly.
-            if _approved_tool_names and _approved_token is None:
-                _approved_token = set_hitl_approved_tools(_approved_tool_names)
 
             # Call LLM again with tool results to get next response
             try:
@@ -1870,9 +2165,6 @@ class LLMNode(BaseTool):
             except GraphBubbleUp:
                 # Preserve GraphInterrupt and related graph-level signals raised
                 # anywhere in the tool iteration, including async-to-sync fallback.
-                # Reset auto-approve context before propagating.
-                if _approved_token is not None:
-                    reset_hitl_approved_tools(_approved_token)
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
@@ -2085,11 +2377,6 @@ class LLMNode(BaseTool):
                     error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
                     new_messages.append(AIMessage(content=error_msg))
                     break
-
-        # Reset auto-approve context on normal loop exit.
-        # GraphBubbleUp paths handle their own cleanup above.
-        if _approved_token is not None:
-            reset_hitl_approved_tools(_approved_token)
 
         # Handle max iterations
         if iteration >= self.steps_limit:
