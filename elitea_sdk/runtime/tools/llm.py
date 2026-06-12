@@ -2382,6 +2382,14 @@ class LLMNode(BaseTool):
                 or meta.get('display_name')
                 or app_name
             )
+            # Child identity for pylon_main to launch a standalone indexer_agent
+            # task. ``args_runnable`` is how the in-process path recreates the
+            # child (toolkits/application.py:187); the id/version + already-fetched
+            # version_details make the spec self-sufficient so pylon_main need not
+            # re-resolve the sub-agent. version_details is a plain dict (JSON-safe);
+            # the live ``llm``/``memory`` objects in args_runnable are intentionally
+            # NOT carried — the child re-resolves those from the parent's payload.
+            runnable = getattr(tool, 'args_runnable', None) or {}
             specs[tool_call_id] = {
                 'tool_call_id': tool_call_id,
                 'name': app_name,
@@ -2389,6 +2397,10 @@ class LLMNode(BaseTool):
                 'input': tool_args,
                 'child_thread_id': child_thread_id,
                 'index': index,
+                'application_id': runnable.get('application_id'),
+                'application_version_id': runnable.get('application_version_id'),
+                'version_details': runnable.get('version_details'),
+                'variable_defaults': getattr(tool, 'variable_defaults', None) or {},
             }
         return specs
 
