@@ -2390,7 +2390,7 @@ class LLMNode(BaseTool):
             # the live ``llm``/``memory`` objects in args_runnable are intentionally
             # NOT carried — the child re-resolves those from the parent's payload.
             runnable = getattr(tool, 'args_runnable', None) or {}
-            specs[tool_call_id] = {
+            specs[tool_call_id] = self._jsonsafe_spec({
                 'tool_call_id': tool_call_id,
                 'name': app_name,
                 'display_name': display_name,
@@ -2401,8 +2401,30 @@ class LLMNode(BaseTool):
                 'application_version_id': runnable.get('application_version_id'),
                 'version_details': runnable.get('version_details'),
                 'variable_defaults': getattr(tool, 'variable_defaults', None) or {},
-            }
+            })
         return specs
+
+    @staticmethod
+    def _jsonsafe_spec(spec: dict) -> dict:
+        """Deep-coerce a dispatch spec to plain JSON, dropping non-serialisable leaves.
+
+        The spec is written to the ``parallel_tasks`` checkpoint channel and then
+        RPC'd to pylon_main, so it MUST be msgpack/JSON-safe. ``input`` (LLM
+        tool_args, whose schema allows ``chat_history: list[BaseMessage]``) and
+        the nested ``version_details`` dict can carry live objects (BaseMessage,
+        an ``EliteAClient`` reference). A non-serialisable leaf becomes ``None``;
+        dict/list structure and JSON scalars — everything reconcile reads back
+        (``version_details.llm_settings``/``meta``/``variables``) — are preserved.
+        """
+        def _coerce(value):
+            if isinstance(value, dict):
+                return {k: _coerce(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_coerce(v) for v in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return None
+        return _coerce(spec)
 
     async def _run_parallel_application_calls(
         self, app_specs, new_messages, config, hitl_decisions=None,
