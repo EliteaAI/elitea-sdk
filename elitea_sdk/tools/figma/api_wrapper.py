@@ -1,13 +1,20 @@
 import functools
 import json
 import logging
+import math
+import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Generator, Optional, Union
+from pathlib import Path
+from typing import Callable, ClassVar, Dict, List, Generator, Literal, Optional, Tuple, TypeVar, Union
 from urllib.parse import urlparse, parse_qs
 
 import requests
+
+T = TypeVar('T')
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import Field, PrivateAttr, create_model, model_validator, SecretStr
@@ -66,6 +73,11 @@ from .toon_tools import (
     infer_cta_destination,
     FrameDetailTOONSchema,
     AnalyzeFileSchema,
+    analyze_frame_with_llm,
+    analyze_flows_with_llm,
+    analyze_file_with_llm,
+    serialize_flow_analysis,
+    serialize_design_analysis,
 )
 from .chunking_strategy import (
     BisectionChunkingStrategy,
@@ -304,6 +316,15 @@ class ArgsSchema(Enum):
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
+    # Threshold for subframe extraction: frames larger than this will have their
+    # children extracted for better image quality instead of rendering the whole frame
+    SUBFRAME_EXTRACT_THRESHOLD: ClassVar[int] = 15000
+
+    # Max dimension for scaling images to fit Claude's 8000px limit.
+    # Set to 7800 (not 8000) because Figma API sometimes returns images slightly
+    # larger than requested due to rounding, and Claude rejects images >8000px.
+    SCALE_TO_LIMIT_THRESHOLD: ClassVar[int] = 7800
+
     token: Optional[SecretStr] = Field(default=None)
     oauth2: Optional[SecretStr] = Field(default=None)
     global_limit: Optional[int] = Field(default=GLOBAL_LIMIT)
@@ -385,6 +406,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             'number_of_threads_override', # Internal concurrency setting
             'figma_nodes_include',       # Already processed during loading
             'figma_nodes_exclude',       # Already processed during loading
+            'image_max_dimension',       # Adaptive scaling setting
+            'frame_spatial_order',       # Spatial ordering setting
         ]
         return base_keys + figma_keys
 
@@ -396,6 +419,9 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_types_include: Optional[List[str]] = None,
         node_types_exclude: Optional[List[str]] = None,
         number_of_threads: Optional[int] = None,
+        index_granularity: Optional[Literal['node', 'toon']] = None,
+        image_max_dimension: Optional[int] = None,
+        frame_spatial_order: Optional[bool] = None,
         **kwargs,
     ) -> Generator[Document, None, None]:
         """Base loader used by the indexer tool.
@@ -416,6 +442,10 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 is not provided.
             number_of_threads: Optional override for number of worker threads to use when
                 processing images.
+            image_max_dimension: Maximum image dimension in pixels for LLM analysis.
+                Images are scaled down to fit this limit. Default: 2000.
+            frame_spatial_order: When True, processes frames in spatial order (top-to-bottom,
+                left-to-right). Default: True.
         """
         self._init_indexing_stats()
         if not urls_or_file_keys:
@@ -472,6 +502,9 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 'figma_pages_exclude': node_ids_exclude or [],
                 'figma_nodes_include': node_types_include or [],
                 'figma_nodes_exclude': node_types_exclude or [],
+                'index_granularity': index_granularity or 'node',
+                'image_max_dimension': image_max_dimension if image_max_dimension is not None else 2000,
+                'frame_spatial_order': frame_spatial_order if frame_spatial_order is not None else True,
             }
 
             if metadata_threads_override is not None:
@@ -588,9 +621,9 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"{len(chunk_result.failed)} failed"
         )
 
-        # Track failed pages
+        # Track failed pages as dependent items (parent file still gets indexed)
         for page_id in chunk_result.failed:
-            self._track_runtime_skipped(f"{file_key}/{page_id}", reason="error")
+            self._track_dependent_item_skipped(f"{file_key}/{page_id}")
 
         # Return page content in order (preserve original order where possible)
         pages = []
@@ -612,47 +645,45 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         """Download and process a single Figma image node.
         This helper is used by `_process_document` (optionally in parallel via threads).
         """
-        # Build item name for tracking: file_key/page_id/node_id
+        log = logging.getLogger(__name__)
         item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
 
         if not image_url:
-            logging.warning(f"Image URL not found for node_id {node_id} in file {file_key}. Skipping.")
-            self._track_skipped_file_read_error(item_name)
+            log.debug(f"No image URL for node {node_id}")
+            self._track_dependent_item_skipped(item_name)
             return None
 
-        logging.info(f"File {file_key}: downloading image node {node_id}.")
-
         try:
-            response = requests.get(image_url)
+            response = requests.get(image_url, timeout=60)
         except Exception as exc:
-            logging.warning(f"Failed to download image for node {node_id} in file {file_key}: {exc}")
-            self._track_skipped_file_read_error(item_name)
+            log.warning(f"Download failed for node {node_id}: {exc}")
+            self._track_dependent_item_skipped(item_name)
             return None
 
         if response.status_code != 200:
-            logging.warning(
-                f"Unexpected status code {response.status_code} when downloading image "
-                f"for node {node_id} in file {file_key}."
-            )
-            self._track_skipped_file_read_error(item_name)
+            log.debug(f"Unexpected status code {response.status_code} for node {node_id}")
+            self._track_dependent_item_skipped(item_name)
             return None
 
         content_type = response.headers.get('Content-Type', '')
+
         if 'text/html' in content_type.lower():
-            logging.warning(f"Received HTML instead of image content for node {node_id} in file {file_key}.")
-            self._track_skipped_file_read_error(item_name)
+            log.debug(f"Received HTML instead of image for node {node_id}")
+            self._track_dependent_item_skipped(item_name)
             return None
 
-        extension = (f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.txt')
-        logging.info(f"File {file_key}: processing image node {node_id}.")
-        page_content = _load_content_from_bytes_with_prompt(
-            file_content=response.content,
-            extension=extension,
-            llm=self.llm,
-            prompt=prompt,
-        )
-
-        logging.info(f"File {file_key}: finished image node {node_id}.")
+        extension = (f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.png')
+        try:
+            page_content = _load_content_from_bytes_with_prompt(
+                file_content=response.content,
+                extension=extension,
+                llm=self.llm,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            log.warning(f"LLM processing failed for node {node_id}: {exc}")
+            self._track_dependent_item_skipped(item_name)
+            return None
 
         return Document(
             page_content=page_content,
@@ -665,6 +696,59 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 'type': 'image',
             },
         )
+
+    def _describe_image(
+        self,
+        image_url: str,
+        prompt: str,
+        node_id: str = "",
+    ) -> Optional[str]:
+        """
+        Download an image from URL and describe it using the LLM.
+
+        Args:
+            image_url: URL to download the image from
+            prompt: Prompt to guide the LLM's image description
+            node_id: Node ID for logging
+
+        Returns:
+            LLM-generated description of the image, or None if processing fails
+        """
+        log = logging.getLogger(__name__)
+
+        if not image_url:
+            return None
+
+        if not self.llm:
+            return None
+
+        try:
+            response = requests.get(image_url, timeout=60)
+        except Exception as exc:
+            log.warning(f"Download failed for node {node_id}: {exc}")
+            return None
+
+        if response.status_code != 200:
+            return None
+
+        content_type = response.headers.get('Content-Type', '')
+
+        if 'text/html' in content_type.lower():
+            return None
+
+        extension = f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.png'
+
+        try:
+            description = _load_content_from_bytes_with_prompt(
+                file_content=response.content,
+                extension=extension,
+                llm=self.llm,
+                prompt=prompt,
+            )
+            return description
+        except Exception as exc:
+            log.warning(f"LLM processing failed for node {node_id}: {exc}")
+            return None
 
     def _is_volume_error(self, e: Exception) -> bool:
         """
@@ -711,6 +795,745 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         return False
 
+    def _is_retriable_server_error(self, e: Exception) -> bool:
+        """
+        Check if error is a transient server error (5xx) that should be retried.
+
+        Args:
+            e: Exception to check
+
+        Returns:
+            True if error is a 5xx server error, False otherwise
+        """
+        error_str = str(e).lower()
+        # 500-level errors are typically transient
+        if any(f"{code}" in str(e) for code in [500, 502, 503, 504]):
+            return True
+        if "internal" in error_str and "error" in error_str:
+            return True
+        if "service unavailable" in error_str:
+            return True
+        if "gateway" in error_str and ("timeout" in error_str or "bad" in error_str):
+            return True
+        return False
+
+    def _retry_with_backoff(
+        self,
+        func: Callable[[], T],
+        max_retries: int = 3,
+        initial_delay: float = 1.0,
+        backoff_factor: float = 2.0,
+        max_delay: float = 30.0,
+        retriable_check: Optional[Callable[[Exception], bool]] = None,
+        operation_name: str = "operation",
+        logger: Optional[logging.Logger] = None,
+    ) -> T:
+        """
+        Execute a function with exponential backoff retry for transient errors.
+
+        Args:
+            func: Function to execute (should take no arguments)
+            max_retries: Maximum number of retry attempts (default 3)
+            initial_delay: Initial delay in seconds before first retry (default 1.0)
+            backoff_factor: Multiplier for delay after each retry (default 2.0)
+            max_delay: Maximum delay in seconds (default 30.0)
+            retriable_check: Function to check if exception should be retried
+            operation_name: Name of operation for logging
+            logger: Logger to use (falls back to module logger)
+
+        Returns:
+            Result of successful function call
+
+        Raises:
+            Last exception if all retries exhausted
+        """
+        log = logger or logging.getLogger(__name__)
+        if retriable_check is None:
+            retriable_check = self._is_retriable_server_error
+
+        last_exception: Optional[Exception] = None
+        delay = initial_delay
+
+        for attempt in range(max_retries + 1):
+            try:
+                return func()
+            except Exception as e:
+                last_exception = e
+
+                # Check if this is a retriable error
+                if not retriable_check(e):
+                    log.debug(f"{operation_name}: Non-retriable error, raising immediately: {e}")
+                    raise
+
+                # Check if we have retries left
+                if attempt >= max_retries:
+                    log.warning(
+                        f"{operation_name}: All {max_retries} retries exhausted. Last error: {e}"
+                    )
+                    raise
+
+                # Log and wait before retry
+                log.info(
+                    f"{operation_name}: Attempt {attempt + 1}/{max_retries + 1} failed with "
+                    f"retriable error: {e}. Retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+
+                # Increase delay for next retry (exponential backoff)
+                delay = min(delay * backoff_factor, max_delay)
+
+        # Should never reach here, but just in case
+        if last_exception:
+            raise last_exception
+        raise RuntimeError(f"{operation_name}: Unexpected retry loop exit")
+
+    def _calculate_optimal_scale(
+        self,
+        width: float,
+        height: float,
+        target_max_dimension: int = 2000,
+    ) -> float:
+        """
+        Calculate optimal scale to keep image dimensions within target.
+
+        Figma API supports scale from 0.01 to 4.0. This method calculates
+        the scale needed to ensure the largest dimension doesn't exceed
+        the target, while staying within Figma's bounds.
+
+        Args:
+            width: Original width in pixels
+            height: Original height in pixels
+            target_max_dimension: Target maximum for either dimension (default 2000)
+
+        Returns:
+            Scale factor between 0.01 and 4.0 (Figma API limits)
+        """
+        if width <= 0 or height <= 0:
+            return 1.0
+
+        max_dim = max(width, height)
+        if max_dim <= target_max_dimension:
+            return 1.0  # No scaling needed
+
+        optimal_scale = target_max_dimension / max_dim
+        # Clamp to Figma API bounds (0.01 to 4.0)
+        return max(0.01, min(optimal_scale, 4.0))
+
+    def _sort_frames_spatially(
+        self,
+        frames: List[Dict],
+    ) -> List[Dict]:
+        """
+        Sort frames by spatial position: top-to-bottom, then left-to-right.
+
+        This preserves the visual reading order of UI components, which is
+        important for LLM analysis to understand the flow of a design.
+
+        The y-coordinate is rounded to the nearest 50px to group frames
+        that are roughly on the same "row" together.
+
+        Args:
+            frames: List of frame dicts with 'bounds' containing x, y coordinates
+
+        Returns:
+            Sorted list of frames in spatial reading order
+        """
+        def sort_key(frame: Dict) -> Tuple[float, float]:
+            bounds = frame.get('bounds', {})
+            y = bounds.get('y', 0)
+            x = bounds.get('x', 0)
+            # Round y to nearest 50px to group frames on same "row"
+            y_rounded = round(y / 50) * 50
+            return (y_rounded, x)
+
+        return sorted(frames, key=sort_key)
+
+    def _get_large_frame_strategy(
+        self,
+        width: float,
+        height: float,
+        scale_threshold: Optional[int] = None,
+        extract_threshold: Optional[int] = None,
+    ) -> str:
+        """
+        Determine the strategy for handling a large frame.
+
+        Strategies:
+        - 'normal': Frame fits within limits, use adaptive scaling
+        - 'scale_to_limit': Frame is 7800-15000px, scale down to fit Claude's 8000px limit
+        - 'extract_subframes': Frame is >15000px, extract children for better quality
+
+        Args:
+            width: Frame width in pixels
+            height: Frame height in pixels
+            scale_threshold: Max dimension for normal processing (default SCALE_TO_LIMIT_THRESHOLD)
+            extract_threshold: Above this, extract subframes (default SUBFRAME_EXTRACT_THRESHOLD)
+
+        Returns:
+            Strategy string: 'normal', 'scale_to_limit', or 'extract_subframes'
+        """
+        if scale_threshold is None:
+            scale_threshold = self.SCALE_TO_LIMIT_THRESHOLD
+        if extract_threshold is None:
+            extract_threshold = self.SUBFRAME_EXTRACT_THRESHOLD
+
+        if width <= 0 or height <= 0:
+            return 'normal'
+
+        max_dim = max(width, height)
+
+        if max_dim <= scale_threshold:
+            return 'normal'
+        elif max_dim <= extract_threshold:
+            return 'scale_to_limit'
+        else:
+            return 'extract_subframes'
+
+    def _extract_subframes(
+        self,
+        file_key: str,
+        parent_node_id: str,
+        parent_info: Dict,
+        scale_threshold: Optional[int] = None,
+        extract_threshold: Optional[int] = None,
+        debug_logger: Optional[logging.Logger] = None,
+    ) -> List[Dict]:
+        """
+        Extract child frames from a large parent frame for individual processing.
+
+        When a frame is too large (>SUBFRAME_EXTRACT_THRESHOLD) to render at good quality,
+        we fetch its children and process them individually. This preserves semantic context
+        (each child is a meaningful UI element) while allowing higher quality rendering.
+
+        Args:
+            file_key: Figma file key
+            parent_node_id: ID of the large parent frame
+            parent_info: Parent frame metadata dict
+            scale_threshold: Max dimension for normal processing (default SCALE_TO_LIMIT_THRESHOLD)
+            extract_threshold: Above this, extract subframes (default SUBFRAME_EXTRACT_THRESHOLD)
+            debug_logger: Optional logger for debug output
+
+        Returns:
+            List of frame_info dicts for each child, similar to frames_to_process format.
+            Each child has a 'strategy' field indicating how it should be processed.
+        """
+        if scale_threshold is None:
+            scale_threshold = self.SCALE_TO_LIMIT_THRESHOLD
+        if extract_threshold is None:
+            extract_threshold = self.SUBFRAME_EXTRACT_THRESHOLD
+
+        log = debug_logger or logging.getLogger(__name__)
+        parent_name = parent_info.get('node_name', parent_node_id)
+
+        log.info(f"    Extracting subframes from '{parent_name}' ({parent_node_id})...")
+
+        try:
+            # Fetch the parent node with its children
+            nodes_data = self._get_file_nodes(file_key, parent_node_id)
+            if not nodes_data or 'nodes' not in nodes_data:
+                log.warning(f"    Failed to fetch children for {parent_node_id}")
+                return []
+
+            parent_node = nodes_data['nodes'].get(parent_node_id, {}).get('document', {})
+            children = parent_node.get('children', [])
+
+            if not children:
+                log.info(f"    No children found in '{parent_name}'")
+                return []
+
+            log.info(f"    Found {len(children)} children in '{parent_name}'")
+
+            subframes = []
+            for child in children:
+                child_id = child.get('id')
+                child_name = child.get('name', '')
+                child_type = child.get('type', '').lower()
+
+                if not child_id:
+                    continue
+
+                # Extract bounds
+                bounds = child.get('absoluteBoundingBox', {})
+                width = bounds.get('width', 0)
+                height = bounds.get('height', 0)
+                x = bounds.get('x', 0)
+                y = bounds.get('y', 0)
+
+                # Skip if no dimensions
+                if width <= 0 or height <= 0:
+                    continue
+
+                # Collect text from this child recursively
+                texts = self.get_texts_recursive(child)
+
+                # Skip vectors with no text content - they're just connectors/arrows
+                # The connection info is typically in the name (e.g., "CTA --> content")
+                is_vector = child_type in ('vector', 'line', 'arrow')
+                if is_vector and not texts:
+                    # Extract connection info from name if present (format: "source --> target")
+                    if ' --> ' in child_name:
+                        log.info(
+                            f"      SKIP connector: {child_name} ({child_id}) - {child_type}, "
+                            f"size: {width:.0f}x{height:.0f} (no text content)"
+                        )
+                    else:
+                        log.info(
+                            f"      SKIP vector: {child_name} ({child_id}) - {child_type}, "
+                            f"size: {width:.0f}x{height:.0f} (no text content)"
+                        )
+                    continue
+
+                # Text nodes: no image needed, just text extraction
+                is_text_node = child_type == 'text'
+
+                # Determine strategy for this child (only relevant for non-text nodes)
+                if is_text_node:
+                    strategy = 'text_only'
+                else:
+                    strategy = self._get_large_frame_strategy(
+                        width, height, scale_threshold, extract_threshold
+                    )
+
+                subframe_info = {
+                    'node_id': child_id,
+                    'node_name': child_name,
+                    'node_type': child_type,
+                    'page_id': parent_info.get('page_id', ''),
+                    'page_name': parent_info.get('page_name', ''),
+                    'parent_frame_id': parent_node_id,
+                    'parent_frame_name': parent_name,
+                    'texts': texts,
+                    'has_image': not is_text_node,  # Text nodes don't need image
+                    'bounds': {
+                        'x': x,
+                        'y': y,
+                        'width': width,
+                        'height': height,
+                    },
+                    'is_subframe': True,  # Mark as extracted subframe
+                    'strategy': strategy,  # 'normal', 'scale_to_limit', 'extract_subframes', or 'text_only'
+                    'node': child,  # Preserve original Figma node for TOON processing
+                }
+
+                subframes.append(subframe_info)
+
+                log.info(
+                    f"      Child: {child_name} ({child_id}) - {child_type}, "
+                    f"size: {width:.0f}x{height:.0f}, strategy: {strategy}, texts: {len(texts)}"
+                )
+
+            return subframes
+
+        except Exception as e:
+            log.warning(f"    Error extracting subframes from {parent_node_id}: {e}")
+            return []
+
+    def _collect_frames_for_analysis(
+        self,
+        file_key: str,
+        pages: List[Dict],
+        max_frames: int = 50,
+        debug_logger: Optional[logging.Logger] = None,
+    ) -> Tuple[List[Dict], Dict[str, str]]:
+        """
+        Collect frames with subframe extraction and compute scaled image URLs.
+
+        This method applies frame-level optimizations for analyze_file:
+        - Subframe extraction for large frames (>15000px)
+        - Adaptive scaling for images
+        - Vector/connector skipping
+        - Spatial ordering
+
+        Args:
+            file_key: Figma file key
+            pages: List of page nodes to process
+            max_frames: Maximum frames to collect (default 50)
+            debug_logger: Optional logger for debug output
+
+        Returns:
+            Tuple of:
+            - frames_list: List of frame dicts with nesting preserved (subframes field)
+            - image_urls_dict: {frame_id: image_url} for all frames needing images
+        """
+        log = debug_logger or logging.getLogger(__name__)
+        log.info("=" * 40)
+        log.info("Collecting frames with optimizations for analysis")
+        log.info("=" * 40)
+
+        all_frames: List[Dict] = []
+        scale_groups: Dict[str, List[str]] = {}  # scale_str -> [node_ids]
+        frame_scales: Dict[str, float] = {}  # node_id -> scale
+
+        scale_threshold = self.SCALE_TO_LIMIT_THRESHOLD
+        extract_threshold = self.SUBFRAME_EXTRACT_THRESHOLD
+        log.info(f"Scale threshold: {scale_threshold}px, Extract threshold: {extract_threshold}px")
+
+        def add_to_scale_group(node_id: str, scale: float):
+            """Helper to add a frame to scale groups for batch fetching."""
+            frame_scales[node_id] = scale
+            scale_str = f"{scale:.2f}"
+            if scale_str not in scale_groups:
+                scale_groups[scale_str] = []
+            scale_groups[scale_str].append(node_id)
+
+        # Phase 1: Collect frames from all pages
+        for page in pages:
+            page_id = page.get('id', '')
+            page_name = page.get('name', '')
+            children = page.get('children', [])
+
+            log.info(f"Page: {page_name} ({page_id}), children: {len(children)}")
+
+            for node in children:
+                node_type = node.get('type', '').lower()
+                node_id = node.get('id')
+                node_name = node.get('name', '')
+
+                if not node_id:
+                    continue
+
+                # Extract bounds
+                bounds = node.get('absoluteBoundingBox', {})
+                width = bounds.get('width', 0)
+                height = bounds.get('height', 0)
+                x = bounds.get('x', 0)
+                y = bounds.get('y', 0)
+
+                # Skip if no dimensions
+                if width <= 0 or height <= 0:
+                    continue
+
+                # Collect text recursively
+                texts = self.get_texts_recursive(node)
+
+                # Skip vectors with no text content
+                is_vector = node_type in ('vector', 'line', 'arrow')
+                if is_vector and not texts:
+                    if ' --> ' in node_name:
+                        log.info(f"  SKIP connector: {node_name} ({node_id})")
+                    else:
+                        log.info(f"  SKIP vector: {node_name} ({node_id})")
+                    continue
+
+                # Determine strategy
+                strategy = self._get_large_frame_strategy(width, height, scale_threshold, extract_threshold)
+
+                frame_info = {
+                    'node_id': node_id,
+                    'node_name': node_name,
+                    'node_type': node_type,
+                    'page_id': page_id,
+                    'page_name': page_name,
+                    'texts': texts,
+                    'bounds': {'x': x, 'y': y, 'width': width, 'height': height},
+                    'strategy': strategy,
+                    'subframes': [],  # Will be populated if strategy == 'extract_subframes'
+                    'is_subframe': False,
+                    'node': node,  # Preserve original Figma node for TOON processing
+                }
+
+                log.info(
+                    f"  Frame: {node_name} ({node_id}) - {node_type}, "
+                    f"size: {width:.0f}x{height:.0f}, strategy: {strategy}"
+                )
+
+                # Handle based on strategy
+                if strategy == 'extract_subframes':
+                    # Extract subframes for large frames
+                    subframes = self._extract_subframes(
+                        file_key, node_id, frame_info,
+                        scale_threshold, extract_threshold, log
+                    )
+
+                    # Process subframes recursively for nested large frames
+                    processed_subframes = []
+                    for sf in subframes:
+                        sf_strategy = sf.get('strategy', 'normal')
+                        sf_id = sf['node_id']
+                        sf_bounds = sf['bounds']
+                        sf_width = sf_bounds.get('width', 0)
+                        sf_height = sf_bounds.get('height', 0)
+
+                        if sf_strategy == 'extract_subframes':
+                            # Recursively extract nested subframes
+                            nested = self._extract_subframes(
+                                file_key, sf_id, sf,
+                                scale_threshold, extract_threshold, log
+                            )
+                            sf['subframes'] = nested
+                            # Add nested subframes to scale groups
+                            for nsf in nested:
+                                if nsf.get('has_image', True) and nsf.get('strategy') != 'text_only':
+                                    nsf_bounds = nsf['bounds']
+                                    nsf_scale = self._calculate_scale_for_strategy(
+                                        nsf['strategy'], nsf_bounds['width'], nsf_bounds['height'],
+                                        scale_threshold
+                                    )
+                                    add_to_scale_group(nsf['node_id'], nsf_scale)
+                        elif sf_strategy == 'text_only':
+                            pass  # No image needed
+                        else:
+                            # Calculate scale and add to group
+                            sf_scale = self._calculate_scale_for_strategy(
+                                sf_strategy, sf_width, sf_height, scale_threshold
+                            )
+                            add_to_scale_group(sf_id, sf_scale)
+
+                        processed_subframes.append(sf)
+
+                    frame_info['subframes'] = processed_subframes
+                    # Parent frame doesn't need its own image when subframes are extracted
+                    frame_info['has_image'] = False
+
+                elif strategy == 'scale_to_limit':
+                    # Scale down to fit Claude's 8000px limit
+                    max_dim = max(width, height)
+                    scale = scale_threshold / max_dim
+                    add_to_scale_group(node_id, scale)
+                    frame_info['has_image'] = True
+
+                else:  # 'normal'
+                    # Use adaptive scaling
+                    scale = self._calculate_optimal_scale(width, height, target_max_dimension=2000)
+                    add_to_scale_group(node_id, scale)
+                    frame_info['has_image'] = True
+
+                all_frames.append(frame_info)
+
+                # Check frame limit
+                total_frames = len(all_frames) + sum(
+                    len(f.get('subframes', [])) for f in all_frames
+                )
+                if total_frames >= max_frames:
+                    log.info(f"Reached max_frames limit ({max_frames})")
+                    break
+
+            if len(all_frames) >= max_frames:
+                break
+
+        # Sort frames spatially
+        all_frames = self._sort_frames_spatially(all_frames)
+        log.info(f"Collected {len(all_frames)} top-level frames")
+
+        # Count total including subframes
+        total_with_subframes = len(all_frames)
+        for f in all_frames:
+            total_with_subframes += len(f.get('subframes', []))
+            for sf in f.get('subframes', []):
+                total_with_subframes += len(sf.get('subframes', []))
+        log.info(f"Total frames including subframes: {total_with_subframes}")
+
+        # Phase 2: Batch fetch image URLs by scale
+        log.info("=" * 40)
+        log.info("Fetching image URLs by scale groups")
+        log.info("=" * 40)
+
+        all_image_urls: Dict[str, str] = {}
+        for scale_str, node_ids in scale_groups.items():
+            scale = float(scale_str)
+            log.info(f"  Fetching {len(node_ids)} images at scale={scale_str}")
+            try:
+                images = self._get_file_images_with_scale(
+                    file_key, node_ids, scale=scale, debug_logger=log
+                )
+                all_image_urls.update(images)
+                log.info(f"    Got {len(images)} URLs")
+            except Exception as e:
+                log.warning(f"    Failed to fetch images at scale {scale_str}: {e}")
+
+        log.info(f"Total image URLs fetched: {len(all_image_urls)}")
+
+        return all_frames, all_image_urls
+
+    def _calculate_scale_for_strategy(
+        self,
+        strategy: str,
+        width: float,
+        height: float,
+        scale_threshold: int,
+    ) -> float:
+        """Calculate the appropriate scale based on strategy."""
+        if strategy == 'scale_to_limit':
+            max_dim = max(width, height)
+            return scale_threshold / max_dim if max_dim > 0 else 1.0
+        elif strategy == 'normal':
+            return self._calculate_optimal_scale(width, height, target_max_dimension=2000)
+        else:
+            return 1.0
+
+    def _split_image_into_tiles(
+        self,
+        image_data: bytes,
+        cols: int,
+        rows: int,
+        overlap: int = 50,
+    ) -> List[Tuple[bytes, int, int, Dict]]:
+        """
+        Split an image into a grid of tiles with optional overlap.
+
+        Args:
+            image_data: PNG image bytes
+            cols: Number of columns
+            rows: Number of rows
+            overlap: Overlap in pixels between adjacent tiles (default 50)
+
+        Returns:
+            List of (tile_bytes, col_index, row_index, tile_info) tuples,
+            ordered left-to-right, top-to-bottom.
+            tile_info contains: width, height, left, top, right, bottom
+        """
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(image_data))
+        img_width, img_height = img.size
+
+        # Calculate base tile dimensions
+        base_tile_width = img_width // cols
+        base_tile_height = img_height // rows
+
+        tiles = []
+        for row in range(rows):
+            for col in range(cols):
+                # Calculate tile boundaries with overlap
+                left = max(0, col * base_tile_width - (overlap if col > 0 else 0))
+                upper = max(0, row * base_tile_height - (overlap if row > 0 else 0))
+
+                # For rightmost/bottom tiles, extend to image edge
+                if col == cols - 1:
+                    right = img_width
+                else:
+                    right = min(img_width, (col + 1) * base_tile_width + overlap)
+
+                if row == rows - 1:
+                    lower = img_height
+                else:
+                    lower = min(img_height, (row + 1) * base_tile_height + overlap)
+
+                tile = img.crop((left, upper, right, lower))
+
+                buffer = io.BytesIO()
+                tile.save(buffer, format='PNG')
+                tile_info = {
+                    'width': right - left,
+                    'height': lower - upper,
+                    'left': left,
+                    'top': upper,
+                    'right': right,
+                    'bottom': lower,
+                }
+                tiles.append((buffer.getvalue(), col, row, tile_info))
+
+        return tiles
+
+    def _describe_image_from_bytes(
+        self,
+        image_data: bytes,
+        prompt: str = "",
+        debug_logger: Optional[logging.Logger] = None,
+    ) -> Optional[str]:
+        """
+        Get LLM description for image from raw bytes.
+
+        Similar to _describe_image but takes bytes instead of URL.
+        Used for analyzing tiles that were split locally.
+
+        Args:
+            image_data: PNG image bytes
+            prompt: Prompt for the LLM
+            debug_logger: Optional logger for debug output
+
+        Returns:
+            LLM-generated description or None if no LLM configured
+        """
+        from langchain_core.messages import HumanMessage
+        import base64
+
+        log = debug_logger or logging.getLogger(__name__)
+
+        if not self.llm:
+            log.debug("No LLM configured, skipping image description")
+            return None
+
+        try:
+            image_b64 = base64.b64encode(image_data).decode('utf-8')
+
+            messages = [
+                HumanMessage(content=[
+                    {"type": "text", "text": prompt or "Describe this UI element in detail."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ])
+            ]
+
+            response = self.llm.invoke(messages)
+            if response and response.content:
+                return response.content
+            return None
+        except Exception as e:
+            log.warning(f"Failed to get LLM description from bytes: {e}")
+            return None
+
+    def _get_file_images_with_scale(
+        self,
+        file_key: str,
+        node_ids: List[str],
+        scale: float = 1.0,
+        debug_logger: Optional[logging.Logger] = None,
+        max_retries: int = 3,
+    ) -> Dict[str, str]:
+        """
+        Fetch image URLs with specified scale, with retry for transient errors.
+
+        This method is used by frame-level processing to request images
+        at a specific scale factor for optimal text readability.
+
+        Args:
+            file_key: Figma file key
+            node_ids: List of node IDs to render
+            scale: Scale factor (0.01-4.0)
+            debug_logger: Optional logger for debug output
+            max_retries: Maximum retry attempts for transient errors (default 3)
+
+        Returns:
+            Dict mapping node_id -> image_url
+        """
+        log = debug_logger or logging.getLogger(__name__)
+
+        if not node_ids:
+            return {}
+
+        scale_str = f"{scale:.2f}"
+        log.info(f"Fetching {len(node_ids)} images at scale={scale_str}")
+
+        def fetch_images():
+            # FigmaPy has a bug: it doesn't include parameter names in the URL
+            # (sends "&0.11" instead of "&scale=0.11"). We bypass it with direct API call.
+            id_list = ','.join(node_ids)
+            endpoint = f'images/{file_key}?ids={id_list}&scale={scale_str}&format=png'
+            data = self._client.api_request(endpoint, method='get')
+            if data and 'images' in data:
+                return data['images']
+            return {}
+
+        try:
+            images = self._retry_with_backoff(
+                func=fetch_images,
+                max_retries=max_retries,
+                initial_delay=1.0,
+                backoff_factor=2.0,
+                retriable_check=self._is_retriable_server_error,
+                operation_name=f"get_file_images(scale={scale_str})",
+                logger=log,
+            )
+            log.info(f"  Got {len(images)} image URLs")
+            return images
+        except Exception as e:
+            log.warning(f"Failed to fetch images at scale {scale_str} after retries: {e}")
+            return {}
+
     def _get_file_images_with_fallback(
         self,
         file_key: str,
@@ -742,19 +1565,33 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 for node_id in node_ids:
                     node_to_page[node_id] = page_id
 
-        # Define fetch function for images
+        # Define fetch function for images with retry for transient server errors
         def fetch_images(node_ids: List[str]) -> Dict[str, str]:
-            """Fetch image URLs for given node IDs."""
-            file_images = self._client.get_file_images(file_key, node_ids)
-            if file_images and file_images.images:
-                return file_images.images
-            return {}
+            """Fetch image URLs for given node IDs with retry for 5xx errors."""
+            def do_fetch():
+                file_images = self._client.get_file_images(file_key, node_ids)
+                if file_images and file_images.images:
+                    return file_images.images
+                return {}
+
+            return self._retry_with_backoff(
+                func=do_fetch,
+                max_retries=3,
+                initial_delay=1.0,
+                backoff_factor=2.0,
+                retriable_check=self._is_retriable_server_error,
+                operation_name=f"get_file_images({len(node_ids)} nodes)",
+            )
+
+        # Combined retriable check: volume errors OR server errors
+        def is_retriable(e: Exception) -> bool:
+            return self._is_volume_error(e) or self._is_retriable_server_error(e)
 
         # Execute with strategy (always flat list, no per-page grouping)
         chunk_result = strategy.execute(
             items=image_nodes,
             fetch_fn=fetch_images,
-            is_retriable_error=self._is_volume_error,
+            is_retriable_error=is_retriable,
         )
 
         # Log summary at INFO level
@@ -775,11 +1612,12 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"  - Failed IDs: {chunk_result.failed}"
         )
 
-        # Track failed items for reporting
+        # Track failed items as dependent items (not top-level docs)
+        # These are sub-items within a parent document that still gets indexed
         for node_id in chunk_result.failed:
             page_id = node_to_page.get(node_id, "")
             item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
-            self._track_runtime_skipped(item_name, reason="error")
+            self._track_dependent_item_skipped(item_name)
 
         return chunk_result.successful
 
@@ -791,9 +1629,43 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         file_key = document.metadata.get('id', '')
         self._log_tool_event(f"Loading details (images) for `{file_key}`")
 
+        # # If prompt not provided, retrieve from toolkit configuration
+        # if not prompt:
+        #     apply_images_prompt = getattr(self, "apply_images_prompt", True)
+        #     images_prompt = getattr(self, "images_prompt", None)
+        #     if (
+        #         apply_images_prompt
+        #         and isinstance(images_prompt, dict)
+        #         and isinstance(images_prompt.get("prompt"), str)
+        #         and images_prompt["prompt"].strip()
+        #     ):
+        #         prompt = images_prompt["prompt"].strip()
+
         figma_pages = self._load_pages(document)
         node_types_include = [t.strip().lower() for t in document.metadata.pop('figma_nodes_include', [])]
         node_types_exclude = [t.strip().lower() for t in document.metadata.pop('figma_nodes_exclude', [])]
+
+        # Route based on granularity level
+        granularity = document.metadata.pop('index_granularity', 'node')
+        if granularity == 'toon':
+            yield from self._process_toon_level(
+                document, figma_pages, node_types_include, node_types_exclude, prompt
+            )
+        else:
+            yield from self._process_node_level(
+                document, figma_pages, node_types_include, node_types_exclude, prompt
+            )
+
+    def _process_node_level(
+        self,
+        document: Document,
+        figma_pages: List[dict],
+        node_types_include: List[str],
+        node_types_exclude: List[str],
+        prompt: str = "",
+    ) -> Generator[Document, None, None]:
+        """Process document at node level - one document per node (image/text). Original behavior."""
+        file_key = document.metadata.get('id', '')
 
         image_nodes = []
         text_nodes = {}
@@ -873,7 +1745,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                             )
                             self._log_tool_event(
                                 f"File {file_key}: processing image node {node_id} "
-                                f"({counted_nodes_ref['value']}/{total_nodes} in {max_workers} threads)."
+                                f"({counted_nodes_ref['value']}/{total_nodes})."
                             )
                             yield doc
                 else:
@@ -920,10 +1792,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                                 )
                                 yield doc
 
-                logging.info(
-                    f"File {file_key}: completed processing of {total_images} image nodes."
-                )
-
         # --- Process text nodes (fast) ---
         if text_nodes:
             for node_id, texts in text_nodes.items():
@@ -948,6 +1816,402 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                             'type': 'text',
                         },
                     )
+
+    def _process_toon_level(
+        self,
+        document: Document,
+        figma_pages: List[dict],
+        node_types_include: List[str],
+        node_types_exclude: List[str],
+        prompt: str = "",
+    ) -> Generator[Document, None, None]:
+        """
+        Process document at TOON level - structured TOON format with LLM analysis.
+
+        Outputs:
+        - 1 document for file: List of pages overview
+        - 1 document per page: FLOWS, VARIANTS, and DESIGN INSIGHTS blocks
+        - 1 document per top-level frame: Full TOON content including nested subframes
+
+        Features:
+        - Parallel page processing for faster indexing
+        - Subframe extraction for large frames (>15000px)
+        - Adaptive scaling for image URLs
+        - LLM analysis for each frame with vision support
+        - Hierarchical frame structure with level indicators
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from queue import Queue
+        from threading import Thread
+
+        file_key = document.metadata.get('id', '')
+        file_name = document.metadata.get('name', 'Untitled')
+        log = logging.getLogger(__name__)
+
+        # Resolve number of threads
+        override_threads = document.metadata.get('number_of_threads_override')
+        if isinstance(override_threads, int) and 1 <= override_threads <= 5:
+            number_of_threads = override_threads
+        else:
+            threads_cfg = getattr(self, "number_of_threads", DEFAULT_NUMBER_OF_THREADS)
+            number_of_threads = threads_cfg if isinstance(threads_cfg, int) and 1 <= threads_cfg <= 5 else DEFAULT_NUMBER_OF_THREADS
+
+        serializer = TOONSerializer()
+        max_frames_per_page = 50
+
+        file_overview_lines = [f"FILE: {file_name} [key:{file_key}]"]
+        page_summaries = []
+        for page in figma_pages:
+            page_id = page.get('id', '')
+            page_name = page.get('name', 'Untitled Page')
+            children_count = len(page.get('children', []))
+            page_summaries.append(f"  PAGE: {page_name} #{page_id} ({children_count} children)")
+        file_overview_lines.extend(page_summaries)
+
+        # Collect all page IDs for dependent_docs
+        all_page_ids = [p.get('id', '') for p in figma_pages if p.get('id')]
+        dependent_docs_str = ','.join(all_page_ids)
+
+        file_doc = Document(
+            page_content='\n'.join(file_overview_lines),
+            metadata={
+                **document.metadata,
+                'id': file_key,  # File doc ID is file_key
+                'granularity': 'toon',
+                'toon_type': 'file',
+                'file_key': file_key,
+                'file_name': file_name,
+                'page_count': len(figma_pages),
+                IndexerKeywords.DEPENDENT_DOCS.value: dependent_docs_str,
+            }
+        )
+        yield file_doc
+
+        # === Helper function to process a single page ===
+        def process_single_page(page: Dict) -> List[Document]:
+            """Process a single page and return all its documents (page doc + frame docs)."""
+            page_id = page.get('id', '')
+            page_name = page.get('name', 'Untitled Page')
+            result_docs = []
+
+            log.debug(f"[Thread] Starting page '{page_name}' ({page_id})")
+
+            # Fetch full page content
+            page_node = page
+            try:
+                nodes_data = self._get_file_nodes(file_key, page_id)
+                if nodes_data:
+                    full_page_node = nodes_data.get('nodes', {}).get(page_id, {}).get('document', {})
+                    if full_page_node:
+                        page_node = full_page_node
+            except Exception as e:
+                log.warning(f"[Thread] Error fetching full page {page_id}: {e}")
+
+            # Collect frames with subframe extraction
+            collected_frames, frame_image_urls = self._collect_frames_for_analysis(
+                file_key=file_key,
+                pages=[page_node],
+                max_frames=max_frames_per_page,
+                debug_logger=log,
+            )
+            log.debug(f"[Thread] Page '{page_name}': Collected {len(collected_frames)} frames")
+
+            # Process frames to TOON data
+            page_data = process_page_to_toon_data(
+                page_node,
+                max_frames=max_frames_per_page,
+                collected_frames=collected_frames,
+            )
+            all_frame_data = page_data.get('frames', [])
+
+            # Flatten all frames (including subframes) for LLM analysis
+            def flatten_frames(frames: List[Dict]) -> List[Dict]:
+                result = []
+                for f in frames:
+                    result.append(f)
+                    result.extend(flatten_frames(f.get('subframes', [])))
+                return result
+
+            all_frames_flat = flatten_frames(all_frame_data)
+            log.debug(f"[Thread] Page '{page_name}': {len(all_frames_flat)} total frames (incl. subframes)")
+
+            # Parallel LLM analysis for all frames within this page
+            frame_explanations = {}
+            if self.llm and all_frames_flat:
+                log.debug(f"[Thread] Page '{page_name}': Starting LLM analysis for {len(all_frames_flat)} frames")
+
+                def analyze_single_frame(frame: Dict) -> tuple:
+                    frame_id = frame.get('id', '')
+                    image_url = frame_image_urls.get(frame_id)
+                    try:
+                        explanation = analyze_frame_with_llm(
+                            frame, self.llm, serializer, image_url=image_url
+                        )
+                        return frame_id, explanation
+                    except Exception as e:
+                        log.warning(f"[Thread] LLM analysis failed for {frame.get('name')}: {e}")
+                        return frame_id, None
+
+                # Use nested thread pool for frame analysis within page
+                with ThreadPoolExecutor(max_workers=number_of_threads) as frame_executor:
+                    futures = {frame_executor.submit(analyze_single_frame, f): f for f in all_frames_flat}
+                    for future in as_completed(futures):
+                        frame_id, explanation = future.result()
+                        if explanation:
+                            frame_explanations[frame_id] = explanation
+
+                log.debug(f"[Thread] Page '{page_name}': LLM complete {len(frame_explanations)}/{len(all_frames_flat)}")
+
+            # === Page document with FLOWS, VARIANTS, DESIGN INSIGHTS ===
+            page_lines = [f"PAGE: {page_name} #{page_id}"]
+
+            # FLOWS section
+            if all_frame_data:
+                page_lines.append("")
+                page_lines.append("FLOWS:")
+                if self.llm:
+                    try:
+                        flow_analysis = analyze_flows_with_llm(all_frames_flat, self.llm)
+                        if flow_analysis:
+                            flow_lines = serialize_flow_analysis(flow_analysis, level=0)
+                            page_lines.extend(flow_lines)
+                        else:
+                            flow_lines = serializer.serialize_flows(all_frames_flat, level=0)
+                            page_lines.extend(flow_lines)
+                    except Exception as e:
+                        log.warning(f"[Thread] LLM flow analysis failed: {e}")
+                        flow_lines = serializer.serialize_flows(all_frames_flat, level=0)
+                        page_lines.extend(flow_lines)
+                else:
+                    flow_lines = serializer.serialize_flows(all_frames_flat, level=0)
+                    page_lines.extend(flow_lines)
+
+            # VARIANTS section
+            if all_frames_flat:
+                variants = group_variants(all_frames_flat)
+                if variants:
+                    page_lines.append("")
+                    page_lines.append("VARIANTS:")
+                    for base, variant_list in variants.items():
+                        if len(variant_list) > 1:
+                            states = list({v.get('state', 'default') for v in variant_list})
+                            ids_short = [f"#{v.get('id', '')[:8]}" for v in variant_list[:5]]
+                            page_lines.append(f"  {base} ({len(variant_list)} frames):")
+                            page_lines.append(f"    states: {', '.join(states[:5])}")
+                            page_lines.append(f"    frames: {', '.join(ids_short)}")
+
+            # DESIGN INSIGHTS section
+            if self.llm and all_frame_data:
+                page_lines.append("")
+                page_lines.append("DESIGN INSIGHTS:")
+                try:
+                    page_file_data = {'name': page_name, 'key': file_key, 'pages': [page_data]}
+                    design_analysis = analyze_file_with_llm(page_file_data, self.llm)
+                    if design_analysis:
+                        insights_text = serialize_design_analysis(design_analysis)
+                        for line in insights_text.split('\n'):
+                            page_lines.append(f"  {line}")
+                except Exception as e:
+                    log.warning(f"[Thread] Design insights failed: {e}")
+                    page_lines.append(f"  [Analysis failed: {e}]")
+
+            # Collect frame IDs for dependent_docs (top-level frames only)
+            page_frame_ids = [f.get('id', '') for f in all_frame_data if f.get('id')]
+            page_dependent_docs_str = ','.join(page_frame_ids)
+
+            page_doc = Document(
+                page_content='\n'.join(page_lines),
+                metadata={
+                    **document.metadata,
+                    'id': page_id,  # Page doc ID is page's node_id
+                    'granularity': 'toon',
+                    'toon_type': 'page',
+                    'file_key': file_key,
+                    'page_id': page_id,
+                    'page_name': page_name,
+                    'frame_count': len(all_frame_data),
+                    'total_frame_count': len(all_frames_flat),
+                    IndexerKeywords.DEPENDENT_DOCS.value: page_dependent_docs_str,
+                }
+            )
+            result_docs.append(page_doc)
+
+            # === Frame documents ===
+            def serialize_frame_with_explanations(frame: Dict, depth: int = 1) -> List[str]:
+                """Recursively serialize frame with LLM explanations."""
+                lines = []
+                frame_id = frame.get('id', '')
+                frame_name = frame.get('name', 'Untitled')
+                frame_type = frame.get('type', 'screen')
+                frame_state = frame.get('state', 'default')
+
+                pos = frame.get('position', {})
+                size = frame.get('size', {})
+                pos_str = f"[{int(pos.get('x', 0))},{int(pos.get('y', 0))} {int(size.get('w', 0))}x{int(size.get('h', 0))}]"
+                level_str = f" level-{depth}" if depth > 1 else ''
+                indent = "  " * (depth - 1)
+
+                lines.append(f"{indent}FRAME: {frame_name} {pos_str} {frame_type}/{frame_state} #{frame_id}{level_str}")
+
+                content_indent = "  " * depth
+                explanation = frame_explanations.get(frame_id)
+                if explanation:
+                    lines.append(f"{content_indent}Purpose: {explanation.purpose}")
+                    goal_line = f"Goal: {explanation.user_goal}"
+                    if explanation.primary_action:
+                        goal_line += f" | Action: \"{explanation.primary_action}\""
+                    lines.append(f"{content_indent}{goal_line}")
+
+                    visual_parts = []
+                    if explanation.visual_focus:
+                        visual_parts.append(f"[focus] {explanation.visual_focus}")
+                    if explanation.layout_pattern:
+                        visual_parts.append(f"[layout] {explanation.layout_pattern}")
+                    if visual_parts:
+                        lines.append(f"{content_indent}Visual: {' | '.join(visual_parts)}")
+
+                # Content from TOON data
+                headings = frame.get('headings', [])
+                buttons = frame.get('buttons', [])
+                inputs = frame.get('inputs', [])
+
+                if headings:
+                    lines.append(f"{content_indent}Headings: {' | '.join(headings[:5])}")
+                if buttons:
+                    btn_strs = []
+                    for btn in buttons[:8]:
+                        dest = infer_cta_destination(btn) if isinstance(btn, str) else btn.get('destination', '')
+                        btn_text = btn if isinstance(btn, str) else btn.get('text', '')
+                        btn_strs.append(f"{btn_text} > {dest}" if dest else btn_text)
+                    lines.append(f"{content_indent}Buttons: {' | '.join(btn_strs)}")
+                if inputs:
+                    from .toon_tools import format_inputs_list
+                    inputs_str = format_inputs_list(inputs[:10])
+                    if inputs_str:
+                        lines.append(f"{content_indent}Inputs: {inputs_str}")
+
+                # Recursively add subframes
+                for subframe in frame.get('subframes', []):
+                    lines.extend(serialize_frame_with_explanations(subframe, depth + 1))
+
+                return lines
+
+            def count_subframes(f: Dict) -> int:
+                count = len(f.get('subframes', []))
+                for sf in f.get('subframes', []):
+                    count += count_subframes(sf)
+                return count
+
+            for frame_data in all_frame_data:
+                frame_id = frame_data.get('id', '')
+                frame_name = frame_data.get('name', 'Untitled')
+
+                frame_lines = serialize_frame_with_explanations(frame_data, depth=1)
+                subframe_count = count_subframes(frame_data)
+
+                frame_doc = Document(
+                    page_content='\n'.join(frame_lines),
+                    metadata={
+                        **document.metadata,
+                        'id': frame_id,  # Frame doc ID is frame's node_id
+                        'granularity': 'toon',
+                        'toon_type': 'frame',
+                        'file_key': file_key,
+                        'page_id': page_id,
+                        'page_name': page_name,
+                        'frame_id': frame_id,
+                        'frame_name': frame_name,
+                        'subframe_count': subframe_count,
+                    }
+                )
+                result_docs.append(frame_doc)
+
+            log.debug(f"[Thread] Page '{page_name}' complete: 1 page doc + {len(all_frame_data)} frame docs")
+            return result_docs
+
+        # === PHASE 2: Process pages with WORK-STEALING POOL ===
+        log.debug("-" * 40)
+        log.debug(f"PHASE 2: Processing {len(figma_pages)} pages with WORK-STEALING POOL")
+        log.debug("-" * 40)
+
+        # Work-stealing strategy: workers dynamically pick pages from a shared queue
+        # When a worker finishes a page, it immediately picks the next available page
+        # This ensures all workers stay busy until all work is done
+        # Cap at 2 workers for page-level parallelism to avoid overwhelming Figma API
+        MAX_PAGE_WORKERS = 2
+        POOL_SIZE = min(number_of_threads, MAX_PAGE_WORKERS)
+        log.debug(f"  number_of_threads config: {number_of_threads}")
+        log.debug(f"  MAX_PAGE_WORKERS cap: {MAX_PAGE_WORKERS}")
+        log.debug(f"  Effective POOL_SIZE: {POOL_SIZE}")
+
+        # Work queue (pages to process) and result queue (documents to yield)
+        work_queue: Queue = Queue()
+        result_queue: Queue = Queue()
+        SENTINEL = object()  # Marker for worker completion
+
+        # Populate work queue with all pages
+        for page in figma_pages:
+            work_queue.put(page)
+
+        log.debug(f"  Work queue: {len(figma_pages)} pages")
+        log.debug(f"  Pool size: {POOL_SIZE} workers")
+
+        def worker(worker_id: int):
+            """Worker that processes pages from work queue until empty."""
+            pages_processed = 0
+            log.debug(f"[Worker-{worker_id}] Started")
+
+            while True:
+                try:
+                    # Try to get a page from work queue (non-blocking)
+                    page = work_queue.get_nowait()
+                except Exception:
+                    # Queue is empty, worker is done
+                    break
+
+                page_name = page.get('name', 'Unknown')
+                log.debug(f"[Worker-{worker_id}] Processing page '{page_name}'")
+
+                try:
+                    docs = process_single_page(page)
+                    log.debug(f"[Worker-{worker_id}] Page '{page_name}' complete, queuing {len(docs)} docs")
+                    for doc in docs:
+                        result_queue.put(doc)
+                    pages_processed += 1
+                except Exception as e:
+                    log.error(f"[Worker-{worker_id}] Page '{page_name}' failed: {e}")
+                finally:
+                    work_queue.task_done()
+
+            log.debug(f"[Worker-{worker_id}] Finished ({pages_processed} pages processed)")
+            result_queue.put(SENTINEL)  # Signal this worker is done
+
+        # Start worker pool
+        workers = []
+        active_workers = min(POOL_SIZE, len(figma_pages))  # Don't start more workers than pages
+        for i in range(active_workers):
+            t = Thread(target=worker, args=(i + 1,))
+            t.start()
+            workers.append(t)
+            log.debug(f"Started Worker-{i + 1}")
+
+        # Yield documents as they arrive from workers (streaming)
+        workers_done = 0
+        log.debug(f"Waiting for {active_workers} workers to complete...")
+
+        while workers_done < active_workers:
+            item = result_queue.get()
+            if item is SENTINEL:
+                workers_done += 1
+                log.debug(f"Worker completed ({workers_done}/{active_workers})")
+            else:
+                yield item
+
+        # Ensure all workers are joined
+        for t in workers:
+            t.join()
+
+        log.debug("All workers completed")
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
@@ -1000,6 +2264,15 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     "urls_or_file_keys entry."
                 ),
                 default=None,
+            )),
+            'index_granularity': (Optional[Literal['node', 'toon']], Field(
+                description=(
+                    "Controls the level at which content is indexed. "
+                    "'node' (default): One document per node (image/text) - most granular. "
+                    "'toon': TOON format with LLM analysis - outputs file overview, page documents with FLOWS/VARIANTS, "
+                    "and frame documents with nested subframes."
+                ),
+                default='node',
             )),
         }
 
@@ -1807,6 +3080,10 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         self._log_tool_event(f"Processing {len(pages_to_process)} pages at detail_level={detail_level}")
 
+        # Track collected data for LLM analysis (avoid refetching)
+        all_page_data_for_llm = []
+        all_frame_image_urls = {}  # {frame_id: image_url}
+
         for page_node in pages_to_process:
             page_id = page_node.get('id', '')
             page_name = page_node.get('name', 'Untitled')
@@ -1836,9 +3113,28 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     page_fetch_error = str(e)
                     self._log_tool_event(f"Error fetching page {page_id}: {e}")
 
-                # Process whatever data we have (full or shallow)
-                page_data = process_page_to_toon_data(page_node, max_frames=max_frames)
+                # Use frame collection with subframe extraction for better coverage
+                collected_frames, frame_image_urls = self._collect_frames_for_analysis(
+                    file_key=file_key,
+                    pages=[page_node],
+                    max_frames=max_frames,
+                    debug_logger=None,
+                )
+                self._log_tool_event(f"Collected {len(collected_frames)} frames (with subframe extraction)")
+
+                # Merge image URLs for LLM analysis
+                all_frame_image_urls.update(frame_image_urls)
+
+                # Process with pre-collected frames that include subframes
+                page_data = process_page_to_toon_data(
+                    page_node,
+                    max_frames=max_frames,
+                    collected_frames=collected_frames,
+                )
                 frames = page_data.get('frames', [])
+
+                # Store for LLM analysis
+                all_page_data_for_llm.append(page_data)
 
                 # If we had an error and got no frames, show the error
                 if page_fetch_error and not frames:
@@ -1884,57 +3180,37 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         if llm_analysis and llm_analysis != 'none' and self.llm:
             self._log_tool_event(f"Running LLM analysis (level={llm_analysis})")
             try:
-                # Build file_data structure for LLM analysis
+                # Build file_data structure for LLM analysis (reuse collected page data)
                 file_data_for_llm = {
                     'name': file_data.name,
                     'key': file_key,
-                    'pages': [],
+                    'pages': all_page_data_for_llm,  # Already collected with subframes
                 }
-                # Collect frame IDs for image fetching (for detailed analysis)
-                all_frame_ids = []
 
-                # Re-use processed page data
-                for page_node in pages_to_process:
-                    page_id = page_node.get('id', '')
-                    try:
-                        # Fetch full page if needed
-                        nodes_data = self._get_file_nodes(file_key, page_id)
-                        if nodes_data:
-                            full_page_node = nodes_data.get('nodes', {}).get(page_id, {}).get('document', {})
-                            if full_page_node:
-                                page_node = full_page_node
-                    except Exception:
-                        pass  # Use shallow data
-                    page_data = process_page_to_toon_data(page_node, max_frames=max_frames)
-                    file_data_for_llm['pages'].append(page_data)
-
-                    # Collect frame IDs for vision analysis
-                    for frame in page_data.get('frames', []):
+                # Helper to recursively collect all frame IDs including subframes
+                def collect_all_frame_ids(frames: List[Dict]) -> List[str]:
+                    """Recursively collect frame IDs from frames and their subframes."""
+                    ids = []
+                    for frame in frames:
                         frame_id = frame.get('id')
                         if frame_id:
-                            all_frame_ids.append(frame_id)
+                            ids.append(frame_id)
+                        # Recursively collect subframe IDs
+                        subframes = frame.get('subframes', [])
+                        if subframes:
+                            ids.extend(collect_all_frame_ids(subframes))
+                    return ids
 
-                # Fetch frame images for vision-based analysis (detailed mode only)
-                frame_images = {}
-                # Use max_frames parameter to limit LLM analysis (respects user setting)
+                # Collect all frame IDs (including subframes) for vision analysis
+                all_frame_ids = []
+                for page_data in all_page_data_for_llm:
+                    all_frame_ids.extend(collect_all_frame_ids(page_data.get('frames', [])))
+
+                # Use pre-collected image URLs from frame collection
+                # These already have adaptive scaling applied
+                frame_images = all_frame_image_urls
                 frames_to_analyze = min(max_frames, len(all_frame_ids))
-                if llm_analysis == 'detailed' and all_frame_ids:
-                    self._log_tool_event(f"Fetching images for {frames_to_analyze} frames (vision analysis)")
-                    try:
-                        frame_ids_to_fetch = all_frame_ids[:frames_to_analyze]
-                        images_response = self._client.get_file_images(
-                            file_key=file_key,
-                            ids=frame_ids_to_fetch,
-                            scale=1,  # Scale 1 is sufficient for analysis
-                            format='png'
-                        )
-                        if images_response and hasattr(images_response, 'images'):
-                            frame_images = images_response.images or {}
-                            self._log_tool_event(f"Fetched {len(frame_images)} frame images")
-                            self._log_tool_event("Processing images and preparing for LLM analysis...")
-                    except Exception as img_err:
-                        self._log_tool_event(f"Frame image fetch failed (continuing without vision): {img_err}")
-                        # Continue without images - will fall back to text analysis
+                self._log_tool_event(f"Using {len(frame_images)} pre-collected image URLs for {frames_to_analyze} frames")
 
                 # Create status callback for progress updates
                 def _status_callback(msg: str):
