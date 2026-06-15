@@ -144,54 +144,37 @@ nodes:
     input_mapping:
       system:
         type: fixed
-        value: "You are a quality assurance validator."
+        value: |
+          You are a JSON data validator. Analyze the provided arrays and return a verdict.
+          IMPORTANT: Base your answer ONLY on the actual "Name" field values in each array.
+          Do NOT hallucinate or assume data that is not present.
       task:
         type: fstring
         value: |
-          Analyze the 'get_files_list' tool execution with conflicting include/skip extensions.
+          Analyze these three file listing results:
 
-          Baseline - Include: ['txt', 'pdf', 'docx', 'png']
-          Result: {files_result_baseline}
+          BASELINE: {files_result_baseline}
+          TEST_1: {files_result_conflict}
+          TEST_2: {files_result_equal_conflict}
 
-          Test 1 (Partial Conflict) - Include: {include_txt_pdf}, Skip: {skip_txt_conflict}
-          Result: {files_result_conflict}
+          Answer these YES/NO questions by examining the "Name" field of each file:
 
-          Test 2 (Full Conflict) - Include: {include_same}, Skip: {skip_same}
-          Result: {files_result_equal_conflict}
+          Q1: Is BASELINE a non-empty array (has at least 1 file)?
+          Q2: In TEST_1, are there any files where "Name" ends with ".txt"?
+          Q3: In TEST_1, do ALL files have "Name" ending with ".pdf"?
+          Q4: Is TEST_2 an empty array []?
 
-          Expected behavior:
-          - All tool executions succeed without errors
-          - Baseline MUST return files (test data should exist)
-          
-          Test 1 (Partial Conflict):
-          - Includes 'txt' and 'pdf' BUT also skips 'txt'
-          - Skip should take precedence: result should contain ONLY .pdf files (no .txt)
-          - Proves exclusion rules override inclusion rules for overlapping extensions
-          
-          Test 2 (Full Conflict - skip == include):
-          - Include and skip lists are IDENTICAL: ['txt', 'pdf']
-          - Skip should take precedence for ALL extensions
-          - Result should contain NO .txt or .pdf files
-          - Should only return files with other extensions (docx, png, etc.) if they exist
-          - This is the ultimate conflict test: when skip == include, skip wins completely
+          PASS CRITERIA:
+          - Q1 must be YES (baseline has files)
+          - Q2 must be NO (no .txt files in test 1)
+          - Q3 must be YES (only .pdf files in test 1) OR TEST_1 is empty
+          - Q4 must be YES (test 2 is empty)
 
-          Validation rules:
-          1. Check all result structures are valid (not error/exception)
-          2. Verify baseline result is non-empty (if empty, test fails - missing test data)
-          3. Verify Test 1 has NO .txt files (zero .txt files)
-          4. Verify Test 1 has only .pdf files (or empty if no .pdf files exist)
-          5. Verify Test 2 is empty (has NO .txt files (zero .txt files), has NO .pdf files (zero .pdf files))
-          6. Confirm skip_extensions took precedence over include_extensions in both tests
+          If ALL criteria are met -> test_passed: true
+          If ANY criterion fails -> test_passed: false
 
-          return a json object with:
-          {{
-            "test_passed": true/false,
-            "summary": "brief description of outcome",
-            "error": "error details if failed, null if passed",
-            "result_sameple_conflict": {files_result_equal_conflict},
-          }}
-
-          return **only** the json object. no markdown formatting, no additional text.
+          Return ONLY valid JSON:
+          {{"test_passed": true/false, "summary": "Q1=YES/NO, Q2=YES/NO, Q3=YES/NO, Q4=YES/NO", "error": null, "result_sameple_conflict": []}}
       chat_history:
         type: fixed
         value: []
