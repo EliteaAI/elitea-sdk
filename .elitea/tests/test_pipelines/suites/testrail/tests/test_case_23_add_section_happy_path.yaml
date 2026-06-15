@@ -1,0 +1,203 @@
+name: "TR23 add section happy path"
+priority: Critical
+description: |
+  Verify the add_section tool creates a new top-level section in a project.
+
+  Objective: Test basic section creation functionality.
+
+  Workflow:
+  - Discover a suite via get_suites (add_section requires suite_id in multi-suite
+    projects; the id is ignored in single-suite mode, so this works either way)
+  - Create a section in that suite
+  - Clean up via delete_section
+
+  Expected Behavior:
+  - add_section executes successfully and returns the created section id and name
+
+toolkits:
+  - id: ${TESTRAIL_TOOLKIT_ID}
+    name: ${TESTRAIL_TOOLKIT_NAME}
+
+state:
+  project_id:
+    type: str
+    value: "${TESTRAIL_PROJECT_ID}"
+  name:
+    type: str
+    value: "Automated Section - TR23 - ${TIMESTAMP}"
+  suites_result:
+    type: dict
+  suite_id:
+    type: str
+  tool_result:
+    type: dict
+  created_section_id:
+    type: str
+  cleanup_result:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_suites
+
+nodes:
+  - id: invoke_get_suites
+    type: toolkit
+    tool: get_suites
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+    output:
+      - suites_result
+    structured_output: true
+    transition: extract_suite_id
+
+  - id: extract_suite_id
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - suites_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a JSON data extractor."
+      task:
+        type: fstring
+        value: |
+          Extract a single suite ID from the list of suites.
+
+          Suites Result: {suites_result}
+
+          Find the first suite object and extract its "id" field.
+          Return ONLY the numeric suite ID as a plain string with no additional text.
+
+          Example: If the first suite is {{"id": 6, "name": "Master"}}, return: 6
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - suite_id
+    structured_output: true
+    transition: invoke_add_section
+
+  - id: invoke_add_section
+    type: toolkit
+    tool: add_section
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+      - name
+      - suite_id
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+      name:
+        type: variable
+        value: name
+      section_properties:
+        type: fstring
+        value: '{{"suite_id": {suite_id}, "description": "Section created by TR23 automated test"}}'
+    output:
+      - tool_result
+    structured_output: true
+    transition: extract_section_id
+
+  - id: extract_section_id
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - tool_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a JSON data extractor."
+      task:
+        type: fstring
+        value: |
+          Extract the section ID from the tool result.
+
+          Tool Result: {tool_result}
+
+          The result looks like "New section has been created: id - 123 - 'name'".
+          Return ONLY the numeric section ID as a plain string with no additional text.
+
+          Example: If the result contains "id - 123", return: 123
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - created_section_id
+    structured_output: true
+    transition: cleanup_delete_section
+
+  - id: cleanup_delete_section
+    type: toolkit
+    tool: delete_section
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - created_section_id
+    input_mapping:
+      section_id:
+        type: variable
+        value: created_section_id
+      soft_delete:
+        type: fixed
+        value: false
+    output:
+      - cleanup_result
+    structured_output: false
+    continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    model: gpt-4o-2024-11-20
+    input:
+      - tool_result
+      - cleanup_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the complete test workflow results.
+
+          Creation Result: {tool_result}
+          Cleanup Result: {cleanup_result}
+
+          Expected behavior:
+          - add_section executed successfully and created a new section
+          - Result confirms section creation with an id and name
+          - Cleanup deleted the created section
+          - No errors or exceptions in creation
+
+          Evaluate:
+          1. Did the add_section tool execute successfully?
+          2. Are there any errors in the creation result?
+          3. Does the output confirm a section was created with an id?
+          4. Was cleanup successful (can ignore cleanup errors)?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+
+          Note: test_passed should be based ONLY on creation success, not cleanup.
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

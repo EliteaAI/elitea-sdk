@@ -375,6 +375,135 @@ getSections = create_model(
     ),
 )
 
+_section_properties_description = (
+    "Optional properties of the section in a key-value format. Possible keys: "
+    ":key description: str - The description of the section. "
+    ":key suite_id: int - The ID of the test suite (ignored if the project is in "
+    "single suite mode, required otherwise). "
+    ":key parent_id: int - The ID of the parent section (to build section hierarchies)."
+)
+
+addSection = create_model(
+    "addSection",
+    project_id=(str, Field(description="Project id the section belongs to")),
+    name=(str, Field(description="Name of the new section")),
+    section_properties=(str, Field(description="JSON string of section properties. " + _section_properties_description, default="{}")),
+)
+
+deleteSection = create_model(
+    "deleteSection",
+    section_id=(str, Field(description="The ID of the section to delete")),
+    soft_delete=(bool, Field(
+        default=False,
+        description="If True, performs a TestRail 'soft' dry run: returns the data that "
+                    "would be affected WITHOUT deleting anything. If False (default), "
+                    "permanently deletes the section and all of its test cases, tests and "
+                    "results (this cannot be undone).",
+    )),
+)
+
+_run_filter_description = (
+    "Optional JSON (as a string or dictionary) of filters for the test runs. "
+    "Supported keys: "
+    ":key created_after: int - Only return runs created after this UNIX timestamp. "
+    ":key created_before: int - Only return runs created before this UNIX timestamp. "
+    ":key created_by: list[int] or comma-separated string - Filter by creator user IDs. "
+    ":key is_completed: int/bool - 1/True for completed runs only, 0/False for active runs only. "
+    ":key limit: int - Limit the number of runs returned. "
+    ":key offset: int - Skip this many runs (for paging). "
+    ":key milestone_id: list[int] or comma-separated string - Filter by milestone IDs. "
+    ":key refs_filter: str - A single Reference ID (e.g. TR-1, 4291). "
+    ":key suite_id: list[int] or comma-separated string - Filter by test suite IDs."
+)
+
+getRun = create_model(
+    "getRun",
+    run_id=(str, Field(description="Test run id")),
+    output_format=(
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    ),
+)
+
+getRuns = create_model(
+    "getRuns",
+    project_id=(str, Field(description="Project id")),
+    run_filter=(
+        Optional[Union[str, dict]],
+        Field(default=None, description="[Optional] " + _run_filter_description),
+    ),
+    output_format=(
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    ),
+)
+
+_result_filter_description = (
+    "Optional JSON (as a string or dictionary) of filters for the results. Supported keys: "
+    ":key status_id: list[int] or comma-separated string - Filter by status IDs "
+    "(built-in: 1 Passed, 2 Blocked, 4 Retest, 5 Failed). "
+    ":key defects_filter: str - A single Defect ID (e.g. TR-1, 4291). "
+    ":key created_after: int - Only results created after this UNIX timestamp (run-level only). "
+    ":key created_before: int - Only results created before this UNIX timestamp (run-level only). "
+    ":key created_by: list[int] or comma-separated string - Filter by creator user IDs (run-level only). "
+    "Pagination is handled automatically; 'limit'/'offset' are ignored."
+)
+
+getResultsForRun = create_model(
+    "getResultsForRun",
+    run_id=(str, Field(description="Test run id")),
+    result_filter=(
+        Optional[Union[str, dict]],
+        Field(default=None, description="[Optional] " + _result_filter_description),
+    ),
+    output_format=(
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    ),
+)
+
+getResultsForCase = create_model(
+    "getResultsForCase",
+    run_id=(str, Field(description="Test run id")),
+    case_id=(str, Field(description="Test case id")),
+    result_filter=(
+        Optional[Union[str, dict]],
+        Field(default=None, description="[Optional] " + _result_filter_description),
+    ),
+    output_format=(
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    ),
+)
+
+getResults = create_model(
+    "getResults",
+    test_id=(str, Field(description="Test id (a 'test' is an instance of a case within a run; list them via get_tests)")),
+    result_filter=(
+        Optional[Union[str, dict]],
+        Field(default=None, description="[Optional] " + _result_filter_description),
+    ),
+    output_format=(
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    ),
+)
+
 SUPPORTED_KEYS = {
     "id", "title", "section_id", "template_id", "type_id", "priority_id", "milestone_id",
     "refs", "created_by", "created_on", "updated_by", "updated_on", "estimate",
@@ -924,6 +1053,241 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except StatusCodeError as e:
             return ToolException(self._format_status_error(e))
 
+    def add_section(self, project_id: str, name: str, section_properties: str = "{}"):
+        """Adds a new section into Testrail per defined parameters.
+        Parameters:
+            project_id: str - the project id the section belongs to.
+            name: str - the name of the new section.
+            section_properties: dict[str, str] - optional properties of the new section:
+                :key description: str
+                    The description of the section
+                :key suite_id: int
+                    The ID of the test suite (ignored if the project is in single
+                    suite mode, required otherwise)
+                :key parent_id: int
+                    The ID of the parent section (to build section hierarchies)
+        """
+        try:
+            props = json.loads(section_properties) if isinstance(section_properties, str) else (section_properties or {})
+            created_section = self._client.sections.add_section(
+                project_id=project_id, name=name, **props
+            )
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ToolException(f"Invalid JSON in section_properties: {e}")
+        except StatusCodeError as e:
+            raise ToolException(f"Unable to add new section {e}")
+        return f"New section has been created: id - {created_section['id']} - '{created_section['name']}'"
+
+    def delete_section(self, section_id: str, soft_delete: bool = False) -> str:
+        """Deletes an existing section.
+
+        Note: in TestRail, deleting a section is permanent and also removes all of
+        its test cases, tests and results. It cannot be undone.
+
+        Args:
+            section_id: The ID of the section to delete.
+            soft_delete: If True, performs a TestRail 'soft' dry run — the API returns
+                        the data that would be affected WITHOUT actually deleting
+                        anything. If False (default), permanently deletes the section
+                        and all of its test cases.
+
+        Returns:
+            Confirmation message of the deletion.
+
+        Raises:
+            ToolException: If the deletion fails.
+        """
+        try:
+            self._log_tool_event(
+                message=f"Deleting section #{section_id} (soft_delete={soft_delete})",
+                tool_name='delete_section'
+            )
+
+            # TestRail API delete_section endpoint
+            # soft=1 returns affected data without deleting; soft=0 performs the deletion
+            self._client.sections.delete_section(
+                section_id=section_id,
+                soft=1 if soft_delete else 0
+            )
+
+            self._log_tool_event(
+                message=f"Section #{section_id} deleted successfully",
+                tool_name='delete_section'
+            )
+
+            delete_type = "previewed for deletion (soft dry run, nothing removed)" if soft_delete else "permanently deleted"
+            return f"Section #{section_id} has been {delete_type} successfully."
+
+        except StatusCodeError as e:
+            raise ToolException(f"Unable to delete section #{section_id}: {e}")
+        except Exception as e:
+            raise ToolException(f"Error deleting section #{section_id}: {str(e)}")
+
+    @staticmethod
+    def _to_run_dicts(runs: List[Dict]) -> List[Dict]:
+        """Projects each run onto a fixed field allowlist for consistent output."""
+        run_fields = [
+            "id", "suite_id", "name", "description", "milestone_id", "assignedto_id",
+            "include_all", "is_completed", "completed_on", "passed_count", "blocked_count",
+            "untested_count", "retest_count", "failed_count", "project_id", "plan_id",
+            "created_on", "created_by", "refs", "url",
+        ]
+        run_dicts = []
+        for run in runs:
+            if isinstance(run, dict):
+                run_dicts.append({field: run[field] for field in run_fields if field in run})
+            else:
+                run_dicts.append({"run": str(run)})
+        return run_dicts
+
+    def get_run(self, run_id: str, output_format: str = "json") -> Union[str, ToolException]:
+        """Extracts a single test run from Testrail.
+
+        Note: this returns the run's metadata and status counts. For the list of
+        tests contained in the run, use the test-listing tools.
+        """
+        try:
+            run = self._client.runs.get_run(run_id=int(run_id))
+        except (ValueError, TypeError):
+            return ToolException(f"run_id must be numeric, got: {run_id!r}")
+        except StatusCodeError as e:
+            return ToolException(self._format_status_error(e))
+        return self._to_markup(self._to_run_dicts([run]), output_format)
+
+    def get_runs(
+        self, project_id: str, run_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
+    ) -> Union[str, ToolException]:
+        """Extracts a list of test runs for a given project from Testrail.
+
+        Only returns test runs that are not part of a test plan. Pass an optional
+        run_filter (JSON string or dict) to narrow the result, e.g.
+        {"is_completed": 0} for active runs or {"suite_id": 6} for a specific suite.
+        """
+        try:
+            if run_filter is None:
+                params = {}
+            elif isinstance(run_filter, str):
+                params = json.loads(run_filter)
+            elif isinstance(run_filter, dict):
+                params = run_filter
+            else:
+                return ToolException("run_filter must be a JSON string or dictionary.")
+        except (ValueError, json.JSONDecodeError) as e:
+            return ToolException(f"Invalid parameter for run_filter: {e}")
+
+        try:
+            response = self._client.runs.get_runs(project_id=project_id, **params)
+        except StatusCodeError as e:
+            return ToolException(self._format_status_error(e))
+
+        # Newer testrail_api wraps results in {'runs': [...]}; older returns a bare list.
+        runs = response['runs'] if isinstance(response, dict) and 'runs' in response else (
+            response if isinstance(response, list) else []
+        )
+        return self._to_markup(self._to_run_dicts(runs), output_format)
+
+    @staticmethod
+    def _to_result_dicts(results: List[Dict]) -> List[Dict]:
+        """Projects each test result onto a fixed field allowlist for consistent output."""
+        result_fields = [
+            "id", "test_id", "status_id", "comment", "version", "elapsed", "defects",
+            "assignedto_id", "created_by", "created_on", "attachment_ids",
+        ]
+        result_dicts = []
+        for result in results:
+            if isinstance(result, dict):
+                result_dicts.append({field: result[field] for field in result_fields if field in result})
+            else:
+                result_dicts.append({"result": str(result)})
+        return result_dicts
+
+    def _read_results(self, fetcher, result_filter, output_format) -> Union[str, ToolException]:
+        """Shared parse/fetch/render path for the get_results* tools.
+
+        `fetcher` is a callable taking the parsed filter kwargs and returning the
+        TestRail response (list, or a dict wrapping a 'results' list).
+        """
+        try:
+            if result_filter is None:
+                params = {}
+            elif isinstance(result_filter, str):
+                params = json.loads(result_filter)
+            elif isinstance(result_filter, dict):
+                params = dict(result_filter)
+            else:
+                return ToolException("result_filter must be a JSON string or dictionary.")
+        except (ValueError, json.JSONDecodeError) as e:
+            return ToolException(f"Invalid parameter for result_filter: {e}")
+
+        # The *_bulk endpoints handle pagination internally; drop paging keys so
+        # they don't interfere with the bulk loop.
+        params.pop("limit", None)
+        params.pop("offset", None)
+
+        try:
+            response = fetcher(**params)
+        except StatusCodeError as e:
+            return ToolException(self._format_status_error(e))
+
+        results = response['results'] if isinstance(response, dict) and 'results' in response else (
+            response if isinstance(response, list) else []
+        )
+        return self._to_markup(self._to_result_dicts(results), output_format)
+
+    def get_results_for_run(
+        self, run_id: str, result_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
+    ) -> Union[str, ToolException]:
+        """Extracts all test results for a given test run from Testrail.
+
+        Returns every result recorded in the run (auto-paginated). Pass an optional
+        result_filter to narrow by status, defect or creation date, e.g.
+        {"status_id": [5]} for failed results only.
+        """
+        try:
+            rid = int(run_id)
+        except (ValueError, TypeError):
+            return ToolException(f"run_id must be numeric, got: {run_id!r}")
+        return self._read_results(
+            lambda **p: self._client.results.get_results_for_run_bulk(run_id=rid, **p),
+            result_filter, output_format,
+        )
+
+    def get_results_for_case(
+        self, run_id: str, case_id: str, result_filter: Optional[Union[str, dict]] = None,
+        output_format: str = "json",
+    ) -> Union[str, ToolException]:
+        """Extracts the test results for a run + case combination from Testrail.
+
+        A 'test' is the instance of a case within a run; this returns that test's
+        result history (auto-paginated). Pass an optional result_filter to narrow
+        by status or defect.
+        """
+        try:
+            rid, cid = int(run_id), int(case_id)
+        except (ValueError, TypeError):
+            return ToolException(f"run_id and case_id must be numeric, got: run_id={run_id!r}, case_id={case_id!r}")
+        return self._read_results(
+            lambda **p: self._client.results.get_results_for_case_bulk(run_id=rid, case_id=cid, **p),
+            result_filter, output_format,
+        )
+
+    def get_results(
+        self, test_id: str, result_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
+    ) -> Union[str, ToolException]:
+        """Extracts the result history for a single test from Testrail.
+
+        A 'test' is an instance of a case within a run (list them via get_tests).
+        Results are auto-paginated. Supported filters: status_id, defects_filter.
+        """
+        try:
+            tid = int(test_id)
+        except (ValueError, TypeError):
+            return ToolException(f"test_id must be numeric, got: {test_id!r}")
+        return self._read_results(
+            lambda **p: self._client.results.get_results_bulk(test_id=tid, **p),
+            result_filter, output_format,
+        )
+
     def _base_loader(self, project_id: str,
                      suite_id: Optional[str] = None,
                      section_id: Optional[int] = None,
@@ -1171,6 +1535,48 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 "ref": self.get_sections,
                 "description": self.get_sections.__doc__,
                 "args_schema": getSections,
+            },
+            {
+                "name": "add_section",
+                "ref": self.add_section,
+                "description": self.add_section.__doc__,
+                "args_schema": addSection,
+            },
+            {
+                "name": "delete_section",
+                "ref": self.delete_section,
+                "description": self.delete_section.__doc__,
+                "args_schema": deleteSection,
+            },
+            {
+                "name": "get_run",
+                "ref": self.get_run,
+                "description": self.get_run.__doc__,
+                "args_schema": getRun,
+            },
+            {
+                "name": "get_runs",
+                "ref": self.get_runs,
+                "description": self.get_runs.__doc__,
+                "args_schema": getRuns,
+            },
+            {
+                "name": "get_results_for_run",
+                "ref": self.get_results_for_run,
+                "description": self.get_results_for_run.__doc__,
+                "args_schema": getResultsForRun,
+            },
+            {
+                "name": "get_results_for_case",
+                "ref": self.get_results_for_case,
+                "description": self.get_results_for_case.__doc__,
+                "args_schema": getResultsForCase,
+            },
+            {
+                "name": "get_results",
+                "ref": self.get_results,
+                "description": self.get_results.__doc__,
+                "args_schema": getResults,
             }
         ]
         return tools
