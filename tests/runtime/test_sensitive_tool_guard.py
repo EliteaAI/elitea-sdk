@@ -352,24 +352,29 @@ def test_hitl_reject_continues_tool_loop():
     assert blocked_payload['status'] == 'blocked'
     assert blocked_payload['blocked_tool_name'] == 'delete_repo'
     assert blocked_payload['equivalent_action_via_other_tool_allowed'] is True
+    # New contract: a single invocation-scoped guidance line is carried INSIDE
+    # the blocked ToolMessage instead of a separate nudge HumanMessage.
+    assert 'guidance' in blocked_payload
+    assert 'declined' in blocked_payload['guidance']
+    assert 'invocation' in blocked_payload['guidance']
     assert 'continuation_message' not in blocked_payload
     assert 'continuation_hint' not in blocked_payload
     assert 'safe_alternatives' not in blocked_payload
     assert 'recovery_instruction' not in blocked_payload
     assert isinstance(result['messages'][-1], AIMessage)
     assert result['messages'][-1].content == client.final_message
-    assert any(
+    # No separate nudge HumanMessage is injected any more.
+    assert not any(
         isinstance(message, HumanMessage)
-        and 'This is a continuation turn after the blocked action(s): github.delete_repo.' in message.content
-        for messages, _ in client.invoke_calls[1:]
+        and 'continuation turn after the blocked action' in str(message.content)
+        for messages, _ in client.invoke_calls
         for message in messages
     )
-    # Verify constrained binding: recovery turn bound only alternative tools, not the blocked one
+    # The blocked tool stays bound — it is NOT yanked from the toolset. The
+    # block is invocation-scoped (per-call independent approval, #5303).
     recovery_tool_names = {t.name for t in client.bound_tools}
-    assert 'delete_repo' not in recovery_tool_names
+    assert 'delete_repo' in recovery_tool_names
     assert 'get_repo_details' in recovery_tool_names
-    assert client.bound_kwargs.get('tool_choice') is None
-    assert client.bound_kwargs.get('parallel_tool_calls') is False
 
 
 def test_sensitive_tool_guard_reject_message_discourages_retry():
@@ -408,26 +413,28 @@ def test_sensitive_tool_guard_reject_message_discourages_retry():
     assert 'continuation_hint' not in payload
 
 
-def test_sensitive_tool_guard_continuation_guidance_keeps_tool_loop_open():
-    node = LLMNode(client=None, lazy_tools_mode=False)
-    enriched = node._enrich_blocked_tool_payload(
-        blocked_payload={
-            'type': SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE,
-            'status': 'blocked',
-            'blocked_tool_name': 'delete_repo',
-            'action_label': 'github.delete_repo',
-            'message': "User blocked the sensitive action 'github.delete_repo'. This tool call was skipped and not executed.",
-            'retry_allowed': False,
-            'equivalent_action_via_other_tool_allowed': True,
-        },
-    )
+def test_blocked_tool_guidance_is_invocation_scoped_and_keeps_loop_open():
+    """The guidance line carried inside the blocked ToolMessage must frame the
+    block as invocation-scoped (not tool-scoped) so a strong model continues the
+    remaining work without retrying the same declined call — replacing the old
+    forced-tool rebinding + nudge HumanMessage."""
+    guidance = LLMNode._build_blocked_tool_guidance({
+        'type': SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE,
+        'status': 'blocked',
+        'blocked_tool_name': 'delete_repo',
+        'action_label': 'github.delete_repo',
+        'message': "User blocked the sensitive action 'github.delete_repo'. This tool call was skipped and not executed.",
+        'retry_allowed': True,
+        'equivalent_action_via_other_tool_allowed': True,
+    })
 
-    assert 'Rethink the tool strategy' in enriched['continuation_message']
-    assert 'other allowed tool calls' in enriched['continuation_message']
-    assert 'reviewed separately' in enriched['continuation_message']
-    assert 'Continue the tool-using reasoning loop' in enriched['continuation_hint']
-    assert 'separate independent review for that invocation' in enriched['continuation_hint']
-    assert 'Do not immediately stop and ask the user' in enriched['continuation_hint']
+    assert 'github.delete_repo' in guidance
+    assert 'declined' in guidance
+    assert 'not executed' in guidance
+    # Invocation-scoped, not tool-scoped — and explicitly permits continuing.
+    assert 'scoped to this exact invocation' in guidance
+    assert 'same arguments' in guidance
+    assert 'next item' in guidance or 'other available tool' in guidance
 
 
 def test_prefixed_direct_sensitive_tool_still_requires_review():
@@ -454,22 +461,10 @@ def test_prefixed_direct_sensitive_tool_still_requires_review():
     assert payload['blocked_tool_name'] == 'list_branches_in_repo'
 
 
-def test_prefixed_followup_tool_is_excluded_when_base_name_is_blocked():
-    node = LLMNode(client=None, lazy_tools_mode=False)
-    prefixed_tool = StructuredTool.from_function(
-        func=lambda repo=None: 'details',
-        name='elitea_core:list_branches_in_repo',
-        description='List branches in repo.',
-        metadata={'toolkit_name': 'elitea_core', 'toolkit_type': 'elitea_core'},
-    )
-
-    assert node._is_allowed_followup_tool(
-        candidate=prefixed_tool,
-        blocked_tool_names={'list_branches_in_repo'},
-    ) is False
-
-
-def test_hitl_reject_uses_continuation_hook_before_allowed_tool_call():
+def test_hitl_reject_continues_via_blocked_toolmessage_guidance():
+    """After a reject, the model continues off the invocation-scoped guidance
+    carried INSIDE the blocked ToolMessage — no nudge HumanMessage, no forced
+    rebinding. The full toolset (including the declined tool) stays bound."""
     configure_sensitive_tools({'github': ['delete_repo', 'delete_branch']})
 
     blocked_tool = StructuredTool.from_function(
@@ -496,6 +491,18 @@ def test_hitl_reject_uses_continuation_hook_before_allowed_tool_call():
         metadata={'toolkit_type': 'github', 'toolkit_name': 'github', 'tool_name': 'get_repo_details'},
     )
 
+    def _blocked_guidance_seen(messages):
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            try:
+                payload = json.loads(message.content)
+            except Exception:
+                continue
+            if payload.get('guidance') and payload.get('blocked_tool_name') == 'delete_repo':
+                return True
+        return False
+
     class ContinuationClient:
         def __init__(self):
             self.bound_tools = []
@@ -513,11 +520,7 @@ def test_hitl_reject_uses_continuation_hook_before_allowed_tool_call():
             self.invoke_calls.append((list(messages), dict(self.bound_kwargs), config))
             if any(isinstance(message, ToolMessage) and message.content == 'details for demo' for message in messages):
                 return AIMessage(content='Recovered through allowed tool call.')
-            if any(
-                isinstance(message, HumanMessage)
-                and 'This is a continuation turn after the blocked action(s): github.delete_repo.' in message.content
-                for message in messages
-            ):
+            if _blocked_guidance_seen(messages):
                 return AIMessage(
                     content='',
                     tool_calls=[{'name': 'get_repo_details', 'args': {'repo': 'demo'}, 'id': 'safe_call_1'}],
@@ -548,23 +551,18 @@ def test_hitl_reject_uses_continuation_hook_before_allowed_tool_call():
         },
     )
 
-    continuation_bindings = [
-        (tools, kwargs)
-        for tools, kwargs in client.bind_history
-        if 'get_repo_details' in [tool.name for tool in tools]
-    ]
-    assert continuation_bindings
-    continuation_tools, continuation_kwargs = continuation_bindings[-1]
-    continuation_tool_names = [tool.name for tool in continuation_tools]
-    assert 'get_repo_details' in continuation_tool_names
-    assert 'delete_branch' in continuation_tool_names
-    assert 'delete_repo' not in continuation_tool_names
-    assert continuation_kwargs.get('tool_choice') is None
-    assert continuation_kwargs['parallel_tool_calls'] is False
+    # The full toolset stays bound on every turn — the declined tool is NOT
+    # yanked, and no constrained tool_choice/parallel_tool_calls is applied.
+    for bound_tools, bound_kwargs in client.bind_history:
+        names = [tool.name for tool in bound_tools]
+        assert 'delete_repo' in names
+        assert bound_kwargs.get('tool_choice') is None
+        assert 'parallel_tool_calls' not in bound_kwargs
 
-    assert any(
+    # No nudge HumanMessage is injected; the model proceeds off the ToolMessage.
+    assert not any(
         isinstance(message, HumanMessage)
-        and 'This is a continuation turn after the blocked action(s): github.delete_repo.' in message.content
+        and 'continuation turn after the blocked action' in str(message.content)
         for message in result['messages']
     )
 
@@ -581,12 +579,10 @@ def test_hitl_reject_uses_continuation_hook_before_allowed_tool_call():
     assert result['messages'][-1].content == 'Recovered through allowed tool call.'
 
 
-def test_lazy_mode_uses_continuation_hook_with_real_tools_from_registry():
-    """In lazy-tools mode, _get_forced_followup_tools must pull real tools from
-    available_tools / tool_registry instead of get_filtered_tools (which returns
-    only meta-tools). The continuation hook should then nudge the model back
-    into the loop while the actual follow-up tool still resolves via the real
-    tool lookup fallbacks."""
+def test_lazy_mode_continues_via_blocked_toolmessage_guidance():
+    """In lazy-tools mode, after a reject the model continues off the blocked
+    ToolMessage guidance and the follow-up tool resolves via the real
+    available_tools / tool_registry fallbacks (no forced-followup lookup)."""
     from elitea_sdk.runtime.tools.lazy_tools import ToolRegistry
 
     configure_sensitive_tools({'github': ['delete_repo']})
@@ -612,6 +608,18 @@ def test_lazy_mode_uses_continuation_hook_with_real_tools_from_registry():
     # Build a real ToolRegistry so the LLMNode is in full lazy mode.
     tool_registry = ToolRegistry.from_tools([blocked_tool, allowed_tool])
 
+    def _blocked_guidance_seen(messages):
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            try:
+                payload = json.loads(message.content)
+            except Exception:
+                continue
+            if payload.get('guidance') and payload.get('blocked_tool_name') == 'delete_repo':
+                return True
+        return False
+
     class LazyContinuationClient:
         def __init__(self):
             self.bind_history = []
@@ -626,11 +634,7 @@ def test_lazy_mode_uses_continuation_hook_with_real_tools_from_registry():
             # If the follow-up tool already ran, return a final text answer.
             if any(isinstance(m, ToolMessage) and m.content == 'details for demo' for m in messages):
                 return AIMessage(content='Recovered in lazy mode.')
-            if any(
-                isinstance(message, HumanMessage)
-                and 'This is a continuation turn after the blocked action(s): github.delete_repo.' in message.content
-                for message in messages
-            ):
+            if _blocked_guidance_seen(messages):
                 return AIMessage(
                     content='',
                     tool_calls=[{'name': 'get_repo_details', 'args': {'repo': 'demo'}, 'id': 'safe_call_1'}],
@@ -662,26 +666,19 @@ def test_lazy_mode_uses_continuation_hook_with_real_tools_from_registry():
         },
     )
 
-    # Verify continuation binding happened with the real allowed tool (not meta-tools).
-    continuation_bindings = [
-        (tools, kwargs)
-        for tools, kwargs in client.bind_history
-        if 'get_repo_details' in tools
-    ]
-    assert continuation_bindings, 'Expected at least one blocked-tool continuation bind_tools call'
-    continuation_tool_names, continuation_kwargs = continuation_bindings[-1]
-    assert 'get_repo_details' in continuation_tool_names
-    assert 'delete_repo' not in continuation_tool_names
-    assert continuation_kwargs.get('tool_choice') is None
-    assert continuation_kwargs['parallel_tool_calls'] is False
+    # No constrained re-binding: bindings never carry tool_choice / parallel_tool_calls.
+    for _names, kwargs in client.bind_history:
+        assert kwargs.get('tool_choice') is None
+        assert 'parallel_tool_calls' not in kwargs
 
-    assert any(
+    # No nudge HumanMessage injected.
+    assert not any(
         isinstance(message, HumanMessage)
-        and 'This is a continuation turn after the blocked action(s): github.delete_repo.' in message.content
+        and 'continuation turn after the blocked action' in str(message.content)
         for message in result['messages']
     )
 
-    # Verify the tool was actually executed (resolved via _forced_followup_lookup).
+    # Verify the tool was actually executed (resolved via the real-tool fallbacks).
     assert any(
         isinstance(m, ToolMessage) and m.content == 'details for demo'
         for m in result['messages']
@@ -1028,7 +1025,11 @@ def test_blocked_tool_visible_payload_omits_internal_enrichment():
     assert 'recovery_instruction' not in payload
 
 
-def test_hitl_reject_auto_executes_recovery_tool_when_forced():
+def test_hitl_reject_recovers_via_allowed_tool_without_constrained_binding():
+    """After a reject the model is free to call an allowed tool to recover. The
+    binding is never constrained (no tool_choice) and the declined tool stays
+    bound — recovery is driven by the blocked ToolMessage guidance, not by a
+    forced shrink-rebind to a single allowed tool."""
     tool = StructuredTool.from_function(
         func=lambda repo: SensitiveToolGuardMiddleware._build_blocked_tool_result(
             action_label='github.delete_repo',
@@ -1047,7 +1048,19 @@ def test_hitl_reject_auto_executes_recovery_tool_when_forced():
         metadata={'toolkit_type': 'github', 'toolkit_name': 'github', 'tool_name': 'get_repo_details'},
     )
 
-    class RecoveryOnlyCallsWhenForcedClient:
+    def _blocked_guidance_seen(messages):
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            try:
+                payload = json.loads(message.content)
+            except Exception:
+                continue
+            if payload.get('guidance') and payload.get('blocked_tool_name') == 'delete_repo':
+                return True
+        return False
+
+    class RecoveryClient:
         def __init__(self):
             self.bound_tools = []
             self.bound_kwargs = {}
@@ -1065,15 +1078,14 @@ def test_hitl_reject_auto_executes_recovery_tool_when_forced():
             tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
             if any(message.content == 'details for demo' for message in tool_messages):
                 return AIMessage(content='Recovered via safe alternative.')
-            bound_tool_names = [tool.name for tool in self.bound_tools]
-            if bound_tool_names == ['get_repo_details']:
+            if _blocked_guidance_seen(messages):
                 return AIMessage(
                     content='',
                     tool_calls=[{'name': 'get_repo_details', 'args': {'repo': 'demo'}, 'id': 'alt_call_1'}],
                 )
             return AIMessage(content='I can suggest get_repo_details if you want.')
 
-    client = RecoveryOnlyCallsWhenForcedClient()
+    client = RecoveryClient()
     node = LLMNode(
         client=client,
         available_tools=[tool, alternative_tool],
@@ -1102,10 +1114,15 @@ def test_hitl_reject_auto_executes_recovery_tool_when_forced():
         isinstance(message, ToolMessage) and message.content == 'details for demo'
         for message in result['messages']
     )
-    assert client.bind_history[-1][1].get('tool_choice') is None
+    # Every binding kept the full toolset and was never constrained.
+    for bound_tools, bound_kwargs in client.bind_history:
+        names = [t.name for t in bound_tools]
+        assert 'delete_repo' in names and 'get_repo_details' in names
+        assert bound_kwargs.get('tool_choice') is None
+        assert 'parallel_tool_calls' not in bound_kwargs
 
 
-def test_multiple_blocked_sensitive_tools_shrink_rebind_and_replace_nudges():
+def test_multiple_blocked_sensitive_tools_each_carry_invocation_scoped_guidance():
     configure_sensitive_tools({'github': ['delete_repo', 'delete_branch']})
 
     blocked_repo_tool = StructuredTool.from_function(
@@ -1156,12 +1173,9 @@ def test_multiple_blocked_sensitive_tools_shrink_rebind_and_replace_nudges():
             if any(isinstance(message, ToolMessage) and message.content == 'details for demo' for message in messages):
                 return AIMessage(content='Recovered after multiple blocked sensitive tools.')
 
-            has_nudge = any(
-                isinstance(message, HumanMessage)
-                and 'This is a continuation turn after the blocked action(s):' in message.content
-                for message in messages
-            )
-
+            # Collect which sensitive tools have already been declined this run,
+            # read from the invocation-scoped guidance carried in the blocked
+            # ToolMessages (no nudge HumanMessage exists any more).
             blocked_tool_names = []
             for message in messages:
                 if not isinstance(message, ToolMessage):
@@ -1171,17 +1185,18 @@ def test_multiple_blocked_sensitive_tools_shrink_rebind_and_replace_nudges():
                 except Exception:
                     continue
                 if payload.get('type') == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE:
+                    assert payload.get('guidance')  # each block carries its own guidance
                     name = payload.get('blocked_tool_name')
                     if name and name not in blocked_tool_names:
                         blocked_tool_names.append(name)
 
-            if has_nudge and blocked_tool_names == ['delete_repo']:
+            if blocked_tool_names == ['delete_repo']:
                 return AIMessage(
                     content='',
                     tool_calls=[{'name': 'delete_branch', 'args': {'repo': 'demo'}, 'id': 'blocked_branch_call'}],
                 )
 
-            if has_nudge and blocked_tool_names == ['delete_repo', 'delete_branch']:
+            if blocked_tool_names == ['delete_repo', 'delete_branch']:
                 return AIMessage(
                     content='',
                     tool_calls=[{'name': 'get_repo_details', 'args': {'repo': 'demo'}, 'id': 'safe_call_1'}],
@@ -1213,21 +1228,18 @@ def test_multiple_blocked_sensitive_tools_shrink_rebind_and_replace_nudges():
         },
     )
 
-    rebound_bindings = [
-        tool_names for tool_names, _ in client.bind_history
-        if tool_names and tool_names != ['delete_repo', 'delete_branch', 'get_repo_details']
-    ]
-    assert rebound_bindings[0] == ['delete_branch', 'get_repo_details']
-    assert rebound_bindings[1] == ['get_repo_details']
+    # Every binding kept the full toolset — nothing is shrunk/yanked.
+    for tool_names, bound_kwargs in client.bind_history:
+        assert tool_names == ['delete_repo', 'delete_branch', 'get_repo_details']
+        assert bound_kwargs.get('tool_choice') is None
+        assert 'parallel_tool_calls' not in bound_kwargs
 
-    continuation_nudges = [
-        message for message in result['messages']
-        if isinstance(message, HumanMessage)
-        and 'This is a continuation turn after the blocked action(s):' in message.content
-    ]
-    assert len(continuation_nudges) == 1
-    assert 'github.delete_repo' in continuation_nudges[0].content
-    assert 'github.delete_branch' in continuation_nudges[0].content
+    # No nudge HumanMessage is ever injected.
+    assert not any(
+        isinstance(message, HumanMessage)
+        and 'continuation turn after the blocked action' in str(message.content)
+        for message in result['messages']
+    )
 
     blocked_tool_messages = [
         json.loads(message.content) for message in result['messages']
@@ -1236,6 +1248,8 @@ def test_multiple_blocked_sensitive_tools_shrink_rebind_and_replace_nudges():
         and message.content.startswith('{')
     ]
     assert [payload['blocked_tool_name'] for payload in blocked_tool_messages] == ['delete_repo', 'delete_branch']
+    # Each blocked ToolMessage carries its own invocation-scoped guidance.
+    assert all(payload.get('guidance') for payload in blocked_tool_messages)
     assert any(
         isinstance(message, ToolMessage) and message.content == 'details for demo'
         for message in result['messages']
