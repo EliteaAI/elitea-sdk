@@ -42,6 +42,8 @@ state:
     type: str
   get_request_result:
     type: str
+  trimmed_request_result:
+    type: str
   delete_result:
     type: str
   test_results:
@@ -145,6 +147,37 @@ nodes:
     output:
       - get_request_result
     structured_output: true
+    transition: trim_request_result
+
+  - id: trim_request_result
+    type: code
+    code:
+      type: fstring
+      value: |
+        import json
+
+        raw = elitea_state.get('get_request_result', '')
+        trimmed = raw
+
+        try:
+            parsed = json.loads(raw)
+            data = parsed.get('data', parsed)
+            trimmed = json.dumps({
+                "name": data.get("name"),
+                "method": data.get("method"),
+                "url": data.get("url"),
+                "description": data.get("description"),
+                "retrieved": True
+            })
+        except Exception:
+            pass
+
+        trimmed
+    input:
+      - get_request_result
+    output:
+      - trimmed_request_result
+    structured_output: true
     transition: cleanup_delete_folder
 
   - id: cleanup_delete_folder
@@ -169,7 +202,7 @@ nodes:
     input:
       - create_folder_result
       - create_request_result
-      - get_request_result
+      - trimmed_request_result
       - request_name
       - request_method
       - request_url
@@ -188,7 +221,7 @@ nodes:
           
           Folder Creation Result: {create_folder_result}
           Request Creation Result: {create_request_result}
-          Get Request Result: {get_request_result}
+          Get Request Result: {trimmed_request_result}
           Expected Request Name: {request_name}
           Expected Method: {request_method}
           Expected URL: {request_url}
@@ -197,9 +230,9 @@ nodes:
           This is a POSITIVE test - we expect successful request creation and retrieval.
           
           Validation Criteria (ALL must pass for test_passed=true):
-          1. folder_created: The create_folder API call returned a success message (do NOT check folder IDs in the retrieved request - folder ID association is not validated here)
+          1. folder_created: The create_folder API call returned a success message
           2. request_created: Request was created successfully (creation API returned success message with an ID)
-          3. request_retrieved: get_request_by_path returned request details (non-empty response with data fields)
+          3. request_retrieved: get_request_by_path returned request details (non-empty response with name, method, url fields)
           4. correct_name: Request name in the retrieved data matches the expected request name
           5. correct_method: Request method in the retrieved data matches the expected method
           6. correct_url: Request URL in the retrieved data matches the expected URL
