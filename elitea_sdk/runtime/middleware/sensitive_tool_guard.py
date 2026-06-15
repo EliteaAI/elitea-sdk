@@ -81,7 +81,7 @@ class SensitiveToolGuardMiddleware(Middleware):
             'blocked_tool_name': tool_name,
             'action_label': action_label,
             'message': cls._build_blocked_tool_message(action_label),
-            'retry_allowed': False,
+            'retry_allowed': True,
             'equivalent_action_via_other_tool_allowed': True,
         }
         if toolkit_name:

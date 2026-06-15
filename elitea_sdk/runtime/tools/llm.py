@@ -1141,8 +1141,8 @@ class LLMNode(BaseTool):
             prompt_parts.append(continuation_hint)
         prompt_parts.append(
             f"This is a continuation turn after the blocked action(s): {blocked_summary}.\n"
-            "Do NOT automatically retry the same blocked tool call or switch to the user prematurely while useful tool paths remain.\n"
-            "Do NOT repeat or restate your previous answer. Pick up where you left off and continue the workflow autonomously.\n"
+            "Do NOT immediately retry the same blocked tool call in this step. Pick up where you left off and continue the workflow autonomously.\n"
+            "Do NOT repeat or restate your previous answer.\n"
             "If an allowed tool can still make meaningful progress, call it now. If the workflow is truly blocked and no allowed tool can help, then explain that clearly to the user."
         )
         return '\n\n'.join(prompt_parts)
@@ -1181,8 +1181,8 @@ class LLMNode(BaseTool):
             or 'the requested action'
         )
         enriched_payload['continuation_message'] = enriched_payload.get('continuation_message') or (
-            f"The action '{action_label}' was blocked by the user and was not executed. "
-            "Do not automatically retry this exact tool call unless the user re-authorizes it. Rethink the tool strategy, decide which allowed action or "
+            f"The action '{action_label}' was blocked by the user and was not executed for this invocation. "
+            "Do not immediately retry this exact tool call in the same step. Rethink the tool strategy, decide which allowed action or "
             "information should be prioritized next, and continue with other allowed tool calls if they can still move the task forward. "
             "If another tool is sensitive, it will be reviewed separately. "
             "Only switch to a user-facing explanation when you decide there is no meaningful allowed tool path left or you truly need user input."
@@ -1190,7 +1190,7 @@ class LLMNode(BaseTool):
         enriched_payload['continuation_hint'] = enriched_payload.get('continuation_hint') or (
             "Continue the tool-using reasoning loop from this blocked tool result. Re-evaluate the remaining allowed tools, "
             "pick the highest-priority next step, and execute other allowed tool calls when they can still advance the task. "
-            "If another tool is sensitive, expect a separate review for that tool call. "
+            "If another tool is sensitive, expect a separate independent review for that invocation. "
             "Do not immediately stop and ask the user for direction unless you determine that no allowed tool path can make meaningful progress."
         )
 
@@ -2589,18 +2589,19 @@ class LLMNode(BaseTool):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
 
-        # Extract historically blocked tools from state-persisted HITL decisions.
-        # These survive across checkpoint resumes and prevent the LLM from
-        # re-offering a tool the user already blocked.
+        # Track blocked tools within the current __perform_tool_calling execution.
+        # Populated below via _historically_blocked.update(blocked_tool_names) after
+        # each iteration so the forced continuation nudge can exclude all tools blocked
+        # in this execution cycle (prevents immediate retry in the same forced followup).
+        #
+        # NOTE: We deliberately do NOT pre-seed this set from state-persisted
+        # hitl_decisions.  Pre-seeding caused tool names that the user rejected in
+        # a prior HITL resume to be permanently excluded from the LLM's tool
+        # binding for all subsequent turns in the same session — breaking the
+        # independent per-call approval model (issue #5303).  Each sensitive-tool
+        # invocation must be reviewed independently: if the user rejects
+        # create_file call #1 they must still be able to approve create_file call #2.
         _historically_blocked: set[str] = set()
-        for decision in (hitl_decisions or []):
-            if decision.get('action') == 'reject' and decision.get('tool_name'):
-                _historically_blocked.add(normalize_tool_name(decision['tool_name']))
-        if _historically_blocked:
-            logger.info(
-                "[HITL] Tools blocked by prior decisions (from state): %s",
-                ', '.join(sorted(_historically_blocked)),
-            )
 
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
@@ -2884,12 +2885,12 @@ class LLMNode(BaseTool):
                 # Reset forced-followup lookup at the start of each LLM re-invoke.
                 _forced_followup_lookup = {}
 
-                # Accumulate current-iteration blocks into history so
-                # future iterations also exclude them.
+                # Accumulate current-iteration blocks into history so the
+                # forced-continuation nudge covers all tools blocked so far
+                # in this __perform_tool_calling execution.
                 _historically_blocked.update(blocked_tool_names)
 
-                # Merge current-iteration blocks with historical blocks
-                # (from state-persisted HITL decisions + earlier iterations).
+                # Merge current-iteration blocks with within-execution history.
                 all_blocked = blocked_tool_names | _historically_blocked
 
                 if blocked_tool_names:
@@ -2940,27 +2941,6 @@ class LLMNode(BaseTool):
                         new_messages.append(HumanMessage(content=continuation_message))
                         current_completion = continuation_client.invoke(new_messages, config=config)
                         new_messages.append(current_completion)
-                elif _historically_blocked:
-                    # No current-iteration blocks but historically blocked
-                    # tools exist — exclude them from the LLM's tool
-                    # binding so it cannot re-call a previously blocked tool.
-                    forced_followup_tools = self._get_forced_followup_tools(
-                        config=config,
-                        blocked_tool_names=_historically_blocked,
-                    )
-                    if forced_followup_tools:
-                        _forced_followup_lookup = {t.name: t for t in forced_followup_tools}
-                        current_completion = self._build_forced_followup_client(
-                            forced_followup_tools,
-                        ).invoke(new_messages, config=config)
-                    else:
-                        logger.info(
-                            "Historical blocked-tool follow-up: no allowed tools remain "
-                            "after excluding [%s]",
-                            ', '.join(sorted(_historically_blocked)),
-                        )
-                        current_completion = llm_client.invoke(new_messages, config=config)
-                    new_messages.append(current_completion)
                 else:
                     current_completion = llm_client.invoke(new_messages, config=config)
                     new_messages.append(current_completion)

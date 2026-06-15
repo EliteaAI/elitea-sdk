@@ -401,7 +401,7 @@ def test_sensitive_tool_guard_reject_message_discourages_retry():
     assert payload['type'] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
     assert payload['blocked_tool_name'] == 'delete_repo'
     assert payload['blocked_toolkit_name'] == 'github'
-    assert payload['retry_allowed'] is False
+    assert payload['retry_allowed'] is True  # per-call independent approval: same tool can be called again
     assert payload['equivalent_action_via_other_tool_allowed'] is True
     assert "This tool call was skipped and not executed." in payload['message']
     assert 'continuation_message' not in payload
@@ -426,7 +426,7 @@ def test_sensitive_tool_guard_continuation_guidance_keeps_tool_loop_open():
     assert 'other allowed tool calls' in enriched['continuation_message']
     assert 'reviewed separately' in enriched['continuation_message']
     assert 'Continue the tool-using reasoning loop' in enriched['continuation_hint']
-    assert 'separate review for that tool call' in enriched['continuation_hint']
+    assert 'separate independent review for that invocation' in enriched['continuation_hint']
     assert 'Do not immediately stop and ask the user' in enriched['continuation_hint']
 
 
@@ -1014,7 +1014,7 @@ def test_blocked_tool_visible_payload_omits_internal_enrichment():
         'blocked_tool_name': 'delete_repo',
         'action_label': 'github.delete_repo',
         'message': 'blocked',
-        'retry_allowed': False,
+        'retry_allowed': True,  # per-call independent approval
         'equivalent_action_via_other_tool_allowed': True,
         'continuation_message': 'internal only',
         'continuation_hint': 'internal only',
@@ -1505,12 +1505,19 @@ def test_second_resume_approve_consumes_stale_replay_values():
     )
 
 
-def test_state_persisted_hitl_decisions_exclude_blocked_tools():
-    """After approving tool 2, the LLM must NOT be offered the previously blocked tool 1.
+def test_blocked_tool_in_prior_decision_remains_available_for_independent_approval():
+    """State-persisted HITL decisions must NOT permanently exclude blocked tools.
 
-    hitl_decisions in state carries the reject for tool 1 across checkpoint
-    resumes.  __perform_tool_calling reads this and excludes tool 1 from the
-    LLM's tool binding when it re-invokes after tool 2 executes.
+    hitl_decisions carries a 'reject' for list_branches_in_repo from a prior
+    HITL turn.  In subsequent turns the LLM MUST still be offered that tool so
+    the per-call approval model is preserved (issue #5303).  If the LLM calls
+    the tool again, the sensitive-tool guard fires independently for that new
+    invocation — the user can approve or reject each call on its own merits.
+
+    Old (buggy) behaviour: tool was stripped from the LLM binding for all
+    future turns after being rejected once, making it permanently unavailable.
+    New (correct) behaviour: tool remains in the bound-tool set; every call
+    goes through the guardrail independently.
     """
 
     # --- Tools ---
@@ -1644,14 +1651,18 @@ def test_state_persisted_hitl_decisions_exclude_blocked_tools():
         )
 
     # The LLM was re-invoked after tool 2 executed.
-    # The re-invocation MUST NOT have list_branches_in_repo in the bound tools.
+    # With per-call independent approval (fix for #5303), the previously-blocked
+    # tool MUST still be offered to the LLM — the guard will prompt the user
+    # again if the LLM calls it. Permanently removing it from the binding is the
+    # bug: it made subsequent calls of the same tool name silently unavailable.
     assert client.invoke_calls, 'Expected at least one LLM invoke call'
     last_invoke = client.invoke_calls[-1]
     bound = last_invoke.get('bound_tool_names', set())
-    assert 'list_branches_in_repo' not in bound, (
-        f'Blocked tool was offered to LLM in follow-up. Bound tools: {bound}'
+    assert 'list_branches_in_repo' in bound, (
+        f'Previously-blocked tool was incorrectly removed from LLM binding '
+        f'(breaks per-call approval model, issue #5303). Bound tools: {bound}'
     )
-    # The result should contain the API call output, not branches
+    # The result should contain the API call output
     messages = result['messages']
     assert any('API result' in m.content for m in messages if isinstance(m, ToolMessage)), (
         f'Expected API tool result in output, got: {[m.content for m in messages]}'
