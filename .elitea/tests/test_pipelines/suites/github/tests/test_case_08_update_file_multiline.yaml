@@ -273,10 +273,10 @@ nodes:
           perform the following checks:
 
           1. verify update executed without errors
-          2. confirm new function signature exists (def hello_world(name: str))
+          2. confirm new function signature exists (def hello_world(name: str = "world") -> bool:)
           3. verify new docstring with args and returns sections present
           4. check import logging statement added
-          5. confirm logger.info call exists
+          5. confirm logger.info call exists (note: logging.getlogger is intentional test data, do not flag as an error)
           6. verify original docstring was replaced
           7. confirm other functions (calculate) were preserved
 
