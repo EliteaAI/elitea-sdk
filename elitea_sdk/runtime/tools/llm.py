@@ -1132,9 +1132,10 @@ class LLMNode(BaseTool):
             prompt_parts.append(continuation_hint)
         prompt_parts.append(
             f"This is a continuation turn after the blocked action(s): {blocked_summary}.\n"
-            "Do NOT immediately retry the same blocked tool call in this step. Pick up where you left off and continue the workflow autonomously.\n"
-            "Do NOT repeat or restate your previous answer.\n"
-            "If an allowed tool can still make meaningful progress, call it now. If the workflow is truly blocked and no allowed tool can help, then explain that clearly to the user."
+            "IMPORTANT: the block is invocation-scoped — only that exact call with those exact arguments was skipped. "
+            "The tool is still available. If the task has more items (next file, next record, next step), "
+            "call the tool now with the next item's data from context.\n"
+            "Do NOT stop, do NOT ask the user, do NOT restate what was blocked. Execute the next step."
         )
         return '\n\n'.join(prompt_parts)
 
@@ -1172,17 +1173,18 @@ class LLMNode(BaseTool):
             or 'the requested action'
         )
         enriched_payload['continuation_message'] = enriched_payload.get('continuation_message') or (
-            f"The action '{action_label}' was blocked by the user and was not executed for this invocation. "
-            "Do not immediately retry this exact tool call in the same step. Rethink the tool strategy, decide which allowed action or "
-            "information should be prioritized next, and continue with other allowed tool calls if they can still move the task forward. "
-            "If another tool is sensitive, it will be reviewed separately. "
-            "Only switch to a user-facing explanation when you decide there is no meaningful allowed tool path left or you truly need user input."
+            f"The action '{action_label}' was blocked for this specific invocation — only this exact call was skipped. "
+            "The tool itself is NOT blocked: if the task has remaining items (more files to create, more records to update, etc.), "
+            "call the same tool again with the next item's data from context. "
+            "Do not stop at this block. Advance to the next step or next item in the sequence. "
+            "If another sensitive tool is needed it will receive its own independent review. "
+            "Only explain to the user when all remaining task steps are exhausted."
         )
         enriched_payload['continuation_hint'] = enriched_payload.get('continuation_hint') or (
-            "Continue the tool-using reasoning loop from this blocked tool result. Re-evaluate the remaining allowed tools, "
-            "pick the highest-priority next step, and execute other allowed tool calls when they can still advance the task. "
-            "If another tool is sensitive, expect a separate independent review for that invocation. "
-            "Do not immediately stop and ask the user for direction unless you determine that no allowed tool path can make meaningful progress."
+            "Pick up the task exactly where this block left it. "
+            "The block applies only to the specific arguments just attempted, not to the tool. "
+            "If work items remain in the sequence, call the same tool now with the next relevant data from context. "
+            "Keep driving toward task completion; do not ask the user for direction unless every remaining tool path is exhausted."
         )
 
         return enriched_payload

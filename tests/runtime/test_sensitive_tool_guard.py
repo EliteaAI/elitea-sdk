@@ -422,12 +422,12 @@ def test_sensitive_tool_guard_continuation_guidance_keeps_tool_loop_open():
         },
     )
 
-    assert 'Rethink the tool strategy' in enriched['continuation_message']
-    assert 'other allowed tool calls' in enriched['continuation_message']
-    assert 'reviewed separately' in enriched['continuation_message']
-    assert 'Continue the tool-using reasoning loop' in enriched['continuation_hint']
-    assert 'separate independent review for that invocation' in enriched['continuation_hint']
-    assert 'Do not immediately stop and ask the user' in enriched['continuation_hint']
+    assert 'only this exact call was skipped' in enriched['continuation_message']
+    assert 'next item' in enriched['continuation_message']
+    assert 'independent review' in enriched['continuation_message']
+    assert 'Pick up the task exactly where this block left it' in enriched['continuation_hint']
+    assert 'specific arguments just attempted' in enriched['continuation_hint']
+    assert 'do not ask the user for direction unless every remaining tool path is exhausted' in enriched['continuation_hint']
 
 
 def test_prefixed_direct_sensitive_tool_still_requires_review():
