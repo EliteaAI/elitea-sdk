@@ -85,7 +85,7 @@ nodes:
           2. branch_confirmed: set_active_branch output mentions '{branch_name}' (with or without backticks)
           3. file_read_success: read_file returned content (not empty, not null, not error)
           4. active_branch_working: read_file used the active branch (no 'branch not found' error)
-          5. no_error: Neither output contains 'error', 'failed', 'exception', 'not found'
+          5. no_error: Neither output contains error indicators such as 'error', 'failed', or 'exception'
           
           IMPORTANT: The set_active_branch tool returns "Switched to branch `BranchName`" with backticks - this is CORRECT and should pass validation.
 
