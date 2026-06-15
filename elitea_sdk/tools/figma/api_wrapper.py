@@ -1859,42 +1859,78 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         serializer = TOONSerializer()
         max_frames_per_page = 50
 
-        file_overview_lines = [f"FILE: {file_name} [key:{file_key}]"]
-        page_summaries = []
-        for page in figma_pages:
+        # === Helper to serialize a single leaf frame ===
+        def serialize_leaf_frame(frame: Dict, explanation: Optional[object] = None) -> List[str]:
+            """Serialize a leaf frame (no subframes) with LLM explanation."""
+            from .toon_tools import format_inputs_list
+            lines = []
+            frame_id = frame.get('id', '')
+            frame_name = frame.get('name', 'Untitled')
+            frame_type = frame.get('type', 'screen')
+            frame_state = frame.get('state', 'default')
+
+            pos = frame.get('position', {})
+            size = frame.get('size', {})
+            pos_str = f"[{int(pos.get('x', 0))},{int(pos.get('y', 0))} {int(size.get('w', 0))}x{int(size.get('h', 0))}]"
+
+            lines.append(f"FRAME: {frame_name} {pos_str} {frame_type}/{frame_state} #{frame_id}")
+
+            if explanation:
+                lines.append(f"  Purpose: {explanation.purpose}")
+                goal_line = f"Goal: {explanation.user_goal}"
+                if explanation.primary_action:
+                    goal_line += f" | Action: \"{explanation.primary_action}\""
+                lines.append(f"  {goal_line}")
+
+                visual_parts = []
+                if explanation.visual_focus:
+                    visual_parts.append(f"[focus] {explanation.visual_focus}")
+                if explanation.layout_pattern:
+                    visual_parts.append(f"[layout] {explanation.layout_pattern}")
+                if visual_parts:
+                    lines.append(f"  Visual: {' | '.join(visual_parts)}")
+
+            # Content from TOON data
+            headings = frame.get('headings', [])
+            buttons = frame.get('buttons', [])
+            inputs = frame.get('inputs', [])
+
+            if headings:
+                lines.append(f"  Headings: {' | '.join(headings[:5])}")
+            if buttons:
+                btn_strs = []
+                for btn in buttons[:8]:
+                    dest = infer_cta_destination(btn) if isinstance(btn, str) else btn.get('destination', '')
+                    btn_text = btn if isinstance(btn, str) else btn.get('text', '')
+                    btn_strs.append(f"{btn_text} > {dest}" if dest else btn_text)
+                lines.append(f"  Buttons: {' | '.join(btn_strs)}")
+            if inputs:
+                inputs_str = format_inputs_list(inputs[:10])
+                if inputs_str:
+                    lines.append(f"  Inputs: {inputs_str}")
+
+            return lines
+
+        # === Helper to find leaf frames (frames with no subframes) ===
+        def get_leaf_frames(frames: List[Dict]) -> List[Dict]:
+            """Recursively find all leaf frames (frames with no subframes)."""
+            leaves = []
+            for f in frames:
+                subframes = f.get('subframes', [])
+                if not subframes:
+                    leaves.append(f)
+                else:
+                    leaves.extend(get_leaf_frames(subframes))
+            return leaves
+
+        # Result queue for streaming documents as they complete
+        result_queue: Queue = Queue()
+        SENTINEL = object()
+
+        def process_page_streaming(page: Dict):
+            """Process a page and stream leaf frame docs to result_queue as LLM completes."""
             page_id = page.get('id', '')
             page_name = page.get('name', 'Untitled Page')
-            children_count = len(page.get('children', []))
-            page_summaries.append(f"  PAGE: {page_name} #{page_id} ({children_count} children)")
-        file_overview_lines.extend(page_summaries)
-
-        # Collect all page IDs for dependent_docs
-        all_page_ids = [p.get('id', '') for p in figma_pages if p.get('id')]
-        dependent_docs_str = ','.join(all_page_ids)
-
-        file_doc = Document(
-            page_content='\n'.join(file_overview_lines),
-            metadata={
-                **document.metadata,
-                'id': file_key,  # File doc ID is file_key
-                'granularity': 'toon',
-                'toon_type': 'file',
-                'file_key': file_key,
-                'file_name': file_name,
-                'page_count': len(figma_pages),
-                IndexerKeywords.DEPENDENT_DOCS.value: dependent_docs_str,
-            }
-        )
-        yield file_doc
-
-        # === Helper function to process a single page ===
-        def process_single_page(page: Dict) -> List[Document]:
-            """Process a single page and return all its documents (page doc + frame docs)."""
-            page_id = page.get('id', '')
-            page_name = page.get('name', 'Untitled Page')
-            result_docs = []
-
-            log.debug(f"[Thread] Starting page '{page_name}' ({page_id})")
 
             # Fetch full page content
             page_node = page
@@ -1905,7 +1941,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     if full_page_node:
                         page_node = full_page_node
             except Exception as e:
-                log.warning(f"[Thread] Error fetching full page {page_id}: {e}")
+                log.warning(f"Error fetching full page {page_id}: {e}")
 
             # Collect frames with subframe extraction
             collected_frames, frame_image_urls = self._collect_frames_for_analysis(
@@ -1914,7 +1950,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 max_frames=max_frames_per_page,
                 debug_logger=log,
             )
-            log.debug(f"[Thread] Page '{page_name}': Collected {len(collected_frames)} frames")
 
             # Process frames to TOON data
             page_data = process_page_to_toon_data(
@@ -1924,196 +1959,45 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             )
             all_frame_data = page_data.get('frames', [])
 
-            # Flatten all frames (including subframes) for LLM analysis
-            def flatten_frames(frames: List[Dict]) -> List[Dict]:
-                result = []
-                for f in frames:
-                    result.append(f)
-                    result.extend(flatten_frames(f.get('subframes', [])))
-                return result
+            # Find only leaf frames (no subframes)
+            leaf_frames = get_leaf_frames(all_frame_data)
+            log.debug(f"Page '{page_name}': {len(leaf_frames)} leaf frames")
 
-            all_frames_flat = flatten_frames(all_frame_data)
-            log.debug(f"[Thread] Page '{page_name}': {len(all_frames_flat)} total frames (incl. subframes)")
+            if not leaf_frames:
+                return
 
-            # Parallel LLM analysis for all frames within this page
-            frame_explanations = {}
-            if self.llm and all_frames_flat:
-                log.debug(f"[Thread] Page '{page_name}': Starting LLM analysis for {len(all_frames_flat)} frames")
+            # Fetch image URLs specifically for leaf frames
+            leaf_frame_ids = [f.get('id', '') for f in leaf_frames if f.get('id')]
+            leaf_image_urls = {}
+            if leaf_frame_ids:
+                try:
+                    leaf_image_urls = self._get_file_images_with_fallback(file_key, leaf_frame_ids)
+                except Exception as e:
+                    log.warning(f"Failed to fetch leaf frame images: {e}")
 
-                def analyze_single_frame(frame: Dict) -> tuple:
-                    frame_id = frame.get('id', '')
-                    image_url = frame_image_urls.get(frame_id)
+            # Process each leaf frame: LLM analysis + immediate doc creation
+            def process_leaf_frame(frame: Dict) -> Optional[Document]:
+                frame_id = frame.get('id', '')
+                frame_name = frame.get('name', 'Untitled')
+                image_url = leaf_image_urls.get(frame_id, '')
+
+                # LLM analysis
+                explanation = None
+                if self.llm:
                     try:
                         explanation = analyze_frame_with_llm(
                             frame, self.llm, serializer, image_url=image_url
                         )
-                        return frame_id, explanation
                     except Exception as e:
-                        log.warning(f"[Thread] LLM analysis failed for {frame.get('name')}: {e}")
-                        return frame_id, None
+                        log.warning(f"LLM analysis failed for {frame_name}: {e}")
 
-                # Use nested thread pool for frame analysis within page
-                with ThreadPoolExecutor(max_workers=number_of_threads) as frame_executor:
-                    futures = {frame_executor.submit(analyze_single_frame, f): f for f in all_frames_flat}
-                    for future in as_completed(futures):
-                        frame_id, explanation = future.result()
-                        if explanation:
-                            frame_explanations[frame_id] = explanation
-
-                log.debug(f"[Thread] Page '{page_name}': LLM complete {len(frame_explanations)}/{len(all_frames_flat)}")
-
-            # === Page document with FLOWS, VARIANTS, DESIGN INSIGHTS ===
-            page_lines = [f"PAGE: {page_name} #{page_id}"]
-
-            # FLOWS section
-            if all_frame_data:
-                page_lines.append("")
-                page_lines.append("FLOWS:")
-                if self.llm:
-                    try:
-                        flow_analysis = analyze_flows_with_llm(all_frames_flat, self.llm)
-                        if flow_analysis:
-                            flow_lines = serialize_flow_analysis(flow_analysis, level=0)
-                            page_lines.extend(flow_lines)
-                        else:
-                            flow_lines = serializer.serialize_flows(all_frames_flat, level=0)
-                            page_lines.extend(flow_lines)
-                    except Exception as e:
-                        log.warning(f"[Thread] LLM flow analysis failed: {e}")
-                        flow_lines = serializer.serialize_flows(all_frames_flat, level=0)
-                        page_lines.extend(flow_lines)
-                else:
-                    flow_lines = serializer.serialize_flows(all_frames_flat, level=0)
-                    page_lines.extend(flow_lines)
-
-            # VARIANTS section
-            if all_frames_flat:
-                variants = group_variants(all_frames_flat)
-                if variants:
-                    page_lines.append("")
-                    page_lines.append("VARIANTS:")
-                    for base, variant_list in variants.items():
-                        if len(variant_list) > 1:
-                            states = list({v.get('state', 'default') for v in variant_list})
-                            ids_short = [f"#{v.get('id', '')[:8]}" for v in variant_list[:5]]
-                            page_lines.append(f"  {base} ({len(variant_list)} frames):")
-                            page_lines.append(f"    states: {', '.join(states[:5])}")
-                            page_lines.append(f"    frames: {', '.join(ids_short)}")
-
-            # DESIGN INSIGHTS section
-            if self.llm and all_frame_data:
-                page_lines.append("")
-                page_lines.append("DESIGN INSIGHTS:")
-                try:
-                    page_file_data = {'name': page_name, 'key': file_key, 'pages': [page_data]}
-                    design_analysis = analyze_file_with_llm(page_file_data, self.llm)
-                    if design_analysis:
-                        insights_text = serialize_design_analysis(design_analysis)
-                        for line in insights_text.split('\n'):
-                            page_lines.append(f"  {line}")
-                except Exception as e:
-                    log.warning(f"[Thread] Design insights failed: {e}")
-                    page_lines.append(f"  [Analysis failed: {e}]")
-
-            # Collect frame IDs for dependent_docs (top-level frames only)
-            page_frame_ids = [f.get('id', '') for f in all_frame_data if f.get('id')]
-            page_dependent_docs_str = ','.join(page_frame_ids)
-
-            page_doc = Document(
-                page_content='\n'.join(page_lines),
-                metadata={
-                    **document.metadata,
-                    'id': page_id,  # Page doc ID is page's node_id
-                    'granularity': 'toon',
-                    'toon_type': 'page',
-                    'file_key': file_key,
-                    'page_id': page_id,
-                    'page_name': page_name,
-                    'frame_count': len(all_frame_data),
-                    'total_frame_count': len(all_frames_flat),
-                    IndexerKeywords.DEPENDENT_DOCS.value: page_dependent_docs_str,
-                }
-            )
-            result_docs.append(page_doc)
-
-            # === Frame documents ===
-            def serialize_frame_with_explanations(frame: Dict, depth: int = 1) -> List[str]:
-                """Recursively serialize frame with LLM explanations."""
-                lines = []
-                frame_id = frame.get('id', '')
-                frame_name = frame.get('name', 'Untitled')
-                frame_type = frame.get('type', 'screen')
-                frame_state = frame.get('state', 'default')
-
-                pos = frame.get('position', {})
-                size = frame.get('size', {})
-                pos_str = f"[{int(pos.get('x', 0))},{int(pos.get('y', 0))} {int(size.get('w', 0))}x{int(size.get('h', 0))}]"
-                level_str = f" level-{depth}" if depth > 1 else ''
-                indent = "  " * (depth - 1)
-
-                lines.append(f"{indent}FRAME: {frame_name} {pos_str} {frame_type}/{frame_state} #{frame_id}{level_str}")
-
-                content_indent = "  " * depth
-                explanation = frame_explanations.get(frame_id)
-                if explanation:
-                    lines.append(f"{content_indent}Purpose: {explanation.purpose}")
-                    goal_line = f"Goal: {explanation.user_goal}"
-                    if explanation.primary_action:
-                        goal_line += f" | Action: \"{explanation.primary_action}\""
-                    lines.append(f"{content_indent}{goal_line}")
-
-                    visual_parts = []
-                    if explanation.visual_focus:
-                        visual_parts.append(f"[focus] {explanation.visual_focus}")
-                    if explanation.layout_pattern:
-                        visual_parts.append(f"[layout] {explanation.layout_pattern}")
-                    if visual_parts:
-                        lines.append(f"{content_indent}Visual: {' | '.join(visual_parts)}")
-
-                # Content from TOON data
-                headings = frame.get('headings', [])
-                buttons = frame.get('buttons', [])
-                inputs = frame.get('inputs', [])
-
-                if headings:
-                    lines.append(f"{content_indent}Headings: {' | '.join(headings[:5])}")
-                if buttons:
-                    btn_strs = []
-                    for btn in buttons[:8]:
-                        dest = infer_cta_destination(btn) if isinstance(btn, str) else btn.get('destination', '')
-                        btn_text = btn if isinstance(btn, str) else btn.get('text', '')
-                        btn_strs.append(f"{btn_text} > {dest}" if dest else btn_text)
-                    lines.append(f"{content_indent}Buttons: {' | '.join(btn_strs)}")
-                if inputs:
-                    from .toon_tools import format_inputs_list
-                    inputs_str = format_inputs_list(inputs[:10])
-                    if inputs_str:
-                        lines.append(f"{content_indent}Inputs: {inputs_str}")
-
-                # Recursively add subframes
-                for subframe in frame.get('subframes', []):
-                    lines.extend(serialize_frame_with_explanations(subframe, depth + 1))
-
-                return lines
-
-            def count_subframes(f: Dict) -> int:
-                count = len(f.get('subframes', []))
-                for sf in f.get('subframes', []):
-                    count += count_subframes(sf)
-                return count
-
-            for frame_data in all_frame_data:
-                frame_id = frame_data.get('id', '')
-                frame_name = frame_data.get('name', 'Untitled')
-
-                frame_lines = serialize_frame_with_explanations(frame_data, depth=1)
-                subframe_count = count_subframes(frame_data)
-
-                frame_doc = Document(
+                # Create document immediately
+                frame_lines = serialize_leaf_frame(frame, explanation)
+                return Document(
                     page_content='\n'.join(frame_lines),
                     metadata={
                         **document.metadata,
-                        'id': frame_id,  # Frame doc ID is frame's node_id
+                        'id': frame_id,
                         'granularity': 'toon',
                         'toon_type': 'frame',
                         'file_key': file_key,
@@ -2121,97 +2005,53 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                         'page_name': page_name,
                         'frame_id': frame_id,
                         'frame_name': frame_name,
-                        'subframe_count': subframe_count,
+                        'image_url': image_url,
+                        'type': 'image',
                     }
                 )
-                result_docs.append(frame_doc)
 
-            log.debug(f"[Thread] Page '{page_name}' complete: 1 page doc + {len(all_frame_data)} frame docs")
-            return result_docs
+            # Process leaf frames in parallel, queue docs as they complete
+            with ThreadPoolExecutor(max_workers=number_of_threads) as executor:
+                futures = {executor.submit(process_leaf_frame, f): f for f in leaf_frames}
+                for future in as_completed(futures):
+                    try:
+                        doc = future.result()
+                        if doc:
+                            result_queue.put(doc)
+                    except Exception as e:
+                        log.warning(f"Frame processing failed: {e}")
 
-        # === PHASE 2: Process pages with WORK-STEALING POOL ===
-        log.debug("-" * 40)
-        log.debug(f"PHASE 2: Processing {len(figma_pages)} pages with WORK-STEALING POOL")
-        log.debug("-" * 40)
+        # Process all pages in parallel, streaming docs as they complete
+        def page_worker(page: Dict):
+            try:
+                process_page_streaming(page)
+            except Exception as e:
+                log.error(f"Page processing failed: {e}")
 
-        # Work-stealing strategy: workers dynamically pick pages from a shared queue
-        # When a worker finishes a page, it immediately picks the next available page
-        # This ensures all workers stay busy until all work is done
-        # Cap at 2 workers for page-level parallelism to avoid overwhelming Figma API
-        MAX_PAGE_WORKERS = 2
-        POOL_SIZE = min(number_of_threads, MAX_PAGE_WORKERS)
-        log.debug(f"  number_of_threads config: {number_of_threads}")
-        log.debug(f"  MAX_PAGE_WORKERS cap: {MAX_PAGE_WORKERS}")
-        log.debug(f"  Effective POOL_SIZE: {POOL_SIZE}")
-
-        # Work queue (pages to process) and result queue (documents to yield)
-        work_queue: Queue = Queue()
-        result_queue: Queue = Queue()
-        SENTINEL = object()  # Marker for worker completion
-
-        # Populate work queue with all pages
+        # Start page processing threads
+        page_threads = []
         for page in figma_pages:
-            work_queue.put(page)
-
-        log.debug(f"  Work queue: {len(figma_pages)} pages")
-        log.debug(f"  Pool size: {POOL_SIZE} workers")
-
-        def worker(worker_id: int):
-            """Worker that processes pages from work queue until empty."""
-            pages_processed = 0
-            log.debug(f"[Worker-{worker_id}] Started")
-
-            while True:
-                try:
-                    # Try to get a page from work queue (non-blocking)
-                    page = work_queue.get_nowait()
-                except Exception:
-                    # Queue is empty, worker is done
-                    break
-
-                page_name = page.get('name', 'Unknown')
-                log.debug(f"[Worker-{worker_id}] Processing page '{page_name}'")
-
-                try:
-                    docs = process_single_page(page)
-                    log.debug(f"[Worker-{worker_id}] Page '{page_name}' complete, queuing {len(docs)} docs")
-                    for doc in docs:
-                        result_queue.put(doc)
-                    pages_processed += 1
-                except Exception as e:
-                    log.error(f"[Worker-{worker_id}] Page '{page_name}' failed: {e}")
-                finally:
-                    work_queue.task_done()
-
-            log.debug(f"[Worker-{worker_id}] Finished ({pages_processed} pages processed)")
-            result_queue.put(SENTINEL)  # Signal this worker is done
-
-        # Start worker pool
-        workers = []
-        active_workers = min(POOL_SIZE, len(figma_pages))  # Don't start more workers than pages
-        for i in range(active_workers):
-            t = Thread(target=worker, args=(i + 1,))
+            t = Thread(target=page_worker, args=(page,))
             t.start()
-            workers.append(t)
-            log.debug(f"Started Worker-{i + 1}")
+            page_threads.append(t)
 
-        # Yield documents as they arrive from workers (streaming)
-        workers_done = 0
-        log.debug(f"Waiting for {active_workers} workers to complete...")
+        # Monitor thread to signal completion
+        def completion_monitor():
+            for t in page_threads:
+                t.join()
+            result_queue.put(SENTINEL)
 
-        while workers_done < active_workers:
+        monitor_thread = Thread(target=completion_monitor)
+        monitor_thread.start()
+
+        # Yield documents as they arrive (streaming)
+        while True:
             item = result_queue.get()
             if item is SENTINEL:
-                workers_done += 1
-                log.debug(f"Worker completed ({workers_done}/{active_workers})")
-            else:
-                yield item
+                break
+            yield item
 
-        # Ensure all workers are joined
-        for t in workers:
-            t.join()
-
-        log.debug("All workers completed")
+        monitor_thread.join()
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
