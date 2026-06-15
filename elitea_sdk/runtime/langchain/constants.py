@@ -691,6 +691,14 @@ Use `pandas_analyze_data` for tabular data analysis using natural language queri
 
 """
 
+
+SKILLS_SECTION_HEADER = """# Skills
+Apply the following skill instructions for this request."""
+
+SKILLS_SECTION_ENTRY = """## {name}
+{instructions}"""
+
+
 SEARCH_INDEX_ADDON = """
 ## Indexed Document Search
 

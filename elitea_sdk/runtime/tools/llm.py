@@ -19,7 +19,7 @@ try:
 except ImportError:
     _SCRATCHPAD_KEY = '__pregel_scratchpad'
 
-from ..langchain.constants import ELITEA_RS
+from ..langchain.constants import ELITEA_RS, SKILLS_SECTION_HEADER, SKILLS_SECTION_ENTRY
 from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
@@ -1327,6 +1327,18 @@ class LLMNode(BaseTool):
                 system_content = f"{system_content}\n\n{tool_index}"
                 logger.debug("[LazyTools] Injected tool index into system prompt")
 
+            # Per-turn skills injection. elitea_core resolves the
+            # ~skill-name token(s) from THIS user message and threads the resolved bodies
+            # through invoke_config["configurable"]["invoked_skills"]. We append the rendered
+            # SKILLS section to system_content BEFORE the messages list is built; the
+            # _anthropic_system_content wrap below makes it cache-safe. Empty/absent ⇒ no-op,
+            # so behavior is byte-identical when no skill was invoked. The injected text rides
+            # the System message and is stripped before checkpoint (_strip_system_messages).
+            skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
+            if skills_section:
+                system_content = f"{system_content}\n\n{skills_section}"
+                logger.info("[Skills] Injected per-turn skills section into system prompt")
+
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
                 task_content = str(task_content) if task_content is not None else ""
@@ -1648,6 +1660,33 @@ class LLMNode(BaseTool):
         # Simple text response (either no output variables or JSON parsing failed)
         new_messages = messages + [ai_message]
         return {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
+
+    @staticmethod
+    def _build_invoked_skills_section(invoked_skills: Any) -> str:
+        if not invoked_skills or not isinstance(invoked_skills, list):
+            return ""
+
+        entries = []
+        for skill in invoked_skills:
+            if not isinstance(skill, dict):
+                continue
+            name = skill.get('name')
+            instructions = skill.get('instructions')
+            if not name or not str(name).strip():
+                continue
+            if not instructions or not str(instructions).strip():
+                continue
+            entries.append(SKILLS_SECTION_ENTRY.format(name=name, instructions=instructions))
+            if len(entries) >= 5:
+                break
+
+        if not entries:
+            return ""
+
+        return "{header}\n\n{body}".format(
+            header=SKILLS_SECTION_HEADER,
+            body="\n\n".join(entries),
+        )
 
     @staticmethod
     def _strip_system_messages(messages: list) -> list:
