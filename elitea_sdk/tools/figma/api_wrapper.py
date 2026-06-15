@@ -2006,14 +2006,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 image_height = int(frame_size.get('h', 0))
 
                 # LLM analysis
-                explanation = None
-                if self.llm:
-                    try:
-                        explanation = analyze_frame_with_llm(
-                            frame, self.llm, serializer, image_url=image_url
-                        )
-                    except Exception as e:
-                        log.warning(f"LLM analysis failed for {frame_name}: {e}")
+                analysis_result = analyze_frame_with_llm(
+                    frame, self.llm, serializer, image_url=image_url
+                )
+                explanation = analysis_result.explanation
+                llm_status = analysis_result.llm_status
 
                 # Create document immediately
                 frame_lines = serialize_leaf_frame(frame, explanation)
@@ -2022,17 +2019,17 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     metadata={
                         **document.metadata,
                         'id': frame_id,
-                        'granularity': 'toon',
-                        'toon_type': 'frame',
                         'file_key': file_key,
+                        'file_name': file_name,
                         'page_id': page_id,
                         'page_name': page_name,
-                        'frame_id': frame_id,
-                        'frame_name': frame_name,
+                        'node_id': frame_id,
+                        'node_name': frame_name,
                         'image_url': image_url,
                         'image_width': image_width,
                         'image_height': image_height,
                         'type': 'image',
+                        'llm_status': llm_status,
                     }
                 )
 

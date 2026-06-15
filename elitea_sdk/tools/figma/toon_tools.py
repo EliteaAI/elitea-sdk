@@ -41,6 +41,7 @@ Flow markers:
 
 import re
 import logging
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Any
 from pydantic import BaseModel, Field, create_model
 
@@ -1975,12 +1976,19 @@ def process_page_to_toon_data(
 # LLM Analysis Functions
 # -----------------------------------------------------------------------------
 
+@dataclass
+class FrameAnalysisResult:
+    """Result of frame analysis with LLM status tracking."""
+    explanation: Optional[ScreenExplanation] = None
+    llm_status: str = 'success'
+
+
 def analyze_frame_with_llm(
     frame_data: Dict,
     llm: Any,
     toon_serializer: Optional['TOONSerializer'] = None,
     image_url: Optional[str] = None,
-) -> Optional[ScreenExplanation]:
+) -> FrameAnalysisResult:
     """
     Analyze a single frame using LLM with structured output.
 
@@ -1994,13 +2002,14 @@ def analyze_frame_with_llm(
         image_url: Optional URL to frame image for vision-based analysis
 
     Returns:
-        ScreenExplanation model or None if analysis fails
+        FrameAnalysisResult with explanation and llm_status
     """
     if not llm:
-        return None
+        return FrameAnalysisResult(explanation=None, llm_status='no llm configured')
 
     frame_name = frame_data.get('name', 'Unknown')
     frame_id = frame_data.get('id', '')
+    fallback_error: Optional[str] = None
 
     # Try vision-based analysis first if image available
     if image_url:
@@ -2022,9 +2031,10 @@ def analyze_frame_with_llm(
             )
             result = structured_llm.invoke([message])
             if result:
-                return result
+                return FrameAnalysisResult(explanation=result, llm_status='success')
         except Exception as e:
             # Vision analysis failed - fall back to text-based
+            fallback_error = f"vision fallback: {type(e).__name__}: {e}"
             logging.warning(f"Vision analysis failed for {frame_name}, falling back to text: {type(e).__name__}: {e}")
 
     # Text-based analysis (fallback or primary if no image)
@@ -2043,11 +2053,17 @@ def analyze_frame_with_llm(
 
         structured_llm = llm.with_structured_output(ScreenExplanation)
         result = structured_llm.invoke(prompt)
-        return result
+
+        # Return with fallback error if vision failed but text succeeded
+        llm_status = fallback_error if fallback_error else 'success'
+        return FrameAnalysisResult(explanation=result, llm_status=llm_status)
 
     except Exception as e:
         logging.warning(f"LLM frame analysis failed for {frame_name}: {type(e).__name__}: {e}")
-        return None
+        error_msg = f"text analysis failed: {type(e).__name__}: {e}"
+        if fallback_error:
+            error_msg = f"{fallback_error}; {error_msg}"
+        return FrameAnalysisResult(explanation=None, llm_status=error_msg)
 
 
 def analyze_file_with_llm(
