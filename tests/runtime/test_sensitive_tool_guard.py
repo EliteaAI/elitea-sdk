@@ -423,10 +423,10 @@ def test_sensitive_tool_guard_continuation_guidance_keeps_tool_loop_open():
     )
 
     assert 'only this exact call was skipped' in enriched['continuation_message']
-    assert 'next item' in enriched['continuation_message']
+    assert 'available again in the next step' in enriched['continuation_message']
     assert 'independent review' in enriched['continuation_message']
-    assert 'Pick up the task exactly where this block left it' in enriched['continuation_hint']
-    assert 'specific arguments just attempted' in enriched['continuation_hint']
+    assert 'invocation-scoped, not tool-scoped' in enriched['continuation_hint']
+    assert 'callable again in the next step' in enriched['continuation_hint']
     assert 'do not ask the user for direction unless every remaining tool path is exhausted' in enriched['continuation_hint']
 
 

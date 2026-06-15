@@ -1133,8 +1133,8 @@ class LLMNode(BaseTool):
         prompt_parts.append(
             f"This is a continuation turn after the blocked action(s): {blocked_summary}.\n"
             "IMPORTANT: the block is invocation-scoped — only that exact call with those exact arguments was skipped. "
-            "The tool is still available. If the task has more items (next file, next record, next step), "
-            "call the tool now with the next item's data from context.\n"
+            "In this immediate step use other available tools to advance the task. "
+            "The same tool will be available again in the next step and can be called for subsequent items with different, contextually relevant data.\n"
             "Do NOT stop, do NOT ask the user, do NOT restate what was blocked. Execute the next step."
         )
         return '\n\n'.join(prompt_parts)
@@ -1174,16 +1174,15 @@ class LLMNode(BaseTool):
         )
         enriched_payload['continuation_message'] = enriched_payload.get('continuation_message') or (
             f"The action '{action_label}' was blocked for this specific invocation — only this exact call was skipped. "
-            "The tool itself is NOT blocked: if the task has remaining items (more files to create, more records to update, etc.), "
-            "call the same tool again with the next item's data from context. "
-            "Do not stop at this block. Advance to the next step or next item in the sequence. "
+            "The tool itself is not permanently blocked. "
+            "In this immediate step, continue with other available tools to advance the task. "
+            "The same tool will be available again in the next step and can be called for subsequent items with different, contextually relevant data from context. "
             "If another sensitive tool is needed it will receive its own independent review. "
-            "Only explain to the user when all remaining task steps are exhausted."
+            "Only explain to the user when all remaining task steps across all available tools are exhausted."
         )
         enriched_payload['continuation_hint'] = enriched_payload.get('continuation_hint') or (
-            "Pick up the task exactly where this block left it. "
-            "The block applies only to the specific arguments just attempted, not to the tool. "
-            "If work items remain in the sequence, call the same tool now with the next relevant data from context. "
+            "This block is invocation-scoped, not tool-scoped. "
+            "Continue the current step with other available tools; the same tool will be callable again in the next step for subsequent items in the sequence. "
             "Keep driving toward task completion; do not ask the user for direction unless every remaining tool path is exhausted."
         )
 
