@@ -321,9 +321,15 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
     SUBFRAME_EXTRACT_THRESHOLD: ClassVar[int] = 15000
 
     # Max dimension for scaling images to fit Claude's 8000px limit.
-    # Set to 7800 (not 8000) because Figma API sometimes returns images slightly
-    # larger than requested due to rounding, and Claude rejects images >8000px.
-    SCALE_TO_LIMIT_THRESHOLD: ClassVar[int] = 7800
+    # User sets the desired limit (e.g., 8000), and the effective value is calculated
+    # as 98% to account for Figma API sometimes returning images slightly larger than requested.
+    SCALE_TO_LIMIT_THRESHOLD: ClassVar[int] = 8000
+    SCALE_MARGIN_PERCENT: ClassVar[float] = 0.02  # 2% safety margin
+
+    @classmethod
+    def get_effective_scale_threshold(cls) -> int:
+        """Return effective scale threshold with 2% safety margin."""
+        return int(cls.SCALE_TO_LIMIT_THRESHOLD * (1 - cls.SCALE_MARGIN_PERCENT))
 
     token: Optional[SecretStr] = Field(default=None)
     oauth2: Optional[SecretStr] = Field(default=None)
@@ -422,6 +428,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         index_granularity: Optional[Literal['node', 'toon']] = None,
         image_max_dimension: Optional[int] = None,
         frame_spatial_order: Optional[bool] = None,
+        subframe_extract_threshold: Optional[int] = None,
+        scale_to_limit_threshold: Optional[int] = None,
         **kwargs,
     ) -> Generator[Document, None, None]:
         """Base loader used by the indexer tool.
@@ -448,6 +456,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 left-to-right). Default: True.
         """
         self._init_indexing_stats()
+
+        # Log model name used for indexing
+        model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'unknown'
+        logging.info(f"Starting Figma index_data with LLM model: {model_name}")
+
         if not urls_or_file_keys:
             raise ValueError("You must provide urls_or_file_keys with at least one URL or file key.")
 
@@ -502,9 +515,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 'figma_pages_exclude': node_ids_exclude or [],
                 'figma_nodes_include': node_types_include or [],
                 'figma_nodes_exclude': node_types_exclude or [],
-                'index_granularity': index_granularity or 'node',
+                'index_granularity': index_granularity or 'toon',
                 'image_max_dimension': image_max_dimension if image_max_dimension is not None else 2000,
                 'frame_spatial_order': frame_spatial_order if frame_spatial_order is not None else True,
+                'subframe_extract_threshold': subframe_extract_threshold if subframe_extract_threshold is not None else self.SUBFRAME_EXTRACT_THRESHOLD,
+                'scale_to_limit_threshold': scale_to_limit_threshold if scale_to_limit_threshold is not None else self.SCALE_TO_LIMIT_THRESHOLD,
             }
 
             if metadata_threads_override is not None:
@@ -973,7 +988,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             Strategy string: 'normal', 'scale_to_limit', or 'extract_subframes'
         """
         if scale_threshold is None:
-            scale_threshold = self.SCALE_TO_LIMIT_THRESHOLD
+            scale_threshold = self.get_effective_scale_threshold()
         if extract_threshold is None:
             extract_threshold = self.SUBFRAME_EXTRACT_THRESHOLD
 
@@ -1018,7 +1033,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             Each child has a 'strategy' field indicating how it should be processed.
         """
         if scale_threshold is None:
-            scale_threshold = self.SCALE_TO_LIMIT_THRESHOLD
+            scale_threshold = self.get_effective_scale_threshold()
         if extract_threshold is None:
             extract_threshold = self.SUBFRAME_EXTRACT_THRESHOLD
 
@@ -1134,12 +1149,14 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         pages: List[Dict],
         max_frames: int = 50,
         debug_logger: Optional[logging.Logger] = None,
+        subframe_extract_threshold: Optional[int] = None,
+        scale_to_limit_threshold: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, str]]:
         """
         Collect frames with subframe extraction and compute scaled image URLs.
 
         This method applies frame-level optimizations for analyze_file:
-        - Subframe extraction for large frames (>15000px)
+        - Subframe extraction for large frames (>extract_threshold px)
         - Adaptive scaling for images
         - Vector/connector skipping
         - Spatial ordering
@@ -1149,6 +1166,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             pages: List of page nodes to process
             max_frames: Maximum frames to collect (default 50)
             debug_logger: Optional logger for debug output
+            subframe_extract_threshold: Override for SUBFRAME_EXTRACT_THRESHOLD
+            scale_to_limit_threshold: Override for SCALE_TO_LIMIT_THRESHOLD
 
         Returns:
             Tuple of:
@@ -1164,9 +1183,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         scale_groups: Dict[str, List[str]] = {}  # scale_str -> [node_ids]
         frame_scales: Dict[str, float] = {}  # node_id -> scale
 
-        scale_threshold = self.SCALE_TO_LIMIT_THRESHOLD
-        extract_threshold = self.SUBFRAME_EXTRACT_THRESHOLD
-        log.info(f"Scale threshold: {scale_threshold}px, Extract threshold: {extract_threshold}px")
+        # Use provided thresholds or fall back to class constants
+        effective_scale_limit = scale_to_limit_threshold if scale_to_limit_threshold is not None else self.SCALE_TO_LIMIT_THRESHOLD
+        scale_threshold = int(effective_scale_limit * (1 - self.SCALE_MARGIN_PERCENT))
+        extract_threshold = subframe_extract_threshold if subframe_extract_threshold is not None else self.SUBFRAME_EXTRACT_THRESHOLD
+        log.info(f"Scale threshold: {scale_threshold}px (from limit {effective_scale_limit}), Extract threshold: {extract_threshold}px")
 
         def add_to_scale_group(node_id: str, scale: float):
             """Helper to add a frame to scale groups for batch fetching."""
@@ -1600,18 +1621,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"{len(chunk_result.failed)} failed"
         )
 
-        # Log detailed debug info after bisection completes
-        logging.debug(
-            f"Bisection complete for file {file_key}:\n"
-            f"  - Total items requested: {len(image_nodes)}\n"
-            f"  - API calls made: {chunk_result.api_calls}\n"
-            f"  - Splits performed: {chunk_result.splits}\n"
-            f"  - Successful: {len(chunk_result.successful)}\n"
-            f"  - Failed: {len(chunk_result.failed)}\n"
-            f"  - Successful IDs: {list(chunk_result.successful.keys())}\n"
-            f"  - Failed IDs: {chunk_result.failed}"
-        )
-
         # Track failed items as dependent items (not top-level docs)
         # These are sub-items within a parent document that still gets indexed
         for node_id in chunk_result.failed:
@@ -1645,11 +1654,17 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_types_include = [t.strip().lower() for t in document.metadata.pop('figma_nodes_include', [])]
         node_types_exclude = [t.strip().lower() for t in document.metadata.pop('figma_nodes_exclude', [])]
 
+        # Extract threshold parameters (with fallback to class constants)
+        subframe_extract_threshold = document.metadata.pop('subframe_extract_threshold', self.SUBFRAME_EXTRACT_THRESHOLD)
+        scale_to_limit_threshold = document.metadata.pop('scale_to_limit_threshold', self.SCALE_TO_LIMIT_THRESHOLD)
+
         # Route based on granularity level
-        granularity = document.metadata.pop('index_granularity', 'node')
+        granularity = document.metadata.pop('index_granularity', 'toon')
         if granularity == 'toon':
             yield from self._process_toon_level(
-                document, figma_pages, node_types_include, node_types_exclude, prompt
+                document, figma_pages, node_types_include, node_types_exclude, prompt,
+                subframe_extract_threshold=subframe_extract_threshold,
+                scale_to_limit_threshold=scale_to_limit_threshold,
             )
         else:
             yield from self._process_node_level(
@@ -1824,6 +1839,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_types_include: List[str],
         node_types_exclude: List[str],
         prompt: str = "",
+        subframe_extract_threshold: Optional[int] = None,
+        scale_to_limit_threshold: Optional[int] = None,
     ) -> Generator[Document, None, None]:
         """
         Process document at TOON level - structured TOON format with LLM analysis.
@@ -1949,6 +1966,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 pages=[page_node],
                 max_frames=max_frames_per_page,
                 debug_logger=log,
+                subframe_extract_threshold=subframe_extract_threshold,
+                scale_to_limit_threshold=scale_to_limit_threshold,
             )
 
             # Process frames to TOON data
@@ -1981,6 +2000,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 frame_name = frame.get('name', 'Untitled')
                 image_url = leaf_image_urls.get(frame_id, '')
 
+                # Extract original image size from frame bounds
+                frame_size = frame.get('size', {})
+                image_width = int(frame_size.get('w', 0))
+                image_height = int(frame_size.get('h', 0))
+
                 # LLM analysis
                 explanation = None
                 if self.llm:
@@ -2006,6 +2030,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                         'frame_id': frame_id,
                         'frame_name': frame_name,
                         'image_url': image_url,
+                        'image_width': image_width,
+                        'image_height': image_height,
                         'type': 'image',
                     }
                 )
@@ -2105,14 +2131,28 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 ),
                 default=None,
             )),
-            'index_granularity': (Optional[Literal['node', 'toon']], Field(
+            # 'index_granularity': (Optional[Literal['node', 'toon']], Field(
+            #     description=(
+            #         "Controls the level at which content is indexed. "
+            #         "'toon' (default): TOON format with LLM analysis - outputs leaf frame documents only. "
+            #         "'node': One document per node (image/text) - most granular, no LLM analysis."
+            #     ),
+            #     default='toon',
+            # )),
+            'scale_to_limit_threshold': (Optional[int], Field(
                 description=(
-                    "Controls the level at which content is indexed. "
-                    "'node' (default): One document per node (image/text) - most granular. "
-                    "'toon': TOON format with LLM analysis - outputs file overview, page documents with FLOWS/VARIANTS, "
-                    "and frame documents with nested subframes."
+                    "Maximum image dimension (in pixels) to meet LLM vision requirements. "
+                    "Frames larger than this will be scaled down. A 2% safety margin is applied automatically."
                 ),
-                default='node',
+                default=self.SCALE_TO_LIMIT_THRESHOLD,
+            )),
+            'subframe_extract_threshold': (Optional[int], Field(
+                description=(
+                    "Frames larger than this dimension (in pixels) will have their subframes extracted "
+                    "and processed individually. Frames between this size and scale_to_limit_threshold "
+                    "will be scaled down to fit the limit."
+                ),
+                default=self.SUBFRAME_EXTRACT_THRESHOLD,
             )),
         }
 
