@@ -376,7 +376,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         tool['type'] in ignored_mcp_servers
                         or server_name in ignored_mcp_servers
                     ):
-                        logger.info("[MCP Auth] Skipping ignored pre-configured MCP server")
+                        logger.info(f"[MCP Auth] Skipping ignored pre-configured MCP: server_name={server_name}")
                         continue
 
                     toolkit_name = tool.get('toolkit_name', '') or server_name
