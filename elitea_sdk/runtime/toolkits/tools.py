@@ -372,6 +372,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         logger.error(f"❌ No server_name found for mcp_config toolkit: {tool}")
                         continue
 
+                    if ignored_mcp_servers and (
+                        tool['type'] in ignored_mcp_servers
+                        or server_name in ignored_mcp_servers
+                    ):
+                        logger.info(f"[MCP Auth] Skipping ignored pre-configured MCP: type={tool['type']}, server_name={server_name}")
+                        continue
+
                     toolkit_name = tool.get('toolkit_name', '') or server_name
                     selected_tools = settings.get('selected_tools', [])
                     excluded_tools = settings.get('excluded_tools', [])
