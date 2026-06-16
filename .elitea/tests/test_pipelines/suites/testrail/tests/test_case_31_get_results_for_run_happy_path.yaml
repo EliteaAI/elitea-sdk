@@ -63,28 +63,21 @@ nodes:
     transition: extract_run_id
 
   - id: extract_run_id
-    type: llm
-    model: gpt-4o-2024-11-20
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        raw = elitea_state.get("runs_result", "")
+        value = ""
+        if isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], dict) and "id" in raw[0]:
+            value = str(raw[0]["id"])
+        else:
+            m = re.search(r"id\W+(\d+)", str(raw))
+            value = m.group(1) if m else ""
+        {"run_id": value}
     input:
       - runs_result
-    input_mapping:
-      system:
-        type: fixed
-        value: "You are a JSON data extractor."
-      task:
-        type: fstring
-        value: |
-          Extract a single test run ID from the list of runs.
-
-          Runs Result: {runs_result}
-
-          Find the first run object and extract its "id" field.
-          Return ONLY the numeric run ID as a plain string with no additional text or formatting.
-
-          Example: If the first run is {{"id": 42, "name": "Sprint 1"}}, return: 42
-      chat_history:
-        type: fixed
-        value: []
     output:
       - run_id
     structured_output: true
@@ -111,7 +104,6 @@ nodes:
 
   - id: validate_result
     type: llm
-    model: gpt-4o-2024-11-20
     input:
       - tool_result
     input_mapping:

@@ -96,6 +96,15 @@ class TestFilterHandling:
         assert isinstance(result, ToolException)
         assert "must be a JSON string or dictionary" in str(result)
 
+    @pytest.mark.parametrize("bad", ["[1, 2]", "5", '"hi"', "null"])
+    def test_json_string_parsing_to_non_object_returns_tool_exception(self, wrapper, bad):
+        """A result_filter that is valid JSON but not an object must not crash with TypeError."""
+        result = wrapper.get_results_for_run("10", result_filter=bad)
+
+        assert isinstance(result, ToolException)
+        assert "must be a JSON object" in str(result)
+        wrapper._client.results.get_results_for_run_bulk.assert_not_called()
+
 
 class TestResponseShapeAndFormats:
     def test_handles_bare_list(self, wrapper):
@@ -141,13 +150,26 @@ class TestEmptyAndErrorsAndProjection:
         assert isinstance(out, ToolException)
         assert "TestRail API error 400" in str(out)
 
-    def test_only_allowlisted_fields_returned(self, wrapper):
+    def test_non_allowlisted_non_custom_fields_dropped(self, wrapper):
         result = _result(1)
-        result["custom_step_results"] = [{"x": 1}]  # not in allowlist
+        result["created_by_avatar"] = "http://x"  # not in allowlist, not custom -> dropped
         wrapper._client.results.get_results_for_run_bulk.return_value = [result]
         out = wrapper.get_results_for_run("10")
-        assert "custom_step_results" not in out
+        assert "created_by_avatar" not in out
         assert "result-1" in out
+
+    def test_custom_fields_pass_through(self, wrapper):
+        result = _result(1)
+        result["custom_severity"] = "high"
+        wrapper._client.results.get_results_for_run_bulk.return_value = [result]
+        out = wrapper.get_results_for_run("10")
+        assert "custom_severity" in out and "high" in out
+
+    def test_created_on_rendered_as_iso(self, wrapper):
+        wrapper._client.results.get_results_for_run_bulk.return_value = [_result(1, created_on=1700000000)]
+        out = wrapper.get_results_for_run("10")
+        assert "2023-11-14T22:13:20+00:00" in out
+        assert "1700000000" not in out
 
 
 class TestGetResultsForCase:

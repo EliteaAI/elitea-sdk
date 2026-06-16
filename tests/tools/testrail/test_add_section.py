@@ -116,6 +116,14 @@ class TestAddSectionErrorPaths:
 
         wrapper._client.sections.add_section.assert_not_called()
 
+    @pytest.mark.parametrize("bad", ["[1, 2]", "5", '"hi"', "null"])
+    def test_json_parsing_to_non_object_raises_tool_exception(self, wrapper, bad):
+        """section_properties that is valid JSON but not an object must not crash with TypeError."""
+        with pytest.raises(ToolException, match="section_properties must be a JSON object"):
+            wrapper.add_section(project_id="10", name="Bad", section_properties=bad)
+
+        wrapper._client.sections.add_section.assert_not_called()
+
     def test_status_code_error_raises_tool_exception(self, wrapper):
         """A StatusCodeError from the API is wrapped in a ToolException."""
         wrapper._client.sections.add_section.side_effect = _status_code_error(

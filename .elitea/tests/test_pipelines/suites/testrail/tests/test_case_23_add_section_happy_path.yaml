@@ -57,28 +57,21 @@ nodes:
     transition: extract_suite_id
 
   - id: extract_suite_id
-    type: llm
-    model: gpt-4o-2024-11-20
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        raw = elitea_state.get("suites_result", "")
+        value = ""
+        if isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], dict) and "id" in raw[0]:
+            value = str(raw[0]["id"])
+        else:
+            m = re.search(r"id\W+(\d+)", str(raw))
+            value = m.group(1) if m else ""
+        {"suite_id": value}
     input:
       - suites_result
-    input_mapping:
-      system:
-        type: fixed
-        value: "You are a JSON data extractor."
-      task:
-        type: fstring
-        value: |
-          Extract a single suite ID from the list of suites.
-
-          Suites Result: {suites_result}
-
-          Find the first suite object and extract its "id" field.
-          Return ONLY the numeric suite ID as a plain string with no additional text.
-
-          Example: If the first suite is {{"id": 6, "name": "Master"}}, return: 6
-      chat_history:
-        type: fixed
-        value: []
     output:
       - suite_id
     structured_output: true
@@ -108,28 +101,17 @@ nodes:
     transition: extract_section_id
 
   - id: extract_section_id
-    type: llm
-    model: gpt-4o-2024-11-20
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        raw = elitea_state.get("tool_result", "")
+        m = re.search(r"id\W+(\d+)", str(raw))
+        value = m.group(1) if m else ""
+        {"created_section_id": value}
     input:
       - tool_result
-    input_mapping:
-      system:
-        type: fixed
-        value: "You are a JSON data extractor."
-      task:
-        type: fstring
-        value: |
-          Extract the section ID from the tool result.
-
-          Tool Result: {tool_result}
-
-          The result looks like "New section has been created: id - 123 - 'name'".
-          Return ONLY the numeric section ID as a plain string with no additional text.
-
-          Example: If the result contains "id - 123", return: 123
-      chat_history:
-        type: fixed
-        value: []
     output:
       - created_section_id
     structured_output: true
@@ -156,7 +138,6 @@ nodes:
 
   - id: validate_result
     type: llm
-    model: gpt-4o-2024-11-20
     input:
       - tool_result
       - cleanup_result

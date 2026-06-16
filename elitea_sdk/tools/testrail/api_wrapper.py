@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union, Any, Generator
 
@@ -24,6 +25,55 @@ except ImportError:
     from elitea_sdk.langchain.interfaces.llm_processor import get_embeddings
 
 logger = logging.getLogger(__name__)
+
+
+def _output_format_field():
+    """Shared schema field for the `output_format` argument (DRY across tools)."""
+    return (
+        str,
+        Field(
+            default="json",
+            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
+        ),
+    )
+
+
+def _epoch_to_iso(value):
+    """Normalize a Unix-epoch timestamp to an ISO-8601 UTC string.
+
+    LLMs reason poorly about raw epoch ints, so timestamp fields are surfaced as
+    ISO-8601. Non-numeric, falsy (0/None) or out-of-range values pass through
+    unchanged.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value:
+        return value
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+    except (ValueError, OSError, OverflowError):
+        return value
+
+
+def _project_records(records, allowlist, fallback_key, timestamp_fields=()):
+    """Project TestRail records onto a field allowlist for consistent output.
+
+    Shared by every read tool (sections/suites/runs/results). Beyond the
+    allowlist, any TestRail custom field (custom_*) is passed through, and the
+    given timestamp fields are normalized to ISO-8601. Non-dict records become
+    {fallback_key: str(record)}.
+    """
+    timestamps = set(timestamp_fields)
+    projected_records = []
+    for record in records:
+        if isinstance(record, dict):
+            projected = {field: record[field] for field in allowlist if field in record}
+            projected.update({k: v for k, v in record.items() if k.startswith("custom_")})
+            for field in timestamps:
+                if field in projected:
+                    projected[field] = _epoch_to_iso(projected[field])
+            projected_records.append(projected)
+        else:
+            projected_records.append({fallback_key: str(record)})
+    return projected_records
 
 _case_properties_description="""
         Properties of new test case in a key-value format: testcase_field_name=testcase_field_value.
@@ -345,13 +395,7 @@ deleteCase = create_model(
 getSuites = create_model(
     "getSuites",
     project_id=(str, Field(description="Project id")),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 getSections = create_model(
@@ -366,28 +410,24 @@ getSections = create_model(
                         "If omitted in multi-suite mode, sections from all suites are returned.",
         ),
     ),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 _section_properties_description = (
-    "Optional properties of the section in a key-value format. Possible keys: "
-    ":key description: str - The description of the section. "
-    ":key suite_id: int - The ID of the test suite (ignored if the project is in "
-    "single suite mode, required otherwise). "
-    ":key parent_id: int - The ID of the parent section (to build section hierarchies)."
+    "Optional properties of the section. Supported keys: "
+    "- description (str): the description of the section. "
+    "- suite_id (int): the ID of the test suite (ignored in single-suite mode, required otherwise). "
+    "- parent_id (int): the ID of the parent section, to build section hierarchies."
 )
 
 addSection = create_model(
     "addSection",
     project_id=(str, Field(description="Project id the section belongs to")),
     name=(str, Field(description="Name of the new section")),
-    section_properties=(str, Field(description="JSON string of section properties. " + _section_properties_description, default="{}")),
+    section_properties=(
+        Optional[Union[str, dict]],
+        Field(description="Section properties as a JSON string or dict. " + _section_properties_description, default="{}"),
+    ),
 )
 
 deleteSection = create_model(
@@ -403,55 +443,45 @@ deleteSection = create_model(
 )
 
 _run_filter_description = (
-    "Optional JSON (as a string or dictionary) of filters for the test runs. "
-    "Supported keys: "
-    ":key created_after: int - Only return runs created after this UNIX timestamp. "
-    ":key created_before: int - Only return runs created before this UNIX timestamp. "
-    ":key created_by: list[int] or comma-separated string - Filter by creator user IDs. "
-    ":key is_completed: int/bool - 1/True for completed runs only, 0/False for active runs only. "
-    ":key limit: int - Limit the number of runs returned. "
-    ":key offset: int - Skip this many runs (for paging). "
-    ":key milestone_id: list[int] or comma-separated string - Filter by milestone IDs. "
-    ":key refs_filter: str - A single Reference ID (e.g. TR-1, 4291). "
-    ":key suite_id: list[int] or comma-separated string - Filter by test suite IDs."
+    "Optional filters for the test runs, as a JSON string or dict. Supported keys: "
+    "- created_after (int): only runs created after this UNIX timestamp. "
+    "- created_before (int): only runs created before this UNIX timestamp. "
+    "- created_by (list[int] or comma-separated string): filter by creator user IDs. "
+    "- is_completed (bool or 0/1): true/1 for completed runs only, false/0 for active runs only. "
+    "- limit (int): limit the number of runs returned. "
+    "- offset (int): skip this many runs (for paging). "
+    "- milestone_id (list[int] or comma-separated string): filter by milestone IDs. "
+    "- refs_filter (str): a single Reference ID (e.g. TR-1, 4291). "
+    "- suite_id (list[int] or comma-separated string): filter by test suite IDs."
 )
 
 getRun = create_model(
     "getRun",
     run_id=(str, Field(description="Test run id")),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 getRuns = create_model(
     "getRuns",
-    project_id=(str, Field(description="Project id")),
+    project_id=(str, Field(
+        description="Project id. Only returns test runs that are NOT part of a test plan; "
+                    "use a test-plan tool for plan-bound runs."
+    )),
     run_filter=(
         Optional[Union[str, dict]],
         Field(default=None, description="[Optional] " + _run_filter_description),
     ),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 _result_filter_description = (
-    "Optional JSON (as a string or dictionary) of filters for the results. Supported keys: "
-    ":key status_id: list[int] or comma-separated string - Filter by status IDs "
+    "Optional filters for the results, as a JSON string or dict. Supported keys: "
+    "- status_id (list[int] or comma-separated string): filter by status IDs "
     "(built-in: 1 Passed, 2 Blocked, 4 Retest, 5 Failed). "
-    ":key defects_filter: str - A single Defect ID (e.g. TR-1, 4291). "
-    ":key created_after: int - Only results created after this UNIX timestamp (run-level only). "
-    ":key created_before: int - Only results created before this UNIX timestamp (run-level only). "
-    ":key created_by: list[int] or comma-separated string - Filter by creator user IDs (run-level only). "
+    "- defects_filter (str): a single Defect ID (e.g. TR-1, 4291). "
+    "- created_after (int): only results created after this UNIX timestamp (run-level only). "
+    "- created_before (int): only results created before this UNIX timestamp (run-level only). "
+    "- created_by (list[int] or comma-separated string): filter by creator user IDs (run-level only). "
     "Pagination is handled automatically; 'limit'/'offset' are ignored."
 )
 
@@ -462,13 +492,7 @@ getResultsForRun = create_model(
         Optional[Union[str, dict]],
         Field(default=None, description="[Optional] " + _result_filter_description),
     ),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 getResultsForCase = create_model(
@@ -479,13 +503,7 @@ getResultsForCase = create_model(
         Optional[Union[str, dict]],
         Field(default=None, description="[Optional] " + _result_filter_description),
     ),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 getResults = create_model(
@@ -495,13 +513,7 @@ getResults = create_model(
         Optional[Union[str, dict]],
         Field(default=None, description="[Optional] " + _result_filter_description),
     ),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
 )
 
 SUPPORTED_KEYS = {
@@ -957,17 +969,11 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             if not suites:
                 return ToolException("No test suites found for the specified project.")
 
-            suite_dicts = []
-            for suite in suites:
-                if isinstance(suite, dict):
-                    suite_dict = {}
-                    for field in ["id", "name", "description", "project_id", "is_baseline", 
-                                 "completed_on", "url", "is_master", "is_completed"]:
-                        if field in suite:
-                            suite_dict[field] = suite[field]
-                    suite_dicts.append(suite_dict)
-                else:
-                    suite_dicts.append({"suite": str(suite)})
+            suite_fields = [
+                "id", "name", "description", "project_id", "is_baseline",
+                "completed_on", "url", "is_master", "is_completed",
+            ]
+            suite_dicts = _project_records(suites, suite_fields, "suite", ("completed_on",))
             return self._to_markup(suite_dicts, output_format)
         except StatusCodeError as e:
             return ToolException(f"Unable to extract test suites: {e}")
@@ -1038,42 +1044,42 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             if not sections:
                 return ToolException("No sections found for the specified project.")
 
-            section_dicts = []
-            for section in sections:
-                if isinstance(section, dict):
-                    section_dict = {}
-                    for field in ["id", "suite_id", "name", "description",
-                                  "parent_id", "display_order", "depth"]:
-                        if field in section:
-                            section_dict[field] = section[field]
-                    section_dicts.append(section_dict)
-                else:
-                    section_dicts.append({"section": str(section)})
+            section_fields = [
+                "id", "suite_id", "name", "description", "parent_id", "display_order", "depth",
+            ]
+            section_dicts = _project_records(sections, section_fields, "section")
             return self._to_markup(section_dicts, output_format)
         except StatusCodeError as e:
             return ToolException(self._format_status_error(e))
 
-    def add_section(self, project_id: str, name: str, section_properties: str = "{}"):
+    def add_section(self, project_id: str, name: str, section_properties: Union[str, dict] = "{}"):
         """Adds a new section into Testrail per defined parameters.
+
         Parameters:
-            project_id: str - the project id the section belongs to.
-            name: str - the name of the new section.
-            section_properties: dict[str, str] - optional properties of the new section:
-                :key description: str
-                    The description of the section
-                :key suite_id: int
-                    The ID of the test suite (ignored if the project is in single
-                    suite mode, required otherwise)
-                :key parent_id: int
-                    The ID of the parent section (to build section hierarchies)
+            project_id (str): the project id the section belongs to.
+            name (str): the name of the new section.
+            section_properties (str | dict): optional properties of the new section:
+                - description (str): the description of the section.
+                - suite_id (int): the ID of the test suite (ignored in single-suite
+                  mode, required otherwise).
+                - parent_id (int): the ID of the parent section, to build hierarchies.
         """
         try:
             props = json.loads(section_properties) if isinstance(section_properties, str) else (section_properties or {})
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ToolException(f"Invalid JSON in section_properties: {e}")
+        if not isinstance(props, dict):
+            raise ToolException(
+                f"section_properties must be a JSON object, got {type(props).__name__}."
+            )
+        try:
+            self._log_tool_event(
+                message=f"Adding section '{name}' to project #{project_id}",
+                tool_name='add_section'
+            )
             created_section = self._client.sections.add_section(
                 project_id=project_id, name=name, **props
             )
-        except (json.JSONDecodeError, ValueError) as e:
-            raise ToolException(f"Invalid JSON in section_properties: {e}")
         except StatusCodeError as e:
             raise ToolException(f"Unable to add new section {e}")
         return f"New section has been created: id - {created_section['id']} - '{created_section['name']}'"
@@ -1124,27 +1130,29 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Error deleting section #{section_id}: {str(e)}")
 
     @staticmethod
+    def _coerce_bool_flag(value) -> int:
+        """Coerce a bool / int / string flag to TestRail's expected 0/1 int."""
+        if isinstance(value, str):
+            value = value.strip().lower() in ("1", "true", "yes")
+        return int(bool(value))
+
+    @staticmethod
     def _to_run_dicts(runs: List[Dict]) -> List[Dict]:
-        """Projects each run onto a fixed field allowlist for consistent output."""
+        """Projects each run onto a field allowlist (+ custom_*, ISO timestamps)."""
         run_fields = [
             "id", "suite_id", "name", "description", "milestone_id", "assignedto_id",
             "include_all", "is_completed", "completed_on", "passed_count", "blocked_count",
             "untested_count", "retest_count", "failed_count", "project_id", "plan_id",
             "created_on", "created_by", "refs", "url",
         ]
-        run_dicts = []
-        for run in runs:
-            if isinstance(run, dict):
-                run_dicts.append({field: run[field] for field in run_fields if field in run})
-            else:
-                run_dicts.append({"run": str(run)})
-        return run_dicts
+        return _project_records(runs, run_fields, "run", ("created_on", "completed_on"))
 
     def get_run(self, run_id: str, output_format: str = "json") -> Union[str, ToolException]:
         """Extracts a single test run from Testrail.
 
         Note: this returns the run's metadata and status counts. For the list of
-        tests contained in the run, use the test-listing tools.
+        tests contained in the run, use the test-listing tools. The run is returned
+        as a single-element list in the chosen format (e.g. JSON shows `[{...}]`).
         """
         try:
             run = self._client.runs.get_run(run_id=int(run_id))
@@ -1164,16 +1172,30 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         {"is_completed": 0} for active runs or {"suite_id": 6} for a specific suite.
         """
         try:
+            int(project_id)
+        except (ValueError, TypeError):
+            return ToolException(f"project_id must be numeric, got: {project_id!r}")
+
+        try:
             if run_filter is None:
                 params = {}
             elif isinstance(run_filter, str):
                 params = json.loads(run_filter)
             elif isinstance(run_filter, dict):
-                params = run_filter
+                params = dict(run_filter)
             else:
                 return ToolException("run_filter must be a JSON string or dictionary.")
         except (ValueError, json.JSONDecodeError) as e:
             return ToolException(f"Invalid parameter for run_filter: {e}")
+
+        if not isinstance(params, dict):
+            return ToolException(
+                f"run_filter must be a JSON object of filters, got {type(params).__name__}."
+            )
+
+        # TestRail's REST API expects is_completed as 0/1; coerce bool/str forms.
+        if "is_completed" in params:
+            params["is_completed"] = self._coerce_bool_flag(params["is_completed"])
 
         try:
             response = self._client.runs.get_runs(project_id=project_id, **params)
@@ -1188,18 +1210,12 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
     @staticmethod
     def _to_result_dicts(results: List[Dict]) -> List[Dict]:
-        """Projects each test result onto a fixed field allowlist for consistent output."""
+        """Projects each test result onto a field allowlist (+ custom_*, ISO timestamps)."""
         result_fields = [
             "id", "test_id", "status_id", "comment", "version", "elapsed", "defects",
             "assignedto_id", "created_by", "created_on", "attachment_ids",
         ]
-        result_dicts = []
-        for result in results:
-            if isinstance(result, dict):
-                result_dicts.append({field: result[field] for field in result_fields if field in result})
-            else:
-                result_dicts.append({"result": str(result)})
-        return result_dicts
+        return _project_records(results, result_fields, "result", ("created_on",))
 
     def _read_results(self, fetcher, result_filter, output_format) -> Union[str, ToolException]:
         """Shared parse/fetch/render path for the get_results* tools.
@@ -1218,6 +1234,11 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 return ToolException("result_filter must be a JSON string or dictionary.")
         except (ValueError, json.JSONDecodeError) as e:
             return ToolException(f"Invalid parameter for result_filter: {e}")
+
+        if not isinstance(params, dict):
+            return ToolException(
+                f"result_filter must be a JSON object of filters, got {type(params).__name__}."
+            )
 
         # The *_bulk endpoints handle pagination internally; drop paging keys so
         # they don't interfere with the bulk loop.

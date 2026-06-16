@@ -107,6 +107,15 @@ class TestGetRunsFilter:
         assert isinstance(result, ToolException)
         assert "must be a JSON string or dictionary" in str(result)
 
+    @pytest.mark.parametrize("bad", ["[1, 2]", "5", '"hi"', "null", "true"])
+    def test_json_string_parsing_to_non_object_returns_tool_exception(self, wrapper, bad):
+        """A run_filter that is valid JSON but not an object must not crash with TypeError."""
+        result = wrapper.get_runs(project_id="10", run_filter=bad)
+
+        assert isinstance(result, ToolException)
+        assert "must be a JSON object" in str(result)
+        wrapper._client.runs.get_runs.assert_not_called()
+
 
 class TestGetRunsOutputFormats:
     def _arrange(self, wrapper):
@@ -156,17 +165,65 @@ class TestGetRunsEmptyAndErrors:
 
 
 class TestGetRunsFieldProjection:
-    def test_only_allowlisted_fields_are_returned(self, wrapper):
+    def test_non_allowlisted_non_custom_fields_dropped(self, wrapper):
         run = _run(1)
-        run["config_ids"] = [1, 2, 3]  # not in allowlist
-        run["custom_status1_count"] = 9  # not in allowlist
+        run["config_ids"] = [1, 2, 3]  # not in allowlist, not custom -> dropped
         wrapper._client.runs.get_runs.return_value = [run]
 
         result = wrapper.get_runs(project_id="10")
 
         assert "config_ids" not in result
-        assert "custom_status1_count" not in result
         assert "run-1" in result
+
+    def test_custom_fields_pass_through(self, wrapper):
+        run = _run(1)
+        run["custom_status1_count"] = 9
+        run["custom_env"] = "staging"
+        wrapper._client.runs.get_runs.return_value = [run]
+
+        result = wrapper.get_runs(project_id="10")
+
+        assert "custom_status1_count" in result
+        assert "custom_env" in result and "staging" in result
+
+
+class TestGetRunsTimestampNormalization:
+    def test_created_on_rendered_as_iso(self, wrapper):
+        wrapper._client.runs.get_runs.return_value = [_run(1, created_on=1700000000)]
+
+        result = wrapper.get_runs(project_id="10")
+
+        assert "2023-11-14T22:13:20+00:00" in result
+        assert "1700000000" not in result
+
+    def test_null_completed_on_passes_through(self, wrapper):
+        wrapper._client.runs.get_runs.return_value = [_run(1, completed_on=None)]
+
+        result = wrapper.get_runs(project_id="10")
+
+        assert "run-1" in result  # no crash on None timestamp
+
+
+class TestGetRunsIsCompletedCoercion:
+    @pytest.mark.parametrize("value,expected", [
+        (True, 1), (False, 0), ("true", 1), ("false", 0),
+        ("1", 1), ("0", 0), (1, 1), (0, 0),
+    ])
+    def test_is_completed_coerced_to_int(self, wrapper, value, expected):
+        wrapper._client.runs.get_runs.return_value = []
+
+        wrapper.get_runs(project_id="10", run_filter={"is_completed": value})
+
+        assert wrapper._client.runs.get_runs.call_args.kwargs["is_completed"] == expected
+
+
+class TestGetRunsProjectIdGuard:
+    def test_non_numeric_project_id_returns_tool_exception(self, wrapper):
+        result = wrapper.get_runs(project_id="abc")
+
+        assert isinstance(result, ToolException)
+        assert "project_id must be numeric" in str(result)
+        wrapper._client.runs.get_runs.assert_not_called()
 
 
 class TestGetRun:
