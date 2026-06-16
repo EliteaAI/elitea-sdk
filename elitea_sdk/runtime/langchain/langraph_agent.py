@@ -2190,35 +2190,53 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             elif (printer_output := result.get(PRINTER_NODE_RS)) == PRINTER_COMPLETED_STATE:
                 # Printer completed, extract last AI message
                 messages = result['messages']
-                output = next(
-                    (normalize_message_content(msg.content) for msg in reversed(messages)
-                     if not isinstance(msg, HumanMessage)),
-                    normalize_message_content(messages[-1].content) if messages else None
-                ) if messages else result.get('output')
+                # Skip messages whose normalized content is empty (Sonnet 4.5/4.6 returns
+                # AIMessage(content=[]) in synthesis turns — issue #5057).
+                output = None
+                for _msg in reversed(messages):
+                    if isinstance(_msg, HumanMessage):
+                        continue
+                    _normed = normalize_message_content(_msg.content).strip()
+                    if _normed:
+                        output = _normed
+                        break
+                if output is None:
+                    output = (
+                        normalize_message_content(messages[-1].content) if messages else None
+                    ) if messages else result.get('output')
             elif printer_output is not None:
                 # Printer node has output (interrupted state)
                 output = normalize_message_content(printer_output) if not isinstance(printer_output, str) else printer_output
             else:
-                # No printer node, extract last AI message from messages
+                # No printer node, extract last non-Human message with non-empty content.
+                # Skip messages whose normalized content is empty — Sonnet 4.5/4.6 returns
+                # AIMessage(content=[]) in synthesis turns after tool calls (issue #5057).
                 messages = result.get('messages', [])
-                output = next(
-                    (normalize_message_content(msg.content) for msg in reversed(messages)
-                     if not isinstance(msg, HumanMessage)),
-                    None
-                )
+                output = None
+                for _msg in reversed(messages):
+                    if isinstance(_msg, HumanMessage):
+                        continue
+                    _normed = normalize_message_content(_msg.content).strip()
+                    if _normed:
+                        output = _normed
+                        break
         except Exception as exc:
             logger.warning("[OUTPUT] Exception during output extraction: %s", exc, exc_info=True)
             # If pipeline was blocked, we already have the output — use it
             if _blocked_output is not None:
                 output = _blocked_output
             else:
-                # Fallback: try to extract from messages first, then last state value
+                # Fallback: try to extract from messages first, then last state value.
+                # Skip messages whose normalized content is empty (issue #5057).
                 messages = result.get('messages', []) if isinstance(result, dict) else []
-                output = next(
-                    (normalize_message_content(msg.content) for msg in reversed(messages)
-                     if hasattr(msg, 'content') and not isinstance(msg, HumanMessage)),
-                    None,
-                )
+                output = None
+                for _msg in reversed(messages):
+                    if not hasattr(_msg, 'content') or isinstance(_msg, HumanMessage):
+                        continue
+                    _normed = normalize_message_content(_msg.content).strip()
+                    if _normed:
+                        output = _normed
+                        break
                 if output is None:
                     output = str(list(result.values())[-1]) if result else 'Output is undefined'
         config_state = self.get_state(config)
@@ -2271,7 +2289,10 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             # falling back to the sentinel string.
             output = extract_state_fallback_output(state_values)
 
-        final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and output is None else output
+        # Use `not output` to cover both output is None and output == '' (empty string).
+        # Sonnet 4.5/4.6 synthesis turns can produce an empty string that must fall
+        # through to the sentinel just as a None would (issue #5057).
+        final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and not output else output
 
         result_with_state = {
             "output": final_output,
