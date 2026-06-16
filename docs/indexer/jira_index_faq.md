@@ -109,7 +109,7 @@ client.issue_get_comments(issue_key)              # 1 REST call per issue
 | Flag | Default | Effect |
 |---|---|---|
 | `process_images` | `False` | When `True` (and LLM configured): runs `AttachmentResolver` + vision-LLM substitution in descriptions and comments. When `False`: skip resolver and LLM calls; image markup stays as-is. |
-| `include_comments` | `True` | When `False`: comments path skipped entirely (no `issue_get_comments`, no per-comment image work). |
+| `include_comments` | `False` | When `True`: fetch comments and emit one dependent doc per comment. When `False` (default): comments path skipped entirely (no `issue_get_comments`, no per-comment image work). |
 | `include_attachments` | `False` | When `True`: creates dependent attachment documents (binary content). Independent of `process_images`. |
 | `max_total_issues` | `1000` | Hard cap on issues fetched from JQL. Silently truncates if JQL would return more. |
 | `skip_attachment_extensions` | `[]` | Filename extensions to exclude from attachment dependent docs. |

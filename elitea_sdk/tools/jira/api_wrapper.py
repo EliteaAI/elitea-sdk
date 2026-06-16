@@ -1832,7 +1832,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         self._skipped_attachment_extensions = kwargs.get('skip_attachment_extensions', [])
         self._include_attachments = kwargs.get('include_attachments', False)
         self._included_fields = fields_to_extract.copy() if fields_to_extract else []
-        self._include_comments = kwargs.get('include_comments', True)
+        self._include_comments = kwargs.get('include_comments', False)
         self._process_images = kwargs.get('process_images', False)
         self._chunking_tool = kwargs.get('chunking_tool', None)
 
@@ -2109,8 +2109,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                                     Field(description="Whether to include attachment content in indexing",
                                           default=False)),
             'include_comments': (Optional[bool], Field(
-                description="Whether to fetch and index comments for each issue. Default is True. Set to False to skip comment fetching (and any per-comment image work) — recommended for large datasets when comment text is not required.",
-                default=True)),
+                description="Whether to fetch and index comments for each issue. Default is False to keep large-dataset indexing fast — set to True when comment text needs to be searchable. When False, comment fetching (and any per-comment image work) is skipped entirely.",
+                default=False)),
             'process_images': (Optional[bool], Field(
                 description="Whether to use a vision LLM to describe images referenced in issue descriptions and comments. Requires an LLM that supports vision. Default is False — image markup stays as-is in indexed text. Enable only when image descriptions are essential and the per-image LLM cost is acceptable.",
                 default=False)),

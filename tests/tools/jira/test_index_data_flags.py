@@ -174,12 +174,15 @@ class TestProcessDocumentCommentsGate:
 class TestIndexToolParams:
     """`include_comments` and `process_images` must be exposed on the public schema."""
 
-    def test_include_comments_present_with_default_true(self):
+    def test_include_comments_present_with_default_false(self):
+        # Defaults to False so the comments REST call (and any per-comment image
+        # work) is opt-in. Indexing 1000+ issue Jira projects with comments on
+        # by default was part of the original perf regression.
         params = JiraApiWrapper.model_construct()._index_tool_params()
 
         assert "include_comments" in params
         _, field = params["include_comments"]
-        assert field.default is True
+        assert field.default is False
 
     def test_process_images_present_with_default_false(self):
         params = JiraApiWrapper.model_construct()._index_tool_params()
