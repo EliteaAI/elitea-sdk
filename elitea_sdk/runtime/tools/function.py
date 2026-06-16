@@ -2,6 +2,8 @@ import base64
 import json
 import logging
 from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.messages import ToolCall
@@ -141,18 +143,60 @@ alita_client = elitea_client
         """Check if the current tool is a PyodideSandboxTool."""
         return self.tool.name.lower() == 'pyodide_sandbox'
 
-    def _save_code_to_artifact(self, code: str, node_name: str) -> None:
-        """Save the assembled code to the 'code-debug' artifact bucket.
+    def _build_client_preamble(self) -> str:
+        """Build the sandbox client preamble that makes the saved file standalone-executable.
 
-        Filename is ``<node_name>.py``.  The bucket is created automatically if
-        it does not yet exist (handled by SandboxArtifact.__init__).
-        Failures are logged as warnings and never propagate to interrupt execution.
+        Reads ``sandbox_client.py`` from ``runtime/clients/`` and prepends it with an
+        ``elitea_client = SandboxClient(...)`` instantiation so the saved artifact can be
+        run directly in a standard Python interpreter without the full SDK installed.
+
+        Mirrors the logic in ``PyodideSandboxTool._prepare_pyodide_input()``.
+        """
+        try:
+            sandbox_client_path = Path(__file__).parent.parent / 'clients' / 'sandbox_client.py'
+            with open(sandbox_client_path, 'r', encoding='utf-8') as f:
+                sandbox_client_code = f.read()
+            client_init = (
+                f"elitea_client = SandboxClient("
+                f"base_url='{self.elitea_client.base_url}',"
+                f"project_id={self.elitea_client.project_id},"
+                f"auth_token='<YOUR_AUTH_TOKEN>')  # TODO: replace with your token before running\n"
+            )
+            return f"#elitea simplified client\n{sandbox_client_code}\n{client_init}\n"
+        except FileNotFoundError:
+            logger.warning(
+                "[code-debug] sandbox_client.py not found — saved file will reference "
+                "undefined elitea_client; add the SandboxClient definition manually."
+            )
+            return ""
+        except Exception as exc:
+            logger.warning("[code-debug] Could not build client preamble: %s", exc)
+            return ""
+
+    def _save_code_to_artifact(self, code: str, node_name: str) -> None:
+        """Save the fully-assembled, standalone-executable code to the 'code-debug' artifact bucket.
+
+        The saved file is structured as:
+          1. ``sandbox_client.py`` contents  (SandboxClient class definition)
+          2. ``elitea_client = SandboxClient(...)``  (live credentials)
+          3. State preamble  (elitea_state dict + ``alita_client = elitea_client``)
+          4. User code
+
+        This exactly mirrors what ``PyodideSandboxTool._prepare_pyodide_input()`` injects
+        at execution time, so the saved file can be run as-is in a standard Python 3
+        interpreter (``pip install requests chardet`` is the only external dependency).
+
+        Filename is ``<node_name>__<YYYYMMDD_HHMMSS>.py`` (UTC timestamp), so every run
+        creates a new snapshot instead of overwriting the previous one.
         """
         try:
             bucket = "code-debug"
-            filename = f"{node_name}.py"
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            filename = f"{node_name}__{timestamp}.py"
+            # Prepend the client preamble so the file is fully self-contained
+            full_code = f"{self._build_client_preamble()}{code}"
             artifact = self.elitea_client.artifact(bucket)
-            result = artifact.create(filename, code.encode('utf-8'))
+            result = artifact.create(filename, full_code.encode('utf-8'))
             if 'error' in result:
                 logger.warning(
                     "[code-debug] Failed to save code artifact for node '%s': %s",
