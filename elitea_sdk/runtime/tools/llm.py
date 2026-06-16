@@ -27,7 +27,7 @@ from ..langchain.utils import (
     make_anthropic_compatible_schema,
     propagate_the_input_mapping,
 )
-from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
+from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
@@ -35,8 +35,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SENSITIVE_TOOL_BLOCKED_RESULT_TYPE = 'sensitive_tool_blocked'
-MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS = 5
-BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER = 'This is a continuation turn after the blocked action(s):'
 STRUCTURED_OUTPUT_PREFILL_PROMPT = "Now produce the structured output based on the information above."
 
 # ContextVar used by __perform_tool_calling to expose intermediate messages
@@ -911,65 +909,6 @@ class LLMNode(BaseTool):
             logger.info("Filtered %d orphaned tool_calls from message history", filtered_count)
         return cleaned_messages
 
-    @staticmethod
-    def _is_blocked_tool_continuation_nudge(message: Any) -> bool:
-        return (
-            isinstance(message, HumanMessage)
-            and BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER in str(getattr(message, 'content', '') or '')
-        )
-
-    @classmethod
-    def _strip_blocked_tool_continuation_nudges(cls, messages: List) -> List:
-        return [message for message in messages if not cls._is_blocked_tool_continuation_nudge(message)]
-
-    @classmethod
-    def _get_current_request_message_slice(cls, messages: List) -> List:
-        last_user_request_index = -1
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            if isinstance(message, HumanMessage) and not cls._is_blocked_tool_continuation_nudge(message):
-                last_user_request_index = index
-                break
-
-        if last_user_request_index >= 0:
-            return messages[last_user_request_index + 1:]
-        return messages
-
-    def _collect_blocked_tool_payloads(self, messages: List) -> List[Dict[str, Any]]:
-        payloads: List[Dict[str, Any]] = []
-        for message in self._get_current_request_message_slice(messages):
-            if not isinstance(message, ToolMessage):
-                continue
-            blocked_payload = self._parse_sensitive_tool_blocked_result(message.content)
-            if blocked_payload is not None:
-                payloads.append(blocked_payload)
-        return payloads
-
-    def _collect_blocked_tool_names(self, messages: List) -> set[str]:
-        blocked_tool_names: set[str] = set()
-        for payload in self._collect_blocked_tool_payloads(messages):
-            blocked_tool_name = normalize_tool_name(
-                payload.get('blocked_tool_name')
-                or payload.get('tool_name')
-                or ''
-            )
-            if blocked_tool_name:
-                blocked_tool_names.add(blocked_tool_name)
-        return blocked_tool_names
-
-    def _collect_blocked_action_labels(self, messages: List) -> List[str]:
-        blocked_labels: List[str] = []
-        for payload in self._collect_blocked_tool_payloads(messages):
-            label = str(
-                payload.get('action_label')
-                or payload.get('blocked_tool_name')
-                or payload.get('tool_name')
-                or ''
-            ).strip()
-            if label and label not in blocked_labels:
-                blocked_labels.append(label)
-        return blocked_labels
-
     def _get_tool_identity(self, tool: BaseTool) -> Dict[str, Optional[str]]:
         metadata = getattr(tool, 'metadata', None) or {}
         toolkit_name = metadata.get('toolkit_name')
@@ -988,204 +927,29 @@ class LLMNode(BaseTool):
             'toolkit_type': toolkit_type,
         }
 
-    def _is_allowed_followup_tool(
-        self,
-        *,
-        candidate: BaseTool,
-        blocked_tool_names: set[str],
-    ) -> bool:
-        # Lazy meta-tools are too broad to safely force after a blocked action.
-        if candidate.name in {'invoke_tool', 'list_toolkits', 'get_toolkit_tools'}:
-            return False
-
-        identity = self._get_tool_identity(candidate)
-        resolved_tool_name = normalize_tool_name(identity.get('tool_name') or candidate.name or '')
-        normalized_blocked_names = {
-            normalize_tool_name(name)
-            for name in blocked_tool_names
-            if normalize_tool_name(name)
-        }
-        candidate_name = normalize_tool_name(candidate.name)
-
-        if candidate_name in normalized_blocked_names:
-            return False
-        if resolved_tool_name in normalized_blocked_names:
-            return False
-
-        toolkit_type = identity.get('toolkit_type')
-        if toolkit_type and is_tool_blocked(toolkit_type, resolved_tool_name):
-            return False
-
-        return True
-
-    def _get_forced_followup_tools(
-        self,
-        *,
-        config: Optional[RunnableConfig],
-        blocked_tool_names: set[str],
-    ) -> List[BaseTool]:
-        forced_tools: List[BaseTool] = []
-        seen_tool_names: set[str] = set()
-
-        # In lazy-tools mode, get_filtered_tools() returns only meta-tools
-        # (invoke_tool, list_toolkits, get_toolkit_tools) which are explicitly
-        # excluded from forced follow-up.  Access the real tool objects from
-        # available_tools / tool_registry instead so the LLM can be forced to
-        # call an actual allowed tool after a blocked action.
-        if self.lazy_tools_mode and self.tool_registry is not None:
-            candidate_tools: List[BaseTool] = list(self.available_tools or [])
-            existing_names = {t.name for t in candidate_tools}
-            for tk_name in self.tool_registry.get_toolkit_names():
-                for tool in self.tool_registry.get_toolkit_tools(tk_name).values():
-                    if tool.name not in existing_names:
-                        candidate_tools.append(tool)
-                        existing_names.add(tool.name)
-            if self.always_bind_tools:
-                for t in self.always_bind_tools:
-                    if t.name not in existing_names:
-                        candidate_tools.append(t)
-                        existing_names.add(t.name)
-            logger.info(
-                "Blocked-tool follow-up: lazy mode detected, using %d real tools as candidate pool",
-                len(candidate_tools),
-            )
-        else:
-            candidate_tools = self.get_filtered_tools(config=config)
-
-        for tool in candidate_tools:
-            if tool.name in seen_tool_names:
-                continue
-            if not self._is_allowed_followup_tool(candidate=tool, blocked_tool_names=blocked_tool_names):
-                continue
-            forced_tools.append(tool)
-            seen_tool_names.add(tool.name)
-
-        return forced_tools
-
-    def _build_forced_followup_client(self, followup_tools: List[BaseTool]) -> Any:
-        # OpenAI-compatible passthrough (Claude via LiteLLM) rejects the
-        # tool_choice litellm derives from parallel_tool_calls=False for Bedrock
-        # ("tool_choice.type: Field required"). The block is still honored — the
-        # blocked tools are already excluded from followup_tools — so bind plain.
-        if self._client_is_openai_compatible(self.client):
-            logger.info(
-                "Blocked-tool continuation: openai-compatible client, binding allowed tools without parallel_tool_calls [%s]",
-                ', '.join(tool.name for tool in followup_tools),
-            )
-            return self.client.bind_tools(followup_tools)
-        try:
-            logger.info(
-                "Blocked-tool continuation: constraining LLM to allowed tools [%s]",
-                ', '.join(tool.name for tool in followup_tools),
-            )
-            return self.client.bind_tools(
-                followup_tools,
-                parallel_tool_calls=False,
-            )
-        except TypeError:
-            logger.debug("Blocked-tool continuation: client bind_tools does not accept parallel_tool_calls")
-        except Exception as exc:
-            logger.debug("Blocked-tool continuation: constrained binding with parallel_tool_calls failed: %s", exc)
-
-        logger.info(
-            "Blocked-tool continuation: falling back to constrained binding without parallel_tool_calls [%s]",
-            ', '.join(tool.name for tool in followup_tools),
-        )
-        return self.client.bind_tools(followup_tools)
-
-    def _should_continue_after_blocked_tool(
-        self,
-        *,
-        completion: Any,
-        blocked_payloads: List[Dict[str, Any]],
-        followup_tools: List[BaseTool],
-        messages: List,
-        attempt_count: int,
-    ) -> Optional[str]:
-        if hasattr(completion, 'tool_calls') and completion.tool_calls:
-            return None
-        if not blocked_payloads or not followup_tools:
-            return None
-        if attempt_count >= MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS:
-            return None
-
-        blocked_labels = self._collect_blocked_action_labels(messages)
-        if not blocked_labels:
-            for payload in blocked_payloads:
-                label = str(
-                    payload.get('action_label')
-                    or payload.get('blocked_tool_name')
-                    or payload.get('tool_name')
-                    or ''
-                ).strip()
-                if label and label not in blocked_labels:
-                    blocked_labels.append(label)
-
-        primary_payload = blocked_payloads[0]
-        continuation_message = str(primary_payload.get('continuation_message') or '').strip()
-        continuation_hint = str(primary_payload.get('continuation_hint') or '').strip()
-        blocked_summary = ', '.join(blocked_labels[:3]) or 'the blocked action'
-        prompt_parts = []
-        if continuation_message:
-            prompt_parts.append(continuation_message)
-        if continuation_hint:
-            prompt_parts.append(continuation_hint)
-        prompt_parts.append(
-            f"This is a continuation turn after the blocked action(s): {blocked_summary}.\n"
-            "Do NOT immediately retry the same blocked tool call in this step. Pick up where you left off and continue the workflow autonomously.\n"
-            "Do NOT repeat or restate your previous answer.\n"
-            "If an allowed tool can still make meaningful progress, call it now. If the workflow is truly blocked and no allowed tool can help, then explain that clearly to the user."
-        )
-        return '\n\n'.join(prompt_parts)
-
     @staticmethod
-    def _build_visible_blocked_tool_payload(blocked_payload: Dict[str, Any]) -> Dict[str, Any]:
-        visible_payload = {}
-        for key in (
-            'type',
-            'status',
-            'blocked_tool_name',
-            'blocked_toolkit_name',
-            'blocked_toolkit_type',
-            'action_label',
-            'message',
-            'user_feedback',
-            'retry_allowed',
-            'equivalent_action_via_other_tool_allowed',
-        ):
-            value = blocked_payload.get(key)
-            if value is None or value == '':
-                continue
-            visible_payload[key] = value
-        return visible_payload
-
-    def _enrich_blocked_tool_payload(
-        self,
-        *,
-        blocked_payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        enriched_payload = dict(blocked_payload)
+    def _build_blocked_tool_guidance(blocked_payload: Dict[str, Any]) -> str:
+        # Fallback directive used ONLY when a blocked payload arrives without its
+        # own `message` (the sensitive-tool guard is the source of truth and bakes
+        # it in). Kept aligned with SensitiveToolGuardMiddleware.BLOCKED_TOOL_MESSAGE:
+        # an explicit, imperative continue-instruction that does NOT end on a
+        # terminal "stopped" note — weak models (haiku, gpt-5.4-mini) read a
+        # terminal ending as "halt" and skip the rest of the workflow.
         action_label = (
-            enriched_payload.get('action_label')
-            or enriched_payload.get('blocked_tool_name')
-            or enriched_payload.get('tool_name')
+            blocked_payload.get('action_label')
+            or blocked_payload.get('blocked_tool_name')
+            or blocked_payload.get('tool_name')
             or 'the requested action'
         )
-        enriched_payload['continuation_message'] = enriched_payload.get('continuation_message') or (
-            f"The action '{action_label}' was blocked by the user and was not executed for this invocation. "
-            "Do not immediately retry this exact tool call in the same step. Rethink the tool strategy, decide which allowed action or "
-            "information should be prioritized next, and continue with other allowed tool calls if they can still move the task forward. "
-            "If another tool is sensitive, it will be reviewed separately. "
-            "Only switch to a user-facing explanation when you decide there is no meaningful allowed tool path left or you truly need user input."
+        return (
+            f"You declined THIS specific call to '{action_label}'; it was not executed. "
+            "The block is for THIS invocation only, not the tool itself. "
+            "This is NOT a stop signal — do not end your turn or summarize yet. "
+            "Do not retry this same call with the same arguments, but DO continue: "
+            "if more items remain, call the tool again for the NEXT item now; "
+            "otherwise use another available tool to keep making progress. "
+            "Only stop and ask the user when nothing remains that can be done without this exact declined call."
         )
-        enriched_payload['continuation_hint'] = enriched_payload.get('continuation_hint') or (
-            "Continue the tool-using reasoning loop from this blocked tool result. Re-evaluate the remaining allowed tools, "
-            "pick the highest-priority next step, and execute other allowed tool calls when they can still advance the task. "
-            "If another tool is sensitive, expect a separate independent review for that invocation. "
-            "Do not immediately stop and ask the user for direction unless you determine that no allowed tool path can make meaningful progress."
-        )
-
-        return enriched_payload
 
     def invoke(
             self,
@@ -2173,20 +1937,6 @@ class LLMNode(BaseTool):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
 
-        # Track blocked tools within the current __perform_tool_calling execution.
-        # Populated below via _historically_blocked.update(blocked_tool_names) after
-        # each iteration so the forced continuation nudge can exclude all tools blocked
-        # in this execution cycle (prevents immediate retry in the same forced followup).
-        #
-        # NOTE: We deliberately do NOT pre-seed this set from state-persisted
-        # hitl_decisions.  Pre-seeding caused tool names that the user rejected in
-        # a prior HITL resume to be permanently excluded from the LLM's tool
-        # binding for all subsequent turns in the same session — breaking the
-        # independent per-call approval model (issue #5303).  Each sensitive-tool
-        # invocation must be reviewed independently: if the user rejects
-        # create_file call #1 they must still be able to approve create_file call #2.
-        _historically_blocked: set[str] = set()
-
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
 
@@ -2220,12 +1970,6 @@ class LLMNode(BaseTool):
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
 
-        # Extra tool lookup table populated after a blocked-tool continuation turn.
-        # In lazy-tools mode the regular get_filtered_tools() returns only
-        # meta-tools, so direct continuation tool calls would fail to resolve.
-        # This dict maps tool-name -> BaseTool for the next iteration only.
-        _forced_followup_lookup: Dict[str, BaseTool] = {}
-
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
         while (hasattr(current_completion, 'tool_calls') and
@@ -2238,8 +1982,6 @@ class LLMNode(BaseTool):
             # Execute each tool call in the current completion
             tool_calls = current_completion.tool_calls if hasattr(current_completion.tool_calls,
                                                                   '__iter__') else []
-            blocked_tool_names: set[str] = set()
-            blocked_payloads_this_iter: List[Dict[str, Any]] = []
 
             for tool_call in tool_calls:
                 tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call,
@@ -2274,13 +2016,6 @@ class LLMNode(BaseTool):
                     if tool.name == tool_name:
                         tool_to_execute = tool
                         break
-
-                # Fallback: check forced follow-up lookup (lazy mode).
-                # After a blocked-tool forced follow-up the LLM calls a real
-                # tool directly, but get_filtered_tools only returns meta-tools.
-                if tool_to_execute is None and tool_name in _forced_followup_lookup:
-                    tool_to_execute = _forced_followup_lookup[tool_name]
-                    logger.info("Resolved tool '%s' via forced-followup lookup", tool_name)
 
                 # Fallback: in lazy mode (and HITL resume) the tool may not appear
                 # in get_filtered_tools because that returns only meta-tools.
@@ -2350,21 +2085,25 @@ class LLMNode(BaseTool):
 
                         blocked_payload = self._parse_sensitive_tool_blocked_result(tool_result)
                         if blocked_payload is not None:
-                            blocked_tool_name = normalize_tool_name(
-                                blocked_payload.get('blocked_tool_name')
-                                or blocked_payload.get('tool_name')
-                                or tool_name
-                                or ''
-                            )
-                            if blocked_tool_name:
-                                blocked_tool_names.add(blocked_tool_name)
-                            enriched_payload = self._enrich_blocked_tool_payload(
-                                blocked_payload=blocked_payload,
-                            )
-                            blocked_payloads_this_iter.append(enriched_payload)
+                            # User declined this sensitive call. The blocked tool
+                            # stays bound (per-call independent approval, #5303).
+                            # The guard already produces a SLIM structured payload
+                            # (type + tool/toolkit identities + denial_reason + a
+                            # single `message` directive). Pass it through verbatim
+                            # so the model input is identical to the tool-trace the
+                            # user sees — one source of truth. The directive in
+                            # `message` is what steers continuation; the slim
+                            # structure avoids the field bloat that tripped weak
+                            # models (haiku, gpt-5.4-mini). If a payload somehow
+                            # lacks `message`, synthesize a fallback directive.
+                            if not blocked_payload.get('message'):
+                                blocked_payload = {
+                                    **blocked_payload,
+                                    'message': self._build_blocked_tool_guidance(blocked_payload),
+                                }
                             tool_message = ToolMessage(
                                 content=json.dumps(
-                                    self._build_visible_blocked_tool_payload(blocked_payload),
+                                    blocked_payload,
                                     ensure_ascii=True,
                                     separators=(',', ':'),
                                 ),
@@ -2446,68 +2185,16 @@ class LLMNode(BaseTool):
                         len(new_messages) - len(sanitized_messages),
                     )
                 new_messages = sanitized_messages
-                # Reset forced-followup lookup at the start of each LLM re-invoke.
-                _forced_followup_lookup = {}
 
-                # Accumulate current-iteration blocks into history so the
-                # forced-continuation nudge covers all tools blocked so far
-                # in this __perform_tool_calling execution.
-                _historically_blocked.update(blocked_tool_names)
-
-                # Merge current-iteration blocks with within-execution history.
-                all_blocked = blocked_tool_names | _historically_blocked
-
-                if blocked_tool_names:
-                    # Current iteration had tool(s) blocked — full
-                    # continuation: nudge LLM to try alternatives.
-                    new_messages = self._strip_blocked_tool_continuation_nudges(new_messages)
-                    blocked_tool_history = self._collect_blocked_tool_names(new_messages) | _historically_blocked
-                    forced_followup_tools = self._get_forced_followup_tools(
-                        config=config,
-                        blocked_tool_names=blocked_tool_history,
-                    )
-                    continuation_client = llm_client
-                    if forced_followup_tools:
-                        # Store for next iteration so the tool call can be resolved.
-                        _forced_followup_lookup = {t.name: t for t in forced_followup_tools}
-                        continuation_client = self._build_forced_followup_client(forced_followup_tools)
-                        current_completion = continuation_client.invoke(
-                            new_messages,
-                            config=config,
-                        )
-                    else:
-                        logger.info(
-                            "Blocked-tool follow-up: no allowed tools remain after excluding [%s]",
-                            ', '.join(sorted(all_blocked)),
-                        )
-                        current_completion = llm_client.invoke(new_messages, config=config)
-
-                    new_messages.append(current_completion)
-                    blocked_tool_continuation_attempts = 0
-                    while True:
-                        continuation_message = self._should_continue_after_blocked_tool(
-                            completion=current_completion,
-                            blocked_payloads=blocked_payloads_this_iter,
-                            followup_tools=forced_followup_tools,
-                            messages=new_messages,
-                            attempt_count=blocked_tool_continuation_attempts,
-                        )
-                        if continuation_message is None:
-                            break
-
-                        blocked_tool_continuation_attempts += 1
-                        logger.info(
-                            "Blocked-tool continuation: nudging LLM to keep working (attempt %s/%s)",
-                            blocked_tool_continuation_attempts,
-                            MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS,
-                        )
-                        new_messages = self._strip_blocked_tool_continuation_nudges(new_messages)
-                        new_messages.append(HumanMessage(content=continuation_message))
-                        current_completion = continuation_client.invoke(new_messages, config=config)
-                        new_messages.append(current_completion)
-                else:
-                    current_completion = llm_client.invoke(new_messages, config=config)
-                    new_messages.append(current_completion)
+                # Re-invoke with the SAME full toolset — including any sensitive
+                # tool the user just declined. The block is invocation-scoped
+                # (per-call independent approval, #5303), so the tool stays bound
+                # and the model can call it again for a different item if needed.
+                # The invocation-scoped guidance carried inside the blocked
+                # ToolMessage tells the model the call was declined and to
+                # continue the remaining work; no forced rebinding or nudge turn.
+                current_completion = llm_client.invoke(new_messages, config=config)
+                new_messages.append(current_completion)
 
                 # Check if we still have tool calls
                 if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:
