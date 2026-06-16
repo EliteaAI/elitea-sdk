@@ -8,6 +8,7 @@ from typing import Any, Optional, List, Dict, Generator, Set
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
+from langchain_core.tools import ToolException
 from pydantic import create_model, Field, SecretStr
 
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
@@ -318,6 +319,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     def index_data(self, **kwargs):
         index_name = kwargs.get("index_name")
+        # Reject empty/None index_name early — otherwise it gets formatted into the
+        # index_meta document's page_content as the literal string "index_meta_None",
+        # poisoning the collection with unattached meta rows.
+        if not index_name or not str(index_name).strip():
+            raise ToolException(
+                "index_data requires a non-empty 'index_name' (the collection suffix)."
+            )
         clean_index = kwargs.get("clean_index")
         chunking_tool = kwargs.get("chunking_tool")
         chunking_config = kwargs.get("chunking_config")
