@@ -129,7 +129,7 @@ nodes:
     input_mapping:
       system:
         type: fixed
-        value: "You are a quality assurance validator."
+        value: "You are a quality assurance validator. Be concise. Evaluate each provided field exactly as labeled. 'Search text_large.txt (filtered)' is the filtered result array to validate for text_large.txt chunking. 'Search All Docs' is only for confirming general indexing and absence of .png files. Do not compare or substitute these arrays for each other."
       task:
         type: fstring
         value: |
@@ -143,19 +143,20 @@ nodes:
           Expected behavior:
           1. Indexing completed successfully (status: ok)
           2. Search returns indexed documents (non-empty results)
-          3. search_large_txt_result must contain AT LEAST 1 item (chunking occurred)
-          4. ALL items in search_large_txt_result must be for text_large.txt (no other files)
+          3. The provided filtered search result for text_large.txt must contain AT LEAST 1 item (chunking occurred)
+          4. ALL items in the provided filtered search result must be for text_large.txt (no other files)
           5. No .png files should be in indexed documents (they were skipped via skip_extensions). Other file types (.pdf, .docx, .txt, etc.) ARE expected and correct.
 
           Validation rules:
           1. Check index_result has "status": "ok"
           2. Check index_result message indicates successful indexing
-          3. Verify search_all_result is not empty and contains document list
-          4. Count total items in search_large_txt_result array - must be AT LEAST 1 (chunking occurred)
-          5. Verify every item in search_large_txt_result has Name == "text_large.txt"
-          6. If count < 1 or any item is not text_large.txt, test fails
-          7. Verify no .png files appear in search_all_result (check "Name" field in metadata ends with ".png"). Files ending in .pdf, .docx, .txt etc. are EXPECTED and should NOT cause failure.
-          8. All validations must pass for test to pass
+          3. Verify Search All Docs is not empty and contains document list
+          4. Use ONLY 'Search text_large.txt (filtered)' for chunk-count and text_large.txt-specific checks
+          5. Count total items in 'Search text_large.txt (filtered)' - must be AT LEAST 1 (chunking occurred)
+          6. Verify every item in 'Search text_large.txt (filtered)' has metadata.Name == "text_large.txt"
+          7. If count < 1 or any filtered item is not text_large.txt, test fails
+          8. Verify no .png files appear in Search All Docs (check metadata.Name ends with ".png"). Files ending in .pdf, .docx, .txt etc. are EXPECTED and should NOT cause failure.
+          9. If rules 1-8 pass, the test MUST pass.
 
           Return a json object with:
           {{
