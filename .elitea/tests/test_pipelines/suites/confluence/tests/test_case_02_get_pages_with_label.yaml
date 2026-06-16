@@ -55,7 +55,7 @@ nodes:
           1. Confirm the tool executed successfully (the result is not empty or null).
           2. Verify the output contains page information (page_id, page_title, page_url).
           3. Check if at least one page was found with the specified label.
-          4. Verify that page IDs are valid integers.
+          4. Verify that page IDs are valid numeric values (either integer or numeric string like "12345").
           5. Verify that page titles are non-empty strings.
 
           Return a JSON object named test_results with the following structure:
@@ -65,7 +65,7 @@ nodes:
             "tool_executed": boolean (true if tool ran without errors),
             "pages_found": boolean (true if at least one page was returned),
             "page_count": integer (number of pages returned),
-            "has_valid_structure": boolean (true if pages have page_id as integer and page_title as non-empty string),
+            "has_valid_structure": boolean (true if pages have page_id as numeric value and page_title as non-empty string),
             "sample_page_title": string (title of first page found, or null if none),
             "failed_checks": [string] // list of failed assertions
           }}
