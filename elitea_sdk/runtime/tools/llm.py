@@ -1577,20 +1577,17 @@ class LLMNode(BaseTool):
                 return True
         return False
 
-    def _resolve_tool_to_execute(self, tool_name, config, forced_followup_lookup=None):
+    def _resolve_tool_to_execute(self, tool_name, config):
         """Resolve a tool name to a BaseTool using the sequential loop's lookup chain.
 
-        Order: filtered tools (dynamic selection aware) → forced-followup lookup
-        (lazy-mode blocked-tool continuation) → available_tools → tool_registry.
-        Returns None when the name cannot be resolved. Extracted so the parallel
-        fan-out partition and the sequential loop resolve tools identically.
+        Order: filtered tools (dynamic selection aware) → available_tools →
+        tool_registry. Returns None when the name cannot be resolved. Extracted
+        so the parallel fan-out partition and the sequential loop resolve tools
+        identically.
         """
         for tool in self.get_filtered_tools(config=config):
             if tool.name == tool_name:
                 return tool
-        if forced_followup_lookup and tool_name in forced_followup_lookup:
-            logger.info("Resolved tool '%s' via forced-followup lookup", tool_name)
-            return forced_followup_lookup[tool_name]
         for tool in (self.available_tools or []):
             if tool.name == tool_name:
                 logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
@@ -2066,7 +2063,7 @@ class LLMNode(BaseTool):
         return self.invoke(kwargs, **kwargs)
 
     def _collect_parallel_application_specs(
-        self, tool_calls, messages, config, forced_followup_lookup,
+        self, tool_calls, messages, config,
         hitl_decisions=None,
     ):
         """Return per-call specs when this turn is a pure multi-Application batch.
@@ -2102,7 +2099,7 @@ class LLMNode(BaseTool):
             # neither count toward the batch nor re-execute.
             if tool_call_id and self._tool_call_already_completed(tool_call_id, messages):
                 continue
-            tool = self._resolve_tool_to_execute(tool_name, config, forced_followup_lookup)
+            tool = self._resolve_tool_to_execute(tool_name, config)
             if not isinstance(tool, Application):
                 return None  # a non-Application call → sequential path
             specs.append((tool_name, tool_args, tool_call_id, tool))
@@ -2391,12 +2388,6 @@ class LLMNode(BaseTool):
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
 
-        # Extra tool lookup table populated after a blocked-tool continuation turn.
-        # In lazy-tools mode the regular get_filtered_tools() returns only
-        # meta-tools, so direct continuation tool calls would fail to resolve.
-        # This dict maps tool-name -> BaseTool for the next iteration only.
-        _forced_followup_lookup: Dict[str, BaseTool] = {}
-
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
         while (hasattr(current_completion, 'tool_calls') and
@@ -2417,7 +2408,7 @@ class LLMNode(BaseTool):
             # Parallelism is LLM-driven — steered by TASK_DELEGATION_ADDON and
             # the sub-agent tool descriptions — not a feature flag.
             app_specs = self._collect_parallel_application_specs(
-                tool_calls, new_messages, config, _forced_followup_lookup,
+                tool_calls, new_messages, config,
                 hitl_decisions=hitl_decisions,
             )
             if app_specs is not None:
@@ -2481,10 +2472,10 @@ class LLMNode(BaseTool):
                     continue
 
                 # Resolve the tool via the shared lookup chain (filtered →
-                # forced-followup → available_tools → tool_registry).
-                tool_to_execute = self._resolve_tool_to_execute(
-                    tool_name, config, _forced_followup_lookup,
-                )
+                # available_tools → tool_registry). Extracted so the parallel
+                # fan-out partition (#4993) and the sequential loop resolve
+                # tools identically.
+                tool_to_execute = self._resolve_tool_to_execute(tool_name, config)
 
                 if tool_to_execute:
                     try:
@@ -2639,10 +2630,6 @@ class LLMNode(BaseTool):
                         len(new_messages) - len(sanitized_messages),
                     )
                 new_messages = sanitized_messages
-                # Reset the tool-resolution fallback at the start of each LLM
-                # re-invoke. It stays empty now that forced follow-up is gone;
-                # direct tool calls resolve via filtered → available → registry.
-                _forced_followup_lookup = {}
 
                 # Re-invoke with the SAME full toolset — including any sensitive
                 # tool the user just declined. The block is invocation-scoped

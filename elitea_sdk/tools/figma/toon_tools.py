@@ -41,6 +41,7 @@ Flow markers:
 
 import re
 import logging
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Any
 from pydantic import BaseModel, Field, create_model
 
@@ -1648,11 +1649,18 @@ class TOONSerializer:
 
         return ' '.join(parts)
 
-    def serialize_frame(self, frame_data: Dict, level: int = 0) -> List[str]:
-        """Serialize a single frame with all its content."""
+    def serialize_frame(self, frame_data: Dict, level: int = 0, frame_depth: int = 1) -> List[str]:
+        """
+        Serialize a single frame with all its content.
+
+        Args:
+            frame_data: Frame data dict
+            level: Indentation level for output
+            frame_depth: Nesting depth (1 = top-level, 2+ = nested frames)
+        """
         lines = []
 
-        # Frame header: name [position size] type/state ~variant_of #id
+        # Frame header: name [position size] type/state ~variant_of #id level-N
         name = frame_data.get('name', 'Untitled')
         frame_id = frame_data.get('id', '')
         pos = frame_data.get('position', {})
@@ -1677,7 +1685,10 @@ class TOONSerializer:
         # Build frame ID marker
         id_str = f" #{frame_id}" if frame_id else ''
 
-        header = f"{self._i(level)}FRAME: {name} {pos_str} {screen_type}/{state}{variant_str}{id_str}".strip()
+        # Build level marker (only for nested frames, depth > 1)
+        level_str = f" level-{frame_depth}" if frame_depth > 1 else ''
+
+        header = f"{self._i(level)}FRAME: {name} {pos_str} {screen_type}/{state}{variant_str}{id_str}{level_str}".strip()
         lines.append(header)
 
         # Content sections
@@ -1752,6 +1763,12 @@ class TOONSerializer:
             if len(image_desc) > 300:
                 desc_truncated += '...'
             lines.append(f"{self._i(content_level)}Image: {desc_truncated}")
+
+        # Serialize nested frames recursively with increased depth
+        subframes = frame_data.get('subframes', [])
+        for subframe in subframes:
+            subframe_lines = self.serialize_frame(subframe, level=level + 1, frame_depth=frame_depth + 1)
+            lines.extend(subframe_lines)
 
         return lines
 
@@ -1835,9 +1852,17 @@ class TOONSerializer:
 # Frame Processing
 # -----------------------------------------------------------------------------
 
-def process_frame_to_toon_data(frame_node: Dict) -> Dict:
+def process_frame_to_toon_data(
+    frame_node: Dict,
+    subframes: Optional[List[Dict]] = None,
+) -> Dict:
     """
     Process a Figma frame node into TOON-ready data structure.
+
+    Args:
+        frame_node: Figma frame node dict
+        subframes: Optional list of subframe dicts with 'node' and optional 'subframes' keys
+                   for recursive nesting
 
     Returns structured data that can be serialized to TOON format.
     """
@@ -1890,31 +1915,55 @@ def process_frame_to_toon_data(frame_node: Dict) -> Dict:
     if base_name != name:
         frame_data['variant_of'] = base_name
 
+    # Process subframes recursively if provided
+    frame_data['subframes'] = []
+    if subframes:
+        for sf in subframes:
+            sf_node = sf.get('node', sf)  # Support both {'node': ...} and direct node
+            sf_subframes = sf.get('subframes', [])
+            sf_data = process_frame_to_toon_data(sf_node, subframes=sf_subframes)
+            frame_data['subframes'].append(sf_data)
+
     return frame_data
 
 
-def process_page_to_toon_data(page_node: Dict, max_frames: int = 50) -> Dict:
+def process_page_to_toon_data(
+    page_node: Dict,
+    max_frames: int = 50,
+    collected_frames: Optional[List[Dict]] = None,
+) -> Dict:
     """
     Process a Figma page node into TOON-ready data structure.
 
     Args:
         page_node: Figma page node dict
         max_frames: Maximum number of frames to process (default 50)
+        collected_frames: Optional pre-collected frames with subframe extraction.
+                          Each item should have 'node' and optional 'subframes' keys.
+                          If provided, these are used instead of page_node.children.
     """
     frames = []
 
-    # Process each child frame (limited by max_frames)
-    children = page_node.get('children', [])[:max_frames]
-    for child in children:
-        child_type = child.get('type', '').upper()
-
-        # Process frames, components, and component sets
-        if child_type in ['FRAME', 'COMPONENT', 'COMPONENT_SET', 'SECTION']:
-            frame_data = process_frame_to_toon_data(child)
+    if collected_frames is not None:
+        # Use pre-collected frames with subframe support
+        for frame_info in collected_frames[:max_frames]:
+            frame_node = frame_info.get('node', frame_info)
+            subframes = frame_info.get('subframes', [])
+            frame_data = process_frame_to_toon_data(frame_node, subframes=subframes)
             frames.append(frame_data)
+    else:
+        # Default behavior: process top-level children from page_node
+        children = page_node.get('children', [])[:max_frames]
+        for child in children:
+            child_type = child.get('type', '').upper()
 
-    # Sort frames by position (left-to-right, top-to-bottom)
-    frames.sort(key=lambda f: (f['position']['y'], f['position']['x']))
+            # Process frames, components, and component sets
+            if child_type in ['FRAME', 'COMPONENT', 'COMPONENT_SET', 'SECTION']:
+                frame_data = process_frame_to_toon_data(child)
+                frames.append(frame_data)
+
+        # Sort frames by position (left-to-right, top-to-bottom)
+        frames.sort(key=lambda f: (f['position']['y'], f['position']['x']))
 
     return {
         'id': page_node.get('id', ''),
@@ -1927,12 +1976,19 @@ def process_page_to_toon_data(page_node: Dict, max_frames: int = 50) -> Dict:
 # LLM Analysis Functions
 # -----------------------------------------------------------------------------
 
+@dataclass
+class FrameAnalysisResult:
+    """Result of frame analysis with LLM status tracking."""
+    explanation: Optional[ScreenExplanation] = None
+    llm_status: str = 'success'
+
+
 def analyze_frame_with_llm(
     frame_data: Dict,
     llm: Any,
     toon_serializer: Optional['TOONSerializer'] = None,
     image_url: Optional[str] = None,
-) -> Optional[ScreenExplanation]:
+) -> FrameAnalysisResult:
     """
     Analyze a single frame using LLM with structured output.
 
@@ -1946,13 +2002,14 @@ def analyze_frame_with_llm(
         image_url: Optional URL to frame image for vision-based analysis
 
     Returns:
-        ScreenExplanation model or None if analysis fails
+        FrameAnalysisResult with explanation and llm_status
     """
     if not llm:
-        return None
+        return FrameAnalysisResult(explanation=None, llm_status='no llm configured')
 
     frame_name = frame_data.get('name', 'Unknown')
     frame_id = frame_data.get('id', '')
+    fallback_error: Optional[str] = None
 
     # Try vision-based analysis first if image available
     if image_url:
@@ -1974,9 +2031,10 @@ def analyze_frame_with_llm(
             )
             result = structured_llm.invoke([message])
             if result:
-                return result
+                return FrameAnalysisResult(explanation=result, llm_status='success')
         except Exception as e:
             # Vision analysis failed - fall back to text-based
+            fallback_error = f"vision fallback: {type(e).__name__}: {e}"
             logging.warning(f"Vision analysis failed for {frame_name}, falling back to text: {type(e).__name__}: {e}")
 
     # Text-based analysis (fallback or primary if no image)
@@ -1995,11 +2053,17 @@ def analyze_frame_with_llm(
 
         structured_llm = llm.with_structured_output(ScreenExplanation)
         result = structured_llm.invoke(prompt)
-        return result
+
+        # Return with fallback error if vision failed but text succeeded
+        llm_status = fallback_error if fallback_error else 'success'
+        return FrameAnalysisResult(explanation=result, llm_status=llm_status)
 
     except Exception as e:
         logging.warning(f"LLM frame analysis failed for {frame_name}: {type(e).__name__}: {e}")
-        return None
+        error_msg = f"text analysis failed: {type(e).__name__}: {e}"
+        if fallback_error:
+            error_msg = f"{fallback_error}; {error_msg}"
+        return FrameAnalysisResult(explanation=None, llm_status=error_msg)
 
 
 def analyze_file_with_llm(
@@ -2314,17 +2378,26 @@ def serialize_file_with_llm_explanations(
     key = file_data.get('key', '')
     lines.append(f"FILE: {name} [key:{key}]")
 
-    # Collect all frames first for parallel processing
+    # Collect all frames first for parallel processing (including subframes)
     all_frames = []
     frame_to_page = {}  # Map frame_id to page info for later
 
-    for page in file_data.get('pages', []):
-        for frame in page.get('frames', []):
+    def collect_frames_recursive(frames: List[Dict], page_info: Dict):
+        """Recursively collect frames and their subframes."""
+        for frame in frames:
             all_frames.append(frame)
-            frame_to_page[frame.get('id', '')] = {
-                'page_name': page.get('name', 'Untitled Page'),
-                'page_id': page.get('id', ''),
-            }
+            frame_to_page[frame.get('id', '')] = page_info
+            # Recursively collect subframes
+            subframes = frame.get('subframes', [])
+            if subframes:
+                collect_frames_recursive(subframes, page_info)
+
+    for page in file_data.get('pages', []):
+        page_info = {
+            'page_name': page.get('name', 'Untitled Page'),
+            'page_id': page.get('id', ''),
+        }
+        collect_frames_recursive(page.get('frames', []), page_info)
 
     total_frames = len(all_frames)
     frames_to_analyze = all_frames[:max_frames_to_analyze]
@@ -2378,6 +2451,117 @@ def serialize_file_with_llm_explanations(
     success_count = len(frame_explanations)
     _log_status(f"Frame analysis complete: {success_count}/{len(frames_to_analyze)} frames analyzed successfully")
 
+    def _serialize_frame_with_llm(
+        frame: Dict,
+        indent_level: int = 2,
+        frame_depth: int = 1,
+    ) -> List[str]:
+        """
+        Serialize a frame with LLM analysis, recursively handling nested frames.
+
+        Args:
+            frame: Frame data dict
+            indent_level: Indentation level for output
+            frame_depth: Nesting depth (1 = top-level, 2+ = nested frames)
+        """
+        result_lines = []
+        indent = "  " * indent_level
+        content_indent = "  " * (indent_level + 1)
+
+        frame_name = frame.get('name', 'Untitled')
+        frame_id = frame.get('id', '')
+        frame_type = frame.get('type', 'screen')
+        frame_state = frame.get('state', 'default')
+
+        # Compact frame header with level indicator for nested frames
+        pos = frame.get('position', {})
+        size = frame.get('size', {})
+        pos_str = f"[{int(pos.get('x', 0))},{int(pos.get('y', 0))} {int(size.get('w', 0))}x{int(size.get('h', 0))}]"
+        level_str = f" level-{frame_depth}" if frame_depth > 1 else ''
+        result_lines.append(f"{indent}FRAME: {frame_name} {pos_str} {frame_type}/{frame_state} #{frame_id}{level_str}")
+
+        # Get frame content
+        headings = frame.get('headings', [])
+        buttons = frame.get('buttons', []).copy()
+        inputs = frame.get('inputs', [])
+        primary_action = None
+
+        # LLM analysis from pre-computed results
+        explanation = frame_explanations.get(frame_id)
+        if explanation:
+            result_lines.append(f"{content_indent}Purpose: {explanation.purpose}")
+            goal_action = f"Goal: {explanation.user_goal}"
+            if explanation.primary_action:
+                primary_action = explanation.primary_action
+                goal_action += f" | Action: \"{primary_action}\""
+            result_lines.append(f"{content_indent}{goal_action}")
+
+            # Visual insights
+            visual_parts = []
+            if explanation.visual_focus:
+                visual_parts.append(f"[focus] {explanation.visual_focus}")
+            if explanation.layout_pattern:
+                visual_parts.append(f"[layout] {explanation.layout_pattern}")
+            if explanation.visual_state and explanation.visual_state != 'default':
+                visual_parts.append(f"[state] {explanation.visual_state}")
+            if visual_parts:
+                result_lines.append(f"{content_indent}Visual: {' | '.join(visual_parts)}")
+
+        # Ensure primary_action from LLM appears in buttons
+        if primary_action:
+            buttons_lower = [b.lower() for b in buttons]
+            action_lower = primary_action.lower()
+            if not any(action_lower in b or b in action_lower for b in buttons_lower):
+                buttons.insert(0, f"[LLM] {primary_action}")
+
+        # Use LLM-extracted inputs if available
+        llm_inputs = []
+        if explanation and hasattr(explanation, 'inputs') and explanation.inputs:
+            llm_inputs = explanation.inputs
+
+        # Extracted content (with reduced limits for nested frames)
+        is_nested = frame_depth > 1
+        max_headings = 2 if is_nested else 3
+        max_buttons = 4 if is_nested else 6
+        if headings:
+            result_lines.append(f"{content_indent}Headings: {' | '.join(headings[:max_headings])}")
+        if buttons:
+            btn_strs = []
+            for btn in buttons[:max_buttons]:
+                dest = infer_cta_destination(btn, frame_context=frame_name)
+                btn_strs.append(f"{btn} > {dest}" if dest else btn)
+            result_lines.append(f"{content_indent}Buttons: {' | '.join(btn_strs)}")
+
+        # Prefer LLM-extracted inputs
+        if llm_inputs:
+            llm_inputs_dicts = [
+                {
+                    'name': inp.label,
+                    'type': inp.input_type,
+                    'required': inp.required,
+                    'value': inp.current_value,
+                    'options': inp.options,
+                }
+                for inp in llm_inputs
+            ]
+            inputs_str = format_inputs_list(llm_inputs_dicts)
+            if inputs_str:
+                result_lines.append(f"{content_indent}Inputs: {inputs_str}")
+        elif inputs:
+            inputs_str = format_inputs_list(inputs)
+            if inputs_str:
+                result_lines.append(f"{content_indent}Inputs: {inputs_str}")
+
+        # Recursively serialize nested frames
+        subframes = frame.get('subframes', [])
+        for subframe in subframes:
+            subframe_lines = _serialize_frame_with_llm(
+                subframe, indent_level=indent_level + 1, frame_depth=frame_depth + 1
+            )
+            result_lines.extend(subframe_lines)
+
+        return result_lines
+
     # Now generate output with pre-computed explanations
     for page in file_data.get('pages', []):
         page_name = page.get('name', 'Untitled Page')
@@ -2385,90 +2569,8 @@ def serialize_file_with_llm_explanations(
         lines.append(f"  PAGE: {page_name} #{page_id}")
 
         for frame in page.get('frames', []):
-            frame_name = frame.get('name', 'Untitled')
-            frame_id = frame.get('id', '')
-            frame_type = frame.get('type', 'screen')
-            frame_state = frame.get('state', 'default')
-
-            # Compact frame header
-            pos = frame.get('position', {})
-            size = frame.get('size', {})
-            pos_str = f"[{int(pos.get('x', 0))},{int(pos.get('y', 0))} {int(size.get('w', 0))}x{int(size.get('h', 0))}]"
-            lines.append(f"    FRAME: {frame_name} {pos_str} {frame_type}/{frame_state} #{frame_id}")
-
-            # Get frame content
-            headings = frame.get('headings', [])
-            buttons = frame.get('buttons', []).copy()  # Copy to allow modification
-            inputs = frame.get('inputs', [])
-            primary_action = None  # Track LLM-identified action
-
-            # LLM analysis from pre-computed results
-            explanation = frame_explanations.get(frame_id)
-            if explanation:
-                lines.append(f"      Purpose: {explanation.purpose}")
-                goal_action = f"Goal: {explanation.user_goal}"
-                if explanation.primary_action:
-                    primary_action = explanation.primary_action
-                    goal_action += f" | Action: \"{primary_action}\""
-                lines.append(f"      {goal_action}")
-
-                # Visual insights
-                visual_parts = []
-                if explanation.visual_focus:
-                    visual_parts.append(f"[focus] {explanation.visual_focus}")
-                if explanation.layout_pattern:
-                    visual_parts.append(f"[layout] {explanation.layout_pattern}")
-                if explanation.visual_state and explanation.visual_state != 'default':
-                    visual_parts.append(f"[state] {explanation.visual_state}")
-                if visual_parts:
-                    lines.append(f"      Visual: {' | '.join(visual_parts)}")
-
-            # Ensure primary_action from LLM appears in buttons (button completeness)
-            if primary_action:
-                # Check if action is already in buttons (case-insensitive)
-                buttons_lower = [b.lower() for b in buttons]
-                action_lower = primary_action.lower()
-                if not any(action_lower in b or b in action_lower for b in buttons_lower):
-                    # Add the LLM-identified action to buttons list
-                    buttons.insert(0, f"[LLM] {primary_action}")
-
-            # Use LLM-extracted inputs if available (preferred), else fall back to heuristic
-            llm_inputs = []
-            if explanation and hasattr(explanation, 'inputs') and explanation.inputs:
-                llm_inputs = explanation.inputs
-
-            # Extracted content (Headings, Buttons, Inputs)
-            if headings:
-                lines.append(f"      Headings: {' | '.join(headings[:3])}")
-            if buttons:
-                # Show buttons with inferred actions
-                btn_strs = []
-                for btn in buttons[:6]:  # Increased limit to accommodate added LLM action
-                    dest = infer_cta_destination(btn, frame_context=frame_name)
-                    btn_strs.append(f"{btn} > {dest}" if dest else btn)
-                lines.append(f"      Buttons: {' | '.join(btn_strs)}")
-
-            # Prefer LLM-extracted inputs over heuristic extraction (standardized format)
-            if llm_inputs:
-                # Convert LLM ExtractedInput objects to dicts for standardized formatting
-                llm_inputs_dicts = [
-                    {
-                        'name': inp.label,
-                        'type': inp.input_type,
-                        'required': inp.required,
-                        'value': inp.current_value,
-                        'options': inp.options,
-                    }
-                    for inp in llm_inputs
-                ]
-                inputs_str = format_inputs_list(llm_inputs_dicts)
-                if inputs_str:
-                    lines.append(f"      Inputs: {inputs_str}")
-            elif inputs:
-                # Fallback to heuristic-extracted inputs (standardized format)
-                inputs_str = format_inputs_list(inputs)
-                if inputs_str:
-                    lines.append(f"      Inputs: {inputs_str}")
+            frame_lines = _serialize_frame_with_llm(frame, indent_level=2, frame_depth=1)
+            lines.extend(frame_lines)
 
         lines.append("")  # Blank line after page
 

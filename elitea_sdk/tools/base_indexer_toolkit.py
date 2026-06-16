@@ -29,9 +29,12 @@ class IndexingStats:
     Terminology:
     - total_fetched: All items initially fetched/considered from source
     - items_processed: Items successfully processed and yielded (after filtering)
-    - total_skipped: Items that were filtered out or failed
+    - total_skipped: Top-level items that were filtered out or failed entirely
+    - dependent_items_skipped: Child/sub-items that failed within a successful parent document
+      (e.g., individual images in a Figma file, attachments in a Confluence page)
 
     Invariant: total_fetched = items_processed + total_skipped
+    Note: dependent_items_skipped is NOT included in total_skipped since parent docs succeeded
     """
     # Common counters
     items_processed: int = 0
@@ -49,6 +52,10 @@ class IndexingStats:
     runtime_skipped_extension: Set[str] = field(default_factory=set)
     runtime_skipped_error: Set[str] = field(default_factory=set)
 
+    # Dependent/child items that failed within successful parent documents
+    # These are tracked separately since the parent document was still indexed
+    dependent_items_skipped: Set[str] = field(default_factory=set)
+
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
         # Calculate counts for each category
@@ -64,7 +71,9 @@ class IndexingStats:
             len(self.runtime_skipped_extension) +
             len(self.runtime_skipped_error)
         )
+        # total_skipped only includes top-level items, not dependent items
         total_skipped = files_skipped_count + documents_skipped_count + runtime_skipped_count
+        dependent_items_count = len(self.dependent_items_skipped)
 
         return {
             "items_processed": self.items_processed,
@@ -94,6 +103,10 @@ class IndexingStats:
                 "extension_filtered_count": len(self.runtime_skipped_extension),
                 "error": sorted(self.runtime_skipped_error),
                 "error_count": len(self.runtime_skipped_error),
+            },
+            "dependent_items_skipped": {
+                "count": dependent_items_count,
+                "items": sorted(self.dependent_items_skipped),
             }
         }
 
@@ -101,24 +114,26 @@ class IndexingStats:
         """Generate human-readable summary of skipped items."""
         lines = []
 
-        # Count file-related skips
+        # Count file-related skips (top-level)
         file_skips = (len(self.files_skipped_whitelist) +
                      len(self.files_skipped_blacklist) +
                      len(self.files_skipped_read_error) +
                      len(self.files_skipped_empty) +
                      len(self.files_unsupported_extension))
 
-        # Count document/runtime-related skips
+        # Count document/runtime-related skips (top-level)
         doc_skips = (len(self.documents_skipped_error) +
                     len(self.runtime_skipped_extension) +
                     len(self.runtime_skipped_error))
 
         total_skipped = file_skips + doc_skips
+        dependent_skipped = len(self.dependent_items_skipped)
 
-        if total_skipped == 0:
+        if total_skipped == 0 and dependent_skipped == 0:
             return ""
 
-        lines.append(f"\nSkipped items ({total_skipped} total):")
+        if total_skipped > 0:
+            lines.append(f"\nSkipped items ({total_skipped} total):")
 
         # File-related skips (for code toolkits)
         if self.files_skipped_whitelist:
@@ -169,6 +184,14 @@ class IndexingStats:
             lines.append(f"  - Runtime skipped (errors) ({len(sorted_runtime_err)}): {', '.join(sorted_runtime_err[:5])}")
             if len(sorted_runtime_err) > 5:
                 lines.append(f"    ... and {len(sorted_runtime_err) - 5} more")
+
+        # Dependent items (sub-items within successful parent documents)
+        if self.dependent_items_skipped:
+            sorted_dependent = sorted(self.dependent_items_skipped)
+            lines.append(f"\nSkipped sub-items ({len(sorted_dependent)} total, parent docs still indexed):")
+            lines.append(f"  - Failed sub-items: {', '.join(sorted_dependent[:5])}")
+            if len(sorted_dependent) > 5:
+                lines.append(f"    ... and {len(sorted_dependent) - 5} more")
 
         return "\n".join(lines)
 
@@ -610,13 +633,34 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             doc_name = self._extract_doc_name(meta)
             self._log_tool_event(message=f"Collecting the dependencies for document "
                                          f"'{doc_name}' (ID: '{doc_id}') to collect dependencies if any...")
-            # Collect all dependencies first so that document.metadata (e.g., dependent_docs)
-            # is fully populated before yielding the parent document
-            dependencies = list(self._process_document(document))
-            yield document
-            for dep in dependencies:
-                dep.metadata[IndexerKeywords.PARENT.value] = document.metadata.get('id', None)
+
+            # Stream dependencies immediately for faster embedding start.
+            # Yield each dependent doc as it's ready, collect IDs, then yield parent last
+            # with merged dependent_docs (combining any pre-set IDs with collected ones).
+            parent_id = document.metadata.get('id', None)
+            collected_dep_ids = []
+
+            for dep in self._process_document(document):
+                # Collect dependency ID for parent's dependent_docs
+                dep_id = dep.metadata.get('id', '')
+                if dep_id:
+                    collected_dep_ids.append(dep_id)
+
+                # Set parent reference on dependency
+                dep.metadata[IndexerKeywords.PARENT.value] = parent_id
                 yield dep
+
+            # Merge collected dep IDs with any existing dependent_docs on parent
+            existing_deps = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+            collected_deps_str = ','.join(collected_dep_ids)
+
+            if existing_deps and collected_deps_str:
+                document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = f"{existing_deps},{collected_deps_str}"
+            elif collected_deps_str:
+                document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = collected_deps_str
+            # else: keep existing_deps as-is (or empty)
+
+            yield document
 
     def _clean_metadata(self, documents: Generator[Document, None, None]):
         for document in documents:

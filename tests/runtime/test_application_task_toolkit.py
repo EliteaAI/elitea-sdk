@@ -639,7 +639,7 @@ def test_collect_specs_pure_application_batch_returns_specs():
         {'name': 'child_b', 'args': {'task': 'y'}, 'id': 'call-B'},
     ]
     specs = node._collect_parallel_application_specs(
-        tool_calls, [], {'configurable': {}}, {})
+        tool_calls, [], {'configurable': {}})
     assert specs is not None and len(specs) == 2
     assert {s[2] for s in specs} == {'call-A', 'call-B'}
 
@@ -656,14 +656,14 @@ def test_collect_specs_mixed_batch_stays_sequential():
         {'name': 'regular', 'args': {'x': '1'}, 'id': 'call-R'},
     ]
     assert node._collect_parallel_application_specs(
-        tool_calls, [], {'configurable': {}}, {}) is None
+        tool_calls, [], {'configurable': {}}) is None
 
 
 def test_collect_specs_single_application_stays_sequential():
     node = _bare_llmnode([_app('child_a', StaticApplication())])
     tool_calls = [{'name': 'child_a', 'args': {'task': 'x'}, 'id': 'call-A'}]
     assert node._collect_parallel_application_specs(
-        tool_calls, [], {'configurable': {}}, {}) is None
+        tool_calls, [], {'configurable': {}}) is None
 
 
 def test_collect_specs_resume_single_remaining_with_decision():
@@ -679,7 +679,7 @@ def test_collect_specs_resume_single_remaining_with_decision():
     ]
     completed = [ToolMessage(content='A-done', tool_call_id='call-A')]
     specs = node._collect_parallel_application_specs(
-        tool_calls, completed, {'configurable': {}}, {},
+        tool_calls, completed, {'configurable': {}},
         hitl_decisions=[{'tool_call_id': 'call-B', 'action': 'approve'}],
     )
     assert specs is not None and len(specs) == 1 and specs[0][2] == 'call-B'
