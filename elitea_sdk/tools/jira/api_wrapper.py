@@ -1832,7 +1832,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         self._skipped_attachment_extensions = kwargs.get('skip_attachment_extensions', [])
         self._include_attachments = kwargs.get('include_attachments', False)
         self._included_fields = fields_to_extract.copy() if fields_to_extract else []
-        self._include_comments = kwargs.get('include_comments', True)
+        self._include_comments = kwargs.get('include_comments', False)
+        self._process_images = kwargs.get('process_images', False)
         self._chunking_tool = kwargs.get('chunking_tool', None)
 
         try:
@@ -1885,14 +1886,21 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def _extend_data(self, documents: Generator[Document, None, None]):
         image_pattern = r'!([^!|]+)(?:\|[^!]*)?!'
+        # Resolve attachments and run vision-LLM image description only when the caller
+        # opted in via process_images, an LLM is configured, and the description actually
+        # contains image markup. Skipping this avoids 3+ Jira REST calls and per-image LLM
+        # calls per issue on the indexing hot path.
+        process_images = bool(getattr(self, '_process_images', False)) and self.llm is not None
         for doc in documents:
-            attachment_resolver = AttachmentResolver(self._client, doc.metadata['issue_key'])
-            processed_content = re.sub(image_pattern,
-                                    lambda match: self.process_image_match(match,
-                                                                           doc.page_content,
-                                                                           attachment_resolver),
-                                    doc.page_content)
-            doc.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = processed_content.encode('utf-8')
+            content = doc.page_content
+            if process_images and re.search(image_pattern, content):
+                attachment_resolver = AttachmentResolver(self._client, doc.metadata['issue_key'])
+                content = re.sub(image_pattern,
+                                 lambda match: self.process_image_match(match,
+                                                                        doc.page_content,
+                                                                        attachment_resolver),
+                                 doc.page_content)
+            doc.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = content.encode('utf-8')
             doc.metadata[IndexerKeywords.CONTENT_FILE_NAME.value] = f"base_doc{file_extension_by_chunker(self._chunking_tool)}"
             yield doc
 
@@ -1942,7 +1950,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                                            'type': 'attachment',
                                        })
         if self._include_comments:
-            comments = self.get_processed_comments_list_with_image_description(client, issue_key)
+            # Skip vision-LLM image description in comments unless explicitly enabled and an LLM is configured.
+            comments_process_images = bool(getattr(self, '_process_images', False)) and self.llm is not None
+            comments = self.get_processed_comments_list_with_image_description(
+                client, issue_key, process_images=comments_process_images
+            )
             if comments:
                 for comment in comments:
                     yield Document(page_content='',
@@ -2096,6 +2108,12 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             'include_attachments': (Optional[bool],
                                     Field(description="Whether to include attachment content in indexing",
                                           default=False)),
+            'include_comments': (Optional[bool], Field(
+                description="Whether to fetch and index comments for each issue. Default is False to keep large-dataset indexing fast — set to True when comment text needs to be searchable. When False, comment fetching (and any per-comment image work) is skipped entirely.",
+                default=False)),
+            'process_images': (Optional[bool], Field(
+                description="Whether to use a vision LLM to describe images referenced in issue descriptions and comments. Requires an LLM that supports vision. Default is False — image markup stays as-is in indexed text. Enable only when image descriptions are essential and the per-image LLM cost is acceptable.",
+                default=False)),
             'max_total_issues': (Optional[int], Field(description="Maximum number of issues to index", default=1000)),
             'skip_attachment_extensions': (Optional[List[str]], Field(
                 description="List of file extensions to skip when processing attachments: i.e. ['.png', '.jpg']",
