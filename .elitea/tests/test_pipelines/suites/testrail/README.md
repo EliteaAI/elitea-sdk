@@ -20,8 +20,15 @@ This test suite validates the functionality of the TestRail toolkit, which provi
 | get_suites | test_case_15, test_case_16 | Critical, High | ✅ Created |
 | empty-result regression coverage | test_case_17, test_case_18, test_case_19, test_case_20 | Critical, High | ✅ Created |
 | get_sections | test_case_21, test_case_22 | Critical, High | ✅ Created |
+| add_section | test_case_23, test_case_24 | Critical, High | ✅ Created |
+| delete_section | test_case_25, test_case_26 | Critical, High | ✅ Created |
+| get_runs | test_case_27, test_case_28 | Critical, High | ✅ Created |
+| get_run | test_case_29, test_case_30 | Critical, High | ✅ Created |
+| get_results_for_run | test_case_31, test_case_32 | Critical, High | ✅ Created |
+| get_results_for_case | test_case_33 | High | ✅ Created |
+| get_results | test_case_34 | High | ✅ Created |
 
-**Total:** 9 tools covered, 21 test files (Critical file attachment test migrated to Artifact suite as ART22)
+**Total:** 16 tools covered, 34 test files (Critical file attachment test migrated to Artifact suite as ART22)
 
 ## Test Scenarios
 
@@ -66,6 +73,28 @@ This test suite validates the functionality of the TestRail toolkit, which provi
 ### TR21-TR22: get_sections
 - **TR21** (Critical): Retrieve sections for a project in JSON format
 - **TR22** (High): Test markdown output format for sections
+
+### TR23-TR24: add_section
+- **TR23** (Critical): Create a new top-level section in a project (happy path)
+- **TR24** (High): Create a nested/child section via `parent_id` in `section_properties`
+
+### TR25-TR26: delete_section
+- **TR25** (Critical): Discover a suite via `get_suites`, create a throwaway section in it, then permanently delete it; validates the deletion succeeded
+- **TR26** (High): Error handling — deleting a non-existent section id returns a graceful error
+
+### TR27-TR28: get_runs
+- **TR27** (Critical): List a project's test runs in JSON format (an empty list is a valid result)
+- **TR28** (High): Filter via `run_filter` (active runs, `is_completed: 0`) with markdown output
+
+### TR29-TR30: get_run
+- **TR29** (Critical): List runs, extract the first run id, then retrieve it via `get_run`
+- **TR30** (High): Error handling — fetching a non-existent run id returns a graceful error
+
+### TR31-TR34: results (read-only)
+- **TR31** (Critical): List runs → extract first run id → fetch results via `get_results_for_run`
+- **TR32** (High): `get_results_for_run` error handling — invalid run id returns a graceful error
+- **TR33** (High): `get_results_for_case` error handling — invalid run+case ids return a graceful error
+- **TR34** (High): `get_results` error handling — invalid test id returns a graceful error
 
 ## Setup Artifacts
 

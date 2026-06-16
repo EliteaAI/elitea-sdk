@@ -1,0 +1,214 @@
+name: "TR24 add section with parent"
+priority: High
+description: |
+  Verify the add_section tool creates a nested section using a parent_id, exercising
+  the section_properties pass-through (suite_id + parent_id + description).
+
+  Objective: Test section hierarchy creation via section_properties.
+
+  Workflow:
+  - Discover a suite via get_suites
+  - Create a parent section in that suite, extract its id
+  - Create a child section under that parent
+  - Clean up by deleting the parent (TestRail cascades the child)
+
+  Expected Behavior:
+  - The child add_section executes successfully and returns the created section id
+
+toolkits:
+  - id: ${TESTRAIL_TOOLKIT_ID}
+    name: ${TESTRAIL_TOOLKIT_NAME}
+
+state:
+  project_id:
+    type: str
+    value: "${TESTRAIL_PROJECT_ID}"
+  parent_name:
+    type: str
+    value: "Automated Parent Section - TR24 - ${TIMESTAMP}"
+  child_name:
+    type: str
+    value: "Automated Child Section - TR24 - ${TIMESTAMP}"
+  suites_result:
+    type: dict
+  suite_id:
+    type: str
+  parent_result:
+    type: dict
+  parent_section_id:
+    type: str
+  tool_result:
+    type: dict
+  cleanup_result:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_suites
+
+nodes:
+  - id: invoke_get_suites
+    type: toolkit
+    tool: get_suites
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+    output:
+      - suites_result
+    structured_output: true
+    transition: extract_suite_id
+
+  - id: extract_suite_id
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        raw = elitea_state.get("suites_result", "")
+        value = ""
+        if isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], dict) and "id" in raw[0]:
+            value = str(raw[0]["id"])
+        else:
+            m = re.search(r"id\W+(\d+)", str(raw))
+            value = m.group(1) if m else ""
+        {"suite_id": value}
+    input:
+      - suites_result
+    output:
+      - suite_id
+    structured_output: true
+    transition: invoke_add_parent
+
+  - id: invoke_add_parent
+    type: toolkit
+    tool: add_section
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+      - parent_name
+      - suite_id
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+      name:
+        type: variable
+        value: parent_name
+      section_properties:
+        type: fstring
+        value: '{{"suite_id": {suite_id}, "description": "Parent section created by TR24"}}'
+    output:
+      - parent_result
+    structured_output: true
+    transition: extract_parent_id
+
+  - id: extract_parent_id
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        raw = elitea_state.get("parent_result", "")
+        m = re.search(r"id\W+(\d+)", str(raw))
+        value = m.group(1) if m else ""
+        {"parent_section_id": value}
+    input:
+      - parent_result
+    output:
+      - parent_section_id
+    structured_output: true
+    transition: invoke_add_child
+
+  - id: invoke_add_child
+    type: toolkit
+    tool: add_section
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+      - child_name
+      - suite_id
+      - parent_section_id
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+      name:
+        type: variable
+        value: child_name
+      section_properties:
+        type: fstring
+        value: '{{"suite_id": {suite_id}, "parent_id": {parent_section_id}, "description": "Child section created by TR24"}}'
+    output:
+      - tool_result
+    structured_output: true
+    transition: cleanup_delete_parent
+
+  - id: cleanup_delete_parent
+    type: toolkit
+    tool: delete_section
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - parent_section_id
+    input_mapping:
+      section_id:
+        type: variable
+        value: parent_section_id
+      soft_delete:
+        type: fixed
+        value: false
+    output:
+      - cleanup_result
+    structured_output: false
+    continue_on_error: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    input:
+      - tool_result
+      - cleanup_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the complete test workflow results.
+
+          Child Creation Result: {tool_result}
+          Cleanup Result: {cleanup_result}
+
+          Expected behavior:
+          - add_section created a nested/child section under the parent section
+          - Result confirms section creation with an id and name
+          - Cleanup deleted the parent (and cascaded the child)
+          - No errors or exceptions in the child creation
+
+          Evaluate:
+          1. Did the child add_section execute successfully?
+          2. Are there any errors in the child creation result?
+          3. Does the output confirm a section was created with an id?
+          4. Was cleanup successful (can ignore cleanup errors)?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+
+          Note: test_passed should be based ONLY on child creation success, not cleanup.
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

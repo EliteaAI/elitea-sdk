@@ -1,14 +1,14 @@
-name: "TR16 get suites formats"
+name: "TR28 get runs filter and format"
 priority: High
 description: |
-  Verify the get_suites tool supports multiple output formats (csv, markdown).
-  
-  Objective: Test output format flexibility for suites.
-  
+  Verify the get_runs tool supports filtering (run_filter) and markdown output.
+
+  Objective: Test run filtering and output format flexibility.
+
   Expected Behavior:
-  - Tool executes successfully with markdown format
-  - Returns suites in markdown format
-  - Data is properly formatted
+  - Tool executes successfully with a run_filter for active runs and markdown format
+  - Returns matching runs (or an empty list) in markdown format
+  - No errors or exceptions
 
 toolkits:
   - id: ${TESTRAIL_TOOLKIT_ID}
@@ -17,7 +17,10 @@ toolkits:
 state:
   project_id:
     type: str
-    value: ${TESTRAIL_PROJECT_ID}
+    value: "${TESTRAIL_PROJECT_ID}"
+  run_filter:
+    type: str
+    value: '{"is_completed": 0}'
   output_format:
     type: str
     value: "markdown"
@@ -26,20 +29,24 @@ state:
   test_results:
     type: dict
 
-entry_point: invoke_get_suites
+entry_point: invoke_get_runs
 
 nodes:
-  - id: invoke_get_suites
+  - id: invoke_get_runs
     type: toolkit
-    tool: get_suites
+    tool: get_runs
     toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
     input:
       - project_id
+      - run_filter
       - output_format
     input_mapping:
       project_id:
         type: fstring
         value: "{project_id}"
+      run_filter:
+        type: variable
+        value: run_filter
       output_format:
         type: variable
         value: output_format
@@ -61,19 +68,19 @@ nodes:
         value: |
           Analyze the tool execution results and determine if the test passed.
 
-          tool executed: get_suites
+          tool executed: get_runs (run_filter for active runs, markdown output)
           results: {tool_result}
 
           expected behavior:
-          - tool executed successfully with markdown output format
-          - returned suites in markdown format
-          - data is properly formatted
+          - tool executed successfully with the filter applied and markdown output format
+          - returned matching runs (or an empty list) without errors
+          - data is properly formatted as markdown when runs are present
           - no errors or exceptions
 
           Evaluate:
           1. did the tool execute successfully?
           2. are there any errors?
-          3. does the output contain markdown formatted data?
+          3. is the output a valid (possibly empty) markdown-formatted run list?
 
           Return a JSON object with:
           {{

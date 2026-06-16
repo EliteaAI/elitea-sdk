@@ -1,14 +1,15 @@
-name: "TR16 get suites formats"
-priority: High
+name: "TR27 get runs happy path"
+priority: Critical
 description: |
-  Verify the get_suites tool supports multiple output formats (csv, markdown).
-  
-  Objective: Test output format flexibility for suites.
-  
+  Verify the get_runs tool retrieves the list of test runs for a project.
+
+  Objective: Test basic test run listing functionality.
+
   Expected Behavior:
-  - Tool executes successfully with markdown format
-  - Returns suites in markdown format
-  - Data is properly formatted
+  - Tool executes successfully with project ID
+  - Returns a list of test runs in JSON format (an empty list is a valid result)
+  - Each run, when present, contains id and name fields
+  - No errors or exceptions
 
 toolkits:
   - id: ${TESTRAIL_TOOLKIT_ID}
@@ -17,21 +18,21 @@ toolkits:
 state:
   project_id:
     type: str
-    value: ${TESTRAIL_PROJECT_ID}
+    value: "${TESTRAIL_PROJECT_ID}"
   output_format:
     type: str
-    value: "markdown"
+    value: "json"
   tool_result:
     type: dict
   test_results:
     type: dict
 
-entry_point: invoke_get_suites
+entry_point: invoke_get_runs
 
 nodes:
-  - id: invoke_get_suites
+  - id: invoke_get_runs
     type: toolkit
-    tool: get_suites
+    tool: get_runs
     toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
     input:
       - project_id
@@ -61,19 +62,19 @@ nodes:
         value: |
           Analyze the tool execution results and determine if the test passed.
 
-          tool executed: get_suites
+          tool executed: get_runs
           results: {tool_result}
 
           expected behavior:
-          - tool executed successfully with markdown output format
-          - returned suites in markdown format
-          - data is properly formatted
+          - tool executed successfully
+          - returned a list of test runs in json format (an empty list "[]" is valid)
+          - if runs are present they contain run data with id and name fields
           - no errors or exceptions
 
           Evaluate:
           1. did the tool execute successfully?
           2. are there any errors?
-          3. does the output contain markdown formatted data?
+          3. does the output contain a runs list (possibly empty)?
 
           Return a JSON object with:
           {{
