@@ -161,9 +161,9 @@ nodes:
           1. active_switch_success: Switch to ActiveBranchTest succeeded
           2. active_read_success: Read file on ActiveBranchTest returned content (file exists)
           3. elitea_switch_success: Switch to EliteaTest succeeded
-          4. elitea_read_expected_fail: Read file on EliteaTest failed (file doesn't exist - this is expected)
+          4. elitea_read_expected_fail: Read file on EliteaTest failed because the file does not exist on that branch; TF401174 or file-not-found wording is expected and should count as PASS for this criterion
           5. main_switch_success: Switch to main succeeded
-          6. no_unexpected_errors: No unexpected errors in any operation
+          6. no_unexpected_errors: No unexpected errors occurred outside the expected missing-file read on EliteaTest; do not count the expected missing-file error as an unexpected error
 
           Return a JSON object with structure:
           {{
@@ -176,6 +176,11 @@ nodes:
             "no_unexpected_errors": boolean,
             "error": string | null
           }}
+
+          IMPORTANT:
+          - The EliteaTest read is a negative check and is expected to fail.
+          - If the EliteaTest read shows TF401174, "File not found", or equivalent missing-file wording, that is expected behavior.
+          - In that case, set both elitea_read_expected_fail=true and no_unexpected_errors=true unless another unrelated error is present.
 
           Return ONLY the JSON object (no markdown or explanation).
     model: ${DEFAULT_LLM_MODEL}
