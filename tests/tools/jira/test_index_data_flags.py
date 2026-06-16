@@ -174,12 +174,14 @@ class TestProcessDocumentCommentsGate:
 class TestIndexToolParams:
     """`include_comments` and `process_images` must be exposed on the public schema."""
 
-    def test_include_comments_present_with_default_true(self):
+    def test_include_comments_present_with_default_false(self):
+        # Default flipped to False to avoid the per-issue comments fetch + image work
+        # for large datasets. Callers must opt in when comment text matters.
         params = JiraApiWrapper.model_construct()._index_tool_params()
 
         assert "include_comments" in params
         _, field = params["include_comments"]
-        assert field.default is True
+        assert field.default is False
 
     def test_process_images_present_with_default_false(self):
         params = JiraApiWrapper.model_construct()._index_tool_params()
