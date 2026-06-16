@@ -172,8 +172,10 @@ class TestSandboxClientV2Urls:
     def test_removed_prompts(self):
         assert not hasattr(self.client, 'prompts')
 
-    def test_removed_auth_user_url(self):
-        assert not hasattr(self.client, 'auth_user_url')
+    def test_auth_user_url(self):
+        assert hasattr(self.client, 'auth_user_url')
+        assert "/api/v2/" in self.client.auth_user_url
+        assert "/api/v1/" not in self.client.auth_user_url
 
     def test_removed_integration_details(self):
         assert not hasattr(self.client, 'integration_details')
@@ -181,8 +183,9 @@ class TestSandboxClientV2Urls:
     def test_removed_configurations_url(self):
         assert not hasattr(self.client, 'configurations_url')
 
-    def test_removed_get_user_data(self):
-        assert not hasattr(self.client, 'get_user_data')
+    def test_get_user_data_exists(self):
+        assert hasattr(self.client, 'get_user_data')
+        assert callable(self.client.get_user_data)
 
     def test_removed_get_real_user_id(self):
         assert not hasattr(self.client, '_get_real_user_id')
