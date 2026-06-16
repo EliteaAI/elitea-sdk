@@ -1551,8 +1551,14 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                             attrs = media.get('attrs', {})
                             if attrs.get('type') == 'file':
                                 alt = attrs.get('alt', '')
-                                image_str = f'!{alt}|alt="{alt}"!'
-                                result.append(image_str)
+                                # Cloud ADF authors often paste images without alt text. The
+                                # outer regex `!([^!|]+)…!` won't match an empty token, so
+                                # fall back to the media node's `id` (the Jira attachment
+                                # ID — AttachmentResolver supports lookup by ID directly).
+                                ref = alt or attrs.get('id', '')
+                                if ref:
+                                    image_str = f'!{ref}|alt="{alt}"!'
+                                    result.append(image_str)
                         elif content_item.get('type') == 'paragraph':
                             result.append(content_item['content'][0].get('text', ''))
                         else:
@@ -2056,9 +2062,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             # Build content starting with summary
             content = f"# Summary\n{issue['fields']['summary']}\n\n"
 
-            # Add description if present
+            # Add description if present. On Jira Cloud the field is ADF (a JSON dict);
+            # convert it to wiki-style markup so `_extend_data`'s `!ref!` regex can find
+            # image references. Server/DC returns a string and falls through unchanged.
             description = issue['fields'].get('description', '')
             if description:
+                if isinstance(description, (dict, list)):
+                    description = self._extract_image_data(description)
                 content += f"# Description\n{description}\n\n"
             else:
                 # If no description, still create document but with minimal content
