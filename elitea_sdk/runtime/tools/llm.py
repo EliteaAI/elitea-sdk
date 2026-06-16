@@ -938,11 +938,12 @@ class LLMNode(BaseTool):
 
     @staticmethod
     def _build_blocked_tool_guidance(blocked_payload: Dict[str, Any]) -> str:
-        # A single factual, invocation-scoped line carried INSIDE the blocked
-        # ToolMessage. It replaces the old forced-tool-rebinding + separate
-        # nudge HumanMessage: the blocked tool stays bound, and this note tells
-        # the model the block applies only to this exact call so it continues
-        # the remaining work (e.g. the next item in a sequence) on its own.
+        # Fallback directive used ONLY when a blocked payload arrives without its
+        # own `message` (the sensitive-tool guard is the source of truth and bakes
+        # it in). Kept aligned with SensitiveToolGuardMiddleware.BLOCKED_TOOL_MESSAGE:
+        # an explicit, imperative continue-instruction that does NOT end on a
+        # terminal "stopped" note — weak models (haiku, gpt-5.4-mini) read a
+        # terminal ending as "halt" and skip the rest of the workflow.
         action_label = (
             blocked_payload.get('action_label')
             or blocked_payload.get('blocked_tool_name')
@@ -950,34 +951,14 @@ class LLMNode(BaseTool):
             or 'the requested action'
         )
         return (
-            f"'{action_label}' was declined by the user for this specific call and was not executed. "
-            "The block is scoped to this exact invocation, not to the tool. "
-            "Do not retry this same call with the same arguments. "
-            "Continue with the remaining work — if items remain, call the tool again for the next item, "
-            "or use any other available tool. Only stop and ask the user if no path forward remains."
+            f"You declined THIS specific call to '{action_label}'; it was not executed. "
+            "The block is for THIS invocation only, not the tool itself. "
+            "This is NOT a stop signal — do not end your turn or summarize yet. "
+            "Do not retry this same call with the same arguments, but DO continue: "
+            "if more items remain, call the tool again for the NEXT item now; "
+            "otherwise use another available tool to keep making progress. "
+            "Only stop and ask the user when nothing remains that can be done without this exact declined call."
         )
-
-    @staticmethod
-    def _build_visible_blocked_tool_payload(blocked_payload: Dict[str, Any]) -> Dict[str, Any]:
-        visible_payload = {}
-        for key in (
-            'type',
-            'status',
-            'blocked_tool_name',
-            'blocked_toolkit_name',
-            'blocked_toolkit_type',
-            'action_label',
-            'message',
-            'user_feedback',
-            'retry_allowed',
-            'equivalent_action_via_other_tool_allowed',
-            'guidance',
-        ):
-            value = blocked_payload.get(key)
-            if value is None or value == '':
-                continue
-            visible_payload[key] = value
-        return visible_payload
 
     def invoke(
             self,
@@ -2559,17 +2540,24 @@ class LLMNode(BaseTool):
                         blocked_payload = self._parse_sensitive_tool_blocked_result(tool_result)
                         if blocked_payload is not None:
                             # User declined this sensitive call. The blocked tool
-                            # stays bound (per-call independent approval, #5303):
-                            # carry a single invocation-scoped guidance line inside
-                            # the ToolMessage so the model continues the remaining
-                            # work naturally — no forced rebinding, no nudge turn.
-                            visible_payload = self._build_visible_blocked_tool_payload({
-                                **blocked_payload,
-                                'guidance': self._build_blocked_tool_guidance(blocked_payload),
-                            })
+                            # stays bound (per-call independent approval, #5303).
+                            # The guard already produces a SLIM structured payload
+                            # (type + tool/toolkit identities + denial_reason + a
+                            # single `message` directive). Pass it through verbatim
+                            # so the model input is identical to the tool-trace the
+                            # user sees — one source of truth. The directive in
+                            # `message` is what steers continuation; the slim
+                            # structure avoids the field bloat that tripped weak
+                            # models (haiku, gpt-5.4-mini). If a payload somehow
+                            # lacks `message`, synthesize a fallback directive.
+                            if not blocked_payload.get('message'):
+                                blocked_payload = {
+                                    **blocked_payload,
+                                    'message': self._build_blocked_tool_guidance(blocked_payload),
+                                }
                             tool_message = ToolMessage(
                                 content=json.dumps(
-                                    visible_payload,
+                                    blocked_payload,
                                     ensure_ascii=True,
                                     separators=(',', ':'),
                                 ),

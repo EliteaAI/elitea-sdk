@@ -40,8 +40,25 @@ class SensitiveToolGuardMiddleware(Middleware):
 
     BLOCKED_TOOL_RESULT_TYPE = 'sensitive_tool_blocked'
 
+    # Default reason when the user rejected without typing a note.
+    BLOCKED_TOOL_DEFAULT_REASON = 'denied by user'
+
+    # `message` is the single natural-language directive a model reads off the
+    # blocked result (there is no duplicate `guidance` field any more). The text
+    # must NOT end on a terminal "stopped / not executed" note — that reads as
+    # "halt" to a weak model (haiku, gpt-5.4-mini) and made them skip the rest
+    # of the workflow. Lead with the block fact, then an explicit, imperative
+    # continue-instruction. The slim structured fields around it (tool name,
+    # toolkit, denial_reason) give the model machine-readable identities without
+    # the field bloat that was tripping weak models.
     BLOCKED_TOOL_MESSAGE = (
-        "User blocked the sensitive action '{action_label}'. This tool call was skipped and not executed."
+        "You declined THIS specific call to '{action_label}'; it was not executed. "
+        "The block is for THIS invocation only, not the tool itself. "
+        "This is NOT a stop signal — do not end your turn or summarize yet. "
+        "Do not retry this same call with the same arguments, but DO continue: "
+        "if more items remain, call the tool again for the NEXT item now; "
+        "otherwise use another available tool to keep making progress. "
+        "Only stop and ask the user when nothing remains that can be done without this exact declined call."
     )
 
     def __init__(
@@ -75,21 +92,22 @@ class SensitiveToolGuardMiddleware(Middleware):
         toolkit_type: Optional[str] = None,
         user_feedback: str = '',
     ) -> dict[str, Any]:
+        # Slim, structured shape. Only `type` (detection), the tool/toolkit
+        # identities (pipeline-block message), `denial_reason`, and a single
+        # `message` directive. No duplicate `guidance`; no unread status/
+        # retry_allowed/equivalent_action fields — those were field bloat that
+        # weak models choked on. `denial_reason` carries the user's typed note
+        # when given, else a default.
         payload: dict[str, Any] = {
             'type': cls.BLOCKED_TOOL_RESULT_TYPE,
-            'status': 'blocked',
             'blocked_tool_name': tool_name,
-            'action_label': action_label,
+            'denial_reason': user_feedback.strip() or cls.BLOCKED_TOOL_DEFAULT_REASON,
             'message': cls._build_blocked_tool_message(action_label),
-            'retry_allowed': True,
-            'equivalent_action_via_other_tool_allowed': True,
         }
         if toolkit_name:
             payload['blocked_toolkit_name'] = toolkit_name
         if toolkit_type:
             payload['blocked_toolkit_type'] = toolkit_type
-        if user_feedback:
-            payload['user_feedback'] = user_feedback
         return payload
 
     @classmethod
