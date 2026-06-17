@@ -14,7 +14,7 @@ import requests
 import swagger_client
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
-from pydantic import Field, PrivateAttr, model_validator, create_model, SecretStr
+from pydantic import Field, PrivateAttr, field_validator, model_validator, create_model, SecretStr
 from sklearn.feature_extraction.text import strip_tags
 from swagger_client import TestCaseApi, SearchApi, PropertyResource, ModuleApi, ProjectApi, FieldApi
 from swagger_client.rest import ApiException
@@ -276,6 +276,11 @@ NoInput = create_model(
 class QtestApiWrapper(NonCodeIndexerToolkit):
     base_url: str
     qtest_project_id: int
+
+    @field_validator('base_url', mode='before')
+    @classmethod
+    def strip_trailing_slash(cls, v: str) -> str:
+        return v.rstrip('/')
     qtest_api_token: SecretStr
     no_of_items_per_page: int = 100
     page: int = 1
@@ -963,23 +968,23 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         # PERMISSION-FREE: Parse properties directly from API response
         # No get_fields call needed - works for all users
         
-        for item in response_to_parse['items']:
+        for item in response_to_parse.get('items') or []:
             # Start with core fields (always present)
             parsed_data_row = {
-                'Id': item['pid'],
-                'Name': item['name'],
-                'Description': self._clean_html_content(item['description'], extract_images, prompt),
-                'Precondition': self._clean_html_content(item['precondition'], extract_images, prompt),
-                QTEST_ID: item['id'],
+                'Id': item.get('pid'),
+                'Name': item.get('name'),
+                'Description': self._clean_html_content(item.get('description') or '', extract_images, prompt),
+                'Precondition': self._clean_html_content(item.get('precondition') or '', extract_images, prompt),
+                QTEST_ID: item.get('id'),
                 'Steps': list(map(lambda step: {
                     'Test Step Number': step[0] + 1,
-                    'Test Step Description': self._clean_html_content(step[1]['description'], extract_images, prompt),
-                    'Test Step Expected Result': self._clean_html_content(step[1]['expected'], extract_images, prompt)
-                }, enumerate(item['test_steps']))),
+                    'Test Step Description': self._clean_html_content(step[1].get('description') or '', extract_images, prompt),
+                    'Test Step Expected Result': self._clean_html_content(step[1].get('expected') or '', extract_images, prompt)
+                }, enumerate(item.get('test_steps') or []))),
             }
-            
+
             # Add custom fields directly from API response properties
-            for prop in item['properties']:
+            for prop in item.get('properties') or []:
                 field_name = prop.get('field_name')
                 if not field_name:
                     continue
@@ -1135,6 +1140,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         """ Search for a qtest id using the test id. Test id should be in format TC-123. """
         dql = f"Id = '{test_id}'"
         parsed_data = self.__perform_search_by_dql(dql)
+        if not parsed_data:
+            raise ValueError(
+                f"Test case '{test_id}' not found in project {self.qtest_project_id}. "
+                f"Please verify the test case ID exists."
+            )
         return parsed_data[0]['QTest Id']
 
     def __find_qtest_internal_id(self, object_type: str, entity_id: str) -> int:
@@ -1320,19 +1330,23 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         link_object_api_instance = swagger_client.ObjectLinkApi(self._client)
         source_type = "requirements"
         linked_type = "test-cases"
-        test_case_ids = json.loads(json_list_of_test_case_ids)
+        try:
+            test_case_ids = json.loads(json_list_of_test_case_ids)
+        except json.JSONDecodeError as e:
+            raise ToolException(f"Invalid JSON in test case IDs list: {e}") from e
         qtest_test_case_ids = [self.__find_qtest_id_by_test_id(tc_id) for tc_id in test_case_ids]
         requirement_id = self._get_jira_requirement_id(requirement_external_id)
 
         try:
             response = link_object_api_instance.link_artifacts(
-                self.qtest_project_id, 
+                self.qtest_project_id,
                 object_id=requirement_id,
                 type=linked_type,
-                object_type=source_type, 
+                object_type=source_type,
                 body=qtest_test_case_ids
             )
-            linked_test_cases = [link.pid for link in response[0].objects]
+            objects = response[0].objects if response and response[0].objects else []
+            linked_test_cases = [link.pid for link in objects]
             return (
                 f"Successfully linked {len(linked_test_cases)} test case(s) to Jira requirement '{requirement_external_id}' "
                 f"in project {self.qtest_project_id}.\n"
@@ -1365,9 +1379,12 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         linked_type = "test-cases"
         
         # Parse and convert test case IDs
-        test_case_ids = json.loads(json_list_of_test_case_ids)
+        try:
+            test_case_ids = json.loads(json_list_of_test_case_ids)
+        except json.JSONDecodeError as e:
+            raise ToolException(f"Invalid JSON in test case IDs list: {e}") from e
         qtest_test_case_ids = [self.__find_qtest_id_by_test_id(tc_id) for tc_id in test_case_ids]
-        
+
         # Get internal QTest ID for the requirement
         qtest_requirement_id = self.__find_qtest_requirement_id_by_id(requirement_id)
 
@@ -1379,7 +1396,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 object_type=source_type,
                 body=qtest_test_case_ids
             )
-            linked_test_cases = [link.pid for link in response[0].objects]
+            objects = response[0].objects if response and response[0].objects else []
+            linked_test_cases = [link.pid for link in objects]
             return (
                 f"Successfully linked {len(linked_test_cases)} test case(s) to QTest requirement '{requirement_id}' "
                 f"in project {self.qtest_project_id}.\n"
@@ -1977,7 +1995,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     def create_test_cases(self, test_case_content: str, folder_to_place_test_cases_to: str) -> dict:
         """ Create the test case based on the incoming content. The input should be in json format. """
         test_cases_api_instance: TestCaseApi = self.__instantiate_test_api_instance()
-        input_obj = json.loads(test_case_content)
+        try:
+            input_obj = json.loads(test_case_content)
+        except json.JSONDecodeError as e:
+            raise ToolException(f"Invalid JSON in test_case_content: {e}") from e
         test_cases = input_obj if isinstance(input_obj, list) else [input_obj]
         bodies = self.__build_body_for_create_test_case(test_cases, folder_to_place_test_cases_to)
         result = {'qtest_folder': folder_to_place_test_cases_to, 'test_cases': []}
@@ -1996,12 +2017,21 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
     def update_test_case(self, test_id: str, test_case_content: str) -> str:
         """ Update the test case base on the incoming content. The input should be in json format. Also test id should be passed in following format TC-786. """
-        input_obj = json.loads(test_case_content)
+        try:
+            input_obj = json.loads(test_case_content)
+        except json.JSONDecodeError as e:
+            raise ToolException(f"Invalid JSON in test_case_content: {e}") from e
         test_case = input_obj[0] if isinstance(input_obj, list) else input_obj
 
         qtest_id = test_case.get(QTEST_ID)
         if qtest_id is None or qtest_id == '':
-            actual_test_case = self.__perform_search_by_dql(f"Id = '{test_id}'")[0]
+            results = self.__perform_search_by_dql(f"Id = '{test_id}'")
+            if not results:
+                raise ValueError(
+                    f"Test case '{test_id}' not found in project {self.qtest_project_id}. "
+                    f"Please verify the test case ID exists."
+                )
+            actual_test_case = results[0]
             test_case = actual_test_case | test_case
             qtest_id = test_case[QTEST_ID]
 
@@ -2050,7 +2080,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             str: Attachment ID from QTest
         """
         # Build upload URL
-        upload_url = f"{self.base_url.rstrip('/')}/api/v3/projects/{self.qtest_project_id}/{object_type}/{object_id}/blob-handles"
+        upload_url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/{object_type}/{object_id}/blob-handles"
         
         # Prepare headers
         headers = {
