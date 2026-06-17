@@ -597,6 +597,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         except ApiException as e:
             stacktrace = format_exc()
             logger.error(f"Exception when calling ModuleApi->get_sub_modules_of:\n {stacktrace}")
+            if e.status == 404:
+                raise ValueError(
+                    f"Unable to retrieve modules for qTest project {self.qtest_project_id}: "
+                    f"the modules endpoint returned 404. Verify the project ID and that your "
+                    f"API token has access to this project.")
             raise ValueError(
                 f"""Unable to get all the modules information from following qTest project - {self.qtest_project_id}.
                                 Exception: \n {stacktrace}""")
@@ -772,14 +777,15 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         try:
             fields = fields_api.get_fields(self.qtest_project_id, qtest_object)
         except ApiException as e:
-            # Check if permission denied (403) - use fallback
-            if e.status == 403:
+            # Fall back to properties API for 403 (no Field Management permission)
+            # and 404 (endpoint unavailable for this project/qTest configuration)
+            if e.status in (403, 404):
                 logger.warning(
-                    "get_fields permission denied (Field Management permission required). "
+                    f"get_fields returned HTTP {e.status} — endpoint unavailable or permission denied. "
                     "Using properties API fallback..."
                 )
                 return self.__get_field_definitions_from_properties_api()
-            
+
             # Other API errors
             stacktrace = format_exc()
             logger.error(f"Exception when calling FieldAPI->get_fields:\n {stacktrace}")
@@ -2153,8 +2159,19 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         if search:
             kwargs["search"] = search
         
-        modules = module_api.get_sub_modules_of(project_id=self.qtest_project_id, **kwargs)
-        
+        try:
+            modules = module_api.get_sub_modules_of(project_id=self.qtest_project_id, **kwargs)
+        except ApiException as e:
+            stacktrace = format_exc()
+            logger.error(f"Exception when calling ModuleApi->get_sub_modules_of:\n {stacktrace}")
+            if e.status == 404:
+                raise ToolException(
+                    f"Unable to retrieve modules for qTest project {self.qtest_project_id}: "
+                    f"the modules endpoint returned 404. Verify the project ID and that your "
+                    f"API token has access to this project.")
+            raise ToolException(
+                f"Unable to get modules for qTest project {self.qtest_project_id}. Exception: \n {stacktrace}")
+
         # Format modules for output
         formatted = []
         
