@@ -103,7 +103,7 @@ class TestAdoConfigurationCheckConnection:
         call_url = mock_get.call_args[0][0]
         parsed_url = urlparse(call_url)
         assert parsed_url.hostname == 'dev.azure.com'
-        assert 'profile' in call_url
+        assert '_apis/projects' in call_url
 
     @patch('requests.get')
     def test_check_connection_with_invalid_token(self, mock_get):
