@@ -85,10 +85,13 @@ class AdoConfiguration(BaseModel):
 
         # Auth-required endpoint to validate PAT (works regardless of project visibility)
         if org_url_kind == 'dev.azure.com':
-            profile_url = f"https://vssps.dev.azure.com/{org_name}/_apis/profile/profiles/me?api-version=7.1-preview.3"
+            base_url = f"https://dev.azure.com/{org_name}"
         else:
-            # For legacy org URLs, use the matching vssps host
-            profile_url = f"https://{org_name}.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1-preview.3"
+            base_url = f"https://{org_name}.visualstudio.com"
+
+        # Append the organization-level Projects API endpoint
+        # We add top=1 so the response is tiny, making it incredibly fast
+        test_url = f"{base_url}/_apis/projects?api-version=7.1&$top=1"
 
         try:
             if token:
@@ -96,18 +99,18 @@ class AdoConfiguration(BaseModel):
                 from requests.auth import HTTPBasicAuth
                 auth = HTTPBasicAuth("", token)
 
-                # Validate token against profile endpoint
-                profile_resp = requests.get(profile_url, auth=auth, timeout=10)
-                if profile_resp.status_code == 200:
+                # Validate token against projects endpoint
+                project_resp = requests.get(test_url, auth=auth, timeout=10)
+                if project_resp.status_code == 200:
                     return None  # Connection successful
-                elif profile_resp.status_code == 401:
+                elif project_resp.status_code == 401:
                     return "Invalid or expired token (PAT). Please generate a new token and try again."
-                elif profile_resp.status_code == 403:
+                elif project_resp.status_code == 403:
                     return "Token is valid but lacks permission to access profile. Check PAT scopes/permissions."
-                elif profile_resp.status_code == 404:
+                elif project_resp.status_code == 404:
                     return "Organization not found. Verify the Organization URL."
                 else:
-                    return f"Token validation failed (HTTP {profile_resp.status_code})."
+                    return f"Token validation failed (HTTP {project_resp.status_code})."
             else:
                 # Without token, just verify the organization URL is reachable
                 # Try to access the projects list endpoint (may work for public orgs)
