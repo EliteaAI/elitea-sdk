@@ -19,7 +19,7 @@ try:
 except ImportError:
     _SCRATCHPAD_KEY = '__pregel_scratchpad'
 
-from ..langchain.constants import ELITEA_RS, SKILLS_SECTION_HEADER, SKILLS_SECTION_ENTRY
+from ..langchain.constants import ELITEA_RS, SKILLS_SECTION_HEADER, SKILLS_SECTION_ENTRY, MAX_SKILLS_PER_INVOCATION
 from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
@@ -1329,21 +1329,22 @@ class LLMNode(BaseTool):
 
             # Per-turn skills injection. elitea_core resolves the
             # ~skill-name token(s) from THIS user message and threads the resolved bodies
-            # through invoke_config["configurable"]["invoked_skills"]. We append the rendered
-            # SKILLS section to system_content BEFORE the messages list is built; the
-            # _anthropic_system_content wrap below makes it cache-safe. Empty/absent ⇒ no-op,
+            # through invoke_config["configurable"]["invoked_skills"]. The rendered SKILLS
+            # section is kept OUT of the cached static block and passed to
+            # _anthropic_system_content as a dynamic suffix: for Anthropic it becomes a
+            # separate block AFTER the cache breakpoint, so a skill-invoking turn does not
+            # bust the cached prefix (instructions + tool schemas). Empty/absent ⇒ no-op,
             # so behavior is byte-identical when no skill was invoked. The injected text rides
             # the System message and is stripped before checkpoint (_strip_system_messages).
             skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
             if skills_section:
-                system_content = f"{system_content}\n\n{skills_section}"
                 logger.info("[Skills] Injected per-turn skills section into system prompt")
 
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
                 task_content = str(task_content) if task_content is not None else ""
             messages = [
-                SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                SystemMessage(content=self._anthropic_system_content(system_content, self.client, skills_section)),
                 *func_args.get('chat_history', []),
                 HumanMessage(content=task_content),
             ]
@@ -1677,7 +1678,7 @@ class LLMNode(BaseTool):
             if not instructions or not str(instructions).strip():
                 continue
             entries.append(SKILLS_SECTION_ENTRY.format(name=name, instructions=instructions))
-            if len(entries) >= 5:
+            if len(entries) >= MAX_SKILLS_PER_INVOCATION:
                 break
 
         if not entries:
@@ -2900,7 +2901,7 @@ class LLMNode(BaseTool):
         return False
 
     @staticmethod
-    def _anthropic_system_content(text: str, client: Any) -> Any:
+    def _anthropic_system_content(text: str, client: Any, dynamic_suffix: str = "") -> Any:
         """Return the SystemMessage content value appropriate for *client*.
 
         For Anthropic clients: a content-block list with a cache_control breakpoint
@@ -2912,9 +2913,21 @@ class LLMNode(BaseTool):
         Args:
             text: The resolved system prompt text.
             client: The raw LLM client (NOT a bound-tools wrapper).
+            dynamic_suffix: Optional per-turn content (e.g. invoked-skill guidance)
+                that changes between turns. For Anthropic it is emitted as a SEPARATE
+                block placed AFTER the cache breakpoint, so it does NOT invalidate the
+                cached static prefix (instructions + tool schemas) on turns where it
+                changes. For other clients it is concatenated onto the text.
         """
         if LLMNode._is_anthropic_client(client) and text:
-            return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+            blocks = [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+            if dynamic_suffix:
+                # No cache_control: this block sits after the breakpoint and is re-priced
+                # each turn, which is correct since its content varies per turn anyway.
+                blocks.append({"type": "text", "text": dynamic_suffix})
+            return blocks
+        if dynamic_suffix:
+            return f"{text}\n\n{dynamic_suffix}" if text else dynamic_suffix
         return text
 
     def __get_struct_output_model(

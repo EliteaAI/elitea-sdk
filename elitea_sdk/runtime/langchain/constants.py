@@ -698,6 +698,8 @@ Apply the following skill instructions for this request."""
 SKILLS_SECTION_ENTRY = """## {name}
 {instructions}"""
 
+MAX_SKILLS_PER_INVOCATION = 5
+
 
 SEARCH_INDEX_ADDON = """
 ## Indexed Document Search
