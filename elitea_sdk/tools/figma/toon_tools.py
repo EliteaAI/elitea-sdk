@@ -36,7 +36,7 @@ Flow markers:
   cta: CTA text with likely destination
   >: Navigation/flow direction
   ~: Variant of (similar to)
-  #: Frame ID (use with get_frame_detail_toon or get_file_nodes for drill-down)
+  #: Frame ID (use with analyze_file or get_file_nodes for drill-down)
 """
 
 import re
@@ -45,6 +45,8 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Any
 from pydantic import BaseModel, Field, create_model
+
+from ..utils.retry import retry_on_llm_error
 
 
 # -----------------------------------------------------------------------------
@@ -2109,7 +2111,12 @@ def analyze_frame_with_llm(
                     image_content,
                 ]
             )
-            raw_result = structured_llm.invoke([message])
+
+            @retry_on_llm_error(max_attempts=3, wait_seconds=(1, 4, 10))
+            def do_vision_call():
+                return structured_llm.invoke([message])
+
+            raw_result = do_vision_call()
             # With include_raw=True, result is {"parsed": ..., "raw": ...}
             result = raw_result.get('parsed') if isinstance(raw_result, dict) else raw_result
             if result:
@@ -2138,7 +2145,12 @@ def analyze_frame_with_llm(
             ScreenExplanation,
             include_raw=True,
         )
-        raw_result = structured_llm.invoke(prompt)
+
+        @retry_on_llm_error(max_attempts=3, wait_seconds=(1, 4, 10))
+        def do_text_call():
+            return structured_llm.invoke(prompt)
+
+        raw_result = do_text_call()
         # With include_raw=True, result is {"parsed": ..., "raw": ...}
         result = raw_result.get('parsed') if isinstance(raw_result, dict) else raw_result
 
@@ -2855,26 +2867,6 @@ PageFlowsTOONSchema = create_model(
 )
 
 
-FrameDetailTOONSchema = create_model(
-    "FrameDetailTOON",
-    file_key=(
-        str,
-        Field(
-            description="Figma file key.",
-            examples=["Fp24FuzPwH0L74ODSrCnQo"],
-        ),
-    ),
-    frame_ids=(
-        str,
-        Field(
-            description="Comma-separated frame IDs to get details for.",
-            examples=["1:100,1:200,1:300"],
-        ),
-    ),
-)
-
-
-# Unified TOON tool with detail levels
 AnalyzeFileSchema = create_model(
     "AnalyzeFile",
     url=(

@@ -1,15 +1,9 @@
 import functools
 import json
 import logging
-import math
-import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from enum import Enum
-from pathlib import Path
-from typing import Callable, ClassVar, Dict, List, Generator, Literal, Optional, Tuple, TypeVar, Union
+from typing import Callable, ClassVar, Dict, List, Generator, Optional, Tuple, TypeVar, Union
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -66,22 +60,20 @@ from .toon_tools import (
     TOONSerializer,
     process_page_to_toon_data,
     process_frame_to_toon_data,
-    extract_text_by_role,
-    extract_components,
     detect_sequences,
     group_variants,
     infer_cta_destination,
-    FrameDetailTOONSchema,
     AnalyzeFileSchema,
     analyze_frame_with_llm,
-    analyze_flows_with_llm,
-    analyze_file_with_llm,
-    serialize_flow_analysis,
-    serialize_design_analysis,
 )
 from .chunking_strategy import (
     BisectionChunkingStrategy,
-    ChunkResult,
+)
+from ..utils.retry import (
+    is_server_error_retriable,
+    is_volume_error_retriable,
+    retry_on_server_error,
+    retry_on_volume_error,
 )
 
 GLOBAL_LIMIT = 1000000
@@ -267,52 +259,6 @@ class ArgsSchema(Enum):
         ),
         extra_params=EXTRA_PARAMS,
     )
-    FileSummary = create_model(
-        "FileSummary",
-        url=(
-            Optional[str],
-            Field(
-                description=(
-                    "Full Figma URL with file key and optional node-id. "
-                    "Example: 'https://www.figma.com/file/<FILE_KEY>/...?...node-id=<NODE_ID>'. "
-                    "If provided and valid, URL is used and file_key/node_ids arguments are ignored."
-                ),
-                default=None,
-            ),
-        ),
-        file_key=(
-            Optional[str],
-            Field(
-                description=(
-                    "Explicit file key used only when URL is not provided."
-                ),
-                default=None,
-                examples=["Fp24FuzPwH0L74ODSrCnQo"],
-            ),
-        ),
-        include_node_ids=(
-            Optional[str],
-            Field(
-                description=(
-                    "Optional comma-separated top-level node ids (pages) to include when URL has no node-id and URL is not set. "
-                    "Example: '8:6,1:7'."
-                ),
-                default=None,
-                examples=["8:6,1:7"],
-            ),
-        ),
-        exclude_node_ids=(
-            Optional[str],
-            Field(
-                description=(
-                    "Optional comma-separated top-level node ids (pages) to exclude when URL has no node-id and URL is not set. "
-                    "Applied only when include_node_ids is not provided."
-                ),
-                default=None,
-                examples=["8:6,1:7"],
-            ),
-        ),
-    )
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
@@ -425,7 +371,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_types_include: Optional[List[str]] = None,
         node_types_exclude: Optional[List[str]] = None,
         number_of_threads: Optional[int] = None,
-        index_granularity: Optional[Literal['node', 'toon']] = None,
         image_max_dimension: Optional[int] = None,
         frame_spatial_order: Optional[bool] = None,
         subframe_extract_threshold: Optional[int] = None,
@@ -515,7 +460,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 'figma_pages_exclude': node_ids_exclude or [],
                 'figma_nodes_include': node_types_include or [],
                 'figma_nodes_exclude': node_types_exclude or [],
-                'index_granularity': index_granularity or 'toon',
                 'image_max_dimension': image_max_dimension if image_max_dimension is not None else 2000,
                 'frame_spatial_order': frame_spatial_order if frame_spatial_order is not None else True,
                 'subframe_extract_threshold': subframe_extract_threshold if subframe_extract_threshold is not None else self.SUBFRAME_EXTRACT_THRESHOLD,
@@ -578,10 +522,14 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 f"Unexpected error while retrieving file {file_key}. "
                 "Please try specifying the node-id of an inner page."
             )
-        all_page_ids = [
-            page['id'] for page in shallow_file.document.get('children', [])
-            if 'id' in page
-        ]
+
+        # Build shallow page lookup for fallback on failed pages
+        shallow_pages_by_id: Dict[str, dict] = {}
+        for page in shallow_file.document.get('children', []):
+            if 'id' in page:
+                shallow_pages_by_id[page['id']] = page
+
+        all_page_ids = list(shallow_pages_by_id.keys())
 
         # Determine which pages to fetch
         if node_ids_include:
@@ -597,37 +545,44 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             logging.info(f"File {file_key}: no pages to fetch after filtering")
             return []
 
-        # Define fetch function for pages
+        # Define fetch function for pages with retry for transient errors
         def fetch_pages(page_ids: List[str]) -> Dict[str, dict]:
-            """Fetch page content for given page IDs."""
+            """Fetch page content for given page IDs with retry for transient server errors."""
             logging.debug(f"fetch_pages: requesting {len(page_ids)} pages: {page_ids}")
-            try:
-                result = self._get_file_nodes(file_key, ','.join(page_ids))
-            except Exception as e:
-                logging.debug(f"fetch_pages: _get_file_nodes raised {type(e).__name__}: {e}")
-                raise
-            if not result:
-                logging.debug("fetch_pages: result is empty/None")
-                return {}
-            nodes = result.get("nodes") or {}
-            logging.debug(f"fetch_pages: got {len(nodes)} nodes in response")
-            output = {}
-            for page_id, node in nodes.items():
-                if node is None:
-                    logging.debug(f"Page {page_id}: node is None (skipped by Figma)")
-                    continue
-                if "document" not in node:
-                    logging.debug(f"Page {page_id}: no 'document' key in node: {list(node.keys())}")
-                    continue
-                output[page_id] = node["document"]
-            logging.debug(f"fetch_pages: returning {len(output)} pages")
-            return output
 
-        # Execute with strategy
+            @retry_on_server_error(max_attempts=3, wait_seconds=(1, 4, 10))
+            def do_fetch() -> Dict[str, dict]:
+                result = self._get_file_nodes(file_key, ','.join(page_ids))
+                if not result:
+                    logging.debug("fetch_pages: result is empty/None")
+                    return {}
+                nodes = result.get("nodes") or {}
+                logging.debug(f"fetch_pages: got {len(nodes)} nodes in response")
+                output = {}
+                for page_id, node in nodes.items():
+                    if node is None:
+                        logging.debug(f"Page {page_id}: node is None (skipped by Figma)")
+                        continue
+                    if "document" not in node:
+                        logging.debug(f"Page {page_id}: no 'document' key in node: {list(node.keys())}")
+                        continue
+                    output[page_id] = node["document"]
+                logging.debug(f"fetch_pages: returning {len(output)} pages")
+                return output
+
+            # Retry transient server errors (5xx), but let volume errors propagate to bisection
+            try:
+                return do_fetch()
+            except Exception as e:
+                # Re-raise for bisection to handle (volume errors will trigger split)
+                logging.debug(f"fetch_pages: error after retries: {type(e).__name__}: {e}")
+                raise
+
+        # Execute with bisection strategy (splits on volume errors)
         chunk_result = strategy.execute(
             items=pages_to_fetch,
             fetch_fn=fetch_pages,
-            is_retriable_error=self._is_volume_error,
+            is_retriable_error=is_volume_error_retriable,
         )
 
         # Log summary at INFO level
@@ -636,81 +591,18 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"{len(chunk_result.failed)} failed"
         )
 
-        # Track failed pages as dependent items (parent file still gets indexed)
-        for page_id in chunk_result.failed:
-            self._track_dependent_item_skipped(f"{file_key}/{page_id}")
-
         # Return page content in order (preserve original order where possible)
+        # For failed pages, use shallow page data as fallback (allows frame extraction via individual fetches)
         pages = []
         for page_id in pages_to_fetch:
             if page_id in chunk_result.successful:
                 pages.append(chunk_result.successful[page_id])
+            elif page_id in chunk_result.failed and page_id in shallow_pages_by_id:
+                # Use shallow page data as fallback - process_page_streaming will try to fetch full content
+                logging.debug(f"File {file_key}: using shallow data fallback for failed page {page_id}")
+                pages.append(shallow_pages_by_id[page_id])
 
         return pages
-
-    def _process_single_image(
-            self,
-            file_key: str,
-            document: Document,
-            node_id: str,
-            image_url: str,
-            prompt: str,
-            page_id: str = "",
-    ) -> Optional[Document]:
-        """Download and process a single Figma image node.
-        This helper is used by `_process_document` (optionally in parallel via threads).
-        """
-        log = logging.getLogger(__name__)
-        item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
-
-        if not image_url:
-            log.debug(f"No image URL for node {node_id}")
-            self._track_dependent_item_skipped(item_name)
-            return None
-
-        try:
-            response = requests.get(image_url, timeout=60)
-        except Exception as exc:
-            log.warning(f"Download failed for node {node_id}: {exc}")
-            self._track_dependent_item_skipped(item_name)
-            return None
-
-        if response.status_code != 200:
-            log.debug(f"Unexpected status code {response.status_code} for node {node_id}")
-            self._track_dependent_item_skipped(item_name)
-            return None
-
-        content_type = response.headers.get('Content-Type', '')
-
-        if 'text/html' in content_type.lower():
-            log.debug(f"Received HTML instead of image for node {node_id}")
-            self._track_dependent_item_skipped(item_name)
-            return None
-
-        extension = (f".{content_type.split('/')[-1]}" if content_type.startswith('image') else '.png')
-        try:
-            page_content = _load_content_from_bytes_with_prompt(
-                file_content=response.content,
-                extension=extension,
-                llm=self.llm,
-                prompt=prompt,
-            )
-        except Exception as exc:
-            log.warning(f"LLM processing failed for node {node_id}: {exc}")
-            self._track_dependent_item_skipped(item_name)
-            return None
-
-        return Document(
-            page_content=page_content,
-            metadata={
-                'id': node_id,
-                'updated_on': document.metadata.get('updated_on', ''),
-                'file_key': file_key,
-                'node_id': node_id,
-                'image_url': image_url,
-                'type': 'image',
-            },
-        )
 
     def _describe_image(
         self,
@@ -764,143 +656,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         except Exception as exc:
             log.warning(f"LLM processing failed for node {node_id}: {exc}")
             return None
-
-    def _is_volume_error(self, e: Exception) -> bool:
-        """
-        Check if error is volume/timeout/network related (retriable).
-
-        These errors indicate the request was too large, took too long,
-        or failed due to network issues - all can be retried with smaller chunks.
-
-        Args:
-            e: Exception to check
-
-        Returns:
-            True if error is retriable (volume/timeout/network), False otherwise
-        """
-        error_str = str(e).lower()
-
-        # Volume-related patterns (size issues)
-        volume_patterns = ["timeout", "too large", "request entity too large", "payload too large"]
-        if any(p in error_str for p in volume_patterns):
-            return True
-
-        # Network/connection errors - often caused by large responses
-        network_patterns = [
-            "response ended prematurely",
-            "chunkedencodingerror",
-            "connection reset",
-            "connection aborted",
-            "connection refused",
-            "broken pipe",
-            "protocol error",
-            "incomplete read",
-            "remote disconnected",
-        ]
-        if any(p in error_str for p in network_patterns):
-            return True
-
-        # 400 only if it looks volume-related, not for invalid IDs
-        if "400" in str(e) and ("size" in error_str or "large" in error_str):
-            return True
-
-        # Generic 400 - treat as potentially volume-related for backward compatibility
-        if "400" in str(e):
-            return True
-
-        return False
-
-    def _is_retriable_server_error(self, e: Exception) -> bool:
-        """
-        Check if error is a transient server error (5xx) that should be retried.
-
-        Args:
-            e: Exception to check
-
-        Returns:
-            True if error is a 5xx server error, False otherwise
-        """
-        error_str = str(e).lower()
-        # 500-level errors are typically transient
-        if any(f"{code}" in str(e) for code in [500, 502, 503, 504]):
-            return True
-        if "internal" in error_str and "error" in error_str:
-            return True
-        if "service unavailable" in error_str:
-            return True
-        if "gateway" in error_str and ("timeout" in error_str or "bad" in error_str):
-            return True
-        return False
-
-    def _retry_with_backoff(
-        self,
-        func: Callable[[], T],
-        max_retries: int = 3,
-        initial_delay: float = 1.0,
-        backoff_factor: float = 2.0,
-        max_delay: float = 30.0,
-        retriable_check: Optional[Callable[[Exception], bool]] = None,
-        operation_name: str = "operation",
-        logger: Optional[logging.Logger] = None,
-    ) -> T:
-        """
-        Execute a function with exponential backoff retry for transient errors.
-
-        Args:
-            func: Function to execute (should take no arguments)
-            max_retries: Maximum number of retry attempts (default 3)
-            initial_delay: Initial delay in seconds before first retry (default 1.0)
-            backoff_factor: Multiplier for delay after each retry (default 2.0)
-            max_delay: Maximum delay in seconds (default 30.0)
-            retriable_check: Function to check if exception should be retried
-            operation_name: Name of operation for logging
-            logger: Logger to use (falls back to module logger)
-
-        Returns:
-            Result of successful function call
-
-        Raises:
-            Last exception if all retries exhausted
-        """
-        log = logger or logging.getLogger(__name__)
-        if retriable_check is None:
-            retriable_check = self._is_retriable_server_error
-
-        last_exception: Optional[Exception] = None
-        delay = initial_delay
-
-        for attempt in range(max_retries + 1):
-            try:
-                return func()
-            except Exception as e:
-                last_exception = e
-
-                # Check if this is a retriable error
-                if not retriable_check(e):
-                    log.debug(f"{operation_name}: Non-retriable error, raising immediately: {e}")
-                    raise
-
-                # Check if we have retries left
-                if attempt >= max_retries:
-                    log.warning(
-                        f"{operation_name}: All {max_retries} retries exhausted. Last error: {e}"
-                    )
-                    raise
-
-                # Log and wait before retry
-                log.info(
-                    f"{operation_name}: Attempt {attempt + 1}/{max_retries + 1} failed with "
-                    f"retriable error: {e}. Retrying in {delay:.1f}s..."
-                )
-                time.sleep(delay)
-
-                # Increase delay for next retry (exponential backoff)
-                delay = min(delay * backoff_factor, max_delay)
-
-        # Should never reach here, but just in case
-        if last_exception:
-            raise last_exception
-        raise RuntimeError(f"{operation_name}: Unexpected retry loop exit")
 
     def _calculate_optimal_scale(
         self,
@@ -1040,23 +795,21 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         log = debug_logger or logging.getLogger(__name__)
         parent_name = parent_info.get('node_name', parent_node_id)
 
-        log.info(f"    Extracting subframes from '{parent_name}' ({parent_node_id})...")
-
         try:
             # Fetch the parent node with its children
             nodes_data = self._get_file_nodes(file_key, parent_node_id)
             if not nodes_data or 'nodes' not in nodes_data:
-                log.warning(f"    Failed to fetch children for {parent_node_id}")
+                log.warning(f"Failed to fetch children for {parent_node_id}")
                 return []
 
             parent_node = nodes_data['nodes'].get(parent_node_id, {}).get('document', {})
             children = parent_node.get('children', [])
 
             if not children:
-                log.info(f"    No children found in '{parent_name}'")
+                log.debug(f"No children found in '{parent_name}'")
                 return []
 
-            log.info(f"    Found {len(children)} children in '{parent_name}'")
+            log.debug(f"Extracting {len(children)} subframes from '{parent_name}'")
 
             subframes = []
             for child in children:
@@ -1085,17 +838,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 # The connection info is typically in the name (e.g., "CTA --> content")
                 is_vector = child_type in ('vector', 'line', 'arrow')
                 if is_vector and not texts:
-                    # Extract connection info from name if present (format: "source --> target")
-                    if ' --> ' in child_name:
-                        log.info(
-                            f"      SKIP connector: {child_name} ({child_id}) - {child_type}, "
-                            f"size: {width:.0f}x{height:.0f} (no text content)"
-                        )
-                    else:
-                        log.info(
-                            f"      SKIP vector: {child_name} ({child_id}) - {child_type}, "
-                            f"size: {width:.0f}x{height:.0f} (no text content)"
-                        )
+                    log.debug(f"SKIP {child_type}: {child_name} ({child_id})")
                     continue
 
                 # Text nodes: no image needed, just text extraction
@@ -1132,15 +875,15 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
                 subframes.append(subframe_info)
 
-                log.info(
-                    f"      Child: {child_name} ({child_id}) - {child_type}, "
-                    f"size: {width:.0f}x{height:.0f}, strategy: {strategy}, texts: {len(texts)}"
+                log.debug(
+                    f"  Subframe: {child_name} ({child_id}), "
+                    f"size: {width:.0f}x{height:.0f}, strategy: {strategy}"
                 )
 
             return subframes
 
         except Exception as e:
-            log.warning(f"    Error extracting subframes from {parent_node_id}: {e}")
+            log.warning(f"Error extracting subframes from {parent_node_id}: {e}")
             return []
 
     def _collect_frames_for_analysis(
@@ -1175,9 +918,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             - image_urls_dict: {frame_id: image_url} for all frames needing images
         """
         log = debug_logger or logging.getLogger(__name__)
-        log.info("=" * 40)
-        log.info("Collecting frames with optimizations for analysis")
-        log.info("=" * 40)
 
         all_frames: List[Dict] = []
         scale_groups: Dict[str, List[str]] = {}  # scale_str -> [node_ids]
@@ -1187,7 +927,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         effective_scale_limit = scale_to_limit_threshold if scale_to_limit_threshold is not None else self.SCALE_TO_LIMIT_THRESHOLD
         scale_threshold = int(effective_scale_limit * (1 - self.SCALE_MARGIN_PERCENT))
         extract_threshold = subframe_extract_threshold if subframe_extract_threshold is not None else self.SUBFRAME_EXTRACT_THRESHOLD
-        log.info(f"Scale threshold: {scale_threshold}px (from limit {effective_scale_limit}), Extract threshold: {extract_threshold}px")
+        log.debug(f"Scale threshold: {scale_threshold}px, Extract threshold: {extract_threshold}px")
 
         def add_to_scale_group(node_id: str, scale: float):
             """Helper to add a frame to scale groups for batch fetching."""
@@ -1203,7 +943,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             page_name = page.get('name', '')
             children = page.get('children', [])
 
-            log.info(f"Page: {page_name} ({page_id}), children: {len(children)}")
+            log.debug(f"Page: {page_name} ({page_id}), children: {len(children)}")
 
             for node in children:
                 node_type = node.get('type', '').lower()
@@ -1230,10 +970,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 # Skip vectors with no text content
                 is_vector = node_type in ('vector', 'line', 'arrow')
                 if is_vector and not texts:
-                    if ' --> ' in node_name:
-                        log.info(f"  SKIP connector: {node_name} ({node_id})")
-                    else:
-                        log.info(f"  SKIP vector: {node_name} ({node_id})")
+                    log.debug(f"  SKIP {node_type}: {node_name} ({node_id})")
                     continue
 
                 # Determine strategy
@@ -1253,7 +990,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     'node': node,  # Preserve original Figma node for TOON processing
                 }
 
-                log.info(
+                log.debug(
                     f"  Frame: {node_name} ({node_id}) - {node_type}, "
                     f"size: {width:.0f}x{height:.0f}, strategy: {strategy}"
                 )
@@ -1326,7 +1063,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     len(f.get('subframes', [])) for f in all_frames
                 )
                 if total_frames >= max_frames:
-                    log.info(f"Reached max_frames limit ({max_frames})")
+                    log.debug(f"Reached max_frames limit ({max_frames})")
                     break
 
             if len(all_frames) >= max_frames:
@@ -1334,7 +1071,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         # Sort frames spatially
         all_frames = self._sort_frames_spatially(all_frames)
-        log.info(f"Collected {len(all_frames)} top-level frames")
 
         # Count total including subframes
         total_with_subframes = len(all_frames)
@@ -1342,27 +1078,49 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             total_with_subframes += len(f.get('subframes', []))
             for sf in f.get('subframes', []):
                 total_with_subframes += len(sf.get('subframes', []))
-        log.info(f"Total frames including subframes: {total_with_subframes}")
+        log.debug(f"Collected {len(all_frames)} top-level frames, {total_with_subframes} total with subframes")
 
-        # Phase 2: Batch fetch image URLs by scale
-        log.info("=" * 40)
-        log.info("Fetching image URLs by scale groups")
-        log.info("=" * 40)
-
+        # Phase 2: Batch fetch image URLs by scale (parallel for multiple scale groups)
         all_image_urls: Dict[str, str] = {}
-        for scale_str, node_ids in scale_groups.items():
-            scale = float(scale_str)
-            log.info(f"  Fetching {len(node_ids)} images at scale={scale_str}")
-            try:
-                images = self._get_file_images_with_scale(
-                    file_key, node_ids, scale=scale, debug_logger=log
-                )
-                all_image_urls.update(images)
-                log.info(f"    Got {len(images)} URLs")
-            except Exception as e:
-                log.warning(f"    Failed to fetch images at scale {scale_str}: {e}")
 
-        log.info(f"Total image URLs fetched: {len(all_image_urls)}")
+        if len(scale_groups) <= 1:
+            # Zero or one scale group - no need for threading overhead
+            for scale_str, node_ids in scale_groups.items():
+                scale = float(scale_str)
+                try:
+                    images = self._get_file_images_with_scale(
+                        file_key, node_ids, scale=scale, debug_logger=log
+                    )
+                    all_image_urls.update(images)
+                except Exception as e:
+                    log.warning(f"Failed to fetch images at scale {scale_str}: {e}")
+        else:
+            # Multiple scale groups - fetch in parallel
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def fetch_for_scale(scale_str: str, node_ids: List[str]) -> Dict[str, str]:
+                scale = float(scale_str)
+                try:
+                    return self._get_file_images_with_scale(
+                        file_key, node_ids, scale=scale, debug_logger=log
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to fetch images at scale {scale_str}: {e}")
+                    return {}
+
+            with ThreadPoolExecutor(max_workers=len(scale_groups)) as executor:
+                futures = {
+                    executor.submit(fetch_for_scale, scale_str, node_ids): scale_str
+                    for scale_str, node_ids in scale_groups.items()
+                }
+                for future in as_completed(futures):
+                    try:
+                        images = future.result()
+                        all_image_urls.update(images)
+                    except Exception as e:
+                        log.warning(f"Image fetch future failed: {e}")
+
+        log.debug(f"Fetched {len(all_image_urls)} image URLs from {len(scale_groups)} scale groups")
 
         return all_frames, all_image_urls
 
@@ -1527,8 +1285,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             return {}
 
         scale_str = f"{scale:.2f}"
-        log.info(f"Fetching {len(node_ids)} images at scale={scale_str}")
 
+        @retry_on_server_error(max_attempts=max_retries + 1, wait_seconds=(1, 4, 10, 30), log=log)
         def fetch_images():
             # FigmaPy has a bug: it doesn't include parameter names in the URL
             # (sends "&0.11" instead of "&scale=0.11"). We bypass it with direct API call.
@@ -1540,95 +1298,12 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             return {}
 
         try:
-            images = self._retry_with_backoff(
-                func=fetch_images,
-                max_retries=max_retries,
-                initial_delay=1.0,
-                backoff_factor=2.0,
-                retriable_check=self._is_retriable_server_error,
-                operation_name=f"get_file_images(scale={scale_str})",
-                logger=log,
-            )
-            log.info(f"  Got {len(images)} image URLs")
+            images = fetch_images()
+            log.debug(f"Fetched {len(images)} images at scale={scale_str}")
             return images
         except Exception as e:
             log.warning(f"Failed to fetch images at scale {scale_str} after retries: {e}")
             return {}
-
-    def _get_file_images_with_fallback(
-        self,
-        file_key: str,
-        image_nodes: List[str],
-        page_node_mapping: Optional[Dict[str, List[str]]] = None,
-    ) -> Dict[str, str]:
-        """
-        Fetch image URLs using bisection chunking strategy.
-
-        Always bisects the flat list of all image nodes (no per-page grouping).
-
-        Args:
-            file_key: Figma file key
-            image_nodes: List of node IDs to fetch images for
-            page_node_mapping: Optional mapping of page_id -> [node_ids] for tracking
-
-        Returns:
-            Dict mapping node_id -> image_url
-        """
-        if not image_nodes:
-            return {}
-
-        strategy = BisectionChunkingStrategy()
-
-        # Build reverse mapping for tracking: node_id -> page_id
-        node_to_page: Dict[str, str] = {}
-        if page_node_mapping:
-            for page_id, node_ids in page_node_mapping.items():
-                for node_id in node_ids:
-                    node_to_page[node_id] = page_id
-
-        # Define fetch function for images with retry for transient server errors
-        def fetch_images(node_ids: List[str]) -> Dict[str, str]:
-            """Fetch image URLs for given node IDs with retry for 5xx errors."""
-            def do_fetch():
-                file_images = self._client.get_file_images(file_key, node_ids)
-                if file_images and file_images.images:
-                    return file_images.images
-                return {}
-
-            return self._retry_with_backoff(
-                func=do_fetch,
-                max_retries=3,
-                initial_delay=1.0,
-                backoff_factor=2.0,
-                retriable_check=self._is_retriable_server_error,
-                operation_name=f"get_file_images({len(node_ids)} nodes)",
-            )
-
-        # Combined retriable check: volume errors OR server errors
-        def is_retriable(e: Exception) -> bool:
-            return self._is_volume_error(e) or self._is_retriable_server_error(e)
-
-        # Execute with strategy (always flat list, no per-page grouping)
-        chunk_result = strategy.execute(
-            items=image_nodes,
-            fetch_fn=fetch_images,
-            is_retriable_error=is_retriable,
-        )
-
-        # Log summary at INFO level
-        logging.info(
-            f"File {file_key}: fetched {len(chunk_result.successful)} image URLs, "
-            f"{len(chunk_result.failed)} failed"
-        )
-
-        # Track failed items as dependent items (not top-level docs)
-        # These are sub-items within a parent document that still gets indexed
-        for node_id in chunk_result.failed:
-            page_id = node_to_page.get(node_id, "")
-            item_name = f"{file_key}/{page_id}/{node_id}" if page_id else f"{file_key}/{node_id}"
-            self._track_dependent_item_skipped(item_name)
-
-        return chunk_result.successful
 
     def _process_document(
         self,
@@ -1658,179 +1333,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         subframe_extract_threshold = document.metadata.pop('subframe_extract_threshold', self.SUBFRAME_EXTRACT_THRESHOLD)
         scale_to_limit_threshold = document.metadata.pop('scale_to_limit_threshold', self.SCALE_TO_LIMIT_THRESHOLD)
 
-        # Route based on granularity level
-        granularity = document.metadata.pop('index_granularity', 'toon')
-        if granularity == 'toon':
-            yield from self._process_toon_level(
-                document, figma_pages, node_types_include, node_types_exclude, prompt,
-                subframe_extract_threshold=subframe_extract_threshold,
-                scale_to_limit_threshold=scale_to_limit_threshold,
-            )
-        else:
-            yield from self._process_node_level(
-                document, figma_pages, node_types_include, node_types_exclude, prompt
-            )
-
-    def _process_node_level(
-        self,
-        document: Document,
-        figma_pages: List[dict],
-        node_types_include: List[str],
-        node_types_exclude: List[str],
-        prompt: str = "",
-    ) -> Generator[Document, None, None]:
-        """Process document at node level - one document per node (image/text). Original behavior."""
-        file_key = document.metadata.get('id', '')
-
-        image_nodes = []
-        text_nodes = {}
-        page_node_mapping: Dict[str, List[str]] = {}  # {page_id: [image_node_ids]}
-        node_to_page: Dict[str, str] = {}  # {node_id: page_id} for tracking
-        for page in figma_pages:
-            page_id = page.get('id', '')
-            page_image_nodes: List[str] = []
-            for node in page.get('children', []):
-                # filter by node_type if specified any include or exclude
-                node_type = node.get('type', '').lower()
-                include = node_types_include and node_type in node_types_include
-                exclude = node_types_exclude and node_type not in node_types_exclude
-                no_filter = not node_types_include and not node_types_exclude
-
-                if include or exclude or no_filter:
-                    node_id = node.get('id')
-                    if node_id:
-                        if self.has_image_representation(node):
-                            image_nodes.append(node['id'])
-                            page_image_nodes.append(node['id'])
-                            node_to_page[node['id']] = page_id
-                        else:
-                            text_nodes[node['id']] = self.get_texts_recursive(node)
-            if page_image_nodes:
-                page_node_mapping[page_id] = page_image_nodes
-        total_nodes = len(image_nodes) + len(text_nodes)
-        # mutable counter so it can be updated from helper calls (even when used in threads)
-        counted_nodes_ref: Dict[str, int] = {"value": 0}
-
-        # Resolve number_of_threads override from document metadata, falling back to class field
-        override_threads = document.metadata.get('number_of_threads_override')
-        if isinstance(override_threads, int) and 1 <= override_threads <= 5:
-            number_of_threads = override_threads
-        else:
-            threads_cfg = getattr(self, "number_of_threads", DEFAULT_NUMBER_OF_THREADS)
-            if isinstance(threads_cfg, int) and 1 <= threads_cfg <= 5:
-                number_of_threads = threads_cfg
-            else:
-                number_of_threads = DEFAULT_NUMBER_OF_THREADS
-
-        # --- Process image nodes (potential bottleneck) with optional threading ---
-        if image_nodes:
-            self._log_tool_event(f"File {file_key}: requesting images for {len(image_nodes)} nodes across {len(page_node_mapping)} pages")
-            images = self._get_file_images_with_fallback(
-                file_key, image_nodes, page_node_mapping
-            )
-            total_images = len(images)
-            if total_images == 0:
-                logging.info(f"No images found for file {file_key}.")
-            else:
-                self._log_tool_event(
-                    f"File {file_key}: starting download/processing for total {total_nodes} nodes"
-                )
-
-                # Decide how many workers to use (bounded by total_images and configuration).
-                max_workers = number_of_threads
-                max_workers = max(1, min(max_workers, total_images))
-
-                if max_workers == 1:
-                    # Keep original sequential behavior
-                    for node_id, image_url in images.items():
-                        doc = self._process_single_image(
-                            file_key=file_key,
-                            document=document,
-                            node_id=node_id,
-                            image_url=image_url,
-                            prompt=prompt,
-                            page_id=node_to_page.get(node_id, ""),
-                        )
-                        counted_nodes_ref["value"] += 1
-                        if doc is not None:
-                            # Track dependent document for proper reindex cleanup (semicolon-separated string)
-                            existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
-                            document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
-                                f"{existing};{node_id}" if existing else node_id
-                            )
-                            self._log_tool_event(
-                                f"File {file_key}: processing image node {node_id} "
-                                f"({counted_nodes_ref['value']}/{total_nodes})."
-                            )
-                            yield doc
-                else:
-                    # Parallelize image download/processing with a thread pool
-                    self._log_tool_event(
-                        f"File {file_key}: using up to {max_workers} worker threads for image nodes."
-                    )
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        future_to_node = {
-                            executor.submit(
-                                self._process_single_image,
-                                file_key,
-                                document,
-                                node_id,
-                                image_url,
-                                prompt,
-                                node_to_page.get(node_id, ""),
-                            ): node_id
-                            for node_id, image_url in images.items()
-                        }
-                        for future in as_completed(future_to_node):
-                            node_id = future_to_node[future]
-                            try:
-                                doc = future.result()
-                            except Exception as exc:  # safeguard
-                                logging.warning(
-                                    f"File {file_key}: unexpected error while processing image node {node_id}: {exc}"
-                                )
-                                continue
-                            finally:
-                                # Count every attempted node, even if it failed or produced no doc,
-                                # so that progress always reaches total_nodes.
-                                counted_nodes_ref["value"] += 1
-
-                            if doc is not None:
-                                # Track dependent document for proper reindex cleanup (semicolon-separated string)
-                                existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
-                                document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
-                                    f"{existing};{node_id}" if existing else node_id
-                                )
-                                self._log_tool_event(
-                                    f"File {file_key}: processing image node {node_id} "
-                                    f"({counted_nodes_ref['value']}/{total_nodes} in {max_workers} threads)."
-                                )
-                                yield doc
-
-        # --- Process text nodes (fast) ---
-        if text_nodes:
-            for node_id, texts in text_nodes.items():
-                counted_nodes_ref["value"] += 1
-                current_index = counted_nodes_ref["value"]
-                if texts:
-                    # Track dependent document for proper reindex cleanup (semicolon-separated string)
-                    existing = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
-                    document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = (
-                        f"{existing};{node_id}" if existing else node_id
-                    )
-                    self._log_tool_event(
-                        f"File {file_key} : processing text node {node_id} ({current_index}/{total_nodes})."
-                    )
-                    yield Document(
-                        page_content="\n".join(texts),
-                        metadata={
-                            'id': node_id,
-                            'updated_on': document.metadata.get('updated_on', ''),
-                            'file_key': file_key,
-                            'node_id': node_id,
-                            'type': 'text',
-                        },
-                    )
+        yield from self._process_toon_level(
+            document, figma_pages, node_types_include, node_types_exclude, prompt,
+            subframe_extract_threshold=subframe_extract_threshold,
+            scale_to_limit_threshold=scale_to_limit_threshold,
+        )
 
     def _process_toon_level(
         self,
@@ -1945,22 +1452,33 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         SENTINEL = object()
 
         def process_page_streaming(page: Dict):
-            """Process a page and stream leaf frame docs to result_queue as LLM completes."""
+            """Process a page and stream leaf frame docs to result_queue as LLM completes.
+
+            Optimization: Fetch images for first scale group and start LLM immediately,
+            while fetching remaining scale groups in parallel.
+            """
             page_id = page.get('id', '')
             page_name = page.get('name', 'Untitled Page')
 
-            # Fetch full page content
+            # Fetch full page content with retry for transient errors
             page_node = page
-            try:
-                nodes_data = self._get_file_nodes(file_key, page_id)
-                if nodes_data:
-                    full_page_node = nodes_data.get('nodes', {}).get(page_id, {}).get('document', {})
-                    if full_page_node:
-                        page_node = full_page_node
-            except Exception as e:
-                log.warning(f"Error fetching full page {page_id}: {e}")
 
-            # Collect frames with subframe extraction
+            @retry_on_volume_error(max_attempts=4, wait_seconds=(1, 4, 10, 30), log=log)
+            def fetch_full_page() -> Optional[Dict]:
+                """Fetch full page content."""
+                data = self._get_file_nodes(file_key, page_id)
+                if data:
+                    return data.get('nodes', {}).get(page_id, {}).get('document')
+                return None
+
+            try:
+                full_page_node = fetch_full_page()
+                if full_page_node:
+                    page_node = full_page_node
+            except Exception as e:
+                log.warning(f"Error fetching full page {page_id} after retries: {e}")
+
+            # Collect frames with subframe extraction (includes image URL fetching)
             collected_frames, frame_image_urls = self._collect_frames_for_analysis(
                 file_key=file_key,
                 pages=[page_node],
@@ -1980,39 +1498,32 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
             # Find only leaf frames (no subframes)
             leaf_frames = get_leaf_frames(all_frame_data)
-            log.debug(f"Page '{page_name}': {len(leaf_frames)} leaf frames")
 
             if not leaf_frames:
+                # Page has no frames - just skip silently (not an error, just empty content)
+                log.debug(f"Page '{page_name}' ({page_id}): no frames, skipping")
                 return
 
-            # Fetch image URLs specifically for leaf frames
+            # Use pre-fetched image URLs
             leaf_frame_ids = [f.get('id', '') for f in leaf_frames if f.get('id')]
-            leaf_image_urls = {}
-            if leaf_frame_ids:
-                try:
-                    leaf_image_urls = self._get_file_images_with_fallback(file_key, leaf_frame_ids)
-                except Exception as e:
-                    log.warning(f"Failed to fetch leaf frame images: {e}")
+            leaf_image_urls = {fid: frame_image_urls.get(fid, '') for fid in leaf_frame_ids if fid in frame_image_urls}
 
-            # Process each leaf frame: LLM analysis + immediate doc creation
             def process_leaf_frame(frame: Dict) -> Optional[Document]:
+                """Process a single leaf frame with LLM analysis."""
                 frame_id = frame.get('id', '')
                 frame_name = frame.get('name', 'Untitled')
                 image_url = leaf_image_urls.get(frame_id, '')
 
-                # Extract original image size from frame bounds
                 frame_size = frame.get('size', {})
                 image_width = int(frame_size.get('w', 0))
                 image_height = int(frame_size.get('h', 0))
 
-                # LLM analysis
                 analysis_result = analyze_frame_with_llm(
                     frame, self.llm, serializer, image_url=image_url
                 )
                 explanation = analysis_result.explanation
                 llm_status = analysis_result.llm_status
 
-                # Create document immediately
                 frame_lines = serialize_leaf_frame(frame, explanation)
                 return Document(
                     page_content='\n'.join(frame_lines),
@@ -2128,14 +1639,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 ),
                 default=None,
             )),
-            # 'index_granularity': (Optional[Literal['node', 'toon']], Field(
-            #     description=(
-            #         "Controls the level at which content is indexed. "
-            #         "'toon' (default): TOON format with LLM analysis - outputs leaf frame documents only. "
-            #         "'node': One document per node (image/text) - most granular, no LLM analysis."
-            #     ),
-            #     default='toon',
-            # )),
             'scale_to_limit_threshold': (Optional[int], Field(
                 description=(
                     "Maximum image dimension (in pixels) to meet LLM vision requirements. "
@@ -2352,131 +1855,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
     ):
         """Reads a specified file by field key from Figma."""
         return self._client.get_file(file_key, geometry, version)
-
-    @process_output
-    def get_file_summary(
-            self,
-            url: Optional[str] = None,
-            file_key: Optional[str] = None,
-            include_node_ids: Optional[str] = None,
-            exclude_node_ids: Optional[str] = None,
-             **kwargs,
-    ):
-        """Summarizes a Figma file by loading pages and nodes via URL or file key.
-
-        Configuration for image processing and summarization is taken from the toolkit
-        configuration (see FigmaToolkit.toolkit_config_schema):
-
-          - self.apply_images_prompt: if True, pass self.images_prompt to the image-processing step.
-          - self.images_prompt: instruction string for how to treat image-based nodes.
-          - self.apply_summary_prompt: if True and self.summary_prompt is set and an LLM is configured,
-            return a single summarized string; otherwise return the raw list of node documents.
-          - self.summary_prompt: instruction string for LLM summarization.
-
-        Tool arguments mirror ArgsSchema.FileSummary and control only which file/pages are loaded.
-        """
-        # Prepare params for _base_loader without evaluating any logic here
-        node_ids_include_list = None
-        node_ids_exclude_list = None
-
-        if include_node_ids:
-            node_ids_include_list = [nid.strip() for nid in include_node_ids.split(',') if nid.strip()]
-
-        if exclude_node_ids:
-            node_ids_exclude_list = [nid.strip() for nid in exclude_node_ids.split(',') if nid.strip()]
-
-        # Delegate URL and file_key handling to _base_loader
-        base_docs = self._base_loader(
-            urls_or_file_keys=url or file_key,
-            node_ids_include=node_ids_include_list,
-            node_ids_exclude=node_ids_exclude_list,
-        )
-
-        # Read prompt-related configuration from toolkit instance (set via wrapper_payload)
-        apply_images_prompt = getattr(self, "apply_images_prompt", False)
-        images_prompt = getattr(self, "images_prompt", None)
-        apply_summary_prompt = getattr(self, "apply_summary_prompt", True)
-        summary_prompt = getattr(self, "summary_prompt", None)
-
-        # Decide whether to apply images_prompt. Expect dict with 'prompt'.
-        if (
-            apply_images_prompt
-            and isinstance(images_prompt, dict)
-            and isinstance(images_prompt.get("prompt"), str)
-            and images_prompt["prompt"].strip()
-        ):
-            images_prompt_str = images_prompt["prompt"].strip()
-        else:
-            images_prompt_str = ""
-
-        results: List[Dict] = []
-        for base_doc in base_docs:
-            for dep in self._process_document(
-                base_doc,
-                images_prompt_str,
-            ):
-                 results.append({
-                     "page_content": dep.page_content,
-                     "metadata": dep.metadata,
-                 })
-
-        # Decide whether to apply summary_prompt
-        has_summary_prompt = bool(
-            isinstance(summary_prompt, dict)
-            and isinstance(summary_prompt.get("prompt"), str)
-            and summary_prompt["prompt"].strip()
-        )
-        if not apply_summary_prompt or not has_summary_prompt:
-            # Return raw docs when summary is disabled or no prompt provided
-            self._log_tool_event("Summary prompt not provided: returning raw documents.")
-            return results
-
-        # If summary_prompt is enabled, generate an LLM-based summary over the loaded docs
-        try:
-            # Build a structured, ordered view of images and texts to help the LLM infer flows.
-            blocks = []
-            for item in results:
-                metadata = item.get("metadata", {}) or {}
-                node_type = str(metadata.get("type", "")).lower()
-                node_id = metadata.get("node_id") or metadata.get("id", "")
-                page_content = str(item.get("page_content", "")).strip()
-
-                if not page_content:
-                    continue
-
-                if node_type == "image":
-                    image_url = metadata.get("image_url", "")
-                    header = f"Image ({node_id}), {image_url}".strip().rstrip(',')
-                    body = page_content
-                else:
-                    header = f"Text ({node_id})".strip()
-                    body = page_content
-
-                block = f"{header}\n{body}\n--------------------"
-                blocks.append(block)
-
-            full_content = "\n".join(blocks) if blocks else "(no content)"
-            self._log_tool_event("Invoking LLM for Figma file summary.")
-
-            if not getattr(self, "llm", None):
-                raise RuntimeError("LLM is not configured for this toolkit; cannot apply summary_prompt.")
-
-            # Use the 'prompt' field from the summary_prompt dict as the instruction block
-            summary_prompt_text = summary_prompt["prompt"].strip()
-            prompt_text = f"{summary_prompt_text}\n\nCONTENT BEGIN\n{full_content}\nCONTENT END"
-            llm_response = self.llm.invoke(prompt_text) if hasattr(self.llm, "invoke") else self.llm(prompt_text)
-
-            if hasattr(llm_response, "content"):
-                summary_text = str(llm_response.content)
-            else:
-                summary_text = str(llm_response)
-
-            self._log_tool_event("Successfully generated LLM-based file summary.")
-            return summary_text
-        except Exception as e:
-            logging.warning(f"Failed to apply summary_prompt in get_file_summary: {e}")
-            self._log_tool_event("Falling back to raw documents due to summary_prompt failure.")
-            return results
 
     @process_output
     def get_file_versions(self, file_key: str, **kwargs):
@@ -2747,35 +2125,13 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         self._log_tool_event("Page flow analysis complete")
         return '\n'.join(lines)
 
-    def get_frame_detail_toon(
-        self,
-        file_key: str,
-        frame_ids: str,
-        **kwargs,
-    ) -> str:
-        """
-        Get detailed information for specific frames in TOON format.
-
-        Returns per-frame:
-        - All text content (headings, labels, buttons, body, errors)
-        - Component hierarchy
-        - Inferred screen type and state
-        - Position and size
-
-        Use this to drill down into specific screens identified from file structure.
-        """
-        try:
-            return self._get_frame_detail_toon_internal(file_key=file_key, frame_ids=frame_ids, **kwargs)
-        except ToolException as e:
-            raise ToolException(_handle_figma_error(e))
-
     def _get_frame_detail_toon_internal(
         self,
         file_key: str,
         frame_ids: str,
         **kwargs,
     ) -> str:
-        """Internal implementation of get_frame_detail_toon without error handling wrapper."""
+        """Get detailed information for specific frames in TOON format."""
         self._log_tool_event("Getting frame details in TOON format")
 
         ids_list = [fid.strip() for fid in frame_ids.split(',') if fid.strip()]
@@ -2848,8 +2204,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
           - No node_id: Analyzes entire file (respecting include/exclude pages)
           - node_id=page_id: Focuses on specific page
           - node_id=frame_id: Returns detailed frame analysis
-
-        For targeted analysis of specific frames (2-3 frames), use get_frame_detail_toon instead.
         """
         try:
             return self._analyze_file_internal(
@@ -3141,13 +2495,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 "args_schema": ArgsSchema.File.value,
                 "ref": self.get_file,
             },
-            # TODO disabled until new requirements
-            # {
-            #     "name": "get_file_summary",
-            #     "description": self.get_file_summary.__doc__,
-            #     "args_schema": ArgsSchema.FileSummary.value,
-            #     "ref": self.get_file_summary,
-            # },
             {
                 "name": "get_file_versions",
                 "description": self.get_file_versions.__doc__,
@@ -3184,20 +2531,10 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 "args_schema": ArgsSchema.ProjectFiles.value,
                 "ref": self.get_project_files,
             },
-            # TOON Format Tools (Token-Optimized)
-            # Primary unified tool with configurable detail levels
             {
                 "name": "analyze_file",
                 "description": self.analyze_file.__doc__,
                 "args_schema": AnalyzeFileSchema,
                 "ref": self.analyze_file,
             },
-            # TODO disabled until new requirements
-            # # Targeted drill-down for specific frames (more efficient than level 3 for 2-3 frames)
-            # {
-            #     "name": "get_frame_detail_toon",
-            #     "description": self.get_frame_detail_toon.__doc__,
-            #     "args_schema": FrameDetailTOONSchema,
-            #     "ref": self.get_frame_detail_toon,
-            # },
         ]
