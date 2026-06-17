@@ -253,6 +253,16 @@ SUPPORTED_ATTACHMENT_MIME_TYPES = (
     "application/json"
     # Add new supported types
 )
+
+# Cloud: /rest/api/{2,3}/attachment/content/{id}
+# Server/DC: /secure/attachment/{id}/{filename} or /secure/thumbnail/{id}/...
+# Module-level — Pydantic v2 turns leading-underscore class attrs into
+# PrivateAttr descriptors, which would shadow the compiled regex.
+_ATTACHMENT_HREF_RE = re.compile(
+    r'/rest/api/[23]/attachment/content/(\d+)'
+    r'|/secure/attachment/(\d+)/'
+    r'|/secure/thumbnail/(\d+)/'
+)
 # Helper class for improved attachment lookup
 class AttachmentResolver:
     """
@@ -1213,29 +1223,18 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         client = self._get_client()
         attachment_data = []
         attachments = client.get_attachments_ids_from_issue(issue=jira_issue_key)
-        api_version = str(getattr(client, "api_version", "2"))
         for attachment in attachments:
             if attachment_pattern and not re.search(attachment_pattern, attachment['filename']):
                 logger.info(f"Skipping attachment {attachment['filename']} as it does not match pattern {attachment_pattern}")
                 continue
             logger.info(f"Processing attachment {attachment['filename']} with ID {attachment['attachment_id']}")
-            try:
-                attachment_content = None
-
-                # Cloud (REST v3) attachments require signed URLs returned from metadata
-                if api_version in {"3", "latest"} or self.cloud:
-                    attachment_content = self._download_attachment_v3(
-                        attachment['attachment_id'],
-                        attachment['filename']
-                    )
-
-                if attachment_content is None:
-                    attachment_content = client.get_attachment_content(attachment['attachment_id'])
-            except Exception as e:
+            attachment_content = self._get_attachment_bytes(
+                attachment['attachment_id'], attachment['filename']
+            )
+            if attachment_content is None:
                 logger.error(
-                    f"Failed to download attachment {attachment['filename']} for issue {jira_issue_key}: {str(e)}")
-                attachment_content = client.get(
-                    path=f"secure/attachment/{attachment['attachment_id']}/{attachment['filename']}", not_json_response=True)
+                    f"Failed to download attachment {attachment['filename']} for issue {jira_issue_key}; skipping.")
+                continue
             content_docs = process_content_by_type(attachment_content, attachment['filename'], llm=self.llm, fallback_extensions=[".txt", ".png"])
             attachment_data.append("filename: " + attachment['filename'] + "\ncontent: " + str([doc.page_content for doc in content_docs]))
 
@@ -1527,41 +1526,201 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
         return content
 
+    def _get_attachment_bytes(self, attachment_id: str, filename: str) -> Optional[bytes]:
+        """Fetch attachment bytes using the endpoint appropriate for this deployment.
+
+        Cloud / REST v3 require a signed URL from the attachment metadata.
+        Server / DC expose the binary at /secure/attachment/{id}/{filename};
+        their /rest/api/2/attachment/content/{id} returns 404, so calling it
+        unconditionally produced spurious ERROR logs on every attachment.
+        """
+        client = self._get_client()
+        api_version = str(getattr(client, "api_version", "2"))
+        is_cloud = bool(self.cloud) or api_version in {"3", "latest"}
+
+        if is_cloud:
+            content = self._download_attachment_v3(attachment_id, filename)
+            if content is not None:
+                return content
+            try:
+                return client.get_attachment_content(attachment_id)
+            except Exception as e:
+                logger.error(
+                    f"Failed to download attachment {filename} (id={attachment_id}) via Cloud endpoints: {e}")
+                return None
+
+        try:
+            return client.get(
+                path=f"secure/attachment/{attachment_id}/{filename}",
+                not_json_response=True,
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to download attachment {filename} (id={attachment_id}) via Server/DC endpoint: {e}")
+            return None
+
+    @staticmethod
+    def _attachment_id_from_href(href: str) -> Optional[str]:
+        if not href:
+            return None
+        m = _ATTACHMENT_HREF_RE.search(href)
+        if m:
+            return m.group(1) or m.group(2) or m.group(3)
+        return None
+
     def _extract_image_data(self, field_data):
         """
-        Extracts image data from general JSON response.
-        Handles lists, dicts with image info, and plain strings.
+        Convert ADF (Atlassian Document Format) — or a list of nodes, or a plain
+        string — into readable text with image references rendered as wiki-style
+        `!ref!` markup that `_extend_data`'s regex (and AttachmentResolver) can
+        consume.
+
+        Two image-reference sources are recognised:
+          * `media`/`mediaSingle`/`mediaGroup`/`mediaInline` nodes — the canonical
+            inline-image case. Emits `!{alt}|alt="{alt}"!`, falling back to the
+            media node's `id` when alt is empty (the resolver supports lookup
+            by attachment id).
+          * Text nodes carrying a `link` mark whose href points to an attachment
+            URL (`/rest/api/3/attachment/content/{id}` on Cloud,
+            `/secure/attachment/{id}/...` on Server/DC). The visible link text
+            is preserved AND a `!{id}!` token is appended so the indexer regex
+            picks it up.
+
+        Plain-string inputs (Server/DC wiki markup) pass through unchanged.
+
+        The walker visits every ADF node type used in real Jira issues so that
+        text from headings, lists, tables, blockquotes, marked-up runs, etc.
+        survives intact — the previous implementation only kept the first child
+        of each paragraph and dropped headings/lists/marked text entirely.
         """
-        if isinstance(field_data, list):
-            return ' '.join(self._extract_image_data(item) for item in field_data)
-        if isinstance(field_data, dict):
-            if 'filename' in field_data and 'content' in field_data:
-                return f"!{field_data['filename']}|alt={field_data['filename']}!"
-            if 'content' in field_data and isinstance(field_data['content'], list):
-                result = []
-                for content_item in field_data['content']:
-                    if (
-                        isinstance(content_item, dict)
-                        and 'content' in content_item
-                        and isinstance(content_item['content'], list)
-                        and content_item['content']
-                    ):
-                        if content_item.get('type') == 'mediaSingle':
-                            media = content_item['content'][0]
-                            attrs = media.get('attrs', {})
-                            if attrs.get('type') == 'file':
-                                alt = attrs.get('alt', '')
-                                image_str = f'!{alt}|alt="{alt}"!'
-                                result.append(image_str)
-                        elif content_item.get('type') == 'paragraph':
-                            result.append(content_item['content'][0].get('text', ''))
-                        else:
-                            result.append(self._extract_image_data(content_item))
-                return '\n'.join(result)
-            return f"Unsupported format of field content."
+        # Strings: passthrough (Server/DC wiki markup or already-stringified text).
         if isinstance(field_data, str):
             return field_data
-        return f"Unsupported field content type: {type(field_data)}. Expected a string, list, or dict."
+
+        # Lists of nodes — concatenate without padding.
+        if isinstance(field_data, list):
+            return ''.join(self._extract_image_data(n) for n in field_data)
+
+        if not isinstance(field_data, dict):
+            return ''
+
+        # Legacy attachment-payload shape: {filename: '...', content: <bytes>}.
+        # Only fires when content is NOT a list of ADF nodes.
+        if (
+            'filename' in field_data
+            and 'content' in field_data
+            and not isinstance(field_data.get('content'), list)
+        ):
+            return f"!{field_data['filename']}|alt={field_data['filename']}!"
+
+        node_type = field_data.get('type')
+
+        # Top-level ADF document.
+        if node_type == 'doc':
+            text = self._extract_image_data(field_data.get('content', []))
+            return text.rstrip('\n')
+
+        if node_type == 'text':
+            text = field_data.get('text', '') or ''
+            for mark in field_data.get('marks') or []:
+                if mark.get('type') == 'link':
+                    href = (mark.get('attrs') or {}).get('href', '')
+                    aid = self._attachment_id_from_href(href)
+                    if aid:
+                        # Preserve link text AND emit a regex-matchable ref so
+                        # AttachmentResolver.by_id can look it up.
+                        return f"{text} !{aid}!"
+            return text
+
+        if node_type == 'paragraph':
+            return self._extract_image_data(field_data.get('content', [])) + '\n\n'
+
+        if node_type == 'heading':
+            level = (field_data.get('attrs') or {}).get('level', 1)
+            try:
+                level = max(1, min(6, int(level)))
+            except (TypeError, ValueError):
+                level = 1
+            inner = self._extract_image_data(field_data.get('content', []))
+            return ('#' * level) + ' ' + inner + '\n\n'
+
+        if node_type == 'bulletList':
+            items = []
+            for item in field_data.get('content', []):
+                inner = self._extract_image_data(item.get('content', [])).strip()
+                if inner:
+                    items.append('- ' + inner.replace('\n', '\n  '))
+            return ('\n'.join(items) + '\n\n') if items else ''
+
+        if node_type == 'orderedList':
+            items = []
+            for idx, item in enumerate(field_data.get('content', []), start=1):
+                inner = self._extract_image_data(item.get('content', [])).strip()
+                if inner:
+                    items.append(f'{idx}. ' + inner.replace('\n', '\n   '))
+            return ('\n'.join(items) + '\n\n') if items else ''
+
+        if node_type == 'listItem':
+            return self._extract_image_data(field_data.get('content', []))
+
+        if node_type == 'blockquote':
+            inner = self._extract_image_data(field_data.get('content', [])).rstrip('\n')
+            if not inner:
+                return ''
+            quoted = '\n'.join('> ' + line if line else '>' for line in inner.split('\n'))
+            return quoted + '\n\n'
+
+        if node_type == 'codeBlock':
+            inner = self._extract_image_data(field_data.get('content', []))
+            return '```\n' + inner.rstrip('\n') + '\n```\n\n'
+
+        if node_type == 'rule':
+            return '\n---\n\n'
+
+        if node_type == 'hardBreak':
+            return '\n'
+
+        if node_type == 'mention':
+            attrs = field_data.get('attrs') or {}
+            return '@' + (attrs.get('text') or attrs.get('displayName') or attrs.get('id') or '')
+
+        if node_type == 'emoji':
+            attrs = field_data.get('attrs') or {}
+            return attrs.get('shortName') or attrs.get('text') or ''
+
+        if node_type == 'inlineCard':
+            attrs = field_data.get('attrs') or {}
+            return attrs.get('url') or ''
+
+        if node_type in ('mediaSingle', 'mediaGroup'):
+            return self._extract_image_data(field_data.get('content', []))
+
+        if node_type in ('media', 'mediaInline'):
+            attrs = field_data.get('attrs') or {}
+            if attrs.get('type') in ('file', 'link', None):
+                alt = attrs.get('alt') or ''
+                ref = alt or attrs.get('id') or ''
+                if ref:
+                    return f'!{ref}|alt="{alt}"!'
+            return ''
+
+        if node_type == 'table':
+            return self._extract_image_data(field_data.get('content', [])) + '\n'
+
+        if node_type == 'tableRow':
+            cells = []
+            for cell in field_data.get('content', []):
+                cells.append(self._extract_image_data(cell.get('content', [])).strip().replace('\n', ' '))
+            return '| ' + ' | '.join(cells) + ' |\n'
+
+        if node_type in ('tableCell', 'tableHeader'):
+            return self._extract_image_data(field_data.get('content', []))
+
+        # Unknown node: walk children if present so we don't silently drop content.
+        if isinstance(field_data.get('content'), list):
+            return self._extract_image_data(field_data['content'])
+
+        return ''
 
     def get_field_with_image_descriptions(self, jira_issue_key: str, field_name: str, prompt: Optional[str] = None,
                                           context_radius: int = 500, process_images: bool = True):
@@ -1924,31 +2083,25 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
                 attachment_id = f"attach_{attachment['id']}"
                 base_document.metadata.setdefault(IndexerKeywords.DEPENDENT_DOCS.value, []).append(attachment_id)
-                try:
-                    attachment_content = client.get_attachment_content(attachment['id'])
-                except Exception as e:
-                    logger.error(f"Failed to download attachment {attachment['filename']} for issue {issue_key}: {str(e)}")
-                    try:
-                        attachment_content = client.get(path=f"secure/attachment/{attachment['id']}/{attachment['filename']}", not_json_response=True)
-                    except Exception as e2:
-                        logger.error(f"Fallback also failed for attachment {attachment['filename']}: {str(e2)}")
-                        self._track_skipped_attachment(attachment['filename'], reason="error")
-                        continue
+                attachment_content = self._get_attachment_bytes(attachment['id'], attachment['filename'])
+                if attachment_content is None:
+                    self._track_skipped_attachment(attachment['filename'], reason="error")
+                    continue
 
-                    yield Document(page_content='',
-                                   metadata={
-                                           IndexerKeywords.CONTENT_IN_BYTES.value: attachment_content,
-                                           IndexerKeywords.CONTENT_FILE_NAME.value: attachment['filename'],
-                                           'id': attachment_id,
-                                           'issue_key': issue_key,
-                                           'source': f"{self.base_url}/browse/{issue_key}",
-                                           'filename': attachment['filename'],
-                                           'created': attachment['created'],
-                                           'mimeType': attachment['mimeType'],
-                                           'author': attachment.get('author', {}).get('name'),
-                                           IndexerKeywords.PARENT.value: base_document.metadata.get('id', None),
-                                           'type': 'attachment',
-                                       })
+                yield Document(page_content='',
+                               metadata={
+                                       IndexerKeywords.CONTENT_IN_BYTES.value: attachment_content,
+                                       IndexerKeywords.CONTENT_FILE_NAME.value: attachment['filename'],
+                                       'id': attachment_id,
+                                       'issue_key': issue_key,
+                                       'source': f"{self.base_url}/browse/{issue_key}",
+                                       'filename': attachment['filename'],
+                                       'created': attachment.get('created'),
+                                       'mimeType': attachment.get('mimeType'),
+                                       'author': (attachment.get('author') or {}).get('name'),
+                                       IndexerKeywords.PARENT.value: base_document.metadata.get('id', None),
+                                       'type': 'attachment',
+                                   })
         if self._include_comments:
             # Skip vision-LLM image description in comments unless explicitly enabled and an LLM is configured.
             comments_process_images = bool(getattr(self, '_process_images', False)) and self.llm is not None
@@ -2056,9 +2209,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             # Build content starting with summary
             content = f"# Summary\n{issue['fields']['summary']}\n\n"
 
-            # Add description if present
+            # Add description if present. On Jira Cloud the field is ADF (a JSON dict);
+            # convert it to wiki-style markup so `_extend_data`'s `!ref!` regex can find
+            # image references. Server/DC returns a string and falls through unchanged.
             description = issue['fields'].get('description', '')
             if description:
+                if isinstance(description, (dict, list)):
+                    description = self._extract_image_data(description)
                 content += f"# Description\n{description}\n\n"
             else:
                 # If no description, still create document but with minimal content
