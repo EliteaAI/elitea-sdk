@@ -2092,9 +2092,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 for _msg in reversed(messages):
                     if isinstance(_msg, HumanMessage):
                         continue
-                    _normed = normalize_message_content(_msg.content).strip()
-                    if _normed:
-                        output = _normed
+                    _normed_check = normalize_message_content(_msg.content).strip()
+                    if _normed_check:
+                        output = normalize_message_content(_msg.content)
                         break
                 if output is None:
                     output = (
@@ -2112,9 +2112,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 for _msg in reversed(messages):
                     if isinstance(_msg, HumanMessage):
                         continue
-                    _normed = normalize_message_content(_msg.content).strip()
-                    if _normed:
-                        output = _normed
+                    _normed_check = normalize_message_content(_msg.content).strip()
+                    if _normed_check:
+                        output = normalize_message_content(_msg.content)
                         break
         except Exception as exc:
             logger.warning("[OUTPUT] Exception during output extraction: %s", exc, exc_info=True)
@@ -2129,9 +2129,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 for _msg in reversed(messages):
                     if not hasattr(_msg, 'content') or isinstance(_msg, HumanMessage):
                         continue
-                    _normed = normalize_message_content(_msg.content).strip()
-                    if _normed:
-                        output = _normed
+                    _normed_check = normalize_message_content(_msg.content).strip()
+                    if _normed_check:
+                        output = normalize_message_content(_msg.content)
                         break
                 if output is None:
                     output = str(list(result.values())[-1]) if result else 'Output is undefined'
@@ -2152,15 +2152,17 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         terminal_output = extract_terminal_state_output(state_values, getattr(self, '_terminal_output_variables', None))
         if terminal_output is not None:
             output = terminal_output
-        elif output is None:
+        elif not output:
             # Last-resort fallback when no terminal output variable is declared:
             # surface the most recently written non-internal state value before
-            # falling back to the sentinel string.
+            # falling back to the sentinel string. Covers both None and '' (issue #5057).
             output = extract_state_fallback_output(state_values)
 
-        # Use `not output` to cover both output is None and output == '' (empty string).
-        # Sonnet 4.5/4.6 synthesis turns can produce an empty string that must fall
-        # through to the sentinel just as a None would (issue #5057).
+        # `messages` may be unbound if the _blocked_output or printer_output (interrupted)
+        # branches ran — define it here so the sentinel f-string below is always safe.
+        if 'messages' not in locals():
+            messages = result.get('messages', []) if isinstance(result, dict) else []
+
         final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and not output else output
 
         result_with_state = {
