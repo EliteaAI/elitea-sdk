@@ -85,10 +85,13 @@ class AdoConfiguration(BaseModel):
 
         # Auth-required endpoint to validate PAT (works regardless of project visibility)
         if org_url_kind == 'dev.azure.com':
-            profile_url = f"https://vssps.dev.azure.com/{org_name}/_apis/profile/profiles/me?api-version=7.1-preview.3"
+            base_url = f"https://dev.azure.com/{org_name}"
         else:
-            # For legacy org URLs, use the matching vssps host
-            profile_url = f"https://{org_name}.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1-preview.3"
+            base_url = f"https://{org_name}.visualstudio.com"
+
+        # Append the organization-level Projects API endpoint
+        # We add top=1 so the response is tiny, making it incredibly fast
+        test_url = f"{base_url}/_apis/projects?api-version=7.1&$top=1"
 
         try:
             if token:
@@ -97,7 +100,7 @@ class AdoConfiguration(BaseModel):
                 auth = HTTPBasicAuth("", token)
 
                 # Validate token against profile endpoint
-                profile_resp = requests.get(profile_url, auth=auth, timeout=10)
+                profile_resp = requests.get(test_url, auth=auth, timeout=10)
                 if profile_resp.status_code == 200:
                     return None  # Connection successful
                 elif profile_resp.status_code == 401:
