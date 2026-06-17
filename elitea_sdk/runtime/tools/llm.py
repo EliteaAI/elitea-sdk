@@ -2245,7 +2245,7 @@ class LLMNode(BaseTool):
             if tcid:
                 decisions_by_id[tcid] = decision
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         async def _run_one(spec):
             tool_name, tool_args, tool_call_id, tool = spec

@@ -2364,8 +2364,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # child is terminal), but report it rather than fabricate an empty result.
         if getattr(child_state, 'next', None):
             return 'paused', None
+        # Guard on `is None`, not falsiness: a child whose explicit `output`
+        # channel is a legitimate empty string must round-trip as-is. Treating
+        # '' as missing would fall through to message-scanning and substitute a
+        # different (last non-Human) message's content (Copilot review, #325).
         output = values.get('output')
-        if not output:
+        if output is None:
             messages = values.get('messages', []) or []
             output = next(
                 (normalize_message_content(m.content) for m in reversed(messages)
