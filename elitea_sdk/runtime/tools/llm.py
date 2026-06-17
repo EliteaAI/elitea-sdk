@@ -1103,15 +1103,34 @@ class LLMNode(BaseTool):
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
                 task_content = str(task_content) if task_content is not None else ""
-            messages = [
-                SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
-                *func_args.get('chat_history', []),
-                HumanMessage(content=task_content),
-            ]
-            # Remove pre-last item if last two messages are same type and content
-            if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
-                -2].content:
-                messages.pop(-2)
+            _chat_history = list(func_args.get('chat_history', []))
+            # When chat_history already ends in a ToolMessage we are RESUMING an
+            # in-progress tool loop (the #4993 park/reconcile re-invoke: children
+            # settled, their results were appended as ToolMessages, and the graph
+            # re-enters this node to synthesize). Re-appending the original task as
+            # a trailing HumanMessage makes the model read the conversation as
+            # "the user is asking again" — so it re-dispatches the same sub-agents
+            # instead of synthesizing, looping forever on Anthropic models (GPT
+            # tolerates the duplicate; haiku/sonnet do not). The in-process gather
+            # path never hits this because it loops inside __perform_tool_calling
+            # on new_messages and never rebuilds the prompt. End on the
+            # ToolMessages so the next turn is a pure synthesis turn.
+            _resuming_tool_loop = bool(_chat_history) and isinstance(_chat_history[-1], ToolMessage)
+            if _resuming_tool_loop:
+                messages = [
+                    SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                    *_chat_history,
+                ]
+            else:
+                messages = [
+                    SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                    *_chat_history,
+                    HumanMessage(content=task_content),
+                ]
+                # Remove pre-last item if last two messages are same type and content
+                if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
+                    -2].content:
+                    messages.pop(-2)
         else:
             # Flow for chat-based LLM node w/o prompt/task from pipeline but with messages in state
             # verify messages structure
