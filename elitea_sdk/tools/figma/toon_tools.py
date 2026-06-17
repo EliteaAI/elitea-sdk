@@ -41,6 +41,7 @@ Flow markers:
 
 import re
 import logging
+import traceback
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Any
 from pydantic import BaseModel, Field, create_model
@@ -53,16 +54,22 @@ from pydantic import BaseModel, Field, create_model
 class ExtractedInput(BaseModel):
     """A form input/control extracted from the screen."""
     label: str = Field(description="Label for this input (e.g., 'Email', 'Creativity', 'Model')")
-    input_type: str = Field(description="Type: text, email, password, number, slider, radio, checkbox, toggle, select, textarea, display")
+    input_type: str = Field(
+        default="text",
+        alias="type",
+        description="Type: text, email, password, number, slider, radio, checkbox, toggle, select, textarea, display"
+    )
     current_value: Optional[str] = Field(default=None, description="Current value shown (if any)")
     options: Optional[List[str]] = Field(default=None, description="Options for select/radio/slider (e.g., ['Low', 'Medium', 'High'])")
     required: bool = Field(default=False, description="Whether this field appears required")
 
+    model_config = {"populate_by_name": True}  # Accept both 'type' and 'input_type'
+
 
 class ScreenExplanation(BaseModel):
     """Structured explanation of a single screen/frame based on visual analysis."""
-    frame_id: str = Field(description="Frame ID from TOON data (e.g., '1:100')")
-    frame_name: str = Field(description="Frame name from TOON data")
+    frame_id: Optional[str] = Field(default="", description="Frame ID from TOON data (e.g., '1:100')")
+    frame_name: Optional[str] = Field(default="", description="Frame name from TOON data")
     purpose: str = Field(description="1-2 sentence explanation of screen's purpose")
     user_goal: str = Field(description="What the user is trying to accomplish here")
     primary_action: Optional[str] = Field(default=None, description="The main CTA/action on this screen")
@@ -106,13 +113,13 @@ SCREEN_VISION_PROMPT = """Analyze this Figma screen image and provide visual ins
 Screen: "{frame_name}" (ID: {frame_id})
 
 Look at the image and identify:
-1. purpose: What is this screen for? (1 sentence)
-2. user_goal: What is the user trying to accomplish? (1 sentence)
-3. primary_action: Which button/CTA is the main action? (just the name you see)
-4. visual_focus: What draws the eye first? What's the visual hierarchy focal point?
-5. layout_pattern: What layout is used? (card grid, form stack, list, split view, etc.)
-6. visual_state: Is this default, error, success, loading, or empty state?
-7. inputs: List ALL form inputs/controls you see:
+- purpose: What is this screen for? (1 sentence)
+- user_goal: What is the user trying to accomplish? (1 sentence)
+- primary_action: Which button/CTA is the main action? (just the name you see)
+- visual_focus: What draws the eye first? What's the visual hierarchy focal point?
+- layout_pattern: What layout is used? (card grid, form stack, list, split view, etc.)
+- visual_state: Is this default, error, success, loading, or empty state?
+- inputs: List ALL form inputs/controls you see:
    - For each input: label, type (text/email/password/number/slider/radio/checkbox/toggle/select/textarea/display)
    - Include current value if visible
    - For sliders/radio/select: list the options (e.g., Low/Medium/High)
@@ -120,7 +127,9 @@ Look at the image and identify:
    - Include dropdowns, model selectors, token counters, settings fields
 
 IMPORTANT: Extract ALL inputs visible - settings screens often have many controls.
-Be concise - 1 sentence per field except inputs which should be complete."""
+Be concise - 1 sentence per field except inputs which should be complete.
+
+You MUST respond with valid JSON matching the required schema. Do NOT use markdown or numbered lists."""
 
 
 # Text-only prompt (fallback when no image)
@@ -132,18 +141,20 @@ Extracted Data:
 {toon_data}
 
 Based on this data, identify:
-1. purpose: What is this screen for? (1 sentence)
-2. user_goal: What is the user trying to accomplish? (1 sentence)
-3. primary_action: Which button/CTA is the main action? (just the name)
-4. visual_focus: Based on element hierarchy, what's likely the focal point?
-5. layout_pattern: What layout pattern is suggested? (form, list, cards, etc.)
-6. visual_state: What state is this? (default, error, success, loading, empty)
-7. inputs: Extract form inputs from the data:
+- purpose: What is this screen for? (1 sentence)
+- user_goal: What is the user trying to accomplish? (1 sentence)
+- primary_action: Which button/CTA is the main action? (just the name)
+- visual_focus: Based on element hierarchy, what's likely the focal point?
+- layout_pattern: What layout pattern is suggested? (form, list, cards, etc.)
+- visual_state: What state is this? (default, error, success, loading, empty)
+- inputs: Extract form inputs from the data:
    - Look for input fields, sliders, dropdowns, toggles, checkboxes
    - For each: label, type, current value (if shown), options (if applicable)
    - Include display-only fields showing values (like "Remaining Tokens: 10000")
 
-Be concise. DO NOT repeat the element lists - they're already shown separately."""
+Be concise. DO NOT repeat the element lists - they're already shown separately.
+
+You MUST respond with valid JSON matching the required schema. Do NOT use markdown or numbered lists."""
 
 
 FILE_ANALYSIS_PROMPT = """Analyze this Figma file design and provide high-level insights.
@@ -2011,31 +2022,103 @@ def analyze_frame_with_llm(
     frame_id = frame_data.get('id', '')
     fallback_error: Optional[str] = None
 
+    # Disable streaming for structured output to avoid JSON parsing errors
+    # (streaming + structured output can cause "EOF while parsing" when response is incomplete)
+    def get_non_streaming_llm(llm_instance):
+        """Try multiple methods to disable streaming on the LLM."""
+        try:
+            # Method 1: Set streaming attribute directly if it exists
+            if hasattr(llm_instance, 'streaming'):
+                llm_instance.streaming = False
+            # Method 2: Try bind (works for some models)
+            if hasattr(llm_instance, 'bind'):
+                return llm_instance.bind(stream=False)
+        except Exception:
+            pass
+        return llm_instance
+
+    def model_requires_base64(llm_instance) -> bool:
+        """Check if the LLM requires base64 images instead of URLs.
+
+        Anthropic/Bedrock models don't support URL sources for images.
+        OpenAI/Azure OpenAI support both URLs and base64.
+        """
+        model_class = type(llm_instance).__name__.lower()
+        model_name = getattr(llm_instance, 'model_name', '') or getattr(llm_instance, 'model', '') or ''
+        model_name = model_name.lower()
+
+        # Anthropic-based models require base64
+        anthropic_indicators = ['anthropic', 'claude', 'bedrock']
+        for indicator in anthropic_indicators:
+            if indicator in model_class or indicator in model_name:
+                return True
+        return False
+
+    def url_to_base64_image(url: str) -> Optional[Dict]:
+        """Download image from URL and convert to base64 format for LLM."""
+        import base64
+        import requests
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            content_type = response.headers.get('content-type', 'image/png')
+            if ';' in content_type:
+                content_type = content_type.split(';')[0].strip()
+            b64_data = base64.b64encode(response.content).decode('utf-8')
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": content_type,
+                    "data": b64_data,
+                }
+            }
+        except Exception as e:
+            logging.warning(f"Failed to download image for base64 conversion: {e}")
+            return None
+
+    llm_no_stream = get_non_streaming_llm(llm)
+
     # Try vision-based analysis first if image available
     if image_url:
         try:
             from langchain_core.messages import HumanMessage
 
-            structured_llm = llm.with_structured_output(ScreenExplanation)
+            # Use include_raw=True to get raw response and avoid streaming parse issues
+            structured_llm = llm_no_stream.with_structured_output(
+                ScreenExplanation,
+                include_raw=True,
+            )
             prompt_text = SCREEN_VISION_PROMPT.format(
                 frame_name=frame_name,
                 frame_id=frame_id,
             )
 
             # Create message with image content
+            # Anthropic/Bedrock models require base64 images, OpenAI supports URLs
+            if model_requires_base64(llm):
+                image_content = url_to_base64_image(image_url)
+                if not image_content:
+                    raise ValueError("Failed to convert image URL to base64")
+            else:
+                image_content = {"type": "image_url", "image_url": {"url": image_url}}
+
             message = HumanMessage(
                 content=[
                     {"type": "text", "text": prompt_text},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    image_content,
                 ]
             )
-            result = structured_llm.invoke([message])
+            raw_result = structured_llm.invoke([message])
+            # With include_raw=True, result is {"parsed": ..., "raw": ...}
+            result = raw_result.get('parsed') if isinstance(raw_result, dict) else raw_result
             if result:
                 return FrameAnalysisResult(explanation=result, llm_status='success')
         except Exception as e:
             # Vision analysis failed - fall back to text-based
             fallback_error = f"vision fallback: {type(e).__name__}: {e}"
             logging.warning(f"Vision analysis failed for {frame_name}, falling back to text: {type(e).__name__}: {e}")
+            logging.debug(f"Vision analysis stacktrace for {frame_name}:\n{traceback.format_exc()}")
 
     # Text-based analysis (fallback or primary if no image)
     try:
@@ -2051,8 +2134,13 @@ def analyze_frame_with_llm(
             toon_data=toon_data,
         )
 
-        structured_llm = llm.with_structured_output(ScreenExplanation)
-        result = structured_llm.invoke(prompt)
+        structured_llm = llm_no_stream.with_structured_output(
+            ScreenExplanation,
+            include_raw=True,
+        )
+        raw_result = structured_llm.invoke(prompt)
+        # With include_raw=True, result is {"parsed": ..., "raw": ...}
+        result = raw_result.get('parsed') if isinstance(raw_result, dict) else raw_result
 
         # Return with fallback error if vision failed but text succeeded
         llm_status = fallback_error if fallback_error else 'success'
@@ -2060,6 +2148,7 @@ def analyze_frame_with_llm(
 
     except Exception as e:
         logging.warning(f"LLM frame analysis failed for {frame_name}: {type(e).__name__}: {e}")
+        logging.debug(f"Text analysis stacktrace for {frame_name}:\n{traceback.format_exc()}")
         error_msg = f"text analysis failed: {type(e).__name__}: {e}"
         if fallback_error:
             error_msg = f"{fallback_error}; {error_msg}"
