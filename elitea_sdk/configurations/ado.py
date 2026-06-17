@@ -99,18 +99,18 @@ class AdoConfiguration(BaseModel):
                 from requests.auth import HTTPBasicAuth
                 auth = HTTPBasicAuth("", token)
 
-                # Validate token against profile endpoint
-                profile_resp = requests.get(test_url, auth=auth, timeout=10)
-                if profile_resp.status_code == 200:
+                # Validate token against projects endpoint
+                project_resp = requests.get(test_url, auth=auth, timeout=10)
+                if project_resp.status_code == 200:
                     return None  # Connection successful
-                elif profile_resp.status_code == 401:
+                elif project_resp.status_code == 401:
                     return "Invalid or expired token (PAT). Please generate a new token and try again."
-                elif profile_resp.status_code == 403:
+                elif project_resp.status_code == 403:
                     return "Token is valid but lacks permission to access profile. Check PAT scopes/permissions."
-                elif profile_resp.status_code == 404:
+                elif project_resp.status_code == 404:
                     return "Organization not found. Verify the Organization URL."
                 else:
-                    return f"Token validation failed (HTTP {profile_resp.status_code})."
+                    return f"Token validation failed (HTTP {project_resp.status_code})."
             else:
                 # Without token, just verify the organization URL is reachable
                 # Try to access the projects list endpoint (may work for public orgs)
