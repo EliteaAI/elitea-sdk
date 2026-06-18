@@ -38,6 +38,12 @@ def normalize_tool_input(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
 class SensitiveToolGuardMiddleware(Middleware):
     """Pause execution before running configured sensitive tools."""
 
+    # Marks this middleware as the sensitive-action guard so trusted contexts
+    # (e.g. pipeline Code nodes running static, editor-authored code — issue
+    # #5348) can opt out of it via MiddlewareManager.wrap_tool(skip_sensitive_guard=True)
+    # while still receiving every other middleware (e.g. exception handling).
+    GUARDS_SENSITIVE_ACTIONS = True
+
     BLOCKED_TOOL_RESULT_TYPE = 'sensitive_tool_blocked'
 
     # Default reason when the user rejected without typing a note.
