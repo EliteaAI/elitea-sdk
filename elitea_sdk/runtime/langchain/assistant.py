@@ -601,6 +601,84 @@ class Assistant:
             logger.warning(f"Unsupported app_type '{self.app_type}', falling back to LangGraph agent")
             return self.getLangGraphReactAgent()
 
+    def _compose_system_prompt(self, prompt_instructions, simple_tools, tool_names, agent_tools):
+        """Build the system prompt string for the react agent.
+
+        Three mutually exclusive modes:
+        - ``persona == 'bare'``: bypass ALL Elitea-injected persona/identity content
+          (no DEFAULT_ASSISTANT wrapper, no "You are EliteA" identity, no support links).
+          Sends only the user's own instructions (if any) plus the functional, tool-gated
+          addons. Returns ``""`` when there are neither instructions nor addon-contributing
+          tools, in which case the caller omits the system message entirely.
+        - agent/predict with instructions: the agent's own instructions + tool-gated addons.
+        - otherwise: persona-template wrapping (DEFAULT_ASSISTANT fallback, Elitea identity).
+        """
+        user_addon = USER_ADDON.format(prompt=str(prompt_instructions)) if prompt_instructions else ""
+        # Check for planning tools (any of them indicates planning capability)
+        has_planning_tools = any(t in tool_names for t in ['update_plan', 'start_step', 'complete_step'])
+        # Use middleware prompt if available, otherwise fall back to PLAN_ADDON
+        plan_addon = self._middleware_prompt if self._middleware_prompt else (PLAN_ADDON if has_planning_tools else "")
+        data_analysis_addon = DATA_ANALYSIS_ADDON if 'pandas_analyze_data' in tool_names else ""
+        pyodite_addon = PYODITE_ADDON if 'pyodide_sandbox' in tool_names else ""
+        search_index_addon = SEARCH_INDEX_ADDON if 'stepback_summary_index' in tool_names else ""
+        task_delegation_addon = TASK_DELEGATION_ADDON if agent_tools else ""
+
+        # Functional, tool-gated addons. Shared verbatim by 'bare' and the agent/predict
+        # branch so both stay in lock-step.
+        functional_addons = "\n\n---\n\n".join(filter(None, [
+            plan_addon,
+            search_index_addon,
+            FILE_HANDLING_INSTRUCTIONS if simple_tools else "",
+            pyodite_addon,
+            data_analysis_addon,
+            task_delegation_addon,
+        ]))
+
+        # Select assistant template based on persona
+        persona_templates = {
+            "qa": QA_ASSISTANT,
+            "nerdy": NERDY_ASSISTANT,
+            "quirky": QUIRKY_ASSISTANT,
+            "cynical": CYNICAL_ASSISTANT,
+        }
+
+        # === BARE PERSONA: no EliteA persona/identity, functional addons only ===
+        if self.persona == 'bare':
+            if prompt_instructions and functional_addons:
+                escaped_prompt = f"{prompt_instructions}\n\n---\n\n{functional_addons}"
+            elif prompt_instructions:
+                escaped_prompt = str(prompt_instructions)
+            else:
+                # No instructions and no addon-contributing tools -> empty. The caller
+                # (LLMNode) omits the SystemMessage entirely for empty content.
+                escaped_prompt = functional_addons
+            logger.debug("bare persona: skipping EliteA persona template (instructions + tool addons only)")
+        # For agent/predict types, use instructions directly without wrapping.
+        # Persona templates (DEFAULT_ASSISTANT, etc.) are only used when persona is specified.
+        elif self.app_type in [APP_TYPE_AGENT, APP_TYPE_PREDICT] and prompt_instructions:
+            # Use agent's own instructions as the base system prompt; append addons
+            # only when their corresponding tools are present.
+            escaped_prompt = (
+                f"{prompt_instructions}\n\n---\n\n{functional_addons}"
+                if functional_addons else str(prompt_instructions)
+            )
+            logger.debug(f"Using agent's own instructions directly (app_type={self.app_type})")
+        else:
+            # Fallback to persona-based template wrapping
+            base_assistant = persona_templates.get(self.persona, DEFAULT_ASSISTANT)
+            escaped_prompt = base_assistant.format(
+                users_instructions=user_addon,
+                planning_instructions=plan_addon,
+                pyodite_addon=pyodite_addon,
+                data_analysis_addon=data_analysis_addon,
+                search_index_addon=search_index_addon,
+                file_handling_instructions=FILE_HANDLING_INSTRUCTIONS
+            )
+            if task_delegation_addon:
+                escaped_prompt = f"{escaped_prompt}\n\n---\n\n{task_delegation_addon}"
+
+        return escaped_prompt
+
     def getLangGraphReactAgent(self):
         """
         Create a LangGraph react agent using a tool-calling agent pattern.
@@ -653,52 +731,9 @@ class Assistant:
             else:
                 logger.debug("Binding tools: %s", tool_names)
 
-        user_addon = USER_ADDON.format(prompt=str(prompt_instructions)) if prompt_instructions else ""
-        # Check for planning tools (any of them indicates planning capability)
-        has_planning_tools = any(t in tool_names for t in ['update_plan', 'start_step', 'complete_step'])
-        # Use middleware prompt if available, otherwise fall back to PLAN_ADDON
-        plan_addon = self._middleware_prompt if self._middleware_prompt else (PLAN_ADDON if has_planning_tools else "")
-        data_analysis_addon = DATA_ANALYSIS_ADDON if 'pandas_analyze_data' in tool_names else ""
-        pyodite_addon = PYODITE_ADDON if 'pyodide_sandbox' in tool_names else ""
-        search_index_addon = SEARCH_INDEX_ADDON if 'stepback_summary_index' in tool_names else ""
-        task_delegation_addon = TASK_DELEGATION_ADDON if agent_tools else ""
-
-        # Select assistant template based on persona
-        persona_templates = {
-            "qa": QA_ASSISTANT,
-            "nerdy": NERDY_ASSISTANT,
-            "quirky": QUIRKY_ASSISTANT,
-            "cynical": CYNICAL_ASSISTANT,
-        }
-
-        # For agent/predict types, use instructions directly without wrapping
-        # Persona templates (DEFAULT_ASSISTANT, etc.) are only used when persona is specified
-        if self.app_type in [APP_TYPE_AGENT, APP_TYPE_PREDICT] and prompt_instructions:
-            # Use agent's own instructions as the base system prompt
-            # Append addons only when their corresponding tools are present
-            addons = "\n\n---\n\n".join(filter(None, [
-                plan_addon,
-                search_index_addon,
-                FILE_HANDLING_INSTRUCTIONS if simple_tools else "",
-                pyodite_addon,
-                data_analysis_addon,
-                task_delegation_addon,
-            ]))
-            escaped_prompt = f"{prompt_instructions}\n\n---\n\n{addons}" if addons else str(prompt_instructions)
-            logger.debug(f"Using agent's own instructions directly (app_type={self.app_type})")
-        else:
-            # Fallback to persona-based template wrapping
-            base_assistant = persona_templates.get(self.persona, DEFAULT_ASSISTANT)
-            escaped_prompt = base_assistant.format(
-                users_instructions=user_addon,
-                planning_instructions=plan_addon,
-                pyodite_addon=pyodite_addon,
-                data_analysis_addon=data_analysis_addon,
-                search_index_addon=search_index_addon,
-                file_handling_instructions=FILE_HANDLING_INSTRUCTIONS
-            )
-            if task_delegation_addon:
-                escaped_prompt = f"{escaped_prompt}\n\n---\n\n{task_delegation_addon}"
+        escaped_prompt = self._compose_system_prompt(
+            prompt_instructions, simple_tools, tool_names, agent_tools
+        )
 
         # Properly setup the prompt for YAML
         import yaml

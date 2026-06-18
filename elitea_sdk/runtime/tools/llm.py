@@ -1116,14 +1116,22 @@ class LLMNode(BaseTool):
             # on new_messages and never rebuilds the prompt. End on the
             # ToolMessages so the next turn is a pure synthesis turn.
             _resuming_tool_loop = bool(_chat_history) and isinstance(_chat_history[-1], ToolMessage)
+            # Omit the system message entirely when content is empty (e.g. the 'bare'
+            # persona with no custom instructions and no addon-contributing tools).
+            # Sending SystemMessage(content="") is not "no system prompt" — some
+            # providers reject or warn on an empty system field — so we drop it.
+            _system_msgs = (
+                [SystemMessage(content=self._anthropic_system_content(system_content, self.client))]
+                if system_content else []
+            )
             if _resuming_tool_loop:
                 messages = [
-                    SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                    *_system_msgs,
                     *_chat_history,
                 ]
             else:
                 messages = [
-                    SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                    *_system_msgs,
                     *_chat_history,
                     HumanMessage(content=task_content),
                 ]
