@@ -11,7 +11,7 @@ on:
         default: dev
         options:
           - dev
-          - stage
+          - stage2
           - prod
           - custom
       custom_environment:
