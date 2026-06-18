@@ -11,6 +11,8 @@ The Figma indexing flow transforms Figma design files into searchable documents 
 - **Resilient Fetching**: Bisection strategy for handling large files and API limits
 - **Retry Mechanisms**: Automatic retry with backoff for transient errors
 - **Streaming Output**: Documents yielded as they complete for memory efficiency
+- **Frame Type Support**: Image frames (LLM-analyzed) and text-only frames (no LLM cost)
+- **Eager Split Optimization**: Skip timeout-prone bulk requests for large batches
 
 ---
 
@@ -46,8 +48,19 @@ The Figma indexing flow transforms Figma design files into searchable documents 
               │
               ├──► process_page_to_toon_data()     ──► TOON serialization
               │
-              └──► process_leaf_frame() [ThreadPool] ──► LLM analysis per frame
+              └──► process_leaf_frame() [ThreadPool]
                             │
+                    ┌───────┴───────┐
+                    ▼               ▼
+           ┌──────────────┐  ┌──────────────┐
+           │ Image Frame  │  │ Text-Only    │
+           │ (has_image)  │  │ Frame        │
+           │              │  │              │
+           │ LLM Analysis │  │ TOON Only    │
+           │ type='image' │  │ type='text'  │
+           └──────────────┘  └──────────────┘
+                    │               │
+                    └───────┬───────┘
                             ▼
                    ┌─────────────────┐
                    │  Result Queue   │  ◄── Documents streamed as completed
@@ -132,16 +145,22 @@ Result: successful={A,B,D,E,F,G,H}, failed=[C]
 - **Parallel Processing**: Left and right halves processed concurrently
 - **Single-Item Isolation**: Only individual problematic items marked as failed
 - **O(log N) Best Case**: Fewer API calls than sequential for large datasets
+- **Eager Split**: Skip first try for batches known to timeout (saves 30-60s per batch)
 
 ```python
 class BisectionChunkingStrategy:
-    def __init__(self, min_chunk_size=1, max_workers=2):
-        self.min_chunk_size = min_chunk_size  # Stop splitting at this size
-        self.max_workers = max_workers        # Parallel workers for halves
+    def __init__(self, min_chunk_size=1, max_workers=2, eager_split_threshold=None):
+        self.min_chunk_size = min_chunk_size        # Stop splitting at this size
+        self.max_workers = max_workers              # Parallel workers for halves
+        self.eager_split_threshold = eager_split_threshold  # Skip first try if batch > threshold
 
     def execute(items, fetch_fn, is_retriable_error) -> ChunkResult:
         # Returns: successful dict, failed list, skipped list, stats
 ```
+
+**Eager Split Thresholds** (based on empirical data):
+- **Pages**: >10 pages → eager split (avoids ~100s timeout)
+- **Images**: >50 images at scale=1.0 → eager split (avoids ~30s timeout)
 
 ---
 
@@ -157,15 +176,17 @@ Processes a single page and streams documents as LLM analysis completes.
 1. Fetch full page content with retry
 2. Collect frames via `_collect_frames_for_analysis()`
 3. Convert to TOON format via `process_page_to_toon_data()`
-4. Find leaf frames (frames without subframes)
-5. Process leaf frames in parallel with `ThreadPoolExecutor`
+4. Find leaf frames (frames without subframes, including text-only)
+5. Process leaf frames in parallel with `ThreadPoolExecutor`:
+   - **Image frames** (`has_image=True`): Full LLM vision/text analysis
+   - **Text-only frames** (`has_image=False`): TOON serialization only, no LLM cost
 6. Queue completed documents for streaming
 
 ---
 
 ### 5. Frame Collection: `_collect_frames_for_analysis()`
 
-**Location**: `api_wrapper.py:901`
+**Location**: `api_wrapper.py:935`
 
 Collects frames for analysis with intelligent subframe extraction.
 
@@ -173,16 +194,26 @@ Collects frames for analysis with intelligent subframe extraction.
 1. Extract top-level frames from pages
 2. Apply spatial ordering (top-to-bottom, left-to-right)
 3. Detect large frames that need subframe extraction
-4. Fetch image URLs for all frames (with scale optimization)
-5. Return collected frames and their image URLs
+4. Determine frame strategy for each frame:
+   - `normal`: Standard processing with adaptive scaling
+   - `scale_to_limit`: Scale down large frames to fit limits
+   - `extract_subframes`: Extract child frames for individual processing
+   - `text_only`: Text nodes, no image needed (`has_image=False`)
+5. Fetch image URLs for frames with `has_image=True` (with scale optimization)
+6. Return collected frames (with `has_image` field) and their image URLs
+
+**Frame `has_image` Field**:
+The `has_image` field is preserved through TOON processing to track which frames need images:
+- `has_image=True`: Image frames requiring LLM analysis
+- `has_image=False`: Text-only frames (labels, titles) skipping LLM
 
 ---
 
 ### 6. Image Fetching: `_get_file_images_with_scale()`
 
-**Location**: `api_wrapper.py:1286`
+**Location**: `api_wrapper.py:1273`
 
-Fetches image URLs with automatic scale optimization.
+Fetches image URLs with automatic scale optimization and bisection fallback.
 
 **Retry Decorator**: `@retry_on_server_error(max_attempts=4, wait_seconds=(1, 4, 10, 30))`
 
@@ -190,6 +221,23 @@ Fetches image URLs with automatic scale optimization.
 - Groups frames by optimal scale factor
 - Fetches each scale group separately
 - Respects `image_max_dimension` limit
+
+**Bisection Fallback for Render Timeouts**:
+
+When Figma returns "render timeout" (400 error) for large batches, the function
+automatically applies bisection to recover:
+
+```
+Batch [A, B, C, D, E, F] → TIMEOUT (too many frames)
+  ├── Batch [A, B, C] → SUCCESS ✓
+  └── Batch [D, E, F] → TIMEOUT
+        ├── Batch [D] → SUCCESS ✓
+        └── Batch [E, F] → SUCCESS ✓
+```
+
+- Splits batch in half recursively on render timeout
+- Individual frames that still timeout are skipped with warning
+- Maximizes image URL recovery for large files
 
 ---
 
@@ -304,9 +352,62 @@ Each yielded document includes:
 - `page_name`: Human-readable page name
 - `node_id`: Frame node ID
 - `node_name`: Frame name
-- `image_url`: Rendered frame image URL
+- `image_url`: Rendered frame image URL (empty for text-only frames)
 - `image_width`, `image_height`: Frame dimensions
-- `llm_status`: LLM analysis status
+- `type`: Frame type - `'image'` (LLM-analyzed) or `'text'` (text-only, no LLM)
+- `llm_issue`: Only present if LLM analysis had issues (omitted on success)
+
+---
+
+## Frame Types
+
+The indexing flow supports two frame types to optimize cost and coverage:
+
+### Image Frames (`type='image'`)
+
+Full UI screens and components that benefit from visual analysis.
+
+**Processing**:
+1. Fetch image URL from Figma API
+2. Run LLM vision analysis (or text fallback)
+3. Generate rich TOON output with Purpose, Actions, Visual sections
+
+**Example Output**:
+```
+FRAME: Login Screen [0,0 375x812] form/default #123:456
+  Purpose: User authentication entry point
+  Actions: Sign in with email | Forgot password
+  Visual: [focus] Email and password fields | [layout] Centered form
+  Headings: Welcome Back
+  Buttons: Sign In | Forgot Password?
+  Inputs: Email (email) | Password (password, secure)
+```
+
+### Text-Only Frames (`type='text'`)
+
+Small text elements (labels, titles, headers) that don't need visual analysis.
+
+**Processing**:
+1. Skip image fetching (no `image_url`)
+2. Skip LLM analysis (zero LLM cost)
+3. Generate TOON output from extracted text content only
+
+**Example Output**:
+```
+FRAME: Save Cost Simulation [502x65] text/default #66:22481
+  Headings: Save Cost Simulation
+  Buttons: Save | Cancel
+```
+
+**Benefits**:
+- **Complete coverage**: All design elements are searchable
+- **Cost efficient**: No LLM calls for simple text labels
+- **Fast indexing**: Text-only frames process instantly
+
+**Identification**:
+Text-only frames are identified during frame collection:
+- TEXT nodes in Figma → `strategy='text_only'`, `has_image=False`
+- Very small elements (typically labels/titles) extracted from larger frames
 
 ---
 
@@ -318,6 +419,7 @@ Each yielded document includes:
 2. **Page Isolation**: Failed pages don't block other pages
 3. **Frame Isolation**: Failed frames logged, others continue
 4. **Bisection Recovery**: Isolates problematic items to single failures
+5. **Image Fetch Bisection**: Render timeouts trigger batch splitting to recover URLs
 
 ### Tracking
 

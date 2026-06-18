@@ -513,7 +513,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         node_ids_exclude = document.metadata.pop('figma_pages_exclude', [])
         self._log_tool_event(f"Included pages: {node_ids_include}. Excluded pages: {node_ids_exclude}.")
 
-        strategy = BisectionChunkingStrategy()
+        # Eager split at 10 pages - larger batches almost always timeout
+        strategy = BisectionChunkingStrategy(eager_split_threshold=10)
 
         # First, get shallow file structure to know all page IDs
         shallow_file = self._client.get_file(file_key, geometry='depth=1')
@@ -587,8 +588,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         # Log summary at INFO level
         logging.info(
-            f"File {file_key}: loaded {len(chunk_result.successful)} pages, "
-            f"{len(chunk_result.failed)} failed"
+            f"File {file_key}: loaded {len(chunk_result.successful)}/{len(pages_to_fetch)} pages"
+            + (f", {len(chunk_result.failed)} failed: {chunk_result.failed}" if chunk_result.failed else "")
         )
 
         # Return page content in order (preserve original order where possible)
@@ -886,6 +887,50 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             log.warning(f"Error extracting subframes from {parent_node_id}: {e}")
             return []
 
+    def _add_subframes_to_scale_groups(
+        self,
+        subframes: List[Dict],
+        file_key: str,
+        scale_threshold: int,
+        extract_threshold: int,
+        add_to_scale_group: Callable[[str, float], None],
+        log: logging.Logger,
+    ) -> None:
+        """
+        Recursively add subframes to scale groups for image fetching.
+
+        Handles nested subframes that also need extraction, ensuring all
+        leaf frames get their images fetched.
+        """
+        for sf in subframes:
+            sf_strategy = sf.get('strategy', 'normal')
+            sf_id = sf['node_id']
+            sf_bounds = sf['bounds']
+            sf_width = sf_bounds.get('width', 0)
+            sf_height = sf_bounds.get('height', 0)
+
+            if sf_strategy == 'extract_subframes':
+                # This subframe needs further extraction
+                nested = self._extract_subframes(
+                    file_key, sf_id, sf,
+                    scale_threshold, extract_threshold, log
+                )
+                sf['subframes'] = nested
+                # Recursively process nested subframes
+                self._add_subframes_to_scale_groups(
+                    nested, file_key, scale_threshold, extract_threshold,
+                    add_to_scale_group, log
+                )
+            elif sf_strategy == 'text_only':
+                pass  # No image needed
+            else:
+                # Normal or scale_to_limit - add to scale group
+                if sf.get('has_image', True):
+                    sf_scale = self._calculate_scale_for_strategy(
+                        sf_strategy, sf_width, sf_height, scale_threshold
+                    )
+                    add_to_scale_group(sf_id, sf_scale)
+
     def _collect_frames_for_analysis(
         self,
         file_key: str,
@@ -1019,15 +1064,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                                 scale_threshold, extract_threshold, log
                             )
                             sf['subframes'] = nested
-                            # Add nested subframes to scale groups
-                            for nsf in nested:
-                                if nsf.get('has_image', True) and nsf.get('strategy') != 'text_only':
-                                    nsf_bounds = nsf['bounds']
-                                    nsf_scale = self._calculate_scale_for_strategy(
-                                        nsf['strategy'], nsf_bounds['width'], nsf_bounds['height'],
-                                        scale_threshold
-                                    )
-                                    add_to_scale_group(nsf['node_id'], nsf_scale)
+                            # Add nested subframes to scale groups (recursively)
+                            self._add_subframes_to_scale_groups(
+                                nested, file_key, scale_threshold, extract_threshold,
+                                add_to_scale_group, log
+                            )
                         elif sf_strategy == 'text_only':
                             pass  # No image needed
                         else:
@@ -1119,8 +1160,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                         all_image_urls.update(images)
                     except Exception as e:
                         log.warning(f"Image fetch future failed: {e}")
-
-        log.debug(f"Fetched {len(all_image_urls)} image URLs from {len(scale_groups)} scale groups")
 
         return all_frames, all_image_urls
 
@@ -1264,10 +1303,13 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         max_retries: int = 3,
     ) -> Dict[str, str]:
         """
-        Fetch image URLs with specified scale, with retry for transient errors.
+        Fetch image URLs with specified scale, with retry and bisection for large batches.
 
         This method is used by frame-level processing to request images
         at a specific scale factor for optimal text readability.
+
+        Uses bisection strategy when Figma returns "render timeout" (400) for batches
+        that are too large to render at once.
 
         Args:
             file_key: Figma file key
@@ -1286,20 +1328,57 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         scale_str = f"{scale:.2f}"
 
+        def is_render_timeout(e: BaseException) -> bool:
+            """Check if error is Figma render timeout (needs bisection)."""
+            error_str = str(e).lower()
+            return 'render timeout' in error_str or 'too large' in error_str
+
         @retry_on_server_error(max_attempts=max_retries + 1, wait_seconds=(1, 4, 10, 30), log=log)
-        def fetch_images():
-            # FigmaPy has a bug: it doesn't include parameter names in the URL
-            # (sends "&0.11" instead of "&scale=0.11"). We bypass it with direct API call.
-            id_list = ','.join(node_ids)
+        def fetch_images_batch(ids: List[str]) -> Dict[str, str]:
+            """Fetch a batch of images, raising on error."""
+            id_list = ','.join(ids)
             endpoint = f'images/{file_key}?ids={id_list}&scale={scale_str}&format=png'
             data = self._client.api_request(endpoint, method='get')
             if data and 'images' in data:
                 return data['images']
             return {}
 
+        # Eager split threshold - batches >50 images almost always timeout
+        EAGER_SPLIT_THRESHOLD = 50
+
+        def fetch_with_bisection(ids: List[str]) -> Dict[str, str]:
+            """Fetch images with bisection fallback for render timeouts."""
+            # Eager split: skip first try if batch exceeds threshold (avoids ~30s timeout)
+            if len(ids) > EAGER_SPLIT_THRESHOLD:
+                mid = len(ids) // 2
+                result = {}
+                if ids[:mid]:
+                    result.update(fetch_with_bisection(ids[:mid]))
+                if ids[mid:]:
+                    result.update(fetch_with_bisection(ids[mid:]))
+                return result
+
+            try:
+                return fetch_images_batch(ids)
+            except Exception as e:
+                if is_render_timeout(e) and len(ids) > 1:
+                    # Split batch in half and try each half
+                    mid = len(ids) // 2
+                    result = {}
+                    if ids[:mid]:
+                        result.update(fetch_with_bisection(ids[:mid]))
+                    if ids[mid:]:
+                        result.update(fetch_with_bisection(ids[mid:]))
+                    return result
+                elif is_render_timeout(e) and len(ids) == 1:
+                    # Single item still times out - skip it
+                    log.warning(f"Frame {ids[0]} render timeout, skipping")
+                    return {}
+                else:
+                    raise
+
         try:
-            images = fetch_images()
-            log.debug(f"Fetched {len(images)} images at scale={scale_str}")
+            images = fetch_with_bisection(list(node_ids))
             return images
         except Exception as e:
             log.warning(f"Failed to fetch images at scale {scale_str} after retries: {e}")
@@ -1436,15 +1515,23 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             return lines
 
         # === Helper to find leaf frames (frames with no subframes) ===
-        def get_leaf_frames(frames: List[Dict]) -> List[Dict]:
-            """Recursively find all leaf frames (frames with no subframes)."""
+        def get_leaf_frames(frames: List[Dict], with_image_only: bool = True) -> List[Dict]:
+            """Recursively find all leaf frames (frames with no subframes).
+
+            Args:
+                frames: List of frame dicts from TOON processing
+                with_image_only: If True, only return frames with has_image=True
+            """
             leaves = []
             for f in frames:
                 subframes = f.get('subframes', [])
                 if not subframes:
+                    # Check if this frame needs an image
+                    if with_image_only and not f.get('has_image', True):
+                        continue  # Skip text-only frames
                     leaves.append(f)
                 else:
-                    leaves.extend(get_leaf_frames(subframes))
+                    leaves.extend(get_leaf_frames(subframes, with_image_only))
             return leaves
 
         # Result queue for streaming documents as they complete
@@ -1496,38 +1583,40 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             )
             all_frame_data = page_data.get('frames', [])
 
-            # Find only leaf frames (no subframes)
-            leaf_frames = get_leaf_frames(all_frame_data)
+            # Find all leaf frames (no subframes), including text-only frames
+            leaf_frames = get_leaf_frames(all_frame_data, with_image_only=False)
 
             if not leaf_frames:
                 # Page has no frames - just skip silently (not an error, just empty content)
                 log.debug(f"Page '{page_name}' ({page_id}): no frames, skipping")
                 return
 
-            # Use pre-fetched image URLs
-            leaf_frame_ids = [f.get('id', '') for f in leaf_frames if f.get('id')]
+            # Use pre-fetched image URLs (only for frames with has_image=True)
+            leaf_frame_ids = [f.get('id', '') for f in leaf_frames if f.get('id') and f.get('has_image', True)]
             leaf_image_urls = {fid: frame_image_urls.get(fid, '') for fid in leaf_frame_ids if fid in frame_image_urls}
 
+            # Track which image frames are missing URLs (unexpected - should be rare)
+            missing_image_frames = [fid for fid in leaf_frame_ids if fid not in frame_image_urls]
+            if missing_image_frames:
+                log.warning(
+                    f"Page '{page_name}': {len(missing_image_frames)}/{len(leaf_frame_ids)} image frames "
+                    f"missing from frame_image_urls (IDs: {missing_image_frames[:5]})"
+                )
+
             def process_leaf_frame(frame: Dict) -> Optional[Document]:
-                """Process a single leaf frame with LLM analysis."""
+                """Process a single leaf frame with optional LLM analysis."""
                 frame_id = frame.get('id', '')
                 frame_name = frame.get('name', 'Untitled')
-                image_url = leaf_image_urls.get(frame_id, '')
+                has_image = frame.get('has_image', True)
 
                 frame_size = frame.get('size', {})
                 image_width = int(frame_size.get('w', 0))
                 image_height = int(frame_size.get('h', 0))
 
-                analysis_result = analyze_frame_with_llm(
-                    frame, self.llm, serializer, image_url=image_url
-                )
-                explanation = analysis_result.explanation
-                llm_status = analysis_result.llm_status
-
-                frame_lines = serialize_leaf_frame(frame, explanation)
-                return Document(
-                    page_content='\n'.join(frame_lines),
-                    metadata={
+                # Text-only frames: skip LLM analysis, just serialize
+                if not has_image:
+                    frame_lines = serialize_leaf_frame(frame, explanation=None)
+                    metadata = {
                         **document.metadata,
                         'id': frame_id,
                         'file_key': file_key,
@@ -1536,12 +1625,45 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                         'page_name': page_name,
                         'node_id': frame_id,
                         'node_name': frame_name,
-                        'image_url': image_url,
+                        'image_url': '',  # No image for text-only frames
                         'image_width': image_width,
                         'image_height': image_height,
-                        'type': 'image',
-                        'llm_status': llm_status,
+                        'type': 'text',  # Mark as text-only element
                     }
+                    return Document(
+                        page_content='\n'.join(frame_lines),
+                        metadata=metadata,
+                    )
+
+                # Image frames: full LLM analysis
+                image_url = leaf_image_urls.get(frame_id, '')
+                analysis_result = analyze_frame_with_llm(
+                    frame, self.llm, serializer, image_url=image_url
+                )
+                explanation = analysis_result.explanation
+                llm_status = analysis_result.llm_status
+
+                frame_lines = serialize_leaf_frame(frame, explanation)
+                metadata = {
+                    **document.metadata,
+                    'id': frame_id,
+                    'file_key': file_key,
+                    'file_name': file_name,
+                    'page_id': page_id,
+                    'page_name': page_name,
+                    'node_id': frame_id,
+                    'node_name': frame_name,
+                    'image_url': image_url,
+                    'image_width': image_width,
+                    'image_height': image_height,
+                    'type': 'image',
+                }
+                # Only include llm_issue if there was a problem
+                if llm_status != 'success':
+                    metadata['llm_issue'] = llm_status
+                return Document(
+                    page_content='\n'.join(frame_lines),
+                    metadata=metadata,
                 )
 
             # Process leaf frames in parallel, queue docs as they complete

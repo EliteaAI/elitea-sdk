@@ -65,7 +65,12 @@ class BisectionChunkingStrategy(Generic[T, R]):
     Logging: DEBUG for splits and fetches, caller logs INFO summary.
     """
 
-    def __init__(self, min_chunk_size: int = 1, max_workers: int = 2):
+    def __init__(
+        self,
+        min_chunk_size: int = 1,
+        max_workers: int = 2,
+        eager_split_threshold: Optional[int] = None,
+    ):
         """
         Initialize bisection strategy.
 
@@ -74,9 +79,13 @@ class BisectionChunkingStrategy(Generic[T, R]):
                            Default: 1 (single item) for maximum isolation.
             max_workers: Maximum number of parallel workers for processing
                         split halves. Default: 2 (parallel left/right processing).
+            eager_split_threshold: If batch size exceeds this, skip first try and
+                                  split immediately. Saves time when large batches
+                                  are known to timeout. Default: None (always try first).
         """
         self.min_chunk_size = min_chunk_size
         self.max_workers = max_workers
+        self.eager_split_threshold = eager_split_threshold
         self._stats_lock = Lock()
 
     def execute(
@@ -148,12 +157,40 @@ class BisectionChunkingStrategy(Generic[T, R]):
         if not items:
             return {}, [], []
 
+        # Eager split: skip first try if batch exceeds threshold (known to timeout)
+        if (
+            self.eager_split_threshold is not None
+            and len(items) > self.eager_split_threshold
+            and len(items) > self.min_chunk_size
+        ):
+            with self._stats_lock:
+                stats["splits"] += 1
+            mid = len(items) // 2
+            left_items = items[:mid]
+            right_items = items[mid:]
+
+            if self.max_workers > 1:
+                return self._parallel_bisect(
+                    left_items, right_items, fetch_fn, is_retriable_error, depth, stats
+                )
+            else:
+                left_success, left_failed, left_skipped = self._bisect_fetch(
+                    left_items, fetch_fn, is_retriable_error, depth + 1, stats
+                )
+                right_success, right_failed, right_skipped = self._bisect_fetch(
+                    right_items, fetch_fn, is_retriable_error, depth + 1, stats
+                )
+                return (
+                    {**left_success, **right_success},
+                    left_failed + right_failed,
+                    left_skipped + right_skipped,
+                )
+
         # Try fetching current chunk
         try:
             with self._stats_lock:
                 stats["api_calls"] += 1
             result = fetch_fn(items)
-            logging.debug(f"Bisection: fetched {len(items)} items at depth {depth}")
             return result, [], []
         except Exception as e:
             if not is_retriable_error(e):
@@ -162,7 +199,7 @@ class BisectionChunkingStrategy(Generic[T, R]):
 
             # Retriable error (volume/timeout) - check if we can split further
             if len(items) <= self.min_chunk_size:
-                logging.debug(f"Bisection: item {items[0]} failed at minimum chunk size (isolated)")
+                logging.warning(f"Bisection: item {items[0]} failed at minimum chunk size (isolated failure)")
                 return {}, list(items), []
 
             # Split in half and recurse
@@ -171,11 +208,6 @@ class BisectionChunkingStrategy(Generic[T, R]):
             mid = len(items) // 2
             left_items = items[:mid]
             right_items = items[mid:]
-
-            logging.debug(
-                f"Bisection: splitting {len(items)} items into "
-                f"{len(left_items)} + {len(right_items)} at depth {depth}"
-            )
 
             # Process BOTH halves in parallel using ThreadPoolExecutor
             if self.max_workers > 1:
@@ -225,29 +257,26 @@ class BisectionChunkingStrategy(Generic[T, R]):
         merged_failed: List[T] = []
         merged_skipped: List[T] = []
 
-        def process_half(items: List[T], side: str) -> Tuple[Dict[T, R], List[T], List[T]]:
-            logging.debug(f"Bisection parallel: processing {side} half ({len(items)} items) at depth {depth + 1}")
+        def process_half(items: List[T]) -> Tuple[Dict[T, R], List[T], List[T]]:
             return self._bisect_fetch(
                 items, fetch_fn, is_retriable_error, depth + 1, stats
             )
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(process_half, left_items, "left"): "left",
-                executor.submit(process_half, right_items, "right"): "right",
-            }
+            futures = [
+                executor.submit(process_half, left_items),
+                executor.submit(process_half, right_items),
+            ]
 
             for future in as_completed(futures):
-                side = futures[future]
                 try:
                     success, failed, skipped = future.result()
                     merged_success.update(success)
                     merged_failed.extend(failed)
                     merged_skipped.extend(skipped)
-                    logging.debug(f"Bisection parallel: {side} half completed with {len(success)} successful")
                 except Exception as e:
                     # Non-retriable error propagated from recursive call
-                    logging.error(f"Bisection parallel: {side} half raised exception: {e}")
+                    logging.error(f"Bisection: parallel half raised exception: {e}")
                     raise
 
         return merged_success, merged_failed, merged_skipped
