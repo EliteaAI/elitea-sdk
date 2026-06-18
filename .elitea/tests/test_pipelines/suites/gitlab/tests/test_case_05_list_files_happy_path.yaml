@@ -220,7 +220,7 @@ nodes:
           4. no_errors: Output does NOT contain error indicators
           5. files_returned: Output contains a list of files
           6. expected_files_present: All 3 created test files appear in the list
-          7. branch_isolation: Files were listed from correct test branch (not main)
+          7. branch_respected: The list includes the created files when querying the test branch; additional pre-existing repository files are allowed
 
           Return JSON test_results:
           {{
@@ -231,7 +231,7 @@ nodes:
             "no_errors": boolean,
             "files_returned": boolean,
             "expected_files_present": boolean,
-            "branch_isolation": boolean,
+            "branch_respected": boolean,
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}
