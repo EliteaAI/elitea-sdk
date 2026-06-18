@@ -238,7 +238,8 @@ nodes:
           6. correct_url: Request URL in the retrieved data matches the expected URL
           7. has_structure: Retrieved request has proper structure (contains method, url, and name fields)
           8. no_errors: No error indicators in any output
-          9. cleanup_succeeded: Test folder was deleted successfully
+          9. cleanup_succeeded: Delete result confirms the test folder was deleted successfully; deleting the folder is sufficient cleanup because it also removes the contained request
+          10. Set test_passed=true when criteria 1-9 are all true. Do not fail merely because cleanup message mentions folder deletion instead of explicit request deletion.
           
           Return JSON test_results:
           {{
