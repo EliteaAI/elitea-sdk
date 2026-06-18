@@ -1868,6 +1868,7 @@ class TOONSerializer:
 def process_frame_to_toon_data(
     frame_node: Dict,
     subframes: Optional[List[Dict]] = None,
+    has_image: bool = True,
 ) -> Dict:
     """
     Process a Figma frame node into TOON-ready data structure.
@@ -1876,6 +1877,7 @@ def process_frame_to_toon_data(
         frame_node: Figma frame node dict
         subframes: Optional list of subframe dicts with 'node' and optional 'subframes' keys
                    for recursive nesting
+        has_image: Whether this frame needs an image (False for text-only frames)
 
     Returns structured data that can be serialized to TOON format.
     """
@@ -1908,6 +1910,7 @@ def process_frame_to_toon_data(
         'name': name,
         'position': position,
         'size': size,
+        'has_image': has_image,  # Whether this frame needs an image URL
         # Deduplicate and limit text fields
         'headings': dedupe_and_clean_text(text_data['headings'], max_items=5),
         'labels': dedupe_and_clean_text(text_data['labels'], max_items=15),
@@ -1934,7 +1937,8 @@ def process_frame_to_toon_data(
         for sf in subframes:
             sf_node = sf.get('node', sf)  # Support both {'node': ...} and direct node
             sf_subframes = sf.get('subframes', [])
-            sf_data = process_frame_to_toon_data(sf_node, subframes=sf_subframes)
+            sf_has_image = sf.get('has_image', True)  # Preserve has_image from collected_frames
+            sf_data = process_frame_to_toon_data(sf_node, subframes=sf_subframes, has_image=sf_has_image)
             frame_data['subframes'].append(sf_data)
 
     return frame_data
@@ -1962,7 +1966,8 @@ def process_page_to_toon_data(
         for frame_info in collected_frames[:max_frames]:
             frame_node = frame_info.get('node', frame_info)
             subframes = frame_info.get('subframes', [])
-            frame_data = process_frame_to_toon_data(frame_node, subframes=subframes)
+            frame_has_image = frame_info.get('has_image', True)
+            frame_data = process_frame_to_toon_data(frame_node, subframes=subframes, has_image=frame_has_image)
             frames.append(frame_data)
     else:
         # Default behavior: process top-level children from page_node
