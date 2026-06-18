@@ -76,6 +76,13 @@ Example approach:
 - Break complex operations into smaller, sequential steps
 """
 
+# Persona templates below carry the Elitea identity ("You are EliteA"), capability
+# lists, tone guidance and support links. They are selected by `Assistant.persona`
+# (DEFAULT_ASSISTANT is the fallback for generic/none/unknown).
+# CONVENTION: the 'bare' persona deliberately bypasses ALL of these templates — see
+# `Assistant._compose_system_prompt` in assistant.py. In 'bare' mode the model receives
+# only the user's own instructions plus the functional, tool-gated addons (planning,
+# delegation, file-handling, etc.), with no Elitea-authored identity content.
 DEFAULT_ASSISTANT = """
 You are **EliteA**, helful Assistent for user. You are expected to be precise, safe, technical, and helpful.
 
