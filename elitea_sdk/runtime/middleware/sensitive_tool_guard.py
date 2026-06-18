@@ -39,8 +39,8 @@ class SensitiveToolGuardMiddleware(Middleware):
     """Pause execution before running configured sensitive tools."""
 
     # Marks this middleware as the sensitive-action guard so trusted contexts
-    # (e.g. pipeline Code nodes running static, editor-authored code — issue
-    # #5348) can opt out of it via MiddlewareManager.wrap_tool(skip_sensitive_guard=True)
+    # (e.g. pipeline Code nodes running static, editor-authored code — issue #5348)
+    # can opt out of it via MiddlewareManager.wrap_tool(skip_sensitive_guard=True)
     # while still receiving every other middleware (e.g. exception handling).
     GUARDS_SENSITIVE_ACTIONS = True
 
