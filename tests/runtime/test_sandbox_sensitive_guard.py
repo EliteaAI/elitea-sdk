@@ -311,6 +311,45 @@ class TestMiddlewareManagerWrapTool:
         payload = json.loads(result)
         assert payload['type'] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
 
+    def test_wrap_tool_default_applies_guard(self):
+        """Default (skip_sensitive_guard=False) keeps the guard — the chat path
+        contract (issue #5348 leaves chat sandbox guarded)."""
+        configure_sensitive_tools({'sandbox': ['pyodide_sandbox']})
+        mgr = MiddlewareManager()
+        mgr.add(SensitiveToolGuardMiddleware())
+
+        tool = StructuredTool.from_function(
+            func=lambda code='': 'executed',
+            name='pyodide_sandbox',
+            description='Execute Python code in sandbox.',
+            metadata={
+                'toolkit_type': 'sandbox',
+                'toolkit_name': 'pyodide',
+                'display_name': 'Python Sandbox',
+            },
+        )
+        wrapped = mgr.wrap_tool(tool)
+        assert wrapped is not tool  # guarded copy
+
+    def test_wrap_tool_skip_sensitive_guard_returns_unguarded(self):
+        """skip_sensitive_guard=True bypasses the guard for trusted pipeline code."""
+        configure_sensitive_tools({'sandbox': ['pyodide_sandbox']})
+        mgr = MiddlewareManager()
+        mgr.add(SensitiveToolGuardMiddleware())
+
+        tool = StructuredTool.from_function(
+            func=lambda code='': 'executed',
+            name='pyodide_sandbox',
+            description='Execute Python code in sandbox.',
+            metadata={
+                'toolkit_type': 'sandbox',
+                'toolkit_name': 'pyodide',
+                'display_name': 'Python Sandbox',
+            },
+        )
+        wrapped = mgr.wrap_tool(tool, skip_sensitive_guard=True)
+        assert wrapped is tool  # guard skipped → same object
+
 
 # ---------------------------------------------------------------------------
 # 5. FunctionTool code-node integration: wrapped sandbox blocks correctly
@@ -358,15 +397,21 @@ class TestFunctionToolSandboxBlocking:
 # ---------------------------------------------------------------------------
 
 class TestPipelineCodeNodeWrapping:
-    """Simulate the pipeline Code node assembly path to verify that
-    middleware_manager.wrap_tool() is applied to the sandbox tool
-    before it reaches FunctionTool."""
+    """Simulate the pipeline Code node assembly path.
 
-    def test_code_node_sandbox_tool_is_wrapped_by_middleware_manager(self):
+    Issue #5348: pipeline Code nodes run static, editor-authored (trusted) code,
+    so the create_graph() branch calls wrap_tool(skip_sensitive_guard=True). The
+    sandbox tool must therefore NOT be sensitive-guarded and must execute without
+    an interrupt — while non-guard middleware (e.g. exception handling) is still
+    applied. The chat path (Assistant.__init__) keeps the guard (see
+    TestWrapSandboxTool / TestMiddlewareManagerWrapTool)."""
+
+    def test_code_node_sandbox_tool_skips_sensitive_guard(self):
         """Simulates the create_graph() Code node branch:
         1. create_sandbox_tool() returns a fresh tool
-        2. middleware_manager.wrap_tool() wraps it
-        3. The wrapped tool blocks on reject
+        2. middleware_manager.wrap_tool(skip_sensitive_guard=True) is applied
+        3. The tool is NOT guarded → executes without interrupt even when the
+           sandbox is configured as a sensitive action.
         """
         configure_sensitive_tools({'sandbox': ['pyodide_sandbox']})
 
@@ -374,9 +419,8 @@ class TestPipelineCodeNodeWrapping:
         mgr.add(SensitiveToolGuardMiddleware())
 
         # Simulate create_sandbox_tool() without Deno
-        original_func = lambda code='': 'executed'
         sandbox_tool = StructuredTool.from_function(
-            func=original_func,
+            func=lambda code='': 'executed',
             name='pyodide_sandbox',
             description='Execute Python code in sandbox.',
             metadata={
@@ -387,21 +431,65 @@ class TestPipelineCodeNodeWrapping:
         )
 
         # This is the key line from the fix in langraph_agent.py
-        wrapped = mgr.wrap_tool(sandbox_tool)
-        assert wrapped is not sandbox_tool, \
-            "Code node sandbox tool should be wrapped when configured as sensitive"
+        wrapped = mgr.wrap_tool(sandbox_tool, skip_sensitive_guard=True)
+        assert wrapped is sandbox_tool, \
+            "Trusted pipeline Code node must skip the sensitive-action guard"
 
-        # Verify the wrapped tool blocks
+        # Static pipeline code executes directly — no interrupt, no review call.
         with patch.object(
             SensitiveToolGuardMiddleware,
             '_review_sensitive_tool_call',
-            return_value={'action': 'reject', 'value': ''},
+            side_effect=AssertionError('guard must not run for pipeline Code node'),
         ):
             result = wrapped.invoke({'code': 'print(1)'})
+        assert result == 'executed'
 
-        payload = json.loads(result)
-        assert payload['type'] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
-        assert payload['blocked_tool_name'] == 'pyodide_sandbox'
+    def test_code_node_skips_guard_but_keeps_other_middleware(self):
+        """skip_sensitive_guard must skip ONLY the sensitive guard. Any other
+        middleware (here a stub standing in for the exception handler) is still
+        applied to the trusted pipeline Code node tool."""
+        configure_sensitive_tools({'sandbox': ['pyodide_sandbox']})
+
+        applied = {'value': False}
+
+        class _StubMiddleware(SensitiveToolGuardMiddleware.__bases__[0]):
+            """Minimal non-guard middleware that records that it wrapped a tool."""
+            def get_tools(self):
+                return []
+
+            def get_system_prompt(self):
+                return ''
+
+            def wrap_tool(self, tool):
+                applied['value'] = True
+                return tool
+
+        mgr = MiddlewareManager()
+        mgr.add(SensitiveToolGuardMiddleware())
+        mgr.add(_StubMiddleware())
+
+        sandbox_tool = StructuredTool.from_function(
+            func=lambda code='': 'executed',
+            name='pyodide_sandbox',
+            description='Execute Python code in sandbox.',
+            metadata={
+                'toolkit_type': 'sandbox',
+                'toolkit_name': 'pyodide',
+                'display_name': 'Python Sandbox',
+            },
+        )
+
+        wrapped = mgr.wrap_tool(sandbox_tool, skip_sensitive_guard=True)
+
+        assert applied['value'] is True, \
+            "Non-guard middleware must still be applied when skip_sensitive_guard=True"
+        # Sensitive guard skipped → executes without interrupt.
+        with patch.object(
+            SensitiveToolGuardMiddleware,
+            '_review_sensitive_tool_call',
+            side_effect=AssertionError('guard must not run'),
+        ):
+            assert wrapped.invoke({'code': 'print(1)'}) == 'executed'
 
     def test_code_node_sandbox_not_wrapped_when_no_middleware_manager(self):
         """When middleware_manager is None (no middleware configured),
@@ -419,24 +507,24 @@ class TestPipelineCodeNodeWrapping:
             },
         )
 
-        # middleware_manager is None → no wrapping (same as before fix)
+        # middleware_manager is None → no wrapping
         middleware_manager = None
         if middleware_manager is not None:
-            sandbox_tool = middleware_manager.wrap_tool(sandbox_tool)
+            sandbox_tool = middleware_manager.wrap_tool(sandbox_tool, skip_sensitive_guard=True)
 
         # Tool should still be the original
         result = sandbox_tool.invoke({'code': 'print(1)'})
         assert result == 'executed'
 
-    def test_stateful_sandbox_also_wrapped(self):
-        """Stateful sandbox variant should also be wrapped by the guard."""
+    def test_stateful_sandbox_also_skips_guard(self):
+        """Stateful sandbox variant in a Code node also skips the guard."""
         configure_sensitive_tools({'sandbox': ['stateful_pyodide_sandbox']})
 
         mgr = MiddlewareManager()
         mgr.add(SensitiveToolGuardMiddleware())
 
         sandbox_tool = StructuredTool.from_function(
-            func=lambda code='': 'executed stateully',
+            func=lambda code='': 'executed statefully',
             name='stateful_pyodide_sandbox',
             description='Execute Python code in stateful sandbox.',
             metadata={
@@ -446,19 +534,16 @@ class TestPipelineCodeNodeWrapping:
             },
         )
 
-        wrapped = mgr.wrap_tool(sandbox_tool)
-        assert wrapped is not sandbox_tool
+        wrapped = mgr.wrap_tool(sandbox_tool, skip_sensitive_guard=True)
+        assert wrapped is sandbox_tool
 
         with patch.object(
             SensitiveToolGuardMiddleware,
             '_review_sensitive_tool_call',
-            return_value={'action': 'reject', 'value': ''},
+            side_effect=AssertionError('guard must not run for pipeline Code node'),
         ):
             result = wrapped.invoke({'code': 'x = 1'})
-
-        payload = json.loads(result)
-        assert payload['type'] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
-        assert payload['blocked_tool_name'] == 'stateful_pyodide_sandbox'
+        assert result == 'executed statefully'
 
 
 # ---------------------------------------------------------------------------

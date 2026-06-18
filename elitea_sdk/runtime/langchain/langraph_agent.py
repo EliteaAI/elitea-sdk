@@ -1223,11 +1223,16 @@ def create_graph(
                 from ..tools.sandbox import create_sandbox_tool
                 sandbox_tool = create_sandbox_tool(stateful=False, allow_net=True,
                                                    elitea_client=kwargs.get('elitea_client', None))
-                # Apply middleware wrapping (e.g. sensitive-tool guard) to the
+                # Apply middleware wrapping (e.g. exception handling) to the
                 # freshly-created sandbox tool — it was not in the `tools` list
                 # that was wrapped during Assistant.__init__().
+                # Pipeline Code nodes run static, editor-authored code — trusted.
+                # Skip ONLY the sensitive-action HITL guard (issue #5348): an
+                # interrupt here corrupts pipeline state (a Code node is a single
+                # direct node call, not a tool-calling loop). Chat sandbox
+                # (LLM-generated, untrusted) is still guarded via Assistant.__init__.
                 if middleware_manager is not None:
-                    sandbox_tool = middleware_manager.wrap_tool(sandbox_tool)
+                    sandbox_tool = middleware_manager.wrap_tool(sandbox_tool, skip_sensitive_guard=True)
                 code_data = node.get('code', {'type': 'fixed', 'value': "return 'Code block is empty'"})
                 lg_builder.add_node(node_id, FunctionTool(
                     tool=sandbox_tool, name=node['id'], return_type='dict',
