@@ -175,14 +175,24 @@ class MiddlewareManager:
         self._middleware.append(middleware)
         return self
 
-    def wrap_tool(self, tool: BaseTool) -> BaseTool:
+    def wrap_tool(self, tool: BaseTool, skip_sensitive_guard: bool = False) -> BaseTool:
         """Apply wrap_tool from all registered middleware that support it.
 
         This ensures tools created outside the normal assistant init path
         (e.g. pipeline Code nodes) still receive middleware guards such as
-        the sensitive-tool guardrail.
+        exception handling.
+
+        Args:
+            tool: Tool to wrap.
+            skip_sensitive_guard: When True, skip any middleware flagged with
+                ``GUARDS_SENSITIVE_ACTIONS`` (the sensitive-action HITL guard).
+                Used for trusted, editor-authored pipeline Code nodes (issue
+                #5348) so static code is not interrupted, while every other
+                middleware (e.g. exception handling) is still applied.
         """
         for mw in self._middleware:
+            if skip_sensitive_guard and getattr(mw, 'GUARDS_SENSITIVE_ACTIONS', False):
+                continue
             if hasattr(mw, 'wrap_tool'):
                 tool = mw.wrap_tool(tool)
         return tool
