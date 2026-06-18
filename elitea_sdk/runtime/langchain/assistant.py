@@ -299,11 +299,16 @@ class Assistant:
                  persona: Optional[str] = "generic",
                  is_subgraph: bool = False,
                  lazy_tools_mode: Optional[bool] = None,
-                 middleware: Optional[list[Middleware]] = None):
+                 middleware: Optional[list[Middleware]] = None,
+                 child_dispatcher: Optional[Any] = None):
 
         self.app_type = app_type
         self.memory = memory
         self.store = store
+        # Parallel sub-agent dispatch seam (Track 2, #4993). Injected like memory;
+        # None → in-process gather fan-out (Track 1, CLI/tests). pylon_indexer
+        # supplies a real dispatcher to enable park-by-returning durable children.
+        self.child_dispatcher = child_dispatcher
         self.persona = persona
         self.max_iterations = data.get('meta', {}).get('step_limit', 25)
         self.is_subgraph = is_subgraph  # Store is_subgraph flag
@@ -765,6 +770,7 @@ class Assistant:
             steps_limit=self.max_iterations,
             always_bind_tools=self._always_bind_tools,  # Middleware tools always bound directly
             middleware_manager=self.middleware_manager,  # Pass middleware for before_model hooks
+            child_dispatcher=self.child_dispatcher,  # Parallel sub-agent dispatch seam (#4993 Track 2)
         )
 
         return agent
@@ -785,6 +791,7 @@ class Assistant:
             lazy_tools_mode=self.lazy_tools_mode,
             always_bind_tools=self._always_bind_tools,
             middleware_manager=self.middleware_manager,
+            child_dispatcher=self.child_dispatcher,  # Parallel sub-agent dispatch seam (#4993 Track 2)
         )
         return agent
 

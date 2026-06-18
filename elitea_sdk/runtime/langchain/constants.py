@@ -635,7 +635,11 @@ Rules:
 - Inline ALL context the sub-agent needs in `task`. No anaphora.
 - Each sub-agent returns a separate ToolMessage; reason over the results in
   the next turn.
-- You may emit multiple sub-agent tool_calls in one response; they are processed in order.
+- You may emit multiple sub-agent tool_calls in one response. When the subtasks
+  are INDEPENDENT (neither needs another's result), emit them together in a
+  single response — they run concurrently and you get all results at once.
+- When subtasks are DEPENDENT (one needs another's output), call one, wait for
+  its result, then issue the next in a later turn. Do NOT batch dependent steps.
 """
 
 PYODITE_ADDON = """

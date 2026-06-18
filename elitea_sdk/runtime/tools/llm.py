@@ -143,6 +143,15 @@ class LLMNode(BaseTool):
         description='MiddlewareManager instance for before_model/after_model hooks. '
                     'Used for context management like summarization and context editing.'
     )
+    child_dispatcher: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description='Optional parallel sub-agent dispatch seam (Track 2, issue #4993). '
+                    'When present and a turn contains 2+ Application (sub-agent) tool calls, '
+                    'the node PARKS by writing child specs to the parallel_tasks state channel '
+                    'and returning instead of running children in-process. When None, the '
+                    'node falls back to the in-process asyncio.gather fan-out (Track 1).'
+    )
     _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
 
     def _prepare_structured_output_params(self) -> dict:
@@ -1094,15 +1103,34 @@ class LLMNode(BaseTool):
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
                 task_content = str(task_content) if task_content is not None else ""
-            messages = [
-                SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
-                *func_args.get('chat_history', []),
-                HumanMessage(content=task_content),
-            ]
-            # Remove pre-last item if last two messages are same type and content
-            if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
-                -2].content:
-                messages.pop(-2)
+            _chat_history = list(func_args.get('chat_history', []))
+            # When chat_history already ends in a ToolMessage we are RESUMING an
+            # in-progress tool loop (the #4993 park/reconcile re-invoke: children
+            # settled, their results were appended as ToolMessages, and the graph
+            # re-enters this node to synthesize). Re-appending the original task as
+            # a trailing HumanMessage makes the model read the conversation as
+            # "the user is asking again" — so it re-dispatches the same sub-agents
+            # instead of synthesizing, looping forever on Anthropic models (GPT
+            # tolerates the duplicate; haiku/sonnet do not). The in-process gather
+            # path never hits this because it loops inside __perform_tool_calling
+            # on new_messages and never rebuilds the prompt. End on the
+            # ToolMessages so the next turn is a pure synthesis turn.
+            _resuming_tool_loop = bool(_chat_history) and isinstance(_chat_history[-1], ToolMessage)
+            if _resuming_tool_loop:
+                messages = [
+                    SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                    *_chat_history,
+                ]
+            else:
+                messages = [
+                    SystemMessage(content=self._anthropic_system_content(system_content, self.client)),
+                    *_chat_history,
+                    HumanMessage(content=task_content),
+                ]
+                # Remove pre-last item if last two messages are same type and content
+                if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
+                    -2].content:
+                    messages.pop(-2)
         else:
             # Flow for chat-based LLM node w/o prompt/task from pipeline but with messages in state
             # verify messages structure
@@ -1237,7 +1265,86 @@ class LLMNode(BaseTool):
         # __perform_tool_calling loop can execute it. The guard will then
         # resolve the resume action consistently: approve executes the tool,
         # reject returns a blocked-tool result and gives the LLM another turn.
-        if hitl_ctx and hitl_ctx.get('tool_name'):
+        if hitl_ctx and hitl_ctx.get('parallel_calls'):
+            # ---- Parallel sub-agent resume (issue #4993) ----
+            # The original turn fanned out 2+ Application calls and the parent
+            # paused on ONE aggregated interrupt (not the single-tool guard).
+            # Rebuild the original AIMessage carrying ALL N tool_calls so
+            # __perform_tool_calling re-enters the fan-out: completed siblings
+            # are skipped (their ToolMessages were restored above), and each
+            # paused child is resumed from its own checkpoint via the matching
+            # hitl_decisions entry.
+            #
+            # Multi-round parallel HITL: a resumed child whose LLM picks a new
+            # sensitive tool re-pauses, and _run_parallel_application_calls
+            # re-issues a fresh parent-level interrupt(aggregate). That aggregate
+            # is the FIRST interrupt() of THIS re-execution, so without help it
+            # consumes a still-pending resume value and RETURNS it instead of
+            # raising — swallowing the divergent child's new pause.
+            #
+            # LangGraph (1.x) delivers resume values two ways (see
+            # langgraph/pregel/_algo.py::_scratchpad + langgraph/types.py::interrupt):
+            #   * the scalar Command(resume=X) of THIS cycle arrives as the
+            #     "null resume" (one per cycle); the first interrupt() consumes it.
+            #   * values consumed by interrupt() in PRIOR cycles are persisted as
+            #     task-specific positional `scratchpad.resume` entries and replayed
+            #     by index on every later re-execution.
+            # So the count of pending values the aggregate would otherwise eat is
+            # len(scratchpad.resume) (positional, prior rounds) + 1 (this cycle's
+            # null). Consume them all here so the aggregate interrupt() lands past
+            # them and actually raises. Child decisions ride the SEPARATE
+            # `hitl_decisions` state channel, so consuming the parent's resume
+            # values never robs a child of its answer.
+            scratchpad = configurable.get(_SCRATCHPAD_KEY)
+            n_positional = (
+                len(scratchpad.resume)
+                if scratchpad is not None
+                and getattr(scratchpad, 'resume', None)
+                else 0
+            )
+            has_null = False
+            if scratchpad is not None and hasattr(scratchpad, 'get_null_resume'):
+                try:
+                    has_null = scratchpad.get_null_resume(False) is not None
+                except Exception:  # pragma: no cover - defensive
+                    has_null = False
+            n_prior = n_positional + (1 if has_null else 0)
+            if n_prior:
+                logger.info(
+                    "[HITL] Consuming %d pending parent resume value(s) before "
+                    "parallel sub-agent re-fanout (multi-round): %d positional "
+                    "+ %d null",
+                    n_prior, n_positional, 1 if has_null else 0,
+                )
+                for _i in range(n_prior):
+                    try:
+                        _langgraph_interrupt({'__replay_consumer__': True})
+                    except Exception as exc:
+                        logger.warning(
+                            "[HITL] Parallel replay consumer #%d raised %s — "
+                            "stopping replay consumption early",
+                            _i, exc,
+                        )
+                        break
+            completion = None
+            original_ai = hitl_ctx.get('original_ai_message')
+            if isinstance(original_ai, dict):
+                try:
+                    from langchain_core.messages.utils import messages_from_dict
+                    restored = messages_from_dict([original_ai])
+                    if restored and isinstance(restored[0], AIMessage):
+                        completion = restored[0]
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "[HITL] Failed to deserialize original AIMessage for "
+                        "parallel resume: %s", exc,
+                    )
+            if completion is None:
+                completion = AIMessage(
+                    content=hitl_ctx.get('content', ''),
+                    tool_calls=list(hitl_ctx['parallel_calls']),
+                )
+        elif hitl_ctx and hitl_ctx.get('tool_name'):
             # ---- Consume stale interrupt replay values ----
             # LangGraph replays ALL previously consumed interrupt/resume
             # values from prior resumes of this task (node execution).
@@ -1316,15 +1423,35 @@ class LLMNode(BaseTool):
             # __perform_tool_calling deduplicates the completion against
             # `messages` internally (multi-tool sibling HITL resume case),
             # so we can pass the full `messages` here unconditionally.
+            #
+            # parked_holder is a mutable hand-off for the Track 2 (#4993)
+            # park-by-returning path. It is passed by reference (NOT a contextvar)
+            # so the parked signal survives even when _run_async_in_sync_context
+            # runs the coroutine in a worker thread with copy_context() — the
+            # thread mutates the same dict object the caller holds.
+            parked_holder: Dict[str, Any] = {}
             new_messages, current_completion = self._run_async_in_sync_context(
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
                     pending_capture_base=_durable_base_count,
+                    parked_holder=parked_holder,
                 )
             )
 
             output_msgs = {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
+            if parked_holder.get('parked'):
+                # Parallel fan-out parked for durable dispatch. Write the child
+                # specs into the parallel_tasks state channel so they survive the
+                # checkpoint; the LangGraphAgentRunnable reads this back and emits
+                # the parked result shape (execution_finished=False). The fresh
+                # parallel_reconcile invocation later reads each child's own
+                # checkpoint to assemble ToolMessages and continue the loop.
+                output_msgs['parallel_tasks'] = {
+                    'parked': True,
+                    'children': parked_holder.get('children', {}),
+                }
+                return output_msgs
             if self.output_variables:
                 if self.output_variables[0] == 'messages':
                     return output_msgs
@@ -1468,6 +1595,28 @@ class LLMNode(BaseTool):
             if isinstance(msg, ToolMessage) and getattr(msg, 'tool_call_id', None) == tool_call_id:
                 return True
         return False
+
+    def _resolve_tool_to_execute(self, tool_name, config):
+        """Resolve a tool name to a BaseTool using the sequential loop's lookup chain.
+
+        Order: filtered tools (dynamic selection aware) → available_tools →
+        tool_registry. Returns None when the name cannot be resolved. Extracted
+        so the parallel fan-out partition and the sequential loop resolve tools
+        identically.
+        """
+        for tool in self.get_filtered_tools(config=config):
+            if tool.name == tool_name:
+                return tool
+        for tool in (self.available_tools or []):
+            if tool.name == tool_name:
+                logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
+                return tool
+        if self.tool_registry is not None:
+            registry_tool = self.tool_registry.get_tool_by_name(tool_name)
+            if registry_tool is not None:
+                logger.info("Resolved tool '%s' via tool_registry fallback", tool_name)
+                return registry_tool
+        return None
 
     @staticmethod
     def _append_completion_dedup(messages: list, completion: AIMessage) -> list:
@@ -1932,11 +2081,299 @@ class LLMNode(BaseTool):
         # Legacy async support
         return self.invoke(kwargs, **kwargs)
 
+    def _collect_parallel_application_specs(
+        self, tool_calls, messages, config,
+        hitl_decisions=None,
+    ):
+        """Return per-call specs when this turn is a pure multi-Application batch.
+
+        A turn qualifies for parallel fan-out (issue #4993) only when, after
+        skipping tool_calls that already completed across a HITL round-trip, it
+        contains 2+ Application (sub-agent) calls and NO regular tool calls.
+        Mixed batches keep the sequential path (returns None). Each returned
+        spec is ``(tool_name, tool_args, tool_call_id, application_tool)``.
+
+        Resume exception: when one child completed and another paused, the
+        resume turn has only the single paused child left (the completed
+        sibling's ToolMessage was restored and is skipped). That lone child was
+        checkpointed under the parallel-suffixed thread_id, so it MUST stay on
+        the parallel path to resume from its own checkpoint. We detect this by
+        matching a remaining call against the resume ``hitl_decisions`` and allow
+        a 1-spec parallel batch in that case.
+        """
+        from .application import Application
+        if not tool_calls or len(tool_calls) < 2:
+            return None
+        decision_ids = {
+            d.get('tool_call_id')
+            for d in (hitl_decisions or [])
+            if isinstance(d, dict) and d.get('tool_call_id')
+        }
+        specs = []
+        for tool_call in tool_calls:
+            tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+            tool_args = tool_call.get('args', {}) if isinstance(tool_call, dict) else getattr(tool_call, 'args', {})
+            tool_call_id = tool_call.get('id', '') if isinstance(tool_call, dict) else getattr(tool_call, 'id', '')
+            # Already-completed siblings (results restored across a HITL resume)
+            # neither count toward the batch nor re-execute.
+            if tool_call_id and self._tool_call_already_completed(tool_call_id, messages):
+                continue
+            tool = self._resolve_tool_to_execute(tool_name, config)
+            if not isinstance(tool, Application):
+                return None  # a non-Application call → sequential path
+            specs.append((tool_name, tool_args, tool_call_id, tool))
+        if not specs:
+            return None
+        # Parallel resume of the remaining paused child(ren): keep on the
+        # parallel path even with a single spec so the suffixed thread_id matches.
+        if any(s[2] in decision_ids for s in specs):
+            return specs
+        return specs if len(specs) >= 2 else None
+
+    def _build_parallel_dispatch_specs(self, app_specs, config):
+        """Turn gather specs into durable-dispatch child specs (Track 2, #4993).
+
+        Used when a ``child_dispatcher`` seam is present: instead of running the
+        sub-agents in-process via ``asyncio.gather``, the parent PARKS and hands
+        these specs to pylon_main, which launches each child as an independent
+        durable ``indexer_agent`` task. Each spec is a plain JSON-serialisable
+        dict (it must survive the checkpoint channel + an RPC round-trip), so it
+        carries NO live tool object — only the identity pylon_main needs to spawn
+        the child and the SDK needs to read its checkpoint back on reconcile.
+
+        The derived ``child_thread_id`` MUST match the in-process scheme in
+        ``application.py`` (``f"{parent}:{name}:{call_id}"``) so the reconcile
+        pass reads each child from the exact checkpoint the child wrote.
+        """
+        configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
+        parent_thread_id = configurable.get('thread_id')
+        specs = {}
+        for index, (tool_name, tool_args, tool_call_id, tool) in enumerate(app_specs):
+            app_name = getattr(tool, 'name', None) or tool_name
+            child_thread_id = (
+                f"{parent_thread_id}:{app_name}:{tool_call_id}"
+                if parent_thread_id else None
+            )
+            # Display label for the UI card, mirroring the gather aggregate's
+            # metadata precedence (original_name → display_name → name).
+            meta = getattr(tool, 'metadata', None) or {}
+            display_name = (
+                meta.get('original_name')
+                or meta.get('display_name')
+                or app_name
+            )
+            # Child identity for pylon_main to launch a standalone indexer_agent
+            # task. ``args_runnable`` is how the in-process path recreates the
+            # child (toolkits/application.py:187); the id/version + already-fetched
+            # version_details make the spec self-sufficient so pylon_main need not
+            # re-resolve the sub-agent. version_details is a plain dict (JSON-safe);
+            # the live ``llm``/``memory`` objects in args_runnable are intentionally
+            # NOT carried — the child re-resolves those from the parent's payload.
+            runnable = getattr(tool, 'args_runnable', None) or {}
+            specs[tool_call_id] = self._jsonsafe_spec({
+                'tool_call_id': tool_call_id,
+                'name': app_name,
+                'display_name': display_name,
+                'input': tool_args,
+                'child_thread_id': child_thread_id,
+                'index': index,
+                'application_id': runnable.get('application_id'),
+                'application_version_id': runnable.get('application_version_id'),
+                'version_details': runnable.get('version_details'),
+                'variable_defaults': getattr(tool, 'variable_defaults', None) or {},
+            })
+        return specs
+
+    @staticmethod
+    def _jsonsafe_spec(spec: dict) -> dict:
+        """Deep-coerce a dispatch spec to plain JSON, dropping non-serialisable leaves.
+
+        The spec is written to the ``parallel_tasks`` checkpoint channel and then
+        RPC'd to pylon_main, so it MUST be msgpack/JSON-safe. ``input`` (LLM
+        tool_args, whose schema allows ``chat_history: list[BaseMessage]``) and
+        the nested ``version_details`` dict can carry live objects (BaseMessage,
+        an ``EliteAClient`` reference). A non-serialisable leaf becomes ``None``;
+        dict/list structure and JSON scalars — everything reconcile reads back
+        (``version_details.llm_settings``/``meta``/``variables``) — are preserved.
+        """
+        def _coerce(value):
+            if isinstance(value, dict):
+                return {k: _coerce(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_coerce(v) for v in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return None
+        return _coerce(spec)
+
+    async def _run_parallel_application_calls(
+        self, app_specs, new_messages, config, hitl_decisions=None,
+        pending_capture_start=0,
+    ):
+        """Execute multiple Application (sub-agent) tool calls concurrently.
+
+        Children run in worker threads under ``asyncio.gather`` so their
+        (blocking) sub-graph invocations overlap (elapsed ≈ max, not sum).
+        ``contextvars.copy_context()`` is captured per child so each runs in an
+        isolated context (its own ``_PENDING_TOOL_MESSAGES`` slot). Per #5245
+        there is no shared approval set — every sensitive call interrupts on its
+        own, so each paused child surfaces its own approval independently.
+
+        A child that pauses for sensitive-tool approval returns a deferred
+        sentinel (it must NOT call ``interrupt()`` inside the executor thread —
+        the raised GraphInterrupt would be captured by gather and the pause
+        lost). All paused children are aggregated into ONE parent-level
+        ``interrupt()`` carrying ``guardrail_type='parallel_sensitive_tools'`` so
+        the UI surfaces N stacked approval cards and a single resume call routes
+        each decision back to the correct child via its ``tool_call_id``.
+        Completed children's ``ToolMessage``s are appended to ``new_messages`` in
+        tool_call order regardless of whether siblings paused. See issue #4993.
+
+        All children are awaited to settlement before the aggregate interrupt is
+        raised: ``interrupt()`` checkpoints and replays the WHOLE node on resume,
+        so a sibling cannot be left running across a human pause on a stateless
+        server — abandoning + re-running it desynchronises the resume-value
+        replay cadence and re-fires the same interrupt in a loop.
+        """
+        from langchain_core.messages import ToolMessage, message_to_dict
+
+        # Map prior decisions (this turn's resume) by the PARENT Application
+        # tool_call_id so each paused child resumes from its own checkpoint.
+        decisions_by_id = {}
+        for decision in (hitl_decisions or []):
+            tcid = decision.get('tool_call_id')
+            if tcid:
+                decisions_by_id[tcid] = decision
+
+        loop = asyncio.get_running_loop()
+
+        async def _run_one(spec):
+            tool_name, tool_args, tool_call_id, tool = spec
+            envelope = {"type": "tool_call", "id": tool_call_id, "args": tool_args, "name": tool_name}
+            child_config = dict(config)
+            child_config['configurable'] = dict(config.get('configurable', {}))
+            decision = decisions_by_id.get(tool_call_id)
+            if decision is not None:
+                # Resume this child from its checkpoint with the user's decision
+                # (the derived child thread_id is keyed by this tool_call_id).
+                child_config['configurable']['__hitl_parallel_resume__'] = {
+                    'action': decision.get('action', 'approve'),
+                    'value': decision.get('value', decision.get('user_feedback', '')),
+                }
+            # Deferred mode must stay sticky ACROSS resume, not just on the fresh
+            # run. A resumed child whose LLM picks a DIFFERENT sensitive tool on
+            # its next turn would otherwise call interrupt() inside this executor
+            # thread — where asyncio.gather captures the GraphInterrupt and the
+            # pause is lost. Keeping it on means a post-resume pause RETURNS a
+            # sentinel and re-aggregates into a fresh parent interrupt (multi-round
+            # parallel HITL — issue #4993 follow-up).
+            child_config['configurable']['__hitl_deferred_mode__'] = True
+            child_config['configurable']['__hitl_parallel_call_id__'] = tool_call_id
+            ctx = contextvars.copy_context()
+            return await loop.run_in_executor(
+                None, lambda c=ctx, t=tool, e=envelope, cc=child_config: c.run(t.invoke, e, config=cc),
+            )
+
+        # Run every child concurrently and wait for ALL to settle. A child that
+        # pauses for sensitive-tool approval returns a deferred sentinel (it must
+        # NOT call interrupt() inside the executor thread — gather would capture
+        # the GraphInterrupt and lose the pause). Completed siblings produce
+        # ToolMessages; paused siblings are aggregated into ONE parent interrupt
+        # below. return_exceptions keeps one child's failure from cancelling the
+        # rest (per-child isolation, issue #4993).
+        results = await asyncio.gather(
+            *[_run_one(spec) for spec in app_specs], return_exceptions=True,
+        )
+
+        pending_deferred = []
+        for spec, result in zip(app_specs, results):
+            tool_name, _tool_args, tool_call_id, _tool = spec
+            if isinstance(result, GraphBubbleUp):
+                raise result
+            if isinstance(result, BaseException):
+                logger.debug("Parallel sub-agent '%s' failed: %s", tool_name, result)
+                new_messages.append(ToolMessage(
+                    content=f"Error executing {tool_name}: {result}",
+                    tool_call_id=tool_call_id,
+                ))
+                continue
+            if isinstance(result, dict) and result.get('__hitl_deferred__'):
+                pending_deferred.append((spec, result))
+                continue
+            if isinstance(result, ToolMessage):
+                if not result.tool_call_id:
+                    result.tool_call_id = tool_call_id
+                new_messages.append(result)
+            else:
+                new_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+
+        if not pending_deferred:
+            return
+
+        # Build ONE aggregated interrupt for all paused children. Each entry is
+        # the single-shape sensitive-tool payload, re-keyed to the PARENT
+        # Application tool_call_id so the resume decision routes back here.
+        pending_payload = []
+        for spec, sentinel in pending_deferred:
+            _tn, _ta, tool_call_id, _tool = spec
+            entry = dict(sentinel.get('hitl_interrupt') or {})
+            entry['tool_call_id'] = tool_call_id
+            # Label the paused card with the sub-agent it originated from so the
+            # UI can group N stacked approvals by sub-agent name (issue #4993).
+            # Falls back to the call name when metadata is absent.
+            sub_agent_name = ''
+            _app_meta = getattr(_tool, 'metadata', None) or {}
+            sub_agent_name = (
+                _app_meta.get('original_name')
+                or _app_meta.get('display_name')
+                or getattr(_tool, 'name', '')
+                or _tn
+            )
+            if sub_agent_name:
+                entry['parent_agent_name'] = sub_agent_name
+            # Per-entry pending messages would duplicate the parent-level set
+            # carried on the aggregate; drop them to keep the payload lean.
+            entry.pop('_pending_messages', None)
+            pending_payload.append(entry)
+
+        # Expose + embed the parent's intermediate messages (completed siblings
+        # and the AIMessage that owns all N tool_calls) so the resume restores
+        # them and the LLMNode skips the finished siblings. Mirrors the
+        # single-tool guard's _pending_messages contract (PR #199).
+        intermediate = list(new_messages[pending_capture_start:])
+        _PENDING_TOOL_MESSAGES.set(intermediate)
+        pending_serialized = []
+        for _m in intermediate:
+            try:
+                pending_serialized.append(message_to_dict(_m))
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        aggregate = {
+            'type': 'hitl',
+            'guardrail_type': 'parallel_sensitive_tools',
+            'message': pending_payload[0].get(
+                'message', 'Multiple actions require your review before continuing.',
+            ),
+            'pending': pending_payload,
+            '_pending_messages': pending_serialized,
+        }
+        logger.info(
+            "[HITL] Aggregating %d paused parallel sub-agent(s) into one interrupt",
+            len(pending_payload),
+        )
+        _langgraph_interrupt(aggregate)  # raises GraphInterrupt → parent pregel
+
     async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
-                                     pending_capture_base=None):
+                                     pending_capture_base=None, parked_holder=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
 
+        # Per-call independent approval (issue #5303): a sensitive tool the user
+        # rejects is NOT excluded from future turns. The blocked tool stays bound
+        # and the loop re-invokes with the full toolset; the only steer is the
+        # invocation-scoped guidance line inside the blocked ToolMessage. If the
+        # user rejects create_file call #1 they can still approve create_file #2.
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
 
@@ -1983,6 +2420,51 @@ class LLMNode(BaseTool):
             tool_calls = current_completion.tool_calls if hasattr(current_completion.tool_calls,
                                                                   '__iter__') else []
 
+            # ── Parallel sub-agent fan-out (issue #4993) ────────────────────
+            # When the assistant turn contains 2+ Application (sub-agent) tool
+            # calls and NOTHING else, run them concurrently. Mixed batches
+            # (Application + a regular toolkit call) keep the sequential path.
+            # Parallelism is LLM-driven — steered by TASK_DELEGATION_ADDON and
+            # the sub-agent tool descriptions — not a feature flag.
+            app_specs = self._collect_parallel_application_specs(
+                tool_calls, new_messages, config,
+                hitl_decisions=hitl_decisions,
+            )
+            if app_specs is not None:
+                # ── Track 2 (#4993): durable park-by-returning ──────────────
+                # When a child_dispatcher seam is injected, do NOT run the
+                # children in-process. Build their dispatch specs, hand them to
+                # the caller via parked_holder, and RETURN immediately. The
+                # parent's AIMessage (with N dangling tool_calls) stays in
+                # new_messages; the LangGraph node ends, its task goes terminal,
+                # and pylon_main launches each child as an independent durable
+                # task. We must NOT fall through to the LLM re-invoke below —
+                # there are no ToolMessages yet, so re-invoking would error on a
+                # dangling-tool-call AIMessage. dispatcher None → fall through to
+                # today's in-process gather (Track 1 baseline, CLI/tests intact).
+                if self.child_dispatcher is not None and parked_holder is not None:
+                    children = self._build_parallel_dispatch_specs(app_specs, config)
+                    parked_holder['parked'] = True
+                    parked_holder['children'] = children
+                    logger.info(
+                        "[PARALLEL] child_dispatcher present — parking %d sub-agent(s) "
+                        "for durable dispatch instead of in-process gather", len(children),
+                    )
+                    _PENDING_TOOL_MESSAGES.set([])
+                    return new_messages, current_completion
+                try:
+                    await self._run_parallel_application_calls(
+                        app_specs, new_messages, config,
+                        hitl_decisions=hitl_decisions,
+                        pending_capture_start=_pending_capture_start,
+                    )
+                except GraphBubbleUp:
+                    # The aggregated parallel interrupt() raised — mirror the
+                    # sequential path's cleanup before propagating to the executor.
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise
+                tool_calls = []  # handled in bulk; skip the sequential loop below
+
             for tool_call in tool_calls:
                 tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call,
                                                                                                   'name',
@@ -2008,29 +2490,11 @@ class LLMNode(BaseTool):
                     )
                     continue
 
-                # Find the tool in filtered tools
-                # Pass config to ensure dynamically selected tools are available
-                filtered_tools = self.get_filtered_tools(config=config)
-                tool_to_execute = None
-                for tool in filtered_tools:
-                    if tool.name == tool_name:
-                        tool_to_execute = tool
-                        break
-
-                # Fallback: in lazy mode (and HITL resume) the tool may not appear
-                # in get_filtered_tools because that returns only meta-tools.
-                # Search available_tools and tool_registry for a direct match.
-                if tool_to_execute is None:
-                    for tool in (self.available_tools or []):
-                        if tool.name == tool_name:
-                            tool_to_execute = tool
-                            logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
-                            break
-                if tool_to_execute is None and self.tool_registry is not None:
-                    registry_tool = self.tool_registry.get_tool_by_name(tool_name)
-                    if registry_tool is not None:
-                        tool_to_execute = registry_tool
-                        logger.info("Resolved tool '%s' via tool_registry fallback", tool_name)
+                # Resolve the tool via the shared lookup chain (filtered →
+                # available_tools → tool_registry). Extracted so the parallel
+                # fan-out partition (#4993) and the sequential loop resolve
+                # tools identically.
+                tool_to_execute = self._resolve_tool_to_execute(tool_name, config)
 
                 if tool_to_execute:
                     try:
