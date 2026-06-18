@@ -642,7 +642,7 @@ class Assistant:
             "cynical": CYNICAL_ASSISTANT,
         }
 
-        # === BARE PERSONA: no Elitea persona/identity, functional addons only ===
+        # === BARE PERSONA: no EliteA persona/identity, functional addons only ===
         if self.persona == 'bare':
             if prompt_instructions and functional_addons:
                 escaped_prompt = f"{prompt_instructions}\n\n---\n\n{functional_addons}"
@@ -652,7 +652,7 @@ class Assistant:
                 # No instructions and no addon-contributing tools -> empty. The caller
                 # (LLMNode) omits the SystemMessage entirely for empty content.
                 escaped_prompt = functional_addons
-            logger.info("bare persona: skipping Elitea persona template (instructions + tool addons only)")
+            logger.debug("bare persona: skipping EliteA persona template (instructions + tool addons only)")
         # For agent/predict types, use instructions directly without wrapping.
         # Persona templates (DEFAULT_ASSISTANT, etc.) are only used when persona is specified.
         elif self.app_type in [APP_TYPE_AGENT, APP_TYPE_PREDICT] and prompt_instructions:
