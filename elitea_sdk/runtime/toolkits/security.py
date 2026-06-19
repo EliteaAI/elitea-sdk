@@ -62,17 +62,13 @@ def normalize_tool_name(tool_name: Optional[str]) -> str:
 
 
 def canonical_match_key(name: Optional[str]) -> str:
-    """Return a separator/format-insensitive key for sensitive-tool matching only.
+    """Return a separator/format-insensitive key for guardrail matching only.
 
     Lowercases and removes every non-alphanumeric character, so naming-style
     variations collapse to the same key: ``CreateFile``, ``create_file``,
     ``create-file`` and ``Create File`` all map to ``createfile``. This key is
-    used *exclusively* for sensitive-action membership tests — tools are still
+    used *exclusively* for blocked/sensitive membership tests — tools are still
     invoked and displayed by their natural names.
-
-    Note: blocked toolkit/tool matching intentionally stays plain ``lower()`` to
-    remain symmetric with the ``elitea_core`` schema-filtering layer, which is
-    not normalized.
     """
     return re.sub(r'[^a-z0-9]', '', str(name or '').strip().lower())
 
@@ -92,25 +88,14 @@ def qualified_tool_identity(tool_name: Optional[str], toolkit_name: Optional[str
     return f'{prefix}.{base}' if prefix else base
 
 
-def _normalize_tools_mapping(tool_map: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
-    return {
-        str(key).strip().lower(): [str(item).strip().lower() for item in (values or []) if str(item).strip()]
-        for key, values in (tool_map or {}).items()
-        if str(key).strip()
-    }
-
-
 def _canonical_toolkit_key(key: str) -> str:
-    """Canonical key for a sensitive-tool toolkit identifier, preserving ``*``."""
+    """Canonical key for a toolkit identifier, preserving the ``*`` wildcard."""
     if str(key).strip() == '*':
         return '*'
     return canonical_match_key(key)
 
 
-def _normalize_sensitive_mapping(tool_map: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
-    """Like :func:`_normalize_tools_mapping` but using the separator/format-insensitive
-    canonical key. Sensitive-action matching is SDK-only (no ``elitea_core`` counterpart),
-    so it can normalize without creating an asymmetry."""
+def _normalize_tools_mapping(tool_map: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
     return {
         _canonical_toolkit_key(key): [canonical_match_key(item) for item in (values or []) if str(item).strip()]
         for key, values in (tool_map or {}).items()
@@ -131,7 +116,7 @@ def configure_blocklist(
     """
     global _blocked_toolkits, _blocked_tools, _blocklist_initialized
 
-    _blocked_toolkits = [t.lower() for t in (blocked_toolkits or [])]
+    _blocked_toolkits = [canonical_match_key(t) for t in (blocked_toolkits or []) if str(t).strip()]
     _blocked_tools = _normalize_tools_mapping(blocked_tools)
     _blocklist_initialized = True
 
@@ -149,7 +134,7 @@ def configure_sensitive_tools(
     global _sensitive_tools, _sensitive_action_company_name, _sensitive_action_message_template
     global _sensitive_tools_initialized
 
-    _sensitive_tools = _normalize_sensitive_mapping(sensitive_tools)
+    _sensitive_tools = _normalize_tools_mapping(sensitive_tools)
     _sensitive_action_company_name = company_name or DEFAULT_SENSITIVE_ACTION_COMPANY_NAME
     _sensitive_action_message_template = (
         message_template or DEFAULT_SENSITIVE_ACTION_MESSAGE_TEMPLATE
@@ -168,7 +153,7 @@ def _load_blocklist_from_env() -> None:
 
     if env_toolkits:
         try:
-            _blocked_toolkits = [t.strip().lower() for t in env_toolkits.split(',') if t.strip()]
+            _blocked_toolkits = [canonical_match_key(t) for t in env_toolkits.split(',') if t.strip()]
             logger.info(f"[SECURITY] Loaded blocked toolkits from env: {_blocked_toolkits}")
         except Exception as e:
             logger.warning(f"[SECURITY] Failed to parse ELITEA_BLOCKED_TOOLKITS: {e}")
@@ -197,7 +182,7 @@ def _load_sensitive_tools_from_env() -> None:
 
     if env_sensitive_tools:
         try:
-            _sensitive_tools = _normalize_sensitive_mapping(json.loads(env_sensitive_tools))
+            _sensitive_tools = _normalize_tools_mapping(json.loads(env_sensitive_tools))
         except Exception as e:
             logger.warning(f"[SECURITY] Failed to parse ELITEA_SENSITIVE_TOOLS: {e}")
 
@@ -222,7 +207,7 @@ def is_toolkit_blocked(toolkit_type: str) -> bool:
     """
     _load_blocklist_from_env()
 
-    blocked = toolkit_type.lower() in _blocked_toolkits
+    blocked = canonical_match_key(toolkit_type) in _blocked_toolkits
     if blocked:
         logger.warning(f"[SECURITY] Blocked toolkit type: {toolkit_type}")
     return blocked
@@ -246,11 +231,11 @@ def is_tool_blocked(toolkit_type: str, tool_name: str) -> bool:
         return True
 
     # Check specific tool
-    toolkit_lower = toolkit_type.lower()
-    if toolkit_lower in _blocked_tools:
-        blocked_tool_names = set(_blocked_tools[toolkit_lower])
+    toolkit_key = canonical_match_key(toolkit_type)
+    if toolkit_key in _blocked_tools:
+        blocked_tool_names = set(_blocked_tools[toolkit_key])
         for candidate_name in get_tool_name_aliases(tool_name):
-            if candidate_name in blocked_tool_names:
+            if canonical_match_key(candidate_name) in blocked_tool_names:
                 logger.warning(f"[SECURITY] Blocked tool '{tool_name}' in toolkit '{toolkit_type}'")
                 return True
 
@@ -268,7 +253,7 @@ def get_blocked_tools_for_toolkit(toolkit_type: str) -> List[str]:
         List of blocked tool names (lowercase) for this toolkit
     """
     _load_blocklist_from_env()
-    return _blocked_tools.get(toolkit_type.lower(), [])
+    return _blocked_tools.get(canonical_match_key(toolkit_type), [])
 
 
 def get_blocklist_config() -> Dict:
