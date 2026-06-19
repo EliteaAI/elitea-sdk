@@ -152,9 +152,14 @@ class BasePyodideSandbox:
             if permission_flag := build_permission_flag(flag, value=value):
                 cmd.append(permission_flag)
 
-        # Memory limit
+        # WASM memory cap — bounds Pyodide's heap (Python objects, numpy arrays,
+        # etc.), which lives in WASM linear memory. This REPLACES the old
+        # --max-old-space-size flag, which only capped the V8 JS heap and had no
+        # effect on Pyodide memory (the bomb that hung the VM was Python data in
+        # WASM, not JS). Pages are 64 KiB each, so 1 MB = 16 pages.
         if memory_limit_mb:
-            cmd.append(f"--v8-flags=--max-old-space-size={memory_limit_mb}")
+            wasm_pages = int(memory_limit_mb) * 16
+            cmd.append(f"--v8-flags=--wasm-max-mem-pages={wasm_pages}")
 
         # Add the package and code
         cmd.extend([self.pkg_name, "-c", code])
