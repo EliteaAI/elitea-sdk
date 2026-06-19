@@ -374,7 +374,12 @@ class PyodideSandboxTool(BaseTool):
         Execute Python code in the Pyodide sandbox
         """
         try:
-            limits = self._sandbox_limits
+            # Resolve limits defensively: instances built via Pydantic
+            # model_construct() (or any path that bypasses __init__) won't have
+            # _sandbox_limits set, so fall back to reading the environment.
+            limits = getattr(self, "_sandbox_limits", None)
+            if limits is None:
+                limits = _read_sandbox_limits_from_env()
 
             # --- Admission gate (burst protection) -------------------------------
             # Reject (soft, retriable) rather than spawn another sandbox when the
