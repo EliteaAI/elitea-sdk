@@ -72,6 +72,131 @@ def _setup_pyodide_cache_env() -> None:
         logger.warning(f"Could not setup Pyodide cache environment: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Sandbox resource limits
+#
+# Read from environment variables (set by the indexer plugin from its config.yml
+# `env_vars:` block at startup — same mechanism as SANDBOX_BASE / DENO_DIR).
+# If a var is absent or malformed, a SAFE default is used — never "unlimited".
+# ---------------------------------------------------------------------------
+
+# Safe defaults applied when the env var is missing or unparseable.
+_DEFAULT_TIMEOUT_SECONDS = 55.0
+_DEFAULT_WASM_MAX_MEM_MB = 512
+_DEFAULT_MAX_CONCURRENT = 16
+_DEFAULT_MEMORY_PRESSURE_PCT = 85
+_MIN_WASM_MEM_MB = 64  # below this Pyodide may fail to boot
+
+
+def _read_sandbox_limits_from_env() -> Dict[str, Union[int, float]]:
+    """Resolve the four sandbox resource limits from the environment.
+
+    Returns a dict: timeout_seconds, wasm_max_mem_mb, max_concurrent,
+    memory_pressure_pct. A malformed value logs a warning and falls back to the
+    safe default, so a bad config can never produce an unlimited sandbox.
+
+    max_concurrent == 0      -> concurrency gate disabled
+    memory_pressure_pct == 0 -> pressure gate disabled
+    """
+    def _num(env_name, default, cast, lo=None, hi=None):
+        raw = os.environ.get(env_name)
+        if raw is None or raw == "":
+            return default
+        try:
+            val = cast(raw)
+        except (ValueError, TypeError):
+            logger.warning("Invalid %s=%r, using default %r", env_name, raw, default)
+            return default
+        if lo is not None and val < lo:
+            return default if lo > 0 else lo
+        if hi is not None and val > hi:
+            return hi
+        return val
+
+    timeout_seconds = _num("SANDBOX_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS, float, lo=0.0001)
+    wasm_max_mem_mb = _num("SANDBOX_WASM_MAX_MEM_MB", _DEFAULT_WASM_MAX_MEM_MB, int, lo=_MIN_WASM_MEM_MB)
+    # 0 is a valid "off" value for the gates, so allow it explicitly (lo=0).
+    max_concurrent = _num("SANDBOX_MAX_CONCURRENT", _DEFAULT_MAX_CONCURRENT, int, lo=0)
+    memory_pressure_pct = _num("SANDBOX_MEMORY_PRESSURE_PCT", _DEFAULT_MEMORY_PRESSURE_PCT, int, lo=0, hi=99)
+    return {
+        "timeout_seconds": timeout_seconds,
+        "wasm_max_mem_mb": wasm_max_mem_mb,
+        "max_concurrent": max_concurrent,
+        "memory_pressure_pct": memory_pressure_pct,
+    }
+
+
+def _count_deno_processes() -> int:
+    """Count live `deno` processes via OS-global pgrep.
+
+    Used as a self-healing concurrency probe: dead processes simply stop being
+    counted, so there is no counter to leak (unlike a semaphore). Reads OS-global
+    state, so it is correct across the forked agent task workers.
+
+    FAILS OPEN: any error returns 0 (never blocks execution on a broken probe).
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-c", "deno"],
+            capture_output=True, text=True, timeout=2,
+        )
+        # pgrep returns rc=1 when there are zero matches — that means 0, not error.
+        if result.returncode == 0:
+            return int(result.stdout.strip() or "0")
+        return 0
+    except Exception as exc:  # pylint: disable=W0703
+        logger.debug("deno process count probe failed (fail-open): %s", exc)
+        return 0
+
+
+def _cgroup_memory_pressure_pct() -> Optional[float]:
+    """Container memory usage as a percentage of its cgroup limit, minus
+    reclaimable page cache.
+
+    Reads cgroup v2: /proc/self/cgroup -> /sys/fs/cgroup/<rel>/memory.{current,max,stat}.
+    Subtracts reclaimable cache (inactive_file + slab_reclaimable) so that page
+    cache does not cause false rejections.
+
+    FAILS OPEN: returns None (pressure gate skipped) if the limit is unset
+    ("max"), the cgroup interface is unavailable, or we are on cgroup v1.
+    """
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as fh:
+            rel = None
+            for line in fh:
+                if line.startswith("0::"):  # cgroup v2 unified hierarchy
+                    rel = line.strip().split("::", 1)[1]
+                    break
+        if rel is None:
+            return None  # cgroup v1 / no unified line -> skip gate
+        base = "/sys/fs/cgroup" + rel
+        with open(base + "/memory.max", "r", encoding="utf-8") as fh:
+            raw_max = fh.read().strip()
+        if raw_max == "max":
+            return None  # no limit configured -> nothing to measure pressure against
+        limit = int(raw_max)
+        if limit <= 0:
+            return None
+        with open(base + "/memory.current", "r", encoding="utf-8") as fh:
+            current = int(fh.read().strip())
+        reclaimable = 0
+        try:
+            with open(base + "/memory.stat", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    key, _, val = line.partition(" ")
+                    if key in ("inactive_file", "slab_reclaimable"):
+                        reclaimable += int(val.strip())
+        except Exception:  # pylint: disable=W0703
+            pass  # memory.stat optional; treat as no reclaimable
+        net = current - reclaimable
+        if net < 0:
+            net = 0
+        return net / limit * 100.0
+    except Exception as exc:  # pylint: disable=W0703
+        logger.debug("cgroup memory pressure probe failed (fail-open): %s", exc)
+        return None
+
+
 # Create input schema for the sandbox tool
 sandbox_tool_input = create_model(
     "SandboxToolInput",
@@ -118,6 +243,16 @@ class PyodideSandboxTool(BaseTool):
             }
         super().__init__(**kwargs)
         self._sandbox = None
+        # Resolve resource limits (timeout / wasm memory cap / concurrency +
+        # memory-pressure gates) from the environment, with safe defaults.
+        self._sandbox_limits = _read_sandbox_limits_from_env()
+        logger.info(
+            "Sandbox resource limits: timeout=%.1fs wasm_mem=%dMB max_concurrent=%d pressure_pct=%d",
+            self._sandbox_limits["timeout_seconds"],
+            self._sandbox_limits["wasm_max_mem_mb"],
+            self._sandbox_limits["max_concurrent"],
+            self._sandbox_limits["memory_pressure_pct"],
+        )
         # Setup caching environment for optimal performance
         _setup_pyodide_cache_env()
         self._initialize_sandbox()
@@ -239,6 +374,43 @@ class PyodideSandboxTool(BaseTool):
         Execute Python code in the Pyodide sandbox
         """
         try:
+            limits = self._sandbox_limits
+
+            # --- Admission gate (burst protection) -------------------------------
+            # Reject (soft, retriable) rather than spawn another sandbox when the
+            # box is already at capacity. Both checks read shared OS/cgroup state,
+            # are self-healing (no counter to leak), and fail OPEN on probe error.
+            max_concurrent = limits["max_concurrent"]
+            if max_concurrent and max_concurrent > 0:
+                n_deno = _count_deno_processes()
+                if n_deno >= max_concurrent:
+                    logger.warning(
+                        "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
+                        n_deno, max_concurrent,
+                    )
+                    return {
+                        "error": f"Sandbox busy: {n_deno} concurrent executions at limit "
+                                 f"{max_concurrent}. Retry shortly.",
+                        "status": "Execution failed",
+                        "execution_info": "Execution time: 0.00s",
+                    }
+
+            pressure_pct = limits["memory_pressure_pct"]
+            if pressure_pct and pressure_pct > 0:
+                current_pressure = _cgroup_memory_pressure_pct()
+                if current_pressure is not None and current_pressure >= pressure_pct:
+                    logger.warning(
+                        "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
+                        current_pressure, pressure_pct,
+                    )
+                    return {
+                        "error": f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
+                                 f"{pressure_pct}%. Retry shortly.",
+                        "status": "Execution failed",
+                        "execution_info": "Execution time: 0.00s",
+                    }
+            # --- End admission gate ----------------------------------------------
+
             if self._sandbox is None:
                 self._initialize_sandbox()
 
@@ -246,11 +418,14 @@ class PyodideSandboxTool(BaseTool):
             # This is needed when _arun is called directly via ainvoke()
             prepared_code = self._prepare_pyodide_input(code)
 
-            # Execute the code with session state if available
+            # Execute the code with session state if available, bounded by the
+            # configured per-execution timeout and WASM memory cap.
             result = await self._sandbox.execute(
                 prepared_code,
                 session_bytes=self.session_bytes,
-                session_metadata=self.session_metadata
+                session_metadata=self.session_metadata,
+                timeout_seconds=limits["timeout_seconds"],
+                memory_limit_mb=limits["wasm_max_mem_mb"],
             )
 
             # Update session state for stateful execution
