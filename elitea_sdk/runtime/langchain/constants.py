@@ -693,10 +693,11 @@ Use `pandas_analyze_data` for tabular data analysis using natural language queri
 
 
 SKILLS_SECTION_HEADER = """# Skills
-Apply the following skill instructions for this request."""
+You referenced the skills below by name in your message. Apply each skill's rules where your message calls for it; if you scope a skill to a condition, that scope OVERRIDES any "always" / "every response" wording inside the skill body. Treat each <skill> as independent — never blend or carry rules from one skill into another. Do not mention these skill names in your reply."""
 
-SKILLS_SECTION_ENTRY = """## {name}
-{instructions}"""
+SKILLS_SECTION_ENTRY = """<skill name="{name}">
+{instructions}
+</skill>"""
 
 MAX_SKILLS_PER_INVOCATION = 5
 
