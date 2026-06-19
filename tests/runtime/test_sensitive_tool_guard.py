@@ -15,7 +15,11 @@ from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable
 from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
 from elitea_sdk.runtime.middleware.strategies import LoggingStrategy
 from elitea_sdk.runtime.middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
-from elitea_sdk.runtime.toolkits.security import configure_sensitive_tools, reset_sensitive_tools
+from elitea_sdk.runtime.toolkits.security import (
+    configure_sensitive_tools,
+    find_sensitive_tool_match,
+    reset_sensitive_tools,
+)
 from elitea_sdk.runtime.tools.llm import LLMNode
 
 
@@ -2170,3 +2174,29 @@ def test_hitl_resume_context_fallback_matches_prefixed_tool_name():
         'Expected synthetic tool execution — normalized base name should match '
         'the prefixed tool name in the fallback path'
     )
+
+
+# ── Separator/format-insensitive sensitive matching (issue #5199) ────────
+
+class TestSensitiveCanonicalMatching:
+    def test_naming_style_variants_match(self):
+        configure_sensitive_tools(sensitive_tools={"Data_Analysis": ["Pandas-Analyze-Data"]})
+        for invoked in ("pandas_analyze_data", "PandasAnalyzeData", "pandas-analyze-data"):
+            assert find_sensitive_tool_match(invoked, ["data_analysis"]) is not None, invoked
+
+    def test_toolkit_identifier_casing_insensitive(self):
+        configure_sensitive_tools(sensitive_tools={"github": ["create_issue"]})
+        # Identifier supplied in a different style still resolves...
+        assert find_sensitive_tool_match("CreateIssue", ["GitHub"]) is not None
+        assert find_sensitive_tool_match("create-issue", ["git_hub"]) is not None  # git_hub == github
+        # ...but a genuinely different toolkit does not match (toolkit-scoped).
+        assert find_sensitive_tool_match("create_issue", ["gitlab"]) is None
+
+    def test_wildcard_still_matches(self):
+        configure_sensitive_tools(sensitive_tools={"*": ["Delete-Everything"]})
+        assert find_sensitive_tool_match("delete_everything", ["any_toolkit"]) == "*"
+        assert find_sensitive_tool_match("DeleteEverything", []) == "*"
+
+    def test_non_sensitive_tool_unaffected(self):
+        configure_sensitive_tools(sensitive_tools={"github": ["create_issue"]})
+        assert find_sensitive_tool_match("get_issue", ["github"]) is None
