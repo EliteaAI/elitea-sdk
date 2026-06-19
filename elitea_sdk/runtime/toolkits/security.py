@@ -96,11 +96,19 @@ def _canonical_toolkit_key(key: str) -> str:
 
 
 def _normalize_tools_mapping(tool_map: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
-    return {
-        _canonical_toolkit_key(key): [canonical_match_key(item) for item in (values or []) if str(item).strip()]
-        for key, values in (tool_map or {}).items()
-        if str(key).strip()
-    }
+    # Filter on the *canonical* result, not the raw string: a key/value made up
+    # only of separators (e.g. "---", "***") canonicalizes to "" and must be
+    # dropped rather than stored as an empty entry. The "*" wildcard is preserved
+    # by _canonical_toolkit_key and survives the truthiness check.
+    normalized: Dict[str, List[str]] = {}
+    for key, values in (tool_map or {}).items():
+        toolkit_key = _canonical_toolkit_key(key)
+        if not toolkit_key:
+            continue
+        normalized[toolkit_key] = [
+            item_key for item_key in (canonical_match_key(item) for item in (values or [])) if item_key
+        ]
+    return normalized
 
 
 def configure_blocklist(
@@ -116,7 +124,7 @@ def configure_blocklist(
     """
     global _blocked_toolkits, _blocked_tools, _blocklist_initialized
 
-    _blocked_toolkits = [canonical_match_key(t) for t in (blocked_toolkits or []) if str(t).strip()]
+    _blocked_toolkits = [key for key in (canonical_match_key(t) for t in (blocked_toolkits or [])) if key]
     _blocked_tools = _normalize_tools_mapping(blocked_tools)
     _blocklist_initialized = True
 
@@ -153,7 +161,7 @@ def _load_blocklist_from_env() -> None:
 
     if env_toolkits:
         try:
-            _blocked_toolkits = [canonical_match_key(t) for t in env_toolkits.split(',') if t.strip()]
+            _blocked_toolkits = [key for key in (canonical_match_key(t) for t in env_toolkits.split(',')) if key]
             logger.info(f"[SECURITY] Loaded blocked toolkits from env: {_blocked_toolkits}")
         except Exception as e:
             logger.warning(f"[SECURITY] Failed to parse ELITEA_BLOCKED_TOOLKITS: {e}")
@@ -250,7 +258,9 @@ def get_blocked_tools_for_toolkit(toolkit_type: str) -> List[str]:
         toolkit_type: The type/name of the toolkit
 
     Returns:
-        List of blocked tool names (lowercase) for this toolkit
+        List of canonical match keys (lowercased, separators stripped — e.g.
+        ``createfile``) for the blocked tools in this toolkit. These are
+        comparison keys, not the original tool names.
     """
     _load_blocklist_from_env()
     return _blocked_tools.get(canonical_match_key(toolkit_type), [])

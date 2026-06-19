@@ -104,6 +104,20 @@ class TestCanonicalMatching:
         blocked = get_blocked_tools_for_toolkit("GITHUB")
         assert set(blocked) == {"createfile", "deleterepo"}
 
+    def test_separator_only_entries_are_dropped(self):
+        # Keys/values that canonicalize to "" (only separators) must not be
+        # stored as empty entries — otherwise an empty toolkit key or tool name
+        # would match nothing meaningful and confuse debugging.
+        configure_blocklist(
+            blocked_toolkits=["---", "  ", "shell"],
+            blocked_tools={"***": ["create_file"], "github": ["---", "delete_repo"]},
+        )
+        assert get_blocked_tools_for_toolkit("github") == ["deleterepo"]
+        assert get_blocked_tools_for_toolkit("***") == []
+        # The empty-canonical toolkit must not be treated as blocked.
+        assert not is_toolkit_blocked("")
+        assert is_toolkit_blocked("shell")
+
 
 # ── _filter_blocked_tools (tools/__init__.py) ────────────────────────────
 
