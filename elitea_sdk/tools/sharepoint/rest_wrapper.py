@@ -564,25 +564,9 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             file_bytes = filedata.encode('utf-8')
             actual_filename = filename
 
-        # Primary: Graph API
+        # Primary: SharePoint REST API (office365 client)
+        _rest_exc = None
         try:
-            result = self._graph_helper().upload_file_to_library(
-                site_url=self.site_url,
-                folder_path=folder_path,
-                filename=actual_filename,
-                file_bytes=file_bytes,
-                replace=replace,
-            )
-            logging.info("File '%s' uploaded via Graph API to '%s'", actual_filename, folder_path)
-            return result
-        except Exception as graph_e:
-            logging.warning(
-                "Graph API upload failed for '%s': %s — falling back to SharePoint REST API.",
-                actual_filename, type(graph_e).__name__)
-
-        # Fallback: SharePoint REST API (office365 client)
-        try:
-            from io import BytesIO
             target_folder = self._client.web.get_folder_by_server_relative_path(folder_path)
             self._client.load(target_folder)
             self._client.execute_query()
@@ -613,7 +597,26 @@ class SharepointRestWrapper(BaseSharepointWrapper):
         except ToolException:
             raise
         except Exception as rest_e:
-            raise ToolException(f"Upload failed via both Graph API and REST: {rest_e}") from None
+            _rest_exc = rest_e
+            logging.warning(
+                "REST upload failed for '%s': %s — falling back to Graph API.",
+                actual_filename, rest_e)
+
+        # Fallback: Graph API
+        try:
+            result = self._graph_helper().upload_file_to_library(
+                site_url=self.site_url,
+                folder_path=folder_path,
+                filename=actual_filename,
+                file_bytes=file_bytes,
+                replace=replace,
+            )
+            logging.info("File '%s' uploaded via Graph API to '%s'", actual_filename, folder_path)
+            return result
+        except Exception as graph_e:
+            raise ToolException(
+                f"Upload failed via both REST and Graph API. "
+                f"REST error: {_rest_exc} | Graph error: {graph_e}") from None
 
     def add_attachment_to_list_item(self, list_title: str, item_id: int,
                                     filepath: Optional[str] = None,
