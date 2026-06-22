@@ -781,7 +781,7 @@ class TestSharingLinkFileValidation:
             wrapper._download_public_link("https://company.sharepoint.com/:b:/p/user/doc")
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)  # Streaming abort message
+        assert ">" in str(exc_info.value)
 
     def test_rejects_double_extension_zip_pdf(self):
         """Files with dangerous intermediate extensions like .zip.pdf are rejected."""
@@ -880,7 +880,7 @@ class TestSharingLinkFileValidation:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)  # Streaming abort message
+        assert ">" in str(exc_info.value)
         # parse_file_content should NOT be called since size check happens during streaming
         mock_parse.assert_not_called()
 
@@ -938,7 +938,7 @@ class TestStreamingDownload:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)
+        assert ">" in str(exc_info.value)
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_download_cleans_up_on_error(self, mock_http_requests):
@@ -1013,7 +1013,7 @@ class TestStreamingDownload:
         message = str(exc_info.value)
         assert "too large" in message.lower()
         assert "3 MB" in message  # image cap, not the 20 MB default
-        assert "Download aborted" in message
+        assert ">" in message
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_download_respects_explicit_max_size(self, mock_http_requests):
@@ -1037,7 +1037,7 @@ class TestStreamingDownload:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)
+        assert ">" in str(exc_info.value)
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_uses_stream_parameter(self, mock_http_requests):

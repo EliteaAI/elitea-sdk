@@ -1988,10 +1988,13 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 cookies=cookies,
             )
         except FileSizeLimitExceeded as e:
+            if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE:
+                limit_msg = f"Maximum supported size for images is {e.max_size_mb:.0f} MB."
+            else:
+                limit_msg = f"Maximum supported size is {e.max_size_mb:.0f} MB."
             raise ToolException(
                 f"File '{e.file_name}' is too large (>{e.actual_size_mb:.1f} MB). "
-                f"Maximum supported size for sharing links is {e.max_size_mb:.0f} MB. "
-                f"Download aborted."
+                f"{limit_msg}"
             ) from e
         except EmptyFileError as e:
             raise ToolException(f"Downloaded file '{e.file_name}' is empty.") from e
