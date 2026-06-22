@@ -533,6 +533,64 @@ class TestSharingLinkFileValidation:
         # Size is None - should only check file type
         wrapper._validate_sharing_link_file("document.pdf", None)
 
+    def test_max_size_for_file_classifies_images_vs_documents(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        image_cap = 3 * 1024 * 1024
+        default_cap = 20 * 1024 * 1024
+
+        for name in ("photo.png", "pic.JPG", "x.jpeg", "anim.gif",
+                     "shot.webp", "old.bmp"):
+            assert wrapper._max_size_for_file(name) == image_cap
+
+        # SVG is treated as a document (like chat) -> default limit
+        assert wrapper._max_size_for_file("diagram.svg") == default_cap
+
+        for name in ("report.pdf", "data.xlsx", "code.py", "noext"):
+            assert wrapper._max_size_for_file(name) == default_cap
+
+    def test_rejects_image_exceeding_image_size_limit(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        file_size = 5 * 1024 * 1024
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("screenshot.png", file_size)
+
+        message = str(exc_info.value).lower()
+        assert "too large" in message
+        assert "3 mb" in message
+        assert "images" in message
+
+    def test_accepts_image_at_image_size_limit(self):
+        """An image exactly at the 3 MB cap is accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Exactly 3 MB - should not raise
+        wrapper._validate_sharing_link_file("photo.jpg", 3 * 1024 * 1024)
+
+    def test_accepts_large_svg_as_document(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 10 MB SVG: over the 3 MB image cap but under the 20 MB document limit
+        wrapper._validate_sharing_link_file("diagram.svg", 10 * 1024 * 1024)
+
     def test_rejects_rar_archive(self):
         """RAR archives are rejected."""
         wrapper = SharepointGraphWrapper(
@@ -723,7 +781,7 @@ class TestSharingLinkFileValidation:
             wrapper._download_public_link("https://company.sharepoint.com/:b:/p/user/doc")
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)  # Streaming abort message
+        assert ">" in str(exc_info.value)
 
     def test_rejects_double_extension_zip_pdf(self):
         """Files with dangerous intermediate extensions like .zip.pdf are rejected."""
@@ -822,7 +880,7 @@ class TestSharingLinkFileValidation:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)  # Streaming abort message
+        assert ">" in str(exc_info.value)
         # parse_file_content should NOT be called since size check happens during streaming
         mock_parse.assert_not_called()
 
@@ -880,7 +938,7 @@ class TestStreamingDownload:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert "Download aborted" in str(exc_info.value)
+        assert ">" in str(exc_info.value)
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_download_cleans_up_on_error(self, mock_http_requests):
@@ -927,6 +985,59 @@ class TestStreamingDownload:
             )
 
         assert "empty" in str(exc_info.value).lower()
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_applies_image_cap(self, mock_http_requests):
+        """Download of an oversized image aborts at the 3 MB image cap.
+
+        Guards the path where Graph/HEAD metadata size is unavailable, so the
+        per-type cap is enforced only during streaming.
+        """
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 4 MB image: under the 20 MB default but over the 3 MB image cap
+        image_content = b'x' * (4 * 1024 * 1024)
+        mock_http_requests.get.return_value = _create_streaming_response_mock(image_content)
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/photo.png',
+                file_name='photo.png',
+                timeout=60,
+            )
+
+        message = str(exc_info.value)
+        assert "too large" in message.lower()
+        assert "3 MB" in message  # image cap, not the 20 MB default
+        assert ">" in message
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_respects_explicit_max_size(self, mock_http_requests):
+        """An explicit max_size overrides the per-type default."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 2 MB PDF: well under the 20 MB default, but over a 1 MB explicit cap
+        content = b'x' * (2 * 1024 * 1024)
+        mock_http_requests.get.return_value = _create_streaming_response_mock(content)
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/report.pdf',
+                file_name='report.pdf',
+                timeout=60,
+                max_size=1 * 1024 * 1024,
+            )
+
+        assert "too large" in str(exc_info.value).lower()
+        assert ">" in str(exc_info.value)
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_uses_stream_parameter(self, mock_http_requests):

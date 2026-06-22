@@ -1914,6 +1914,38 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     # ------------------------------------------------------------------ #
 
     _SHARING_LINK_MAX_SIZE = 20 * 1024 * 1024
+    # Mirrors the chat-attachment image cap enforced by the backend. Kept in
+    # sync manually: there is no shared constant importable from the SDK, so
+    # update this if the platform chat-attachment limit changes.
+    _SHARING_LINK_MAX_IMAGE_SIZE = 3 * 1024 * 1024
+
+    @staticmethod
+    def _get_file_extension(file_name: str) -> str:
+        """Return the lowercased extension (with leading dot), or '' if none."""
+        return ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
+
+    def _max_size_for_file(self, file_name: str) -> int:
+        """Return the max allowed size in bytes for a file based on its type.
+
+        Size-gating for sharing links is introduced by this change, so the
+        classification follows the platform's existing attachment policy rather
+        than any prior behavior of this tool:
+
+        - Raster images get the tight 3 MB cap. For them, file size closely
+          approximates the base64 payload sent to the vision model, so a
+          byte-size limit is an effective guard.
+        - SVG is excluded from that cap and keeps the default 20 MB limit. This
+          mirrors how the chat-attachment layer classifies SVG (with documents,
+          not images) for size-gating.
+        - All other supported files also use the default 20 MB limit.
+        """
+        from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
+
+        ext = self._get_file_extension(file_name)
+        mime_type = (loaders_map.get(ext) or {}).get('mime_type', '')
+        if mime_type.startswith('image/') and ext != '.svg':
+            return self._SHARING_LINK_MAX_IMAGE_SIZE
+        return self._SHARING_LINK_MAX_SIZE
 
     def _stream_download_to_tempfile(
         self,
@@ -1922,6 +1954,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         timeout: int = 120,
         headers: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        max_size: Optional[int] = None,
     ) -> str:
         """Stream download a file to a temporary file with size limit enforcement.
 
@@ -1934,6 +1967,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             timeout: Request timeout in seconds
             headers: Optional request headers
             cookies: Optional request cookies
+            max_size: Max allowed size in bytes. Defaults to the per-type limit
+                derived from ``file_name`` (images 3 MB, everything else 20 MB).
 
         Returns:
             Path to temporary file containing downloaded content
@@ -1941,20 +1976,25 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         Raises:
             ToolException: If download exceeds size limit or fails
         """
+        if max_size is None:
+            max_size = self._max_size_for_file(file_name)
         try:
             return stream_download_to_tempfile(
                 url=url,
                 file_name=file_name,
-                max_size=self._SHARING_LINK_MAX_SIZE,
+                max_size=max_size,
                 timeout=timeout,
                 headers=headers,
                 cookies=cookies,
             )
         except FileSizeLimitExceeded as e:
+            if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE:
+                limit_msg = f"Maximum supported size for images is {e.max_size_mb:.0f} MB."
+            else:
+                limit_msg = f"Maximum supported size is {e.max_size_mb:.0f} MB."
             raise ToolException(
                 f"File '{e.file_name}' is too large (>{e.actual_size_mb:.1f} MB). "
-                f"Maximum supported size for sharing links is {e.max_size_mb:.0f} MB. "
-                f"Download aborted."
+                f"{limit_msg}"
             ) from e
         except EmptyFileError as e:
             raise ToolException(f"Downloaded file '{e.file_name}' is empty.") from e
@@ -1973,17 +2013,20 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """
         from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
 
-        # Check file size
-        if file_size is not None and file_size > self._SHARING_LINK_MAX_SIZE:
+        max_size = self._max_size_for_file(file_name)
+        if file_size is not None and file_size > max_size:
             size_mb = file_size / (1024 * 1024)
-            max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
+            max_mb = max_size / (1024 * 1024)
+            if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE:
+                limit_msg = f"Maximum supported size for images is {max_mb:.0f} MB."
+            else:
+                limit_msg = f"Maximum supported size is {max_mb:.0f} MB."
             raise ToolException(
-                f"File '{file_name}' is too large ({size_mb:.1f} MB). "
-                f"Maximum supported size for sharing links is {max_mb:.0f} MB."
+                f"File '{file_name}' is too large ({size_mb:.1f} MB). {limit_msg}"
             )
 
         # Check file extension against loaders_map
-        ext = ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
+        ext = self._get_file_extension(file_name)
 
         if not ext:
             # Files without extensions cannot be reliably processed
@@ -1996,7 +2039,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise ToolException(
                 f"File type '{ext}' is not supported. "
                 f"Supported formats include documents (PDF, DOCX, XLSX, PPTX), "
-                f"text files, images (PNG, JPG), and common code files."
+                f"text files (TXT, MD, CSV, JSON, HTML, XML), "
+                f"images (PNG, JPG, JPEG, GIF, WEBP, BMP, SVG), "
+                f"and common code files. Archives (ZIP, RAR), media (MP4, MP3), "
+                f"and executables are not supported."
             )
 
         # Check for double-extension attack (e.g., malware.zip.pdf)

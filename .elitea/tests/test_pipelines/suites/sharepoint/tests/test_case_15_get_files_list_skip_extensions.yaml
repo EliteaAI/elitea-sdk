@@ -137,8 +137,9 @@ nodes:
           - All tool executions succeed without errors
           - Baseline MUST return files (test data should exist)
           - Test 1 returns all files EXCEPT .txt files
-          - Test 2 returns all files EXCEPT .pdf, .docx, .png files (NONE of these should be present)
+          - Test 2 returns all files EXCEPT .pdf, .docx, .png files
           - Extensions are matched case-insensitively
+          - Both dotted and non-dotted extension filters are accepted
           - Filtered results should have <= files than baseline
 
           Validation rules:
@@ -157,9 +158,7 @@ nodes:
           {{
             "test_passed": true/false,
             "summary": "brief description of outcome",
-            "error": "error details if failed, null if passed",
-            "Result_1": {files_result_skip_txt},
-            "Result_2": {files_result_skip_multiple}
+            "error": "error details if failed, null if passed"
           }}
 
           return **only** the json object. no markdown formatting, no additional text.
