@@ -1914,7 +1914,15 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     # ------------------------------------------------------------------ #
 
     _SHARING_LINK_MAX_SIZE = 20 * 1024 * 1024
+    # Mirrors the chat-attachment image cap enforced by the backend. Kept in
+    # sync manually: there is no shared constant importable from the SDK, so
+    # update this if the platform chat-attachment limit changes.
     _SHARING_LINK_MAX_IMAGE_SIZE = 3 * 1024 * 1024
+
+    @staticmethod
+    def _get_file_extension(file_name: str) -> str:
+        """Return the lowercased extension (with leading dot), or '' if none."""
+        return ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
 
     def _max_size_for_file(self, file_name: str) -> int:
         """Return the max allowed size in bytes for a file based on its type.
@@ -1926,7 +1934,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """
         from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
 
-        ext = ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
+        ext = self._get_file_extension(file_name)
         mime_type = (loaders_map.get(ext) or {}).get('mime_type', '')
         if mime_type.startswith('image/') and ext != '.svg':
             return self._SHARING_LINK_MAX_IMAGE_SIZE
@@ -1952,6 +1960,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             timeout: Request timeout in seconds
             headers: Optional request headers
             cookies: Optional request cookies
+            max_size: Max allowed size in bytes. Defaults to the per-type limit
+                derived from ``file_name`` (images 3 MB, everything else 20 MB).
 
         Returns:
             Path to temporary file containing downloaded content
@@ -1997,14 +2007,14 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if file_size is not None and file_size > max_size:
             size_mb = file_size / (1024 * 1024)
             max_mb = max_size / (1024 * 1024)
+            limit_kind = 'images' if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE else 'files'
             raise ToolException(
                 f"File '{file_name}' is too large ({size_mb:.1f} MB). "
-                f"Maximum supported size is {max_mb:.0f} MB "
-                f"({'images' if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE else 'files'})."
+                f"Maximum supported size is {max_mb:.0f} MB ({limit_kind})."
             )
 
         # Check file extension against loaders_map
-        ext = ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
+        ext = self._get_file_extension(file_name)
 
         if not ext:
             # Files without extensions cannot be reliably processed
