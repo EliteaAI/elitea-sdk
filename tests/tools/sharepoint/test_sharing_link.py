@@ -987,6 +987,59 @@ class TestStreamingDownload:
         assert "empty" in str(exc_info.value).lower()
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_applies_image_cap(self, mock_http_requests):
+        """Download of an oversized image aborts at the 3 MB image cap.
+
+        Guards the path where Graph/HEAD metadata size is unavailable, so the
+        per-type cap is enforced only during streaming.
+        """
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 4 MB image: under the 20 MB default but over the 3 MB image cap
+        image_content = b'x' * (4 * 1024 * 1024)
+        mock_http_requests.get.return_value = _create_streaming_response_mock(image_content)
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/photo.png',
+                file_name='photo.png',
+                timeout=60,
+            )
+
+        message = str(exc_info.value)
+        assert "too large" in message.lower()
+        assert "3 MB" in message  # image cap, not the 20 MB default
+        assert "Download aborted" in message
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_download_respects_explicit_max_size(self, mock_http_requests):
+        """An explicit max_size overrides the per-type default."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 2 MB PDF: well under the 20 MB default, but over a 1 MB explicit cap
+        content = b'x' * (2 * 1024 * 1024)
+        mock_http_requests.get.return_value = _create_streaming_response_mock(content)
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/report.pdf',
+                file_name='report.pdf',
+                timeout=60,
+                max_size=1 * 1024 * 1024,
+            )
+
+        assert "too large" in str(exc_info.value).lower()
+        assert "Download aborted" in str(exc_info.value)
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_uses_stream_parameter(self, mock_http_requests):
         """Streaming download sets stream=True in request."""
         wrapper = SharepointGraphWrapper(

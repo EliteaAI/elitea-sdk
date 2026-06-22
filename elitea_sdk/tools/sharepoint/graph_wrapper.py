@@ -1927,10 +1927,17 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     def _max_size_for_file(self, file_name: str) -> int:
         """Return the max allowed size in bytes for a file based on its type.
 
-        Non-SVG images are processed as images by the LLM and capped at 3 MB,
-        matching chat attachments. SVG is intentionally excluded: like chat
-        attachments it is handled as a document and keeps the default 20 MB
-        limit. All other supported files also use the default 20 MB limit.
+        Size-gating for sharing links is introduced by this change, so the
+        classification follows the platform's existing attachment policy rather
+        than any prior behavior of this tool:
+
+        - Raster images get the tight 3 MB cap. For them, file size closely
+          approximates the base64 payload sent to the vision model, so a
+          byte-size limit is an effective guard.
+        - SVG is excluded from that cap and keeps the default 20 MB limit. This
+          mirrors how the chat-attachment layer classifies SVG (with documents,
+          not images) for size-gating.
+        - All other supported files also use the default 20 MB limit.
         """
         from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
 
@@ -2007,10 +2014,12 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if file_size is not None and file_size > max_size:
             size_mb = file_size / (1024 * 1024)
             max_mb = max_size / (1024 * 1024)
-            limit_kind = 'images' if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE else 'files'
+            if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE:
+                limit_msg = f"Maximum supported size for images is {max_mb:.0f} MB."
+            else:
+                limit_msg = f"Maximum supported size is {max_mb:.0f} MB."
             raise ToolException(
-                f"File '{file_name}' is too large ({size_mb:.1f} MB). "
-                f"Maximum supported size is {max_mb:.0f} MB ({limit_kind})."
+                f"File '{file_name}' is too large ({size_mb:.1f} MB). {limit_msg}"
             )
 
         # Check file extension against loaders_map
