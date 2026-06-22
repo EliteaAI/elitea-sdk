@@ -239,6 +239,7 @@ class SandboxClient:
         self.artifact_url = f'{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}'
         self.bucket_url = f'{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}'
         self.s3_url = f'{self.base_url}/artifacts/s3'
+        self.auth_user_url = f'{self.base_url}{self.api_v2_path}/auth/user'
         self.model_timeout = kwargs.get('model_timeout', 120)
 
     def get_mcp_toolkits(self):
@@ -294,6 +295,14 @@ class SandboxClient:
                      f' Application ID: {application_id}, Version ID: {application_version_id}')
         raise ApiDetailsRequestError(
             f'Failed to fetch application version details for {application_id}/{application_version_id}.')
+
+    def get_user_data(self) -> Dict[str, Any]:
+        """Fetch the currently authenticated user's data."""
+        resp = requests.get(self.auth_user_url, headers=self.headers, verify=False)
+        if resp.ok:
+            return resp.json()
+        logger.error(f'Failed to fetch user data: {resp.status_code} - {resp.text}')
+        raise ApiDetailsRequestError(f'Failed to fetch user data with status code {resp.status_code}.')
 
     def unsecret(self, secret_name: str):
         url = f'{self.secrets_url}/{secret_name}'

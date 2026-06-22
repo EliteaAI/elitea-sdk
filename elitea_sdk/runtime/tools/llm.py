@@ -27,7 +27,7 @@ from ..langchain.utils import (
     make_anthropic_compatible_schema,
     propagate_the_input_mapping,
 )
-from ..toolkits.security import is_tool_blocked, normalize_tool_name, qualified_tool_identity
+from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
@@ -35,8 +35,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SENSITIVE_TOOL_BLOCKED_RESULT_TYPE = 'sensitive_tool_blocked'
-MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS = 5
-BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER = 'This is a continuation turn after the blocked action(s):'
 STRUCTURED_OUTPUT_PREFILL_PROMPT = "Now produce the structured output based on the information above."
 
 # ContextVar used by __perform_tool_calling to expose intermediate messages
@@ -144,6 +142,15 @@ class LLMNode(BaseTool):
         exclude=True,
         description='MiddlewareManager instance for before_model/after_model hooks. '
                     'Used for context management like summarization and context editing.'
+    )
+    child_dispatcher: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description='Optional parallel sub-agent dispatch seam (Track 2, issue #4993). '
+                    'When present and a turn contains 2+ Application (sub-agent) tool calls, '
+                    'the node PARKS by writing child specs to the parallel_tasks state channel '
+                    'and returning instead of running children in-process. When None, the '
+                    'node falls back to the in-process asyncio.gather fan-out (Track 1).'
     )
     _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
 
@@ -911,65 +918,6 @@ class LLMNode(BaseTool):
             logger.info("Filtered %d orphaned tool_calls from message history", filtered_count)
         return cleaned_messages
 
-    @staticmethod
-    def _is_blocked_tool_continuation_nudge(message: Any) -> bool:
-        return (
-            isinstance(message, HumanMessage)
-            and BLOCKED_TOOL_CONTINUATION_NUDGE_MARKER in str(getattr(message, 'content', '') or '')
-        )
-
-    @classmethod
-    def _strip_blocked_tool_continuation_nudges(cls, messages: List) -> List:
-        return [message for message in messages if not cls._is_blocked_tool_continuation_nudge(message)]
-
-    @classmethod
-    def _get_current_request_message_slice(cls, messages: List) -> List:
-        last_user_request_index = -1
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            if isinstance(message, HumanMessage) and not cls._is_blocked_tool_continuation_nudge(message):
-                last_user_request_index = index
-                break
-
-        if last_user_request_index >= 0:
-            return messages[last_user_request_index + 1:]
-        return messages
-
-    def _collect_blocked_tool_payloads(self, messages: List) -> List[Dict[str, Any]]:
-        payloads: List[Dict[str, Any]] = []
-        for message in self._get_current_request_message_slice(messages):
-            if not isinstance(message, ToolMessage):
-                continue
-            blocked_payload = self._parse_sensitive_tool_blocked_result(message.content)
-            if blocked_payload is not None:
-                payloads.append(blocked_payload)
-        return payloads
-
-    def _collect_blocked_tool_names(self, messages: List) -> set[str]:
-        blocked_tool_names: set[str] = set()
-        for payload in self._collect_blocked_tool_payloads(messages):
-            blocked_tool_name = normalize_tool_name(
-                payload.get('blocked_tool_name')
-                or payload.get('tool_name')
-                or ''
-            )
-            if blocked_tool_name:
-                blocked_tool_names.add(blocked_tool_name)
-        return blocked_tool_names
-
-    def _collect_blocked_action_labels(self, messages: List) -> List[str]:
-        blocked_labels: List[str] = []
-        for payload in self._collect_blocked_tool_payloads(messages):
-            label = str(
-                payload.get('action_label')
-                or payload.get('blocked_tool_name')
-                or payload.get('tool_name')
-                or ''
-            ).strip()
-            if label and label not in blocked_labels:
-                blocked_labels.append(label)
-        return blocked_labels
-
     def _get_tool_identity(self, tool: BaseTool) -> Dict[str, Optional[str]]:
         metadata = getattr(tool, 'metadata', None) or {}
         toolkit_name = metadata.get('toolkit_name')
@@ -988,204 +936,29 @@ class LLMNode(BaseTool):
             'toolkit_type': toolkit_type,
         }
 
-    def _is_allowed_followup_tool(
-        self,
-        *,
-        candidate: BaseTool,
-        blocked_tool_names: set[str],
-    ) -> bool:
-        # Lazy meta-tools are too broad to safely force after a blocked action.
-        if candidate.name in {'invoke_tool', 'list_toolkits', 'get_toolkit_tools'}:
-            return False
-
-        identity = self._get_tool_identity(candidate)
-        resolved_tool_name = normalize_tool_name(identity.get('tool_name') or candidate.name or '')
-        normalized_blocked_names = {
-            normalize_tool_name(name)
-            for name in blocked_tool_names
-            if normalize_tool_name(name)
-        }
-        candidate_name = normalize_tool_name(candidate.name)
-
-        if candidate_name in normalized_blocked_names:
-            return False
-        if resolved_tool_name in normalized_blocked_names:
-            return False
-
-        toolkit_type = identity.get('toolkit_type')
-        if toolkit_type and is_tool_blocked(toolkit_type, resolved_tool_name):
-            return False
-
-        return True
-
-    def _get_forced_followup_tools(
-        self,
-        *,
-        config: Optional[RunnableConfig],
-        blocked_tool_names: set[str],
-    ) -> List[BaseTool]:
-        forced_tools: List[BaseTool] = []
-        seen_tool_names: set[str] = set()
-
-        # In lazy-tools mode, get_filtered_tools() returns only meta-tools
-        # (invoke_tool, list_toolkits, get_toolkit_tools) which are explicitly
-        # excluded from forced follow-up.  Access the real tool objects from
-        # available_tools / tool_registry instead so the LLM can be forced to
-        # call an actual allowed tool after a blocked action.
-        if self.lazy_tools_mode and self.tool_registry is not None:
-            candidate_tools: List[BaseTool] = list(self.available_tools or [])
-            existing_names = {t.name for t in candidate_tools}
-            for tk_name in self.tool_registry.get_toolkit_names():
-                for tool in self.tool_registry.get_toolkit_tools(tk_name).values():
-                    if tool.name not in existing_names:
-                        candidate_tools.append(tool)
-                        existing_names.add(tool.name)
-            if self.always_bind_tools:
-                for t in self.always_bind_tools:
-                    if t.name not in existing_names:
-                        candidate_tools.append(t)
-                        existing_names.add(t.name)
-            logger.info(
-                "Blocked-tool follow-up: lazy mode detected, using %d real tools as candidate pool",
-                len(candidate_tools),
-            )
-        else:
-            candidate_tools = self.get_filtered_tools(config=config)
-
-        for tool in candidate_tools:
-            if tool.name in seen_tool_names:
-                continue
-            if not self._is_allowed_followup_tool(candidate=tool, blocked_tool_names=blocked_tool_names):
-                continue
-            forced_tools.append(tool)
-            seen_tool_names.add(tool.name)
-
-        return forced_tools
-
-    def _build_forced_followup_client(self, followup_tools: List[BaseTool]) -> Any:
-        # OpenAI-compatible passthrough (Claude via LiteLLM) rejects the
-        # tool_choice litellm derives from parallel_tool_calls=False for Bedrock
-        # ("tool_choice.type: Field required"). The block is still honored — the
-        # blocked tools are already excluded from followup_tools — so bind plain.
-        if self._client_is_openai_compatible(self.client):
-            logger.info(
-                "Blocked-tool continuation: openai-compatible client, binding allowed tools without parallel_tool_calls [%s]",
-                ', '.join(tool.name for tool in followup_tools),
-            )
-            return self.client.bind_tools(followup_tools)
-        try:
-            logger.info(
-                "Blocked-tool continuation: constraining LLM to allowed tools [%s]",
-                ', '.join(tool.name for tool in followup_tools),
-            )
-            return self.client.bind_tools(
-                followup_tools,
-                parallel_tool_calls=False,
-            )
-        except TypeError:
-            logger.debug("Blocked-tool continuation: client bind_tools does not accept parallel_tool_calls")
-        except Exception as exc:
-            logger.debug("Blocked-tool continuation: constrained binding with parallel_tool_calls failed: %s", exc)
-
-        logger.info(
-            "Blocked-tool continuation: falling back to constrained binding without parallel_tool_calls [%s]",
-            ', '.join(tool.name for tool in followup_tools),
-        )
-        return self.client.bind_tools(followup_tools)
-
-    def _should_continue_after_blocked_tool(
-        self,
-        *,
-        completion: Any,
-        blocked_payloads: List[Dict[str, Any]],
-        followup_tools: List[BaseTool],
-        messages: List,
-        attempt_count: int,
-    ) -> Optional[str]:
-        if hasattr(completion, 'tool_calls') and completion.tool_calls:
-            return None
-        if not blocked_payloads or not followup_tools:
-            return None
-        if attempt_count >= MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS:
-            return None
-
-        blocked_labels = self._collect_blocked_action_labels(messages)
-        if not blocked_labels:
-            for payload in blocked_payloads:
-                label = str(
-                    payload.get('action_label')
-                    or payload.get('blocked_tool_name')
-                    or payload.get('tool_name')
-                    or ''
-                ).strip()
-                if label and label not in blocked_labels:
-                    blocked_labels.append(label)
-
-        primary_payload = blocked_payloads[0]
-        continuation_message = str(primary_payload.get('continuation_message') or '').strip()
-        continuation_hint = str(primary_payload.get('continuation_hint') or '').strip()
-        blocked_summary = ', '.join(blocked_labels[:3]) or 'the blocked action'
-        prompt_parts = []
-        if continuation_message:
-            prompt_parts.append(continuation_message)
-        if continuation_hint:
-            prompt_parts.append(continuation_hint)
-        prompt_parts.append(
-            f"This is a continuation turn after the blocked action(s): {blocked_summary}.\n"
-            "Do NOT automatically retry the same blocked tool call or switch to the user prematurely while useful tool paths remain.\n"
-            "Do NOT repeat or restate your previous answer. Pick up where you left off and continue the workflow autonomously.\n"
-            "If an allowed tool can still make meaningful progress, call it now. If the workflow is truly blocked and no allowed tool can help, then explain that clearly to the user."
-        )
-        return '\n\n'.join(prompt_parts)
-
     @staticmethod
-    def _build_visible_blocked_tool_payload(blocked_payload: Dict[str, Any]) -> Dict[str, Any]:
-        visible_payload = {}
-        for key in (
-            'type',
-            'status',
-            'blocked_tool_name',
-            'blocked_toolkit_name',
-            'blocked_toolkit_type',
-            'action_label',
-            'message',
-            'user_feedback',
-            'retry_allowed',
-            'equivalent_action_via_other_tool_allowed',
-        ):
-            value = blocked_payload.get(key)
-            if value is None or value == '':
-                continue
-            visible_payload[key] = value
-        return visible_payload
-
-    def _enrich_blocked_tool_payload(
-        self,
-        *,
-        blocked_payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        enriched_payload = dict(blocked_payload)
+    def _build_blocked_tool_guidance(blocked_payload: Dict[str, Any]) -> str:
+        # Fallback directive used ONLY when a blocked payload arrives without its
+        # own `message` (the sensitive-tool guard is the source of truth and bakes
+        # it in). Kept aligned with SensitiveToolGuardMiddleware.BLOCKED_TOOL_MESSAGE:
+        # an explicit, imperative continue-instruction that does NOT end on a
+        # terminal "stopped" note — weak models (haiku, gpt-5.4-mini) read a
+        # terminal ending as "halt" and skip the rest of the workflow.
         action_label = (
-            enriched_payload.get('action_label')
-            or enriched_payload.get('blocked_tool_name')
-            or enriched_payload.get('tool_name')
+            blocked_payload.get('action_label')
+            or blocked_payload.get('blocked_tool_name')
+            or blocked_payload.get('tool_name')
             or 'the requested action'
         )
-        enriched_payload['continuation_message'] = enriched_payload.get('continuation_message') or (
-            f"The action '{action_label}' was blocked by the user and was not executed. "
-            "Do not automatically retry this exact tool call unless the user re-authorizes it. Rethink the tool strategy, decide which allowed action or "
-            "information should be prioritized next, and continue with other allowed tool calls if they can still move the task forward. "
-            "If another tool is sensitive, it will be reviewed separately. "
-            "Only switch to a user-facing explanation when you decide there is no meaningful allowed tool path left or you truly need user input."
+        return (
+            f"You declined THIS specific call to '{action_label}'; it was not executed. "
+            "The block is for THIS invocation only, not the tool itself. "
+            "This is NOT a stop signal — do not end your turn or summarize yet. "
+            "Do not retry this same call with the same arguments, but DO continue: "
+            "if more items remain, call the tool again for the NEXT item now; "
+            "otherwise use another available tool to keep making progress. "
+            "Only stop and ask the user when nothing remains that can be done without this exact declined call."
         )
-        enriched_payload['continuation_hint'] = enriched_payload.get('continuation_hint') or (
-            "Continue the tool-using reasoning loop from this blocked tool result. Re-evaluate the remaining allowed tools, "
-            "pick the highest-priority next step, and execute other allowed tool calls when they can still advance the task. "
-            "If another tool is sensitive, expect a separate review for that tool call. "
-            "Do not immediately stop and ask the user for direction unless you determine that no allowed tool path can make meaningful progress."
-        )
-
-        return enriched_payload
 
     def invoke(
             self,
@@ -1343,15 +1116,42 @@ class LLMNode(BaseTool):
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
                 task_content = str(task_content) if task_content is not None else ""
-            messages = [
-                SystemMessage(content=self._anthropic_system_content(system_content, self.client, skills_section)),
-                *func_args.get('chat_history', []),
-                HumanMessage(content=task_content),
-            ]
-            # Remove pre-last item if last two messages are same type and content
-            if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
-                -2].content:
-                messages.pop(-2)
+            _chat_history = list(func_args.get('chat_history', []))
+            # When chat_history already ends in a ToolMessage we are RESUMING an
+            # in-progress tool loop (the #4993 park/reconcile re-invoke: children
+            # settled, their results were appended as ToolMessages, and the graph
+            # re-enters this node to synthesize). Re-appending the original task as
+            # a trailing HumanMessage makes the model read the conversation as
+            # "the user is asking again" — so it re-dispatches the same sub-agents
+            # instead of synthesizing, looping forever on Anthropic models (GPT
+            # tolerates the duplicate; haiku/sonnet do not). The in-process gather
+            # path never hits this because it loops inside __perform_tool_calling
+            # on new_messages and never rebuilds the prompt. End on the
+            # ToolMessages so the next turn is a pure synthesis turn.
+            _resuming_tool_loop = bool(_chat_history) and isinstance(_chat_history[-1], ToolMessage)
+            # Omit the system message entirely when content is empty (e.g. the 'bare'
+            # persona with no custom instructions and no addon-contributing tools).
+            # Sending SystemMessage(content="") is not "no system prompt" — some
+            # providers reject or warn on an empty system field — so we drop it.
+            _system_msgs = (
+                [SystemMessage(content=self._anthropic_system_content(system_content, self.client, skills_section))]
+                if system_content else []
+            )
+            if _resuming_tool_loop:
+                messages = [
+                    *_system_msgs,
+                    *_chat_history,
+                ]
+            else:
+                messages = [
+                    *_system_msgs,
+                    *_chat_history,
+                    HumanMessage(content=task_content),
+                ]
+                # Remove pre-last item if last two messages are same type and content
+                if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
+                    -2].content:
+                    messages.pop(-2)
         else:
             # Flow for chat-based LLM node w/o prompt/task from pipeline but with messages in state
             # verify messages structure
@@ -1486,7 +1286,86 @@ class LLMNode(BaseTool):
         # __perform_tool_calling loop can execute it. The guard will then
         # resolve the resume action consistently: approve executes the tool,
         # reject returns a blocked-tool result and gives the LLM another turn.
-        if hitl_ctx and hitl_ctx.get('tool_name'):
+        if hitl_ctx and hitl_ctx.get('parallel_calls'):
+            # ---- Parallel sub-agent resume (issue #4993) ----
+            # The original turn fanned out 2+ Application calls and the parent
+            # paused on ONE aggregated interrupt (not the single-tool guard).
+            # Rebuild the original AIMessage carrying ALL N tool_calls so
+            # __perform_tool_calling re-enters the fan-out: completed siblings
+            # are skipped (their ToolMessages were restored above), and each
+            # paused child is resumed from its own checkpoint via the matching
+            # hitl_decisions entry.
+            #
+            # Multi-round parallel HITL: a resumed child whose LLM picks a new
+            # sensitive tool re-pauses, and _run_parallel_application_calls
+            # re-issues a fresh parent-level interrupt(aggregate). That aggregate
+            # is the FIRST interrupt() of THIS re-execution, so without help it
+            # consumes a still-pending resume value and RETURNS it instead of
+            # raising — swallowing the divergent child's new pause.
+            #
+            # LangGraph (1.x) delivers resume values two ways (see
+            # langgraph/pregel/_algo.py::_scratchpad + langgraph/types.py::interrupt):
+            #   * the scalar Command(resume=X) of THIS cycle arrives as the
+            #     "null resume" (one per cycle); the first interrupt() consumes it.
+            #   * values consumed by interrupt() in PRIOR cycles are persisted as
+            #     task-specific positional `scratchpad.resume` entries and replayed
+            #     by index on every later re-execution.
+            # So the count of pending values the aggregate would otherwise eat is
+            # len(scratchpad.resume) (positional, prior rounds) + 1 (this cycle's
+            # null). Consume them all here so the aggregate interrupt() lands past
+            # them and actually raises. Child decisions ride the SEPARATE
+            # `hitl_decisions` state channel, so consuming the parent's resume
+            # values never robs a child of its answer.
+            scratchpad = configurable.get(_SCRATCHPAD_KEY)
+            n_positional = (
+                len(scratchpad.resume)
+                if scratchpad is not None
+                and getattr(scratchpad, 'resume', None)
+                else 0
+            )
+            has_null = False
+            if scratchpad is not None and hasattr(scratchpad, 'get_null_resume'):
+                try:
+                    has_null = scratchpad.get_null_resume(False) is not None
+                except Exception:  # pragma: no cover - defensive
+                    has_null = False
+            n_prior = n_positional + (1 if has_null else 0)
+            if n_prior:
+                logger.info(
+                    "[HITL] Consuming %d pending parent resume value(s) before "
+                    "parallel sub-agent re-fanout (multi-round): %d positional "
+                    "+ %d null",
+                    n_prior, n_positional, 1 if has_null else 0,
+                )
+                for _i in range(n_prior):
+                    try:
+                        _langgraph_interrupt({'__replay_consumer__': True})
+                    except Exception as exc:
+                        logger.warning(
+                            "[HITL] Parallel replay consumer #%d raised %s — "
+                            "stopping replay consumption early",
+                            _i, exc,
+                        )
+                        break
+            completion = None
+            original_ai = hitl_ctx.get('original_ai_message')
+            if isinstance(original_ai, dict):
+                try:
+                    from langchain_core.messages.utils import messages_from_dict
+                    restored = messages_from_dict([original_ai])
+                    if restored and isinstance(restored[0], AIMessage):
+                        completion = restored[0]
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "[HITL] Failed to deserialize original AIMessage for "
+                        "parallel resume: %s", exc,
+                    )
+            if completion is None:
+                completion = AIMessage(
+                    content=hitl_ctx.get('content', ''),
+                    tool_calls=list(hitl_ctx['parallel_calls']),
+                )
+        elif hitl_ctx and hitl_ctx.get('tool_name'):
             # ---- Consume stale interrupt replay values ----
             # LangGraph replays ALL previously consumed interrupt/resume
             # values from prior resumes of this task (node execution).
@@ -1565,15 +1444,35 @@ class LLMNode(BaseTool):
             # __perform_tool_calling deduplicates the completion against
             # `messages` internally (multi-tool sibling HITL resume case),
             # so we can pass the full `messages` here unconditionally.
+            #
+            # parked_holder is a mutable hand-off for the Track 2 (#4993)
+            # park-by-returning path. It is passed by reference (NOT a contextvar)
+            # so the parked signal survives even when _run_async_in_sync_context
+            # runs the coroutine in a worker thread with copy_context() — the
+            # thread mutates the same dict object the caller holds.
+            parked_holder: Dict[str, Any] = {}
             new_messages, current_completion = self._run_async_in_sync_context(
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
                     pending_capture_base=_durable_base_count,
+                    parked_holder=parked_holder,
                 )
             )
 
             output_msgs = {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
+            if parked_holder.get('parked'):
+                # Parallel fan-out parked for durable dispatch. Write the child
+                # specs into the parallel_tasks state channel so they survive the
+                # checkpoint; the LangGraphAgentRunnable reads this back and emits
+                # the parked result shape (execution_finished=False). The fresh
+                # parallel_reconcile invocation later reads each child's own
+                # checkpoint to assemble ToolMessages and continue the loop.
+                output_msgs['parallel_tasks'] = {
+                    'parked': True,
+                    'children': parked_holder.get('children', {}),
+                }
+                return output_msgs
             if self.output_variables:
                 if self.output_variables[0] == 'messages':
                     return output_msgs
@@ -1744,6 +1643,28 @@ class LLMNode(BaseTool):
             if isinstance(msg, ToolMessage) and getattr(msg, 'tool_call_id', None) == tool_call_id:
                 return True
         return False
+
+    def _resolve_tool_to_execute(self, tool_name, config):
+        """Resolve a tool name to a BaseTool using the sequential loop's lookup chain.
+
+        Order: filtered tools (dynamic selection aware) → available_tools →
+        tool_registry. Returns None when the name cannot be resolved. Extracted
+        so the parallel fan-out partition and the sequential loop resolve tools
+        identically.
+        """
+        for tool in self.get_filtered_tools(config=config):
+            if tool.name == tool_name:
+                return tool
+        for tool in (self.available_tools or []):
+            if tool.name == tool_name:
+                logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
+                return tool
+        if self.tool_registry is not None:
+            registry_tool = self.tool_registry.get_tool_by_name(tool_name)
+            if registry_tool is not None:
+                logger.info("Resolved tool '%s' via tool_registry fallback", tool_name)
+                return registry_tool
+        return None
 
     @staticmethod
     def _append_completion_dedup(messages: list, completion: AIMessage) -> list:
@@ -2208,24 +2129,299 @@ class LLMNode(BaseTool):
         # Legacy async support
         return self.invoke(kwargs, **kwargs)
 
+    def _collect_parallel_application_specs(
+        self, tool_calls, messages, config,
+        hitl_decisions=None,
+    ):
+        """Return per-call specs when this turn is a pure multi-Application batch.
+
+        A turn qualifies for parallel fan-out (issue #4993) only when, after
+        skipping tool_calls that already completed across a HITL round-trip, it
+        contains 2+ Application (sub-agent) calls and NO regular tool calls.
+        Mixed batches keep the sequential path (returns None). Each returned
+        spec is ``(tool_name, tool_args, tool_call_id, application_tool)``.
+
+        Resume exception: when one child completed and another paused, the
+        resume turn has only the single paused child left (the completed
+        sibling's ToolMessage was restored and is skipped). That lone child was
+        checkpointed under the parallel-suffixed thread_id, so it MUST stay on
+        the parallel path to resume from its own checkpoint. We detect this by
+        matching a remaining call against the resume ``hitl_decisions`` and allow
+        a 1-spec parallel batch in that case.
+        """
+        from .application import Application
+        if not tool_calls or len(tool_calls) < 2:
+            return None
+        decision_ids = {
+            d.get('tool_call_id')
+            for d in (hitl_decisions or [])
+            if isinstance(d, dict) and d.get('tool_call_id')
+        }
+        specs = []
+        for tool_call in tool_calls:
+            tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+            tool_args = tool_call.get('args', {}) if isinstance(tool_call, dict) else getattr(tool_call, 'args', {})
+            tool_call_id = tool_call.get('id', '') if isinstance(tool_call, dict) else getattr(tool_call, 'id', '')
+            # Already-completed siblings (results restored across a HITL resume)
+            # neither count toward the batch nor re-execute.
+            if tool_call_id and self._tool_call_already_completed(tool_call_id, messages):
+                continue
+            tool = self._resolve_tool_to_execute(tool_name, config)
+            if not isinstance(tool, Application):
+                return None  # a non-Application call → sequential path
+            specs.append((tool_name, tool_args, tool_call_id, tool))
+        if not specs:
+            return None
+        # Parallel resume of the remaining paused child(ren): keep on the
+        # parallel path even with a single spec so the suffixed thread_id matches.
+        if any(s[2] in decision_ids for s in specs):
+            return specs
+        return specs if len(specs) >= 2 else None
+
+    def _build_parallel_dispatch_specs(self, app_specs, config):
+        """Turn gather specs into durable-dispatch child specs (Track 2, #4993).
+
+        Used when a ``child_dispatcher`` seam is present: instead of running the
+        sub-agents in-process via ``asyncio.gather``, the parent PARKS and hands
+        these specs to pylon_main, which launches each child as an independent
+        durable ``indexer_agent`` task. Each spec is a plain JSON-serialisable
+        dict (it must survive the checkpoint channel + an RPC round-trip), so it
+        carries NO live tool object — only the identity pylon_main needs to spawn
+        the child and the SDK needs to read its checkpoint back on reconcile.
+
+        The derived ``child_thread_id`` MUST match the in-process scheme in
+        ``application.py`` (``f"{parent}:{name}:{call_id}"``) so the reconcile
+        pass reads each child from the exact checkpoint the child wrote.
+        """
+        configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
+        parent_thread_id = configurable.get('thread_id')
+        specs = {}
+        for index, (tool_name, tool_args, tool_call_id, tool) in enumerate(app_specs):
+            app_name = getattr(tool, 'name', None) or tool_name
+            child_thread_id = (
+                f"{parent_thread_id}:{app_name}:{tool_call_id}"
+                if parent_thread_id else None
+            )
+            # Display label for the UI card, mirroring the gather aggregate's
+            # metadata precedence (original_name → display_name → name).
+            meta = getattr(tool, 'metadata', None) or {}
+            display_name = (
+                meta.get('original_name')
+                or meta.get('display_name')
+                or app_name
+            )
+            # Child identity for pylon_main to launch a standalone indexer_agent
+            # task. ``args_runnable`` is how the in-process path recreates the
+            # child (toolkits/application.py:187); the id/version + already-fetched
+            # version_details make the spec self-sufficient so pylon_main need not
+            # re-resolve the sub-agent. version_details is a plain dict (JSON-safe);
+            # the live ``llm``/``memory`` objects in args_runnable are intentionally
+            # NOT carried — the child re-resolves those from the parent's payload.
+            runnable = getattr(tool, 'args_runnable', None) or {}
+            specs[tool_call_id] = self._jsonsafe_spec({
+                'tool_call_id': tool_call_id,
+                'name': app_name,
+                'display_name': display_name,
+                'input': tool_args,
+                'child_thread_id': child_thread_id,
+                'index': index,
+                'application_id': runnable.get('application_id'),
+                'application_version_id': runnable.get('application_version_id'),
+                'version_details': runnable.get('version_details'),
+                'variable_defaults': getattr(tool, 'variable_defaults', None) or {},
+            })
+        return specs
+
+    @staticmethod
+    def _jsonsafe_spec(spec: dict) -> dict:
+        """Deep-coerce a dispatch spec to plain JSON, dropping non-serialisable leaves.
+
+        The spec is written to the ``parallel_tasks`` checkpoint channel and then
+        RPC'd to pylon_main, so it MUST be msgpack/JSON-safe. ``input`` (LLM
+        tool_args, whose schema allows ``chat_history: list[BaseMessage]``) and
+        the nested ``version_details`` dict can carry live objects (BaseMessage,
+        an ``EliteAClient`` reference). A non-serialisable leaf becomes ``None``;
+        dict/list structure and JSON scalars — everything reconcile reads back
+        (``version_details.llm_settings``/``meta``/``variables``) — are preserved.
+        """
+        def _coerce(value):
+            if isinstance(value, dict):
+                return {k: _coerce(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_coerce(v) for v in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return None
+        return _coerce(spec)
+
+    async def _run_parallel_application_calls(
+        self, app_specs, new_messages, config, hitl_decisions=None,
+        pending_capture_start=0,
+    ):
+        """Execute multiple Application (sub-agent) tool calls concurrently.
+
+        Children run in worker threads under ``asyncio.gather`` so their
+        (blocking) sub-graph invocations overlap (elapsed ≈ max, not sum).
+        ``contextvars.copy_context()`` is captured per child so each runs in an
+        isolated context (its own ``_PENDING_TOOL_MESSAGES`` slot). Per #5245
+        there is no shared approval set — every sensitive call interrupts on its
+        own, so each paused child surfaces its own approval independently.
+
+        A child that pauses for sensitive-tool approval returns a deferred
+        sentinel (it must NOT call ``interrupt()`` inside the executor thread —
+        the raised GraphInterrupt would be captured by gather and the pause
+        lost). All paused children are aggregated into ONE parent-level
+        ``interrupt()`` carrying ``guardrail_type='parallel_sensitive_tools'`` so
+        the UI surfaces N stacked approval cards and a single resume call routes
+        each decision back to the correct child via its ``tool_call_id``.
+        Completed children's ``ToolMessage``s are appended to ``new_messages`` in
+        tool_call order regardless of whether siblings paused. See issue #4993.
+
+        All children are awaited to settlement before the aggregate interrupt is
+        raised: ``interrupt()`` checkpoints and replays the WHOLE node on resume,
+        so a sibling cannot be left running across a human pause on a stateless
+        server — abandoning + re-running it desynchronises the resume-value
+        replay cadence and re-fires the same interrupt in a loop.
+        """
+        from langchain_core.messages import ToolMessage, message_to_dict
+
+        # Map prior decisions (this turn's resume) by the PARENT Application
+        # tool_call_id so each paused child resumes from its own checkpoint.
+        decisions_by_id = {}
+        for decision in (hitl_decisions or []):
+            tcid = decision.get('tool_call_id')
+            if tcid:
+                decisions_by_id[tcid] = decision
+
+        loop = asyncio.get_running_loop()
+
+        async def _run_one(spec):
+            tool_name, tool_args, tool_call_id, tool = spec
+            envelope = {"type": "tool_call", "id": tool_call_id, "args": tool_args, "name": tool_name}
+            child_config = dict(config)
+            child_config['configurable'] = dict(config.get('configurable', {}))
+            decision = decisions_by_id.get(tool_call_id)
+            if decision is not None:
+                # Resume this child from its checkpoint with the user's decision
+                # (the derived child thread_id is keyed by this tool_call_id).
+                child_config['configurable']['__hitl_parallel_resume__'] = {
+                    'action': decision.get('action', 'approve'),
+                    'value': decision.get('value', decision.get('user_feedback', '')),
+                }
+            # Deferred mode must stay sticky ACROSS resume, not just on the fresh
+            # run. A resumed child whose LLM picks a DIFFERENT sensitive tool on
+            # its next turn would otherwise call interrupt() inside this executor
+            # thread — where asyncio.gather captures the GraphInterrupt and the
+            # pause is lost. Keeping it on means a post-resume pause RETURNS a
+            # sentinel and re-aggregates into a fresh parent interrupt (multi-round
+            # parallel HITL — issue #4993 follow-up).
+            child_config['configurable']['__hitl_deferred_mode__'] = True
+            child_config['configurable']['__hitl_parallel_call_id__'] = tool_call_id
+            ctx = contextvars.copy_context()
+            return await loop.run_in_executor(
+                None, lambda c=ctx, t=tool, e=envelope, cc=child_config: c.run(t.invoke, e, config=cc),
+            )
+
+        # Run every child concurrently and wait for ALL to settle. A child that
+        # pauses for sensitive-tool approval returns a deferred sentinel (it must
+        # NOT call interrupt() inside the executor thread — gather would capture
+        # the GraphInterrupt and lose the pause). Completed siblings produce
+        # ToolMessages; paused siblings are aggregated into ONE parent interrupt
+        # below. return_exceptions keeps one child's failure from cancelling the
+        # rest (per-child isolation, issue #4993).
+        results = await asyncio.gather(
+            *[_run_one(spec) for spec in app_specs], return_exceptions=True,
+        )
+
+        pending_deferred = []
+        for spec, result in zip(app_specs, results):
+            tool_name, _tool_args, tool_call_id, _tool = spec
+            if isinstance(result, GraphBubbleUp):
+                raise result
+            if isinstance(result, BaseException):
+                logger.debug("Parallel sub-agent '%s' failed: %s", tool_name, result)
+                new_messages.append(ToolMessage(
+                    content=f"Error executing {tool_name}: {result}",
+                    tool_call_id=tool_call_id,
+                ))
+                continue
+            if isinstance(result, dict) and result.get('__hitl_deferred__'):
+                pending_deferred.append((spec, result))
+                continue
+            if isinstance(result, ToolMessage):
+                if not result.tool_call_id:
+                    result.tool_call_id = tool_call_id
+                new_messages.append(result)
+            else:
+                new_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+
+        if not pending_deferred:
+            return
+
+        # Build ONE aggregated interrupt for all paused children. Each entry is
+        # the single-shape sensitive-tool payload, re-keyed to the PARENT
+        # Application tool_call_id so the resume decision routes back here.
+        pending_payload = []
+        for spec, sentinel in pending_deferred:
+            _tn, _ta, tool_call_id, _tool = spec
+            entry = dict(sentinel.get('hitl_interrupt') or {})
+            entry['tool_call_id'] = tool_call_id
+            # Label the paused card with the sub-agent it originated from so the
+            # UI can group N stacked approvals by sub-agent name (issue #4993).
+            # Falls back to the call name when metadata is absent.
+            sub_agent_name = ''
+            _app_meta = getattr(_tool, 'metadata', None) or {}
+            sub_agent_name = (
+                _app_meta.get('original_name')
+                or _app_meta.get('display_name')
+                or getattr(_tool, 'name', '')
+                or _tn
+            )
+            if sub_agent_name:
+                entry['parent_agent_name'] = sub_agent_name
+            # Per-entry pending messages would duplicate the parent-level set
+            # carried on the aggregate; drop them to keep the payload lean.
+            entry.pop('_pending_messages', None)
+            pending_payload.append(entry)
+
+        # Expose + embed the parent's intermediate messages (completed siblings
+        # and the AIMessage that owns all N tool_calls) so the resume restores
+        # them and the LLMNode skips the finished siblings. Mirrors the
+        # single-tool guard's _pending_messages contract (PR #199).
+        intermediate = list(new_messages[pending_capture_start:])
+        _PENDING_TOOL_MESSAGES.set(intermediate)
+        pending_serialized = []
+        for _m in intermediate:
+            try:
+                pending_serialized.append(message_to_dict(_m))
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        aggregate = {
+            'type': 'hitl',
+            'guardrail_type': 'parallel_sensitive_tools',
+            'message': pending_payload[0].get(
+                'message', 'Multiple actions require your review before continuing.',
+            ),
+            'pending': pending_payload,
+            '_pending_messages': pending_serialized,
+        }
+        logger.info(
+            "[HITL] Aggregating %d paused parallel sub-agent(s) into one interrupt",
+            len(pending_payload),
+        )
+        _langgraph_interrupt(aggregate)  # raises GraphInterrupt → parent pregel
+
     async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
-                                     pending_capture_base=None):
+                                     pending_capture_base=None, parked_holder=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
 
-        # Extract historically blocked tools from state-persisted HITL decisions.
-        # These survive across checkpoint resumes and prevent the LLM from
-        # re-offering a tool the user already blocked.
-        _historically_blocked: set[str] = set()
-        for decision in (hitl_decisions or []):
-            if decision.get('action') == 'reject' and decision.get('tool_name'):
-                _historically_blocked.add(normalize_tool_name(decision['tool_name']))
-        if _historically_blocked:
-            logger.info(
-                "[HITL] Tools blocked by prior decisions (from state): %s",
-                ', '.join(sorted(_historically_blocked)),
-            )
-
+        # Per-call independent approval (issue #5303): a sensitive tool the user
+        # rejects is NOT excluded from future turns. The blocked tool stays bound
+        # and the loop re-invokes with the full toolset; the only steer is the
+        # invocation-scoped guidance line inside the blocked ToolMessage. If the
+        # user rejects create_file call #1 they can still approve create_file #2.
         new_messages = self._append_completion_dedup(list(messages), completion)
         iteration = 0
 
@@ -2259,12 +2455,6 @@ class LLMNode(BaseTool):
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
 
-        # Extra tool lookup table populated after a blocked-tool continuation turn.
-        # In lazy-tools mode the regular get_filtered_tools() returns only
-        # meta-tools, so direct continuation tool calls would fail to resolve.
-        # This dict maps tool-name -> BaseTool for the next iteration only.
-        _forced_followup_lookup: Dict[str, BaseTool] = {}
-
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
         while (hasattr(current_completion, 'tool_calls') and
@@ -2277,8 +2467,51 @@ class LLMNode(BaseTool):
             # Execute each tool call in the current completion
             tool_calls = current_completion.tool_calls if hasattr(current_completion.tool_calls,
                                                                   '__iter__') else []
-            blocked_tool_names: set[str] = set()
-            blocked_payloads_this_iter: List[Dict[str, Any]] = []
+
+            # ── Parallel sub-agent fan-out (issue #4993) ────────────────────
+            # When the assistant turn contains 2+ Application (sub-agent) tool
+            # calls and NOTHING else, run them concurrently. Mixed batches
+            # (Application + a regular toolkit call) keep the sequential path.
+            # Parallelism is LLM-driven — steered by TASK_DELEGATION_ADDON and
+            # the sub-agent tool descriptions — not a feature flag.
+            app_specs = self._collect_parallel_application_specs(
+                tool_calls, new_messages, config,
+                hitl_decisions=hitl_decisions,
+            )
+            if app_specs is not None:
+                # ── Track 2 (#4993): durable park-by-returning ──────────────
+                # When a child_dispatcher seam is injected, do NOT run the
+                # children in-process. Build their dispatch specs, hand them to
+                # the caller via parked_holder, and RETURN immediately. The
+                # parent's AIMessage (with N dangling tool_calls) stays in
+                # new_messages; the LangGraph node ends, its task goes terminal,
+                # and pylon_main launches each child as an independent durable
+                # task. We must NOT fall through to the LLM re-invoke below —
+                # there are no ToolMessages yet, so re-invoking would error on a
+                # dangling-tool-call AIMessage. dispatcher None → fall through to
+                # today's in-process gather (Track 1 baseline, CLI/tests intact).
+                if self.child_dispatcher is not None and parked_holder is not None:
+                    children = self._build_parallel_dispatch_specs(app_specs, config)
+                    parked_holder['parked'] = True
+                    parked_holder['children'] = children
+                    logger.info(
+                        "[PARALLEL] child_dispatcher present — parking %d sub-agent(s) "
+                        "for durable dispatch instead of in-process gather", len(children),
+                    )
+                    _PENDING_TOOL_MESSAGES.set([])
+                    return new_messages, current_completion
+                try:
+                    await self._run_parallel_application_calls(
+                        app_specs, new_messages, config,
+                        hitl_decisions=hitl_decisions,
+                        pending_capture_start=_pending_capture_start,
+                    )
+                except GraphBubbleUp:
+                    # The aggregated parallel interrupt() raised — mirror the
+                    # sequential path's cleanup before propagating to the executor.
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise
+                tool_calls = []  # handled in bulk; skip the sequential loop below
 
             for tool_call in tool_calls:
                 tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call,
@@ -2305,36 +2538,11 @@ class LLMNode(BaseTool):
                     )
                     continue
 
-                # Find the tool in filtered tools
-                # Pass config to ensure dynamically selected tools are available
-                filtered_tools = self.get_filtered_tools(config=config)
-                tool_to_execute = None
-                for tool in filtered_tools:
-                    if tool.name == tool_name:
-                        tool_to_execute = tool
-                        break
-
-                # Fallback: check forced follow-up lookup (lazy mode).
-                # After a blocked-tool forced follow-up the LLM calls a real
-                # tool directly, but get_filtered_tools only returns meta-tools.
-                if tool_to_execute is None and tool_name in _forced_followup_lookup:
-                    tool_to_execute = _forced_followup_lookup[tool_name]
-                    logger.info("Resolved tool '%s' via forced-followup lookup", tool_name)
-
-                # Fallback: in lazy mode (and HITL resume) the tool may not appear
-                # in get_filtered_tools because that returns only meta-tools.
-                # Search available_tools and tool_registry for a direct match.
-                if tool_to_execute is None:
-                    for tool in (self.available_tools or []):
-                        if tool.name == tool_name:
-                            tool_to_execute = tool
-                            logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
-                            break
-                if tool_to_execute is None and self.tool_registry is not None:
-                    registry_tool = self.tool_registry.get_tool_by_name(tool_name)
-                    if registry_tool is not None:
-                        tool_to_execute = registry_tool
-                        logger.info("Resolved tool '%s' via tool_registry fallback", tool_name)
+                # Resolve the tool via the shared lookup chain (filtered →
+                # available_tools → tool_registry). Extracted so the parallel
+                # fan-out partition (#4993) and the sequential loop resolve
+                # tools identically.
+                tool_to_execute = self._resolve_tool_to_execute(tool_name, config)
 
                 if tool_to_execute:
                     try:
@@ -2389,21 +2597,25 @@ class LLMNode(BaseTool):
 
                         blocked_payload = self._parse_sensitive_tool_blocked_result(tool_result)
                         if blocked_payload is not None:
-                            blocked_tool_name = normalize_tool_name(
-                                blocked_payload.get('blocked_tool_name')
-                                or blocked_payload.get('tool_name')
-                                or tool_name
-                                or ''
-                            )
-                            if blocked_tool_name:
-                                blocked_tool_names.add(blocked_tool_name)
-                            enriched_payload = self._enrich_blocked_tool_payload(
-                                blocked_payload=blocked_payload,
-                            )
-                            blocked_payloads_this_iter.append(enriched_payload)
+                            # User declined this sensitive call. The blocked tool
+                            # stays bound (per-call independent approval, #5303).
+                            # The guard already produces a SLIM structured payload
+                            # (type + tool/toolkit identities + denial_reason + a
+                            # single `message` directive). Pass it through verbatim
+                            # so the model input is identical to the tool-trace the
+                            # user sees — one source of truth. The directive in
+                            # `message` is what steers continuation; the slim
+                            # structure avoids the field bloat that tripped weak
+                            # models (haiku, gpt-5.4-mini). If a payload somehow
+                            # lacks `message`, synthesize a fallback directive.
+                            if not blocked_payload.get('message'):
+                                blocked_payload = {
+                                    **blocked_payload,
+                                    'message': self._build_blocked_tool_guidance(blocked_payload),
+                                }
                             tool_message = ToolMessage(
                                 content=json.dumps(
-                                    self._build_visible_blocked_tool_payload(blocked_payload),
+                                    blocked_payload,
                                     ensure_ascii=True,
                                     separators=(',', ':'),
                                 ),
@@ -2485,89 +2697,16 @@ class LLMNode(BaseTool):
                         len(new_messages) - len(sanitized_messages),
                     )
                 new_messages = sanitized_messages
-                # Reset forced-followup lookup at the start of each LLM re-invoke.
-                _forced_followup_lookup = {}
 
-                # Accumulate current-iteration blocks into history so
-                # future iterations also exclude them.
-                _historically_blocked.update(blocked_tool_names)
-
-                # Merge current-iteration blocks with historical blocks
-                # (from state-persisted HITL decisions + earlier iterations).
-                all_blocked = blocked_tool_names | _historically_blocked
-
-                if blocked_tool_names:
-                    # Current iteration had tool(s) blocked — full
-                    # continuation: nudge LLM to try alternatives.
-                    new_messages = self._strip_blocked_tool_continuation_nudges(new_messages)
-                    blocked_tool_history = self._collect_blocked_tool_names(new_messages) | _historically_blocked
-                    forced_followup_tools = self._get_forced_followup_tools(
-                        config=config,
-                        blocked_tool_names=blocked_tool_history,
-                    )
-                    continuation_client = llm_client
-                    if forced_followup_tools:
-                        # Store for next iteration so the tool call can be resolved.
-                        _forced_followup_lookup = {t.name: t for t in forced_followup_tools}
-                        continuation_client = self._build_forced_followup_client(forced_followup_tools)
-                        current_completion = continuation_client.invoke(
-                            new_messages,
-                            config=config,
-                        )
-                    else:
-                        logger.info(
-                            "Blocked-tool follow-up: no allowed tools remain after excluding [%s]",
-                            ', '.join(sorted(all_blocked)),
-                        )
-                        current_completion = llm_client.invoke(new_messages, config=config)
-
-                    new_messages.append(current_completion)
-                    blocked_tool_continuation_attempts = 0
-                    while True:
-                        continuation_message = self._should_continue_after_blocked_tool(
-                            completion=current_completion,
-                            blocked_payloads=blocked_payloads_this_iter,
-                            followup_tools=forced_followup_tools,
-                            messages=new_messages,
-                            attempt_count=blocked_tool_continuation_attempts,
-                        )
-                        if continuation_message is None:
-                            break
-
-                        blocked_tool_continuation_attempts += 1
-                        logger.info(
-                            "Blocked-tool continuation: nudging LLM to keep working (attempt %s/%s)",
-                            blocked_tool_continuation_attempts,
-                            MAX_BLOCKED_TOOL_CONTINUATION_ATTEMPTS,
-                        )
-                        new_messages = self._strip_blocked_tool_continuation_nudges(new_messages)
-                        new_messages.append(HumanMessage(content=continuation_message))
-                        current_completion = continuation_client.invoke(new_messages, config=config)
-                        new_messages.append(current_completion)
-                elif _historically_blocked:
-                    # No current-iteration blocks but historically blocked
-                    # tools exist — exclude them from the LLM's tool
-                    # binding so it cannot re-call a previously blocked tool.
-                    forced_followup_tools = self._get_forced_followup_tools(
-                        config=config,
-                        blocked_tool_names=_historically_blocked,
-                    )
-                    if forced_followup_tools:
-                        _forced_followup_lookup = {t.name: t for t in forced_followup_tools}
-                        current_completion = self._build_forced_followup_client(
-                            forced_followup_tools,
-                        ).invoke(new_messages, config=config)
-                    else:
-                        logger.info(
-                            "Historical blocked-tool follow-up: no allowed tools remain "
-                            "after excluding [%s]",
-                            ', '.join(sorted(_historically_blocked)),
-                        )
-                        current_completion = llm_client.invoke(new_messages, config=config)
-                    new_messages.append(current_completion)
-                else:
-                    current_completion = llm_client.invoke(new_messages, config=config)
-                    new_messages.append(current_completion)
+                # Re-invoke with the SAME full toolset — including any sensitive
+                # tool the user just declined. The block is invocation-scoped
+                # (per-call independent approval, #5303), so the tool stays bound
+                # and the model can call it again for a different item if needed.
+                # The invocation-scoped guidance carried inside the blocked
+                # ToolMessage tells the model the call was declined and to
+                # continue the remaining work; no forced rebinding or nudge turn.
+                current_completion = llm_client.invoke(new_messages, config=config)
+                new_messages.append(current_completion)
 
                 # Check if we still have tool calls
                 if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:

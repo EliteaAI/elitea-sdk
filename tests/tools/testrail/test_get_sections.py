@@ -208,7 +208,7 @@ class TestGetSectionsFieldProjection:
     """The wrapper projects each section onto a fixed field allowlist."""
 
     def test_only_allowlisted_fields_are_returned(self, wrapper):
-        """Extra fields from the TestRail response are dropped; allowlisted ones pass through."""
+        """Extra non-custom fields from the TestRail response are dropped; allowlisted ones pass through."""
         wrapper._client.projects.get_project.return_value = {"suite_mode": 1}
         raw_section = _section(1)
         raw_section["unexpected_field"] = "should-be-dropped"
@@ -218,3 +218,14 @@ class TestGetSectionsFieldProjection:
 
         assert "should-be-dropped" not in result
         assert "section-1" in result
+
+    def test_custom_fields_pass_through(self, wrapper):
+        """custom_* fields are surfaced (consistent with runs/results projection)."""
+        wrapper._client.projects.get_project.return_value = {"suite_mode": 1}
+        raw_section = _section(1)
+        raw_section["custom_area"] = "login"
+        wrapper._client.sections.get_sections.return_value = [raw_section]
+
+        result = wrapper.get_sections(project_id="10")
+
+        assert "custom_area" in result and "login" in result

@@ -727,7 +727,8 @@ class EliteAClient:
                     is_subgraph: bool = False, middleware: Optional[list] = None,
                     exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
                     auto_approve_sensitive_actions: bool = False,
-                    openai_compatible: Optional[bool] = None):
+                    openai_compatible: Optional[bool] = None,
+                    child_dispatcher: Optional[Any] = None):
         if tools is None:
             tools = []
         if chat_history is None:
@@ -818,7 +819,8 @@ class EliteAClient:
                                       conversation_id=conversation_id, ignored_mcp_servers=ignored_mcp_servers,
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
-                                      lazy_tools_mode=lazy_tools_mode)
+                                      lazy_tools_mode=lazy_tools_mode,
+                                      child_dispatcher=child_dispatcher)
         if runtime == 'langchain':
             return LangChainAssistant(self, data, llm,
                                       chat_history, app_type,
@@ -826,7 +828,8 @@ class EliteAClient:
                                       conversation_id=conversation_id, ignored_mcp_servers=ignored_mcp_servers,
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
-                                      lazy_tools_mode=lazy_tools_mode).runnable()
+                                      lazy_tools_mode=lazy_tools_mode,
+                                      child_dispatcher=child_dispatcher).runnable()
         elif runtime == 'llama':
             raise NotImplementedError("LLama runtime is not supported")
 
@@ -1157,7 +1160,8 @@ class EliteAClient:
                       ignored_mcp_servers: Optional[list] = None, persona: Optional[str] = "generic",
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
                       exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
-                      step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False):
+                      step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
+                      child_dispatcher: Optional[Any] = None):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -1257,7 +1261,8 @@ class EliteAClient:
             ignored_mcp_servers=ignored_mcp_servers,
             persona=persona,
             middleware=middleware_list if middleware_list else None,
-            lazy_tools_mode=lazy_tools_mode
+            lazy_tools_mode=lazy_tools_mode,
+            child_dispatcher=child_dispatcher
         ).runnable()
 
     def _validate_toolkit_config(self, toolkit_config: dict) -> dict:

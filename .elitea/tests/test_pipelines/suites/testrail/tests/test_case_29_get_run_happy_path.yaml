@@ -1,0 +1,141 @@
+name: "TR29 get run happy path"
+priority: Critical
+description: |
+  Verify the get_run tool retrieves a single test run by ID.
+
+  Objective: Test single test run retrieval.
+
+  Workflow:
+  - List the project's runs via get_runs (setup)
+  - Extract the first run id from the list
+  - Retrieve that run via get_run and validate the result
+
+  Expected Behavior:
+  - get_run executes successfully for an existing run id
+  - Returns run metadata including id and name
+  - No errors or exceptions
+
+  Note: requires the project to have at least one test run. If the project has no
+  runs, the extractor yields no id and this test is expected to fail — seed a run
+  or point TESTRAIL_PROJECT_ID at a project that has runs.
+
+toolkits:
+  - id: ${TESTRAIL_TOOLKIT_ID}
+    name: ${TESTRAIL_TOOLKIT_NAME}
+
+state:
+  project_id:
+    type: str
+    value: "${TESTRAIL_PROJECT_ID}"
+  output_format:
+    type: str
+    value: "json"
+  runs_result:
+    type: dict
+  run_id:
+    type: str
+  tool_result:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_runs
+
+nodes:
+  - id: invoke_get_runs
+    type: toolkit
+    tool: get_runs
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+      - output_format
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+      output_format:
+        type: variable
+        value: output_format
+    output:
+      - runs_result
+    structured_output: true
+    transition: extract_run_id
+
+  - id: extract_run_id
+    type: code
+    code:
+      type: fixed
+      value: |
+        import re
+        raw = elitea_state.get("runs_result", "")
+        value = ""
+        if isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], dict) and "id" in raw[0]:
+            value = str(raw[0]["id"])
+        else:
+            m = re.search(r"id\W+(\d+)", str(raw))
+            value = m.group(1) if m else ""
+        {"run_id": value}
+    input:
+      - runs_result
+    output:
+      - run_id
+    structured_output: true
+    transition: invoke_get_run
+
+  - id: invoke_get_run
+    type: toolkit
+    tool: get_run
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - run_id
+    input_mapping:
+      run_id:
+        type: variable
+        value: run_id
+    output:
+      - tool_result
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    input:
+      - tool_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the tool execution results and determine if the test passed.
+
+          tool executed: get_run
+          results: {tool_result}
+
+          expected behavior:
+          - get_run executed successfully for an existing run id
+          - result contains run data with id and name fields
+          - no errors or exceptions
+
+          Evaluate:
+          1. did the tool execute successfully?
+          2. are there any errors?
+          3. does the output contain a single run's data with an id?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

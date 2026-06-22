@@ -71,6 +71,54 @@ class TestBlocklistConfiguration:
         assert not is_toolkit_blocked("github")
 
 
+# ── Separator/format-insensitive matching (issue #5199) ──────────────────
+
+class TestCanonicalMatching:
+    def test_blocked_tool_matches_naming_style_variants(self):
+        # Configured in one style; invoked in many. All collapse to "createfile".
+        configure_blocklist(blocked_tools={"GitHub": ["Create-File"]})
+        for invoked in ("create_file", "CreateFile", "create-file", "Create File", "createfile"):
+            assert is_tool_blocked("github", invoked), invoked
+
+    def test_blocked_tool_matches_prefixed_and_styled(self):
+        configure_blocklist(blocked_tools={"github": ["create_file"]})
+        # Routing prefixes (___ / :) plus a casing change still match.
+        assert is_tool_blocked("github", "github___CreateFile")
+        assert is_tool_blocked("GITHUB", "github:create-file")
+
+    def test_blocked_toolkit_matches_naming_style_variants(self):
+        configure_blocklist(blocked_toolkits=["Data_Analysis"])
+        for invoked in ("data_analysis", "data-analysis", "DataAnalysis", "Data Analysis"):
+            assert is_toolkit_blocked(invoked), invoked
+
+    def test_matching_is_toolkit_scoped(self):
+        # Same logical tool blocked under github must NOT be blocked elsewhere
+        # (protects e.g. an Artifacts tool sharing a common verb). AC9.
+        configure_blocklist(blocked_tools={"github": ["create_file"]})
+        assert is_tool_blocked("github", "CreateFile")
+        assert not is_tool_blocked("artifacts", "CreateFile")
+        assert not is_tool_blocked("filesystem", "create_file")
+
+    def test_get_blocked_tools_for_toolkit_styled_lookup(self):
+        configure_blocklist(blocked_tools={"GitHub": ["Create-File", "Delete_Repo"]})
+        blocked = get_blocked_tools_for_toolkit("GITHUB")
+        assert set(blocked) == {"createfile", "deleterepo"}
+
+    def test_separator_only_entries_are_dropped(self):
+        # Keys/values that canonicalize to "" (only separators) must not be
+        # stored as empty entries — otherwise an empty toolkit key or tool name
+        # would match nothing meaningful and confuse debugging.
+        configure_blocklist(
+            blocked_toolkits=["---", "  ", "shell"],
+            blocked_tools={"***": ["create_file"], "github": ["---", "delete_repo"]},
+        )
+        assert get_blocked_tools_for_toolkit("github") == ["deleterepo"]
+        assert get_blocked_tools_for_toolkit("***") == []
+        # The empty-canonical toolkit must not be treated as blocked.
+        assert not is_toolkit_blocked("")
+        assert is_toolkit_blocked("shell")
+
+
 # ── _filter_blocked_tools (tools/__init__.py) ────────────────────────────
 
 class TestFilterBlockedTools:

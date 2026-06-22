@@ -12,7 +12,7 @@ on:
         options:
           - local
           - dev
-          - stage
+          - stage2
           - prod
           - custom
       custom_environment:

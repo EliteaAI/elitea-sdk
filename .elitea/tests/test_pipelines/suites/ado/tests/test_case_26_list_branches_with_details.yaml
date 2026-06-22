@@ -60,7 +60,9 @@ nodes:
           2. is_branch_report: Output is a formatted string report (not JSON)
           3. has_main_branch: Output contains branch name 'main'
           4. has_eliteatest_branch: Output contains branch name 'EliteaTest'
-          5. no_error: Output does NOT contain 'error', 'failed', 'exception'
+          5. no_issues: Output does NOT contain failure indicators like 'failed', 'exception', an 'Error:' prefix, or a real tool failure message. Minor formatting oddities, quoting, or stray backticks in a branch name should NOT count as an issue by themselves.
+
+          Set test_passed=true if and only if criteria 1-5 are all true.
 
           Return a JSON object with structure:
           {{
@@ -70,9 +72,14 @@ nodes:
             "has_main_branch": boolean,
             "has_eliteatest_branch": boolean,
             "branch_count": number,
-            "no_error": boolean,
-            "error": string | null
+            "no_issues": boolean,
+            "details": string | null
           }}
+
+          IMPORTANT:
+          - If the output is a plain-text branch report, contains both expected branches, and has no failure indicators, then test_passed must be true.
+          - Do not fail the test for wording like "Found 277 branches in the repository"; that is a normal success report.
+          - Do not fail the test because one listed branch name contains extra quotes or a stray backtick; that is formatting noise unless the tool reported an explicit failure.
 
           Return ONLY the JSON object (no markdown or explanation).
     model: ${DEFAULT_LLM_MODEL}

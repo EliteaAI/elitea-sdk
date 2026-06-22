@@ -564,6 +564,45 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             file_bytes = filedata.encode('utf-8')
             actual_filename = filename
 
+        # Primary: SharePoint REST API (office365 client)
+        _rest_exc = None
+        try:
+            target_folder = self._client.web.get_folder_by_server_relative_path(folder_path)
+            self._client.load(target_folder)
+            self._client.execute_query()
+
+            if not replace:
+                try:
+                    existing = target_folder.files.get_by_url(actual_filename)
+                    self._client.load(existing)
+                    self._client.execute_query()
+                    raise ToolException(
+                        f"File '{actual_filename}' already exists at '{folder_path}'. "
+                        f"Set replace=True to overwrite.")
+                except ToolException:
+                    raise
+                except Exception:
+                    pass  # File does not exist, proceed
+
+            file_stream = BytesIO(file_bytes)
+            uploaded = target_folder.upload_file(actual_filename, file_stream).execute_query()
+            logging.info("File '%s' uploaded via REST to '%s'", actual_filename, folder_path)
+            return {
+                'id': uploaded.unique_id if hasattr(uploaded, 'unique_id') else '',
+                'webUrl': uploaded.properties.get('LinkingUrl', ''),
+                'path': uploaded.properties.get('ServerRelativeUrl', folder_path + '/' + actual_filename),
+                'size': len(file_bytes),
+                'mime_type': 'application/octet-stream',
+            }
+        except ToolException:
+            raise
+        except Exception as rest_e:
+            _rest_exc = rest_e
+            logging.warning(
+                "REST upload failed for '%s': %s — falling back to Graph API.",
+                actual_filename, rest_e)
+
+        # Fallback: Graph API
         try:
             result = self._graph_helper().upload_file_to_library(
                 site_url=self.site_url,
@@ -572,10 +611,12 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                 file_bytes=file_bytes,
                 replace=replace,
             )
-            logging.info("File '%s' uploaded successfully to '%s'", actual_filename, folder_path)
+            logging.info("File '%s' uploaded via Graph API to '%s'", actual_filename, folder_path)
             return result
-        except Exception as e:
-            raise ToolException(f"Upload failed: {e}") from None
+        except Exception as graph_e:
+            raise ToolException(
+                f"Upload failed via both REST and Graph API. "
+                f"REST error: {_rest_exc} | Graph error: {graph_e}") from None
 
     def add_attachment_to_list_item(self, list_title: str, item_id: int,
                                     filepath: Optional[str] = None,

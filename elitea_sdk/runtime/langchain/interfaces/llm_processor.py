@@ -17,8 +17,9 @@ import logging
 from json import dumps
 from traceback import format_exc
 
-import httpx
 from tenacity import retry, stop_after_attempt, wait_chain, wait_fixed, retry_if_exception, before_sleep_log
+
+from elitea_sdk.tools.utils.retry import is_server_error_retriable
 
 logger = logging.getLogger(__name__)
 from langchain_community.llms import __getattr__ as get_llm, __all__ as llms  # pylint: disable=E0401
@@ -177,39 +178,8 @@ def get_vectorstore(vectorstore_type, vectorstore_params, embedding_func=None):
     #
     raise RuntimeError(f"Unknown VectorStore type: {vectorstore_type}")
 
-def _is_server_error_retryable(exception: BaseException) -> bool:
-    """
-    Check if exception is a retryable server error (5xx).
-
-    Handles:
-    - httpx.RemoteProtocolError: Connection closed prematurely
-    - httpx.HTTPStatusError: HTTP errors with 5xx status
-    - openai.APIStatusError: OpenAI API errors with 5xx status
-    - openai.APIConnectionError: Connection issues
-    """
-    # Connection closed prematurely (e.g., server restart during response)
-    if isinstance(exception, httpx.RemoteProtocolError):
-        return True
-
-    # HTTP status errors - retry only on 5xx
-    if isinstance(exception, httpx.HTTPStatusError):
-        return 500 <= exception.response.status_code < 600
-
-    # OpenAI SDK errors
-    try:
-        import openai
-        if isinstance(exception, openai.APIConnectionError):
-            return True
-        if isinstance(exception, openai.APIStatusError):
-            return 500 <= exception.status_code < 600
-    except ImportError:
-        pass
-
-    return False
-
-
 @retry(
-    retry=retry_if_exception(_is_server_error_retryable),
+    retry=retry_if_exception(is_server_error_retriable),
     stop=stop_after_attempt(5),  # 1 initial + 4 retries
     wait=wait_chain(
         wait_fixed(15),

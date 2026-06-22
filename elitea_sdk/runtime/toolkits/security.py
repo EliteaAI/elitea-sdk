@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import json
 from typing import Dict, List, Optional
 
@@ -60,6 +61,18 @@ def normalize_tool_name(tool_name: Optional[str]) -> str:
     return aliases[-1] if aliases else ''
 
 
+def canonical_match_key(name: Optional[str]) -> str:
+    """Return a separator/format-insensitive key for guardrail matching only.
+
+    Lowercases and removes every non-alphanumeric character, so naming-style
+    variations collapse to the same key: ``CreateFile``, ``create_file``,
+    ``create-file`` and ``Create File`` all map to ``createfile``. This key is
+    used *exclusively* for blocked/sensitive membership tests — tools are still
+    invoked and displayed by their natural names.
+    """
+    return re.sub(r'[^a-z0-9]', '', str(name or '').strip().lower())
+
+
 def qualified_tool_identity(tool_name: Optional[str], toolkit_name: Optional[str] = None) -> str:
     """Return a qualified tool identity for disambiguation.
 
@@ -75,12 +88,27 @@ def qualified_tool_identity(tool_name: Optional[str], toolkit_name: Optional[str
     return f'{prefix}.{base}' if prefix else base
 
 
+def _canonical_toolkit_key(key: str) -> str:
+    """Canonical key for a toolkit identifier, preserving the ``*`` wildcard."""
+    if str(key).strip() == '*':
+        return '*'
+    return canonical_match_key(key)
+
+
 def _normalize_tools_mapping(tool_map: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
-    return {
-        str(key).strip().lower(): [str(item).strip().lower() for item in (values or []) if str(item).strip()]
-        for key, values in (tool_map or {}).items()
-        if str(key).strip()
-    }
+    # Filter on the *canonical* result, not the raw string: a key/value made up
+    # only of separators (e.g. "---", "***") canonicalizes to "" and must be
+    # dropped rather than stored as an empty entry. The "*" wildcard is preserved
+    # by _canonical_toolkit_key and survives the truthiness check.
+    normalized: Dict[str, List[str]] = {}
+    for key, values in (tool_map or {}).items():
+        toolkit_key = _canonical_toolkit_key(key)
+        if not toolkit_key:
+            continue
+        normalized[toolkit_key] = [
+            item_key for item_key in (canonical_match_key(item) for item in (values or [])) if item_key
+        ]
+    return normalized
 
 
 def configure_blocklist(
@@ -96,7 +124,7 @@ def configure_blocklist(
     """
     global _blocked_toolkits, _blocked_tools, _blocklist_initialized
 
-    _blocked_toolkits = [t.lower() for t in (blocked_toolkits or [])]
+    _blocked_toolkits = [key for key in (canonical_match_key(t) for t in (blocked_toolkits or [])) if key]
     _blocked_tools = _normalize_tools_mapping(blocked_tools)
     _blocklist_initialized = True
 
@@ -133,7 +161,7 @@ def _load_blocklist_from_env() -> None:
 
     if env_toolkits:
         try:
-            _blocked_toolkits = [t.strip().lower() for t in env_toolkits.split(',') if t.strip()]
+            _blocked_toolkits = [key for key in (canonical_match_key(t) for t in env_toolkits.split(',')) if key]
             logger.info(f"[SECURITY] Loaded blocked toolkits from env: {_blocked_toolkits}")
         except Exception as e:
             logger.warning(f"[SECURITY] Failed to parse ELITEA_BLOCKED_TOOLKITS: {e}")
@@ -187,7 +215,7 @@ def is_toolkit_blocked(toolkit_type: str) -> bool:
     """
     _load_blocklist_from_env()
 
-    blocked = toolkit_type.lower() in _blocked_toolkits
+    blocked = canonical_match_key(toolkit_type) in _blocked_toolkits
     if blocked:
         logger.warning(f"[SECURITY] Blocked toolkit type: {toolkit_type}")
     return blocked
@@ -211,11 +239,11 @@ def is_tool_blocked(toolkit_type: str, tool_name: str) -> bool:
         return True
 
     # Check specific tool
-    toolkit_lower = toolkit_type.lower()
-    if toolkit_lower in _blocked_tools:
-        blocked_tool_names = set(_blocked_tools[toolkit_lower])
+    toolkit_key = canonical_match_key(toolkit_type)
+    if toolkit_key in _blocked_tools:
+        blocked_tool_names = set(_blocked_tools[toolkit_key])
         for candidate_name in get_tool_name_aliases(tool_name):
-            if candidate_name in blocked_tool_names:
+            if canonical_match_key(candidate_name) in blocked_tool_names:
                 logger.warning(f"[SECURITY] Blocked tool '{tool_name}' in toolkit '{toolkit_type}'")
                 return True
 
@@ -230,10 +258,12 @@ def get_blocked_tools_for_toolkit(toolkit_type: str) -> List[str]:
         toolkit_type: The type/name of the toolkit
 
     Returns:
-        List of blocked tool names (lowercase) for this toolkit
+        List of canonical match keys (lowercased, separators stripped — e.g.
+        ``createfile``) for the blocked tools in this toolkit. These are
+        comparison keys, not the original tool names.
     """
     _load_blocklist_from_env()
-    return _blocked_tools.get(toolkit_type.lower(), [])
+    return _blocked_tools.get(canonical_match_key(toolkit_type), [])
 
 
 def get_blocklist_config() -> Dict:
@@ -262,20 +292,20 @@ def find_sensitive_tool_match(
 
     normalized_identifiers = []
     for identifier in toolkit_identifiers or []:
-        normalized = str(identifier or '').strip().lower()
+        normalized = canonical_match_key(identifier)
         if normalized and normalized not in normalized_identifiers:
             normalized_identifiers.append(normalized)
 
+    candidate_keys = {canonical_match_key(alias) for alias in tool_name_aliases}
+
     for identifier in normalized_identifiers:
         sensitive_tool_names = set(_sensitive_tools.get(identifier, []))
-        for candidate_name in tool_name_aliases:
-            if candidate_name in sensitive_tool_names:
-                return identifier
+        if candidate_keys & sensitive_tool_names:
+            return identifier
 
     wildcard_sensitive_tool_names = set(_sensitive_tools.get('*', []))
-    for candidate_name in tool_name_aliases:
-        if candidate_name in wildcard_sensitive_tool_names:
-            return '*'
+    if candidate_keys & wildcard_sensitive_tool_names:
+        return '*'
 
     return None
 

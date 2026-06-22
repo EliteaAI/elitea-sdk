@@ -935,7 +935,7 @@ class IsolatedPipelineTestRunner:
             logger.info("No toolkit tools (test uses only code/llm nodes)")
 
         # Extract model from YAML if specified in nodes
-        model_name = 'gpt-5-mini'  # default
+        model_name = load_from_env('DEFAULT_LLM_MODEL') or 'gpt-5.4-mini'  # default
         # try:
         #     yaml_dict = yaml.safe_load(yaml_schema)
         #     if isinstance(yaml_dict, dict) and 'nodes' in yaml_dict:

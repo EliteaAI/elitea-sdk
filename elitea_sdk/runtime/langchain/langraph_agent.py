@@ -865,7 +865,8 @@ class StateModifierNode(Runnable):
 
 def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_before=None, interrupt_after=None,
                           interrupt_after_successors=None, state_class=None, output_variables=None,
-                          tool_registry=None, middleware_manager=None, terminal_output_variables=None):
+                          tool_registry=None, middleware_manager=None, terminal_output_variables=None,
+                          child_dispatcher=None):
     # prepare output channels
     if interrupt_after is None:
         interrupt_after = []
@@ -918,6 +919,7 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
         tool_registry=tool_registry,
         middleware_manager=middleware_manager,
         terminal_output_variables=terminal_output_variables,
+        child_dispatcher=child_dispatcher,
     )
 
     compiled.attach_node(START, None)
@@ -994,6 +996,7 @@ def create_graph(
         lazy_tools_mode: bool = False,
         always_bind_tools: Optional[list[BaseTool]] = None,
         middleware_manager: Optional[Any] = None,
+        child_dispatcher: Optional[Any] = None,
         **kwargs
 ):
     """
@@ -1220,11 +1223,16 @@ def create_graph(
                 from ..tools.sandbox import create_sandbox_tool
                 sandbox_tool = create_sandbox_tool(stateful=False, allow_net=True,
                                                    elitea_client=kwargs.get('elitea_client', None))
-                # Apply middleware wrapping (e.g. sensitive-tool guard) to the
+                # Apply middleware wrapping (e.g. exception handling) to the
                 # freshly-created sandbox tool — it was not in the `tools` list
                 # that was wrapped during Assistant.__init__().
+                # Pipeline Code nodes run static, editor-authored code — trusted.
+                # Skip ONLY the sensitive-action HITL guard (issue #5348): an
+                # interrupt here corrupts pipeline state (a Code node is a single
+                # direct node call, not a tool-calling loop). Chat sandbox
+                # (LLM-generated, untrusted) is still guarded via Assistant.__init__.
                 if middleware_manager is not None:
-                    sandbox_tool = middleware_manager.wrap_tool(sandbox_tool)
+                    sandbox_tool = middleware_manager.wrap_tool(sandbox_tool, skip_sensitive_guard=True)
                 code_data = node.get('code', {'type': 'fixed', 'value': "return 'Code block is empty'"})
                 lg_builder.add_node(node_id, FunctionTool(
                     tool=sandbox_tool, name=node['id'], return_type='dict',
@@ -1306,6 +1314,9 @@ def create_graph(
                     always_bind_tools=always_bind_tools or [],
                     # Middleware manager for before_model/after_model hooks (summarization, context editing)
                     middleware_manager=middleware_manager,
+                    # Parallel sub-agent dispatch seam (Track 2, #4993). None → in-process
+                    # gather fan-out (Track 1); present → park-by-returning dispatch.
+                    child_dispatcher=child_dispatcher,
                 ))
             elif node_type in ['router', 'decision']:
                 if node_type == 'router':
@@ -1507,6 +1518,7 @@ def create_graph(
         tool_registry=tool_registry,
         middleware_manager=middleware_manager,
         terminal_output_variables=collect_terminal_output_variables(schema),
+        child_dispatcher=child_dispatcher,
     )
     return compiled.validate()
 
@@ -1578,13 +1590,14 @@ def convert_dict_to_message(msg_dict):
 class LangGraphAgentRunnable(CompiledStateGraph):
     def __init__(self, *args, output_variables=None, tool_registry=None,
                  interrupt_after_successors=None, middleware_manager=None,
-                 terminal_output_variables=None, **kwargs):
+                 terminal_output_variables=None, child_dispatcher=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_variables = output_variables
         self.tool_registry = tool_registry
         self._interrupt_after_successors = interrupt_after_successors or set()
         self._middleware_manager = middleware_manager
         self._terminal_output_variables = terminal_output_variables or []
+        self._child_dispatcher = child_dispatcher
 
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
@@ -1756,7 +1769,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         
         # Validate that input is not empty after all processing.
         # HITL resume payloads may carry only action metadata with no text body.
-        if not input.get('input') and not self._is_hitl_resume(input):
+        if (not input.get('input')
+                and not self._is_hitl_resume(input)
+                and not self._is_parallel_reconcile(input)):
             raise RuntimeError(
                 "Empty input after processing. Cannot send empty string to LLM. "
                 "This likely means the message contained only non-text content "
@@ -1797,11 +1812,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # user's new message is effectively deferred — they must
                 # resolve the pending action first, then re-send.
                 if hitl_interrupt and not self._is_hitl_resume(input):
-                    hitl_for_ui = {
-                        k: v for k, v in hitl_interrupt.items()
-                        if k not in ('tool_args_raw', '_pending_messages',
-                                     '_parent_tool_name', '_parent_tool_args')
-                    }
+                    hitl_interrupts_for_ui = self._strip_hitl_ui_keys(
+                        self._get_hitl_interrupts(checkpoint_state)
+                    )
+                    hitl_for_ui = (
+                        hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
+                    )
                     logger.warning(
                         "[HITL] Stale HITL interrupt detected for tool '%s'. "
                         "Returning interrupt to caller for resolution "
@@ -1816,6 +1832,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         "thread_id": thread_id,
                         "execution_finished": False,
                         "hitl_interrupt": hitl_for_ui,
+                        "hitl_interrupts": hitl_interrupts_for_ui,
                     }
                     if hasattr(checkpoint_state, 'values') and checkpoint_state.values:
                         for key, value in checkpoint_state.values.items():
@@ -1823,7 +1840,30 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 result_with_state[key] = value
                     return result_with_state
 
-                if hitl_interrupt and self._is_hitl_resume(input):
+                if self._is_parallel_reconcile(input):
+                    # ── Parallel sub-agent reconcile (Track 2, #4993) ──────
+                    # pylon_main re-invokes the parked parent with
+                    # parallel_reconcile=<epoch> once every child task is
+                    # terminal. The parked checkpoint sits at END (is_at_end),
+                    # so this MUST be checked before the is_at_end branch —
+                    # otherwise the parent would clear its checkpoint and
+                    # re-fan-out. We append one ToolMessage per child (read from
+                    # each child's own checkpoint) and resume the agent node so
+                    # the LLM synthesizes the final answer from the collected
+                    # sub-agent results.
+                    epoch = (input.pop('parallel_reconcile', None)
+                             or config.get('configurable', {}).get('parallel_reconcile'))
+                    logger.info(
+                        "[PARALLEL] reconcile epoch=%s for thread %s — "
+                        "assembling settled child results", epoch, thread_id,
+                    )
+                    result = self._resume_parallel_reconcile(
+                        config, thread_id, *args, **kwargs
+                    )
+                    # Read the LATEST checkpoint (the reconcile continuation)
+                    # below, not the stale parked one.
+                    config.get('configurable', {}).pop('checkpoint_id', None)
+                elif hitl_interrupt and self._is_hitl_resume(input):
                     # Resuming from an HITL dynamic interrupt - use Command(resume=...)
                     hitl_resume_value = self._extract_hitl_resume(input)
                     logger.info(f"[HITL] Resuming HITL interrupt with: {hitl_resume_value}")
@@ -1934,6 +1974,65 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
+
+                    elif guardrail_type == 'parallel_sensitive_tools':
+                        # Parallel sub-agent fan-out resume (issue #4993).
+                        # The aggregate interrupt paused N children at once; the
+                        # caller returns a decision per child as hitl_decisions.
+                        # We rebuild the original N-tool-call AIMessage so the
+                        # LLMNode re-fans-out, but each paused child resumes from
+                        # ITS OWN checkpoint (via __hitl_parallel_resume__) so no
+                        # non-sensitive side effects are replayed; completed
+                        # siblings are restored from _pending_messages and skipped
+                        # by _tool_call_already_completed.
+                        decisions = hitl_resume_value.get('hitl_decisions') or []
+                        if not isinstance(decisions, list):
+                            decisions = []
+
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        original_ai_dict = self._extract_last_ai_message_dict(pending_msgs_dicts)
+                        parallel_calls = []
+                        if original_ai_dict is not None:
+                            parallel_calls = original_ai_dict.get('tool_calls') \
+                                or original_ai_dict.get('data', {}).get('tool_calls') \
+                                or []
+
+                        resume_ctx = {
+                            'parallel_calls': list(parallel_calls),
+                            'content': (original_ai_dict or {}).get('content', '')
+                                if isinstance(original_ai_dict, dict) else '',
+                            'hitl_decisions': list(decisions),
+                        }
+                        if original_ai_dict is not None:
+                            resume_ctx['original_ai_message'] = original_ai_dict
+                        if pending_msgs_dicts:
+                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                            if trimmed:
+                                resume_ctx['pending_messages'] = trimmed
+                        hitl_resume_ctx = resume_ctx
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+
+                        # Persist each per-child decision to state for the
+                        # blocked-tool set + audit trail (reducer appends).
+                        persisted = []
+                        for d in decisions:
+                            if not isinstance(d, dict):
+                                continue
+                            persisted.append({
+                                'tool_name': d.get('tool_name', ''),
+                                'toolkit_name': d.get('toolkit_name', ''),
+                                'toolkit_type': d.get('toolkit_type', ''),
+                                'action': d.get('action', 'approve'),
+                                'action_label': d.get('action_label', ''),
+                                'user_feedback': d.get('value', ''),
+                                'tool_call_id': d.get('tool_call_id', ''),
+                            })
+                        if persisted:
+                            self.update_state(config, {'hitl_decisions': persisted})
+                        logger.info(
+                            "[HITL] Resuming %d parallel sub-agent decision(s)",
+                            len(persisted),
+                        )
 
                     result = super().invoke(
                         Command(resume=hitl_resume_value),
@@ -2061,8 +2160,17 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # execution path, but override the output and attach HITL metadata.
 
                 # Strip internal-only fields (e.g. unmasked tool args) before logging
-                # or returning results that will be emitted to UI clients.
-                hitl_for_ui = {k: v for k, v in hitl_interrupt.items() if k not in ('tool_args_raw', '_pending_messages', '_parent_tool_name', '_parent_tool_args')}
+                # or returning results that will be emitted to UI clients. The
+                # plural form (issue #4993) unpacks a parallel sub-agent
+                # aggregate into one entry per paused child; for a single
+                # interrupt it is a one-element list and hitl_interrupt stays the
+                # first element for back-compat.
+                hitl_interrupts_for_ui = self._strip_hitl_ui_keys(
+                    self._get_hitl_interrupts(config_state)
+                )
+                hitl_for_ui = (
+                    hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
+                )
                 logger.info(f"[HITL] Execution paused at HITL node: {hitl_for_ui}")
 
                 result_with_state = {
@@ -2070,6 +2178,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     "thread_id": thread_id,
                     "execution_finished": False,
                     "hitl_interrupt": hitl_for_ui,
+                    "hitl_interrupts": hitl_interrupts_for_ui,
                 }
 
                 if hasattr(config_state, 'values') and config_state.values:
@@ -2086,39 +2195,84 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             elif (printer_output := result.get(PRINTER_NODE_RS)) == PRINTER_COMPLETED_STATE:
                 # Printer completed, extract last AI message
                 messages = result['messages']
-                output = next(
-                    (normalize_message_content(msg.content) for msg in reversed(messages)
-                     if not isinstance(msg, HumanMessage)),
-                    normalize_message_content(messages[-1].content) if messages else None
-                ) if messages else result.get('output')
+                # Skip messages whose normalized content is empty (Sonnet 4.5/4.6 returns
+                # AIMessage(content=[]) in synthesis turns — issue #5057).
+                output = None
+                for _msg in reversed(messages):
+                    if isinstance(_msg, HumanMessage):
+                        continue
+                    _normed_check = normalize_message_content(_msg.content).strip()
+                    if _normed_check:
+                        output = normalize_message_content(_msg.content)
+                        break
+                if output is None:
+                    output = (
+                        normalize_message_content(messages[-1].content) if messages else None
+                    ) if messages else result.get('output')
             elif printer_output is not None:
                 # Printer node has output (interrupted state)
                 output = normalize_message_content(printer_output) if not isinstance(printer_output, str) else printer_output
             else:
-                # No printer node, extract last AI message from messages
+                # No printer node, extract last non-Human message with non-empty content.
+                # Skip messages whose normalized content is empty — Sonnet 4.5/4.6 returns
+                # AIMessage(content=[]) in synthesis turns after tool calls (issue #5057).
                 messages = result.get('messages', [])
-                output = next(
-                    (normalize_message_content(msg.content) for msg in reversed(messages)
-                     if not isinstance(msg, HumanMessage)),
-                    None
-                )
+                output = None
+                for _msg in reversed(messages):
+                    if isinstance(_msg, HumanMessage):
+                        continue
+                    _normed_check = normalize_message_content(_msg.content).strip()
+                    if _normed_check:
+                        output = normalize_message_content(_msg.content)
+                        break
         except Exception as exc:
             logger.warning("[OUTPUT] Exception during output extraction: %s", exc, exc_info=True)
             # If pipeline was blocked, we already have the output — use it
             if _blocked_output is not None:
                 output = _blocked_output
             else:
-                # Fallback: try to extract from messages first, then last state value
+                # Fallback: try to extract from messages first, then last state value.
+                # Skip messages whose normalized content is empty (issue #5057).
                 messages = result.get('messages', []) if isinstance(result, dict) else []
-                output = next(
-                    (normalize_message_content(msg.content) for msg in reversed(messages)
-                     if hasattr(msg, 'content') and not isinstance(msg, HumanMessage)),
-                    None,
-                )
+                output = None
+                for _msg in reversed(messages):
+                    if not hasattr(_msg, 'content') or isinstance(_msg, HumanMessage):
+                        continue
+                    _normed_check = normalize_message_content(_msg.content).strip()
+                    if _normed_check:
+                        output = normalize_message_content(_msg.content)
+                        break
                 if output is None:
                     output = str(list(result.values())[-1]) if result else 'Output is undefined'
         config_state = self.get_state(config)
         is_execution_finished = not config_state.next
+
+        # ── Track 2 (#4993): parallel sub-agent park-by-returning ───────────
+        # The LLMNode parked a multi-Application fan-out: it wrote child specs
+        # into the parallel_tasks channel and returned without running them, so
+        # LangGraph routed to END (config_state.next is empty → looks finished).
+        # Override: this is NOT a finished run — the parent must be re-invoked
+        # with parallel_reconcile once its children settle. Preserve thread_id
+        # (the re-invocation keys off it) and surface the dispatch specs so the
+        # indexer can hand them to pylon_main. Intercept BEFORE the normal-path
+        # is_execution_finished/thread_id logic so the parked shape survives.
+        _pt_state = config_state.values if (hasattr(config_state, 'values') and config_state.values) else {}
+        _parked = _pt_state.get('parallel_tasks') or {}
+        if isinstance(_parked, dict) and _parked.get('parked'):
+            children = _parked.get('children') or {}
+            logger.info(
+                "[PARALLEL] parent parked with %d child(ren) for durable dispatch "
+                "(thread_id=%s)", len(children), thread_id,
+            )
+            return {
+                "output": None,
+                "thread_id": thread_id,
+                "execution_finished": False,
+                "parallel_parked": True,
+                "parallel_dispatch": list(children.values()),
+                "messages": _pt_state.get('messages', []),
+            }
+
         if is_execution_finished:
             thread_id = None
 
@@ -2134,13 +2288,18 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         terminal_output = extract_terminal_state_output(state_values, getattr(self, '_terminal_output_variables', None))
         if terminal_output is not None:
             output = terminal_output
-        elif output is None:
+        elif not output:
             # Last-resort fallback when no terminal output variable is declared:
             # surface the most recently written non-internal state value before
-            # falling back to the sentinel string.
+            # falling back to the sentinel string. Covers both None and '' (issue #5057).
             output = extract_state_fallback_output(state_values)
 
-        final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and output is None else output
+        # `messages` may be unbound if the _blocked_output or printer_output (interrupted)
+        # branches ran — define it here so the sentinel f-string below is always safe.
+        if 'messages' not in locals():
+            messages = result.get('messages', []) if isinstance(result, dict) else []
+
+        final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and not output else output
 
         result_with_state = {
             "output": final_output,
@@ -2198,6 +2357,134 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         return result_with_state
 
     # =========================================================================
+    # Parallel sub-agent reconcile (Track 2, issue #4993)
+    # =========================================================================
+
+    def _read_child_result(self, child_thread_id):
+        """Read one parallel child's terminal output from its OWN checkpoint.
+
+        Track 2 (#4993) reconcile-assembly source. The child ran as an
+        independent durable task (a separate fork-pool process) but wrote to the
+        SAME checkpointer keyed by ``child_thread_id``, so the parent reads it
+        back here — NOT from the ephemeral arbiter result. Returns
+        ``(status, output)`` where status is ``'completed' | 'paused' | 'missing'``.
+        Output is taken from an explicit ``output`` channel when present, else
+        from the last non-Human message — mirroring how the runnable derives a
+        run's output, so it is robust whether or not ``output`` is a declared
+        state channel.
+        """
+        if not child_thread_id or not self.checkpointer:
+            return 'missing', None
+        child_config = {'configurable': {'thread_id': child_thread_id}}
+        try:
+            child_state = self.get_state(child_config)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "[PARALLEL] reconcile: failed to read child checkpoint %s: %s",
+                child_thread_id, e,
+            )
+            return 'missing', None
+        values = child_state.values if (hasattr(child_state, 'values') and child_state.values) else {}
+        if not values:
+            return 'missing', None
+        # A child still pending an interrupt has a non-empty next — NOT terminal.
+        # Post-gate this should not happen (pylon_main only reconciles once every
+        # child is terminal), but report it rather than fabricate an empty result.
+        if getattr(child_state, 'next', None):
+            return 'paused', None
+        # Guard on `is None`, not falsiness: a child whose explicit `output`
+        # channel is a legitimate empty string must round-trip as-is. Treating
+        # '' as missing would fall through to message-scanning and substitute a
+        # different (last non-Human) message's content (Copilot review, #325).
+        output = values.get('output')
+        if output is None:
+            messages = values.get('messages', []) or []
+            output = next(
+                (normalize_message_content(m.content) for m in reversed(messages)
+                 if hasattr(m, 'content') and not isinstance(m, HumanMessage)),
+                None,
+            )
+        return 'completed', output
+
+    def _assemble_parallel_reconcile(self, config):
+        """Build ToolMessages for a parked parent's settled children (#4993).
+
+        Reads the parent checkpoint's ``parallel_tasks`` channel for the child
+        specs, then reads EACH child's own checkpoint to collect its output,
+        producing one ToolMessage per child keyed by the PARENT Application
+        ``tool_call_id`` (so the parked AIMessage's dangling tool_calls are all
+        satisfied and the LLM can synthesize on the next turn). ToolMessages are
+        ordered by the original tool_call index. Returns
+        ``(tool_messages, all_terminal)``.
+        """
+        from langchain_core.messages import ToolMessage
+        parent_state = self.get_state(config)
+        values = parent_state.values if (hasattr(parent_state, 'values') and parent_state.values) else {}
+        parked = values.get('parallel_tasks') or {}
+        children = parked.get('children') or {}
+        ordered = sorted(children.values(), key=lambda c: c.get('index', 0))
+        tool_messages = []
+        all_terminal = True
+        for spec in ordered:
+            tool_call_id = spec.get('tool_call_id')
+            status, output = self._read_child_result(spec.get('child_thread_id'))
+            if status == 'paused':
+                all_terminal = False
+            if status == 'missing':
+                output = (
+                    f"Sub-agent '{spec.get('display_name') or spec.get('name')}' "
+                    "produced no result."
+                )
+            tool_messages.append(ToolMessage(
+                content=output if output is not None else '',
+                tool_call_id=tool_call_id,
+            ))
+        return tool_messages, all_terminal
+
+    def _resume_parallel_reconcile(self, config, thread_id, *args, **kwargs):
+        """Re-enter a parked parent after its children settled (#4993).
+
+        Appends one ToolMessage per child (assembled from child checkpoints),
+        clears the parked flag, and resumes the agent node so the LLM
+        synthesizes the final answer from the tool results. The parked
+        checkpoint is at END (the LLMNode returned without an interrupt), so the
+        update is recorded ``as_node`` the entry node to make the next superstep
+        re-run the agent. ``_tool_call_already_completed`` in the LLMNode skips
+        any duplicate tool_calls the LLM might re-emit, so re-entry is safe.
+        """
+        tool_messages, all_terminal = self._assemble_parallel_reconcile(config)
+        logger.info(
+            "[PARALLEL] reconcile: assembled %d child ToolMessage(s) "
+            "(all_terminal=%s) for thread %s",
+            len(tool_messages), all_terminal, thread_id,
+        )
+        entry_node = self._parallel_reconcile_entry_node()
+        self.update_state(
+            config,
+            {'messages': tool_messages, 'parallel_tasks': None},
+            as_node=entry_node,
+        )
+        return super().invoke(None, config=config, *args, **kwargs)
+
+    def _parallel_reconcile_entry_node(self):
+        """Node to attribute the reconcile state update to (#4993).
+
+        ``update_state(as_node=X)`` makes the next superstep run X's successors.
+        Recording against ``__start__`` routes the next step into the graph's
+        entry node — ``StateDefaultNode`` (which only fills MISSING declared
+        state vars, so it never clobbers the injected ToolMessages) and onward
+        to the agent (LLM) node, or directly to the agent when no
+        StateDefaultNode exists. Either path re-runs the LLM so it synthesizes
+        the final answer from the collected sub-agent ToolMessages.
+
+        NOTE: for a pipeline/flow parent whose fan-out LLM node is mid-graph,
+        re-entering from ``__start__`` would replay upstream nodes; that
+        multi-node-pipeline parent case is out of scope here (chat/predict
+        parents are the supported fan-out parents) and tracked separately.
+        """
+        return '__start__'
+
+    # =========================================================================
     # HITL (Human-in-the-Loop) helpers
     # =========================================================================
 
@@ -2216,6 +2503,65 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     if hasattr(intr, 'value') and isinstance(intr.value, dict):
                         if intr.value.get('type') == 'hitl':
                             return intr.value
+        return None
+
+    @classmethod
+    def _get_hitl_interrupts(cls, state_snapshot) -> list[dict]:
+        """Return all pending HITL interrupts as a flat list (issue #4993).
+
+        A parallel sub-agent fan-out raises ONE aggregated interrupt with
+        ``guardrail_type='parallel_sensitive_tools'`` whose ``pending`` list
+        holds one single-shape payload per paused child. Unpack it so callers
+        (and the UI) can treat single and parallel pauses uniformly. A normal
+        single interrupt is wrapped into a one-element list. Returns [] when no
+        interrupt is pending.
+        """
+        interrupt_value = cls._get_hitl_interrupt(state_snapshot)
+        if not interrupt_value:
+            return []
+        if interrupt_value.get('guardrail_type') == 'parallel_sensitive_tools':
+            pending = interrupt_value.get('pending') or []
+            return [p for p in pending if isinstance(p, dict)]
+        return [interrupt_value]
+
+    # Internal payload keys that must never leak to the UI/transport layer.
+    _HITL_INTERNAL_KEYS = (
+        'tool_args_raw', '_pending_messages',
+        '_parent_tool_name', '_parent_tool_args', 'nested_config',
+    )
+
+    @classmethod
+    def _strip_hitl_ui_keys(cls, interrupts: list) -> list:
+        """Drop internal-only keys from each interrupt before returning to caller.
+
+        Internal keys (captured intermediate messages, nested resume config,
+        parent-tool back-references) are needed by the resume path but must not
+        be serialized to the indexer/UI.
+        """
+        cleaned = []
+        for entry in interrupts:
+            if not isinstance(entry, dict):
+                continue
+            cleaned.append({
+                k: v for k, v in entry.items()
+                if k not in cls._HITL_INTERNAL_KEYS
+            })
+        return cleaned
+
+    @staticmethod
+    def _extract_last_ai_message_dict(pending_msgs_dicts: list) -> Optional[dict]:
+        """Return the last serialized AIMessage dict from captured pending messages.
+
+        Used to rebuild the synthetic N-tool-call completion on a parallel
+        sub-agent resume — that AIMessage owns all the fanned-out Application
+        tool_calls. Returns None when none is present.
+        """
+        if not pending_msgs_dicts:
+            return None
+        for i in range(len(pending_msgs_dicts) - 1, -1, -1):
+            msg_dict = pending_msgs_dicts[i]
+            if isinstance(msg_dict, dict) and msg_dict.get('type') == 'ai':
+                return msg_dict
         return None
 
     @staticmethod
@@ -2382,12 +2728,30 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if input_data.get('hitl_resume') is True:
             return True
 
+        # Parallel multi-interrupt resume: a list of per-child decisions.
+        if isinstance(input_data.get('hitl_decisions'), list) and input_data['hitl_decisions']:
+            return True
+
         action = input_data.get('hitl_action') or input_data.get('action')
         if not isinstance(action, str):
             return False
 
         normalized_action = action.strip().lower()
         return normalized_action in {'approve', 'reject', 'edit'}
+
+    @staticmethod
+    def _is_parallel_reconcile(input_data) -> bool:
+        """True when this invocation is a parked-parent reconcile pass (#4993).
+
+        pylon_main re-invokes the parked parent with a ``parallel_reconcile``
+        marker (the reconcile epoch id) once every child sub-agent task is
+        terminal. The payload carries no message body, so — like an HITL resume
+        — it must bypass the empty-input guard and route to the reconcile
+        branch instead of starting a fresh turn.
+        """
+        if not isinstance(input_data, dict):
+            return False
+        return bool(input_data.get('parallel_reconcile'))
 
     @staticmethod
     def _extract_hitl_resume(input_data: dict) -> dict:
@@ -2408,10 +2772,19 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if value is None:
             value = input_data.get("value", "")
 
-        return {
+        resume = {
             "action": action,
             "value": value,
         }
+
+        # Parallel multi-interrupt resume (issue #4993): carry the per-child
+        # decision map through so __perform_tool_calling can route each
+        # approve/reject back to the correct paused sub-agent.
+        decisions = input_data.get("hitl_decisions")
+        if isinstance(decisions, list) and decisions:
+            resume["hitl_decisions"] = decisions
+
+        return resume
 
     def _is_at_static_interrupt(self, checkpoint_state) -> bool:
         """Check if the graph is paused at a compile-time static interrupt.

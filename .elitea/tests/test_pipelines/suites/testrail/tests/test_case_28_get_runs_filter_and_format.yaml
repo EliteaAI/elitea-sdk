@@ -1,0 +1,100 @@
+name: "TR28 get runs filter and format"
+priority: High
+description: |
+  Verify the get_runs tool supports filtering (run_filter) and markdown output.
+
+  Objective: Test run filtering and output format flexibility.
+
+  Expected Behavior:
+  - Tool executes successfully with a run_filter for active runs and markdown format
+  - Returns matching runs (or an empty list) in markdown format
+  - No errors or exceptions
+
+toolkits:
+  - id: ${TESTRAIL_TOOLKIT_ID}
+    name: ${TESTRAIL_TOOLKIT_NAME}
+
+state:
+  project_id:
+    type: str
+    value: "${TESTRAIL_PROJECT_ID}"
+  run_filter:
+    type: str
+    value: '{"is_completed": 0}'
+  output_format:
+    type: str
+    value: "markdown"
+  tool_result:
+    type: dict
+  test_results:
+    type: dict
+
+entry_point: invoke_get_runs
+
+nodes:
+  - id: invoke_get_runs
+    type: toolkit
+    tool: get_runs
+    toolkit_name: ${TESTRAIL_TOOLKIT_NAME}
+    input:
+      - project_id
+      - run_filter
+      - output_format
+    input_mapping:
+      project_id:
+        type: fstring
+        value: "{project_id}"
+      run_filter:
+        type: variable
+        value: run_filter
+      output_format:
+        type: variable
+        value: output_format
+    output:
+      - tool_result
+    structured_output: true
+    transition: validate_result
+
+  - id: validate_result
+    type: llm
+    input:
+      - tool_result
+    input_mapping:
+      system:
+        type: fixed
+        value: "You are a quality assurance validator."
+      task:
+        type: fstring
+        value: |
+          Analyze the tool execution results and determine if the test passed.
+
+          tool executed: get_runs (run_filter for active runs, markdown output)
+          results: {tool_result}
+
+          expected behavior:
+          - tool executed successfully with the filter applied and markdown output format
+          - returned matching runs (or an empty list) without errors
+          - data is properly formatted as markdown when runs are present
+          - no errors or exceptions
+
+          Evaluate:
+          1. did the tool execute successfully?
+          2. are there any errors?
+          3. is the output a valid (possibly empty) markdown-formatted run list?
+
+          Return a JSON object with:
+          {{
+            "test_passed": true/false,
+            "summary": "brief description of outcome",
+            "error": "error details if failed, null if passed"
+          }}
+
+          Return **ONLY** the JSON object. No markdown formatting, no additional text.
+      chat_history:
+        type: fixed
+        value: []
+    output:
+      - test_results
+    structured_output_dict:
+      test_results: "dict"
+    transition: END

@@ -12,6 +12,13 @@
     "add_file_to_case",
     "get_suites",
     "delete_case",
-    "get_sections"
+    "get_sections",
+    "add_section",
+    "delete_section",
+    "get_run",
+    "get_runs",
+    "get_results_for_run",
+    "get_results_for_case",
+    "get_results"
   ]
 }

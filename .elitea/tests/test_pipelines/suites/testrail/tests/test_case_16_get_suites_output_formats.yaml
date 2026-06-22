@@ -38,8 +38,8 @@ nodes:
       - output_format
     input_mapping:
       project_id:
-        type: variable
-        value: project_id
+        type: fstring
+        value: "{project_id}"
       output_format:
         type: variable
         value: output_format
@@ -50,7 +50,6 @@ nodes:
 
   - id: validate_result
     type: llm
-    model: gpt-4o-2024-11-20
     input:
       - tool_result
     input_mapping:

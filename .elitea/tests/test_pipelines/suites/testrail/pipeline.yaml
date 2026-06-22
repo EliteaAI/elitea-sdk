@@ -73,6 +73,18 @@ execution:
     - test_case_20_*.yaml  # TR20 - Get Cases By Filter Empty Project With Keys
     - test_case_21_*.yaml  # TR21 - Get Sections Happy Path
     - test_case_22_*.yaml  # TR22 - Get Sections Output Formats
+    - test_case_23_*.yaml  # TR23 - Add Section Happy Path
+    - test_case_24_*.yaml  # TR24 - Add Section With Parent
+    - test_case_25_*.yaml  # TR25 - Delete Section Happy Path
+    - test_case_26_*.yaml  # TR26 - Delete Section Error Handling
+    - test_case_27_*.yaml  # TR27 - Get Runs Happy Path
+    - test_case_28_*.yaml  # TR28 - Get Runs Filter And Format
+    - test_case_29_*.yaml  # TR29 - Get Run Happy Path
+    - test_case_30_*.yaml  # TR30 - Get Run Error Handling
+    - test_case_31_*.yaml  # TR31 - Get Results For Run Happy Path
+    - test_case_32_*.yaml  # TR32 - Get Results For Run Error Handling
+    - test_case_33_*.yaml  # TR33 - Get Results For Case Error Handling
+    - test_case_34_*.yaml  # TR34 - Get Results Error Handling
 
   # Variables to substitute in test YAML files
   substitutions:
