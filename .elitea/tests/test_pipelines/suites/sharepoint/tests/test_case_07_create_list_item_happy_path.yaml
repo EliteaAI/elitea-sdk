@@ -71,13 +71,12 @@ nodes:
           list title: {list_title}
           provided fields: {item_fields}
           results: {created_item}
-
           expected behavior:
           - tool executes successfully without errors
           - returns object with id and fields properties
           - id is a valid positive integer
           - all provided fields are present in the response
-          - no tool execution error message is present in the result payload
+          - no error messages in output
 
           evaluate:
           1. did the tool execute successfully?
@@ -85,7 +84,7 @@ nodes:
           3. is the id a positive integer?
           4. are the provided fields present in the response?
           5. does the response include the title field value?
-          6. does the result payload itself contain a tool execution error message?
+          6. confirm the result is not a processed error string or exception object.
 
           return a json object with:
           {{
