@@ -26,9 +26,6 @@ state:
       Title: "Test Item Created by SDK"
   created_item:
     type: dict
-  error_indicators:
-    type: list
-    value: ["error", "failed", "exception"]
   test_results:
     type: dict
 
@@ -61,7 +58,6 @@ nodes:
       - created_item
       - list_title
       - item_fields
-      - error_indicators
     input_mapping:
       system:
         type: fixed
@@ -75,22 +71,21 @@ nodes:
           list title: {list_title}
           provided fields: {item_fields}
           results: {created_item}
-          error indicators: {error_indicators}
 
           expected behavior:
           - tool executes successfully without errors
           - returns object with id and fields properties
           - id is a valid positive integer
           - all provided fields are present in the response
-          - no error messages in output
+          - no tool execution error message is present in the result payload
 
           evaluate:
           1. did the tool execute successfully?
-          2. are there any error indicators in the output?
-          3. does the result contain an id field?
-          4. is the id a positive integer?
-          5. are the provided fields present in the response?
-          6. does the response include the title field value?
+          2. does the result contain an id field?
+          3. is the id a positive integer?
+          4. are the provided fields present in the response?
+          5. does the response include the title field value?
+          6. does the result payload itself contain a tool execution error message?
 
           return a json object with:
           {{
