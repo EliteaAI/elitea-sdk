@@ -533,6 +533,64 @@ class TestSharingLinkFileValidation:
         # Size is None - should only check file type
         wrapper._validate_sharing_link_file("document.pdf", None)
 
+    def test_max_size_for_file_classifies_images_vs_documents(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        image_cap = 3 * 1024 * 1024
+        default_cap = 20 * 1024 * 1024
+
+        for name in ("photo.png", "pic.JPG", "x.jpeg", "anim.gif",
+                     "shot.webp", "old.bmp"):
+            assert wrapper._max_size_for_file(name) == image_cap
+
+        # SVG is treated as a document (like chat) -> default limit
+        assert wrapper._max_size_for_file("diagram.svg") == default_cap
+
+        for name in ("report.pdf", "data.xlsx", "code.py", "noext"):
+            assert wrapper._max_size_for_file(name) == default_cap
+
+    def test_rejects_image_exceeding_image_size_limit(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        file_size = 5 * 1024 * 1024
+
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("screenshot.png", file_size)
+
+        message = str(exc_info.value).lower()
+        assert "too large" in message
+        assert "3 mb" in message
+        assert "images" in message
+
+    def test_accepts_image_at_image_size_limit(self):
+        """An image exactly at the 3 MB cap is accepted."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # Exactly 3 MB - should not raise
+        wrapper._validate_sharing_link_file("photo.jpg", 3 * 1024 * 1024)
+
+    def test_accepts_large_svg_as_document(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+
+        # 10 MB SVG: over the 3 MB image cap but under the 20 MB document limit
+        wrapper._validate_sharing_link_file("diagram.svg", 10 * 1024 * 1024)
+
     def test_rejects_rar_archive(self):
         """RAR archives are rejected."""
         wrapper = SharepointGraphWrapper(

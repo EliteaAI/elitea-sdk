@@ -1914,6 +1914,23 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     # ------------------------------------------------------------------ #
 
     _SHARING_LINK_MAX_SIZE = 20 * 1024 * 1024
+    _SHARING_LINK_MAX_IMAGE_SIZE = 3 * 1024 * 1024
+
+    def _max_size_for_file(self, file_name: str) -> int:
+        """Return the max allowed size in bytes for a file based on its type.
+
+        Non-SVG images are processed as images by the LLM and capped at 3 MB,
+        matching chat attachments. SVG is intentionally excluded: like chat
+        attachments it is handled as a document and keeps the default 20 MB
+        limit. All other supported files also use the default 20 MB limit.
+        """
+        from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
+
+        ext = ('.' + file_name.rsplit('.', 1)[-1].lower()) if '.' in file_name else ''
+        mime_type = (loaders_map.get(ext) or {}).get('mime_type', '')
+        if mime_type.startswith('image/') and ext != '.svg':
+            return self._SHARING_LINK_MAX_IMAGE_SIZE
+        return self._SHARING_LINK_MAX_SIZE
 
     def _stream_download_to_tempfile(
         self,
@@ -1922,6 +1939,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         timeout: int = 120,
         headers: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        max_size: Optional[int] = None,
     ) -> str:
         """Stream download a file to a temporary file with size limit enforcement.
 
@@ -1941,11 +1959,13 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         Raises:
             ToolException: If download exceeds size limit or fails
         """
+        if max_size is None:
+            max_size = self._max_size_for_file(file_name)
         try:
             return stream_download_to_tempfile(
                 url=url,
                 file_name=file_name,
-                max_size=self._SHARING_LINK_MAX_SIZE,
+                max_size=max_size,
                 timeout=timeout,
                 headers=headers,
                 cookies=cookies,
@@ -1973,13 +1993,14 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """
         from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
 
-        # Check file size
-        if file_size is not None and file_size > self._SHARING_LINK_MAX_SIZE:
+        max_size = self._max_size_for_file(file_name)
+        if file_size is not None and file_size > max_size:
             size_mb = file_size / (1024 * 1024)
-            max_mb = self._SHARING_LINK_MAX_SIZE / (1024 * 1024)
+            max_mb = max_size / (1024 * 1024)
             raise ToolException(
                 f"File '{file_name}' is too large ({size_mb:.1f} MB). "
-                f"Maximum supported size for sharing links is {max_mb:.0f} MB."
+                f"Maximum supported size is {max_mb:.0f} MB "
+                f"({'images' if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE else 'files'})."
             )
 
         # Check file extension against loaders_map
@@ -1996,7 +2017,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise ToolException(
                 f"File type '{ext}' is not supported. "
                 f"Supported formats include documents (PDF, DOCX, XLSX, PPTX), "
-                f"text files, images (PNG, JPG), and common code files."
+                f"text files (TXT, MD, CSV, JSON, HTML, XML), "
+                f"images (PNG, JPG, JPEG, GIF, WEBP, BMP, SVG), "
+                f"and common code files. Archives (ZIP, RAR), media (MP4, MP3), "
+                f"and executables are not supported."
             )
 
         # Check for double-extension attack (e.g., malware.zip.pdf)
