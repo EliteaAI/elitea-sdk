@@ -14,6 +14,8 @@
 import io
 import logging
 import os
+import zipfile
+from dataclasses import dataclass
 from typing import Iterator, List, Optional, Union
 import pandas as pd
 from json import loads
@@ -27,6 +29,35 @@ from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
 logger = logging.getLogger(__name__)
 
 cell_delimiter = " | "
+
+EXCEL_MAX_REQUEST_ROWS = 10_000
+EXCEL_MAX_IMAGE_COUNT = 32
+EXCEL_SAMPLE_ROW_LIMIT = 10
+EXCEL_MAX_FULL_READ_FILE_SIZE = 20 * 1024 * 1024
+EXCEL_READ_LIMIT_ERROR = (
+    "Excel read request exceeds safety limits. Use get_file_metadata to inspect sheets "
+    "and call read_file with extra_params using a smaller start_row/end_row range."
+)
+
+
+@dataclass
+class ExcelReadEstimate:
+    """Structured estimate for an Excel read request."""
+
+    sheets: List[dict]
+    total_rows_workbook: int
+    target_sheet: Optional[str]
+    target_sheet_total_rows: int
+    requested_start_row: int
+    requested_end_row: int
+    requested_rows: int
+    sampled_rows: int
+    sampled_chars: int
+    estimated_output_chars: int
+    embedded_images: int
+    file_size_bytes: Optional[int]
+    is_unbounded_read: bool
+    violations: List[str]
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +75,172 @@ def _open_source(file_name: Optional[str], source: Union[str, bytes, io.BytesIO]
     ref_name = file_name if file_name else (source if isinstance(source, str) else "")
     extension = os.path.splitext(ref_name)[-1].lower()
     return extension, source
+
+
+def _read_binary_source(source: Union[str, bytes, io.BytesIO]) -> bytes:
+    """Return workbook bytes for lightweight metadata inspection."""
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, bytearray):
+        return bytes(source)
+    if isinstance(source, io.BytesIO):
+        position = source.tell()
+        try:
+            source.seek(0)
+            return source.read()
+        finally:
+            source.seek(position)
+    with open(source, "rb") as file_obj:
+        return file_obj.read()
+
+
+def _get_source_size(source: Union[str, bytes, io.BytesIO]) -> Optional[int]:
+    """Return raw workbook size in bytes when it can be determined cheaply."""
+    if isinstance(source, bytes):
+        return len(source)
+    if isinstance(source, bytearray):
+        return len(source)
+    if isinstance(source, io.BytesIO):
+        position = source.tell()
+        try:
+            source.seek(0, io.SEEK_END)
+            return source.tell()
+        finally:
+            source.seek(position)
+    try:
+        return os.path.getsize(source)
+    except OSError:
+        return None
+
+
+def _count_xlsx_images(source: Union[str, bytes, io.BytesIO],
+                       file_name: Optional[str] = None) -> int:
+    """Count embedded images in OOXML workbooks using zip metadata only."""
+    extension, _ = _open_source(file_name, source)
+    if extension not in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
+        return 0
+
+    if isinstance(source, str):
+        archive_source = source
+    else:
+        archive_source = io.BytesIO(_read_binary_source(source))
+
+    with zipfile.ZipFile(archive_source) as archive:
+        return sum(
+            1 for name in archive.namelist()
+            if name.startswith("xl/media/") and not name.endswith("/")
+        )
+
+
+def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
+                            *,
+                            file_name: Optional[str] = None,
+                            sheet_name: Optional[str] = None,
+                            start_row: Optional[int] = None,
+                            end_row: Optional[int] = None,
+                            max_output_chars: int = 200000,
+                            raise_on_violation: bool = False) -> ExcelReadEstimate:
+    """Estimate an Excel request and optionally reject unsafe reads."""
+    extension, openable = _open_source(file_name, source)
+    sheets = list_excel_sheets(source, file_name=file_name)
+    total_rows_workbook = sum(sheet.get("max_row", 0) or 0 for sheet in sheets)
+
+    target_sheet_info = None
+    if sheet_name:
+        target_sheet_info = next((sheet for sheet in sheets if sheet["name"] == sheet_name), None)
+        if target_sheet_info is None:
+            raise ValueError(
+                f"Sheet '{sheet_name}' not found. Available: {[sheet['name'] for sheet in sheets]}"
+            )
+    elif sheets:
+        target_sheet_info = sheets[0]
+
+    target_sheet = target_sheet_info["name"] if target_sheet_info else None
+    target_sheet_total_rows = target_sheet_info.get("max_row", 0) if target_sheet_info else 0
+    file_size_bytes = _get_source_size(source)
+    requested_start_row = start_row if start_row is not None and start_row > 0 else 1
+    requested_end_row = end_row if end_row is not None else target_sheet_total_rows
+    if target_sheet_total_rows > 0:
+        requested_end_row = min(requested_end_row, target_sheet_total_rows)
+    requested_rows = 0
+    if target_sheet_total_rows > 0 and requested_start_row <= requested_end_row:
+        requested_rows = requested_end_row - requested_start_row + 1
+
+    embedded_images = 0
+    if extension in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
+        embedded_images = _count_xlsx_images(source, file_name=file_name)
+
+    is_unbounded_read = (
+        start_row is None and end_row is None and requested_rows == target_sheet_total_rows
+    )
+
+    violations = []
+    if is_unbounded_read and file_size_bytes is not None and file_size_bytes > EXCEL_MAX_FULL_READ_FILE_SIZE:
+        violations.append(
+            f"file size={file_size_bytes} exceeds full-read limit {EXCEL_MAX_FULL_READ_FILE_SIZE}"
+        )
+    if requested_rows > EXCEL_MAX_REQUEST_ROWS:
+        violations.append(
+            f"requested rows={requested_rows} exceeds limit {EXCEL_MAX_REQUEST_ROWS}"
+        )
+    if embedded_images > EXCEL_MAX_IMAGE_COUNT:
+        violations.append(
+            f"embedded images={embedded_images} exceeds limit {EXCEL_MAX_IMAGE_COUNT}"
+        )
+
+    sample_end_row = requested_end_row
+    sampled_rows = 0
+    sampled_chars = 0
+    estimated_output_chars = 0
+    if not violations and target_sheet and requested_rows > 0:
+        sample_end_row = min(
+            requested_end_row,
+            requested_start_row + EXCEL_SAMPLE_ROW_LIMIT - 1,
+        )
+        sampled_rows = sample_end_row - requested_start_row + 1
+        sample_result = read_excel_rows(
+            openable,
+            sheet_name=target_sheet,
+            start_row=requested_start_row,
+            end_row=sample_end_row,
+            include_headers=False,
+            file_name=file_name,
+        )
+        sampled_chars = len(sample_result.get("content", ""))
+        estimated_output_chars = sampled_chars
+        if requested_rows > sampled_rows and sampled_rows > 0:
+            estimated_output_chars = int((sampled_chars / sampled_rows) * requested_rows)
+
+    if sampled_chars > max_output_chars:
+        violations.append(
+            f"sampled output size={sampled_chars} exceeds limit {max_output_chars}"
+        )
+    elif estimated_output_chars > max_output_chars:
+        violations.append(
+            f"estimated output size={estimated_output_chars} exceeds limit {max_output_chars}"
+        )
+
+    estimate = ExcelReadEstimate(
+        sheets=sheets,
+        total_rows_workbook=total_rows_workbook,
+        target_sheet=target_sheet,
+        target_sheet_total_rows=target_sheet_total_rows,
+        requested_start_row=requested_start_row,
+        requested_end_row=requested_end_row,
+        requested_rows=requested_rows,
+        sampled_rows=sampled_rows,
+        sampled_chars=sampled_chars,
+        estimated_output_chars=estimated_output_chars,
+        embedded_images=embedded_images,
+        file_size_bytes=file_size_bytes,
+        is_unbounded_read=is_unbounded_read,
+        violations=violations,
+    )
+
+    if violations and raise_on_violation:
+        raise ValueError(f"{EXCEL_READ_LIMIT_ERROR} Details: {'; '.join(violations)}")
+
+    return estimate
 
 
 def list_excel_sheets(source: Union[str, bytes, io.BytesIO],
@@ -140,9 +337,7 @@ def _format_row_cells(cells) -> str:
 
 def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
                     include_headers, header_row):
-    # Use read_only=False so we get Cell objects with hyperlink support,
-    # matching the formatting of the full parse_sheet path.
-    wb = load_workbook(openable, read_only=False, data_only=True)
+    wb = load_workbook(openable, read_only=True, data_only=True)
     try:
         if sheet_name is None:
             sheet_name = wb.sheetnames[0]
@@ -156,14 +351,14 @@ def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
 
         header_line = None
         if include_headers and header_row >= 1:
-            for row in ws.iter_rows(min_row=header_row, max_row=header_row):
-                header_line = _format_row_cells(row)
+            for row in ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True):
+                header_line = _format_row(row)
                 break
 
         body_rows = []
         if start_row <= effective_end:
-            for row in ws.iter_rows(min_row=start_row, max_row=effective_end):
-                body_rows.append(_format_row_cells(row))
+            for row in ws.iter_rows(min_row=start_row, max_row=effective_end, values_only=True):
+                body_rows.append(_format_row(row))
 
         lines = []
         if header_line is not None and (start_row > header_row or not body_rows
@@ -248,9 +443,24 @@ class EliteAExcelLoader(EliteATableLoader):
         the extra_params that ``read_file`` can accept.
         """
         sheets: List[dict] = []
+        read_limits = {
+            "max_request_rows": EXCEL_MAX_REQUEST_ROWS,
+            "max_embedded_images": EXCEL_MAX_IMAGE_COUNT,
+            "max_output_chars": 200000,
+            "max_full_read_file_size": EXCEL_MAX_FULL_READ_FILE_SIZE,
+        }
         if file_content:
             try:
-                sheets = list_excel_sheets(file_content, file_name=filename)
+                estimate = check_excel_read_limits(file_content, file_name=filename)
+                sheets = estimate.sheets
+                read_limits["estimated_total_rows"] = estimate.total_rows_workbook
+                read_limits["estimated_request_rows"] = estimate.requested_rows
+                read_limits["estimated_output_chars"] = estimate.estimated_output_chars
+                read_limits["embedded_images"] = estimate.embedded_images
+                read_limits["file_size_bytes"] = estimate.file_size_bytes
+                read_limits["full_read_allowed"] = (
+                    estimate.is_unbounded_read and not estimate.violations
+                )
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning("Failed to list excel sheets for %s: %s",
                                filename, e)
@@ -287,10 +497,16 @@ class EliteAExcelLoader(EliteATableLoader):
             "notes": (
                 "For large workbooks, call read_file with a small "
                 "start_row/end_row range to keep memory and tokens bounded. "
-                "Pass extra_params as a JSON string."
+                "Pass extra_params as a JSON string. Full reads are rejected "
+                "when workbook metadata suggests they exceed safe row, text, "
+                "or embedded-image limits."
             ),
         }
-        return {"sheets": sheets, "instruction_for_readFile": instruction}
+        return {
+            "sheets": sheets,
+            "read_limits": read_limits,
+            "instruction_for_readFile": instruction,
+        }
 
     def __init__(self, **kwargs):
         if not kwargs.get('file_path'):
@@ -336,11 +552,22 @@ class EliteAExcelLoader(EliteATableLoader):
         returns a dict with the streaming row slice instead.
         """
         # Row-range fast path - streams via openpyxl read_only.
+        requested_start_row = self.start_row if self.start_row is not None else 1
+        requested_end_row = self.end_row
+        check_excel_read_limits(
+            self.file_path,
+            file_name=self.file_name,
+            sheet_name=self.sheet_name,
+            start_row=requested_start_row,
+            end_row=requested_end_row,
+            raise_on_violation=True,
+        )
+
         if self._is_row_range_mode():
             return read_excel_rows(
                 self.file_path,
                 sheet_name=self.sheet_name,
-                start_row=self.start_row if self.start_row is not None else 1,
+                start_row=requested_start_row,
                 end_row=self.end_row,
                 include_headers=bool(self.include_headers),
                 header_row=int(self.header_row) if self.header_row else 1,
