@@ -205,7 +205,7 @@ class HITLNode(Runnable):
                           f"Treating as approve.")
             resume_value = {"action": HITL_ACTION_APPROVE, "value": str(resume_value)}
 
-        action = resume_value.get("action", HITL_ACTION_APPROVE).lower()
+        action = str(resume_value.get("action", HITL_ACTION_APPROVE)).strip().lower()
         value = resume_value.get("value", "")
 
         # 'block_with_comment' / 'reject_with_comment' (issue #5318) are reject
