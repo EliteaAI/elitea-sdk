@@ -448,7 +448,7 @@ class EliteAClient:
                     "openai-organization": str(self.project_id),
                     "Authorization": f"Bearer {self.auth_token}",
                     "anthropic-beta": "prompt-caching-2024-07-31",
-                    **self.api_extra_headers,
+                    **(getattr(self, "api_extra_headers", None) or {}),
                 },
             }
             
@@ -491,8 +491,9 @@ class EliteAClient:
                 "seed": model_config.get("seed", None),
                 "openai_organization": str(self.project_id),
             }
-            if self.api_extra_headers:
-                target_kwargs["default_headers"] = dict(self.api_extra_headers)
+            extra_headers = getattr(self, "api_extra_headers", None) or {}
+            if extra_headers:
+                target_kwargs["default_headers"] = dict(extra_headers)
 
             reasoning_effort = model_config.get("reasoning_effort")
             if reasoning_effort:
