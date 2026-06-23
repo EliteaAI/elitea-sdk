@@ -259,6 +259,41 @@ class ArgsSchema(Enum):
         ),
         extra_params=EXTRA_PARAMS,
     )
+    ExtractDesignTokens = create_model(
+        "ExtractDesignTokens",
+        file_key=(
+            str,
+            Field(
+                description="Figma file key.",
+                examples=["Fp24FuzPwH0L74ODSrCnQo"],
+            ),
+        ),
+        node_id=(
+            str,
+            Field(
+                description=(
+                    "ID of the node to extract design tokens from. "
+                    "Must be a FRAME, COMPONENT, COMPONENT_SET, SECTION, or GROUP — not a PAGE (CANVAS). "
+                    "Hyphens are automatically converted to colons (e.g. '169-14446' → '169:14446')."
+                ),
+                examples=["169:14446"],
+            ),
+        ),
+        depth=(
+            Optional[int],
+            Field(
+                description=(
+                    "How deep to traverse the node tree when fetching from Figma. "
+                    "Use 4 for most frames and components (default). "
+                    "Use 6 for COMPONENT_SET nodes with many variants. "
+                    "Valid range: 1–8."
+                ),
+                default=4,
+                ge=1,
+                le=8,
+            ),
+        ),
+    )
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
@@ -2602,6 +2637,323 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         self._log_tool_event(f"File analysis complete (detail_level={detail_level})")
         return toon_output
 
+    # -------------------------------------------------------------------------
+    # Design Token Extraction
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_node_styles_recursive(
+        node: dict,
+        path: str = "",
+        results: Optional[List[dict]] = None,
+    ) -> List[dict]:
+        """Recursively walk a Figma node tree and collect raw style data.
+
+        Collects fills, strokes, effects, typography (style), and local style
+        references (styles) from every node in the tree.
+
+        Args:
+            node:    A Figma node dict (document field from /files/{key}/nodes).
+            path:    Slash-separated path built during recursion (for traceability).
+            results: Accumulator list; a new list is created when None.
+
+        Returns:
+            List of dicts, one per node that carries at least one style property:
+            {
+                "path":       "Parent/Child/Name",
+                "type":       "FRAME" | "TEXT" | "VECTOR" | ...,
+                "fills":      [ {type, color, opacity, ...} ],   # IMAGE fills excluded
+                "strokes":    [ {type, color, ...} ],
+                "effects":    [ {type, visible, color, offset, radius, ...} ],
+                "typography": { fontFamily, fontSize, fontWeight, lineHeightPx,
+                                letterSpacing, textAlignHorizontal },
+                "style_refs": { fill: "S:id", text: "S:id", ... },
+            }
+        """
+        if results is None:
+            results = []
+
+        name = node.get("name", "")
+        ntype = node.get("type", "")
+        current_path = f"{path}/{name}" if path else name
+
+        # Fills — exclude IMAGE type and alpha=0 (invisible)
+        raw_fills = node.get("fills", [])
+        fills = [
+            f for f in raw_fills
+            if f.get("type") != "IMAGE"
+            and (f.get("color", {}).get("a", 1.0) > 0 or f.get("type") != "SOLID")
+        ]
+
+        # Strokes
+        strokes = node.get("strokes", [])
+
+        # Effects — exclude invisible
+        effects = [e for e in node.get("effects", []) if e.get("visible", True)]
+
+        # Typography — only when fontFamily is present
+        style = node.get("style", {})
+        typography: dict = {}
+        if style.get("fontFamily"):
+            typography = {
+                k: style[k]
+                for k in (
+                    "fontFamily", "fontSize", "fontWeight",
+                    "lineHeightPx", "letterSpacing", "textAlignHorizontal",
+                )
+                if k in style
+            }
+
+        # Local style node ID references
+        style_refs = node.get("styles", {})
+
+        has_style = any([fills, strokes, effects, typography, style_refs])
+        if has_style:
+            results.append({
+                "path":       current_path,
+                "type":       ntype,
+                "fills":      fills,
+                "strokes":    strokes,
+                "effects":    effects,
+                "typography": typography,
+                "style_refs": style_refs,
+            })
+
+        for child in node.get("children", []):
+            FigmaApiWrapper._extract_node_styles_recursive(child, current_path, results)
+
+        return results
+
+    @staticmethod
+    def _dedup_colors(entries: List[dict]) -> List[dict]:
+        """Deduplicate fill colors across all entries.
+
+        Dedup key is (hex, rounded_alpha) so the same hex at different opacities
+        produces separate tokens — e.g. #1C756A at alpha=1.0 and #1C756A at
+        alpha=0.3 are distinct design tokens (overlay vs. solid usage).
+
+        Gradient fills are expanded into their individual gradient stops.
+        Invisible fills (alpha=0) are always excluded.
+        """
+        seen: dict = {}  # (hex, alpha_key) -> token dict (keeps first occurrence)
+        for entry in entries:
+            for fill in entry.get("fills", []):
+                fill_type = fill.get("type", "")
+                if fill_type == "SOLID":
+                    c = fill.get("color", {})
+                    alpha = c.get("a", 1.0)
+                    if alpha == 0.0:
+                        continue
+                    r, g, b = round(c.get("r", 0) * 255), round(c.get("g", 0) * 255), round(c.get("b", 0) * 255)
+                    hex_color = f"#{r:02X}{g:02X}{b:02X}"
+                    # Include alpha in key: same hex at different opacities = different tokens
+                    key = (hex_color, round(alpha, 2))
+                    if key not in seen:
+                        seen[key] = {
+                            "hex":         hex_color,
+                            "alpha":       round(alpha, 4),
+                            "opacity":     round(fill.get("opacity", 1.0), 4),
+                            "source_path": entry["path"],
+                        }
+                elif fill_type in ("GRADIENT_LINEAR", "GRADIENT_RADIAL",
+                                   "GRADIENT_ANGULAR", "GRADIENT_DIAMOND"):
+                    for stop in fill.get("gradientStops", []):
+                        c = stop.get("color", {})
+                        alpha = c.get("a", 1.0)
+                        if alpha == 0.0:
+                            continue
+                        r, g, b = round(c.get("r", 0) * 255), round(c.get("g", 0) * 255), round(c.get("b", 0) * 255)
+                        hex_color = f"#{r:02X}{g:02X}{b:02X}"
+                        key = (hex_color, round(alpha, 2))
+                        if key not in seen:
+                            seen[key] = {
+                                "hex":         hex_color,
+                                "alpha":       round(alpha, 4),
+                                "opacity":     1.0,
+                                "source_path": f"{entry['path']} [{fill_type}]",
+                            }
+        return list(seen.values())
+
+    @staticmethod
+    def _dedup_strokes(entries: List[dict]) -> List[dict]:
+        """Deduplicate stroke colors across all entries.
+
+        Handles both SOLID and gradient stroke types. Dedup key includes alpha
+        so the same hex at different opacities produces separate tokens.
+        """
+        seen: dict = {}
+        for entry in entries:
+            for stroke in entry.get("strokes", []):
+                stroke_type = stroke.get("type", "")
+                if stroke_type == "SOLID":
+                    c = stroke.get("color", {})
+                    alpha = c.get("a", 1.0)
+                    if alpha == 0.0:
+                        continue
+                    r, g, b = round(c.get("r", 0) * 255), round(c.get("g", 0) * 255), round(c.get("b", 0) * 255)
+                    hex_color = f"#{r:02X}{g:02X}{b:02X}"
+                    key = (hex_color, round(alpha, 2))
+                    if key not in seen:
+                        seen[key] = {
+                            "hex":         hex_color,
+                            "alpha":       round(alpha, 4),
+                            "source_path": entry["path"],
+                        }
+                elif stroke_type in ("GRADIENT_LINEAR", "GRADIENT_RADIAL",
+                                     "GRADIENT_ANGULAR", "GRADIENT_DIAMOND"):
+                    for stop in stroke.get("gradientStops", []):
+                        c = stop.get("color", {})
+                        alpha = c.get("a", 1.0)
+                        if alpha == 0.0:
+                            continue
+                        r, g, b = round(c.get("r", 0) * 255), round(c.get("g", 0) * 255), round(c.get("b", 0) * 255)
+                        hex_color = f"#{r:02X}{g:02X}{b:02X}"
+                        key = (hex_color, round(alpha, 2))
+                        if key not in seen:
+                            seen[key] = {
+                                "hex":         hex_color,
+                                "alpha":       round(alpha, 4),
+                                "source_path": f"{entry['path']} [{stroke_type}]",
+                            }
+        return list(seen.values())
+
+    @staticmethod
+    def _dedup_typography(entries: List[dict]) -> List[dict]:
+        """Deduplicate typography combinations (family + size + weight) across entries."""
+        seen: dict = {}
+        for entry in entries:
+            t = entry.get("typography", {})
+            if not t.get("fontFamily"):
+                continue
+            key = (t.get("fontFamily"), t.get("fontSize"), t.get("fontWeight"))
+            if key not in seen:
+                seen[key] = {**t, "source_path": entry["path"]}
+        return list(seen.values())
+
+    @staticmethod
+    def _dedup_effects(entries: List[dict]) -> List[dict]:
+        """Deduplicate effects by their full structural signature across entries.
+
+        Signature includes: type, offsetX, offsetY, radius, spread, and the
+        full color RGBA (rounded to 2dp). This prevents collapsing shadows that
+        differ only in color RGB or X-offset.
+        """
+        seen: dict = {}
+        for entry in entries:
+            for eff in entry.get("effects", []):
+                color = eff.get("color") or {}
+                offset = eff.get("offset") or {}
+                sig = (
+                    eff.get("type"),
+                    round(offset.get("x", 0), 2),
+                    round(offset.get("y", 0), 2),
+                    eff.get("radius"),
+                    eff.get("spread"),
+                    round(color.get("r", 0), 2),
+                    round(color.get("g", 0), 2),
+                    round(color.get("b", 0), 2),
+                    round(color.get("a", 0), 2),
+                )
+                if sig not in seen:
+                    seen[sig] = {**eff, "source_path": entry["path"]}
+        return list(seen.values())
+
+    def extract_design_tokens(
+        self,
+        file_key: str,
+        node_id: str,
+        depth: int = 4,
+        **kwargs,
+    ) -> str:
+        """Extract deduplicated design tokens (colors, typography, effects, strokes)
+        from a Figma node and its entire subtree.
+
+        Fetches the node tree at the requested depth and recursively collects all
+        style properties — fills, strokes, effects, and typography — then
+        deduplicates them across the subtree.
+
+        Returns a JSON string with the following structure:
+        {
+          "node_id":   "169:14446",
+          "node_name": "Formula Section",
+          "node_type": "SECTION",
+          "colors":    [{"hex": "#1C756A", "alpha": 1.0, "opacity": 1.0, "source_path": "..."}],
+          "strokes":   [{"hex": "#000000", "alpha": 1.0, "source_path": "..."}],
+          "typography":[{"fontFamily": "Noto Sans", "fontSize": 14.0, "fontWeight": 400, ...}],
+          "effects":   [{"type": "DROP_SHADOW", "radius": 6, ..., "source_path": "..."}],
+          "summary":   {"total_style_entries": 177, "unique_colors": 11,
+                        "unique_fonts": 5, "unique_effects": 5, "unique_strokes": 4}
+        }
+
+        Args:
+            file_key: Figma file key (e.g. "Fp24FuzPwH0L74ODSrCnQo").
+            node_id:  Node ID of a FRAME, COMPONENT, COMPONENT_SET, or SECTION.
+                      Hyphens are auto-converted to colons.
+                      Do NOT pass a PAGE (CANVAS) id — it will return an error.
+            depth:    Tree fetch depth (1–8). Default 4 covers most components.
+                      Use 6–8 for deeply nested COMPONENT_SET nodes.
+
+        Returns:
+            JSON string with deduplicated design tokens.
+
+        Raises:
+            ToolException: If the node is null (likely a PAGE id), the file is
+                           not found, or the API request fails.
+        """
+        # Normalise node id format (URL uses hyphens, API uses colons)
+        node_id = node_id.replace("-", ":")
+
+        try:
+            raw = self._client.api_request(
+                f"files/{file_key}/nodes?ids={node_id}&depth={depth}",
+                method="get",
+            )
+        except ToolException as e:
+            raise ToolException(
+                f"Failed to fetch node '{node_id}' from file '{file_key}': {e}"
+            ) from e
+
+        nodes = (raw or {}).get("nodes") or {}
+        node_wrap = nodes.get(node_id)
+
+        if node_wrap is None:
+            raise ToolException(
+                f"Node '{node_id}' returned null. "
+                "This usually means the ID belongs to a PAGE (CANVAS) node. "
+                "Please provide a FRAME, COMPONENT, COMPONENT_SET, or SECTION node ID. "
+                "Use get_file_structure_toon to discover valid child frame IDs."
+            )
+
+        node_doc = node_wrap.get("document") or {}
+        node_name = node_doc.get("name", "")
+        node_type = node_doc.get("type", "")
+
+        entries = self._extract_node_styles_recursive(node_doc)
+
+        colors     = self._dedup_colors(entries)
+        strokes    = self._dedup_strokes(entries)
+        typography = self._dedup_typography(entries)
+        effects    = self._dedup_effects(entries)
+
+        result = {
+            "node_id":    node_id,
+            "node_name":  node_name,
+            "node_type":  node_type,
+            "colors":     colors,
+            "strokes":    strokes,
+            "typography": typography,
+            "effects":    effects,
+            "summary": {
+                "total_style_entries": len(entries),
+                "unique_colors":       len(colors),
+                "unique_fonts":        len(typography),
+                "unique_effects":      len(effects),
+                "unique_strokes":      len(strokes),
+            },
+            "raw_entries": entries,
+        }
+        return json.dumps(result)
+
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [
@@ -2658,5 +3010,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 "description": self.analyze_file.__doc__,
                 "args_schema": AnalyzeFileSchema,
                 "ref": self.analyze_file,
+            },
+            {
+                "name": "extract_design_tokens",
+                "description": self.extract_design_tokens.__doc__,
+                "args_schema": ArgsSchema.ExtractDesignTokens.value,
+                "ref": self.extract_design_tokens,
             },
         ]
