@@ -9,11 +9,16 @@ Covers:
 """
 
 import io
+import os
+import zipfile
 
 import pytest
 from openpyxl import Workbook
 
 from elitea_sdk.runtime.langchain.document_loaders.EliteAExcelLoader import (
+    EXCEL_READ_LIMIT_ERROR,
+    EXCEL_MAX_FULL_READ_FILE_SIZE,
+    check_excel_read_limits,
     list_excel_sheets,
     read_excel_rows,
 )
@@ -32,6 +37,16 @@ def _build_workbook(tmp_path, sheets):
     path = tmp_path / "wb.xlsx"
     wb.save(path)
     return str(path)
+
+
+def _pad_file_without_corrupting_zip(path, min_size_bytes):
+    """Increase file size while keeping the zip central directory at EOF."""
+    current_size = os.path.getsize(path)
+    if current_size >= min_size_bytes:
+        return
+
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("xl/padding.bin", b"0" * (min_size_bytes - current_size))
 
 
 def test_list_excel_sheets_returns_all_sheets(tmp_path):
@@ -145,3 +160,88 @@ def test_read_excel_rows_header_row_in_range_no_duplication(tmp_path):
     result = read_excel_rows(path, sheet_name="S", start_row=1, end_row=2)
     lines = result["content"].splitlines()
     assert lines == ["h1 | h2", "a | b"]
+
+
+def test_check_excel_read_limits_rejects_too_many_rows(tmp_path):
+    path = _build_workbook(tmp_path, {
+        "S": [["h1"]] + [[idx] for idx in range(100)],
+    })
+
+    with pytest.raises(ValueError) as exc:
+        check_excel_read_limits(path, raise_on_violation=True)
+
+    assert EXCEL_READ_LIMIT_ERROR in str(exc.value)
+    assert "workbook rows=" in str(exc.value)
+
+
+def test_check_excel_read_limits_rejects_large_text_budget(tmp_path):
+    large_value = "x" * 32_000
+    path = _build_workbook(tmp_path, {
+        "S": [["h1"]] + [[large_value] for _ in range(8)],
+    })
+
+    with pytest.raises(ValueError) as exc:
+        check_excel_read_limits(path, raise_on_violation=True)
+
+    assert "output size=" in str(exc.value)
+
+
+def test_check_excel_read_limits_counts_embedded_images(tmp_path):
+    path = _build_workbook(tmp_path, {"S": [["h1"], [1]]})
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("xl/media/image1.png", b"fake")
+        archive.writestr("xl/media/image2.jpeg", b"fake")
+
+    estimate = check_excel_read_limits(path)
+
+    assert estimate.embedded_images == 2
+
+
+def test_check_excel_read_limits_rejects_too_many_images(tmp_path):
+    path = _build_workbook(tmp_path, {"S": [["h1"], [1]]})
+    with zipfile.ZipFile(path, "a") as archive:
+        for idx in range(33):
+            archive.writestr(f"xl/media/image{idx}.png", b"fake")
+
+    with pytest.raises(ValueError) as exc:
+        check_excel_read_limits(path, raise_on_violation=True)
+
+    assert "embedded images=" in str(exc.value)
+
+
+def test_check_excel_read_limits_partial_scope_uses_requested_range(tmp_path):
+    path = _build_workbook(tmp_path, {
+        "S": [["h1"]] + [["x" * 50_000] for _ in range(3)] + [["ok"] for _ in range(50)],
+    })
+
+    estimate = check_excel_read_limits(path, sheet_name="S", start_row=5, end_row=10)
+
+    assert estimate.requested_rows == 6
+    assert estimate.estimated_output_chars < 200000
+
+
+def test_check_excel_read_limits_rejects_large_full_read_by_file_size(tmp_path):
+    path = _build_workbook(tmp_path, {"S": [["h1"], [1]]})
+    _pad_file_without_corrupting_zip(path, EXCEL_MAX_FULL_READ_FILE_SIZE + 1)
+
+    with pytest.raises(ValueError) as exc:
+        check_excel_read_limits(path, raise_on_violation=True)
+
+    assert "file size=" in str(exc.value)
+    assert str(EXCEL_MAX_FULL_READ_FILE_SIZE) in str(exc.value)
+
+
+def test_check_excel_read_limits_allows_large_file_partial_read_when_scope_is_safe(tmp_path):
+    path = _build_workbook(tmp_path, {"S": [["h1"], ["ok"], ["ok2"]]})
+    _pad_file_without_corrupting_zip(path, EXCEL_MAX_FULL_READ_FILE_SIZE + 1)
+
+    estimate = check_excel_read_limits(
+        path,
+        sheet_name="S",
+        start_row=2,
+        end_row=2,
+        raise_on_violation=True,
+    )
+
+    assert estimate.requested_rows == 1
+    assert estimate.file_size_bytes > EXCEL_MAX_FULL_READ_FILE_SIZE
