@@ -460,7 +460,7 @@ class TestSharingLinkFileValidation:
             wrapper._validate_sharing_link_file("large_file.pdf", file_size)
 
         assert "too large" in str(exc_info.value).lower()
-        assert "25.0 MB" in str(exc_info.value)
+        assert "25.00 MB" in str(exc_info.value)
         assert "20 MB" in str(exc_info.value)
 
     def test_accepts_supported_file_type_pdf(self):
@@ -473,6 +473,34 @@ class TestSharingLinkFileValidation:
 
         # Should not raise
         wrapper._validate_sharing_link_file("document.pdf", 5 * 1024 * 1024)
+
+    def test_5341_oversize_message_has_no_rounding_collision(self):
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+        # 21,005,621 bytes = 20.03 MiB -- the exact reproduction file
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("20mb.pdf", 21005621)
+        msg = str(exc_info.value)
+        assert "20.04 MB" in msg        # file size, rounded UP, distinct from the limit
+        assert "20 MB" in msg           # the limit
+        assert "20.0 MB" not in msg     # no rounding collision with the limit
+        assert "too large" in msg.lower()
+
+    def test_oversize_message_rounds_file_size_up(self):
+        """A file 1 byte over the cap still renders strictly above the limit."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._validate_sharing_link_file("barely.pdf", 20 * 1024 * 1024 + 1)
+        msg = str(exc_info.value)
+        assert "20.01 MB" in msg
+        assert "20.0 MB" not in msg
 
     def test_accepts_supported_file_type_docx(self):
         """DOCX files are accepted."""
@@ -781,7 +809,7 @@ class TestSharingLinkFileValidation:
             wrapper._download_public_link("https://company.sharepoint.com/:b:/p/user/doc")
 
         assert "too large" in str(exc_info.value).lower()
-        assert ">" in str(exc_info.value)
+        assert "exceeds" in str(exc_info.value).lower()
 
     def test_rejects_double_extension_zip_pdf(self):
         """Files with dangerous intermediate extensions like .zip.pdf are rejected."""
@@ -880,7 +908,7 @@ class TestSharingLinkFileValidation:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert ">" in str(exc_info.value)
+        assert "exceeds" in str(exc_info.value).lower()
         # parse_file_content should NOT be called since size check happens during streaming
         mock_parse.assert_not_called()
 
@@ -938,7 +966,30 @@ class TestStreamingDownload:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert ">" in str(exc_info.value)
+        assert "exceeds" in str(exc_info.value).lower()
+
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    def test_streaming_oversize_message_has_no_collision(self, mock_http_requests):
+        """Streaming early-abort message for a file just over the cap must not
+        collide with the limit number (issue #5341)."""
+        wrapper = SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"]
+        )
+        content = b'x' * (20 * 1024 * 1024 + 8192)  # just over 20 MiB
+        mock_http_requests.get.return_value = _create_streaming_response_mock(content)
+        with pytest.raises(ToolException) as exc_info:
+            wrapper._stream_download_to_tempfile(
+                url='https://download.url/20mb.pdf',
+                file_name='20mb.pdf',
+                timeout=60,
+            )
+        msg = str(exc_info.value)
+        assert "too large" in msg.lower()
+        assert "exceeds" in msg.lower()
+        assert "20 MB" in msg
+        assert "20.0 MB" not in msg
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_download_cleans_up_on_error(self, mock_http_requests):
@@ -1013,7 +1064,7 @@ class TestStreamingDownload:
         message = str(exc_info.value)
         assert "too large" in message.lower()
         assert "3 MB" in message  # image cap, not the 20 MB default
-        assert ">" in message
+        assert "exceeds" in message.lower()
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_download_respects_explicit_max_size(self, mock_http_requests):
@@ -1037,7 +1088,7 @@ class TestStreamingDownload:
             )
 
         assert "too large" in str(exc_info.value).lower()
-        assert ">" in str(exc_info.value)
+        assert "exceeds" in str(exc_info.value).lower()
 
     @patch('elitea_sdk.tools.utils.http_utils.requests')
     def test_streaming_uses_stream_parameter(self, mock_http_requests):

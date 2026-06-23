@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import os
 import re
 import time
@@ -36,6 +37,22 @@ from ..utils.http_utils import (
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _SMALL_FILE_THRESHOLD = 4 * 1024 * 1024   # 4 MB — simple PUT
 _CHUNK_SIZE = 5 * 1024 * 1024             # 5 MB chunks for resumable upload
+
+
+def _format_oversize_message(file_name, max_bytes, is_image, *, actual_bytes=None):
+    mb = 1024 * 1024
+    limit_mb = max_bytes / mb
+    scope = "images" if is_image else "files"
+    if actual_bytes is None:
+        size_clause = "it exceeds"
+    else:
+        actual_mb = math.ceil(actual_bytes / mb * 100) / 100
+        size_clause = f"{actual_mb:.2f} MB exceeds"
+    return (
+        f"File '{file_name}' is too large: {size_clause} the "
+        f"{limit_mb:.0f} MB limit for shared {scope}. "
+        f"Try compressing it or sharing a smaller export."
+    )
 
 
 class SharepointGraphWrapper(BaseSharepointWrapper):
@@ -1988,13 +2005,11 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 cookies=cookies,
             )
         except FileSizeLimitExceeded as e:
-            if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE:
-                limit_msg = f"Maximum supported size for images is {e.max_size_mb:.0f} MB."
-            else:
-                limit_msg = f"Maximum supported size is {e.max_size_mb:.0f} MB."
             raise ToolException(
-                f"File '{e.file_name}' is too large (>{e.actual_size_mb:.1f} MB). "
-                f"{limit_msg}"
+                _format_oversize_message(
+                    e.file_name, e.max_size,
+                    is_image=(max_size == self._SHARING_LINK_MAX_IMAGE_SIZE),
+                )
             ) from e
         except EmptyFileError as e:
             raise ToolException(f"Downloaded file '{e.file_name}' is empty.") from e
@@ -2015,14 +2030,12 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
         max_size = self._max_size_for_file(file_name)
         if file_size is not None and file_size > max_size:
-            size_mb = file_size / (1024 * 1024)
-            max_mb = max_size / (1024 * 1024)
-            if max_size == self._SHARING_LINK_MAX_IMAGE_SIZE:
-                limit_msg = f"Maximum supported size for images is {max_mb:.0f} MB."
-            else:
-                limit_msg = f"Maximum supported size is {max_mb:.0f} MB."
             raise ToolException(
-                f"File '{file_name}' is too large ({size_mb:.1f} MB). {limit_msg}"
+                _format_oversize_message(
+                    file_name, max_size,
+                    is_image=(max_size == self._SHARING_LINK_MAX_IMAGE_SIZE),
+                    actual_bytes=file_size,
+                )
             )
 
         # Check file extension against loaders_map
