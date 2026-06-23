@@ -49,6 +49,18 @@ class SensitiveToolGuardMiddleware(Middleware):
     # Default reason when the user rejected without typing a note.
     BLOCKED_TOOL_DEFAULT_REASON = 'denied by user'
 
+    # Resume actions that mean "block this call but carry a free-text note"
+    # (issue #5318). They map onto the reject execution path; the note rides
+    # `value` into the blocked-tool result's `denial_reason` so the model reads
+    # the user's reason and adapts its next step. `reject_with_comment` is an
+    # accepted alias so a caller can use either name.
+    BLOCK_WITH_COMMENT_ACTIONS = frozenset({'block_with_comment', 'reject_with_comment'})
+
+    # Defensive cap on the user's note. A pathological multi-KB comment would
+    # bloat every blocked-tool result and the checkpoint; the model only needs
+    # the gist of the reason. Keep the head.
+    MAX_COMMENT_LEN = 2000
+
     # `message` is the single natural-language directive a model reads off the
     # blocked result (there is no duplicate `guidance` field any more). The text
     # must NOT end on a terminal "stopped / not executed" note — that reads as
@@ -274,7 +286,7 @@ class SensitiveToolGuardMiddleware(Middleware):
             'guardrail_type': 'sensitive_tool',
             'node_name': 'sensitive_tool_guard',
             'message': sensitive_tool_context['policy_message'],
-            'available_actions': ['approve', 'reject'],
+            'available_actions': ['approve', 'reject', 'block_with_comment'],
             'routes': {},
             'tool_name': sensitive_tool_context['tool_name'],
             'toolkit_name': sensitive_tool_context['toolkit_name'],
@@ -300,12 +312,25 @@ class SensitiveToolGuardMiddleware(Middleware):
             return {'action': 'approve', 'value': str(resume_value or '')}
 
         action = str(resume_value.get('action', 'approve')).strip().lower()
-        if action not in {'approve', 'reject'}:
+        value = str(resume_value.get('value', '') or '')
+
+        # 'block_with_comment' (issue #5318) is a reject that carries a free-text
+        # note. Map it onto the reject execution path so the tool is blocked; the
+        # note rides `value` -> the blocked-tool result's `denial_reason`, the
+        # AI-native signal the model reads to decide its next step. Any other
+        # unrecognized action falls back to approve (the historical default for
+        # malformed/legacy resume payloads).
+        if action in self.BLOCK_WITH_COMMENT_ACTIONS:
+            action = 'reject'
+        elif action not in {'approve', 'reject'}:
             action = 'approve'
+
+        if len(value) > self.MAX_COMMENT_LEN:
+            value = value[:self.MAX_COMMENT_LEN]
 
         return {
             'action': action,
-            'value': str(resume_value.get('value', '') or ''),
+            'value': value,
         }
 
     def _could_be_sensitive(self, tool: BaseTool) -> bool:

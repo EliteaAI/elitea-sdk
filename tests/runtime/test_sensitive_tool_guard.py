@@ -2200,3 +2200,153 @@ class TestSensitiveCanonicalMatching:
     def test_non_sensitive_tool_unaffected(self):
         configure_sensitive_tools(sensitive_tools={"github": ["create_issue"]})
         assert find_sensitive_tool_match("get_issue", ["github"]) is None
+
+
+# ── Block with Comment action (issue #5318) ──────────────────────────────
+#
+# A third HITL action `block_with_comment` lets the user decline a sensitive
+# call AND attach a free-text note. It maps onto the reject execution path; the
+# note rides `value` into the blocked-tool result's `denial_reason` so the model
+# reads the user's reason and adapts its next step (AI-native — no chat-input
+# round-trip, works for parallel HITL cards that arrive close together).
+
+def _block_comment_ctx():
+    return {
+        "tool_name": "delete_repo",
+        "toolkit_name": "github",
+        "toolkit_type": "github",
+        "action_label": "github.delete_repo",
+        "policy_message": "Approval required",
+        "tool_args": {},
+    }
+
+
+class TestBlockWithCommentAction:
+    def test_available_actions_advertises_block_with_comment(self):
+        """The interrupt payload offers block_with_comment alongside
+        approve/reject so the UI can render the third action."""
+        captured = {}
+
+        def capturing_interrupt(payload):
+            captured["payload"] = payload
+            return {"action": "approve", "value": ""}
+
+        guard = SensitiveToolGuardMiddleware()
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=capturing_interrupt,
+        ):
+            guard._review_sensitive_tool_call(_block_comment_ctx())
+
+        assert captured["payload"]["available_actions"] == [
+            "approve", "reject", "block_with_comment",
+        ]
+
+    @pytest.mark.parametrize(
+        "action", ["block_with_comment", "reject_with_comment", "BLOCK_WITH_COMMENT"]
+    )
+    def test_block_with_comment_maps_to_reject_keeping_note(self, action):
+        """block_with_comment (and the reject_with_comment alias, any case) maps
+        to the reject action while preserving the user's note in `value`."""
+        guard = SensitiveToolGuardMiddleware()
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=lambda payload: {
+                "action": action,
+                "value": "please use the REST API with a service account",
+            },
+        ):
+            review = guard._review_sensitive_tool_call(_block_comment_ctx())
+
+        assert review["action"] == "reject"
+        assert review["value"] == "please use the REST API with a service account"
+
+    def test_block_with_comment_empty_note_falls_back_to_default_reason(self):
+        """An empty note still blocks the call; denial_reason falls back to the
+        default so the model is never handed an empty reason."""
+        guard = SensitiveToolGuardMiddleware()
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=lambda payload: {"action": "block_with_comment", "value": ""},
+        ):
+            review = guard._review_sensitive_tool_call(_block_comment_ctx())
+
+        assert review["action"] == "reject"
+        assert review["value"] == ""
+
+        payload = SensitiveToolGuardMiddleware._build_blocked_tool_result_payload(
+            action_label="github.delete_repo",
+            tool_name="delete_repo",
+            toolkit_name="github",
+            toolkit_type="github",
+            user_feedback=review["value"],
+        )
+        assert payload["denial_reason"] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_DEFAULT_REASON
+
+    def test_block_with_comment_caps_overlong_note(self):
+        """A pathological multi-KB note is truncated to MAX_COMMENT_LEN so it
+        cannot bloat every blocked-tool result and the checkpoint."""
+        guard = SensitiveToolGuardMiddleware()
+        long_note = "x" * (SensitiveToolGuardMiddleware.MAX_COMMENT_LEN + 500)
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=lambda payload: {"action": "block_with_comment", "value": long_note},
+        ):
+            review = guard._review_sensitive_tool_call(_block_comment_ctx())
+
+        assert review["action"] == "reject"
+        assert len(review["value"]) == SensitiveToolGuardMiddleware.MAX_COMMENT_LEN
+
+    def test_unknown_action_still_defaults_to_approve(self):
+        """Regression: a genuinely unrecognized action keeps the historical
+        approve fallback — only the block_with_comment variants map to reject."""
+        guard = SensitiveToolGuardMiddleware()
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=lambda payload: {"action": "frobnicate", "value": "x"},
+        ):
+            review = guard._review_sensitive_tool_call(_block_comment_ctx())
+
+        assert review["action"] == "approve"
+
+    def test_block_with_comment_blocks_tool_and_stamps_denial_reason(self):
+        """End-to-end through the REAL guard (interrupt patched, not _review):
+        a block_with_comment resume blocks the tool and the note becomes
+        denial_reason in the blocked-tool result the model reads."""
+        configure_sensitive_tools({"github": ["delete_repo"]})
+        middleware = SensitiveToolGuardMiddleware()
+        executed = {"value": False}
+
+        def delete_repo(repo):
+            executed["value"] = True
+            return f"deleted {repo}"
+
+        tool = StructuredTool.from_function(
+            func=delete_repo,
+            name="delete_repo",
+            description="Delete a repository.",
+            metadata={"toolkit_type": "github", "toolkit_name": "github"},
+        )
+        wrapped_tool = middleware.wrap_tool(tool)
+
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=lambda payload: {
+                "action": "block_with_comment",
+                "value": "use the REST API with a service account",
+            },
+        ):
+            result = wrapped_tool.invoke({"repo": "demo"})
+
+        assert executed["value"] is False, "block_with_comment must NOT execute the tool"
+        payload = json.loads(result)
+        assert payload["type"] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
+        assert payload["blocked_tool_name"] == "delete_repo"
+        assert payload["denial_reason"] == "use the REST API with a service account"
+
+    @pytest.mark.parametrize("action", ["block_with_comment", "reject_with_comment"])
+    def test_is_hitl_resume_recognizes_block_with_comment(self, action):
+        """A resume that carries only the action (no explicit hitl_resume flag)
+        still routes to the resume path for the block_with_comment variants."""
+        assert LangGraphAgentRunnable._is_hitl_resume({"hitl_action": action}) is True
+        assert LangGraphAgentRunnable._is_hitl_resume({"action": action}) is True

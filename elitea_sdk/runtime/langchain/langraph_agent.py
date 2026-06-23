@@ -2737,7 +2737,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             return False
 
         normalized_action = action.strip().lower()
-        return normalized_action in {'approve', 'reject', 'edit'}
+        # 'block_with_comment' / 'reject_with_comment' (issue #5318) are reject
+        # variants that carry a free-text note; they must be recognized as a
+        # resume so a caller that sends only the action (no explicit
+        # hitl_resume flag) still routes to the resume path.
+        return normalized_action in {
+            'approve', 'reject', 'edit', 'block_with_comment', 'reject_with_comment',
+        }
 
     @staticmethod
     def _is_parallel_reconcile(input_data) -> bool:
