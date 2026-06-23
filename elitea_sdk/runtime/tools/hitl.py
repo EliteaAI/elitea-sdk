@@ -208,6 +208,17 @@ class HITLNode(Runnable):
         action = resume_value.get("action", HITL_ACTION_APPROVE).lower()
         value = resume_value.get("value", "")
 
+        # 'block_with_comment' / 'reject_with_comment' (issue #5318) are reject
+        # variants that carry a free-text note. Map them onto the reject action
+        # here so a "block" is NEVER silently downgraded to approve by the
+        # unknown-action fallback below. The note stays in `value`. We do not
+        # advertise these in available_actions — routing semantics are unchanged
+        # (a block routes exactly like reject); if the node has no reject route
+        # configured, the not-configured guard below fails loud rather than
+        # approving.
+        if action in {"block_with_comment", "reject_with_comment"}:
+            action = HITL_ACTION_REJECT
+
         if action not in HITL_VALID_ACTIONS:
             logger.warning(f"HITL node '{self.name}': unknown action '{action}', defaulting to approve")
             action = HITL_ACTION_APPROVE
