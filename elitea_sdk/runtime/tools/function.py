@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import textwrap
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -173,6 +174,28 @@ alita_client = elitea_client
             logger.warning("[code-debug] Could not build client preamble: %s", exc)
             return ""
 
+    @staticmethod
+    def _wrap_user_code_for_debug(code: str) -> str:
+        """Wrap user code so top-level ``await`` runs under standard CPython.
+
+        Pyodide compiles user code with ``PyCF_ALLOW_TOP_LEVEL_AWAIT``; CPython
+        does not. To keep the saved debug file copy-paste-runnable via
+        ``python file.py``, indent the user block into an ``async`` coroutine
+        and drive it with ``asyncio.run()``. Sync code is unaffected.
+        """
+        indented = textwrap.indent(code, "    ")
+        return (
+            "import asyncio as _elitea_debug_asyncio\n"
+            "\n"
+            "async def _elitea_debug_main():\n"
+            f"{indented}\n"
+            "    return locals().get('result')\n"
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    _elitea_debug_result = _elitea_debug_asyncio.run(_elitea_debug_main())\n"
+            "    print(_elitea_debug_result)\n"
+        )
+
     def _save_code_to_artifact(self, code: str, node_name: str) -> None:
         """Save the fully-assembled, standalone-executable code to the 'code-debug' artifact bucket.
 
@@ -193,8 +216,13 @@ alita_client = elitea_client
             bucket = "code-debug"
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"{node_name}__{timestamp}.py"
-            # Prepend the client preamble so the file is fully self-contained
-            full_code = f"{self._build_client_preamble()}{code}"
+            # Prepend the client preamble so the file is fully self-contained,
+            # then wrap user code in an async runner so top-level await — valid
+            # under Pyodide — also runs under standard CPython.
+            full_code = (
+                f"{self._build_client_preamble()}"
+                f"{self._wrap_user_code_for_debug(code)}"
+            )
             artifact = self.elitea_client.artifact(bucket)
             result = artifact.create(filename, full_code.encode('utf-8'))
             if 'error' in result:
