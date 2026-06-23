@@ -162,16 +162,15 @@ def test_read_excel_rows_header_row_in_range_no_duplication(tmp_path):
     assert lines == ["h1 | h2", "a | b"]
 
 
-def test_check_excel_read_limits_rejects_too_many_rows(tmp_path):
+def test_check_excel_read_limits_allows_workbook_row_count_when_scope_is_safe(tmp_path):
     path = _build_workbook(tmp_path, {
         "S": [["h1"]] + [[idx] for idx in range(100)],
     })
 
-    with pytest.raises(ValueError) as exc:
-        check_excel_read_limits(path, raise_on_violation=True)
+    estimate = check_excel_read_limits(path, raise_on_violation=True)
 
-    assert EXCEL_READ_LIMIT_ERROR in str(exc.value)
-    assert "workbook rows=" in str(exc.value)
+    assert estimate.requested_rows == 101
+    assert estimate.estimated_output_chars < 200000
 
 
 def test_check_excel_read_limits_rejects_large_text_budget(tmp_path):

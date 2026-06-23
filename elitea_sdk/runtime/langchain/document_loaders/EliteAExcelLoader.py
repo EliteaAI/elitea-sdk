@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 cell_delimiter = " | "
 
-EXCEL_MAX_WORKBOOK_ROWS = 100
 EXCEL_MAX_REQUEST_ROWS = 10_000
 EXCEL_MAX_IMAGE_COUNT = 32
 EXCEL_SAMPLE_ROW_LIMIT = 10
@@ -57,7 +56,8 @@ class ExcelReadEstimate:
     estimated_output_chars: int
     embedded_images: int
     file_size_bytes: Optional[int]
-    full_read_allowed: bool
+    is_unbounded_read: bool
+    violations: List[str]
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +120,12 @@ def _count_xlsx_images(source: Union[str, bytes, io.BytesIO],
     if extension not in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
         return 0
 
-    workbook_bytes = _read_binary_source(source)
-    with zipfile.ZipFile(io.BytesIO(workbook_bytes)) as archive:
+    if isinstance(source, str):
+        archive_source = source
+    else:
+        archive_source = io.BytesIO(_read_binary_source(source))
+
+    with zipfile.ZipFile(archive_source) as archive:
         return sum(
             1 for name in archive.namelist()
             if name.startswith("xl/media/") and not name.endswith("/")
@@ -166,10 +170,29 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
     if extension in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
         embedded_images = _count_xlsx_images(source, file_name=file_name)
 
+    is_unbounded_read = (
+        start_row is None and end_row is None and requested_rows == target_sheet_total_rows
+    )
+
+    violations = []
+    if is_unbounded_read and file_size_bytes is not None and file_size_bytes > EXCEL_MAX_FULL_READ_FILE_SIZE:
+        violations.append(
+            f"file size={file_size_bytes} exceeds full-read limit {EXCEL_MAX_FULL_READ_FILE_SIZE}"
+        )
+    if requested_rows > EXCEL_MAX_REQUEST_ROWS:
+        violations.append(
+            f"requested rows={requested_rows} exceeds limit {EXCEL_MAX_REQUEST_ROWS}"
+        )
+    if embedded_images > EXCEL_MAX_IMAGE_COUNT:
+        violations.append(
+            f"embedded images={embedded_images} exceeds limit {EXCEL_MAX_IMAGE_COUNT}"
+        )
+
     sample_end_row = requested_end_row
     sampled_rows = 0
     sampled_chars = 0
-    if target_sheet and requested_rows > 0:
+    estimated_output_chars = 0
+    if not violations and target_sheet and requested_rows > 0:
         sample_end_row = min(
             requested_end_row,
             requested_start_row + EXCEL_SAMPLE_ROW_LIMIT - 1,
@@ -184,14 +207,19 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
             file_name=file_name,
         )
         sampled_chars = len(sample_result.get("content", ""))
+        estimated_output_chars = sampled_chars
+        if requested_rows > sampled_rows and sampled_rows > 0:
+            estimated_output_chars = int((sampled_chars / sampled_rows) * requested_rows)
 
-    estimated_output_chars = sampled_chars
-    if requested_rows > sampled_rows and sampled_rows > 0:
-        estimated_output_chars = int((sampled_chars / sampled_rows) * requested_rows)
+    if sampled_chars > max_output_chars:
+        violations.append(
+            f"sampled output size={sampled_chars} exceeds limit {max_output_chars}"
+        )
+    elif estimated_output_chars > max_output_chars:
+        violations.append(
+            f"estimated output size={estimated_output_chars} exceeds limit {max_output_chars}"
+        )
 
-    full_read_allowed = (
-        start_row is None and end_row is None and requested_rows == target_sheet_total_rows
-    )
     estimate = ExcelReadEstimate(
         sheets=sheets,
         total_rows_workbook=total_rows_workbook,
@@ -205,34 +233,9 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
         estimated_output_chars=estimated_output_chars,
         embedded_images=embedded_images,
         file_size_bytes=file_size_bytes,
-        full_read_allowed=full_read_allowed,
+        is_unbounded_read=is_unbounded_read,
+        violations=violations,
     )
-
-    violations = []
-    if full_read_allowed and file_size_bytes is not None and file_size_bytes > EXCEL_MAX_FULL_READ_FILE_SIZE:
-        violations.append(
-            f"file size={file_size_bytes} exceeds full-read limit {EXCEL_MAX_FULL_READ_FILE_SIZE}"
-        )
-    if total_rows_workbook > EXCEL_MAX_WORKBOOK_ROWS:
-        violations.append(
-            f"workbook rows={total_rows_workbook} exceeds limit {EXCEL_MAX_WORKBOOK_ROWS}"
-        )
-    if requested_rows > EXCEL_MAX_REQUEST_ROWS:
-        violations.append(
-            f"requested rows={requested_rows} exceeds limit {EXCEL_MAX_REQUEST_ROWS}"
-        )
-    if embedded_images > EXCEL_MAX_IMAGE_COUNT:
-        violations.append(
-            f"embedded images={embedded_images} exceeds limit {EXCEL_MAX_IMAGE_COUNT}"
-        )
-    if sampled_chars > max_output_chars:
-        violations.append(
-            f"sampled output size={sampled_chars} exceeds limit {max_output_chars}"
-        )
-    elif estimated_output_chars > max_output_chars:
-        violations.append(
-            f"estimated output size={estimated_output_chars} exceeds limit {max_output_chars}"
-        )
 
     if violations and raise_on_violation:
         raise ValueError(f"{EXCEL_READ_LIMIT_ERROR} Details: {'; '.join(violations)}")
@@ -441,10 +444,10 @@ class EliteAExcelLoader(EliteATableLoader):
         """
         sheets: List[dict] = []
         read_limits = {
-            "max_workbook_rows": EXCEL_MAX_WORKBOOK_ROWS,
             "max_request_rows": EXCEL_MAX_REQUEST_ROWS,
             "max_embedded_images": EXCEL_MAX_IMAGE_COUNT,
             "max_output_chars": 200000,
+            "max_full_read_file_size": EXCEL_MAX_FULL_READ_FILE_SIZE,
         }
         if file_content:
             try:
@@ -454,11 +457,9 @@ class EliteAExcelLoader(EliteATableLoader):
                 read_limits["estimated_request_rows"] = estimate.requested_rows
                 read_limits["estimated_output_chars"] = estimate.estimated_output_chars
                 read_limits["embedded_images"] = estimate.embedded_images
+                read_limits["file_size_bytes"] = estimate.file_size_bytes
                 read_limits["full_read_allowed"] = (
-                    estimate.total_rows_workbook <= EXCEL_MAX_WORKBOOK_ROWS
-                    and estimate.requested_rows <= EXCEL_MAX_REQUEST_ROWS
-                    and estimate.estimated_output_chars <= 200000
-                    and estimate.embedded_images <= EXCEL_MAX_IMAGE_COUNT
+                    estimate.is_unbounded_read and not estimate.violations
                 )
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning("Failed to list excel sheets for %s: %s",
