@@ -149,23 +149,50 @@ class TestSaveCodeToArtifact:
         )
 
     def test_saved_bytes_contain_user_code(self):
-        """The user code must appear in the bytes passed to create()."""
+        """The user code must appear (indented inside async wrapper) in the bytes passed to create()."""
         code = "result = 42"
         ft, mock_client = _make_function_tool(node_name="n1")
         self._run_save(ft, code, "n1")
         args, _ = mock_client.artifact.return_value.create.call_args
-        assert code.encode("utf-8") in args[1]
+        saved = args[1].decode("utf-8")
+        # User code is indented 4 spaces inside async def _elitea_debug_main()
+        assert f"    {code}" in saved
 
     def test_saved_bytes_contain_client_preamble(self):
-        """The client preamble returned by _build_client_preamble must be prepended."""
+        """The client preamble returned by _build_client_preamble must be prepended.
+
+        After the preamble, the user code is wrapped in an async runner so top-level
+        await works under standard CPython. The user code (indented) and the
+        asyncio.run() driver must both be present.
+        """
         code = "result = 1"
         ft, mock_client = _make_function_tool(node_name="n2")
         self._run_save(ft, code, "n2")
         args, _ = mock_client.artifact.return_value.create.call_args
         saved = args[1].decode("utf-8")
-        # preamble comes first, user code after
+        # preamble comes first, async wrapper + user code after
         assert saved.startswith(_FAKE_PREAMBLE)
-        assert code in saved
+        assert "async def _elitea_debug_main():" in saved
+        assert f"    {code}" in saved
+        assert "_elitea_debug_asyncio.run(_elitea_debug_main())" in saved
+
+    def test_saved_bytes_make_top_level_await_compilable(self):
+        """User code with top-level await must be syntactically valid in the saved file.
+
+        This is the bug this wrapper fixes: Pyodide compiles with PyCF_ALLOW_TOP_LEVEL_AWAIT,
+        CPython does not. Wrapping in `async def` + `asyncio.run()` makes the saved file
+        runnable via `python file.py`.
+        """
+        import ast
+        code = "x = await some_coro()\nresult = x"
+        ft, mock_client = _make_function_tool(node_name="n3")
+        self._run_save(ft, code, "n3")
+        args, _ = mock_client.artifact.return_value.create.call_args
+        saved = args[1].decode("utf-8")
+        # Strip the fake preamble (test stub is not real Python) and verify the
+        # wrapped user code parses cleanly without PyCF_ALLOW_TOP_LEVEL_AWAIT.
+        wrapped = saved[len(_FAKE_PREAMBLE):]
+        ast.parse(wrapped)
 
 
 # ---------------------------------------------------------------------------
