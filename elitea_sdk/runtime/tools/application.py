@@ -221,6 +221,23 @@ class Application(BaseTool):
                 if key not in config['metadata']:
                     config['metadata'][key] = value
 
+        # Per-invocation discriminator (#5386). The parent tool_call_id uniquely
+        # identifies THIS sub-agent invocation. Two sequential (or parallel) calls
+        # to the SAME sub-agent share a display name — and, on the in-process path,
+        # the same derived thread_id — so the UI cannot otherwise tell the
+        # invocations apart and merges their activity into a single accordion
+        # ("only the last executed is shown"). Stamping the call id into config
+        # metadata propagates it onto BOTH the wrapper tool event (this config's
+        # metadata, read by on_tool_start/end) AND the child's inner llm/tool
+        # events (via _run → nested_metadata, seeded from this same metadata dict),
+        # giving every event of one invocation a shared per-invocation key. We
+        # OVERRIDE rather than setdefault so a nested grandchild stamps its OWN
+        # call id (the inherited parent value must not win at the deeper level).
+        if tool_call_id is not None:
+            config = dict(config)
+            config['metadata'] = dict(config.get('metadata') or {})
+            config['metadata']['parent_agent_call_id'] = tool_call_id
+
         # super().invoke() → BaseTool.run() fires on_tool_start/on_tool_end callbacks
         # (agent_tool_start chip event) and passes config to _run() via the RunnableConfig
         # type annotation on _run's `config` parameter.

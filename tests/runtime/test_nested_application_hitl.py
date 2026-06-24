@@ -528,6 +528,60 @@ def test_application_run_forwards_parent_checkpoint_context():
 
 
 
+def test_application_run_propagates_parent_agent_call_id():
+    """#5386: the parent tool_call_id is stamped onto the child's event metadata
+    as ``parent_agent_call_id`` so the UI can tell two invocations of the SAME
+    sub-agent apart (same display name, and on the in-process path the same
+    derived thread_id) and render one accordion per invocation instead of
+    merging their activity into one.
+
+    The discriminator must be unique PER invocation: a second sequential call to
+    the same sub-agent carries the second tool_call_id, not the first.
+    """
+    nested = StaticApplication(output='ok')
+    application_tool = Application(
+        name='child_agent',
+        description='Nested agent',
+        application=nested,
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+        metadata={'display_name': 'child_agent'},
+    )
+
+    def _invoke(call_id):
+        # Invoked the way LangGraph's ToolNode does: a ToolCall envelope carrying
+        # the parent's tool_call id.
+        application_tool.invoke(
+            {
+                'type': 'tool_call',
+                'id': call_id,
+                'name': 'child_agent',
+                'args': {'task': 'Run nested app', 'chat_history': []},
+            },
+            config={
+                'metadata': {'origin': 'parent'},
+                'configurable': {'thread_id': 'parent-thread'},
+            },
+        )
+
+    _invoke('call-A')
+    _invoke('call-B')
+
+    assert len(nested.calls) == 2
+    # The child's inner events inherit the discriminator via nested_metadata, so
+    # asserting it on the child config confirms it was stamped into the shared
+    # config metadata (which the wrapper tool event reads too).
+    first_meta = nested.calls[0]['config']['metadata']
+    second_meta = nested.calls[1]['config']['metadata']
+    assert first_meta['parent_agent_call_id'] == 'call-A'
+    assert second_meta['parent_agent_call_id'] == 'call-B'
+    # Sub-agent display name is unchanged — only the per-invocation id differs.
+    assert first_meta['parent_agent_name'] == 'child_agent'
+    assert second_meta['parent_agent_name'] == 'child_agent'
+
+
+
 def test_application_toolkit_passes_parent_memory_and_subgraph_flag():
     client = FakeToolkitClient()
     parent_memory = object()
