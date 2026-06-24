@@ -94,6 +94,10 @@ class EliteAClient:
         }
         if api_extra_headers is not None:
             self.headers.update(api_extra_headers)
+        # Kept separate so LLM call path (default_headers on ChatOpenAI /
+        # ChatAnthropic) can forward identity headers (e.g. X-Project-Id) that
+        # the platform proxy uses to bill the correct team.
+        self.api_extra_headers = dict(api_extra_headers) if api_extra_headers else {}
         self.base_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/"
         self.base_public_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/public_application/prompt_lib/"
         self.app = f"{self.base_app_url}{self.project_id}"
@@ -444,6 +448,7 @@ class EliteAClient:
                     "openai-organization": str(self.project_id),
                     "Authorization": f"Bearer {self.auth_token}",
                     "anthropic-beta": "prompt-caching-2024-07-31",
+                    **(getattr(self, "api_extra_headers", None) or {}),
                 },
             }
             
@@ -486,6 +491,9 @@ class EliteAClient:
                 "seed": model_config.get("seed", None),
                 "openai_organization": str(self.project_id),
             }
+            extra_headers = getattr(self, "api_extra_headers", None) or {}
+            if extra_headers:
+                target_kwargs["default_headers"] = dict(extra_headers)
 
             reasoning_effort = model_config.get("reasoning_effort")
             if reasoning_effort:
