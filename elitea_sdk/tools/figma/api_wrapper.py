@@ -294,6 +294,47 @@ class ArgsSchema(Enum):
             ),
         ),
     )
+    ExtractDesignTokensBatch = create_model(
+        "ExtractDesignTokensBatch",
+        entries=(
+            List[Dict],
+            Field(
+                description=(
+                    "List of design token extraction requests. "
+                    "Each entry must contain 'file_key' and 'node_id'. "
+                    "Optional 'depth' per entry (defaults to 4). "
+                    "Supports mixed depths across entries. "
+                    "Node IDs with hyphens are auto-converted to colons."
+                ),
+                examples=[
+                    [
+                        {"file_key": "Fp24FuzPwH0L74ODSrCnQo", "node_id": "169:14446"},
+                        {"file_key": "URzQWqsJejoMYDDz9TmyY1", "node_id": "1262:67108", "depth": 6},
+                    ]
+                ],
+            ),
+        ),
+        parallel=(
+            Optional[bool],
+            Field(
+                description="Enable parallel extraction for faster batch processing (default: True).",
+                default=True,
+            ),
+        ),
+        output_format=(
+            Optional[str],
+            Field(
+                description=(
+                    "Control output verbosity for LLM optimization: "
+                    "'full' (all data), 'compact' (no full token lists), "
+                    "'summary' (counts only, fastest), 'style_guide' (detailed tokens + component references). "
+                    "Default: 'full'. Use 'compact'/'summary' for smallest LLM payload, "
+                    "or 'style_guide' to generate a screen style guide."
+                ),
+                default="full",
+            ),
+        ),
+    )
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
@@ -2954,6 +2995,439 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         }
         return json.dumps(result)
 
+    def extract_design_tokens_batch(
+        self,
+        entries: List[Dict],
+        parallel: bool = True,
+        output_format: str = "full",
+        **kwargs,
+    ) -> str:
+        """Extract deduplicated design tokens from multiple Figma nodes in batch.
+
+        Efficiently processes multiple file_key + node_id pairs and returns
+        deduplicated design tokens for each entry.
+
+        Each entry must contain:
+        - file_key (required): Figma file key
+        - node_id (required): Node ID (FRAME, COMPONENT, COMPONENT_SET, SECTION, or GROUP)
+        - depth (optional): Tree fetch depth for this entry (1–8, default 4)
+
+        Batch processing can be parallelized for better performance.
+
+        Output formats (for LLM optimization):
+        - 'full': All data (colors, strokes, typography, effects lists + summary)
+        - 'compact': Summary only + counts (no full token lists) - Recommended for LLM
+        - 'summary': Batch summary only (fastest, minimal tokens)
+        - 'style_guide': Detailed design tokens + per-component token references (recommended for style guide generation)
+
+        Returns a JSON string with the following structure (varies by output_format):
+
+        FULL FORMAT (default):
+        {
+          "results": [
+            {
+              "entry_index": 0,
+              "file_key": "...",
+              "node_id": "...",
+              "node_name": "...",
+              "status": "success" | "error",
+              "colors": [...objects...],
+              "strokes": [...objects...],
+              "typography": [...objects...],
+              "effects": [...objects...],
+              "summary": {...}
+            },
+            ...
+          ],
+          "batch_summary": {...}
+        }
+
+        COMPACT FORMAT (LLM optimized):
+        {
+          "results": [
+            {
+              "entry_index": 0,
+              "node_id": "...",
+              "node_name": "...",
+              "status": "success",
+              "color_count": 15,
+              "stroke_count": 3,
+              "font_count": 4,
+              "effect_count": 2
+            },
+            ...
+          ],
+          "batch_summary": {...}
+        }
+
+        SUMMARY FORMAT (minimal):
+        {
+          "batch_summary": {
+            "total_entries": 22,
+            "processed_entries": 21,
+            "successful": 21,
+            "failed": 1,
+            "total_colors": 87,
+            ...
+          }
+        }
+
+        Args:
+            entries: List of dicts, each with file_key, node_id, and optional depth
+            parallel: If True, process entries in parallel (default True).
+            output_format: 'full' (all data), 'compact' (counts only), 'summary' (batch only),
+                          or 'style_guide' (detailed tokens + component references).
+                          Default: 'full'. Use 'compact'/'summary' for smallest LLM payload,
+                          or 'style_guide' for screen style guide creation.
+
+        Raises:
+            ToolException: If entries list is empty or malformed.
+        """
+        # Validate output_format
+        if output_format not in ("full", "compact", "summary", "style_guide"):
+            output_format = "full"
+
+        if not entries:
+            raise ToolException("Batch entries list cannot be empty")
+
+        if not isinstance(entries, list):
+            raise ToolException("entries must be a list of dicts")
+
+        self._log_tool_event(f"Starting batch design token extraction for {len(entries)} entries (format={output_format})...")
+
+        # ...existing code...
+
+        # Validate and normalize entries
+        validated_entries = []
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ToolException(f"Entry {i} is not a dict: {type(entry)}")
+
+            file_key = entry.get("file_key")
+            node_id = entry.get("node_id")
+
+            if node_id is None:
+                self._log_tool_event(f"Skipping entry {i}: node_id is None")
+                continue
+
+            if not file_key or not node_id:
+                raise ToolException(
+                    f"Entry {i} missing required fields. "
+                    f"Each entry must have 'file_key' and 'node_id'. "
+                    f"Got: {list(entry.keys())}"
+                )
+
+            depth = entry.get("depth", 4)
+            if not isinstance(depth, int) or depth < 1 or depth > 8:
+                depth = 4
+
+            validated_entries.append({
+                "index": i,
+                "file_key": file_key,
+                "node_id": node_id,
+                "depth": depth,
+            })
+
+        if not validated_entries:
+            raise ToolException("No valid entries after filtering (all had None node_id)")
+
+        # Process entries
+        def process_entry(entry: Dict) -> Dict:
+            """Process a single entry and return result dict."""
+            entry_index = entry["index"]
+            file_key = entry["file_key"]
+            node_id = entry["node_id"]
+            depth = entry["depth"]
+
+            try:
+                result_json = self.extract_design_tokens(
+                    file_key=file_key,
+                    node_id=node_id,
+                    depth=depth,
+                )
+                result_data = json.loads(result_json)
+
+                return {
+                    "entry_index": entry_index,
+                    "file_key": file_key,
+                    "node_id": node_id,
+                    "node_name": result_data.get("node_name", ""),
+                    "node_type": result_data.get("node_type", ""),
+                    "status": "success",
+                    "colors": result_data.get("colors", []),
+                    "strokes": result_data.get("strokes", []),
+                    "typography": result_data.get("typography", []),
+                    "effects": result_data.get("effects", []),
+                    "summary": result_data.get("summary", {}),
+                }
+            except Exception as e:
+                return {
+                    "entry_index": entry_index,
+                    "file_key": file_key,
+                    "node_id": node_id,
+                    "status": "error",
+                    "error": str(e),
+                }
+
+        # Execute extraction
+        all_results = []
+        if parallel and len(validated_entries) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import logging as logging_module
+
+            log = logging_module.getLogger(__name__)
+            max_workers = min(5, len(validated_entries))  # Cap at 5 parallel workers
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_entry, entry): entry for entry in validated_entries}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        all_results.append(result)
+                    except Exception as e:
+                        entry = futures[future]
+                        log.warning(f"Entry {entry['index']} failed: {e}")
+                        all_results.append({
+                            "entry_index": entry["index"],
+                            "file_key": entry["file_key"],
+                            "node_id": entry["node_id"],
+                            "status": "error",
+                            "error": str(e),
+                        })
+        else:
+            # Sequential processing
+            for entry in validated_entries:
+                result = process_entry(entry)
+                all_results.append(result)
+
+        # Sort by entry index to maintain order
+        all_results.sort(key=lambda r: r["entry_index"])
+
+        # Calculate batch summary
+        successful = [r for r in all_results if r["status"] == "success"]
+        failed = [r for r in all_results if r["status"] == "error"]
+
+        total_colors = sum(len(r.get("colors", [])) for r in successful)
+        total_strokes = sum(len(r.get("strokes", [])) for r in successful)
+        total_fonts = sum(len(r.get("typography", [])) for r in successful)
+        total_effects = sum(len(r.get("effects", [])) for r in successful)
+
+        batch_summary = {
+            "total_entries": len(entries),
+            "processed_entries": len(validated_entries),
+            "successful": len(successful),
+            "failed": len(failed),
+            "total_colors": total_colors,
+            "total_strokes": total_strokes,
+            "total_fonts": total_fonts,
+            "total_effects": total_effects,
+        }
+
+        # Apply output format filtering for token optimization
+        if output_format == "summary":
+            # Return ONLY batch summary (minimal tokens for LLM)
+            result = {"batch_summary": batch_summary}
+        elif output_format == "compact":
+            # Return entry summaries without full token lists (compact for LLM)
+            compact_results = []
+            for r in all_results:
+                if r["status"] == "error":
+                    compact_results.append({
+                        "entry_index": r["entry_index"],
+                        "node_id": r["node_id"],
+                        "status": "error",
+                        "error": r["error"],
+                    })
+                else:
+                    compact_results.append({
+                        "entry_index": r["entry_index"],
+                        "node_id": r["node_id"],
+                        "node_name": r["node_name"],
+                        "node_type": r["node_type"],
+                        "status": "success",
+                        "color_count": len(r.get("colors", [])),
+                        "stroke_count": len(r.get("strokes", [])),
+                        "font_count": len(r.get("typography", [])),
+                        "effect_count": len(r.get("effects", [])),
+                    })
+            result = {
+                "results": compact_results,
+                "batch_summary": batch_summary,
+            }
+        elif output_format == "style_guide":
+            # Build normalized token dictionaries and per-component references.
+            colors_registry: Dict[tuple, str] = {}
+            strokes_registry: Dict[tuple, str] = {}
+            typography_registry: Dict[tuple, str] = {}
+            effects_registry: Dict[tuple, str] = {}
+
+            colors_definitions: List[Dict] = []
+            strokes_definitions: List[Dict] = []
+            typography_definitions: List[Dict] = []
+            effects_definitions: List[Dict] = []
+
+            color_usage: Dict[str, int] = {}
+            stroke_usage: Dict[str, int] = {}
+            typography_usage: Dict[str, int] = {}
+            effect_usage: Dict[str, int] = {}
+
+            def _register_color(token: Dict) -> str:
+                key = (token.get("hex", ""), token.get("alpha", 1.0), token.get("opacity", 1.0))
+                token_id = colors_registry.get(key)
+                if token_id:
+                    return token_id
+                token_id = f"color_{len(colors_definitions) + 1:03d}"
+                colors_registry[key] = token_id
+                colors_definitions.append({
+                    "id": token_id,
+                    "hex": token.get("hex", ""),
+                    "alpha": token.get("alpha", 1.0),
+                    "opacity": token.get("opacity", 1.0),
+                    "source_path": token.get("source_path", ""),
+                })
+                color_usage[token_id] = 0
+                return token_id
+
+            def _register_stroke(token: Dict) -> str:
+                key = (token.get("hex", ""), token.get("alpha", 1.0))
+                token_id = strokes_registry.get(key)
+                if token_id:
+                    return token_id
+                token_id = f"stroke_{len(strokes_definitions) + 1:03d}"
+                strokes_registry[key] = token_id
+                strokes_definitions.append({
+                    "id": token_id,
+                    "hex": token.get("hex", ""),
+                    "alpha": token.get("alpha", 1.0),
+                    "source_path": token.get("source_path", ""),
+                })
+                stroke_usage[token_id] = 0
+                return token_id
+
+            def _register_typography(token: Dict) -> str:
+                key = (
+                    token.get("fontFamily", ""),
+                    token.get("fontSize", None),
+                    token.get("fontWeight", None),
+                    token.get("lineHeightPx", None),
+                    token.get("letterSpacing", None),
+                    token.get("textAlignHorizontal", None),
+                )
+                token_id = typography_registry.get(key)
+                if token_id:
+                    return token_id
+                token_id = f"type_{len(typography_definitions) + 1:03d}"
+                typography_registry[key] = token_id
+                typography_definitions.append({
+                    "id": token_id,
+                    "fontFamily": token.get("fontFamily", ""),
+                    "fontSize": token.get("fontSize", None),
+                    "fontWeight": token.get("fontWeight", None),
+                    "lineHeightPx": token.get("lineHeightPx", None),
+                    "letterSpacing": token.get("letterSpacing", None),
+                    "textAlignHorizontal": token.get("textAlignHorizontal", None),
+                    "source_path": token.get("source_path", ""),
+                })
+                typography_usage[token_id] = 0
+                return token_id
+
+            def _register_effect(token: Dict) -> str:
+                effect_key_payload = {
+                    "type": token.get("type", ""),
+                    "visible": token.get("visible", True),
+                    "radius": token.get("radius", None),
+                    "spread": token.get("spread", None),
+                    "offset": token.get("offset", {}),
+                    "color": token.get("color", {}),
+                }
+                key = json.dumps(effect_key_payload, sort_keys=True)
+                token_id = effects_registry.get(key)
+                if token_id:
+                    return token_id
+                token_id = f"effect_{len(effects_definitions) + 1:03d}"
+                effects_registry[key] = token_id
+                effects_definitions.append({
+                    "id": token_id,
+                    **effect_key_payload,
+                    "source_path": token.get("source_path", ""),
+                })
+                effect_usage[token_id] = 0
+                return token_id
+
+            components: List[Dict] = []
+            for r in all_results:
+                if r["status"] == "error":
+                    components.append({
+                        "entry_index": r["entry_index"],
+                        "file_key": r["file_key"],
+                        "node_id": r["node_id"],
+                        "status": "error",
+                        "error": r["error"],
+                    })
+                    continue
+
+                color_ids = sorted({_register_color(c) for c in r.get("colors", [])})
+                stroke_ids = sorted({_register_stroke(s) for s in r.get("strokes", [])})
+                typography_ids = sorted({_register_typography(t) for t in r.get("typography", [])})
+                effect_ids = sorted({_register_effect(e) for e in r.get("effects", [])})
+
+                for token_id in color_ids:
+                    color_usage[token_id] += 1
+                for token_id in stroke_ids:
+                    stroke_usage[token_id] += 1
+                for token_id in typography_ids:
+                    typography_usage[token_id] += 1
+                for token_id in effect_ids:
+                    effect_usage[token_id] += 1
+
+                components.append({
+                    "entry_index": r["entry_index"],
+                    "file_key": r["file_key"],
+                    "node_id": r["node_id"],
+                    "node_name": r.get("node_name", ""),
+                    "node_type": r.get("node_type", ""),
+                    "status": "success",
+                    "tokens": {
+                        "colors": color_ids,
+                        "strokes": stroke_ids,
+                        "typography": typography_ids,
+                        "effects": effect_ids,
+                    },
+                })
+
+            for item in colors_definitions:
+                item["components_count"] = color_usage.get(item["id"], 0)
+            for item in strokes_definitions:
+                item["components_count"] = stroke_usage.get(item["id"], 0)
+            for item in typography_definitions:
+                item["components_count"] = typography_usage.get(item["id"], 0)
+            for item in effects_definitions:
+                item["components_count"] = effect_usage.get(item["id"], 0)
+
+            result = {
+                "style_guide": {
+                    "tokens": {
+                        "colors": colors_definitions,
+                        "strokes": strokes_definitions,
+                        "typography": typography_definitions,
+                        "effects": effects_definitions,
+                    },
+                    "components": components,
+                },
+                "batch_summary": batch_summary,
+            }
+        else:
+            # FULL format (backward compatible, all data)
+            result = {
+                "results": all_results,
+                "batch_summary": batch_summary,
+            }
+
+        self._log_tool_event(
+            f"Batch extraction complete (format={output_format}): {len(successful)} succeeded, {len(failed)} failed"
+        )
+        return json.dumps(result, indent=2)
+
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [
@@ -3016,5 +3490,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 "description": self.extract_design_tokens.__doc__,
                 "args_schema": ArgsSchema.ExtractDesignTokens.value,
                 "ref": self.extract_design_tokens,
+            },
+            {
+                "name": "extract_design_tokens_batch",
+                "description": self.extract_design_tokens_batch.__doc__,
+                "args_schema": ArgsSchema.ExtractDesignTokensBatch.value,
+                "ref": self.extract_design_tokens_batch,
             },
         ]
