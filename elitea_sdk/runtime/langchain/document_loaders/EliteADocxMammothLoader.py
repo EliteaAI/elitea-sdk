@@ -503,8 +503,38 @@ class EliteADocxMammothLoader(BaseLoader):
         
         # Replace all marked sections with appropriate wrappers
         result_html = pattern.sub(replace_with_appropriate_wrapper, html)
-        
+
         return result_html
+
+    def __hoist_images_from_headings(self, html):
+        """Relocate <img> tags that Mammoth placed inside heading elements.
+
+        When an image is inserted into a heading paragraph in the source DOCX,
+        Mammoth emits it as an inline <img> inside an <h1>..<h6>. markdownify
+        renders headings as text-only and silently drops inline <img> tags.
+        Move each such <img> into its own <p> immediately
+        after the heading so it survives markdownify.
+        The heading keeps its text.
+
+        Args:
+            html (str): The HTML content from Mammoth.
+
+        Returns:
+            str: HTML with heading-embedded images relocated; unchanged if none.
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        heading_tags = ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')
+        moved = False
+        for heading in soup.find_all(heading_tags):
+            anchor = heading
+            for img in heading.find_all('img'):
+                img.extract()
+                paragraph = soup.new_tag('p')
+                paragraph.append(img)
+                anchor.insert_after(paragraph)
+                anchor = paragraph
+                moved = True
+        return str(soup) if moved else html
 
     def load(self):
         """
@@ -614,7 +644,11 @@ class EliteADocxMammothLoader(BaseLoader):
         html_with_code_blocks = self.__wrap_marked_sections_in_code_blocks(
             result.value, start_marker, end_marker
         )
-        
+
+        # Step 3.5: Hoist images out of headings so markdownify keeps them
+        # (markdownify renders headings as text-only and drops inline <img>).
+        html_with_code_blocks = self.__hoist_images_from_headings(html_with_code_blocks)
+
         # Step 4: Convert HTML to markdown
         content = markdownify(html_with_code_blocks, heading_style="ATX")
         
