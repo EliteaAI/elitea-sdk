@@ -578,11 +578,12 @@ class EliteADocxMammothLoader(BaseLoader):
             html (str): The HTML content from Mammoth.
 
         Returns:
-            str: HTML with heading-embedded images relocated; unchanged if none.
+            str: serialized HTML with any heading-embedded images relocated.
+                Every document is routed through this single serialization
+                (see the return note below).
         """
         soup = BeautifulSoup(html, 'html.parser')
         heading_tags = ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')
-        moved = False
         for heading in soup.find_all(heading_tags):
             images = heading.find_all('img')
             if not images:
@@ -596,7 +597,6 @@ class EliteADocxMammothLoader(BaseLoader):
                 paragraph.append(img)
                 anchor.insert_after(paragraph)
                 anchor = paragraph
-            moved = True
             if not had_text:
                 # Image-only heading (e.g. a logo/banner used as a section
                 # divider). Keep it as a header boundary — header-based chunking
@@ -605,7 +605,13 @@ class EliteADocxMammothLoader(BaseLoader):
                 # Setting .string also clears any leftover empty inline wrappers.
                 label = (images[0].get('alt') or '').strip() or 'Image'
                 heading.string = label
-        return str(soup) if moved else html
+        # Always return the serialized soup, even when nothing moved, so every
+        # document follows one canonical HTML path. We already parsed `html`
+        # above, and markdownify itself parses with BeautifulSoup, so this
+        # round-trip is idempotent for mammoth's HTML and costs only a serialize
+        # — but it removes the moved/not-moved divergence that would otherwise
+        # be an input-specific, hard-to-reproduce difference.
+        return str(soup)
 
     def load(self):
         """

@@ -691,6 +691,16 @@ class TestDocxHoistImagesFromHeadings:
         assert heading is not None
         assert heading.get_text(strip=True) == 'Image'
 
+    def test_multiple_images_in_one_heading_preserve_order(self):
+        """Two imgs in a heading hoist into two <p>s in source order."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        html = '<h2>T<img src="tok_a"/><img src="tok_b"/></h2>'
+        soup = BeautifulSoup(
+            loader._EliteADocxMammothLoader__hoist_images_from_headings(html),
+            'html.parser')
+        imgs = [p.find('img')['src'] for p in soup.find_all('p')]
+        assert imgs == ['tok_a', 'tok_b']
+
 
 class TestDocxImageTranscriptPreservation:
     """Transcripts with parentheses/newlines survive postprocessing (#5333).
@@ -714,6 +724,26 @@ class TestDocxImageTranscriptPreservation:
         assert transcript in result  # verbatim — no truncation at ')'
         assert token not in result  # token resolved
         assert "**Image Transcript:**" in result
+
+    def test_literal_image_markdown_in_body_is_not_converted(self):
+        """A real ![](url) the user typed in the doc must survive verbatim —
+        only registered tokens become transcript blocks."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        loader._image_payload_map = {}  # no tokens registered
+        md = "See ![diagram](https://example.com/a.png) here."
+        assert loader._EliteADocxMammothLoader__postprocess_original_md(md) == md
+
+    def test_literal_image_survives_alongside_a_real_token(self):
+        """Even with a registered token present, a user-typed ![](url) whose
+        target is not a token is left untouched; only the token is resolved."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        token = loader._EliteADocxMammothLoader__register_image_payload(
+            "Image: i.png, a description")
+        md = f"![user](https://example.com/a.png) and ![]({token})"
+        result = loader._EliteADocxMammothLoader__postprocess_original_md(md)
+        assert "![user](https://example.com/a.png)" in result  # literal kept
+        assert token not in result  # token resolved
+        assert "a description" in result
 
 
 class TestDocxLoaderReuse:
