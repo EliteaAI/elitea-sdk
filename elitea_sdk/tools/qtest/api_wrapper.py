@@ -12,9 +12,10 @@ from typing import Any, Optional, Generator, Literal
 
 import requests
 import swagger_client
+import urllib3
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
-from pydantic import Field, PrivateAttr, model_validator, create_model, SecretStr
+from pydantic import Field, PrivateAttr, field_validator, model_validator, create_model, SecretStr
 from sklearn.feature_extraction.text import strip_tags
 from swagger_client import TestCaseApi, SearchApi, PropertyResource, ModuleApi, ProjectApi, FieldApi
 from swagger_client.rest import ApiException
@@ -160,7 +161,9 @@ QtestDataQuerySearch = create_model(
     dql=(str, Field(description="Qtest Data Query Language (DQL) query string")),
     extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled and no custom prompt is provided, the repository default image-processing prompt is used.", default=False)),
     prompt=(Optional[str], Field(description="Optional override prompt for image processing. If omitted or empty, the repository default image-processing prompt is used.", default=None)),
-    max_results=(Optional[int], Field(description="Maximum total results to fetch across all pages. Set to 0 or negative for unlimited. Default: 20", default=20))
+    max_results=(Optional[int], Field(description="Maximum total results to fetch across all pages. Set to 0 or negative for unlimited. Default: 20", default=20)),
+    append_test_steps=(Optional[bool], Field(description="When True, include full test-step data for every result. Defaults to False for lighter, faster responses; opt in only when step-level detail is needed.", default=False)),
+    include_external_properties=(Optional[bool], Field(description="When True, include all external properties for every result. Defaults to False for lighter responses.", default=False))
 )
 
 QtestCreateTestCase = create_model(
@@ -288,6 +291,16 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     _chunking_tool: Optional[str] = PrivateAttr(default=None)
     _extract_images: bool = PrivateAttr(default=False)
     _image_prompt: Optional[str] = PrivateAttr(default=None)
+
+    @field_validator('base_url', mode='before')
+    @classmethod
+    def strip_trailing_slash(cls, v: str) -> str:
+        """Remove a trailing slash from base_url.
+
+        qTest returns 404s when the configured host ends with '/', because the
+        generated client concatenates request paths directly onto the host.
+        """
+        return v.rstrip('/')
 
     @model_validator(mode='before')
     @classmethod
@@ -967,13 +980,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 QTEST_ID: item['id'],
                 'Steps': list(map(lambda step: {
                     'Test Step Number': step[0] + 1,
-                    'Test Step Description': self._clean_html_content(step[1]['description'], extract_images, prompt),
-                    'Test Step Expected Result': self._clean_html_content(step[1]['expected'], extract_images, prompt)
-                }, enumerate(item['test_steps']))),
+                    'Test Step Description': self._clean_html_content(step[1].get('description') or '', extract_images, prompt),
+                    'Test Step Expected Result': self._clean_html_content(step[1].get('expected') or '', extract_images, prompt)
+                }, enumerate(item.get('test_steps') or []))),
             }
             
             # Add custom fields directly from API response properties
-            for prop in item['properties']:
+            for prop in item.get('properties') or []:
                 field_name = prop.get('field_name')
                 if not field_name:
                     continue
@@ -1069,7 +1082,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         content = strip_tags(content)
         return content
 
-    def __perform_search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None) -> list:
+    def __perform_search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
+                                append_test_steps: bool=False, include_external_properties: bool=False) -> list:
         """Perform DQL search with pagination control.
         
         Args:
@@ -1078,6 +1092,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             prompt: Optional prompt for image processing
             max_results: Maximum total results to fetch. If None, defaults to 20.
                         Set to 0 or negative for unlimited (fetch all pages).
+            append_test_steps: When True, request full test-step data for every
+                        result. Defaults to False to keep list/search payloads light.
+            include_external_properties: When True, request all external properties
+                        for every result. Defaults to False for lighter payloads.
         
         Returns:
             List of parsed test case data, limited to max_results if specified
@@ -1085,8 +1103,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         search_instance: SearchApi = swagger_client.SearchApi(self._client)
         body = swagger_client.ArtifactSearchParams(object_type='test-cases', fields=['*'],
                                                    query=dql)
-        append_test_steps = 'true'
-        include_external_properties = 'true'
+        # Only request heavy payload fields when the caller explicitly opts in.
+        # Omitting the params lets the qTest API apply its lightweight defaults.
+        search_kwargs = {}
+        if append_test_steps:
+            search_kwargs['append_test_steps'] = 'true'
+        if include_external_properties:
+            search_kwargs['include_external_properties'] = 'true'
         parsed_data = []
         
         # Determine effective max_results (default to 20 if not specified)
@@ -1094,9 +1117,9 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         unlimited = effective_max <= 0
         
         try:
-            api_response = search_instance.search_artifact(self.qtest_project_id, body, append_test_steps=append_test_steps,
-                                                           include_external_properties=include_external_properties,
-                                                           page_size=self.no_of_items_per_page, page=self.page)
+            api_response = search_instance.search_artifact(self.qtest_project_id, body,
+                                                           page_size=self.no_of_items_per_page, page=self.page,
+                                                           **search_kwargs)
             self.__parse_data(api_response, parsed_data, extract_images, prompt)
             
             # Check if we've reached the limit after first page
@@ -1111,9 +1134,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                     
                     next_page = self.page + 1
                     api_response = search_instance.search_artifact(self.qtest_project_id, body,
-                                                                   append_test_steps=append_test_steps,
-                                                                   include_external_properties=include_external_properties,
-                                                                   page_size=self.no_of_items_per_page, page=next_page)
+                                                                   page_size=self.no_of_items_per_page, page=next_page,
+                                                                   **search_kwargs)
                     self.__parse_data(api_response, parsed_data, extract_images, prompt)
         except ApiException as e:
             stacktrace = format_exc()
@@ -1777,7 +1799,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
-    def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None):
+    def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
+                      append_test_steps: bool=False, include_external_properties: bool=False):
         """Search for the test cases in qTest using Data Query Language.
         
         Args:
@@ -1786,11 +1809,18 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             prompt: Optional prompt for image processing
             max_results: Maximum total results to fetch. If None, defaults to 20.
                         Set to 0 or negative for unlimited (fetch all pages).
+            append_test_steps: When True, include full test-step data for every
+                        result. Defaults to False for lighter, faster responses;
+                        opt in when step-level detail is required.
+            include_external_properties: When True, include all external properties
+                        for every result. Defaults to False for lighter responses.
         
         Returns:
             String with search results summary and first no_of_tests_shown_in_dql_search items
         """
-        parsed_data = self.__perform_search_by_dql(dql, extract_images, prompt, max_results)
+        parsed_data = self.__perform_search_by_dql(dql, extract_images, prompt, max_results,
+                                                   append_test_steps=append_test_steps,
+                                                   include_external_properties=include_external_properties)
         return "Found " + str(
             len(parsed_data)) + f" Qtest test cases:\n" + str(parsed_data[:self.no_of_tests_shown_in_dql_search])
 

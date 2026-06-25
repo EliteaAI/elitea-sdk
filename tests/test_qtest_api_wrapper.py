@@ -437,3 +437,124 @@ def test_parse_data_extracts_multiple_images_in_order(monkeypatch):
     assert description.index('Image Transcript: first image transcript') < description.index('Middle')
     assert description.index('Middle') < description.index('Image Transcript: second image transcript')
     assert description.index('Image Transcript: second image transcript') < description.index('End')
+
+
+# ---------------------------------------------------------------------------
+# #4953 - optional heavy payload parameters in search_by_dql
+# ---------------------------------------------------------------------------
+
+def _patch_search_api(monkeypatch, response):
+    """Patch swagger_client.SearchApi with a fake recording search_artifact kwargs."""
+    calls = []
+
+    class FakeSearchApi:
+        def __init__(self, client):
+            pass
+
+        def search_artifact(self, project_id, body, **kwargs):
+            calls.append(kwargs)
+            return response
+
+    monkeypatch.setattr('swagger_client.SearchApi', FakeSearchApi)
+    return calls
+
+
+def test_perform_search_by_dql_omits_heavy_params_by_default(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None  # model_construct skips setup_qtest_client; fake SearchApi ignores it
+    response = {
+        'items': [
+            {'pid': 'TC-1', 'name': 'Case', 'description': 'd', 'precondition': 'p', 'id': 101}
+        ],
+        'links': [],
+    }
+    calls = _patch_search_api(monkeypatch, response)
+
+    result = wrapper._QtestApiWrapper__perform_search_by_dql("Id = 'TC-1'")
+
+    assert len(calls) == 1
+    # Heavy payload params are omitted entirely so the API applies its light defaults.
+    assert 'append_test_steps' not in calls[0]
+    assert 'include_external_properties' not in calls[0]
+    # Lightweight response (no test_steps/properties keys) parses without error.
+    assert result[0]['Id'] == 'TC-1'
+    assert result[0]['Steps'] == []
+
+
+def test_perform_search_by_dql_includes_heavy_params_when_opted_in(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None  # model_construct skips setup_qtest_client; fake SearchApi ignores it
+    response = {
+        'items': [
+            {
+                'pid': 'TC-2', 'name': 'Case2', 'description': 'd', 'precondition': 'p', 'id': 102,
+                'test_steps': [{'description': 'do something', 'expected': 'all good'}],
+                'properties': [],
+            }
+        ],
+        'links': [],
+    }
+    calls = _patch_search_api(monkeypatch, response)
+
+    result = wrapper._QtestApiWrapper__perform_search_by_dql(
+        "Id = 'TC-2'", append_test_steps=True, include_external_properties=True
+    )
+
+    assert calls[0]['append_test_steps'] == 'true'
+    assert calls[0]['include_external_properties'] == 'true'
+    assert 'do something' in result[0]['Steps'][0]['Test Step Description']
+    assert 'all good' in result[0]['Steps'][0]['Test Step Expected Result']
+
+
+def test_parse_data_tolerates_missing_steps_and_properties():
+    wrapper = _make_wrapper()
+    parsed_data = []
+
+    wrapper._QtestApiWrapper__parse_data(
+        {'items': [{'pid': 'TC-9', 'name': 'n', 'description': 'd', 'precondition': 'p', 'id': 9}]},
+        parsed_data,
+        extract_images=False,
+        prompt=None,
+    )
+
+    assert parsed_data[0]['Id'] == 'TC-9'
+    assert parsed_data[0][QTEST_ID] == 9
+    assert parsed_data[0]['Steps'] == []
+
+
+def test_search_by_dql_forwards_opt_in_flags(monkeypatch):
+    wrapper = _make_wrapper()
+    captured = {}
+
+    def fake_perform(self, dql, extract_images=False, prompt=None, max_results=None,
+                     append_test_steps=False, include_external_properties=False):
+        captured['append_test_steps'] = append_test_steps
+        captured['include_external_properties'] = include_external_properties
+        return []
+
+    monkeypatch.setattr(
+        QtestApiWrapper, '_QtestApiWrapper__perform_search_by_dql', fake_perform
+    )
+
+    wrapper.search_by_dql("Id = 'TC-1'", append_test_steps=True, include_external_properties=True)
+
+    assert captured == {'append_test_steps': True, 'include_external_properties': True}
+
+
+def test_search_by_dql_defaults_to_lightweight(monkeypatch):
+    wrapper = _make_wrapper()
+    captured = {}
+
+    def fake_perform(self, dql, extract_images=False, prompt=None, max_results=None,
+                     append_test_steps=False, include_external_properties=False):
+        captured['append_test_steps'] = append_test_steps
+        captured['include_external_properties'] = include_external_properties
+        return []
+
+    monkeypatch.setattr(
+        QtestApiWrapper, '_QtestApiWrapper__perform_search_by_dql', fake_perform
+    )
+
+    wrapper.search_by_dql("Id = 'TC-1'")
+
+    assert captured == {'append_test_steps': False, 'include_external_properties': False}
