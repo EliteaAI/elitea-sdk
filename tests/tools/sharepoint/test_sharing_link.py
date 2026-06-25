@@ -1122,13 +1122,18 @@ class TestReadFromSharingLinkSchema:
     """Test Pydantic schema for the tool."""
 
     def test_schema_has_required_fields(self):
-        """Schema includes sharing_url as only required field."""
+        """Schema includes sharing_url as the only required field.
+
+        is_capture_image is an optional, non-required field (default False),
+        mirroring read_file's ReadDocument schema.
+        """
 
         schema = ReadFromSharingLink.model_json_schema()
 
         assert 'sharing_url' in schema['properties']
-        assert len(schema['properties']) == 1  # Only sharing_url
-        assert 'sharing_url' in schema.get('required', [])
+        assert schema.get('required', []) == ['sharing_url']  # only sharing_url required
+        assert 'is_capture_image' in schema['properties']
+        assert schema['properties']['is_capture_image'].get('default') is False
 
     def test_schema_sharing_url_description(self):
         """sharing_url field has helpful description."""

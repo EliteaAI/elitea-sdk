@@ -2074,7 +2074,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         f"Files with intermediate extensions like '{intermediate_ext}' are not allowed."
                     )
 
-    def read_file_from_sharing_link(self, sharing_url: str) -> str:
+    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False) -> str:
         """Read a file from a SharePoint/OneDrive sharing link.
 
         Supports:
@@ -2089,6 +2089,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
         Args:
             sharing_url: Full HTTPS sharing link URL
+            is_capture_image: When True and an LLM is configured, embedded images
+                are recognized and transcribed via the vision pipeline.
 
         Returns:
             Parsed text content of the file
@@ -2117,7 +2119,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             file_name, temp_path = self._download_public_link(sharing_url)
             if temp_path:
                 try:
-                    result = parse_file_content(file_path=temp_path, llm=self.llm)
+                    result = parse_file_content(
+                        file_path=temp_path, llm=self.llm,
+                        is_capture_image=is_capture_image
+                    )
                     if isinstance(result, ToolException):
                         raise result
                     return result
@@ -2155,7 +2160,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         )
 
         try:
-            result = parse_file_content(file_path=temp_path, llm=self.llm)
+            result = parse_file_content(
+                file_path=temp_path, llm=self.llm,
+                is_capture_image=is_capture_image)
             if isinstance(result, ToolException):
                 raise result
             return result

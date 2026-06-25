@@ -94,6 +94,10 @@ ReadFromSharingLink = create_model(
                     "Accepts personal OneDrive links (company-my.sharepoint.com/:x:/...) "
                     "and SharePoint site sharing links (company.sharepoint.com/:x:/s/...). "
                     "The link must be shared as 'Anyone with the link' or with your account.")),
+    is_capture_image=(Optional[bool], Field(
+        description="Determines is pictures in the document should be recognized.",
+        default=False)
+    ),
 )
 
 UploadFile = create_model(
@@ -612,7 +616,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         return self._backend.add_attachment_to_list_item(
             list_title, item_id, filepath, filedata, filename, replace)
 
-    def read_file_from_sharing_link(self, sharing_url: str):
+    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False):
         """Read a file from a SharePoint/OneDrive sharing link.
 
         Use this tool when you have a sharing link URL to a file (typically from
@@ -628,12 +632,17 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
 
         Args:
             sharing_url: Complete sharing link URL
+            is_capture_image: When True and an LLM is configured, embedded images
+                are recognized and transcribed via the vision pipeline.
 
         Returns:
             Parsed text content of the shared file
         """
         self._sync_backend_context()
-        return self._backend.read_file_from_sharing_link(sharing_url=sharing_url)
+        return self._backend.read_file_from_sharing_link(
+            sharing_url=sharing_url,
+            is_capture_image=is_capture_image
+        )
 
     # ------------------------------------------------------------------ #
     #  OneNote — delegates to backend                                     #

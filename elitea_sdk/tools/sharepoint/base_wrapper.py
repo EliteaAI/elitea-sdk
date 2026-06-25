@@ -212,11 +212,12 @@ class BaseSharepointWrapper(ABC):
         "Provide token + scopes to enable sharing link support."
     )
 
-    def read_file_from_sharing_link(self, sharing_url: str) -> str:
+    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False) -> str:
         """Read a file from a SharePoint/OneDrive sharing link.
 
         Args:
             sharing_url: Full sharing URL (e.g., https://company-my.sharepoint.com/:x:/...)
+            is_capture_image: When True and an LLM is configured, embedded images are transcribed.
 
         Returns:
             Parsed text content of the file
