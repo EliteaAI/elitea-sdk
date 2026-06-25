@@ -14,6 +14,12 @@ Run:
 import io
 from unittest.mock import MagicMock, patch, Mock
 import pytest
+from bs4 import BeautifulSoup
+from docx import Document as DocxDocument
+
+from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+    EliteADocxMammothLoader
+)
 
 
 class MockImageFile:
@@ -112,9 +118,11 @@ class TestDocxMammothLoaderImageHandling:
             # Third argument should be the prompt
             assert call_args[2] == 'Describe this image'
 
-            # Result should contain the LLM description with image name prefix
-            assert 'Mocked LLM description' in result['src']
-            assert 'Image: image_1' in result['src']
+            # src is now a unique token; the payload (filename + transcript) is
+            # stored verbatim in the payload map so parens/newlines survive.
+            payload = loader._image_payload_map[result['src']]
+            assert 'Mocked LLM description' in payload
+            assert 'Image: image_1' in payload
 
     def test_handle_image_with_llm_returns_description(self):
         """Test that LLM-generated descriptions are returned correctly"""
@@ -136,7 +144,8 @@ class TestDocxMammothLoaderImageHandling:
 
             result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
-            assert 'A chart showing quarterly revenue growth' in result['src']
+            payload = loader._image_payload_map[result['src']]
+            assert 'A chart showing quarterly revenue growth' in payload
 
     def test_handle_image_without_llm_returns_placeholder(self):
         """Without an LLM, no transcription backend exists → placeholder text."""
@@ -153,8 +162,9 @@ class TestDocxMammothLoaderImageHandling:
         result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
         # No LLM → no transcript available (Tesseract fallback removed)
-        assert 'Transcript is not available' in result['src']
-        assert 'Image: image_1' in result['src']
+        payload = loader._image_payload_map[result['src']]
+        assert 'Transcript is not available' in payload
+        assert 'Image: image_1' in payload
 
     def test_handle_image_fallback_on_llm_exception(self):
         """When the LLM call fails, the placeholder transcript is returned."""
@@ -177,7 +187,8 @@ class TestDocxMammothLoaderImageHandling:
             result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
             # LLM failed and there is no OCR fallback → placeholder transcript
-            assert 'Transcript is not available' in result['src']
+            payload = loader._image_payload_map[result['src']]
+            assert 'Transcript is not available' in payload
 
     def test_handle_image_bug_reproduction_without_read(self):
         """
@@ -618,3 +629,167 @@ class TestDocxScanImageReferences:
         loader._scan_image_references(DocxDocument(io.BytesIO(buf.getvalue())))
 
         assert loader._image_ref_order == []
+
+
+class TestDocxHoistImagesFromHeadings:
+    """Tests for __hoist_images_from_headings (issue #5333)."""
+
+    def test_image_inside_heading_is_hoisted_into_following_paragraph(self):
+        """An <img> inside a heading must be relocated into its own <p> right
+        after the heading so markdownify keeps it; the heading keeps its text
+        and the image src (which carries the transcript) is preserved.
+        """
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        html = (
+            '<h2>Section title<img src="Image: image1.png, a bubble sort diagram" /></h2>'
+            '<p>Body text.</p>'
+        )
+
+        result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
+        soup = BeautifulSoup(result, 'html.parser')
+
+        heading = soup.find('h2')
+        # Heading keeps its text but no longer holds the image.
+        assert heading.get_text(strip=True) == 'Section title'
+        assert heading.find('img') is None
+
+        # The image now lives in a <p> immediately after the heading, src intact.
+        hoisted = heading.find_next_sibling()
+        assert hoisted.name == 'p'
+        img = hoisted.find('img')
+        assert img is not None
+        assert img['src'] == 'Image: image1.png, a bubble sort diagram'
+
+    def test_image_only_heading_kept_as_labeled_boundary(self):
+        """A heading that held only the image must stay a header boundary
+        (header-based chunking relies on it) and be labeled from the image's
+        alt/filename — not dropped (which would merge the section) and not left
+        as an empty '#'."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        html = '<h1><img src="tok" alt="logo.png" /></h1><p>Body.</p>'
+
+        result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
+        soup = BeautifulSoup(result, 'html.parser')
+
+        heading = soup.find('h1')
+        assert heading is not None  # boundary preserved
+        assert heading.get_text(strip=True) == 'logo.png'  # labeled, not empty
+        assert heading.find('img') is None
+        # Image relocated into the following paragraph.
+        assert soup.find('p').find('img') is not None
+
+    def test_image_only_heading_without_alt_gets_generic_label(self):
+        """With no alt to draw from, the kept boundary falls back to 'Image'."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        html = '<h2><img src="tok" /></h2><p>Body.</p>'
+
+        result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
+        heading = BeautifulSoup(result, 'html.parser').find('h2')
+        assert heading is not None
+        assert heading.get_text(strip=True) == 'Image'
+
+    def test_multiple_images_in_one_heading_preserve_order(self):
+        """Two imgs in a heading hoist into two <p>s in source order."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        html = '<h2>T<img src="tok_a"/><img src="tok_b"/></h2>'
+        soup = BeautifulSoup(
+            loader._EliteADocxMammothLoader__hoist_images_from_headings(html),
+            'html.parser')
+        imgs = [p.find('img')['src'] for p in soup.find_all('p')]
+        assert imgs == ['tok_a', 'tok_b']
+
+
+class TestDocxImageTranscriptPreservation:
+    """Transcripts with parentheses/newlines survive postprocessing (#5333).
+
+    Regression for the previous approach that round-tripped the transcript
+    through the markdown image URL and truncated it at the first ')'.
+    """
+
+    def test_postprocess_preserves_parentheses_and_newlines(self):
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        transcript = ("Bubble sort (ascending) step 1.\n"
+                      "Trend: increasing (left to right).\nNumbers: (5, 3, 8).")
+        token = loader._EliteADocxMammothLoader__register_image_payload(
+            f"Image: image1.png, {transcript}")
+
+        # markdownify renders the token-src image as ![](token)
+        md = f"# Title\n\n![]({token})\n\nBody text."
+        result = loader._EliteADocxMammothLoader__postprocess_original_md(md)
+
+        assert transcript in result  # verbatim — no truncation at ')'
+        assert token not in result  # token resolved
+        assert "**Image Transcript:**" in result
+
+    def test_literal_image_markdown_in_body_is_not_converted(self):
+        """A real ![](url) the user typed in the doc must survive verbatim —
+        only registered tokens become transcript blocks."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        loader._image_payload_map = {}  # no tokens registered
+        md = "See ![diagram](https://example.com/a.png) here."
+        assert loader._EliteADocxMammothLoader__postprocess_original_md(md) == md
+
+    def test_literal_image_survives_alongside_a_real_token(self):
+        """Even with a registered token present, a user-typed ![](url) whose
+        target is not a token is left untouched; only the token is resolved."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        token = loader._EliteADocxMammothLoader__register_image_payload(
+            "Image: i.png, a description")
+        md = f"![user](https://example.com/a.png) and ![]({token})"
+        result = loader._EliteADocxMammothLoader__postprocess_original_md(md)
+        assert "![user](https://example.com/a.png)" in result  # literal kept
+        assert token not in result  # token resolved
+        assert "a description" in result
+
+
+class TestDocxLoaderReuse:
+    """Per-conversion image state must not leak across reuse (#5333)."""
+
+    def test_reset_clears_dedup_cache_so_repeated_image_re_transcribes(self):
+        """A reused instance processing a second document whose image bytes
+        match the first must NOT emit a stale 'already transcribed' back-ref;
+        it must re-transcribe the image in the new document."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        loader.llm = MagicMock()
+        loader.prompt = 'Describe'
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader'
+            '.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            mock_predict.return_value = 'A unique description'
+
+            # First conversion
+            loader._reset_image_state()
+            r1 = loader._EliteADocxMammothLoader__handle_image(
+                MockMammothImage(MINIMAL_PNG_BYTES))
+            assert 'A unique description' in loader._image_payload_map[r1['src']]
+
+            # Second conversion, SAME image bytes — reset must drop the dedup hit
+            loader._reset_image_state()
+            r2 = loader._EliteADocxMammothLoader__handle_image(
+                MockMammothImage(MINIMAL_PNG_BYTES))
+            payload2 = loader._image_payload_map[r2['src']]
+            assert 'already transcribed' not in payload2  # no stale back-ref
+            assert 'A unique description' in payload2  # re-transcribed
+
+    def test_convert_docx_to_markdown_resets_image_state(self):
+        """Guard the call site: the conversion entry point must invoke
+        _reset_image_state, so deleting that one line is caught by a test
+        (not only the helper's own behavior)."""
+        buf = io.BytesIO()
+        document = DocxDocument()
+        document.add_paragraph("hello world")
+        document.save(buf)
+
+        loader = EliteADocxMammothLoader(
+            file_content=buf.getvalue(), file_name='t.docx')
+        with patch.object(
+            loader, '_reset_image_state', wraps=loader._reset_image_state
+        ) as spy:
+            loader._convert_docx_to_markdown(io.BytesIO(buf.getvalue()))
+        spy.assert_called_once()
