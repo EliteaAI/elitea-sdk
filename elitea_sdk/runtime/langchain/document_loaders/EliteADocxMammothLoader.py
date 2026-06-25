@@ -103,6 +103,23 @@ class EliteADocxMammothLoader(BaseLoader):
         self._image_ref_order = []
         # Counter to track current position during mammoth callbacks
         self._image_ref_index = 0
+        # token → image payload text (filename + transcript). Image handlers
+        # embed the token as the <img> src so the transcript — which routinely
+        # contains parentheses/newlines (LLM vision output) — is never parsed
+        # as part of the markdown image URL. Resolved in __postprocess_original_md.
+        self._image_payload_map = {}
+
+    def __register_image_payload(self, payload_text: str) -> str:
+        """Register an image payload and return a unique, paren/space-free token.
+
+        The token is embedded as the <img> ``src``; markdownify turns it into
+        ``![](<token>)`` and __postprocess_original_md swaps it back for the
+        payload verbatim. This avoids corrupting transcripts that contain ``)``
+        or newlines, which the previous ``src``-as-text approach truncated.
+        """
+        token = f"eliteaimgtoken{uuid.uuid4().hex}"
+        self._image_payload_map[token] = payload_text
+        return token
 
     def _scan_image_references(self, doc):
         """Pre-scan document XML for image references in document order.
@@ -165,7 +182,8 @@ class EliteADocxMammothLoader(BaseLoader):
 
             # Check dedup cache
             if img_hash in self._image_cache:
-                return {"src": f"Image: {image_name} [already transcribed, see above]"}
+                return {"src": self.__register_image_payload(
+                    f"Image: {image_name} [already transcribed, see above]")}
 
             # Process image
             transcript = None
@@ -181,10 +199,12 @@ class EliteADocxMammothLoader(BaseLoader):
                 transcript = "Transcript is not available"
 
             self._image_cache[img_hash] = transcript
-            return {"src": f"Image: {image_name}, {transcript}"}
+            return {"src": self.__register_image_payload(
+                f"Image: {image_name}, {transcript}")}
 
         except Exception:
-            return {"src": f"Image: {image_name}, Transcript is not available"}
+            return {"src": self.__register_image_payload(
+                f"Image: {image_name}, Transcript is not available")}
 
     def __placeholder_image_handler(self, image) -> dict:
         """Placeholder handler for non-image reads.
@@ -194,7 +214,7 @@ class EliteADocxMammothLoader(BaseLoader):
         """
         image_name = self._get_current_image_name()
         return {
-            "src": (
+            "src": self.__register_image_payload(
                 f"Image: {image_name}, you can selectively read it, "
                 "call get_file_metadata to figure out how"
             )
@@ -206,15 +226,36 @@ class EliteADocxMammothLoader(BaseLoader):
 
 
     def __postprocess_original_md(self, original_md: str) -> str:
-        # Pattern to match placeholders like[image_1_1.png] or similar
-        pattern = re.compile(r'!\[([^\]]*)\]\(([^)]*)(\s\"([^"]*)\")?\)')
+        """Swap image-payload tokens back for formatted transcript blocks.
 
-        def replace_placeholder(match):
-            transcript = match.group(2)
-            # Return a markdown formatted transcript section.
-            return f"\n**Image Transcript:**\n{transcript}\n"
+        Image handlers embed a unique token as the <img> ``src``; markdownify
+        renders it as ``![](<token>)``. Each token is replaced with its payload
+        taken verbatim from ``_image_payload_map`` — so parentheses and newlines
+        in the transcript (typical of LLM vision output) survive intact, unlike
+        the previous approach that parsed the transcript out of the markdown URL.
+        """
+        if not self._image_payload_map:
+            return original_md
 
-        new_md = pattern.sub(replace_placeholder, original_md)
+        # ![alt](TOKEN) or ![alt](TOKEN "title") → transcript block
+        image_md_pattern = re.compile(
+            r'!\[[^\]]*\]\((eliteaimgtoken[0-9a-f]+)(?:\s+"[^"]*")?\)')
+
+        def replace_token(match):
+            payload = self._image_payload_map.get(match.group(1))
+            if payload is None:
+                return match.group(0)
+            return f"\n**Image Transcript:**\n{payload}\n"
+
+        new_md = image_md_pattern.sub(replace_token, original_md)
+
+        # Defensive: if markdownify emitted a token outside image syntax
+        # (e.g. as bare text), still swap it for its transcript.
+        for token, payload in self._image_payload_map.items():
+            if token in new_md:
+                new_md = new_md.replace(
+                    token, f"\n**Image Transcript:**\n{payload}\n")
+
         return new_md
 
     def __has_border(self, paragraph):
@@ -526,14 +567,21 @@ class EliteADocxMammothLoader(BaseLoader):
         heading_tags = ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')
         moved = False
         for heading in soup.find_all(heading_tags):
+            images = heading.find_all('img')
+            if not images:
+                continue
             anchor = heading
-            for img in heading.find_all('img'):
+            for img in images:
                 img.extract()
                 paragraph = soup.new_tag('p')
                 paragraph.append(img)
                 anchor.insert_after(paragraph)
                 anchor = paragraph
-                moved = True
+            moved = True
+            # Drop the heading if it held only the image(s): otherwise it
+            # markdownifies to a dangling, empty ATX header line.
+            if not heading.get_text(strip=True):
+                heading.decompose()
         return str(soup) if moved else html
 
     def load(self):

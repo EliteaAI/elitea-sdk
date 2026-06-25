@@ -14,6 +14,11 @@ Run:
 import io
 from unittest.mock import MagicMock, patch, Mock
 import pytest
+from bs4 import BeautifulSoup
+
+from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
+    EliteADocxMammothLoader
+)
 
 
 class MockImageFile:
@@ -112,9 +117,11 @@ class TestDocxMammothLoaderImageHandling:
             # Third argument should be the prompt
             assert call_args[2] == 'Describe this image'
 
-            # Result should contain the LLM description with image name prefix
-            assert 'Mocked LLM description' in result['src']
-            assert 'Image: image_1' in result['src']
+            # src is now a unique token; the payload (filename + transcript) is
+            # stored verbatim in the payload map so parens/newlines survive.
+            payload = loader._image_payload_map[result['src']]
+            assert 'Mocked LLM description' in payload
+            assert 'Image: image_1' in payload
 
     def test_handle_image_with_llm_returns_description(self):
         """Test that LLM-generated descriptions are returned correctly"""
@@ -136,7 +143,8 @@ class TestDocxMammothLoaderImageHandling:
 
             result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
-            assert 'A chart showing quarterly revenue growth' in result['src']
+            payload = loader._image_payload_map[result['src']]
+            assert 'A chart showing quarterly revenue growth' in payload
 
     def test_handle_image_without_llm_returns_placeholder(self):
         """Without an LLM, no transcription backend exists → placeholder text."""
@@ -153,8 +161,9 @@ class TestDocxMammothLoaderImageHandling:
         result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
         # No LLM → no transcript available (Tesseract fallback removed)
-        assert 'Transcript is not available' in result['src']
-        assert 'Image: image_1' in result['src']
+        payload = loader._image_payload_map[result['src']]
+        assert 'Transcript is not available' in payload
+        assert 'Image: image_1' in payload
 
     def test_handle_image_fallback_on_llm_exception(self):
         """When the LLM call fails, the placeholder transcript is returned."""
@@ -177,7 +186,8 @@ class TestDocxMammothLoaderImageHandling:
             result = loader._EliteADocxMammothLoader__handle_image(mock_image)
 
             # LLM failed and there is no OCR fallback → placeholder transcript
-            assert 'Transcript is not available' in result['src']
+            payload = loader._image_payload_map[result['src']]
+            assert 'Transcript is not available' in payload
 
     def test_handle_image_bug_reproduction_without_read(self):
         """
@@ -618,3 +628,71 @@ class TestDocxScanImageReferences:
         loader._scan_image_references(DocxDocument(io.BytesIO(buf.getvalue())))
 
         assert loader._image_ref_order == []
+
+
+class TestDocxHoistImagesFromHeadings:
+    """Tests for __hoist_images_from_headings (issue #5333)."""
+
+    def test_image_inside_heading_is_hoisted_into_following_paragraph(self):
+        """An <img> inside a heading must be relocated into its own <p> right
+        after the heading so markdownify keeps it; the heading keeps its text
+        and the image src (which carries the transcript) is preserved.
+        """
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        html = (
+            '<h2>Section title<img src="Image: image1.png, a bubble sort diagram" /></h2>'
+            '<p>Body text.</p>'
+        )
+
+        result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
+        soup = BeautifulSoup(result, 'html.parser')
+
+        heading = soup.find('h2')
+        # Heading keeps its text but no longer holds the image.
+        assert heading.get_text(strip=True) == 'Section title'
+        assert heading.find('img') is None
+
+        # The image now lives in a <p> immediately after the heading, src intact.
+        hoisted = heading.find_next_sibling()
+        assert hoisted.name == 'p'
+        img = hoisted.find('img')
+        assert img is not None
+        assert img['src'] == 'Image: image1.png, a bubble sort diagram'
+
+    def test_image_only_heading_is_dropped_not_left_empty(self):
+        """A heading that held only the image must be removed, otherwise it
+        markdownifies to a dangling empty '#' header line."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        html = '<h1><img src="Image: image1.png, diagram" /></h1><p>Body.</p>'
+
+        result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
+        soup = BeautifulSoup(result, 'html.parser')
+
+        assert soup.find('h1') is None  # empty heading dropped
+        assert soup.find('img') is not None  # image preserved in its new <p>
+
+
+class TestDocxImageTranscriptPreservation:
+    """Transcripts with parentheses/newlines survive postprocessing (#5333).
+
+    Regression for the previous approach that round-tripped the transcript
+    through the markdown image URL and truncated it at the first ')'.
+    """
+
+    def test_postprocess_preserves_parentheses_and_newlines(self):
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        transcript = ("Bubble sort (ascending) step 1.\n"
+                      "Trend: increasing (left to right).\nNumbers: (5, 3, 8).")
+        token = loader._EliteADocxMammothLoader__register_image_payload(
+            f"Image: image1.png, {transcript}")
+
+        # markdownify renders the token-src image as ![](token)
+        md = f"# Title\n\n![]({token})\n\nBody text."
+        result = loader._EliteADocxMammothLoader__postprocess_original_md(md)
+
+        assert transcript in result  # verbatim — no truncation at ')'
+        assert token not in result  # token resolved
+        assert "**Image Transcript:**" in result
