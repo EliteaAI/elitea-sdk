@@ -749,7 +749,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         matched_key = matched_candidates[0]
                         token_data = mcp_tokens.get(matched_key)
                     if token_data:
-                        logger.info(f"[MCP Auth] Found token data for {matched_key or canonical_url}")
+                        logger.info("[MCP Auth] Found token data for matched server")
                         # Handle both old format (string) and new format (dict with access_token and session_id)
                         if isinstance(token_data, dict):
                             access_token = token_data.get('access_token')
@@ -784,8 +784,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     auth_err.toolkit_type = tool['type']
                     mcp_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
                     logger.info(
-                        "[MCP Auth] Deferred authorization for toolkit '%s' with %d proxy tool(s)",
-                        tool.get('toolkit_name', tool.get('type', 'mcp')),
+                        "[MCP Auth] Deferred authorization for toolkit with %d proxy tool(s)",
                         len(mcp_tools),
                     )
                     if mcp_tools and not _mcp_auth_control_added:
@@ -826,7 +825,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                 _canonical = canonical_resource(_server_url)
                                 _skip = _canonical in ignored_mcp_servers or _server_url in ignored_mcp_servers
                         if _skip:
-                            logger.info(f"[MCP Auth] Skipping ignored pre-configured MCP: server_name={server_name}")
+                            logger.info("[MCP Auth] Skipping ignored pre-configured MCP server")
                             continue
 
                     toolkit_name = tool.get('toolkit_name', '') or server_name
@@ -855,8 +854,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     _inject_display_metadata(tool, toolkit_tools)
                     tools.extend(toolkit_tools)
                     logger.info(
-                        "[MCP Auth] Deferred authorization for pre-configured MCP '%s' with %d proxy tool(s)",
-                        tool.get('toolkit_name', server_name),
+                        "[MCP Auth] Deferred authorization for pre-configured MCP with %d proxy tool(s)",
                         len(toolkit_tools),
                     )
                     if toolkit_tools and not _mcp_auth_control_added:
