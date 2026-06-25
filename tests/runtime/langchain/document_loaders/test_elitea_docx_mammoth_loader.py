@@ -15,6 +15,7 @@ import io
 from unittest.mock import MagicMock, patch, Mock
 import pytest
 from bs4 import BeautifulSoup
+from docx import Document as DocxDocument
 
 from elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader import (
     EliteADocxMammothLoader
@@ -696,3 +697,52 @@ class TestDocxImageTranscriptPreservation:
         assert transcript in result  # verbatim — no truncation at ')'
         assert token not in result  # token resolved
         assert "**Image Transcript:**" in result
+
+
+class TestDocxLoaderReuse:
+    """Per-conversion image state must not leak across reuse (#5333)."""
+
+    def test_reset_clears_dedup_cache_so_repeated_image_re_transcribes(self):
+        """A reused instance processing a second document whose image bytes
+        match the first must NOT emit a stale 'already transcribed' back-ref;
+        it must re-transcribe the image in the new document."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+        loader.llm = MagicMock()
+        loader.prompt = 'Describe'
+
+        with patch(
+            'elitea_sdk.runtime.langchain.document_loaders.EliteADocxMammothLoader'
+            '.perform_llm_prediction_for_image_bytes'
+        ) as mock_predict:
+            mock_predict.return_value = 'A unique description'
+
+            # First conversion
+            loader._reset_image_state()
+            r1 = loader._EliteADocxMammothLoader__handle_image(
+                MockMammothImage(MINIMAL_PNG_BYTES))
+            assert 'A unique description' in loader._image_payload_map[r1['src']]
+
+            # Second conversion, SAME image bytes — reset must drop the dedup hit
+            loader._reset_image_state()
+            r2 = loader._EliteADocxMammothLoader__handle_image(
+                MockMammothImage(MINIMAL_PNG_BYTES))
+            payload2 = loader._image_payload_map[r2['src']]
+            assert 'already transcribed' not in payload2  # no stale back-ref
+            assert 'A unique description' in payload2  # re-transcribed
+
+    def test_convert_docx_to_markdown_resets_image_state(self):
+        """Guard the call site: the conversion entry point must invoke
+        _reset_image_state, so deleting that one line is caught by a test
+        (not only the helper's own behavior)."""
+        buf = io.BytesIO()
+        document = DocxDocument()
+        document.add_paragraph("hello world")
+        document.save(buf)
+
+        loader = EliteADocxMammothLoader(
+            file_content=buf.getvalue(), file_name='t.docx')
+        with patch.object(
+            loader, '_reset_image_state', wraps=loader._reset_image_state
+        ) as spy:
+            loader._convert_docx_to_markdown(io.BytesIO(buf.getvalue()))
+        spy.assert_called_once()

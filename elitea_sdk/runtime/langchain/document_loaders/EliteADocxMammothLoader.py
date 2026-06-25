@@ -109,6 +109,20 @@ class EliteADocxMammothLoader(BaseLoader):
         # as part of the markdown image URL. Resolved in __postprocess_original_md.
         self._image_payload_map = {}
 
+    def _reset_image_state(self):
+        """Clear per-conversion image caches.
+
+        Reset together so they cannot drift apart: the token→payload map and
+        the MD5→transcript dedup cache. Without clearing the dedup cache, a
+        reused instance processing a second document whose image bytes match
+        one from the first would short-circuit to a "[already transcribed,
+        see above]" back-reference that points at nothing — and lose that
+        image's transcript. (``_image_ref_*`` are reset by
+        ``_scan_image_references`` on every conversion.)
+        """
+        self._image_payload_map = {}
+        self._image_cache = {}
+
     def __register_image_payload(self, payload_text: str) -> str:
         """Register an image payload and return a unique, paren/space-free token.
 
@@ -666,6 +680,10 @@ class EliteADocxMammothLoader(BaseLoader):
         Detects bordered content and treats it as code blocks.  Pre-scans
         image references so that callbacks can include the original filename.
         """
+        # Reset per-conversion image state so a reused loader instance does not
+        # carry stale tokens or dedup hits across multiple conversions.
+        self._reset_image_state()
+
         if hasattr(docx_file, 'seek'):
             docx_file.seek(0)
 
