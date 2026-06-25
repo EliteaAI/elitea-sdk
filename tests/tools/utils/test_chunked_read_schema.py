@@ -18,9 +18,11 @@ from openpyxl import Workbook
 from pydantic import ValidationError
 
 from elitea_sdk.tools.utils.file_metadata import (
+    DEFAULT_MAX_OUTPUT_CHARS,
     RESULT_STATUS_KEY,
     SCHEMA_VERSION,
     ResultStatus,
+    build_error_response,
     build_over_limit_response,
     get_file_metadata,
     validate_chunked_read_response,
@@ -49,6 +51,9 @@ def test_base_output_carries_discriminator_and_validates():
     # Canonical instruction block is present even for the generic fallback.
     instr = meta["instruction_for_readFile"]
     assert set(instr.keys()) >= {"first_class_params", "extra_params", "notes"}
+    # Universal read_limits baseline is ALWAYS present, even with no loader.
+    assert meta["read_limits"]["max_output_chars"] == DEFAULT_MAX_OUTPUT_CHARS
+    assert "full_read_allowed" in meta["read_limits"]
     # Conforms to the contract.
     validate_chunked_read_response(meta)
 
@@ -83,12 +88,14 @@ def test_over_limit_reuses_metadata_and_flips_only_discriminator():
         meta, actual_chars=870123, limit_chars=200000, requested="full read"
     )
 
-    # Only the discriminator changed (+ added context).
+    # Only the discriminator changed (+ added context + pinned full_read_allowed).
     assert over[RESULT_STATUS_KEY] == ResultStatus.CONTENT_TOO_LARGE.value
     assert over["unit"] == meta["unit"]
     assert over["total_rows"] == meta["total_rows"]
     assert over["instruction_for_readFile"] == meta["instruction_for_readFile"]
-    assert over["read_limits"] == meta["read_limits"]
+    # max_output_chars survives; full_read_allowed is pinned False on over-limit.
+    assert over["read_limits"]["max_output_chars"] == meta["read_limits"]["max_output_chars"]
+    assert over["read_limits"]["full_read_allowed"] is False
     # context describes the over-limit condition.
     assert over["context"] == {
         "limit_chars": 200000,
@@ -96,6 +103,37 @@ def test_over_limit_reuses_metadata_and_flips_only_discriminator():
         "requested": "full read",
     }
     validate_chunked_read_response(over)
+
+
+def test_docx_metadata_carries_read_limits_baseline():
+    # Docx loader supplies no read_limits of its own; the central baseline must
+    # still make max_output_chars present (the documented-required field).
+    meta = get_file_metadata("doc.docx", file_content=None, file_size=1234)
+    assert meta[RESULT_STATUS_KEY] == ResultStatus.FILE_METADATA.value
+    assert meta["read_limits"]["max_output_chars"] == DEFAULT_MAX_OUTPUT_CHARS
+    validate_chunked_read_response(meta)
+
+
+def test_guidance_without_read_limits_fails_validation():
+    # A file_metadata/content_too_large object MUST carry read_limits.
+    for status in (ResultStatus.FILE_METADATA, ResultStatus.CONTENT_TOO_LARGE):
+        with pytest.raises(ValidationError):
+            validate_chunked_read_response({
+                RESULT_STATUS_KEY: status.value,
+                "filename": "x.dat",
+            })
+
+
+def test_error_response_carries_schema_version_and_validates():
+    # Major-2: error emissions route through the model (schema_version + valid),
+    # and an error response may omit read_limits.
+    err = build_error_response("boom", filename="x.dat", filepath="/b/x.dat")
+    assert err[RESULT_STATUS_KEY] == ResultStatus.ERROR.value
+    assert err["schema_version"] == SCHEMA_VERSION
+    assert err["message"] == "boom"
+    assert err["filepath"] == "/b/x.dat"  # extra context rides through
+    assert "read_limits" not in err
+    validate_chunked_read_response(err)
 
 
 def test_non_conformant_read_limits_fails_validation():

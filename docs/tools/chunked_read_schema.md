@@ -64,7 +64,7 @@ elif status in (None,):
 | `filesize` | int \| null | Bytes. |
 | `unit` | string \| null | Authoritative natural unit: `rows` \| `lines` \| `pages` \| `sheets` \| null. Names which `total_<unit>` is the total of record. |
 | `total_<unit>` | int | **Flat** per-unit total: `total_rows` / `total_lines` / `total_pages` / `total_sheets`. Only the relevant one(s) present. |
-| `read_limits` | object \| null | Per-type caps + estimates (below). |
+| `read_limits` | object | **Required** on `file_metadata` / `content_too_large` (the looping node needs a limit to chunk against); omitted only on `error`. Per-type caps + estimates (below). |
 | `instruction_for_readFile` | object | Exact `read_file` params for the next chunk (below). |
 | `context` | object | **Over-limit only.** `{limit_chars, actual_chars, requested?}`. |
 | `message` | string | **Error only.** |
@@ -77,7 +77,13 @@ Only two keys are **universal and required**:
 | Key | Type | Meaning |
 |-----|------|---------|
 | `max_output_chars` | int | **THE** single bounded-read limit — chars of text returned to context (200000). One limit, no second number. |
-| `full_read_allowed` | bool | Whether an unbounded full read is permitted for this file. |
+| `full_read_allowed` | bool | Whether an unbounded full read is permitted for this file. Always `false` on `content_too_large` (a full read just exceeded the limit). |
+
+The central `get_file_metadata` injects a **universal baseline** for these two
+keys for *every* file type, then merges the loader's `read_limits` key-wise on
+top. A loader therefore inherits `max_output_chars` / `full_read_allowed`
+without restating them, and the documented-required field is genuinely always
+present (including for loaders like Docx that supply no `read_limits`).
 
 Everything else is **optional and MUST be type-prefixed**, so no other loader
 assumes the key exists. Example Excel extras:
@@ -193,16 +199,27 @@ def get_file_metadata(cls, *, filename, file_content=None, file_size=None) -> di
     }
 ```
 
-The central `file_metadata.get_file_metadata` merges this over the generic base,
-stamps `__result_status__` / `schema_version`, and **validates the merged dict
-through `ChunkedReadResponse`** before returning. A loader that omits a required
-`read_limits` key (or returns a malformed shape) fails validation — the central
-function then returns an `error` response and logs the violation. This is the
-single enforcement point every Phase-1 per-type task (PRE-2..12) conforms to.
+The central `file_metadata.get_file_metadata` merges this over the generic base
+(including the universal `read_limits` baseline), stamps `__result_status__` /
+`schema_version`, and **validates the merged dict through `ChunkedReadResponse`**
+before returning. A loader that returns a malformed shape fails validation — the
+central function then returns an `error` response and logs the violation. This is
+the single enforcement point every Phase-1 per-type task (PRE-2..12) conforms to.
 
-Validate any dict explicitly with:
+A loader does **not** need to restate `max_output_chars` / `full_read_allowed`
+(the baseline supplies them), but a guidance object that ends up with no
+`read_limits` at all is rejected by the model validator.
+
+**All emissions route through the model.** Both the success path
+(`get_file_metadata`) and every error path (`build_error_response`) produce dicts
+via `ChunkedReadResponse`, so every response — including errors raised in the
+artifact tool/client — carries `schema_version` and the discriminator. Never
+hand-build a response dict.
 
 ```python
-from elitea_sdk.tools.utils.file_metadata import validate_chunked_read_response
-validate_chunked_read_response(some_dict)   # raises pydantic.ValidationError on non-conformance
+from elitea_sdk.tools.utils.file_metadata import (
+    validate_chunked_read_response, build_error_response,
+)
+validate_chunked_read_response(some_dict)        # raises ValidationError on non-conformance
+build_error_response("msg", filename="x.dat")    # the only way to emit an error response
 ```

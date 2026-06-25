@@ -42,7 +42,13 @@ import os
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +61,13 @@ SCHEMA_VERSION = "1.0"
 #: JSON key carrying the single machine-detectable discriminator. Namespaced
 #: with dunders so it never collides with a content dict's own keys.
 RESULT_STATUS_KEY = "__result_status__"
+
+#: The single universal bounded-read limit (chars of text returned to context).
+#: Injected as the ``read_limits`` baseline for every file type so the
+#: documented-required field is genuinely always present, even for loaders that
+#: supply no ``read_limits`` of their own. Phase 4 (#5446) wires the configurable
+#: per-tool value through; PRE-1 only needs a single source of truth.
+DEFAULT_MAX_OUTPUT_CHARS = 200000
 
 
 class ResultStatus(str, Enum):
@@ -158,6 +171,23 @@ class ChunkedReadResponse(BaseModel):
     # Present only when result_status == error.
     message: Optional[str] = None
 
+    @model_validator(mode="after")
+    def _read_limits_required_for_guidance(self) -> "ChunkedReadResponse":
+        """``read_limits`` is mandatory on guidance responses.
+
+        A ``file_metadata`` / ``content_too_large`` object without
+        ``read_limits.max_output_chars`` gives the looping node no limit to
+        chunk against. Only ``error`` responses (which carry no guidance) may
+        omit it. The central builders always inject the universal baseline, so
+        this only bites a caller that hand-builds a guidance object incorrectly.
+        """
+        if self.result_status is not ResultStatus.ERROR and self.read_limits is None:
+            raise ValueError(
+                "read_limits is required for "
+                f"__result_status__={self.result_status.value!r}"
+            )
+        return self
+
 
 def _dump(model: ChunkedReadResponse) -> Dict[str, Any]:
     """Serialize a response model to a plain dict using the JSON aliases.
@@ -177,14 +207,33 @@ def validate_chunked_read_response(obj: Dict[str, Any]) -> ChunkedReadResponse:
     return ChunkedReadResponse.model_validate(obj)
 
 
-def _error_response(filename: Optional[str], message: str,
-                    extension: str = "") -> Dict[str, Any]:
-    return _dump(ChunkedReadResponse(
+def build_error_response(
+    message: str,
+    *,
+    filename: Optional[str] = None,
+    extension: str = "",
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Build an ``error`` chunked-read response through the validated model.
+
+    The single error-emission entry point: every caller routes here so error
+    responses carry ``schema_version`` and the discriminator and stay within the
+    one PRE-1 contract (no hand-built dicts that silently drift). ``extra``
+    carries optional context such as ``filepath`` or ``bucket``.
+    """
+    model = ChunkedReadResponse(
         result_status=ResultStatus.ERROR,
         filename=filename,
         extension=extension,
         message=message,
-    ))
+    )
+    payload = _dump(model)
+    # extra=allow on the model lets these ride through; merge after dump so they
+    # appear in output without needing declared fields.
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 def _detect_type(filename: str, file_content: Optional[bytes]):
@@ -235,6 +284,13 @@ def get_file_metadata(
             len(file_content) if file_content is not None else None
         ),
         "unit": None,
+        # Universal read_limits baseline so the documented-required field is
+        # ALWAYS present, even for loaders that supply no read_limits of their
+        # own (e.g. Docx). Loaders refine it via key-wise merge below.
+        "read_limits": {
+            "max_output_chars": DEFAULT_MAX_OUTPUT_CHARS,
+            "full_read_allowed": True,
+        },
         "instruction_for_readFile": {
             "first_class_params": {},
             "extra_params": {},
@@ -265,14 +321,22 @@ def get_file_metadata(
                 extra = {}
 
     # Shallow-merge: loader overrides base on conflicting keys. The nested
-    # instruction block is merged key-wise so loaders can supply only the
-    # sub-keys they care about.
+    # instruction and read_limits blocks are merged key-wise so loaders can
+    # supply only the sub-keys they care about while the universal baseline
+    # (max_output_chars + full_read_allowed) always survives.
     instr = dict(base["instruction_for_readFile"])
     loader_instr = extra.pop("instruction_for_readFile", None)
     if isinstance(loader_instr, dict):
         instr.update(loader_instr)
+
+    read_limits = dict(base["read_limits"])
+    loader_limits = extra.pop("read_limits", None)
+    if isinstance(loader_limits, dict):
+        read_limits.update(loader_limits)
+
     base.update(extra)
     base["instruction_for_readFile"] = instr
+    base["read_limits"] = read_limits
 
     try:
         return _dump(validate_chunked_read_response(base))
@@ -281,8 +345,9 @@ def get_file_metadata(
         # surface as an error response (tests assert conformance separately).
         logger.warning("get_file_metadata for %s (%s) failed schema validation: %s",
                        filename, extension, e)
-        return _error_response(
-            filename, f"Metadata failed schema validation: {e}", extension
+        return build_error_response(
+            f"Metadata failed schema validation: {e}",
+            filename=filename, extension=extension,
         )
 
 
@@ -303,10 +368,16 @@ def build_over_limit_response(
     a bounded chunked read using the same ``instruction_for_readFile``.
 
     ``metadata`` is the dict returned by :func:`get_file_metadata` (or any
-    contract-conformant dict).
+    contract-conformant dict). It must carry ``read_limits`` (guaranteed for
+    anything produced by :func:`get_file_metadata`); the model validator rejects
+    a guidance object without it.
     """
     model = validate_chunked_read_response(metadata)
     model.result_status = ResultStatus.CONTENT_TOO_LARGE
+    # By definition a full read is not allowed on the over-limit path — the read
+    # just exceeded the limit. Pin it so the looping node never re-attempts one.
+    if model.read_limits is not None:
+        model.read_limits.full_read_allowed = False
     model.context = OverLimitContext(
         limit_chars=limit_chars,
         actual_chars=actual_chars,

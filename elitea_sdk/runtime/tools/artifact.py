@@ -27,7 +27,7 @@ from ...runtime.utils.content_appender import (
     get_param_description_blocks,
 )
 from ...runtime.utils.utils import IndexerKeywords
-from ...tools.utils.file_metadata import RESULT_STATUS_KEY, ResultStatus
+from ...tools.utils.file_metadata import build_error_response
 
 DEFAULT_MAX_SINGLE_READ_SIZE = 200000
 
@@ -737,17 +737,14 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 try:
                     target_bucket, key = parse_filepath(filepath)
                 except ValueError as e:
-                    return json.dumps({
-                        RESULT_STATUS_KEY: ResultStatus.ERROR.value,
-                        "filepath": filepath,
-                        "message": f"Invalid filepath format: {e}",
-                    })
+                    return json.dumps(build_error_response(
+                        f"Invalid filepath format: {e}", filepath=filepath,
+                    ))
             else:
                 if not filename:
-                    return json.dumps({
-                        RESULT_STATUS_KEY: ResultStatus.ERROR.value,
-                        "message": "Must provide either 'filepath' or 'filename'.",
-                    })
+                    return json.dumps(build_error_response(
+                        "Must provide either 'filepath' or 'filename'.",
+                    ))
                 target_bucket = bucket_name or self.bucket
                 key = filename.lstrip('/')
 
@@ -764,12 +761,10 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 meta["filepath"] = filepath
             return json.dumps(meta, default=str)
         except Exception as e:  # pylint: disable=broad-except
-            return json.dumps({
-                RESULT_STATUS_KEY: ResultStatus.ERROR.value,
-                "filepath": filepath,
-                "filename": filename,
-                "message": f"Error reading file metadata: {e}",
-            })
+            return json.dumps(build_error_response(
+                f"Error reading file metadata: {e}",
+                filename=filename, filepath=filepath,
+            ))
 
     def create_new_bucket(self, bucket_name: str, expiration_measure = "weeks", expiration_value = 1):
         sanitized_name = bucket_name.replace('_', '-').lower()
