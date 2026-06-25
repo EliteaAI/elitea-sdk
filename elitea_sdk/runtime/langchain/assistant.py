@@ -423,10 +423,18 @@ class Assistant:
             mcp_tokens=mcp_tokens,
             conversation_id=conversation_id,
             ignored_mcp_servers=ignored_mcp_servers,
-            current_participant_id=self.current_participant_id
+            current_participant_id=self.current_participant_id,
+            user_declined_mcp_servers=data.get("user_declined_mcp_servers"),
         )
         if tools:
             self.tools += tools
+            # Deduplicate by name keeping the last occurrence — the richer version
+            # from indexer_agent._make_mcp_auth_tools (injected via tools=) overrides
+            # the basic mcp_auth_control created by get_tools() for the predict path.
+            _seen: dict = {}
+            for _t in self.tools:
+                _seen[_t.name] = _t
+            self.tools = list(_seen.values())
 
         # Initialize middleware manager and add middleware tools
         # Middleware tools are tracked separately as "always-bind" tools

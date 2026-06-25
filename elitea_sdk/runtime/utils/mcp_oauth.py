@@ -9,6 +9,110 @@ from langchain_core.tools import ToolException
 
 logger = logging.getLogger(__name__)
 
+MCP_AUTH_DECISION_TYPE = "mcp_auth_decision"
+
+
+def _is_http_url(value: Optional[str]) -> bool:
+    """Return True if value is a valid HTTP or HTTPS URL."""
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
+    """Return the alternate Atlassian MCP URL (authv2 <-> SSE), or None for non-Atlassian URLs."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "mcp.atlassian.com":
+        return None
+    path = parsed.path.rstrip("/")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    if path == "/v1/mcp/authv2":
+        return f"{origin}/v1/sse"
+    if path == "/v1/sse":
+        return f"{origin}/v1/mcp/authv2"
+    return None
+
+
+def has_active_mcp_token(mcp_tokens: Optional[dict], server_url: Optional[str]) -> bool:
+    """Return True if mcp_tokens contains a valid token for server_url.
+
+    Checks the raw URL, its canonical form, and Atlassian alternate URL variants
+    to handle token keys stored under different but equivalent forms.
+    """
+    if not isinstance(mcp_tokens, dict) or not server_url:
+        return False
+
+    candidates: list = []
+    for raw_candidate in [
+        server_url,
+        canonical_resource(server_url),
+        atlassian_mcp_alternate_resource(server_url),
+    ]:
+        if isinstance(raw_candidate, str) and raw_candidate and raw_candidate not in candidates:
+            candidates.append(raw_candidate)
+
+    for candidate in candidates:
+        token_data = mcp_tokens.get(candidate)
+        if isinstance(token_data, dict):
+            if token_data.get("access_token") or token_data.get("refresh_token"):
+                return True
+        elif token_data:
+            return True
+
+    return False
+
+
+def build_mcp_auth_decision_payload(
+    *,
+    status: str,
+    server_url: str,
+    tool_name: str = "",
+    toolkit_type: str = "",
+    message: str,
+    next_step: str,
+    denial_reason: Optional[str] = None,
+    resource_metadata_url: Optional[str] = None,
+    www_authenticate: Optional[str] = None,
+    resource_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a slim, structured MCP auth decision payload for LLM guidance.
+
+    The shape mirrors the sensitive-tool blocked payload style: one type discriminator,
+    compact machine-readable routing fields, and a single natural-language directive.
+    """
+    payload: Dict[str, Any] = {
+        "type": MCP_AUTH_DECISION_TYPE,
+        "status": status,
+        "server_url": server_url,
+        "tool_name": tool_name,
+        "toolkit_type": toolkit_type,
+        "message": message,
+        "next_step": next_step,
+        "auth_context": {
+            "resource_metadata_url": resource_metadata_url,
+            "www_authenticate": www_authenticate,
+            "resource_metadata": resource_metadata,
+        },
+    }
+    if denial_reason:
+        payload["denial_reason"] = denial_reason
+    return payload
+
+
+def build_mcp_auth_decision_result(**kwargs) -> str:
+    """Serialize MCP auth decision payload as compact JSON string."""
+    return json.dumps(
+        build_mcp_auth_decision_payload(**kwargs),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
 
 class McpAuthorizationRequired(ToolException):
     """Raised when an MCP server requires OAuth authorization before use."""
@@ -34,12 +138,16 @@ class McpAuthorizationRequired(ToolException):
         self.toolkit_type = toolkit_type
 
     def to_dict(self) -> Dict[str, Any]:
+        authorization_servers = getattr(self, "authorization_servers", None)
+        if authorization_servers is None and isinstance(self.resource_metadata, dict):
+            authorization_servers = self.resource_metadata.get("authorization_servers")
         return {
             "message": str(self),
             "server_url": self.server_url,
             "resource_metadata_url": self.resource_metadata_url,
             "www_authenticate": self.www_authenticate,
             "resource_metadata": self.resource_metadata,
+            "authorization_servers": authorization_servers,
             "status": self.status,
             "tool_name": self.tool_name,
             "toolkit_type": self.toolkit_type,

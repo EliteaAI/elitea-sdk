@@ -48,6 +48,7 @@ from langchain_core.tools import BaseToolkit, BaseTool
 from pydantic import BaseModel, Field
 
 from ..utils.mcp_oauth import substitute_mcp_placeholders
+from ..utils.mcp_oauth import canonical_resource
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,28 @@ name = "mcp_config"
 # Global session manager for stdio process lifecycle
 _session_manager_lock = threading.Lock()
 _session_manager: Optional['McpStdioSessionManager'] = None
+
+
+def _atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
+    if not isinstance(url, str):
+        return None
+    if url.startswith("https://mcp.atlassian.com/"):
+        normalized = url.rstrip("/")
+        if normalized.endswith("/v1/mcp/authv2"):
+            return "https://mcp.atlassian.com/v1/sse"
+        if normalized.endswith("/v1/sse"):
+            return "https://mcp.atlassian.com/v1/mcp/authv2"
+    return None
+
+
+def _normalize_atlassian_mcp_url(url: Optional[str]) -> Optional[str]:
+    """Normalize deprecated Atlassian MCP URL /v1/sse to the current /v1/mcp/authv2."""
+    if not isinstance(url, str):
+        return url
+    normalized = url.rstrip("/")
+    if normalized == "https://mcp.atlassian.com/v1/sse":
+        return "https://mcp.atlassian.com/v1/mcp/authv2"
+    return url
 
 
 def _create_stdio_tool_func(original_tool_name: str, server_name: str, server_config: Dict[str, Any]):
@@ -596,46 +619,87 @@ class McpConfigToolkit(BaseToolkit):
         headers = substitute_mcp_placeholders(server_config.get('headers', {}), user_config)
         timeout = server_config.get('timeout', 60)
         ssl_verify = user_config.get('ssl_verify', server_config.get('ssl_verify', True))
+        canonical_url = canonical_resource(url) if url else None
+        atlassian_alt_url = _atlassian_mcp_alternate_resource(canonical_url or url)
 
-        # Apply OAuth token if available: find if it ends with server_name or toolkit_name for flexibility
+        token_keys = [key for key in mcp_tokens.keys() if isinstance(key, str)]
+        token_keys_lower_map = {key.lower(): key for key in token_keys}
+
+        lookup_candidates = [
+            server_name,
+            toolkit_name,
+            f"mcp_{server_name}" if server_name else None,
+            f"mcp_{toolkit_name}" if toolkit_name else None,
+            canonical_url,
+            url,
+            atlassian_alt_url,
+        ]
+        lookup_candidates = [candidate for candidate in lookup_candidates if isinstance(candidate, str) and candidate]
+
+        # Apply OAuth token if available.
+        # Priority: explicit candidate keys (including URL variants), then legacy suffix matching.
         token_data = None
-        for key in mcp_tokens:
-            if key.endswith(server_name) or key.endswith(toolkit_name or ''):
-                token_data = mcp_tokens[key]
-                break
-        if not token_data:
-            token_data = mcp_tokens.get(server_name) or mcp_tokens.get(toolkit_name)
+        matched_key = None
 
-        logger.debug(f"[MCP Config] MCP Server {server_name} token_data present: {token_data is not None}")
+        for candidate in lookup_candidates:
+            token_data = mcp_tokens.get(candidate)
+            if token_data is not None:
+                matched_key = candidate
+                break
+
+            lower_candidate = candidate.lower()
+            actual_key = token_keys_lower_map.get(lower_candidate)
+            if actual_key:
+                token_data = mcp_tokens.get(actual_key)
+                matched_key = actual_key
+                break
+
+        if not token_data:
+            for key in token_keys:
+                if key.endswith(server_name) or key.endswith(toolkit_name or ''):
+                    token_data = mcp_tokens[key]
+                    matched_key = key
+                    break
+
         if not token_data:
             # Try to find by URL match
             for token_key, token_info in mcp_tokens.items():
                 if isinstance(token_info, dict) and token_info.get('url') == url:
                     token_data = token_info
+                    matched_key = token_key
                     break
 
+        session_id = None
         if token_data:
-            access_token = token_data.get('access_token')
-            token_type = token_data.get('token_type', 'Bearer')
+            access_token = token_data.get('access_token') if isinstance(token_data, dict) else None
+            # Also handle case where token_data is just the token string itself
+            if not access_token and isinstance(token_data, str):
+                access_token = token_data
+            token_type = token_data.get('token_type', 'Bearer') if isinstance(token_data, dict) else 'Bearer'
+            # Extract session_id for session-based auth (e.g. Atlassian MCP)
+            session_id = token_data.get('session_id') if isinstance(token_data, dict) else None
 
             if access_token:
                 if headers is None:
                     headers = {}
                 headers['Authorization'] = f"{token_type} {access_token}"
-                logger.info(f"[MCP Config] Applied OAuth token for HTTP server {server_name}")
 
-        logger.debug(f"[MCP Config] Connecting to HTTP server {server_name} at {url} (ssl_verify={ssl_verify})")
+        # Normalize deprecated Atlassian /v1/sse URL to /v1/mcp/authv2 for the actual connection
+        connection_url = _normalize_atlassian_mcp_url(url)
+
+        logger.debug(f"[MCP Config] Connecting to HTTP server {server_name} at {connection_url} (ssl_verify={ssl_verify})")
 
 
         # Use existing McpToolkit for HTTP servers
         mcp_toolkit = McpToolkit.get_toolkit(
-            url=url,
+            url=connection_url,
             headers=headers,
             timeout=timeout,
             ssl_verify=ssl_verify,
             selected_tools=selected_tools or [],
             toolkit_name=toolkit_name,
             client=client,
+            session_id=session_id,
         )
 
         tools = mcp_toolkit.get_tools()
