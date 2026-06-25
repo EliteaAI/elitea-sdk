@@ -2209,11 +2209,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             "include_archived_content": (Optional[bool], Field(description="Include archived content.", default=False)),
             "include_attachments": (Optional[bool], Field(description="Include attachments.", default=False)),
             'include_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to include when processing attachments: i.e. ['*.png', '*.jpg']. "
+                description='List of file extensions to include when processing attachments: i.e. ["*.png", "*.jpg"]. '
                             "If empty, all files will be processed (except skip_extensions).",
                 default=[])),
             'skip_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to skip when processing attachments: i.e. ['*.png', '*.jpg']",
+                description='List of file extensions to skip when processing attachments: i.e. ["*.png", "*.jpg"]',
                 default=[])),
             "include_comments": (Optional[bool], Field(description="Include comments.", default=False)),
             "include_labels": (Optional[bool], Field(description="Include labels.", default=False)),

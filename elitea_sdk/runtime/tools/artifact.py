@@ -786,15 +786,15 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                 default=None)),
             'include_extensions': (Optional[List[str]], Field(
                 description="Patterns to include when processing. Supports glob-style matching (case-insensitive):\n"
-                            "- Extension patterns: ['*.png', '*.jpg'] - matches files at any depth\n"
-                            "- Folder patterns: ['_shared/*', 'docs/*'] - for multi-folder when folder=None\n"
-                            "- Combined: ['docs/*.md', 'reports/*.pdf'] - folder + extension filter\n"
+                            '- Extension patterns: ["*.png", "*.jpg"] - matches files at any depth\n'
+                            '- Folder patterns: ["_shared/*", "docs/*"] - for multi-folder when folder=None\n'
+                            '- Combined: ["docs/*.md", "reports/*.pdf"] - folder + extension filter\n'
                             "If empty, all files are processed (except skip_extensions).\n"
                             "Note: [, ], and ? are glob metacharacters.",
                 default=[])),
             'skip_extensions': (Optional[List[str]], Field(
                 description="Patterns to skip when processing. Same glob-style syntax as include_extensions (case-insensitive).\n"
-                            "Examples: ['temp/*', '*.tmp', 'draft/*']\n"
+                            'Examples: ["temp/*", "*.tmp", "draft/*"]\n'
                             "Note: [, ], and ? are glob metacharacters.",
                 default=[])),
         }

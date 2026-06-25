@@ -2273,7 +2273,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 default=False)),
             'max_total_issues': (Optional[int], Field(description="Maximum number of issues to index", default=1000)),
             'skip_attachment_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to skip when processing attachments: i.e. ['.png', '.jpg']",
+                description='List of file extensions to skip when processing attachments: i.e. [".png", ".jpg"]',
                 default=[])),
             'chunking_tool': (Literal['markdown', ''], Field(description="Name of chunking tool for base document", default='markdown')),
         }
