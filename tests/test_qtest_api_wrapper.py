@@ -1,8 +1,15 @@
 import html
 
+import pytest
+import urllib3
 from pydantic import SecretStr
 
-from elitea_sdk.tools.qtest.api_wrapper import QTEST_ID, QtestApiWrapper
+from elitea_sdk.tools.qtest.api_wrapper import (
+    QTEST_ID,
+    QtestApiWrapper,
+    _TimeoutApiClient,
+    _default_qtest_timeout,
+)
 from elitea_sdk.tools.utils.content_parser import image_processing_prompt
 
 
@@ -558,3 +565,110 @@ def test_search_by_dql_defaults_to_lightweight(monkeypatch):
     wrapper.search_by_dql("Id = 'TC-1'")
 
     assert captured == {'append_test_steps': False, 'include_external_properties': False}
+
+
+# ---------------------------------------------------------------------------
+# #4952 - configurable per-request HTTP timeout for the qTest client
+# ---------------------------------------------------------------------------
+
+def test_default_qtest_timeout_from_env(monkeypatch):
+    monkeypatch.setenv('QTEST_API_TIMEOUT_SECONDS', '42')
+    assert _default_qtest_timeout() == 42
+
+
+def test_default_qtest_timeout_fallback_when_unset(monkeypatch):
+    monkeypatch.delenv('QTEST_API_TIMEOUT_SECONDS', raising=False)
+    assert _default_qtest_timeout() == 180
+
+
+def test_default_qtest_timeout_fallback_when_invalid(monkeypatch):
+    monkeypatch.setenv('QTEST_API_TIMEOUT_SECONDS', 'not-a-number')
+    assert _default_qtest_timeout() == 180
+
+
+def test_default_qtest_timeout_fallback_when_non_positive(monkeypatch):
+    monkeypatch.setenv('QTEST_API_TIMEOUT_SECONDS', '0')
+    assert _default_qtest_timeout() == 180
+
+
+def _make_timeout_client(request_timeout=180):
+    import swagger_client
+    return _TimeoutApiClient(swagger_client.Configuration(), request_timeout=request_timeout)
+
+
+def test_timeout_client_injects_default_request_timeout(monkeypatch):
+    import swagger_client
+    captured = {}
+
+    def fake_call_api(self, resource_path, method, *args, **kwargs):
+        captured.update(kwargs)
+        return 'ok'
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', fake_call_api)
+    client = _make_timeout_client(180)
+
+    result = client.call_api('/api/v3/projects/1/search', 'POST')
+
+    assert result == 'ok'
+    assert captured['_request_timeout'] == 180
+
+
+def test_timeout_client_respects_explicit_request_timeout(monkeypatch):
+    import swagger_client
+    captured = {}
+
+    def fake_call_api(self, resource_path, method, *args, **kwargs):
+        captured.update(kwargs)
+        return 'ok'
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', fake_call_api)
+    client = _make_timeout_client(180)
+
+    client.call_api('/x', 'GET', _request_timeout=5)
+
+    assert captured['_request_timeout'] == 5
+
+
+def test_timeout_client_translates_read_timeout(monkeypatch):
+    import swagger_client
+
+    def boom(self, *args, **kwargs):
+        raise urllib3.exceptions.ReadTimeoutError(None, '/x', 'read timed out')
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', boom)
+    client = _make_timeout_client(180)
+
+    with pytest.raises(TimeoutError) as exc_info:
+        client.call_api('/api/v3/projects/1/search', 'POST')
+
+    message = str(exc_info.value)
+    assert '180' in message
+    assert 'timed out' in message.lower()
+
+
+def test_timeout_client_translates_maxretry_timeout(monkeypatch):
+    import swagger_client
+    reason = urllib3.exceptions.ConnectTimeoutError('connect timed out')
+
+    def boom(self, *args, **kwargs):
+        raise urllib3.exceptions.MaxRetryError(None, '/x', reason=reason)
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', boom)
+    client = _make_timeout_client(180)
+
+    with pytest.raises(TimeoutError):
+        client.call_api('/api/v3/projects/1/search', 'POST')
+
+
+def test_timeout_client_reraises_non_timeout_maxretry(monkeypatch):
+    import swagger_client
+    reason = urllib3.exceptions.ProtocolError('connection aborted')
+
+    def boom(self, *args, **kwargs):
+        raise urllib3.exceptions.MaxRetryError(None, '/x', reason=reason)
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', boom)
+    client = _make_timeout_client(180)
+
+    with pytest.raises(urllib3.exceptions.MaxRetryError):
+        client.call_api('/x', 'GET')

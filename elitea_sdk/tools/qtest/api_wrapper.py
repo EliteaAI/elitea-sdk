@@ -276,6 +276,77 @@ NoInput = create_model(
     "NoInput"
 )
 
+# Default per-request timeout (seconds) applied to every qTest API call.
+DEFAULT_QTEST_API_TIMEOUT_SECONDS = 180
+
+
+def _default_qtest_timeout() -> int:
+    """Resolve the default qTest API request timeout.
+
+    Reads ``QTEST_API_TIMEOUT_SECONDS`` from the environment, falling back to
+    ``DEFAULT_QTEST_API_TIMEOUT_SECONDS`` when the variable is unset, empty,
+    non-numeric, or not a positive integer.
+    """
+    raw = os.getenv("QTEST_API_TIMEOUT_SECONDS")
+    if raw is None:
+        return DEFAULT_QTEST_API_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid QTEST_API_TIMEOUT_SECONDS=%r; falling back to %ss.",
+            raw, DEFAULT_QTEST_API_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_QTEST_API_TIMEOUT_SECONDS
+    if value <= 0:
+        logger.warning(
+            "Non-positive QTEST_API_TIMEOUT_SECONDS=%r; falling back to %ss.",
+            raw, DEFAULT_QTEST_API_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_QTEST_API_TIMEOUT_SECONDS
+    return value
+
+
+class _TimeoutApiClient(swagger_client.ApiClient):
+    """qTest ``ApiClient`` that enforces a default per-request timeout.
+
+    The generated qTest swagger client exposes no client-level timeout: a
+    timeout is only honored per request through the ``_request_timeout``
+    argument (an int total timeout, or a ``(connect, read)`` tuple). Without
+    it an unresponsive qTest endpoint blocks the calling thread forever.
+
+    This subclass injects ``request_timeout`` into every call that does not set
+    its own, so all qTest traffic is bounded, and translates the low-level
+    urllib3 timeout (which is *not* an ``ApiException`` and would otherwise
+    bypass the toolkit's error handling) into a clear ``TimeoutError``.
+    """
+
+    def __init__(self, configuration=None, request_timeout: Optional[int] = None, **kwargs):
+        super().__init__(configuration, **kwargs)
+        self.request_timeout = request_timeout
+
+    def call_api(self, resource_path, method, *args, **kwargs):
+        if self.request_timeout is not None and kwargs.get("_request_timeout") is None:
+            kwargs["_request_timeout"] = self.request_timeout
+        try:
+            return super().call_api(resource_path, method, *args, **kwargs)
+        except urllib3.exceptions.MaxRetryError as e:
+            if isinstance(e.reason, urllib3.exceptions.TimeoutError):
+                raise TimeoutError(self._timeout_message(method, resource_path)) from e
+            raise
+        except urllib3.exceptions.TimeoutError as e:
+            raise TimeoutError(self._timeout_message(method, resource_path)) from e
+
+    def _timeout_message(self, method: str, resource_path: str) -> str:
+        return (
+            f"qTest API request timed out after {self.request_timeout}s "
+            f"({method} {resource_path}). The qTest server did not respond in time. "
+            f"Verify connectivity to the qTest host or increase the timeout via the "
+            f"QTEST_API_TIMEOUT_SECONDS environment variable (or the qtest_api_timeout "
+            f"toolkit setting)."
+        )
+
+
 class QtestApiWrapper(NonCodeIndexerToolkit):
     base_url: str
     qtest_project_id: int
@@ -283,6 +354,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     no_of_items_per_page: int = 100
     page: int = 1
     no_of_tests_shown_in_dql_search: int = 10
+    qtest_api_timeout: int = Field(
+        default_factory=_default_qtest_timeout,
+        description="Per-request timeout (seconds) for qTest API calls. Defaults to "
+                    "the QTEST_API_TIMEOUT_SECONDS env var, or 180s when unset.",
+    )
     _client: Any = PrivateAttr()
     _field_definitions_cache: Optional[dict] = PrivateAttr(default=None)
     _modules_cache: Optional[list] = PrivateAttr(default=None)
@@ -332,7 +408,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             configuration.host = self.base_url
             configuration.api_key['Authorization'] = self.qtest_api_token.get_secret_value()
             configuration.api_key_prefix['Authorization'] = 'Bearer'
-            self._client = swagger_client.ApiClient(configuration)
+            self._client = _TimeoutApiClient(configuration, request_timeout=self.qtest_api_timeout)
         return self
 
     def __instantiate_test_api_instance(self) -> TestCaseApi:
