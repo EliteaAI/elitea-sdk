@@ -661,18 +661,35 @@ class TestDocxHoistImagesFromHeadings:
         assert img is not None
         assert img['src'] == 'Image: image1.png, a bubble sort diagram'
 
-    def test_image_only_heading_is_dropped_not_left_empty(self):
-        """A heading that held only the image must be removed, otherwise it
-        markdownifies to a dangling empty '#' header line."""
+    def test_image_only_heading_kept_as_labeled_boundary(self):
+        """A heading that held only the image must stay a header boundary
+        (header-based chunking relies on it) and be labeled from the image's
+        alt/filename — not dropped (which would merge the section) and not left
+        as an empty '#'."""
         loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
 
-        html = '<h1><img src="Image: image1.png, diagram" /></h1><p>Body.</p>'
+        html = '<h1><img src="tok" alt="logo.png" /></h1><p>Body.</p>'
 
         result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
         soup = BeautifulSoup(result, 'html.parser')
 
-        assert soup.find('h1') is None  # empty heading dropped
-        assert soup.find('img') is not None  # image preserved in its new <p>
+        heading = soup.find('h1')
+        assert heading is not None  # boundary preserved
+        assert heading.get_text(strip=True) == 'logo.png'  # labeled, not empty
+        assert heading.find('img') is None
+        # Image relocated into the following paragraph.
+        assert soup.find('p').find('img') is not None
+
+    def test_image_only_heading_without_alt_gets_generic_label(self):
+        """With no alt to draw from, the kept boundary falls back to 'Image'."""
+        loader = EliteADocxMammothLoader(file_path='/tmp/test.docx')
+
+        html = '<h2><img src="tok" /></h2><p>Body.</p>'
+
+        result = loader._EliteADocxMammothLoader__hoist_images_from_headings(html)
+        heading = BeautifulSoup(result, 'html.parser').find('h2')
+        assert heading is not None
+        assert heading.get_text(strip=True) == 'Image'
 
 
 class TestDocxImageTranscriptPreservation:

@@ -197,7 +197,8 @@ class EliteADocxMammothLoader(BaseLoader):
             # Check dedup cache
             if img_hash in self._image_cache:
                 return {"src": self.__register_image_payload(
-                    f"Image: {image_name} [already transcribed, see above]")}
+                    f"Image: {image_name} [already transcribed, see above]"),
+                    "alt": image_name}
 
             # Process image
             transcript = None
@@ -214,11 +215,12 @@ class EliteADocxMammothLoader(BaseLoader):
 
             self._image_cache[img_hash] = transcript
             return {"src": self.__register_image_payload(
-                f"Image: {image_name}, {transcript}")}
+                f"Image: {image_name}, {transcript}"), "alt": image_name}
 
         except Exception:
             return {"src": self.__register_image_payload(
-                f"Image: {image_name}, Transcript is not available")}
+                f"Image: {image_name}, Transcript is not available"),
+                "alt": image_name}
 
     def __placeholder_image_handler(self, image) -> dict:
         """Placeholder handler for non-image reads.
@@ -231,7 +233,8 @@ class EliteADocxMammothLoader(BaseLoader):
             "src": self.__register_image_payload(
                 f"Image: {image_name}, you can selectively read it, "
                 "call get_file_metadata to figure out how"
-            )
+            ),
+            "alt": image_name,
         }
 
     def __default_image_handler(self, image) -> dict:
@@ -584,6 +587,8 @@ class EliteADocxMammothLoader(BaseLoader):
             images = heading.find_all('img')
             if not images:
                 continue
+            # Whether the heading carries its own text besides the image(s).
+            had_text = bool(heading.get_text(strip=True))
             anchor = heading
             for img in images:
                 img.extract()
@@ -592,10 +597,14 @@ class EliteADocxMammothLoader(BaseLoader):
                 anchor.insert_after(paragraph)
                 anchor = paragraph
             moved = True
-            # Drop the heading if it held only the image(s): otherwise it
-            # markdownifies to a dangling, empty ATX header line.
-            if not heading.get_text(strip=True):
-                heading.decompose()
+            if not had_text:
+                # Image-only heading (e.g. a logo/banner used as a section
+                # divider). Keep it as a header boundary — header-based chunking
+                # relies on it — but give it a label rather than leaving an empty
+                # '#'. Prefer the image's alt/filename, else a generic label.
+                # Setting .string also clears any leftover empty inline wrappers.
+                label = (images[0].get('alt') or '').strip() or 'Image'
+                heading.string = label
         return str(soup) if moved else html
 
     def load(self):
