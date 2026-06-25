@@ -564,6 +564,9 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             file_bytes = filedata.encode('utf-8')
             actual_filename = filename
 
+        # Normalize: SharePoint REST returns 404 for paths with a trailing slash
+        folder_path = folder_path.rstrip('/')
+
         # Primary: SharePoint REST API (office365 client)
         _rest_exc = None
         try:
