@@ -731,14 +731,46 @@ class PostmanApiWrapper(BaseToolApiWrapper):
     # ANALYSIS AND READ-ONLY METHODS
     # =================================================================
 
+    def _validate_workspace_id(self) -> None:
+        """Validate that the configured workspace_id is accessible.
+
+        Raises:
+            ToolException: If workspace_id is invalid or inaccessible.
+        """
+        if not self.workspace_id:
+            return
+
+        try:
+            self._make_request('GET', f'/workspaces/{self.workspace_id}')
+        except Exception:
+            raise ToolException(
+                f"Workspace ID '{self.workspace_id}' is invalid or you don't have access to it. "
+                "Please verify the workspace ID in your toolkit configuration."
+            )
+
     def get_collections(self, **kwargs) -> str:
         """Get all Postman collections accessible to the user."""
         try:
             response = self._make_request('GET', f'/collections?workspace={self.workspace_id}')
+
+            # If empty results and workspace_id is configured, verify workspace is valid
+            collections = response.get('collections', [])
+            if not collections and self.workspace_id:
+                self._validate_workspace_id()
+
             return json.dumps(response, indent=2)
+        except ToolException:
+            # Re-raise ToolException from validation without wrapping
+            raise
         except Exception as e:
             stacktrace = format_exc()
             logger.error(f"Exception when getting collections: {stacktrace}")
+            # On any error, check if it's due to invalid workspace_id
+            if self.workspace_id:
+                try:
+                    self._validate_workspace_id()
+                except ToolException:
+                    raise
             raise ToolException(f"Unable to get collections: {str(e)}")
 
     def execute_request(self, request_path: str, override_variables: str = "{}", **kwargs) -> str:
@@ -1379,6 +1411,12 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             stacktrace = format_exc()
             logger.error(
                 f"Exception when duplicating collection: {stacktrace}")
+            # Check if error is due to invalid workspace_id
+            if self.workspace_id:
+                try:
+                    self._validate_workspace_id()
+                except ToolException:
+                    raise
             raise ToolException(
                 f"Unable to duplicate collection {self.collection_id}: {str(e)}")
 
