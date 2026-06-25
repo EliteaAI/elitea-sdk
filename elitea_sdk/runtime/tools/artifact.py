@@ -27,6 +27,7 @@ from ...runtime.utils.content_appender import (
     get_param_description_blocks,
 )
 from ...runtime.utils.utils import IndexerKeywords
+from ...tools.utils.file_metadata import RESULT_STATUS_KEY, ResultStatus
 
 DEFAULT_MAX_SINGLE_READ_SIZE = 200000
 
@@ -737,35 +738,36 @@ Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra
                     target_bucket, key = parse_filepath(filepath)
                 except ValueError as e:
                     return json.dumps({
+                        RESULT_STATUS_KEY: ResultStatus.ERROR.value,
                         "filepath": filepath,
-                        "status": "error",
                         "message": f"Invalid filepath format: {e}",
                     })
             else:
                 if not filename:
                     return json.dumps({
-                        "status": "error",
+                        RESULT_STATUS_KEY: ResultStatus.ERROR.value,
                         "message": "Must provide either 'filepath' or 'filename'.",
                     })
                 target_bucket = bucket_name or self.bucket
                 key = filename.lstrip('/')
 
             # Always download so the loader can provide full structural hints
-            # (e.g. Excel sheet listing). This is the purpose of the tool.
+            # (e.g. Excel sheet listing). This is the purpose of the tool. The
+            # returned dict already carries the schema discriminator
+            # (__result_status__) stamped by file_metadata.get_file_metadata.
             meta = self.artifact.get_metadata(
                 key,
                 bucket_name=target_bucket,
                 download_for_detection=True,
             )
-            meta.setdefault("status", "success")
             if filepath:
                 meta["filepath"] = filepath
             return json.dumps(meta, default=str)
         except Exception as e:  # pylint: disable=broad-except
             return json.dumps({
+                RESULT_STATUS_KEY: ResultStatus.ERROR.value,
                 "filepath": filepath,
                 "filename": filename,
-                "status": "error",
                 "message": f"Error reading file metadata: {e}",
             })
 
