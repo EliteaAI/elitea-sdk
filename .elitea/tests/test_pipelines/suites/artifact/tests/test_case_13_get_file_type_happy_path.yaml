@@ -135,25 +135,27 @@ nodes:
       task:
         type: fstring
         value: |
-          Analyze the file type detection result to verify correct identification.
+          Analyze the file metadata result to verify correct file type detection.
           
           Tool executed: get_file_metadata
           File: type-test-${TIMESTAMP}.txt (plain text)
-          Filepath format: /{bucket}/{filename}
+          Filepath format: /{bucket_name}/{txt_file}
           
           Type result: {type_result}
           
           Expected behavior:
-          - Operation succeeds (status: success)
-          - File type is detected as text (extension returned as ".txt" with leading dot)
-          - MIME type is text/plain or similar text type
+          - Operation succeeds and returns file metadata
+          - Result status is "file_metadata"
+          - File type is detected as text
+          - Extension is ".txt" with a leading dot
+          - MIME type is present in the "type" field and is text/plain or another text MIME type
           - Filename is returned correctly
           - No error in detection
           
           Evaluate:
-          1. Is the status "success"?
+          1. Is the result status "file_metadata"?
           2. Does the result contain extension field (should be ".txt" with a leading dot)?
-          3. Does the result contain mime field with text type?
+          3. Does the result contain type field with a text MIME type such as text/plain?
           4. Is the filename correctly identified?
           5. Is there any error message?
           
