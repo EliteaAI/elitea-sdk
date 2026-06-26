@@ -73,7 +73,16 @@ GetFiles = create_model(
 ReadDocument = create_model(
     "ReadDocument",
     path=(str, Field(
-        description="Contains the server-relative path of a document for reading.")),
+        description=(
+            "Path of the document to read. Accepts either a full server-relative "
+            "path including the document-library name "
+            "(e.g. '/sites/SiteName/.../file.docx' or "
+            "'/teams/TeamName/.../file.docx'), or a path relative to a "
+            "library (e.g. 'folder/file.docx'). The document-library segment is "
+            "resolved automatically to the correct drive. If a relative path is "
+            "given, the file is looked up under 'Shared Documents' and other "
+            "(including private) libraries."
+        ))),
     is_capture_image=(Optional[bool], Field(
         description="Determines is pictures in the document should be recognized.",
         default=False)),
