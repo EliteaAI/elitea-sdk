@@ -23,14 +23,10 @@ class EliteATextLoader(BaseLoader):
         total_lines = 0
         if file_content:
             try:
-                if isinstance(file_content, (bytes, bytearray)):
-                    try:
-                        text = file_content.decode("utf-8")
-                    except UnicodeDecodeError:
-                        text = decode_text(file_content)
-                else:
-                    text = file_content
-                total_lines = len(text.splitlines())
+                nl = b'\n' if isinstance(file_content, (bytes, bytearray)) else '\n'
+                total_lines = file_content.count(nl) + (
+                    1 if not file_content.endswith(nl) else 0
+                )
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning("Failed to count lines for %s: %s", filename, e)
 
