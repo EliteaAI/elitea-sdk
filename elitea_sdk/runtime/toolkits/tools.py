@@ -801,8 +801,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         # Pipeline nodes call tools directly — deferred stubs are useless.
                         # Re-raise so the caller can trigger the OAuth flow for the user.
                         logger.info(
-                            "[MCP Auth] Pipeline node toolkit '%s' requires authorization — re-raising",
-                            tool.get('toolkit_name', ''),
+                            "[MCP Auth] Pipeline node toolkit requires authorization — re-raising"
                         )
                         raise
                     mcp_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
