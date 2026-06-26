@@ -53,7 +53,7 @@ nodes:
             "def hello_world():" + nl +
             '    """original docstring."""' + nl +
             '    print("hello, world!")' + nl +
-            "    return true" + nl +
+            "    return True" + nl +
             nl +
             "def calculate(a, b):" + nl +
             '    """calculate sum."""' + nl +
@@ -151,7 +151,7 @@ nodes:
             "def hello_world():" + nl +
             '    """original docstring."""' + nl +
             '    print("hello, world!")' + nl +
-            "    return true" + nl
+            "    return True" + nl
         )
 
         new_content = (
@@ -163,16 +163,16 @@ nodes:
             '        name: the name to greet. defaults to "world".' + nl +
             nl +
             "    returns:" + nl +
-            "        true if greeting was successful." + nl +
+            "        True if greeting was successful." + nl +
             nl +
             f"    updated: {timestamp}" + nl +
             f"    update id: {random_id}" + nl +
             '    """' + nl +
             "    import logging" + nl +
-            "    logger = logging.getlogger(__name__)" + nl +
+            "    logger = logging.getLogger(__name__)" + nl +
             '    logger.info(f"greeting {name}")' + nl +
             '    print(f"hello, {name}!")' + nl +
-            "    return true"
+            "    return True"
         )
 
         file_query = file_path + nl
