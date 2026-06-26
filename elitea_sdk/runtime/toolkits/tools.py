@@ -780,6 +780,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     merged_headers = dict(headers) if headers else {}
                     merged_headers.setdefault('Authorization', f'Bearer {access_token}')
                     settings['headers'] = merged_headers
+                    # If Authorization was NOT already in the DB-configured headers, the token
+                    # we just injected came from the OAuth flow (mcp_tokens), not from a static
+                    # credential.  Signal this so a 401 re-triggers OAuth instead of a ValueError.
+                    if not any(k.lower() == 'authorization' for k in (headers or {})):
+                        settings['_oauth_token_injected'] = True
                     logger.info(f"[MCP Auth] Added Authorization header for {url}")
                     
                 # Pass session_id to MCP toolkit if available
