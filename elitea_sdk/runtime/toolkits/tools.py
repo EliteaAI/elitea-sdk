@@ -729,8 +729,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 if url and url.rstrip('/') == _ATLASSIAN_DEPRECATED:
                     _authv2_url = 'https://mcp.atlassian.com/v1/mcp/authv2'
                     logger.info(
-                        "[Atlassian MCP] Normalizing deprecated URL '%s' to '%s'",
-                        url, _authv2_url,
+                        "[Atlassian MCP] Normalizing deprecated Atlassian MCP endpoint to authv2 endpoint"
                     )
                     url = _authv2_url
                     settings['url'] = url
