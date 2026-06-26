@@ -9,6 +9,19 @@ from langchain_community.document_loaders.unstructured import (
 
 class EliteAMarkdownLoader(UnstructuredFileLoader):
 
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-3 #5434)."""
+        from elitea_sdk.tools.utils.file_metadata import build_line_range_metadata
+        return build_line_range_metadata(file_content, file_type_note="Markdown file")
+
+    def get_content(self) -> str:
+        """Return raw markdown text so read_file line-slicing works correctly."""
+        with open(self.file_path, "r", encoding="utf-8") as f:
+            return f.read()
+
     def __init__(
         self,
         file_path: Union[str, Path],

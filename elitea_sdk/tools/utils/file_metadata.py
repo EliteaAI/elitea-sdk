@@ -236,6 +236,49 @@ def build_error_response(
     return payload
 
 
+def _count_lines(file_content) -> int:
+    """Count lines in *file_content* (bytes, bytearray, or str) without decoding.
+
+    Scans for newline bytes/chars directly — no decode, no extra copy.
+    The +1 handles files that don't end with a trailing newline.
+    """
+    if not file_content:
+        return 0
+    nl = b'\n' if isinstance(file_content, (bytes, bytearray)) else '\n'
+    return file_content.count(nl) + (1 if not file_content.endswith(nl) else 0)
+
+
+def build_line_range_metadata(file_content, *, file_type_note: str = "file") -> dict:
+    """Return a loader-conformant dict for line-oriented text files (PRE-3 #5434).
+
+    Shared by EliteATextLoader, EliteACodeLoader, and EliteAMarkdownLoader so
+    the logic lives in one place. Pass *file_type_note* for the human-readable
+    ``notes`` string (e.g. "text file", "source file", "Markdown file").
+    """
+    total_lines = _count_lines(file_content)
+    range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
+    return {
+        "unit": "lines",
+        "total_lines": total_lines,
+        "instruction_for_readFile": {
+            "first_class_params": {
+                "start_line": (
+                    f"integer (1-indexed, inclusive) — first line to read. "
+                    f"{range_hint}Omit to read from the beginning."
+                ),
+                "end_line": (
+                    f"integer (1-indexed, inclusive) — last line to read. "
+                    f"{range_hint}Omit to read to the end."
+                ),
+            },
+            "notes": (
+                f"Use start_line/end_line together to read a bounded slice "
+                f"of a large {file_type_note} and keep tokens bounded."
+            ),
+        },
+    }
+
+
 def _detect_type(filename: str, file_content: Optional[bytes]):
     """Return (mime, extension) for the given file."""
     extension = os.path.splitext(filename or "")[-1].lower()

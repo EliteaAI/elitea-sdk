@@ -9,8 +9,15 @@ from langchain_core.tools import ToolException
 from elitea_sdk.tools.chunkers import text_chunker
 from elitea_sdk.tools.utils.text_operations import decode_text
 
-
 class EliteATextLoader(BaseLoader):
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-3 #5434)."""
+        from elitea_sdk.tools.utils.file_metadata import build_line_range_metadata
+        return build_line_range_metadata(file_content, file_type_note="text file")
 
     def __init__(self, **kwargs):
         """Initialize with file path."""
