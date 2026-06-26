@@ -265,8 +265,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             All drives are probed; every drive that contains the folder is
             returned so that results from multiple libraries are included.
 
-            'test'  (exists in both EliteA_test and Elitea_test)
-            → [(elitea_test_drive_id, 'test'), (elitea_test_drive_id, 'test')]
+            'test'  (exists in both EliteA_test and private_docs)
+            → [(elitea_test_drive_id, 'test'), (private_docs_drive_id, 'test')]
 
         Falls back to the default drive (keeping the full cleaned path) when
         no drive matches and no probe succeeds, so existing callers that already
@@ -544,24 +544,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             return file_bytes, filename or artifact_filename
         return filedata.encode('utf-8'), filename
 
-    def _build_drive_item_path(self, folder_path: str, actual_filename: str) -> str:
-        """Build a URL-safe, drive-relative item path from *folder_path* and *actual_filename*.
-
-        .. deprecated::
-            Prefer :meth:`_resolve_drive_and_folder` which correctly identifies
-            the target drive.  This method is kept for backwards compatibility with
-            callers that already pass a drive-relative path.
-
-        The method strips the site prefix (if present) but does **not** strip the
-        document-library segment — use :meth:`_resolve_drive_and_folder` for that.
-        """
-        site_path = re.sub(r'^https?://[^/]+', '', self.site_url).strip('/')
-        folder_clean = folder_path.strip('/')
-        if folder_clean.startswith(site_path):
-            folder_clean = folder_clean[len(site_path):].lstrip('/')
-        item_path = f"{folder_clean}/{actual_filename}".strip('/')
-        return quote(item_path, safe='/')
-
     def _upload_small_file(
         self, drive_id: str, safe_item_path: str, conflict: str,
         file_bytes: bytes, mime_type: str,
@@ -821,9 +803,13 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         except ToolException:
             raise
         except Exception as e:
+            # Log full detail server-side, but keep the user/LLM-facing message
+            # free of raw exception text (which may carry internal URLs/ids),
+            # consistent with the sanitized error in load_file_content_in_bytes.
             logging.error("Graph read_file failed (%s): %s", path, e)
-            return ToolException(
-                f"File not found. Please, check file name and path: {e}")
+            raise ToolException(
+                f"Could not read document at path '{path}'. "
+                "Please check the file name and path.")
 
     def load_file_content_in_bytes(self, path: str) -> bytes:
         # Try to extract drive_id directly from the path when it is in
@@ -834,29 +820,51 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             drive_id = drive_match.group(1)
             relative = drive_match.group(2).strip('/')
         else:
-            drive_id = self._resolve_drive_id()
-            # Strip server-relative prefix so we get a drive-relative path
-            # e.g. "/sites/MySite/Shared Documents/folder/file.txt" → "folder/file.txt"
-            # We resolve the drive root path to strip it
-            drive_data = self._get(f"{_GRAPH_BASE}/drives/{drive_id}/root")
-            drive_name = drive_data.get('name', '')
-            # Build drive-root prefix to strip (e.g. "/drives/<id>/root:/Shared Documents")
-            relative = path.strip('/')
-            # Try to match the drive path prefix from the site segments
-            site_path = re.sub(r'^https?://[^/]+', '', self.site_url).strip('/')
-            prefix_candidates = [
-                f"{site_path}/{drive_name}",
-                drive_name,
-            ]
-            for prefix in prefix_candidates:
-                if relative.startswith(prefix):
-                    relative = relative[len(prefix):].lstrip('/')
-                    break
+            # Resolve the path the same way upload_file/index_data do, via
+            # _resolve_drive_and_folder (matches on drive webUrl). The previous
+            # strip-by-drive-name approach never stripped the human-facing
+            # "Shared Documents" segment, producing a 404 (issue #5323). The
+            # resolver is documented for folders but is safe for a file path:
+            # the prefix-match leg is pure string slicing and the probe leg
+            # accepts files via the 'id' key (see _resolve_drive_and_folder).
+            matches = self._resolve_drive_and_folder(path)
+            if len(matches) > 1:
+                # Ambiguous bare path present in several libraries.
+                # Prefer the default library rather than silently
+                # reading whichever drive enumerated first.
+                default_drive_id = self._resolve_drive_id()
+                chosen = next(
+                    (m for m in matches if m[0] == default_drive_id), matches[0])
+                logging.warning(
+                    "load_file_content_in_bytes: ambiguous bare path %r matched "
+                    "%d drives; reading from drive_id=%s. Pass a library-prefixed "
+                    "path (e.g. '/sites/Site/Shared Documents/...') to disambiguate.",
+                    path, len(matches), chosen[0],
+                )
+                drive_id, relative = chosen
+            else:
+                drive_id, relative = matches[0]
+
+        if not relative:
+            # The path resolved to a document-library / folder root with no file
+            # component (e.g. '/sites/Site/Shared Documents'). Fail with a clear
+            # message instead of issuing a malformed '.../root:/:/content' GET.
+            raise ToolException(
+                f"Path '{path}' does not point to a file (it resolves to a "
+                "document-library or folder root). Include the file name.")
 
         encoded = quote(relative, safe='/')
         url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:/content"
         resp = self._get_raw(url, timeout=120, allow_redirects=True)
-        resp.raise_for_status()
+        if not resp.ok:
+            logging.error(
+                "Graph content GET failed: HTTP %s for %s",
+                resp.status_code, url,
+            )
+            raise ToolException(
+                f"Could not read document at path '{path}' "
+                f"(HTTP {resp.status_code})."
+            )
         return resp.content
 
     def upload_file(self, folder_path: str, filepath: Optional[str] = None,
