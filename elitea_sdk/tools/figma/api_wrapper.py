@@ -212,11 +212,10 @@ class ArgsSchema(Enum):
             ),
         ),
         ids=(
-            Optional[str],
+            str,
             Field(
                 description="Specifies id of file images separated by comma",
                 examples=["8:6,1:7"],
-                default="0:0",
             ),
         ),
         scale=(
@@ -2075,7 +2074,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
     def get_file_images(
         self,
         file_key: str,
-        ids: Optional[str] = "0:0",
+        ids: str,
         scale: Optional[str] = None,
         format: Optional[str] = None,
         version: Optional[str] = None,
