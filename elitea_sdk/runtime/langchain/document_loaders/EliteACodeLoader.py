@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Iterator, Generator
 
@@ -8,8 +9,52 @@ from langchain_core.tools import ToolException
 
 from elitea_sdk.tools.utils.text_operations import decode_text
 
+logger = logging.getLogger(__name__)
+
 
 class EliteACodeLoader(BaseLoader):
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-3 #5434)."""
+        total_lines = 0
+        if file_content:
+            try:
+                if isinstance(file_content, (bytes, bytearray)):
+                    try:
+                        text = file_content.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = decode_text(file_content)
+                else:
+                    text = file_content
+                total_lines = len(text.splitlines())
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning("Failed to count lines for %s: %s", filename, e)
+
+        range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
+        instruction = {
+            "first_class_params": {
+                "start_line": (
+                    f"integer (1-indexed, inclusive) — first line to read. "
+                    f"{range_hint}Omit to read from the beginning."
+                ),
+                "end_line": (
+                    f"integer (1-indexed, inclusive) — last line to read. "
+                    f"{range_hint}Omit to read to the end."
+                ),
+            },
+            "notes": (
+                "Use start_line/end_line together to read a bounded slice "
+                "of a large source file and keep tokens bounded."
+            ),
+        }
+        return {
+            "unit": "lines",
+            "total_lines": total_lines,
+            "instruction_for_readFile": instruction,
+        }
 
     def __init__(self, **kwargs):
         if kwargs.get('file_path'):

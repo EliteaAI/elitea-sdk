@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Any, List, Union, Generator, Iterator
 from langchain_core.documents import Document
@@ -7,7 +8,54 @@ from langchain_community.document_loaders.unstructured import (
     validate_unstructured_version,
 )
 
+logger = logging.getLogger(__name__)
+
+
 class EliteAMarkdownLoader(UnstructuredFileLoader):
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-3 #5434)."""
+        total_lines = 0
+        if file_content:
+            try:
+                if isinstance(file_content, (bytes, bytearray)):
+                    text = file_content.decode("utf-8")
+                else:
+                    text = file_content
+                total_lines = len(text.splitlines())
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning("Failed to count lines for %s: %s", filename, e)
+
+        range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
+        instruction = {
+            "first_class_params": {
+                "start_line": (
+                    f"integer (1-indexed, inclusive) — first line to read. "
+                    f"{range_hint}Omit to read from the beginning."
+                ),
+                "end_line": (
+                    f"integer (1-indexed, inclusive) — last line to read. "
+                    f"{range_hint}Omit to read to the end."
+                ),
+            },
+            "notes": (
+                "Use start_line/end_line together to read a bounded slice "
+                "of a large Markdown file and keep tokens bounded."
+            ),
+        }
+        return {
+            "unit": "lines",
+            "total_lines": total_lines,
+            "instruction_for_readFile": instruction,
+        }
+
+    def get_content(self) -> str:
+        """Return raw markdown text so read_file line-slicing works correctly."""
+        with open(self.file_path, "r", encoding="utf-8") as f:
+            return f.read()
 
     def __init__(
         self,
