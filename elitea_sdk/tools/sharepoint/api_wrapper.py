@@ -880,14 +880,14 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 description="List of file extensions to include when processing. "
                             "Applies to both SharePoint document-library files and "
                             "OneNote page attachments (when include_attachments is enabled). "
-                            "i.e. ['*.png', '*.jpg']. "
+                            'i.e. ["*.png", "*.jpg"]. '
                             "If empty, all files will be processed (except skip_extensions).",
                 default=[])),
             'skip_extensions': (Optional[List[str]], Field(
                 description="List of file extensions to skip when processing. "
                             "Applies to both SharePoint document-library files and "
                             "OneNote page attachments (when include_attachments is enabled). "
-                            "i.e. ['*.exe', '*.zip']",
+                            'i.e. ["*.exe", "*.zip"]',
                 default=[])),
             'path': (Optional[str], Field(
                 description="Folder path. "

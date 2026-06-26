@@ -887,7 +887,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
                                     Field(description="Whether to include attachment content in indexing",
                                           default=False)),
             'skip_attachment_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to skip when processing attachments (e.g., ['.exe', '.zip', '.bin'])",
+                description='List of file extensions to skip when processing attachments (e.g., [".exe", ".zip", ".bin"])',
                 default=None)),
         }
 

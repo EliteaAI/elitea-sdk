@@ -1806,7 +1806,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             'node_ids_include': (Optional[List[str]], Field(
                 description=(
                     "List of top-level node IDs (pages) to include in the index. Values should match "
-                    "Figma node-id format like ['123-56', '7651-9230']. These include rules are applied "
+                    'Figma node-id format like ["123-56", "7651-9230"]. These include rules are applied '
                     "for each entry in urls_or_file_keys when the URL does not specify node-id and for "
                     "each raw file_key entry."
                 ),
@@ -1823,8 +1823,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             )),
             'node_types_include': (Optional[List[str]], Field(
                 description=(
-                    "List of node types to include in the index, e.g. ['FRAME', 'COMPONENT', 'RECTANGLE', "
-                    "'COMPONENT_SET', 'INSTANCE', 'VECTOR', ...]. If provided, only these types are indexed "
+                    'List of node types to include in the index, e.g. ["FRAME", "COMPONENT", "RECTANGLE", '
+                    '"COMPONENT_SET", "INSTANCE", "VECTOR", ...]. If provided, only these types are indexed '
                     "for each page loaded from each urls_or_file_keys entry."
                 ),
                 default=None,

@@ -1462,7 +1462,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                                     Field(description="Whether to include attachment content in indexing",
                                           default=False)),
             'skip_attachment_extensions': (Optional[List[str]], Field(
-                description="List of file extensions to skip when processing attachments: i.e. ['.png', '.jpg']",
+                description='List of file extensions to skip when processing attachments: i.e. [".png", ".jpg"]',
                 default=[])),
             'chunking_tool':(Literal['json', ''], Field(description="Name of chunking tool", default='json'))
         }
