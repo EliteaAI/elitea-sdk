@@ -7,7 +7,7 @@ description: |
 
   Expected Behavior:
   - Tool executes successfully.
-  - Returns string containing project data.
+  - Returns project data in a usable response format.
 
 toolkits:
   - id: ${JIRA_TOOLKIT_ID}
@@ -50,7 +50,8 @@ nodes:
 
           Perform the following checks:
           1. Confirm tool executed successfully (result is not empty or null).
-          2. Result should be a string containing project information.
+          2. Verify the result contains project information in a usable response format.
+          3. Accept either a structured collection of project objects or a string representation containing project data.
 
           Return a JSON object named test_results with the following structure:
 
