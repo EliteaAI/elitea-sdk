@@ -476,7 +476,7 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
-def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, user_declined_mcp_servers: Optional[list] = None) -> list:
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, user_declined_mcp_servers: Optional[list] = None, pipeline_node_toolkit_names: Optional[set] = None) -> list:
     """
     Process tool configurations and return instantiated tools.
 
@@ -722,7 +722,19 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 # remote mcp tool initialization with token injection
                 settings = dict(tool['settings'])
                 url = settings.get('url')
-                
+
+                # Normalize deprecated Atlassian MCP SSE URL to the current authv2 endpoint.
+                # Only applies to the legacy /v1/sse form; authv2 URLs are left unchanged.
+                _ATLASSIAN_DEPRECATED = 'https://mcp.atlassian.com/v1/sse'
+                if url and url.rstrip('/') == _ATLASSIAN_DEPRECATED:
+                    _authv2_url = 'https://mcp.atlassian.com/v1/mcp/authv2'
+                    logger.info(
+                        "[Atlassian MCP] Normalizing deprecated URL '%s' to '%s'",
+                        url, _authv2_url,
+                    )
+                    url = _authv2_url
+                    settings['url'] = url
+
                 # Check if this MCP server should be ignored (user chose to continue without auth)
                 if ignored_mcp_servers and url:
                     canonical_url = canonical_resource(url)
@@ -782,6 +794,18 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         **settings).get_tools()
                 except McpAuthorizationRequired as auth_err:
                     auth_err.toolkit_type = tool['type']
+                    _is_pipeline_node = (
+                        pipeline_node_toolkit_names is not None
+                        and tool.get('toolkit_name', '') in pipeline_node_toolkit_names
+                    )
+                    if _is_pipeline_node:
+                        # Pipeline nodes call tools directly — deferred stubs are useless.
+                        # Re-raise so the caller can trigger the OAuth flow for the user.
+                        logger.info(
+                            "[MCP Auth] Pipeline node toolkit '%s' requires authorization — re-raising",
+                            tool.get('toolkit_name', ''),
+                        )
+                        raise
                     mcp_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
                     logger.info(
                         "[MCP Auth] Deferred authorization for toolkit with %d proxy tool(s)",
@@ -791,8 +815,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers))
                         _mcp_auth_control_added = True
                         logger.info("[MCP Auth] Injected mcp_auth_control into predict-path toolset (mcp type)")
-                _inject_display_metadata(tool, mcp_tools)
-                tools.extend(mcp_tools)
+                    _inject_display_metadata(tool, mcp_tools)
+                    tools.extend(mcp_tools)
+                else:
+                    _inject_display_metadata(tool, mcp_tools)
+                    tools.extend(mcp_tools)
             elif tool['type'] == 'mcp_config' or tool['type'].startswith('mcp_'):
                 tool_handled = True
                 # MCP Config toolkit - pre-configured MCP servers (stdio or http)
@@ -850,6 +877,16 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     logger.info(f"✅ Successfully added {len(toolkit_tools)} tools from McpConfigToolkit ({server_name})")
                 except McpAuthorizationRequired as auth_err:
                     auth_err.toolkit_type = tool['type']
+                    _is_pipeline_node = (
+                        pipeline_node_toolkit_names is not None
+                        and tool.get('toolkit_name', '') in pipeline_node_toolkit_names
+                    )
+                    if _is_pipeline_node:
+                        logger.info(
+                            "[MCP Auth] Pipeline node toolkit '%s' requires authorization — re-raising",
+                            tool.get('toolkit_name', ''),
+                        )
+                        raise
                     toolkit_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
                     _inject_display_metadata(tool, toolkit_tools)
                     tools.extend(toolkit_tools)
