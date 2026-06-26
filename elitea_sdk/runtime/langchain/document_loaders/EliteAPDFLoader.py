@@ -1,3 +1,5 @@
+import logging
+
 import pymupdf
 import fitz
 from langchain_community.document_loaders import PyPDFium2Loader
@@ -7,7 +9,49 @@ from .ImageParser import ImageParser
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
 from langchain_core.tools import ToolException
 
+logger = logging.getLogger(__name__)
+
+
 class EliteAPDFLoader:
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total page count and advertise page_number for read_file (PRE-2 #5433).
+
+        page_number is a first-class read_file arg, so it goes under
+        first_class_params (like DOCX's is_capture_image).
+        """
+        total_pages = 0
+        if file_content:
+            try:
+                with pymupdf.open(stream=file_content, filetype="pdf") as report:
+                    total_pages = report.page_count
+            except Exception as e:  # pylint: disable=broad-except
+                # Encrypted/corrupt PDF — report 0 pages rather than fail.
+                logger.warning("Failed to read PDF page count for %s: %s",
+                               filename, e)
+
+        page_number_desc = (
+            "integer (1-indexed) — single page to read. "
+            + (f"Valid range 1..{total_pages}. " if total_pages else "")
+            + "Omit to read the whole document."
+        )
+        instruction = {
+            "first_class_params": {
+                "page_number": page_number_desc,
+            },
+            "notes": (
+                "For large PDFs, pass page_number to read one page at a time "
+                "and keep memory and tokens bounded."
+            ),
+        }
+        return {
+            "unit": "pages",
+            "total_pages": total_pages,
+            "instruction_for_readFile": instruction,
+        }
 
     def __init__(self, **kwargs):
         if kwargs.get('file_path'):
