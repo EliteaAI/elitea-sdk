@@ -443,16 +443,25 @@ class EliteAExcelLoader(EliteATableLoader):
         the extra_params that ``read_file`` can accept.
         """
         sheets: List[dict] = []
+        total_rows = 0
+        # read_limits universal keys (PRE-1 #5432): max_output_chars and
+        # full_read_allowed are REQUIRED by the contract. Everything else is
+        # Excel-specific and therefore type-prefixed so no other loader assumes
+        # the key exists. ``excel_full_read_max_bytes`` is a raw-bytes pre-gate
+        # (reject a full read before sampling rows) — a different unit and
+        # purpose than the universal output-chars cap.
         read_limits = {
-            "max_request_rows": EXCEL_MAX_REQUEST_ROWS,
-            "max_embedded_images": EXCEL_MAX_IMAGE_COUNT,
             "max_output_chars": 200000,
-            "max_full_read_file_size": EXCEL_MAX_FULL_READ_FILE_SIZE,
+            "full_read_allowed": False,
+            "excel_max_request_rows": EXCEL_MAX_REQUEST_ROWS,
+            "excel_max_embedded_images": EXCEL_MAX_IMAGE_COUNT,
+            "excel_full_read_max_bytes": EXCEL_MAX_FULL_READ_FILE_SIZE,
         }
         if file_content:
             try:
                 estimate = check_excel_read_limits(file_content, file_name=filename)
                 sheets = estimate.sheets
+                total_rows = estimate.total_rows_workbook
                 read_limits["estimated_total_rows"] = estimate.total_rows_workbook
                 read_limits["estimated_request_rows"] = estimate.requested_rows
                 read_limits["estimated_output_chars"] = estimate.estimated_output_chars
@@ -503,6 +512,9 @@ class EliteAExcelLoader(EliteATableLoader):
             ),
         }
         return {
+            "unit": "rows",
+            "total_rows": total_rows,
+            "total_sheets": len(sheets),
             "sheets": sheets,
             "read_limits": read_limits,
             "instruction_for_readFile": instruction,

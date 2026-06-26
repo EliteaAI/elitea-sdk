@@ -107,7 +107,9 @@ class Artifact:
         loader's ``get_file_metadata`` classmethod can add per-type structural
         hints (e.g. sheet listing for Excel).
         """
-        from elitea_sdk.tools.utils.file_metadata import get_file_metadata
+        from elitea_sdk.tools.utils.file_metadata import (
+            get_file_metadata, build_error_response,
+        )
         if not bucket_name:
             bucket_name = self.bucket_name
         file_size = None
@@ -130,11 +132,11 @@ class Artifact:
         if download_for_detection:
             data = self.client.download_artifact_s3(bucket_name, artifact_name)
             if isinstance(data, dict) and 'error' in data:
-                return {
-                    "filename": artifact_name,
-                    "bucket": bucket_name,
-                    "error": f"{data['error']}. {data.get('content', '')}"
-                }
+                return build_error_response(
+                    f"{data['error']}. {data.get('content', '')}",
+                    filename=artifact_name,
+                    bucket=bucket_name,
+                )
             file_content = data
         meta = get_file_metadata(artifact_name, file_content=file_content,
                                  file_size=file_size)
