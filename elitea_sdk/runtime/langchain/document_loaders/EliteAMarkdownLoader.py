@@ -1,4 +1,3 @@
-import logging
 from pathlib import Path
 from typing import Any, List, Union, Generator, Iterator
 from langchain_core.documents import Document
@@ -8,9 +7,6 @@ from langchain_community.document_loaders.unstructured import (
     validate_unstructured_version,
 )
 
-logger = logging.getLogger(__name__)
-
-
 class EliteAMarkdownLoader(UnstructuredFileLoader):
 
     @classmethod
@@ -18,38 +14,8 @@ class EliteAMarkdownLoader(UnstructuredFileLoader):
                           file_content=None,
                           file_size=None) -> dict:
         """Report total line count and advertise start_line/end_line (PRE-3 #5434)."""
-        total_lines = 0
-        if file_content:
-            try:
-                nl = b'\n' if isinstance(file_content, (bytes, bytearray)) else '\n'
-                total_lines = file_content.count(nl) + (
-                    1 if not file_content.endswith(nl) else 0
-                )
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning("Failed to count lines for %s: %s", filename, e)
-
-        range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
-        instruction = {
-            "first_class_params": {
-                "start_line": (
-                    f"integer (1-indexed, inclusive) — first line to read. "
-                    f"{range_hint}Omit to read from the beginning."
-                ),
-                "end_line": (
-                    f"integer (1-indexed, inclusive) — last line to read. "
-                    f"{range_hint}Omit to read to the end."
-                ),
-            },
-            "notes": (
-                "Use start_line/end_line together to read a bounded slice "
-                "of a large Markdown file and keep tokens bounded."
-            ),
-        }
-        return {
-            "unit": "lines",
-            "total_lines": total_lines,
-            "instruction_for_readFile": instruction,
-        }
+        from elitea_sdk.tools.utils.file_metadata import build_line_range_metadata
+        return build_line_range_metadata(file_content, file_type_note="Markdown file")
 
     def get_content(self) -> str:
         """Return raw markdown text so read_file line-slicing works correctly."""
