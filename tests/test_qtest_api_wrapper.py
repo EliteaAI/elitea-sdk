@@ -1,8 +1,15 @@
 import html
 
+import pytest
+import urllib3
 from pydantic import SecretStr
 
-from elitea_sdk.tools.qtest.api_wrapper import QTEST_ID, QtestApiWrapper
+from elitea_sdk.tools.qtest.api_wrapper import (
+    QTEST_ID,
+    QtestApiWrapper,
+    _TimeoutApiClient,
+    _default_qtest_timeout,
+)
 from elitea_sdk.tools.utils.content_parser import image_processing_prompt
 
 
@@ -437,3 +444,232 @@ def test_parse_data_extracts_multiple_images_in_order(monkeypatch):
     assert description.index('Image Transcript: first image transcript') < description.index('Middle')
     assert description.index('Middle') < description.index('Image Transcript: second image transcript')
     assert description.index('Image Transcript: second image transcript') < description.index('End')
+
+
+# ---------------------------------------------------------------------------
+# #4953 - optional heavy payload parameters in search_by_dql
+# ---------------------------------------------------------------------------
+
+def _patch_search_api(monkeypatch, response):
+    """Patch swagger_client.SearchApi with a fake recording search_artifact kwargs."""
+    calls = []
+
+    class FakeSearchApi:
+        def __init__(self, client):
+            pass
+
+        def search_artifact(self, project_id, body, **kwargs):
+            calls.append(kwargs)
+            return response
+
+    monkeypatch.setattr('swagger_client.SearchApi', FakeSearchApi)
+    return calls
+
+
+def test_perform_search_by_dql_sends_false_for_heavy_params_by_default(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None  # model_construct skips setup_qtest_client; fake SearchApi ignores it
+    response = {
+        'items': [
+            {'pid': 'TC-1', 'name': 'Case', 'description': 'd', 'precondition': 'p', 'id': 101}
+        ],
+        'links': [],
+    }
+    calls = _patch_search_api(monkeypatch, response)
+
+    result = wrapper._QtestApiWrapper__perform_search_by_dql("Id = 'TC-1'")
+
+    assert len(calls) == 1
+    # Flags are sent explicitly as 'false' so the qTest API excludes heavy data at
+    # the source instead of returning it for us to discard during parsing.
+    assert calls[0]['append_test_steps'] == 'false'
+    assert calls[0]['include_external_properties'] == 'false'
+    # Lightweight response (no test_steps/properties keys) parses without error.
+    assert result[0]['Id'] == 'TC-1'
+    assert result[0]['Steps'] == []
+
+
+def test_perform_search_by_dql_includes_heavy_params_when_opted_in(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None  # model_construct skips setup_qtest_client; fake SearchApi ignores it
+    response = {
+        'items': [
+            {
+                'pid': 'TC-2', 'name': 'Case2', 'description': 'd', 'precondition': 'p', 'id': 102,
+                'test_steps': [{'description': 'do something', 'expected': 'all good'}],
+                'properties': [],
+            }
+        ],
+        'links': [],
+    }
+    calls = _patch_search_api(monkeypatch, response)
+
+    result = wrapper._QtestApiWrapper__perform_search_by_dql(
+        "Id = 'TC-2'", append_test_steps=True, include_external_properties=True
+    )
+
+    assert calls[0]['append_test_steps'] == 'true'
+    assert calls[0]['include_external_properties'] == 'true'
+    assert 'do something' in result[0]['Steps'][0]['Test Step Description']
+    assert 'all good' in result[0]['Steps'][0]['Test Step Expected Result']
+
+
+def test_parse_data_tolerates_missing_steps_and_properties():
+    wrapper = _make_wrapper()
+    parsed_data = []
+
+    wrapper._QtestApiWrapper__parse_data(
+        {'items': [{'pid': 'TC-9', 'name': 'n', 'description': 'd', 'precondition': 'p', 'id': 9}]},
+        parsed_data,
+        extract_images=False,
+        prompt=None,
+    )
+
+    assert parsed_data[0]['Id'] == 'TC-9'
+    assert parsed_data[0][QTEST_ID] == 9
+    assert parsed_data[0]['Steps'] == []
+
+
+def test_search_by_dql_forwards_opt_in_flags(monkeypatch):
+    wrapper = _make_wrapper()
+    captured = {}
+
+    def fake_perform(self, dql, extract_images=False, prompt=None, max_results=None,
+                     append_test_steps=False, include_external_properties=False):
+        captured['append_test_steps'] = append_test_steps
+        captured['include_external_properties'] = include_external_properties
+        return []
+
+    monkeypatch.setattr(
+        QtestApiWrapper, '_QtestApiWrapper__perform_search_by_dql', fake_perform
+    )
+
+    wrapper.search_by_dql("Id = 'TC-1'", append_test_steps=True, include_external_properties=True)
+
+    assert captured == {'append_test_steps': True, 'include_external_properties': True}
+
+
+def test_search_by_dql_defaults_to_lightweight(monkeypatch):
+    wrapper = _make_wrapper()
+    captured = {}
+
+    def fake_perform(self, dql, extract_images=False, prompt=None, max_results=None,
+                     append_test_steps=False, include_external_properties=False):
+        captured['append_test_steps'] = append_test_steps
+        captured['include_external_properties'] = include_external_properties
+        return []
+
+    monkeypatch.setattr(
+        QtestApiWrapper, '_QtestApiWrapper__perform_search_by_dql', fake_perform
+    )
+
+    wrapper.search_by_dql("Id = 'TC-1'")
+
+    assert captured == {'append_test_steps': False, 'include_external_properties': False}
+
+
+# ---------------------------------------------------------------------------
+# #4952 - configurable per-request HTTP timeout for the qTest client
+# ---------------------------------------------------------------------------
+
+def test_default_qtest_timeout_from_env(monkeypatch):
+    monkeypatch.setenv('QTEST_API_TIMEOUT_SECONDS', '42')
+    assert _default_qtest_timeout() == 42
+
+
+def test_default_qtest_timeout_fallback_when_unset(monkeypatch):
+    monkeypatch.delenv('QTEST_API_TIMEOUT_SECONDS', raising=False)
+    assert _default_qtest_timeout() == 180
+
+
+def test_default_qtest_timeout_fallback_when_invalid(monkeypatch):
+    monkeypatch.setenv('QTEST_API_TIMEOUT_SECONDS', 'not-a-number')
+    assert _default_qtest_timeout() == 180
+
+
+def test_default_qtest_timeout_fallback_when_non_positive(monkeypatch):
+    monkeypatch.setenv('QTEST_API_TIMEOUT_SECONDS', '0')
+    assert _default_qtest_timeout() == 180
+
+
+def _make_timeout_client(request_timeout=180):
+    import swagger_client
+    return _TimeoutApiClient(swagger_client.Configuration(), request_timeout=request_timeout)
+
+
+def test_timeout_client_injects_default_request_timeout(monkeypatch):
+    import swagger_client
+    captured = {}
+
+    def fake_call_api(self, resource_path, method, *args, **kwargs):
+        captured.update(kwargs)
+        return 'ok'
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', fake_call_api)
+    client = _make_timeout_client(180)
+
+    result = client.call_api('/api/v3/projects/1/search', 'POST')
+
+    assert result == 'ok'
+    assert captured['_request_timeout'] == 180
+
+
+def test_timeout_client_respects_explicit_request_timeout(monkeypatch):
+    import swagger_client
+    captured = {}
+
+    def fake_call_api(self, resource_path, method, *args, **kwargs):
+        captured.update(kwargs)
+        return 'ok'
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', fake_call_api)
+    client = _make_timeout_client(180)
+
+    client.call_api('/x', 'GET', _request_timeout=5)
+
+    assert captured['_request_timeout'] == 5
+
+
+def test_timeout_client_translates_read_timeout(monkeypatch):
+    import swagger_client
+
+    def boom(self, *args, **kwargs):
+        raise urllib3.exceptions.ReadTimeoutError(None, '/x', 'read timed out')
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', boom)
+    client = _make_timeout_client(180)
+
+    with pytest.raises(TimeoutError) as exc_info:
+        client.call_api('/api/v3/projects/1/search', 'POST')
+
+    message = str(exc_info.value)
+    assert '180' in message
+    assert 'timed out' in message.lower()
+
+
+def test_timeout_client_translates_maxretry_timeout(monkeypatch):
+    import swagger_client
+    reason = urllib3.exceptions.ConnectTimeoutError('connect timed out')
+
+    def boom(self, *args, **kwargs):
+        raise urllib3.exceptions.MaxRetryError(None, '/x', reason=reason)
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', boom)
+    client = _make_timeout_client(180)
+
+    with pytest.raises(TimeoutError):
+        client.call_api('/api/v3/projects/1/search', 'POST')
+
+
+def test_timeout_client_reraises_non_timeout_maxretry(monkeypatch):
+    import swagger_client
+    reason = urllib3.exceptions.ProtocolError('connection aborted')
+
+    def boom(self, *args, **kwargs):
+        raise urllib3.exceptions.MaxRetryError(None, '/x', reason=reason)
+
+    monkeypatch.setattr(swagger_client.ApiClient, 'call_api', boom)
+    client = _make_timeout_client(180)
+
+    with pytest.raises(urllib3.exceptions.MaxRetryError):
+        client.call_api('/x', 'GET')

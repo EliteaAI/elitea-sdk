@@ -12,9 +12,10 @@ from typing import Any, Optional, Generator, Literal
 
 import requests
 import swagger_client
+import urllib3
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
-from pydantic import Field, PrivateAttr, model_validator, create_model, SecretStr
+from pydantic import Field, PrivateAttr, field_validator, model_validator, create_model, SecretStr
 from sklearn.feature_extraction.text import strip_tags
 from swagger_client import TestCaseApi, SearchApi, PropertyResource, ModuleApi, ProjectApi, FieldApi
 from swagger_client.rest import ApiException
@@ -160,7 +161,9 @@ QtestDataQuerySearch = create_model(
     dql=(str, Field(description="Qtest Data Query Language (DQL) query string")),
     extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled and no custom prompt is provided, the repository default image-processing prompt is used.", default=False)),
     prompt=(Optional[str], Field(description="Optional override prompt for image processing. If omitted or empty, the repository default image-processing prompt is used.", default=None)),
-    max_results=(Optional[int], Field(description="Maximum total results to fetch across all pages. Set to 0 or negative for unlimited. Default: 20", default=20))
+    max_results=(Optional[int], Field(description="Maximum total results to fetch across all pages. Set to 0 or negative for unlimited. Default: 20", default=20)),
+    append_test_steps=(Optional[bool], Field(description="When True, include full test-step data for every result. Defaults to False for lighter, faster responses; opt in only when step-level detail is needed.", default=False)),
+    include_external_properties=(Optional[bool], Field(description="When True, include all external properties for every result. Defaults to False for lighter responses.", default=False))
 )
 
 QtestCreateTestCase = create_model(
@@ -273,6 +276,77 @@ NoInput = create_model(
     "NoInput"
 )
 
+# Default per-request timeout (seconds) applied to every qTest API call.
+DEFAULT_QTEST_API_TIMEOUT_SECONDS = 180
+
+
+def _default_qtest_timeout() -> int:
+    """Resolve the default qTest API request timeout.
+
+    Reads ``QTEST_API_TIMEOUT_SECONDS`` from the environment, falling back to
+    ``DEFAULT_QTEST_API_TIMEOUT_SECONDS`` when the variable is unset, empty,
+    non-numeric, or not a positive integer.
+    """
+    raw = os.getenv("QTEST_API_TIMEOUT_SECONDS")
+    if raw is None:
+        return DEFAULT_QTEST_API_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid QTEST_API_TIMEOUT_SECONDS=%r; falling back to %ss.",
+            raw, DEFAULT_QTEST_API_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_QTEST_API_TIMEOUT_SECONDS
+    if value <= 0:
+        logger.warning(
+            "Non-positive QTEST_API_TIMEOUT_SECONDS=%r; falling back to %ss.",
+            raw, DEFAULT_QTEST_API_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_QTEST_API_TIMEOUT_SECONDS
+    return value
+
+
+class _TimeoutApiClient(swagger_client.ApiClient):
+    """qTest ``ApiClient`` that enforces a default per-request timeout.
+
+    The generated qTest swagger client exposes no client-level timeout: a
+    timeout is only honored per request through the ``_request_timeout``
+    argument (an int total timeout, or a ``(connect, read)`` tuple). Without
+    it an unresponsive qTest endpoint blocks the calling thread forever.
+
+    This subclass injects ``request_timeout`` into every call that does not set
+    its own, so all qTest traffic is bounded, and translates the low-level
+    urllib3 timeout (which is *not* an ``ApiException`` and would otherwise
+    bypass the toolkit's error handling) into a clear ``TimeoutError``.
+    """
+
+    def __init__(self, configuration=None, request_timeout: Optional[int] = None, **kwargs):
+        super().__init__(configuration, **kwargs)
+        self.request_timeout = request_timeout
+
+    def call_api(self, resource_path, method, *args, **kwargs):
+        if self.request_timeout is not None and kwargs.get("_request_timeout") is None:
+            kwargs["_request_timeout"] = self.request_timeout
+        try:
+            return super().call_api(resource_path, method, *args, **kwargs)
+        except urllib3.exceptions.MaxRetryError as e:
+            if isinstance(e.reason, urllib3.exceptions.TimeoutError):
+                raise TimeoutError(self._timeout_message(method, resource_path)) from e
+            raise
+        except urllib3.exceptions.TimeoutError as e:
+            raise TimeoutError(self._timeout_message(method, resource_path)) from e
+
+    def _timeout_message(self, method: str, resource_path: str) -> str:
+        return (
+            f"qTest API request timed out after {self.request_timeout}s "
+            f"({method} {resource_path}). The qTest server did not respond in time. "
+            f"Verify connectivity to the qTest host or increase the timeout via the "
+            f"QTEST_API_TIMEOUT_SECONDS environment variable (or the qtest_api_timeout "
+            f"toolkit setting)."
+        )
+
+
 class QtestApiWrapper(NonCodeIndexerToolkit):
     base_url: str
     qtest_project_id: int
@@ -280,6 +354,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     no_of_items_per_page: int = 100
     page: int = 1
     no_of_tests_shown_in_dql_search: int = 10
+    qtest_api_timeout: int = Field(
+        default_factory=_default_qtest_timeout,
+        description="Per-request timeout (seconds) for qTest API calls. Defaults to "
+                    "the QTEST_API_TIMEOUT_SECONDS env var, or 180s when unset.",
+    )
     _client: Any = PrivateAttr()
     _field_definitions_cache: Optional[dict] = PrivateAttr(default=None)
     _modules_cache: Optional[list] = PrivateAttr(default=None)
@@ -288,6 +367,16 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     _chunking_tool: Optional[str] = PrivateAttr(default=None)
     _extract_images: bool = PrivateAttr(default=False)
     _image_prompt: Optional[str] = PrivateAttr(default=None)
+
+    @field_validator('base_url', mode='before')
+    @classmethod
+    def strip_trailing_slash(cls, v: str) -> str:
+        """Remove a trailing slash from base_url.
+
+        qTest returns 404s when the configured host ends with '/', because the
+        generated client concatenates request paths directly onto the host.
+        """
+        return v.rstrip('/')
 
     @model_validator(mode='before')
     @classmethod
@@ -319,7 +408,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             configuration.host = self.base_url
             configuration.api_key['Authorization'] = self.qtest_api_token.get_secret_value()
             configuration.api_key_prefix['Authorization'] = 'Bearer'
-            self._client = swagger_client.ApiClient(configuration)
+            self._client = _TimeoutApiClient(configuration, request_timeout=self.qtest_api_timeout)
         return self
 
     def __instantiate_test_api_instance(self) -> TestCaseApi:
@@ -967,13 +1056,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 QTEST_ID: item['id'],
                 'Steps': list(map(lambda step: {
                     'Test Step Number': step[0] + 1,
-                    'Test Step Description': self._clean_html_content(step[1]['description'], extract_images, prompt),
-                    'Test Step Expected Result': self._clean_html_content(step[1]['expected'], extract_images, prompt)
-                }, enumerate(item['test_steps']))),
+                    'Test Step Description': self._clean_html_content(step[1].get('description') or '', extract_images, prompt),
+                    'Test Step Expected Result': self._clean_html_content(step[1].get('expected') or '', extract_images, prompt)
+                }, enumerate(item.get('test_steps') or []))),
             }
             
             # Add custom fields directly from API response properties
-            for prop in item['properties']:
+            for prop in item.get('properties') or []:
                 field_name = prop.get('field_name')
                 if not field_name:
                     continue
@@ -1069,7 +1158,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         content = strip_tags(content)
         return content
 
-    def __perform_search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None) -> list:
+    def __perform_search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
+                                append_test_steps: bool=False, include_external_properties: bool=False) -> list:
         """Perform DQL search with pagination control.
         
         Args:
@@ -1078,6 +1168,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             prompt: Optional prompt for image processing
             max_results: Maximum total results to fetch. If None, defaults to 20.
                         Set to 0 or negative for unlimited (fetch all pages).
+            append_test_steps: When True, request full test-step data for every
+                        result. Defaults to False to keep list/search payloads light.
+            include_external_properties: When True, request all external properties
+                        for every result. Defaults to False for lighter payloads.
         
         Returns:
             List of parsed test case data, limited to max_results if specified
@@ -1085,8 +1179,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         search_instance: SearchApi = swagger_client.SearchApi(self._client)
         body = swagger_client.ArtifactSearchParams(object_type='test-cases', fields=['*'],
                                                    query=dql)
-        append_test_steps = 'true'
-        include_external_properties = 'true'
+        # Pass the flags explicitly as 'true'/'false' so the qTest API decides at the
+        # source whether to return heavy test-step / external-property data. Omitting
+        # them makes the API fall back to its default (which returns test steps),
+        # forcing a heavy response we would only transfer and then discard.
+        search_kwargs = {
+            'append_test_steps': 'true' if append_test_steps else 'false',
+            'include_external_properties': 'true' if include_external_properties else 'false',
+        }
         parsed_data = []
         
         # Determine effective max_results (default to 20 if not specified)
@@ -1094,9 +1194,9 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         unlimited = effective_max <= 0
         
         try:
-            api_response = search_instance.search_artifact(self.qtest_project_id, body, append_test_steps=append_test_steps,
-                                                           include_external_properties=include_external_properties,
-                                                           page_size=self.no_of_items_per_page, page=self.page)
+            api_response = search_instance.search_artifact(self.qtest_project_id, body,
+                                                           page_size=self.no_of_items_per_page, page=self.page,
+                                                           **search_kwargs)
             self.__parse_data(api_response, parsed_data, extract_images, prompt)
             
             # Check if we've reached the limit after first page
@@ -1111,9 +1211,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                     
                     next_page = self.page + 1
                     api_response = search_instance.search_artifact(self.qtest_project_id, body,
-                                                                   append_test_steps=append_test_steps,
-                                                                   include_external_properties=include_external_properties,
-                                                                   page_size=self.no_of_items_per_page, page=next_page)
+                                                                   page_size=self.no_of_items_per_page, page=next_page,
+                                                                   **search_kwargs)
                     self.__parse_data(api_response, parsed_data, extract_images, prompt)
         except ApiException as e:
             stacktrace = format_exc()
@@ -1777,7 +1876,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
-    def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None):
+    def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
+                      append_test_steps: bool=False, include_external_properties: bool=False):
         """Search for the test cases in qTest using Data Query Language.
         
         Args:
@@ -1786,11 +1886,18 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             prompt: Optional prompt for image processing
             max_results: Maximum total results to fetch. If None, defaults to 20.
                         Set to 0 or negative for unlimited (fetch all pages).
+            append_test_steps: When True, include full test-step data for every
+                        result. Defaults to False for lighter, faster responses;
+                        opt in when step-level detail is required.
+            include_external_properties: When True, include all external properties
+                        for every result. Defaults to False for lighter responses.
         
         Returns:
             String with search results summary and first no_of_tests_shown_in_dql_search items
         """
-        parsed_data = self.__perform_search_by_dql(dql, extract_images, prompt, max_results)
+        parsed_data = self.__perform_search_by_dql(dql, extract_images, prompt, max_results,
+                                                   append_test_steps=append_test_steps,
+                                                   include_external_properties=include_external_properties)
         return "Found " + str(
             len(parsed_data)) + f" Qtest test cases:\n" + str(parsed_data[:self.no_of_tests_shown_in_dql_search])
 
