@@ -883,8 +883,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     )
                     if _is_pipeline_node:
                         logger.info(
-                            "[MCP Auth] Pipeline node toolkit '%s' requires authorization — re-raising",
-                            tool.get('toolkit_name', ''),
+                            "[MCP Auth] Pipeline node toolkit requires authorization — re-raising"
                         )
                         raise
                     toolkit_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
