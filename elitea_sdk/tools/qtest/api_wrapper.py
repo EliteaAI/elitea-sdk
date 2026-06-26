@@ -1179,13 +1179,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         search_instance: SearchApi = swagger_client.SearchApi(self._client)
         body = swagger_client.ArtifactSearchParams(object_type='test-cases', fields=['*'],
                                                    query=dql)
-        # Only request heavy payload fields when the caller explicitly opts in.
-        # Omitting the params lets the qTest API apply its lightweight defaults.
-        search_kwargs = {}
-        if append_test_steps:
-            search_kwargs['append_test_steps'] = 'true'
-        if include_external_properties:
-            search_kwargs['include_external_properties'] = 'true'
+        # Pass the flags explicitly as 'true'/'false' so the qTest API decides at the
+        # source whether to return heavy test-step / external-property data. Omitting
+        # them makes the API fall back to its default (which returns test steps),
+        # forcing a heavy response we would only transfer and then discard.
+        search_kwargs = {
+            'append_test_steps': 'true' if append_test_steps else 'false',
+            'include_external_properties': 'true' if include_external_properties else 'false',
+        }
         parsed_data = []
         
         # Determine effective max_results (default to 20 if not specified)

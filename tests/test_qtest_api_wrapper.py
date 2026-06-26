@@ -466,7 +466,7 @@ def _patch_search_api(monkeypatch, response):
     return calls
 
 
-def test_perform_search_by_dql_omits_heavy_params_by_default(monkeypatch):
+def test_perform_search_by_dql_sends_false_for_heavy_params_by_default(monkeypatch):
     wrapper = _make_wrapper()
     wrapper._client = None  # model_construct skips setup_qtest_client; fake SearchApi ignores it
     response = {
@@ -480,9 +480,10 @@ def test_perform_search_by_dql_omits_heavy_params_by_default(monkeypatch):
     result = wrapper._QtestApiWrapper__perform_search_by_dql("Id = 'TC-1'")
 
     assert len(calls) == 1
-    # Heavy payload params are omitted entirely so the API applies its light defaults.
-    assert 'append_test_steps' not in calls[0]
-    assert 'include_external_properties' not in calls[0]
+    # Flags are sent explicitly as 'false' so the qTest API excludes heavy data at
+    # the source instead of returning it for us to discard during parsing.
+    assert calls[0]['append_test_steps'] == 'false'
+    assert calls[0]['include_external_properties'] == 'false'
     # Lightweight response (no test_steps/properties keys) parses without error.
     assert result[0]['Id'] == 'TC-1'
     assert result[0]['Steps'] == []
