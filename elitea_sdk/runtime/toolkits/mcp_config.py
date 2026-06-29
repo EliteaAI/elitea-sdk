@@ -48,7 +48,7 @@ from langchain_core.tools import BaseToolkit, BaseTool
 from pydantic import BaseModel, Field
 
 from ..utils.mcp_oauth import substitute_mcp_placeholders
-from ..utils.mcp_oauth import canonical_resource, atlassian_mcp_alternate_resource, normalize_mcp_url
+from ..utils.mcp_oauth import canonical_resource, mcp_alternate_resource, normalize_mcp_url
 
 logger = logging.getLogger(__name__)
 
@@ -599,7 +599,7 @@ class McpConfigToolkit(BaseToolkit):
         timeout = server_config.get('timeout', 60)
         ssl_verify = user_config.get('ssl_verify', server_config.get('ssl_verify', True))
         canonical_url = canonical_resource(url) if url else None
-        atlassian_alt_url = atlassian_mcp_alternate_resource(canonical_url or url)
+        atlassian_alt_url = mcp_alternate_resource(canonical_url or url)
 
         token_keys = [key for key in mcp_tokens.keys() if isinstance(key, str)]
         token_keys_lower_map = {key.lower(): key for key in token_keys}

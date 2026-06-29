@@ -20,7 +20,7 @@ from ..models.mcp_models import McpConnectionConfig
 from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
 from ..utils.mcp_oauth import (
     McpAuthorizationRequired,
-    atlassian_mcp_alternate_resource,
+    mcp_alternate_resource,
     canonical_resource,
     extract_resource_metadata_url,
     fetch_resource_metadata,

@@ -40,51 +40,38 @@ _MCP_DEPRECATED_PATHS: Dict[str, Dict[str, str]] = {
 }
 
 
-def atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
-    """Return the alternate MCP URL for known path mappings, or None if not recognized.
-
-    Looks up the URL hostname in ``_MCP_ALTERNATE_PATHS`` and returns the
-    corresponding alternate path form.  Adding a new provider requires only a
-    new entry in that dict — no logic changes needed here.
-    """
-    if not isinstance(url, str):
-        return None
+def _apply_mcp_path_map(url: str, path_maps: Dict[str, Dict[str, str]]) -> Optional[str]:
+    """Return the remapped URL if ``url`` matches an entry in ``path_maps``, else None."""
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(url.strip())
     except Exception:
         return None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    path_map = _MCP_ALTERNATE_PATHS.get(parsed.netloc.lower())
+    path_map = path_maps.get(parsed.netloc.lower())
     if path_map:
-        alt_path = path_map.get(parsed.path.rstrip("/"))
-        if alt_path:
-            return f"{parsed.scheme}://{parsed.netloc}{alt_path}"
+        new_path = path_map.get(parsed.path.rstrip("/"))
+        if new_path:
+            return f"{parsed.scheme}://{parsed.netloc}{new_path}"
     return None
+
+
+def mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
+    """Return the alternate MCP URL for known path mappings, or None if not recognized."""
+    if not isinstance(url, str):
+        return None
+    return _apply_mcp_path_map(url, _MCP_ALTERNATE_PATHS)
 
 
 def normalize_mcp_url(url: Optional[str]) -> Optional[str]:
     """Normalize an MCP server URL, redirecting deprecated endpoints to current ones.
 
-    Looks up the URL hostname in ``_MCP_DEPRECATED_PATHS`` and rewrites any
-    recognized deprecated path to its current form.  Adding support for a new
-    provider migration requires only a new entry in that dict.
     Returns the input unchanged if no migration is registered for it.
+    To add a new migration, insert a new entry in ``_MCP_DEPRECATED_PATHS``.
     """
     if not isinstance(url, str):
         return url
-    try:
-        parsed = urlparse(url.strip())
-    except Exception:
-        return url
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return url
-    path_map = _MCP_DEPRECATED_PATHS.get(parsed.netloc.lower())
-    if path_map:
-        new_path = path_map.get(parsed.path.rstrip("/"))
-        if new_path:
-            return f"{parsed.scheme}://{parsed.netloc}{new_path}"
-    return url.strip()
+    return _apply_mcp_path_map(url, _MCP_DEPRECATED_PATHS) or url.strip()
 
 
 def has_active_mcp_token(mcp_tokens: Optional[dict], server_url: Optional[str]) -> bool:
@@ -100,7 +87,7 @@ def has_active_mcp_token(mcp_tokens: Optional[dict], server_url: Optional[str]) 
     for raw_candidate in [
         server_url,
         canonical_resource(server_url),
-        atlassian_mcp_alternate_resource(server_url),
+        mcp_alternate_resource(server_url),
     ]:
         if isinstance(raw_candidate, str) and raw_candidate and raw_candidate not in candidates:
             candidates.append(raw_candidate)

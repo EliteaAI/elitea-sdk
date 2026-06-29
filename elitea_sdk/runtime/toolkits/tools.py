@@ -26,7 +26,7 @@ from ..utils.mcp_oauth import (
     McpAuthorizationRequired,
     build_mcp_auth_decision_result,
     _is_http_url,
-    atlassian_mcp_alternate_resource,
+    mcp_alternate_resource,
     has_active_mcp_token,
     normalize_mcp_url,
 )
@@ -334,7 +334,7 @@ def _make_mcp_auth_control_tool(
         # Do NOT call discover_mcp_tools — that would raise McpAuthorizationRequired
         # again and trigger another auth dialog even though the user already skipped.
         # Check canonical URL and Atlassian alternate URL to cover all token storage key forms.
-        _atlassian_alt_url = atlassian_mcp_alternate_resource(normalized_url) if normalized_url else None
+        _atlassian_alt_url = mcp_alternate_resource(normalized_url) if normalized_url else None
         _declined_key = None
         for _check_key in [normalized_url, _atlassian_alt_url]:
             if _check_key and _check_key in server_metadata:
@@ -362,7 +362,7 @@ def _make_mcp_auth_control_tool(
         auth_headers: Dict[str, str] = {}
         token_session_id: Optional[str] = None
         if mcp_tokens:
-            _atlassian_alt = atlassian_mcp_alternate_resource(normalized_url) if normalized_url else None
+            _atlassian_alt = mcp_alternate_resource(normalized_url) if normalized_url else None
             for lookup_key in [normalized_url, server_url, _atlassian_alt]:
                 if not lookup_key:
                     continue
@@ -747,7 +747,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     logger.debug("[MCP Auth] Looking up token for MCP server")
                     logger.debug("[MCP Auth] Token lookup — %d known servers", len(mcp_tokens))
                     lookup_candidates = [canonical_url, url]
-                    atlassian_alt = atlassian_mcp_alternate_resource(canonical_url)
+                    atlassian_alt = mcp_alternate_resource(canonical_url)
                     if atlassian_alt:
                         lookup_candidates.append(atlassian_alt)
                     matched_candidates = [candidate for candidate in lookup_candidates if candidate in mcp_tokens]
