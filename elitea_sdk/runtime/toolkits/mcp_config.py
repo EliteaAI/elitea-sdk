@@ -48,7 +48,7 @@ from langchain_core.tools import BaseToolkit, BaseTool
 from pydantic import BaseModel, Field
 
 from ..utils.mcp_oauth import substitute_mcp_placeholders
-from ..utils.mcp_oauth import canonical_resource
+from ..utils.mcp_oauth import canonical_resource, atlassian_mcp_alternate_resource, normalize_mcp_url
 
 logger = logging.getLogger(__name__)
 
@@ -58,27 +58,6 @@ name = "mcp_config"
 _session_manager_lock = threading.Lock()
 _session_manager: Optional['McpStdioSessionManager'] = None
 
-
-def _atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
-    if not isinstance(url, str):
-        return None
-    if url.startswith("https://mcp.atlassian.com/"):
-        normalized = url.rstrip("/")
-        if normalized.endswith("/v1/mcp/authv2"):
-            return "https://mcp.atlassian.com/v1/sse"
-        if normalized.endswith("/v1/sse"):
-            return "https://mcp.atlassian.com/v1/mcp/authv2"
-    return None
-
-
-def _normalize_atlassian_mcp_url(url: Optional[str]) -> Optional[str]:
-    """Normalize deprecated Atlassian MCP URL /v1/sse to the current /v1/mcp/authv2."""
-    if not isinstance(url, str):
-        return url
-    normalized = url.rstrip("/")
-    if normalized == "https://mcp.atlassian.com/v1/sse":
-        return "https://mcp.atlassian.com/v1/mcp/authv2"
-    return url
 
 
 def _create_stdio_tool_func(original_tool_name: str, server_name: str, server_config: Dict[str, Any]):
@@ -620,7 +599,7 @@ class McpConfigToolkit(BaseToolkit):
         timeout = server_config.get('timeout', 60)
         ssl_verify = user_config.get('ssl_verify', server_config.get('ssl_verify', True))
         canonical_url = canonical_resource(url) if url else None
-        atlassian_alt_url = _atlassian_mcp_alternate_resource(canonical_url or url)
+        atlassian_alt_url = atlassian_mcp_alternate_resource(canonical_url or url)
 
         token_keys = [key for key in mcp_tokens.keys() if isinstance(key, str)]
         token_keys_lower_map = {key.lower(): key for key in token_keys}
@@ -685,7 +664,7 @@ class McpConfigToolkit(BaseToolkit):
                 headers['Authorization'] = f"{token_type} {access_token}"
 
         # Normalize deprecated Atlassian /v1/sse URL to /v1/mcp/authv2 for the actual connection
-        connection_url = _normalize_atlassian_mcp_url(url)
+        connection_url = normalize_mcp_url(url)
 
         logger.debug(f"[MCP Config] Connecting to HTTP server {server_name} at {connection_url} (ssl_verify={ssl_verify})")
 

@@ -20,6 +20,20 @@ def _is_http_url(value: Optional[str]) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+# Bidirectional path mappings for Atlassian MCP URL alternates.
+# Maps each known path form to its counterpart for token-key compatibility lookups.
+_ATLASSIAN_MCP_ALT_PATHS: Dict[str, str] = {
+    "/v1/mcp/authv2": "/v1/sse",
+    "/v1/sse": "/v1/mcp/authv2",
+}
+
+# Deprecated → current path migrations for Atlassian MCP.
+# Normalizes legacy endpoint forms to the canonical current form.
+_ATLASSIAN_MCP_DEPRECATED_PATHS: Dict[str, str] = {
+    "/v1/sse": "/v1/mcp/authv2",
+}
+
+
 def atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
     """Return the alternate Atlassian MCP URL (authv2 <-> SSE), or None for non-Atlassian URLs."""
     if not isinstance(url, str):
@@ -31,12 +45,31 @@ def atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
     if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "mcp.atlassian.com":
         return None
     path = parsed.path.rstrip("/")
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    if path == "/v1/mcp/authv2":
-        return f"{origin}/v1/sse"
-    if path == "/v1/sse":
-        return f"{origin}/v1/mcp/authv2"
+    alt_path = _ATLASSIAN_MCP_ALT_PATHS.get(path)
+    if alt_path:
+        return f"{parsed.scheme}://{parsed.netloc}{alt_path}"
     return None
+
+
+def normalize_mcp_url(url: Optional[str]) -> Optional[str]:
+    """Normalize an MCP server URL, redirecting deprecated endpoints to current ones.
+
+    Currently handles the Atlassian MCP migration from /v1/sse to /v1/mcp/authv2.
+    Returns the input unchanged if it is not a recognized deprecated endpoint.
+    """
+    if not isinstance(url, str):
+        return url
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return url
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return url
+    if parsed.netloc.lower() == "mcp.atlassian.com":
+        new_path = _ATLASSIAN_MCP_DEPRECATED_PATHS.get(parsed.path.rstrip("/"))
+        if new_path:
+            return f"{parsed.scheme}://{parsed.netloc}{new_path}"
+    return url.strip()
 
 
 def has_active_mcp_token(mcp_tokens: Optional[dict], server_url: Optional[str]) -> bool:

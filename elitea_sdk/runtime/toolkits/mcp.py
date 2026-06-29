@@ -25,6 +25,7 @@ from ..utils.mcp_oauth import (
     extract_resource_metadata_url,
     fetch_resource_metadata,
     infer_authorization_servers_from_realm,
+    normalize_mcp_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -788,15 +789,11 @@ def get_tools(tool_config: dict, elitea_client, llm=None, memory_store=None) -> 
         logger.error("MCP toolkit configuration missing required 'url'")
         return []
 
-    # Normalize deprecated Atlassian MCP SSE URL to the current authv2 endpoint.
-    # Only applies to the legacy /v1/sse form; authv2 URLs are left unchanged.
-    _ATLASSIAN_DEPRECATED = 'https://mcp.atlassian.com/v1/sse'
-    if url.rstrip('/') == _ATLASSIAN_DEPRECATED:
-        url = 'https://mcp.atlassian.com/v1/mcp/authv2'
-        logger.info(
-            "[Atlassian MCP] Normalizing deprecated URL '%s' to '%s'",
-            _ATLASSIAN_DEPRECATED, url,
-        )
+    # Normalize deprecated endpoint forms (e.g. Atlassian /v1/sse -> /v1/mcp/authv2)
+    normalized_url = normalize_mcp_url(url)
+    if normalized_url != url:
+        logger.info("[MCP] Normalizing deprecated endpoint to current form")
+        url = normalized_url
 
     # Type conversion for numeric settings that may come as strings from config
     return McpToolkit.get_toolkit(

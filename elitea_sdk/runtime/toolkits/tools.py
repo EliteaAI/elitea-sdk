@@ -28,6 +28,7 @@ from ..utils.mcp_oauth import (
     _is_http_url,
     atlassian_mcp_alternate_resource,
     has_active_mcp_token,
+    normalize_mcp_url,
 )
 from ...tools.utils import clean_string
 from elitea_sdk.tools import _inject_toolkit_id, _inject_display_metadata, _patch_tool_invoke
@@ -723,22 +724,19 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 settings = dict(tool['settings'])
                 url = settings.get('url')
 
-                # Normalize deprecated Atlassian MCP SSE URL to the current authv2 endpoint.
-                # Only applies to the legacy /v1/sse form; authv2 URLs are left unchanged.
-                _ATLASSIAN_DEPRECATED = 'https://mcp.atlassian.com/v1/sse'
-                if url and url.rstrip('/') == _ATLASSIAN_DEPRECATED:
-                    _authv2_url = 'https://mcp.atlassian.com/v1/mcp/authv2'
-                    logger.info(
-                        "[Atlassian MCP] Normalizing deprecated Atlassian MCP endpoint to authv2 endpoint"
-                    )
-                    url = _authv2_url
-                    settings['url'] = url
+                # Normalize deprecated endpoint forms (e.g. Atlassian /v1/sse -> /v1/mcp/authv2)
+                if url:
+                    normalized_url = normalize_mcp_url(url)
+                    if normalized_url != url:
+                        logger.info("[MCP] Normalizing deprecated endpoint to current form")
+                        url = normalized_url
+                        settings['url'] = url
 
                 # Check if this MCP server should be ignored (user chose to continue without auth)
                 if ignored_mcp_servers and url:
                     canonical_url = canonical_resource(url)
                     if canonical_url in ignored_mcp_servers or url in ignored_mcp_servers:
-                        logger.info(f"[MCP Auth] Skipping ignored MCP server: {url}")
+                        logger.info("[MCP Auth] Skipping ignored MCP server")
                         continue
                 
                 headers = settings.get('headers')
@@ -746,9 +744,8 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 session_id = None
                 if mcp_tokens and url:
                     canonical_url = canonical_resource(url)
-                    logger.info(f"[MCP Auth] Looking for token for URL: {url}")
-                    logger.info(f"[MCP Auth] Canonical URL: {canonical_url}")
-                    logger.info(f"[MCP Auth] Available tokens: {list(mcp_tokens.keys())}")
+                    logger.debug("[MCP Auth] Looking up token for MCP server")
+                    logger.debug("[MCP Auth] Token lookup — %d known servers", len(mcp_tokens))
                     lookup_candidates = [canonical_url, url]
                     atlassian_alt = atlassian_mcp_alternate_resource(canonical_url)
                     if atlassian_alt:
@@ -772,7 +769,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             logger.info(f"[MCP Auth] Using legacy token format (string)")
                     else:
                         access_token = None
-                        logger.warning(f"[MCP Auth] No token found for {canonical_url}")
+                        logger.debug("[MCP Auth] No token found for this MCP server")
                 else:
                     access_token = None
                     
@@ -785,12 +782,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     # credential.  Signal this so a 401 re-triggers OAuth instead of a ValueError.
                     if not any(k.lower() == 'authorization' for k in (headers or {})):
                         settings['_oauth_token_injected'] = True
-                    logger.info(f"[MCP Auth] Added Authorization header for {url}")
+                    logger.debug("[MCP Auth] Added Authorization header for MCP server")
                     
                 # Pass session_id to MCP toolkit if available
                 if session_id:
                     settings['session_id'] = session_id
-                    logger.info(f"[MCP Auth] Passing session_id to toolkit: {session_id}")
+                    logger.debug("[MCP Auth] Passing session_id to toolkit")
                 try:
                     mcp_tools = McpToolkit.get_toolkit(
                         toolkit_name=tool.get('toolkit_name', ''),
