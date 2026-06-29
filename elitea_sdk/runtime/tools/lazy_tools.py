@@ -397,10 +397,14 @@ class ToolRegistry:
         for toolkit_type in sorted(toolkits_by_type.keys()):
             toolkit_names = sorted(toolkits_by_type[toolkit_type])
 
-            # Get tools from first toolkit of this type (all should have same tools)
-            first_toolkit_of_type = toolkit_names[0]
-            tools = self._toolkits[first_toolkit_of_type]
-            tool_names = sorted(tools.keys())
+            # Collect the union of tools across ALL toolkits of this type.
+            # Toolkits of the same type may carry different tools (e.g. three Elitea
+            # MCP toolkits all have toolkit_type="mcp" but distinct tool sets), so we
+            # must not trust toolkit_names[0] alone.  Using a set deduplicates tool
+            # names for the identical-tool case (e.g. multi-repo GitHub) without loss.
+            tool_names = sorted(
+                {name for tk in toolkit_names for name in self._toolkits[tk].keys()}
+            )
             tool_count_for_type = len(tool_names)
 
             # Type header - clearly marked as TYPE not name
@@ -511,9 +515,13 @@ class ListToolkitsTool(BaseTool):
         result = []
         for toolkit_type in sorted(toolkits_by_type.keys()):
             instances = toolkits_by_type[toolkit_type]
-            # Get tools from first instance (all same type have same tools)
-            first_instance = instances[0]['name']
-            tools = self.registry.get_toolkit_tools(first_instance)
+            # Collect the union of tools across ALL instances of this type.
+            # Same rationale as generate_index(): same-type toolkits may carry different
+            # tool sets (Elitea MCP: Applications/Chat/Toolkits each distinct).
+            all_tools = sorted(
+                {name for inst in instances
+                 for name in self.registry.get_toolkit_tools(inst['name']).keys()}
+            )
 
             # Build toolkit entries with 'name' as primary identifier
             toolkit_entries = []
@@ -526,8 +534,8 @@ class ListToolkitsTool(BaseTool):
             result.append({
                 'toolkit_type': toolkit_type,  # Category/type (do NOT use this for tool calls)
                 'toolkits': toolkit_entries,   # USE 'name' from these entries
-                'tools': sorted(tools.keys()),
-                'tool_count': len(tools),
+                'tools': all_tools,
+                'tool_count': len(all_tools),
             })
 
         return json.dumps(result, indent=2)
