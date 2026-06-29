@@ -20,42 +20,56 @@ def _is_http_url(value: Optional[str]) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-# Bidirectional path mappings for Atlassian MCP URL alternates.
+# Bidirectional path alternates keyed by hostname.
 # Maps each known path form to its counterpart for token-key compatibility lookups.
-_ATLASSIAN_MCP_ALT_PATHS: Dict[str, str] = {
-    "/v1/mcp/authv2": "/v1/sse",
-    "/v1/sse": "/v1/mcp/authv2",
+# To add a new provider, insert an entry here — no logic changes required.
+_MCP_ALTERNATE_PATHS: Dict[str, Dict[str, str]] = {
+    "mcp.atlassian.com": {
+        "/v1/mcp/authv2": "/v1/sse",
+        "/v1/sse": "/v1/mcp/authv2",
+    },
 }
 
-# Deprecated → current path migrations for Atlassian MCP.
-# Normalizes legacy endpoint forms to the canonical current form.
-_ATLASSIAN_MCP_DEPRECATED_PATHS: Dict[str, str] = {
-    "/v1/sse": "/v1/mcp/authv2",
+# Deprecated → current path migrations keyed by hostname.
+# Normalizes legacy endpoint forms to their canonical current forms.
+# To add a new migration, insert an entry here — no logic changes required.
+_MCP_DEPRECATED_PATHS: Dict[str, Dict[str, str]] = {
+    "mcp.atlassian.com": {
+        "/v1/sse": "/v1/mcp/authv2",
+    },
 }
 
 
 def atlassian_mcp_alternate_resource(url: Optional[str]) -> Optional[str]:
-    """Return the alternate Atlassian MCP URL (authv2 <-> SSE), or None for non-Atlassian URLs."""
+    """Return the alternate MCP URL for known path mappings, or None if not recognized.
+
+    Looks up the URL hostname in ``_MCP_ALTERNATE_PATHS`` and returns the
+    corresponding alternate path form.  Adding a new provider requires only a
+    new entry in that dict — no logic changes needed here.
+    """
     if not isinstance(url, str):
         return None
     try:
         parsed = urlparse(url)
     except Exception:
         return None
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "mcp.atlassian.com":
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    path = parsed.path.rstrip("/")
-    alt_path = _ATLASSIAN_MCP_ALT_PATHS.get(path)
-    if alt_path:
-        return f"{parsed.scheme}://{parsed.netloc}{alt_path}"
+    path_map = _MCP_ALTERNATE_PATHS.get(parsed.netloc.lower())
+    if path_map:
+        alt_path = path_map.get(parsed.path.rstrip("/"))
+        if alt_path:
+            return f"{parsed.scheme}://{parsed.netloc}{alt_path}"
     return None
 
 
 def normalize_mcp_url(url: Optional[str]) -> Optional[str]:
     """Normalize an MCP server URL, redirecting deprecated endpoints to current ones.
 
-    Currently handles the Atlassian MCP migration from /v1/sse to /v1/mcp/authv2.
-    Returns the input unchanged if it is not a recognized deprecated endpoint.
+    Looks up the URL hostname in ``_MCP_DEPRECATED_PATHS`` and rewrites any
+    recognized deprecated path to its current form.  Adding support for a new
+    provider migration requires only a new entry in that dict.
+    Returns the input unchanged if no migration is registered for it.
     """
     if not isinstance(url, str):
         return url
@@ -65,8 +79,9 @@ def normalize_mcp_url(url: Optional[str]) -> Optional[str]:
         return url
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return url
-    if parsed.netloc.lower() == "mcp.atlassian.com":
-        new_path = _ATLASSIAN_MCP_DEPRECATED_PATHS.get(parsed.path.rstrip("/"))
+    path_map = _MCP_DEPRECATED_PATHS.get(parsed.netloc.lower())
+    if path_map:
+        new_path = path_map.get(parsed.path.rstrip("/"))
         if new_path:
             return f"{parsed.scheme}://{parsed.netloc}{new_path}"
     return url.strip()
