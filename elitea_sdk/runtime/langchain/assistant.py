@@ -413,6 +413,26 @@ class Assistant:
 
             logger.info(f"Added {len(actual_internal_tools)} internal tools as first-class: {actual_internal_tools}")
 
+        # For pipeline agents, find the toolkit names of direct MCP/toolkit pipeline nodes
+        # so that mcp_auth_control is not injected for them (direct nodes bypass LLM decision-making).
+        pipeline_node_toolkit_names = None
+        if self.app_type == APP_TYPE_PIPELINE:
+            try:
+                import yaml as _yaml
+                _pipeline_yaml = _yaml.safe_load(data.get('instructions', '') or '') or {}
+                pipeline_node_toolkit_names = {
+                    node['toolkit_name']
+                    for node in _pipeline_yaml.get('nodes', [])
+                    if node.get('type') in ('mcp', 'toolkit') and node.get('toolkit_name')
+                }
+            except Exception:
+                pass
+
+        # Collects toolkit names that were skipped because the user declined MCP auth.
+        # Pipeline nodes whose toolkit is in this set will be replaced with a clean
+        # blocked-termination node in create_graph() instead of raising ToolException.
+        self._skipped_pipeline_toolkit_names: set = set()
+
         self.tools = get_tools(
             version_tools,
             elitea_client=elitea,
@@ -423,10 +443,23 @@ class Assistant:
             mcp_tokens=mcp_tokens,
             conversation_id=conversation_id,
             ignored_mcp_servers=ignored_mcp_servers,
-            current_participant_id=self.current_participant_id
+            current_participant_id=self.current_participant_id,
+            user_declined_mcp_servers=data.get("user_declined_mcp_servers"),
+            pipeline_node_toolkit_names=pipeline_node_toolkit_names,
+            skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
         )
         if tools:
             self.tools += tools
+            # Deduplicate keeping the last occurrence, but scoped per toolkit so that
+            # two toolkits with same-named tools (e.g. GitHub's create_issue and
+            # Jira's create_issue) are both preserved.  The richer mcp_auth_control
+            # injected via tools= still overrides the basic one from get_tools()
+            # because they share both name and toolkit_name (None).
+            _seen: dict = {}
+            for _t in self.tools:
+                _toolkit = (getattr(_t, 'metadata', None) or {}).get('toolkit_name')
+                _seen[(_t.name, _toolkit)] = _t
+            self.tools = list(_seen.values())
 
         # Initialize middleware manager and add middleware tools
         # Middleware tools are tracked separately as "always-bind" tools
@@ -827,6 +860,7 @@ class Assistant:
             always_bind_tools=self._always_bind_tools,
             middleware_manager=self.middleware_manager,
             child_dispatcher=self.child_dispatcher,  # Parallel sub-agent dispatch seam (#4993 Track 2)
+            skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
         )
         return agent
 

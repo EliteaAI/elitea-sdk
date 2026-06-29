@@ -83,7 +83,7 @@ nodes:
           1. tool_executed: create_branch result is not empty/null
           2. success_indicated: create_branch output contains a success indicator
           3. branch_exists_in_list: list_branches output contains '{branch_name}'
-          4. no_error: Neither output contains 'error', 'failed', 'already exists'
+          4. no_error: Neither output contains a real failure indicator such as an 'Error:' prefix, 'Tool execution error', or 'Failed to'. Do NOT treat successful branch report text containing the substring 'error' inside branch names as a failure.
 
           Return a JSON object with structure:
           {{

@@ -1169,7 +1169,8 @@ class EliteAClient:
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
                       exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
                       step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
-                      child_dispatcher: Optional[Any] = None):
+                      child_dispatcher: Optional[Any] = None,
+                      user_declined_mcp_servers: Optional[list] = None):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -1216,7 +1217,8 @@ class EliteAClient:
             'tools': tools,  # Tool configs that will be processed by get_tools()
             'variables': variables,
             'internal_tools': internal_tools,  # Mode flags like 'swarm' for multi-agent collaboration
-            'meta': {'step_limit': step_limit} if step_limit is not None else {}
+            'meta': {'step_limit': step_limit} if step_limit is not None else {},
+            'user_declined_mcp_servers': user_declined_mcp_servers or [],
         }
 
         # Auto-create middleware based on internal_tools parameter

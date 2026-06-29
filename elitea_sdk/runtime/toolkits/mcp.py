@@ -20,10 +20,12 @@ from ..models.mcp_models import McpConnectionConfig
 from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
 from ..utils.mcp_oauth import (
     McpAuthorizationRequired,
+    mcp_alternate_resource,
     canonical_resource,
     extract_resource_metadata_url,
     fetch_resource_metadata,
     infer_authorization_servers_from_realm,
+    normalize_mcp_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,7 +245,14 @@ class McpToolkit(BaseToolkit):
         session_id = kwargs.get('session_id')
         if session_id:
             logger.info(f"[MCP Session] Using provided session ID for toolkit '{toolkit_name}': {session_id}")
-        
+
+        # tools.py sets _oauth_token_injected=True when the Authorization header was NOT in
+        # the original DB settings but was injected from mcp_tokens (an OAuth-obtained token).
+        # That tells the MCP client to treat a 401 as "token expired, re-run OAuth" rather
+        # than "static credentials are wrong" (which would raise ValueError and silently drop
+        # the toolkit's tools).
+        oauth_token_injected = kwargs.get('_oauth_token_injected', False)
+
         # Create MCP connection configuration
         try:
             connection_config = McpConnectionConfig(
@@ -266,7 +275,8 @@ class McpToolkit(BaseToolkit):
             timeout=timeout,
             selected_tools=selected_tools,
             client=client,
-            ssl_verify=ssl_verify
+            ssl_verify=ssl_verify,
+            oauth_token_injected=oauth_token_injected,
         )
 
         return toolkit
@@ -279,7 +289,8 @@ class McpToolkit(BaseToolkit):
         timeout: int,
         selected_tools: List[str],
         client,
-        ssl_verify: bool = True
+        ssl_verify: bool = True,
+        oauth_token_injected: bool = False,
     ) -> List[BaseTool]:
         """
         Create tools from a single MCP server. Always performs live discovery when connection config is provided.
@@ -295,7 +306,8 @@ class McpToolkit(BaseToolkit):
                 toolkit_name=toolkit_name,
                 connection_config=connection_config,
                 timeout=timeout,
-                ssl_verify=ssl_verify
+                ssl_verify=ssl_verify,
+                oauth_token_injected=oauth_token_injected,
             )
 
             # Filter tools if specific ones are selected
@@ -367,7 +379,8 @@ class McpToolkit(BaseToolkit):
         toolkit_name: str,
         connection_config: McpConnectionConfig,
         timeout: int,
-        ssl_verify: bool = True
+        ssl_verify: bool = True,
+        oauth_token_injected: bool = False,
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Discover tools and prompts from MCP server using SSE client.
@@ -387,7 +400,8 @@ class McpToolkit(BaseToolkit):
                     toolkit_name=toolkit_name,
                     connection_config=connection_config,
                     timeout=timeout,
-                    ssl_verify=ssl_verify
+                    ssl_verify=ssl_verify,
+                    oauth_token_injected=oauth_token_injected,
                 )
             )
             # Return tools and the session_id (server-provided or generated)
@@ -407,7 +421,8 @@ class McpToolkit(BaseToolkit):
         toolkit_name: str,
         connection_config: McpConnectionConfig,
         timeout: int,
-        ssl_verify: bool = True
+        ssl_verify: bool = True,
+        oauth_token_injected: bool = False,
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Async implementation of tool discovery using SSE client.
@@ -432,8 +447,13 @@ class McpToolkit(BaseToolkit):
         if connection_config.headers:
             headers.update(connection_config.headers)
 
-        # True when the user has an Authorization header in their DB toolkit config
+        # True when the user has an Authorization header in their DB toolkit config.
+        # If the token was injected from the OAuth flow (not a static DB credential),
+        # force configured_auth=False so that a 401 re-triggers the OAuth flow instead
+        # of raising a plain ValueError.
         configured_auth = any(k.lower() == 'authorization' for k in headers)
+        if oauth_token_injected:
+            configured_auth = False
 
         # Create unified MCP client (auto-detects SSE vs Streamable HTTP)
         client = McpClient(
@@ -768,6 +788,12 @@ def get_tools(tool_config: dict, elitea_client, llm=None, memory_store=None) -> 
     if not url:
         logger.error("MCP toolkit configuration missing required 'url'")
         return []
+
+    # Normalize deprecated endpoint forms (e.g. Atlassian /v1/sse -> /v1/mcp/authv2)
+    normalized_url = normalize_mcp_url(url)
+    if normalized_url != url:
+        logger.info("[MCP] Normalizing deprecated endpoint to current form")
+        url = normalized_url
 
     # Type conversion for numeric settings that may come as strings from config
     return McpToolkit.get_toolkit(
