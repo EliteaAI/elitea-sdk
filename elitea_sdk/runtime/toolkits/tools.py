@@ -223,7 +223,7 @@ def _make_mcp_auth_control_tool(
 
     class _McpAuthControlInput(PydanticBaseModel):
         action: str = Field(default="authorize", description="Action to perform: 'authorize' to start OAuth flow, 'status' to check declined state, 'explain_skip' to generate structured skip guidance")
-        server_url: str = Field(description="MCP server URL that needs authorization")
+        server_url: Optional[str] = Field(default=None, description="MCP server URL that needs authorization (required for 'authorize'; optional for 'status'/'explain_skip')")
         tool_name: Optional[str] = Field(default=None, description="Name of the MCP tool that triggered auth")
         reason: Optional[str] = Field(default=None, description="Optional reason for authorization")
 
@@ -764,16 +764,18 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         matched_key = matched_candidates[0]
                         token_data = mcp_tokens.get(matched_key)
                     if token_data:
-                        logger.info("[MCP Auth] Found token data for matched server")
+                        logger.debug("[MCP Auth] Found token data for matched server")
                         # Handle both old format (string) and new format (dict with access_token and session_id)
                         if isinstance(token_data, dict):
                             access_token = token_data.get('access_token')
                             session_id = token_data.get('session_id')
-                            logger.info(f"[MCP Auth] Token data: access_token={'present' if access_token else 'missing'}, session_id={session_id or 'none'}")
+                            logger.debug("[MCP Auth] Token data: access_token=%s, session_id=%s",
+                                         'present' if access_token else 'missing',
+                                         'present' if session_id else 'none')
                         else:
                             # Backward compatibility: treat as plain token string
                             access_token = token_data
-                            logger.info(f"[MCP Auth] Using legacy token format (string)")
+                            logger.debug("[MCP Auth] Using legacy token format (string)")
                     else:
                         access_token = None
                         logger.debug("[MCP Auth] No token found for this MCP server")
