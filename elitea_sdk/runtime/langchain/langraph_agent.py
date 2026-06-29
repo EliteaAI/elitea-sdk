@@ -31,7 +31,7 @@ from .utils import (
     safe_format,
 )
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
-from ..tools.function import FunctionTool
+from ..tools.function import FunctionTool, PIPELINE_BLOCKED_KEY
 from ..tools.hitl import HITLNode
 from ..tools.indexer_tool import IndexerNode
 from ..tools.llm import LLMNode
@@ -940,6 +940,32 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
     return compiled
 
 
+def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list):
+    """Return a LangGraph node callable for an MCP pipeline node whose auth was skipped.
+
+    Sets PIPELINE_BLOCKED_KEY so the graph terminates cleanly after this node
+    (TransitionalEdge and ConditionalEdge both check this flag and route to END).
+    All declared output variables are set to None to avoid corrupt downstream state.
+    """
+    def _node(state):
+        message = (
+            f"**Pipeline stopped** — MCP toolkit **{toolkit_name}** "
+            f"(node: *{node_id}*) authentication was skipped.\n\n"
+            f"Downstream nodes that depend on `{node_id}` output were not executed "
+            f"because the required data is unavailable without authentication.\n\n"
+            f"> **Tip:** Authorize the MCP server and try again."
+        )
+        result = {
+            "messages": [{"role": "assistant", "content": message}],
+            PIPELINE_BLOCKED_KEY: message,
+        }
+        for var in output_vars:
+            if var != "messages":
+                result[var] = None
+        return result
+    return _node
+
+
 def find_tool_by_name_or_metadata(tools: list, tool_name: str, toolkit_name: Optional[str] = None) -> Optional[BaseTool]:
     """
     Find a tool by name or by matching metadata (toolkit_name + tool_name).
@@ -997,6 +1023,7 @@ def create_graph(
         always_bind_tools: Optional[list[BaseTool]] = None,
         middleware_manager: Optional[Any] = None,
         child_dispatcher: Optional[Any] = None,
+        skipped_pipeline_toolkit_names: Optional[set] = None,
         **kwargs
 ):
     """
@@ -1130,12 +1157,24 @@ def create_graph(
                     # Use enhanced validation that checks both direct name and metadata
                     matching_tool = find_tool_by_name_or_metadata(tools, tool_name, toolkit_name)
                     if not matching_tool:
-                        # tool is not found in the provided tools
-                        error_msg = f"Node `{node_id}` with type `{node_type}` has tool '{tool_name}'"
-                        if toolkit_name:
-                            error_msg += f" (toolkit: '{toolkit_name}')"
-                        error_msg += f" which is not found in the provided tools. Make sure it is connected properly. Available tools: {format_tools(tools)}"
-                        raise ToolException(error_msg)
+                        # Check if the toolkit was intentionally skipped due to user declining MCP auth.
+                        # In that case the pipeline must terminate cleanly instead of raising.
+                        if node_type == 'mcp' and skipped_pipeline_toolkit_names and toolkit_name in skipped_pipeline_toolkit_names:
+                            _output_vars = node.get('output', [])
+                            lg_builder.add_node(
+                                node_id,
+                                _make_mcp_auth_skip_node(node_id, toolkit_name, _output_vars),
+                            )
+                            # matching_tool stays None → if matching_tool: block below is skipped.
+                            # Fall through to edge-adding code so TransitionalEdge is registered;
+                            # it will detect _pipeline_blocked and route to END automatically.
+                        else:
+                            # tool is not found in the provided tools
+                            error_msg = f"Node `{node_id}` with type `{node_type}` has tool '{tool_name}'"
+                            if toolkit_name:
+                                error_msg += f" (toolkit: '{toolkit_name}')"
+                            error_msg += f" which is not found in the provided tools. Make sure it is connected properly. Available tools: {format_tools(tools)}"
+                            raise ToolException(error_msg)
                 else:
                     # For other node types, find tool by direct name match
                     for tool in tools:

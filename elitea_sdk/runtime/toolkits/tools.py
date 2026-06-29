@@ -477,7 +477,7 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
-def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, user_declined_mcp_servers: Optional[list] = None, pipeline_node_toolkit_names: Optional[set] = None) -> list:
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, user_declined_mcp_servers: Optional[list] = None, pipeline_node_toolkit_names: Optional[set] = None, skipped_pipeline_toolkit_names: Optional[set] = None) -> list:
     """
     Process tool configurations and return instantiated tools.
 
@@ -737,6 +737,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     canonical_url = canonical_resource(url)
                     if canonical_url in ignored_mcp_servers or url in ignored_mcp_servers:
                         logger.info("[MCP Auth] Skipping ignored MCP server")
+                        _tname = tool.get('toolkit_name') or url
+                        if (
+                            skipped_pipeline_toolkit_names is not None
+                            and pipeline_node_toolkit_names is not None
+                            and _tname in pipeline_node_toolkit_names
+                        ):
+                            skipped_pipeline_toolkit_names.add(_tname)
                         continue
                 
                 headers = settings.get('headers')
@@ -853,6 +860,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                 _skip = _canonical in ignored_mcp_servers or _server_url in ignored_mcp_servers
                         if _skip:
                             logger.info("[MCP Auth] Skipping ignored pre-configured MCP server")
+                            _tname = tool.get('toolkit_name') or server_name
+                            if (
+                                skipped_pipeline_toolkit_names is not None
+                                and pipeline_node_toolkit_names is not None
+                                and _tname in pipeline_node_toolkit_names
+                            ):
+                                skipped_pipeline_toolkit_names.add(_tname)
                             continue
 
                     toolkit_name = tool.get('toolkit_name', '') or server_name

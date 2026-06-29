@@ -428,6 +428,11 @@ class Assistant:
             except Exception:
                 pass
 
+        # Collects toolkit names that were skipped because the user declined MCP auth.
+        # Pipeline nodes whose toolkit is in this set will be replaced with a clean
+        # blocked-termination node in create_graph() instead of raising ToolException.
+        self._skipped_pipeline_toolkit_names: set = set()
+
         self.tools = get_tools(
             version_tools,
             elitea_client=elitea,
@@ -441,6 +446,7 @@ class Assistant:
             current_participant_id=self.current_participant_id,
             user_declined_mcp_servers=data.get("user_declined_mcp_servers"),
             pipeline_node_toolkit_names=pipeline_node_toolkit_names,
+            skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
         )
         if tools:
             self.tools += tools
@@ -854,6 +860,7 @@ class Assistant:
             always_bind_tools=self._always_bind_tools,
             middleware_manager=self.middleware_manager,
             child_dispatcher=self.child_dispatcher,  # Parallel sub-agent dispatch seam (#4993 Track 2)
+            skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
         )
         return agent
 
