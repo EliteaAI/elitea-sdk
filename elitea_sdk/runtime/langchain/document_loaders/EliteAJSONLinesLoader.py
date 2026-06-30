@@ -18,6 +18,34 @@ class EliteAJSONLinesLoader(EliteAJSONLoader):
     - Returns a list of Documents with chunked JSON content.
     """
 
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-6 #5437).
+
+        JSONL is read back through ``read_file`` as raw text and sliced by
+        physical line — each non-empty line is one complete JSON record, so a
+        physical-line slice is record-aligned and yields valid JSONL (unlike
+        pretty-printed JSON where a line slice is not necessarily valid JSON).
+
+        Unit is ``lines`` because that is what ``apply_line_slice`` actually
+        operates on. When there are no blank lines in the file, line number ==
+        record number.
+        """
+        from elitea_sdk.tools.utils.file_metadata import build_line_range_metadata
+        meta = build_line_range_metadata(file_content, file_type_note="JSON Lines file")
+        if "instruction_for_readFile" in meta:
+            instr = meta["instruction_for_readFile"]
+            notes = instr.get("notes", "")
+            if notes:
+                instr["notes"] = (
+                    notes
+                    + " Each non-empty line is one complete JSON record, so a "
+                    "line slice is record-aligned and is itself valid JSONL."
+                )
+        return meta
+
     def __init__(self, **kwargs):
         # Reuse EliteAJSONLoader initialization logic (file_path / file_content handling, encoding, etc.)
         super().__init__(**kwargs)
