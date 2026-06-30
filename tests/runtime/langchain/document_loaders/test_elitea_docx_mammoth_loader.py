@@ -793,3 +793,47 @@ class TestDocxLoaderReuse:
         ) as spy:
             loader._convert_docx_to_markdown(io.BytesIO(buf.getvalue()))
         spy.assert_called_once()
+
+
+class TestGetFileMetadataPRE7:
+    """Tests for get_file_metadata additions in PRE-7 (#5438)."""
+
+    def _make_docx(self, paragraphs=None) -> bytes:
+        doc = DocxDocument()
+        for text in (paragraphs or ["Hello world."]):
+            doc.add_paragraph(text)
+        buf = io.BytesIO()
+        doc.save(buf)
+        return buf.getvalue()
+
+    def test_metadata_unit_is_lines(self):
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename="t.docx", file_content=self._make_docx())
+        assert meta["unit"] == "lines"
+
+    def test_metadata_advertises_start_end_line(self):
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename="t.docx", file_content=self._make_docx())
+        first_class = meta["instruction_for_readFile"]["first_class_params"]
+        assert "start_line" in first_class
+        assert "end_line" in first_class
+
+    def test_metadata_reports_total_lines(self):
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename="t.docx", file_content=self._make_docx(["A", "B", "C"]))
+        assert meta["total_lines"] >= 1
+
+    def test_metadata_total_lines_matches_rendered_content(self):
+        data = self._make_docx(["First", "Second", "Third"])
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename="t.docx", file_content=data)
+        rendered = EliteADocxMammothLoader(
+            file_content=data, file_name="t.docx", extract_images=False).get_content()
+        assert meta["total_lines"] == len(rendered.splitlines())
+
+    def test_metadata_no_content_total_lines_zero(self):
+        meta = EliteADocxMammothLoader.get_file_metadata(
+            filename="t.docx", file_content=None)
+        assert meta["unit"] == "lines"
+        assert meta["total_lines"] == 0
+        assert "start_line" in meta["instruction_for_readFile"]["first_class_params"]
