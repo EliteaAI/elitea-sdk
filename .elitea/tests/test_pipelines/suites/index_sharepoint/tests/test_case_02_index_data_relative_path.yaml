@@ -129,42 +129,59 @@ nodes:
     input_mapping:
       system:
         type: fixed
-        value: "You are a quality assurance validator."
+        value: "You are a quality assurance validator. Output ONLY valid JSON."
       task:
         type: fstring
         value: |
-          Analyze the indexing and search results for SharePoint documents.
+          Validate SharePoint indexing and search results.
+
+          ## Data to Validate
 
           Index Result: {index_result}
           Search All Docs: {search_all_result}
           Search text_large.txt (filtered): {search_large_txt_result}
           Skip Extensions: {skip_extensions}
 
-          Expected behavior:
-          1. Indexing completed successfully (status: ok)
-          2. Search returns indexed documents (non-empty results)
-          3. search_large_txt_result must contain EXACTLY 4 items (4 chunks)
-          4. ALL items in search_large_txt_result must be for text_large.txt (no other files)
-          5. No png files should be in indexed documents (they were skipped)
+          ## Chunk Structure Reference
 
-          Validation rules:
-          1. Check index_result has "status": "ok"
-          2. Check index_result message indicates successful indexing
-          3. Verify search_all_result is not empty and contains document list
-          4. Count total items in search_large_txt_result array - must be EXACTLY 4
-          5. Verify every item in search_large_txt_result has Name == "text_large.txt"
-          6. If count != 4 or any item is not text_large.txt, test fails
-          7. Verify no .png files appear in search_all_result (check "Name" field in metadata)
-          8. All validations must pass for test to pass
+          Each chunk in search results is a JSON object with this structure:
+          ```
+          {{
+            "page_content": "...",
+            "metadata": {{
+              "chunk_id": "...",
+              "Name": "text_large.txt",
+              ...
+            }}
+          }}
+          ```
 
-          Return a json object with:
+          The search_large_txt_result is an ARRAY of such chunk objects.
+
+          ## Counting Instructions
+
+          To count chunks in search_large_txt_result:
+          1. Parse search_large_txt_result as a JSON array
+          2. Count the number of top-level objects in the array
+          3. Each object with "page_content" and "metadata" is ONE chunk
+          4. Do NOT count nested fields or metadata properties as separate chunks
+
+          ## Validation Rules
+
+          1. index_result must have "status": "ok"
+          2. search_all_result must be non-empty
+          3. search_large_txt_result must contain EXACTLY 4 chunk objects
+          4. Every chunk in search_large_txt_result must have metadata.Name == "text_large.txt"
+          5. No .png files in search_all_result (check metadata.Name field)
+
+          ## Output
+
+          Return ONLY this JSON (no markdown):
           {{
             "test_passed": true/false,
-            "summary": "brief description including chunk count for text_large.txt",
+            "summary": "description with actual chunk count",
             "error": "error details if failed, null if passed"
           }}
-
-          Return **only** the json object. No markdown formatting, no additional text.
       chat_history:
         type: fixed
         value: []
