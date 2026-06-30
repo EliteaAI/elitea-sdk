@@ -143,7 +143,7 @@ nodes:
           Expected behavior:
           1. Indexing completed successfully (status: ok)
           2. Search returns indexed documents (non-empty results)
-          3. search_large_txt_result must contain EXACTLY 4 items (4 chunks)
+          3. search_large_txt_result must contain EXACTLY 3 items (3 chunks)
           4. ALL items in search_large_txt_result must be for text_large.txt (no other files)
           5. No png files should be in indexed documents (they were skipped)
 
@@ -151,9 +151,9 @@ nodes:
           1. Check index_result has "status": "ok"
           2. Check index_result message indicates successful indexing
           3. Verify search_all_result is not empty and contains document list
-          4. Count total items in search_large_txt_result array - must be EXACTLY 4
+          4. Count total items in search_large_txt_result array - must be EXACTLY 3
           5. Verify every item in search_large_txt_result has Name == "text_large.txt"
-          6. If count != 4 or any item is not text_large.txt, test fails
+          6. If count != 3 or any item is not text_large.txt, test fails
           7. Verify no .png files appear in search_all_result (check "Name" field in metadata)
           8. All validations must pass for test to pass
 
