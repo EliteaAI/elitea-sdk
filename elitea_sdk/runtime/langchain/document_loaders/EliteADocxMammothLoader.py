@@ -27,15 +27,11 @@ class EliteADocxMammothLoader(BaseLoader):
     def get_file_metadata(cls, *, filename: str,
                           file_content=None,
                           file_size=None) -> dict:
-        """Return per-type metadata for DOCX files.
-
-        Reports embedded image count/names and advertises the extra_params
-        that ``read_file`` accepts for DOCX.
-        """
         import logging
         _logger = logging.getLogger(__name__)
         image_count = 0
         image_names = []
+        total_lines = 0
         if file_content:
             try:
                 doc = DocxDocument(BytesIO(file_content) if isinstance(file_content, (bytes, bytearray)) else file_content)
@@ -43,18 +39,39 @@ class EliteADocxMammothLoader(BaseLoader):
                     try:
                         tp = rel.target_part
                     except Exception:  # pylint: disable=broad-except
-                        continue  # skip External relationships (hyperlinks etc.)
+                        continue
                     if hasattr(tp, 'content_type') and tp.content_type.startswith('image/'):
                         image_count += 1
                         image_names.append(tp.partname.filename)
             except Exception as exc:  # pylint: disable=broad-except
-                _logger.warning("Failed to inspect images in %s: %s", filename, exc)
+                _logger.warning("Failed to inspect %s: %s", filename, exc)
 
+            # A chunked read renders the whole docx to markdown anyway (mammoth
+            # has no bounded-slice API), so count lines on that same rendered
+            # text. extract_images=False keeps it deterministic and LLM-free.
+            try:
+                rendered = cls(file_content=file_content, file_name=filename,
+                               extract_images=False).get_content()
+                total_lines = len(rendered.splitlines())
+            except Exception as exc:  # pylint: disable=broad-except
+                _logger.warning("Failed to render %s for line count: %s", filename, exc)
+
+        range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
         instruction = {
             "first_class_params": {
                 "is_capture_image": (
                     "set to true to transcribe ALL embedded images "
                     "via the AI vision model"
+                ),
+                "start_line": (
+                    "integer (1-indexed, inclusive) — first line of the "
+                    f"converted markdown to return. {range_hint}"
+                    "Omit to read from the start."
+                ),
+                "end_line": (
+                    "integer (1-indexed, inclusive) — last line of the "
+                    f"converted markdown to return. {range_hint}"
+                    "Omit to read to the end."
                 ),
             },
             "extra_params": {
@@ -74,13 +91,17 @@ class EliteADocxMammothLoader(BaseLoader):
                 ),
             },
             "notes": (
-                "Image transcription adds latency proportional to the "
-                "number of images. Use extracted_images_names + "
-                "read_images_only to transcribe only the images you "
-                "need. Pass extra_params as a JSON string."
+                f"Document renders to {total_lines} markdown lines. Use "
+                "start_line/end_line to page through it in bounded chunks. "
+                "total_lines counts the text WITHOUT image transcripts; passing "
+                "is_capture_image adds transcript lines and shifts the count. "
+                "Image transcription adds latency proportional to image count. "
+                "Pass extra_params as a JSON string."
             ),
         }
         return {
+            "unit": "lines",
+            "total_lines": total_lines,
             "image_count": image_count,
             "image_names": image_names,
             "instruction_for_readFile": instruction,
@@ -630,6 +651,9 @@ class EliteADocxMammothLoader(BaseLoader):
         When ``read_images_only`` is True and ``extracted_images_names`` is
         provided, bypasses mammoth entirely and returns a JSON dict of
         ``{filename: transcript}`` for the requested images only.
+
+        When ``start_paragraph`` or ``end_paragraph`` is set, returns a fast
+        structural slice via ``_read_paragraph_slice`` (no mammoth).
         """
         if self.read_images_only and self.extracted_images_names:
             return self._read_images_only()
