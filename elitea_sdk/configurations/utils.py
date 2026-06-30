@@ -3,6 +3,30 @@ from typing import Optional
 from urllib.parse import urlparse
 
 
+def url_host_matches_domain(url: Optional[str], domain: str) -> bool:
+    """Return True if *url*'s host is exactly *domain* or a subdomain of it.
+
+    Host-based matching, not substring matching: this is robust against
+    spoofing such as ``https://evil.atlassian.net.attacker.com`` or
+    ``https://attacker.com/?x=bitbucket.org`` — both of which would pass a naive
+    ``domain in url`` check but resolve to a non-matching host here.
+
+    The URL may omit its scheme (e.g. a bare ``bitbucket.org/foo``); in that
+    case the host is recovered by reparsing with a ``//`` netloc marker.
+    """
+    if not url:
+        return False
+    candidate = url.strip()
+    host = urlparse(candidate).hostname
+    if not host:
+        # No scheme: urlparse put the authority in the path. Reparse so that
+        # 'bitbucket.org/foo' yields hostname 'bitbucket.org'.
+        host = urlparse('//' + candidate).hostname
+    host = (host or '').lower()
+    domain = domain.lower().lstrip('.')
+    return host == domain or host.endswith('.' + domain)
+
+
 _ATLASSIAN_HOSTING_TOOLTIP = (
     "Hosting defines how the API client connects to your instance. "
     "Auto detects hosting type from the Base URL automatically. "
@@ -32,7 +56,7 @@ def _hosting_to_cloud(hosting: Optional[str], base_url: Optional[str]) -> bool:
     if normalized_hosting == 'server':
         return False
     # 'auto' or None — detect from URL
-    if base_url and '.atlassian.net' in base_url.lower():
+    if url_host_matches_domain(base_url, 'atlassian.net'):
         return True
     return False
 
@@ -90,7 +114,7 @@ def _resolve_api_version(api_version: Optional[str], cloud: Optional[bool], base
     # Auto-resolve
     if cloud is True:
         return '3'
-    if base_url and '.atlassian.net' in base_url.lower():
+    if url_host_matches_domain(base_url, 'atlassian.net'):
         return '3'
     return '2'
 
@@ -113,7 +137,7 @@ def _resolve_confluence_api_version(api_version: Optional[str], cloud: Optional[
     # Auto-resolve
     if cloud is True:
         return '2'
-    if base_url and '.atlassian.net' in base_url.lower():
+    if url_host_matches_domain(base_url, 'atlassian.net'):
         return '2'
     return '1'
 
