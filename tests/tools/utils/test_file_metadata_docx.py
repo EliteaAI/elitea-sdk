@@ -47,8 +47,12 @@ def test_docx_metadata_returns_image_count_and_instruction():
     assert meta["filesize"] == len(data)
     assert meta["image_count"] >= 1
     assert len(meta["image_names"]) >= 1
+    assert meta["unit"] == "lines"
+    assert meta["total_lines"] >= 1
     instr = meta["instruction_for_readFile"]
     assert "is_capture_image" in instr["first_class_params"]
+    assert "start_line" in instr["first_class_params"]
+    assert "end_line" in instr["first_class_params"]
     assert "extracted_images_names" in instr["extra_params"]
     assert "prompt" in instr["extra_params"]
     assert "JSON string" in instr["notes"]
