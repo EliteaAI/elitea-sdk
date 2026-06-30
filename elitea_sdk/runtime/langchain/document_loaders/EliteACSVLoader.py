@@ -20,6 +20,29 @@ from langchain_core.documents import Document
 from .EliteATableLoader import EliteATableLoader
 
 class EliteACSVLoader(EliteATableLoader):
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-4 #5435).
+
+        CSV is read back through ``read_file`` as raw text and sliced by physical
+        line (``apply_line_slice``), exactly like the text family — there is no
+        row-range/dict read path as Excel has. So the chunk unit is ``lines`` and
+        the first row is normally the header; the note tells the caller to keep
+        line 1 in its slice when it needs column context.
+        """
+        from elitea_sdk.tools.utils.file_metadata import build_line_range_metadata
+        meta = build_line_range_metadata(file_content, file_type_note="CSV file")
+        instr = meta["instruction_for_readFile"]
+        instr["notes"] = (
+            instr["notes"]
+            + " Line 1 is normally the CSV header row; include it in the slice "
+            "(e.g. read line 1 plus your range) when you need column names."
+        )
+        return meta
+
     def __init__(self,
                  file_path: str = None,
                  file_content: bytes = None,
