@@ -3,7 +3,8 @@ import re
 from datetime import datetime
 from typing import Any, Optional
 
-from jinja2 import Environment, DebugUndefined
+from jinja2 import DebugUndefined
+from jinja2.sandbox import SandboxedEnvironment
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
@@ -608,9 +609,12 @@ class Assistant:
             if extra_context:
                 context.update(extra_context)
 
-            # Process template with Jinja2
-            # DebugUndefined leaves unresolved variables as {{variable}} rather than failing
-            environment = Environment(undefined=DebugUndefined)
+            # Process template with Jinja2.
+            # SandboxedEnvironment blocks access to unsafe attributes/methods (e.g.
+            # __class__.__subclasses__ chains) so an agent author cannot turn the
+            # instruction template into a server-side template-injection RCE.
+            # DebugUndefined leaves unresolved variables as {{variable}} rather than failing.
+            environment = SandboxedEnvironment(undefined=DebugUndefined)
             template = environment.from_string(template_str)
             resolved = template.render(context)
 
