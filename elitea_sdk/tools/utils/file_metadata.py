@@ -251,11 +251,41 @@ def _count_lines(file_content) -> int:
 def build_line_range_metadata(file_content, *, file_type_note: str = "file") -> dict:
     """Return a loader-conformant dict for line-oriented text files (PRE-3 #5434).
 
-    Shared by EliteATextLoader, EliteACodeLoader, and EliteAMarkdownLoader so
-    the logic lives in one place. Pass *file_type_note* for the human-readable
-    ``notes`` string (e.g. "text file", "source file", "Markdown file").
+    Shared by EliteATextLoader, EliteACodeLoader, EliteAMarkdownLoader,
+    EliteACSVLoader, and EliteAJSONLoader so the logic lives in one place. Pass
+    *file_type_note* for the human-readable ``notes`` string (e.g. "text file",
+    "source file", "Markdown file", "JSON file").
+
+    Single-line honesty (#5436): line slicing reads the file, then splits on
+    newlines — a file with no usable line breaks is one "line", so a line range
+    returns the *whole* file regardless of start_line/end_line. When such a file
+    also exceeds the output cap there is no way to read it in bounded chunks, so
+    we refuse the full read (``full_read_allowed=False``) and DON'T advertise
+    start_line/end_line as if they worked. (The 150 MB artifact upload ceiling
+    bounds the worst case, so this is a refuse-and-explain, not a memory guard.)
     """
     total_lines = _count_lines(file_content)
+    content_size = len(file_content) if file_content else 0
+
+    # A single (or zero) line file that is also over the output cap cannot be
+    # chunked by line — be honest rather than offer params that do nothing.
+    if total_lines <= 1 and content_size > DEFAULT_MAX_OUTPUT_CHARS:
+        return {
+            "unit": "lines",
+            "total_lines": total_lines,
+            "read_limits": {"full_read_allowed": False},
+            "instruction_for_readFile": {
+                "first_class_params": {},
+                "notes": (
+                    f"This {file_type_note} has no usable line breaks "
+                    f"({content_size} characters on a single line) and exceeds "
+                    f"the {DEFAULT_MAX_OUTPUT_CHARS}-character read limit. Line "
+                    f"slicing would return the whole file, so a bounded read is "
+                    f"not possible — the full read is refused."
+                ),
+            },
+        }
+
     range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
     return {
         "unit": "lines",
