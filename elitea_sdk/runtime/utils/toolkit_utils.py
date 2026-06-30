@@ -7,6 +7,8 @@ import logging
 import random
 from typing import Dict, Any, Optional, List
 
+from .utils import safe_config_summary
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,7 @@ def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any],
         
         # Log the configuration being used
         logger.info(f"Instantiating toolkit {toolkit_name} with LLM client")
-        logger.debug(f"Toolkit {toolkit_name} configuration: {toolkit_config}")
+        logger.debug(f"Toolkit {toolkit_name} configuration: {safe_config_summary(toolkit_config)}")
 
         # Use toolkit type from config, or fall back to lowercase toolkit name
         toolkit_type = toolkit_config.get('type', toolkit_name.lower())

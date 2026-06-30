@@ -31,6 +31,7 @@ from ..utils.mcp_oauth import (
     normalize_mcp_url,
 )
 from ...tools.utils import clean_string
+from ..utils.utils import safe_config_summary
 from elitea_sdk.tools import _inject_toolkit_id, _inject_display_metadata, _patch_tool_invoke
 
 # Human-readable display names for all internal tools.
@@ -494,12 +495,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             # Check for corrupted structure where 'type' and 'name' contain the full tool config
             if 'type' in tool and isinstance(tool['type'], dict):
                 # This is a corrupted tool - use the inner dict instead
-                logger.warning(f"Detected corrupted tool configuration (type=dict), fixing: {tool}")
+                logger.warning(f"Detected corrupted tool configuration (type=dict), fixing: {safe_config_summary(tool)}")
                 actual_tool = tool['type']  # or tool['name'], they should be the same
                 sanitized_tools.append(actual_tool)
             elif 'name' in tool and isinstance(tool['name'], dict):
                 # Another corruption pattern where name contains the full config
-                logger.warning(f"Detected corrupted tool configuration (name=dict), fixing: {tool}")
+                logger.warning(f"Detected corrupted tool configuration (name=dict), fixing: {safe_config_summary(tool)}")
                 actual_tool = tool['name']
                 sanitized_tools.append(actual_tool)
             elif 'type' in tool and isinstance(tool['type'], str):
@@ -507,9 +508,9 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 sanitized_tools.append(tool)
             else:
                 # Skip invalid/corrupted tools that can't be fixed
-                logger.warning(f"Skipping invalid tool configuration: {tool}")
+                logger.warning(f"Skipping invalid tool configuration: {safe_config_summary(tool)}")
         else:
-            logger.warning(f"Skipping non-dict tool: {tool}")
+            logger.warning(f"Skipping non-dict tool: {safe_config_summary(tool)}")
             # Skip non-dict tools
 
     # Deduplication and self-filtering
@@ -833,7 +834,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 tool_handled = True
                 # MCP Config toolkit - pre-configured MCP servers (stdio or http)
                 # Handle both explicit 'mcp_config' type and dynamic names like 'mcp_playwright'
-                logger.info(f"Processing mcp_config toolkit: {tool}")
+                logger.info(f"Processing mcp_config toolkit: {safe_config_summary(tool)}")
                 try:
                     settings = tool.get('settings', {})
 
@@ -844,7 +845,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         server_name = tool['type'][4:]  # Remove 'mcp_' prefix
 
                     if not server_name:
-                        logger.error(f"❌ No server_name found for mcp_config toolkit: {tool}")
+                        logger.error(f"❌ No server_name found for mcp_config toolkit: {safe_config_summary(tool)}")
                         continue
 
                     if ignored_mcp_servers:
