@@ -11,6 +11,7 @@ from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import clean_string, get_max_toolkit_length, check_connection_response
 from ...configurations.bitbucket import BitbucketConfiguration
+from ...configurations.utils import url_host_matches_domain
 from ...configurations.pgvector import PgVectorConfiguration
 from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 import requests
@@ -93,7 +94,7 @@ class EliteABitbucketToolkit(BaseToolkit):
         if selected_tools is None:
             selected_tools = []
         if kwargs["cloud"] is None:
-            kwargs["cloud"] = True if "bitbucket.org" in kwargs.get('url') else False
+            kwargs["cloud"] = url_host_matches_domain(kwargs.get('url'), "bitbucket.org")
         wrapper_payload = {
             **kwargs,
             # TODO use bitbucket_configuration fields
