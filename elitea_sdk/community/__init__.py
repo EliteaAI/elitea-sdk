@@ -110,7 +110,7 @@ def get_tools(tools_list: list, elitea_client, llm) -> list:
         if isinstance(tool, dict):
             tool_type = tool.get('type')
         else:
-            logger.error(f"Community tools received non-dict tool: {tool} (type: {type(tool)})")
+            logger.error(f"Community tools received non-dict tool of type: {type(tool).__name__}")
             continue
         class_name = _tool_mapping.get(tool_type)
         
