@@ -1127,8 +1127,8 @@ def create_graph(
             "Pipeline has no nodes to execute. Please add at least one node "
             "to the pipeline before running it."
         )
-    logger.debug(f"Schema: {schema}")
-    logger.debug(f"Tools: {tools}")
+    # Log structure only — pipeline nodes can embed toolkit settings (credentials).
+    logger.debug(f"Schema keys: {sorted(schema.keys())}, node count: {len(nodes)}")
     logger.debug(f"Tools: {[tool.name for tool in tools]}")
     state = schema.get('state', {})
     state_class = create_state(state)

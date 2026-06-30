@@ -180,7 +180,7 @@ class SharepointConfiguration(BaseModel):
         # resource_metadata_url points to whichever endpoint actually responded,
         # or to the v2.0 URL as a sensible default when discovery fails.
         resource_metadata_url = azure_v2_endpoint
-        log.debug(f"Fetched OpenID metadata for SharePoint OAuth discovery: {openid_meta}")
+        log.debug(f"Fetched OpenID metadata for SharePoint OAuth discovery (keys): {sorted((openid_meta or {}).keys())}")
 
         authorization_endpoint = (openid_meta or {}).get(
             "authorization_endpoint",
@@ -231,7 +231,7 @@ class SharepointConfiguration(BaseModel):
             resource_metadata["scopes_supported"] = effective_scopes
         if configuration_uuid:
             resource_metadata["configuration_uuid"] = configuration_uuid
-        log.debug(f"SharePoint resource_metadata: {resource_metadata}")
+        log.debug(f"SharePoint resource_metadata (keys): {sorted(resource_metadata.keys())}")
         return McpAuthorizationRequired(
             message=message,
             server_url=site_url,

@@ -331,7 +331,9 @@ class Assistant:
         else:
             self.lazy_tools_mode = data.get('meta', {}).get('lazy_tools_mode', False)
 
-        logger.debug("Data for agent creation: %s", data)
+        # Log only the payload's top-level keys — the full dict carries
+        # instructions and variable *values* that may include secrets.
+        logger.debug("Data for agent creation (keys): %s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         logger.debug("App type: %s", app_type)
 
         self.elitea_client = elitea

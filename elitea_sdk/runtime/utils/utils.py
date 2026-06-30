@@ -13,6 +13,23 @@ def mask_secret(secret: str, visible_chars: int = 4) -> str:
         return '****'
     return '*' * 4 + secret[-visible_chars:]
 
+
+def safe_config_summary(config: Any) -> str:
+    """Render a toolkit/tool config dict for logging without leaking secrets.
+
+    Toolkit configs carry a ``settings`` block (and sometimes top-level auth
+    fields) that hold tokens, passwords and similar credentials. Logging the raw
+    dict exposes those in clear text. This returns only non-sensitive identity
+    fields plus the list of setting *keys* (never their values).
+    """
+    if not isinstance(config, dict):
+        return f"<{type(config).__name__}>"
+    safe = {k: config.get(k) for k in ('id', 'type', 'name', 'toolkit_name') if k in config}
+    settings = config.get('settings')
+    if isinstance(settings, dict):
+        safe['settings_keys'] = sorted(settings.keys())
+    return repr(safe)
+
 # DEPRECATED: Tool names no longer use prefixes
 # Kept for backward compatibility only
 TOOLKIT_SPLITTER = "___"
