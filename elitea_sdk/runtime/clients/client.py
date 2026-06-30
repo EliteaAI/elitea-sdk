@@ -1170,7 +1170,8 @@ class EliteAClient:
                       exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
                       step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
                       child_dispatcher: Optional[Any] = None,
-                      user_declined_mcp_servers: Optional[list] = None):
+                      user_declined_mcp_servers: Optional[list] = None,
+                      mcp_addon_instructions: Optional[str] = None):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -1195,6 +1196,8 @@ class EliteAClient:
             context_settings: Optional context params
             step_limit: Optional maximum number of tool execution iterations (default: 25).
                        Use to limit or extend how many tool calls the agent can make per turn.
+            mcp_addon_instructions: Optional MCP entity link instructions to append as functional addon.
+                       Kept separate from user instructions to avoid polluting bare personalization.
 
         Returns:
             Runnable agent ready for execution
@@ -1272,7 +1275,8 @@ class EliteAClient:
             persona=persona,
             middleware=middleware_list if middleware_list else None,
             lazy_tools_mode=lazy_tools_mode,
-            child_dispatcher=child_dispatcher
+            child_dispatcher=child_dispatcher,
+            mcp_addon_instructions=mcp_addon_instructions
         ).runnable()
 
     def _validate_toolkit_config(self, toolkit_config: dict) -> dict:

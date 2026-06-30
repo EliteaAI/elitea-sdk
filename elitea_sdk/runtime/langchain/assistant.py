@@ -300,7 +300,8 @@ class Assistant:
                  is_subgraph: bool = False,
                  lazy_tools_mode: Optional[bool] = None,
                  middleware: Optional[list[Middleware]] = None,
-                 child_dispatcher: Optional[Any] = None):
+                 child_dispatcher: Optional[Any] = None,
+                 mcp_addon_instructions: Optional[str] = None):
 
         self.app_type = app_type
         self.memory = memory
@@ -315,6 +316,10 @@ class Assistant:
 
         # Current participant ID - used for self-filtering in tools
         self.current_participant_id = data.get('current_participant_id')
+
+        # MCP addon instructions - functional addon for entity link instructions
+        # Kept separate from user instructions to avoid polluting bare personalization
+        self.mcp_addon_instructions = mcp_addon_instructions or data.get('mcp_addon_instructions', '')
 
         # Swarm mode - enables multi-agent collaboration with shared message history
         # Check both conversation-level internal_tools and agent version meta internal_tools
@@ -665,6 +670,7 @@ class Assistant:
             pyodite_addon,
             data_analysis_addon,
             task_delegation_addon,
+            self.mcp_addon_instructions if self.mcp_addon_instructions else "",
         ]))
 
         # Select assistant template based on persona
