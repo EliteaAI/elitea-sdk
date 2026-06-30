@@ -102,6 +102,30 @@ class TestTextLoaderMetadata:
         last = apply_line_slice(text, offset=total, limit=1)
         assert last.strip() == "line five"
 
+    def test_large_single_line_refused(self):
+        """Single-line file over the cap can't be line-chunked => refuse (#5436).
+
+        Lives at the text-family level because the behaviour comes from the
+        shared build_line_range_metadata helper used by every line-oriented
+        loader (txt/md/code/csv/json).
+        """
+        from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
+        big = b"x" * (DEFAULT_MAX_OUTPUT_CHARS + 1000)  # one line, no newline
+        meta = get_file_metadata("big.txt", file_content=big, file_size=len(big))
+        assert meta["total_lines"] == 1
+        assert meta["read_limits"]["full_read_allowed"] is False
+        instr = meta["instruction_for_readFile"]
+        assert "start_line" not in instr["first_class_params"]
+        assert "no usable line breaks" in instr["notes"].lower()
+
+    def test_small_single_line_ok(self):
+        """A short single-line file still reads fully — only large ones refused."""
+        meta = get_file_metadata("short.txt", file_content=b"just one line",
+                                 file_size=13)
+        assert meta["total_lines"] == 1
+        assert meta["read_limits"]["full_read_allowed"] is True
+        assert "start_line" in meta["instruction_for_readFile"]["first_class_params"]
+
 
 # ---------------------------------------------------------------------------
 # EliteACodeLoader (.py and other code extensions)

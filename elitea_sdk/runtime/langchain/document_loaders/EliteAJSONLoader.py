@@ -13,6 +13,32 @@ from elitea_sdk.tools.utils.text_operations import decode_text
 
 class EliteAJSONLoader(BaseLoader):
 
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report total line count and advertise start_line/end_line (PRE-5 #5436).
+
+        JSON is read back through ``read_file`` as raw text (``_decode_text``)
+        and sliced by physical line (``apply_line_slice``), exactly like the
+        text family and CSV — there is no structural/key-range read path. So the
+        chunk unit is ``lines``. A line slice of pretty-printed JSON is not
+        necessarily valid JSON on its own; the note tells the caller as much.
+
+        Minified JSON is typically one physical line, so the shared helper's
+        single-line handling applies: a large minified document has no usable
+        line breaks and the full read is refused rather than line-sliced.
+        """
+        from elitea_sdk.tools.utils.file_metadata import build_line_range_metadata
+        meta = build_line_range_metadata(file_content, file_type_note="JSON file")
+        instr = meta["instruction_for_readFile"]
+        instr["notes"] = (
+            instr["notes"]
+            + " JSON is read as text and sliced by physical line; a line slice "
+            "is not necessarily valid JSON on its own."
+        )
+        return meta
+
     def __init__(self, **kwargs):
         """Initialize with file path."""
         if kwargs.get('file_path'):
