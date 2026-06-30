@@ -1,5 +1,7 @@
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from .utils import url_host_matches_domain
+
 
 class BitbucketConfiguration(BaseModel):
     model_config = ConfigDict(
@@ -74,8 +76,10 @@ class BitbucketConfiguration(BaseModel):
         if not password_value or not str(password_value).strip():
             return "Bitbucket password cannot be empty"
         
-        # Detect if this is Bitbucket Cloud or Server/Data Center
-        is_cloud = "bitbucket.org" in url.lower() or "api.bitbucket.org" in url.lower()
+        # Detect if this is Bitbucket Cloud or Server/Data Center.
+        # Host-based match (api.bitbucket.org is a subdomain of bitbucket.org,
+        # so a single domain check covers both the web and API hosts).
+        is_cloud = url_host_matches_domain(url, "bitbucket.org")
         is_correct_bitbucket_domain = "bitbucket" in url.lower()
         
         if is_cloud:
