@@ -13,8 +13,7 @@
 # limitations under the License.
 
 from langchain_community.document_loaders import (
-    AirbyteJSONLoader, UnstructuredHTMLLoader,
-    UnstructuredXMLLoader, UnstructuredWordDocumentLoader)
+    AirbyteJSONLoader, UnstructuredWordDocumentLoader)
 
 from .EliteACSVLoader import EliteACSVLoader
 from .EliteADocxMammothLoader import EliteADocxMammothLoader
@@ -29,6 +28,7 @@ from .EliteACodeLoader import EliteACodeLoader
 from .EliteAMarkdownLoader import EliteAMarkdownLoader
 from .EliteAPythonLoader import EliteAPythonLoader
 from .EliteAEmailLoader import EliteAEmailLoader
+from .EliteAHTMLLoader import EliteAHTMLLoader, EliteAXMLLoader
 from enum import Enum
 from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
 
@@ -242,21 +242,21 @@ document_loaders_map = {
         'allowed_to_override': DEFAULT_ALLOWED_BASE
     },
     '.htm': {
-        'class': UnstructuredHTMLLoader,
+        'class': EliteAHTMLLoader,
         'mime_type': 'text/html',
         'is_multimodal_processing': False,
         'kwargs': {},
         'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
     },
     '.html': {
-        'class': UnstructuredHTMLLoader,
+        'class': EliteAHTMLLoader,
         'mime_type': 'text/html',
         'is_multimodal_processing': False,
         'kwargs': {},
         'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
     },
     '.xml': {
-        'class': UnstructuredXMLLoader,
+        'class': EliteAXMLLoader,
         'mime_type': 'text/xml',
         'is_multimodal_processing': False,
         'kwargs': {},
