@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from langchain_community.document_loaders import (
-    AirbyteJSONLoader, UnstructuredWordDocumentLoader)
+    AirbyteJSONLoader)
 
 from .EliteACSVLoader import EliteACSVLoader
 from .EliteADocxMammothLoader import EliteADocxMammothLoader
@@ -219,14 +219,9 @@ document_loaders_map = {
         },
         'allowed_to_override': {**DEFAULT_ALLOWED_WITH_LLM, 'mode': 'paged'}
     },
-    # Legacy binary Word format — uses unstructured (libreoffice/antiword under the hood)
-    '.doc': {
-        'class': UnstructuredWordDocumentLoader,
-        'mime_type': 'application/msword',
-        'is_multimodal_processing': False,
-        'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_BASE
-    },
+    # Legacy binary .doc is intentionally NOT registered: unstructured converts
+    # .doc -> .docx via LibreOffice (soffice), which is not installed in the pylon
+    # image, so it was never readable. Convert to .docx. (PRE-11 #5442, mirrors .ppt)
     '.json': {
         'class': EliteAJSONLoader,
         'mime_type': 'application/json',
