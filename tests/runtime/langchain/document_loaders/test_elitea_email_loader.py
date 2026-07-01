@@ -311,3 +311,114 @@ class TestMSGHeaderExtraction:
         assert eml_method != msg_method
         assert callable(eml_method)
         assert callable(msg_method)
+
+
+# PRE-10 (#5441): chunked-read metadata + single-attachment selection.
+
+def _eml_with_attachments(attachments, *, subject="Attach Test", body="Body line one\nBody line two"):
+    """Build a multipart .eml as bytes. attachments = list of (filename, text)."""
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = "sender@example.com"
+    msg["To"] = "recipient@example.com"
+    msg["Subject"] = subject
+    msg.set_content(body)
+    for filename, text in attachments:
+        msg.add_attachment(
+            text.encode("utf-8"), maintype="text", subtype="plain", filename=filename,
+        )
+    return msg.as_bytes()
+
+
+class TestGetFileMetadata:
+    """PRE-10 get_file_metadata: body line unit + flat attachment inventory."""
+
+    def _meta(self, file_content, filename="test.eml"):
+        from elitea_sdk.runtime.langchain.document_loaders.EliteAEmailLoader import EliteAEmailLoader
+        return EliteAEmailLoader.get_file_metadata(filename=filename, file_content=file_content)
+
+    def test_metadata_conforms_to_schema(self):
+        """Merged central output validates against the #5432 contract."""
+        from elitea_sdk.tools.utils.file_metadata import (
+            get_file_metadata, validate_chunked_read_response,
+        )
+        content = _eml_with_attachments([("report.pdf", "x")])
+        merged = get_file_metadata("test.eml", file_content=content)
+        # Central path stamps the discriminator and validates; re-validate to be sure.
+        assert merged["__result_status__"] == "file_metadata"
+        validate_chunked_read_response(merged)
+        assert merged["unit"] == "lines"
+        assert merged["read_limits"]["max_output_chars"]  # baseline survived
+        assert merged["read_limits"]["email_max_attachment_size_mb"] == 10
+
+    def test_line_unit_and_body_count(self):
+        meta = self._meta(_eml_with_attachments([]))
+        assert meta["unit"] == "lines"
+        assert meta["total_lines"] > 0
+
+    def test_inventory_indexes_duplicate_names(self):
+        """Five identically-named attachments each get a distinct 1-indexed slot."""
+        content = _eml_with_attachments([("invoice.pdf", f"n{i}") for i in range(5)])
+        meta = self._meta(content)
+        inv = meta["attachments"]
+        assert [a["index"] for a in inv] == [1, 2, 3, 4, 5]
+        assert all(a["name"] == "invoice.pdf" for a in inv)
+
+    def test_inventory_readable_flag(self):
+        """.txt is readable (loader exists); .xyz is not."""
+        content = _eml_with_attachments([("notes.txt", "hi"), ("blob.xyz", "??")])
+        inv = self._meta(content)["attachments"]
+        by_name = {a["name"]: a for a in inv}
+        assert by_name["notes.txt"]["readable"] is True
+        assert by_name["blob.xyz"]["readable"] is False
+
+    def test_advertises_selection_params(self):
+        meta = self._meta(_eml_with_attachments([("a.txt", "x")]))
+        extra = meta["instruction_for_readFile"]["extra_params"]
+        assert "attachment_index" in extra
+        assert "attachment_name" in extra
+        assert "process_attachments" in extra
+
+
+class TestSingleAttachmentRead:
+    """PRE-10 single-attachment selection via get_content()."""
+
+    def _loader(self, content, **kwargs):
+        from elitea_sdk.runtime.langchain.document_loaders.EliteAEmailLoader import EliteAEmailLoader
+        return EliteAEmailLoader(file_content=content, file_name="test.eml", **kwargs)
+
+    def test_read_by_index(self):
+        content = _eml_with_attachments([("one.txt", "FIRST"), ("two.txt", "SECOND")])
+        result = self._loader(content, attachment_index=2).get_content()
+        assert "SECOND" in result
+        assert "FIRST" not in result
+
+    def test_index_out_of_range(self):
+        content = _eml_with_attachments([("one.txt", "FIRST")])
+        result = self._loader(content, attachment_index=9).get_content()
+        assert "out of range" in result
+        assert "1:one.txt" in result
+
+    def test_read_by_unique_name(self):
+        content = _eml_with_attachments([("only.txt", "UNIQUE"), ("other.txt", "NOPE")])
+        result = self._loader(content, attachment_name="only.txt").get_content()
+        assert "UNIQUE" in result
+
+    def test_ambiguous_name_refused(self):
+        content = _eml_with_attachments([("dup.txt", "A"), ("dup.txt", "B")])
+        result = self._loader(content, attachment_name="dup.txt").get_content()
+        assert "attachment_index" in result
+        assert "2 attachments" in result
+
+    def test_unknown_name(self):
+        content = _eml_with_attachments([("real.txt", "X")])
+        result = self._loader(content, attachment_name="ghost.txt").get_content()
+        assert "No attachment named" in result
+
+    def test_selection_does_not_affect_load(self):
+        """load() (indexing) ignores the selector and still returns full content."""
+        content = _eml_with_attachments([("one.txt", "FIRST"), ("two.txt", "SECOND")])
+        docs = self._loader(content, attachment_index=2, max_tokens=-1).load()
+        joined = "\n".join(d.page_content for d in docs)
+        assert "FIRST" in joined and "SECOND" in joined

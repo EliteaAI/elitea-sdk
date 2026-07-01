@@ -60,6 +60,94 @@ class EliteAEmailLoader(BaseLoader):
     Supports processing nested attachments when process_attachments=True.
     """
 
+    @classmethod
+    def get_file_metadata(cls, *, filename: str, file_content=None, file_size=None) -> dict:
+        """Chunked-read metadata for email files (PRE-10 #5441, schema #5432).
+
+        Two chunk axes: body line range (start_line/end_line) and a selectable,
+        FLAT attachment inventory (attachment_index — unambiguous across the
+        duplicate filenames real emails contain). total_lines counts the
+        headers+body render only; a default read also appends attachment bodies.
+        """
+        total_lines = 0
+        attachments = []
+        if file_content:
+            try:
+                loader = cls(file_content=file_content, file_name=filename,
+                             process_attachments=False)
+                body = loader.get_content()
+                total_lines = len(body.splitlines()) if body else 0
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to render %s body for line count: %s", filename, exc)
+
+            try:
+                from .constants import loaders_map
+                raw = cls(file_content=file_content, file_name=filename)._extract_attachments_with_content()
+                for i, (name, content) in enumerate(raw, 1):
+                    ext = _sanitize_text(os.path.splitext(name)[1].lower())
+                    size_bytes = len(content)
+                    size_mb = size_bytes / (1024 * 1024)
+                    attachments.append({
+                        "index": i,
+                        "name": _sanitize_text(name),
+                        "size_bytes": size_bytes,
+                        "size_mb": round(size_mb, 3),
+                        "readable": ext in loaders_map and size_mb <= 10,
+                    })
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to inventory attachments for %s: %s", filename, exc)
+
+        range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
+        att_hint = f"Valid range 1..{len(attachments)}. " if attachments else ""
+        instruction = {
+            "first_class_params": {
+                "start_line": (
+                    "integer (1-indexed, inclusive) — first line of the "
+                    f"headers+body text to return. {range_hint}Omit to read from the start."
+                ),
+                "end_line": (
+                    "integer (1-indexed, inclusive) — last line of the "
+                    f"headers+body text to return. {range_hint}Omit to read to the end."
+                ),
+            },
+            "extra_params": {
+                "attachment_index": (
+                    "integer (1-indexed) — return ONLY this attachment's parsed "
+                    f"content (see the attachments inventory). {att_hint}"
+                    "Unambiguous even when several attachments share a filename."
+                ),
+                "attachment_name": (
+                    "string — return ONLY the attachment with this filename; "
+                    "honoured only when exactly one attachment matches, otherwise "
+                    "use attachment_index."
+                ),
+                "process_attachments": (
+                    "boolean (default true) — set false to return headers+body "
+                    "only, so start_line/end_line slice clean text without the "
+                    "appended attachment bodies."
+                ),
+                "max_attachment_size_mb": (
+                    "integer (default 10) — max size of an attachment that will "
+                    "be parsed; larger ones are skipped."
+                ),
+            },
+            "notes": (
+                f"total_lines ({total_lines}) counts the headers+body render "
+                "with process_attachments=false. A default read appends each "
+                "readable attachment's body, which shifts the line count — pass "
+                "process_attachments=false for clean body slicing, or "
+                "attachment_index to pull a single attachment. Pass extra_params "
+                "as a JSON string."
+            ),
+        }
+        return {
+            "unit": "lines",
+            "total_lines": total_lines,
+            "attachments": attachments,
+            "read_limits": {"email_max_attachment_size_mb": 10},
+            "instruction_for_readFile": instruction,
+        }
+
     def __init__(self, **kwargs):
         """
         Initialize EliteAEmailLoader.
@@ -74,6 +162,8 @@ class EliteAEmailLoader(BaseLoader):
                 max_tokens (int): Maximum tokens per chunk. Default: 512.
                 max_attachment_depth (int): Maximum recursion depth for nested attachments. Default: 2.
                 max_attachment_size_mb (int): Maximum attachment size in MB to process. Default: 10.
+                attachment_index (int): 1-indexed attachment to return alone via get_content() (PRE-10).
+                attachment_name (str): attachment filename to return alone; used only when it matches exactly one attachment.
 
         Raises:
             ValueError: If neither file_path nor (file_content + file_name) is provided.
@@ -86,6 +176,10 @@ class EliteAEmailLoader(BaseLoader):
         self.max_tokens = kwargs.get('max_tokens', 512)
         self.max_attachment_depth = kwargs.get('max_attachment_depth', 2)
         self.max_attachment_size_mb = kwargs.get('max_attachment_size_mb', 10)
+        # Single-attachment chunked read (PRE-10 #5441); honoured only by
+        # get_content(), never by load() (indexing).
+        self.attachment_index = kwargs.get('attachment_index')
+        self.attachment_name = kwargs.get('attachment_name')
 
         if not self.file_path and not (self.file_content and self.file_name):
             raise ValueError("Either 'file_path' or ('file_content' and 'file_name') must be provided.")
@@ -555,17 +649,49 @@ class EliteAEmailLoader(BaseLoader):
         for doc in self.load():
             yield doc
 
+    def _resolve_selected_attachment(self, attachments: List[Tuple[str, bytes]]):
+        """Resolve attachment_index/attachment_name against the flat list (PRE-10).
+
+        Returns (filename, content) on a unique match, or a str message when the
+        selector is out of range, unknown, or ambiguous. attachment_index wins
+        when both are set; a name is honoured only when it matches exactly one
+        entry (duplicate filenames are legal, so ambiguity is refused).
+        """
+        inventory = ", ".join(f"{i}:{name}" for i, (name, _) in enumerate(attachments, 1)) or "(none)"
+
+        if self.attachment_index is not None:
+            try:
+                idx = int(self.attachment_index)
+            except (TypeError, ValueError):
+                return f"attachment_index must be an integer. Available attachments: {inventory}"
+            if not 1 <= idx <= len(attachments):
+                return f"attachment_index {idx} out of range 1..{len(attachments)}. Available attachments: {inventory}"
+            return attachments[idx - 1]
+
+        matches = [(name, content) for name, content in attachments if name == self.attachment_name]
+        if not matches:
+            return f"No attachment named {self.attachment_name!r}. Available attachments: {inventory}"
+        if len(matches) > 1:
+            return (f"{len(matches)} attachments named {self.attachment_name!r}; "
+                    f"use attachment_index to pick one. Available attachments: {inventory}")
+        return matches[0]
+
     def get_content(self) -> str:
         """
         Get email content as a formatted string for interactive parsing.
 
         This method is used by ADO and other toolkits when parse_attachments=True.
         Returns the same formatted content as would appear in page_content.
+        When attachment_index/attachment_name is set, returns ONLY that
+        attachment's parsed content (PRE-10 chunked read).
 
         Returns:
             Formatted email content with headers, body, and attachments.
         """
         try:
+            if self.attachment_index is not None or self.attachment_name is not None:
+                return self._get_single_attachment_content()
+
             # Load raw documents (without chunking)
             docs = self._load_raw()
 
@@ -579,3 +705,16 @@ class EliteAEmailLoader(BaseLoader):
         except Exception as e:
             logger.warning(f"Failed to get email content: {e}")
             return ""
+
+    def _get_single_attachment_content(self) -> str:
+        """Return one selected attachment's parsed text (PRE-10 #5441)."""
+        attachments = self._extract_attachments_with_content()
+        selected = self._resolve_selected_attachment(attachments)
+        if isinstance(selected, str):
+            return selected
+        filename, content = selected
+        parsed = _sanitize_text(self._parse_attachment_content(filename, content))
+        if not parsed:
+            return (f"Attachment {_sanitize_text(filename)!r} could not be read "
+                    f"(unsupported type, empty, or exceeds max_attachment_size_mb={self.max_attachment_size_mb}).")
+        return f"**Attachment: {_sanitize_text(filename)}**\n\n{parsed}"
