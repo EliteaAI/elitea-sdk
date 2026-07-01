@@ -66,40 +66,19 @@ def build_dynamic_application_schema(variables: list, app_name: str = "Applicati
 def _build_application_description(
     base_description: Optional[str],
     tools: list,
-    ignored_mcp_servers: Optional[list] = None,
 ) -> Optional[str]:
     """Build an enriched description for an Application tool.
 
-    Appends a structured capabilities summary derived from the nested agent's configured
-    toolkits. The parent LLM uses this to decide whether to delegate a task, knowing which
-    toolkits are available versus skipped.
+    Appends a structured capabilities list derived from the nested agent's configured
+    toolkits so the orchestrator LLM knows what the agent can handle and which individual
+    tools are available. Enrichment is based purely on the agent's static configuration
+    at bind time.
     """
     if not tools:
         return base_description
 
-    _ignored = set()
-    for _entry in (ignored_mcp_servers or []):
-        if isinstance(_entry, str):
-            _ignored.add(_entry.lower().rstrip('/'))
-        elif isinstance(_entry, dict):
-            _url = _entry.get('url') or _entry.get('server_url') or ''
-            if _url:
-                _ignored.add(_url.lower().rstrip('/'))
-
-    def _is_skipped(tool: dict) -> bool:
-        if not _ignored:
-            return False
-        _settings = tool.get('settings') or {}
-        for _key in ('url', 'server_url', 'base_url'):
-            _val = _settings.get(_key) or ''
-            if _val and _val.lower().rstrip('/') in _ignored:
-                return True
-        return False
-
-    # Collect toolkit labels, flagging skipped ones
-    _available = []
-    _skipped = []
     _seen_labels = set()
+    _capability_lines = []
     for tool in tools:
         _type = str(tool.get('type') or '')
         _label = (
@@ -110,27 +89,22 @@ def _build_application_description(
         if not _label or _label in _seen_labels:
             continue
         _seen_labels.add(_label)
-        if _is_skipped(tool):
-            _skipped.append(_label)
+        _settings = tool.get('settings') or {}
+        _selected = _settings.get('selected_tools') or []
+        if _selected:
+            _capability_lines.append(f"{_label}: {', '.join(_selected)}")
         else:
-            _available.append(_label)
+            _capability_lines.append(_label)
 
-    if not _available and not _skipped:
+    if not _capability_lines:
         return base_description
 
     parts = []
     if base_description:
         parts.append(base_description.rstrip())
+    parts.append("Configured capabilities:\n" + "\n".join(f"- {c}" for c in _capability_lines))
 
-    if _available:
-        parts.append("Available capabilities: " + ", ".join(_available) + ".")
-    if _skipped:
-        parts.append(
-            "Skipped (unavailable this run — do NOT delegate tasks requiring these): "
-            + ", ".join(_skipped) + "."
-        )
-
-    return "\n".join(parts) if parts else base_description
+    return "\n".join(parts)
 
 
 class ApplicationToolkit(BaseToolkit):
@@ -253,7 +227,6 @@ class ApplicationToolkit(BaseToolkit):
         description = _build_application_description(
             app_details.get("description"),
             version_details.get('tools', []),
-            ignored_mcp_servers=ignored_mcp_servers,
         )
 
         return cls(tools=[Application(name=app_name,
