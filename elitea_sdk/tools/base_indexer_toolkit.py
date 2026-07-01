@@ -1118,6 +1118,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "indexed": metadata.get("indexed", 0),
             "updated": metadata.get("updated", 0),
             "toolkit_id": metadata.get("toolkit_id"),
+            # Emit created_at (= this row's own created_on) and updated_on so
+            # ensure_index_data_has_task_id can match on created_on and stamp task_id
+            # on the row (its guard is current_metadata['created_on'] == event['created_at']).
+            # Without these the guard always fails and the Index-tab Stop button stays
+            # hidden until the row goes stale (~2h). task_id lets the row be linked/stamped.
+            "created_at": metadata.get("created_on"),
+            IndexerKeywords.UPDATED_ON.value: metadata.get(IndexerKeywords.UPDATED_ON.value),
+            "task_id": metadata.get("task_id"),
         }
         
         # Emit the event
