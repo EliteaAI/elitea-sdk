@@ -14,8 +14,7 @@
 
 from langchain_community.document_loaders import (
     AirbyteJSONLoader, UnstructuredHTMLLoader,
-    UnstructuredXMLLoader, UnstructuredWordDocumentLoader,
-    UnstructuredPowerPointLoader)
+    UnstructuredXMLLoader, UnstructuredWordDocumentLoader)
 
 from .EliteACSVLoader import EliteACSVLoader
 from .EliteADocxMammothLoader import EliteADocxMammothLoader
@@ -262,14 +261,6 @@ document_loaders_map = {
         'is_multimodal_processing': False,
         'kwargs': {},
         'allowed_to_override': DEFAULT_ALLOWED_WITH_LLM
-    },
-    # Legacy binary PowerPoint format — uses unstructured (libreoffice under the hood)
-    '.ppt': {
-        'class': UnstructuredPowerPointLoader,
-        'mime_type': 'application/vnd.ms-powerpoint',
-        'is_multimodal_processing': False,
-        'kwargs': {},
-        'allowed_to_override': DEFAULT_ALLOWED_BASE
     },
     '.pptx': {
         'class': EliteAPowerPointLoader,
