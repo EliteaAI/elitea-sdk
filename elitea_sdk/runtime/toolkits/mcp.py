@@ -393,17 +393,46 @@ class McpToolkit(BaseToolkit):
         if not initial_session_id:
             logger.warning(f"[MCP Session] No session_id provided for '{toolkit_name}' - will generate one")
 
-        # Run async discovery in sync context
-        try:
-            all_tools, server_session_id = asyncio.run(
-                cls._discover_tools_async(
-                    toolkit_name=toolkit_name,
-                    connection_config=connection_config,
-                    timeout=timeout,
-                    ssl_verify=ssl_verify,
-                    oauth_token_injected=oauth_token_injected,
+        # Run async discovery in sync context.
+        # When called from within a running event loop (e.g. nested agent execution),
+        # asyncio.run() raises "cannot be called from a running event loop".
+        # In that case, run the coroutine in a dedicated thread that owns its own loop.
+        def _run_in_new_loop():
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    cls._discover_tools_async(
+                        toolkit_name=toolkit_name,
+                        connection_config=connection_config,
+                        timeout=timeout,
+                        ssl_verify=ssl_verify,
+                        oauth_token_injected=oauth_token_injected,
+                    )
                 )
-            )
+            finally:
+                loop.close()
+
+        try:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if running_loop is not None:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_run_in_new_loop)
+                    all_tools, server_session_id = future.result()
+            else:
+                all_tools, server_session_id = asyncio.run(
+                    cls._discover_tools_async(
+                        toolkit_name=toolkit_name,
+                        connection_config=connection_config,
+                        timeout=timeout,
+                        ssl_verify=ssl_verify,
+                        oauth_token_injected=oauth_token_injected,
+                    )
+                )
             # Return tools and the session_id (server-provided or generated)
             logger.info(f"[MCP Session] Final session_id for '{toolkit_name}': {server_session_id}")
             return all_tools, server_session_id
