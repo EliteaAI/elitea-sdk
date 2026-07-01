@@ -300,7 +300,8 @@ class Assistant:
                  is_subgraph: bool = False,
                  lazy_tools_mode: Optional[bool] = None,
                  middleware: Optional[list[Middleware]] = None,
-                 child_dispatcher: Optional[Any] = None):
+                 child_dispatcher: Optional[Any] = None,
+                 user_declined_mcp_servers: Optional[list] = None):
 
         self.app_type = app_type
         self.memory = memory
@@ -444,18 +445,21 @@ class Assistant:
             conversation_id=conversation_id,
             ignored_mcp_servers=ignored_mcp_servers,
             current_participant_id=self.current_participant_id,
-            user_declined_mcp_servers=data.get("user_declined_mcp_servers"),
+            user_declined_mcp_servers=user_declined_mcp_servers or data.get("user_declined_mcp_servers"),
             pipeline_node_toolkit_names=pipeline_node_toolkit_names,
             skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
         )
         if tools:
-            self.tools += tools
-            # Deduplicate keeping the last occurrence, but scoped per toolkit so that
+            # Deduplicate keeping the last occurrence, scoped per (name, toolkit_name) so that
             # two toolkits with same-named tools (e.g. GitHub's create_issue and
-            # Jira's create_issue) are both preserved.  The richer mcp_auth_control
-            # injected via tools= still overrides the basic one from get_tools()
-            # because they share both name and toolkit_name (None).
+            # Jira's create_issue) are both preserved.
+            # Process injected tools first, then get_tools() results — get_tools() wins on
+            # conflict.  This ensures mcp_auth_control from get_tools() (which carries the
+            # ignored_mcp_servers guard) takes precedence over the injected version.
             _seen: dict = {}
+            for _t in tools:
+                _toolkit = (getattr(_t, 'metadata', None) or {}).get('toolkit_name')
+                _seen[(_t.name, _toolkit)] = _t
             for _t in self.tools:
                 _toolkit = (getattr(_t, 'metadata', None) or {}).get('toolkit_name')
                 _seen[(_t.name, _toolkit)] = _t
