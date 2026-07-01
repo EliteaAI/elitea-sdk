@@ -93,6 +93,8 @@ def _build_deferred_mcp_auth_tools(
     tool: dict,
     auth_err: McpAuthorizationRequired,
     mcp_tokens: Optional[dict] = None,
+    user_declined_mcp_servers: Optional[list] = None,
+    force_declined: bool = False,
 ) -> List[StructuredTool]:
     """Build proxy tools that trigger MCP auth only when actually invoked.
 
@@ -139,12 +141,47 @@ def _build_deferred_mcp_auth_tools(
     www_authenticate = auth_err.www_authenticate
     resource_metadata = auth_err.resource_metadata
 
+    # Check if the user has already declined auth for this server in this session.
+    # If so, the proxy should tell the LLM the server is unavailable rather than
+    # re-triggering the authorization flow.
+    _server_is_declined = force_declined
+    if not _server_is_declined and user_declined_mcp_servers and _is_http_url(normalized_server_url):
+        for _dec in user_declined_mcp_servers:
+            _dec_url = (
+                _dec.get('server_url') or ''
+                if isinstance(_dec, dict) else str(_dec or '')
+            )
+            if _dec_url and _is_http_url(_dec_url):
+                if normalized_server_url == canonical_resource(normalize_mcp_url(_dec_url)):
+                    _server_is_declined = True
+                    break
+
     proxies: List[StructuredTool] = []
     for proxy_name in proxy_names:
         resolved_name = proxy_name
 
-        def _deferred_mcp_tool(arguments: Optional[Dict[str, Any]] = None, _tool_name: str = resolved_name) -> str:
+        def _deferred_mcp_tool(
+            arguments: Optional[Dict[str, Any]] = None,
+            _tool_name: str = resolved_name,
+            _declined: bool = _server_is_declined,
+        ) -> str:
             _ = arguments
+            if _declined:
+                # User already skipped auth for this server — do not re-trigger the flow.
+                return build_mcp_auth_decision_result(
+                    status="declined",
+                    server_url=normalized_server_url,
+                    tool_name=_tool_name,
+                    toolkit_type=toolkit_type,
+                    message=(
+                        f"The '{toolkit_name}' MCP server was skipped for this run and is unavailable. "
+                        "Do NOT request authorization, offer credentials, or suggest curl commands. "
+                        "If other tools are available to complete or partially complete the task, use them. "
+                        "If not, respond with one concise sentence explaining the task could not be completed "
+                        f"because the {toolkit_name} server was skipped."
+                    ),
+                    next_step="use_other_tools_or_report",
+                )
             # This proxy was created because toolkit loading already failed with
             # McpAuthorizationRequired — any token in mcp_tokens was rejected by
             # the server (expired or invalid). Do not short-circuit with a token
@@ -166,18 +203,26 @@ def _build_deferred_mcp_auth_tools(
                 resource_metadata=resource_metadata,
             )
 
+        if _server_is_declined:
+            _proxy_description = (
+                f"Gateway for '{toolkit_name}' MCP server operations. "
+                f"ALWAYS call this tool when any task involves '{toolkit_name}' before responding to the user. "
+                "The tool result will tell you exactly what to do next."
+            )
+        else:
+            _proxy_description = (
+                f"Access gateway for '{toolkit_name}' MCP server tools. "
+                f"The '{toolkit_name}' server requires authorization before its tools can be used. "
+                f"When the user requests any '{toolkit_name}' operation, call this tool immediately "
+                "to initiate the authorization flow — do NOT tell the user these tools are unavailable. "
+                "After calling this tool, you MUST follow up by calling "
+                "mcp_auth_control(action='authorize', server_url=...) to complete authorization."
+            )
         proxies.append(
             StructuredTool.from_function(
                 func=_deferred_mcp_tool,
                 name=resolved_name,
-                description=(
-                    f"Access gateway for '{toolkit_name}' MCP server tools. "
-                    f"The '{toolkit_name}' server requires authorization before its tools can be used. "
-                    f"When the user requests any '{toolkit_name}' operation, call this tool immediately "
-                    "to initiate the authorization flow — do NOT tell the user these tools are unavailable. "
-                    "After calling this tool, you MUST follow up by calling "
-                    "mcp_auth_control(action='authorize', server_url=...) to complete authorization."
-                ),
+                description=_proxy_description,
                 args_schema=_DeferredMcpAuthInput,
                 handle_tool_error=False,
                 metadata={
@@ -195,6 +240,7 @@ def _make_mcp_auth_control_tool(
     tool_configs: list,
     mcp_tokens: Optional[dict] = None,
     user_declined_mcp_servers: Optional[list] = None,
+    ignored_mcp_servers: Optional[list] = None,
 ) -> List[StructuredTool]:
     """Create the mcp_auth_control StructuredTool (and its legacy alias) for the predict path.
 
@@ -357,6 +403,29 @@ def _make_mcp_auth_control_tool(
                 next_step="use_other_tool",
                 denial_reason=_decline,
             )
+
+        # Check if this server was ignored (user clicked Skip) for this run.
+        # Return declined immediately — do NOT call discover_mcp_tools, which would
+        # raise McpAuthorizationRequired again and re-trigger the auth dialog.
+        _ignored = ignored_mcp_servers or []
+        if _ignored and normalized_url:
+            _atlassian_alt_url_ignored = mcp_alternate_resource(normalized_url) if normalized_url else None
+            for _check in [normalized_url, server_url, _atlassian_alt_url_ignored]:
+                if _check and (_check in _ignored or canonical_resource(_check) in _ignored):
+                    return build_mcp_auth_decision_result(
+                        status="declined",
+                        server_url=normalized_url,
+                        tool_name=tool_name or "",
+                        message=(
+                            "This MCP server was skipped for this run and is unavailable. "
+                            "Do NOT request authorization, offer credentials, or suggest curl commands. "
+                            "If other tools are available to complete or partially complete the task, use them. "
+                            "If not, respond with one concise sentence explaining the task could not be completed "
+                            "because this MCP server was skipped."
+                        ),
+                        next_step="use_other_tools_or_report",
+                        denial_reason="user skipped MCP login for this run",
+                    )
 
         # Look up token from mcp_tokens (canonical key first, then raw URL, then Atlassian alternate)
         auth_headers: Dict[str, str] = {}
@@ -619,13 +688,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         agent_type=agent_type,  # Pass agent_type for metadata
                         memory=memory,
                         fallback_llm=llm,  # Fallback for embedded sub-agents with null llm_settings
+                        user_declined_mcp_servers=user_declined_mcp_servers,
                     ).get_tools())
-                except McpAuthorizationRequired:
-                    # OAuth required by a nested agent's toolkit — propagate so user is prompted
-                    raise
                 except Exception as app_err:
-                    # Gracefully skip application tools that fail to load (e.g., deleted agents)
-                    # This is common for conversation participants that reference stale agents
+                    # Gracefully skip application tools that fail to load (e.g., deleted agents,
+                    # or participants whose nested MCP requires auth — Application._run() rebuilds
+                    # the assistant on invocation, so init-time failures are non-fatal).
                     logger.error(f"Skipping application tool '{tool.get('name', 'unknown')}': {app_err}")
                     continue
             elif tool['type'] == 'memory':
@@ -733,10 +801,25 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         settings['url'] = url
 
                 # Check if this MCP server should be ignored (user chose to continue without auth)
-                if ignored_mcp_servers and url:
+                # or was explicitly declined (user clicked Skip on the auth dialog).
+                if url:
                     canonical_url = canonical_resource(url)
-                    if canonical_url in ignored_mcp_servers or url in ignored_mcp_servers:
-                        logger.info("[MCP Auth] Skipping ignored MCP server")
+                    _should_skip = bool(
+                        ignored_mcp_servers
+                        and (canonical_url in ignored_mcp_servers or url in ignored_mcp_servers)
+                    )
+                    if not _should_skip and user_declined_mcp_servers:
+                        for _dec in user_declined_mcp_servers:
+                            _dec_url = (
+                                _dec.get('server_url') or ''
+                                if isinstance(_dec, dict) else str(_dec or '')
+                            )
+                            if _dec_url and _is_http_url(_dec_url):
+                                if canonical_url == canonical_resource(normalize_mcp_url(_dec_url)):
+                                    _should_skip = True
+                                    break
+                    if _should_skip:
+                        logger.info("[MCP Auth] Skipping ignored/declined MCP server — injecting declined proxy")
                         _tname = tool.get('toolkit_name') or url
                         if (
                             skipped_pipeline_toolkit_names is not None
@@ -744,6 +827,24 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             and _tname in pipeline_node_toolkit_names
                         ):
                             skipped_pipeline_toolkit_names.add(_tname)
+                        _fake_auth_err = McpAuthorizationRequired(
+                            message="MCP server skipped by user",
+                            server_url=canonical_url or url,
+                        )
+                        _fake_auth_err.toolkit_type = tool.get('type', 'mcp')
+                        _declined_proxies = _build_deferred_mcp_auth_tools(
+                            tool, _fake_auth_err, mcp_tokens=mcp_tokens, force_declined=True
+                        )
+                        if _declined_proxies:
+                            _inject_display_metadata(tool, _declined_proxies)
+                            tools.extend(_declined_proxies)
+                            if not _mcp_auth_control_added:
+                                tools.extend(_make_mcp_auth_control_tool(
+                                    deduplicated_tools, mcp_tokens=mcp_tokens,
+                                    user_declined_mcp_servers=user_declined_mcp_servers,
+                                    ignored_mcp_servers=ignored_mcp_servers,
+                                ))
+                                _mcp_auth_control_added = True
                         continue
                 
                 headers = settings.get('headers')
@@ -815,13 +916,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             "[MCP Auth] Pipeline node toolkit requires authorization — re-raising"
                         )
                         raise
-                    mcp_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
+                    mcp_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers)
                     logger.info(
                         "[MCP Auth] Deferred authorization for toolkit with %d proxy tool(s)",
                         len(mcp_tools),
                     )
                     if mcp_tools and not _mcp_auth_control_added:
-                        tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers))
+                        tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers, ignored_mcp_servers=ignored_mcp_servers))
                         _mcp_auth_control_added = True
                         logger.info("[MCP Auth] Injected mcp_auth_control into predict-path toolset (mcp type)")
                     _inject_display_metadata(tool, mcp_tools)
@@ -847,21 +948,43 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         logger.error(f"❌ No server_name found for mcp_config toolkit: {tool}")
                         continue
 
-                    if ignored_mcp_servers:
+                    if ignored_mcp_servers or user_declined_mcp_servers:
                         # Check by server_name / toolkit type (stdio and legacy cases)
-                        _skip = tool['type'] in ignored_mcp_servers or server_name in ignored_mcp_servers
-                        if not _skip:
+                        _skip = bool(
+                            ignored_mcp_servers
+                            and (tool['type'] in ignored_mcp_servers or server_name in ignored_mcp_servers)
+                        )
+                        # Resolve the HTTP URL for this server (needed for both ignored and declined checks)
+                        _server_url = (
+                            settings.get('url')
+                            or (settings.get('server_config') or {}).get('url')
+                        )
+                        if not _server_url:
+                            _global_cfg = get_mcp_server_config(server_name) or {}
+                            _server_url = _global_cfg.get('url')
+                        if _server_url:
+                            _server_url = normalize_mcp_url(_server_url)
+                        if not _skip and ignored_mcp_servers and _server_url:
                             # Also check by HTTP URL for http-type pre-configured servers.
-                            # The server URL lives in settings['url'] or in the global server config.
-                            _server_url = settings.get('url')
-                            if not _server_url:
-                                _global_cfg = get_mcp_server_config(server_name) or {}
-                                _server_url = _global_cfg.get('url')
-                            if _server_url:
-                                _canonical = canonical_resource(_server_url)
-                                _skip = _canonical in ignored_mcp_servers or _server_url in ignored_mcp_servers
+                            _canonical = canonical_resource(_server_url)
+                            _skip = _canonical in ignored_mcp_servers or _server_url in ignored_mcp_servers
+                        if not _skip and user_declined_mcp_servers:
+                            # Check by name (stdio servers) or by HTTP URL (http-type servers)
+                            for _dec in user_declined_mcp_servers:
+                                if not isinstance(_dec, dict):
+                                    continue
+                                _dec_url = _dec.get('server_url') or ''
+                                if _dec_url and not _is_http_url(_dec_url):
+                                    # Symbolic server name — match by name or toolkit type
+                                    if _dec_url == server_name or _dec_url == tool['type']:
+                                        _skip = True
+                                        break
+                                elif _dec_url and _is_http_url(_dec_url) and _server_url:
+                                    if canonical_resource(_server_url) == canonical_resource(normalize_mcp_url(_dec_url)):
+                                        _skip = True
+                                        break
                         if _skip:
-                            logger.info("[MCP Auth] Skipping ignored pre-configured MCP server")
+                            logger.info("[MCP Auth] Skipping ignored/declined pre-configured MCP server — injecting declined proxy")
                             _tname = tool.get('toolkit_name') or server_name
                             if (
                                 skipped_pipeline_toolkit_names is not None
@@ -869,6 +992,25 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                 and _tname in pipeline_node_toolkit_names
                             ):
                                 skipped_pipeline_toolkit_names.add(_tname)
+                            _fake_skip_url = _server_url or server_name
+                            _fake_auth_err = McpAuthorizationRequired(
+                                message="MCP server skipped by user",
+                                server_url=_fake_skip_url,
+                            )
+                            _fake_auth_err.toolkit_type = tool.get('type', 'mcp_config')
+                            _declined_proxies = _build_deferred_mcp_auth_tools(
+                                tool, _fake_auth_err, mcp_tokens=mcp_tokens, force_declined=True
+                            )
+                            if _declined_proxies:
+                                _inject_display_metadata(tool, _declined_proxies)
+                                tools.extend(_declined_proxies)
+                                if not _mcp_auth_control_added:
+                                    tools.extend(_make_mcp_auth_control_tool(
+                                        deduplicated_tools, mcp_tokens=mcp_tokens,
+                                        user_declined_mcp_servers=user_declined_mcp_servers,
+                                        ignored_mcp_servers=ignored_mcp_servers,
+                                    ))
+                                    _mcp_auth_control_added = True
                             continue
 
                     toolkit_name = tool.get('toolkit_name', '') or server_name
@@ -902,7 +1044,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             "[MCP Auth] Pipeline node toolkit requires authorization — re-raising"
                         )
                         raise
-                    toolkit_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens)
+                    toolkit_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers)
                     _inject_display_metadata(tool, toolkit_tools)
                     tools.extend(toolkit_tools)
                     logger.info(
@@ -910,7 +1052,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         len(toolkit_tools),
                     )
                     if toolkit_tools and not _mcp_auth_control_added:
-                        tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers))
+                        tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers, ignored_mcp_servers=ignored_mcp_servers))
                         _mcp_auth_control_added = True
                         logger.info("[MCP Auth] Injected mcp_auth_control into predict-path toolset (mcp_config type)")
                     continue

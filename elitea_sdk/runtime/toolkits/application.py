@@ -63,6 +63,76 @@ def build_dynamic_application_schema(variables: list, app_name: str = "Applicati
 
     return create_model(model_name, **fields)
 
+def _build_application_description(
+    base_description: Optional[str],
+    tools: list,
+    ignored_mcp_servers: Optional[list] = None,
+) -> Optional[str]:
+    """Build an enriched description for an Application tool.
+
+    Appends a structured capabilities summary derived from the nested agent's configured
+    toolkits. The parent LLM uses this to decide whether to delegate a task, knowing which
+    toolkits are available versus skipped.
+    """
+    if not tools:
+        return base_description
+
+    _ignored = set()
+    for _entry in (ignored_mcp_servers or []):
+        if isinstance(_entry, str):
+            _ignored.add(_entry.lower().rstrip('/'))
+        elif isinstance(_entry, dict):
+            _url = _entry.get('url') or _entry.get('server_url') or ''
+            if _url:
+                _ignored.add(_url.lower().rstrip('/'))
+
+    def _is_skipped(tool: dict) -> bool:
+        if not _ignored:
+            return False
+        _settings = tool.get('settings') or {}
+        for _key in ('url', 'server_url', 'base_url'):
+            _val = _settings.get(_key) or ''
+            if _val and _val.lower().rstrip('/') in _ignored:
+                return True
+        return False
+
+    # Collect toolkit labels, flagging skipped ones
+    _available = []
+    _skipped = []
+    _seen_labels = set()
+    for tool in tools:
+        _type = str(tool.get('type') or '')
+        _label = (
+            tool.get('toolkit_name')
+            or tool.get('name')
+            or _type
+        )
+        if not _label or _label in _seen_labels:
+            continue
+        _seen_labels.add(_label)
+        if _is_skipped(tool):
+            _skipped.append(_label)
+        else:
+            _available.append(_label)
+
+    if not _available and not _skipped:
+        return base_description
+
+    parts = []
+    if base_description:
+        parts.append(base_description.rstrip())
+
+    if _available:
+        parts.append("Available capabilities: " + ", ".join(_available) + ".")
+    if _skipped:
+        parts.append(
+            "Skipped (unavailable this run — do NOT delegate tasks requiring these): "
+            + ", ".join(_skipped) + "."
+        )
+
+    return "\n".join(parts) if parts else base_description
+
+
 class ApplicationToolkit(BaseToolkit):
     tools: List[BaseTool] = []
     
@@ -84,7 +154,8 @@ class ApplicationToolkit(BaseToolkit):
                     mcp_tokens: Optional[dict] = None, project_id: int = None,
                     conversation_id: Optional[str] = None, agent_type: str = 'agent',
                     memory: Optional[Any] = None,
-                    fallback_llm=None):
+                    fallback_llm=None,
+                    user_declined_mcp_servers: Optional[list] = None):
         """
         Get toolkit for an application.
 
@@ -144,7 +215,8 @@ class ApplicationToolkit(BaseToolkit):
                                  is_subgraph=is_subgraph,
                                  mcp_tokens=mcp_tokens,
                                  conversation_id=conversation_id,
-                                 version_details=version_details)  # Pass version_details to avoid re-fetching
+                                 version_details=version_details,
+                                 user_declined_mcp_servers=user_declined_mcp_servers)  # Pass version_details to avoid re-fetching
 
         # Extract icon_meta from version_details meta field
         icon_meta = version_details.get('meta', {}).get('icon_meta', {})
@@ -175,8 +247,17 @@ class ApplicationToolkit(BaseToolkit):
         if icon_meta:
             metadata['icon_meta'] = icon_meta
 
+        # Build an enriched description so the parent LLM knows what capabilities
+        # the nested agent actually has. Without this, the parent blindly delegates tasks
+        # to the nested agent even when the required toolkit was skipped or unavailable.
+        description = _build_application_description(
+            app_details.get("description"),
+            version_details.get('tools', []),
+            ignored_mcp_servers=ignored_mcp_servers,
+        )
+
         return cls(tools=[Application(name=app_name,
-                                      description=app_details.get("description"),
+                                      description=description,
                                       application=app,
                                       args_schema=dynamic_schema,
                                       return_type='str',
@@ -195,6 +276,7 @@ class ApplicationToolkit(BaseToolkit):
                                           "mcp_tokens": mcp_tokens,
                                           "conversation_id": conversation_id,
                                           "version_details": version_details,  # Include to avoid re-fetching (critical for public project apps)
+                                          "user_declined_mcp_servers": user_declined_mcp_servers,
                                       })])
             
     def get_tools(self):

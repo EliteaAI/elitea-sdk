@@ -53,12 +53,31 @@ def discover_mcp_tools(
         >>> print(f"Found {len(tools)} tools")
     """
     logger.info(f"[MCP Discovery] Starting tool discovery from {url}")
-    
+
+    def _run_in_new_loop():
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                _discover_tools_async(url, headers, timeout, session_id, ssl_verify)
+            )
+        finally:
+            loop.close()
+
     try:
-        # Run the async discovery in a new event loop
-        tools_list = asyncio.run(
-            _discover_tools_async(url, headers, timeout, session_id, ssl_verify)
-        )
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is not None:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_in_new_loop)
+                tools_list = future.result()
+        else:
+            tools_list = asyncio.run(
+                _discover_tools_async(url, headers, timeout, session_id, ssl_verify)
+            )
         logger.info(f"[MCP Discovery] Successfully discovered {len(tools_list)} tools from {url}")
         return tools_list
         
