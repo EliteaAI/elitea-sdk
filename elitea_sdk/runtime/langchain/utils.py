@@ -12,6 +12,32 @@ from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 
 logger = logging.getLogger(__name__)
 
+# Max chars of a tool result rendered into the INFO summary line. The full body
+# is never logged at INFO — a tool (esp. MCP) can return megabytes and flood logs.
+TOOL_RESULT_PREVIEW_CHARS = 500
+
+
+def tool_result_summary(node_name, tool_name, toolkit_id, tool_result, label='response'):
+    # Bounded one-liner: identity + size + type + capped preview. Never the full body.
+    try:
+        rendered = tool_result if isinstance(tool_result, str) else str(tool_result)
+    except Exception:
+        rendered = f'<unrenderable {type(tool_result).__name__}>'
+    size = len(rendered)
+    preview = rendered[:TOOL_RESULT_PREVIEW_CHARS]
+    suffix = f'…(truncated, {size} chars total)' if size > TOOL_RESULT_PREVIEW_CHARS else ''
+    tk = f" toolkit={toolkit_id}" if toolkit_id is not None else ''
+    return (f"ToolNode '{node_name}' tool '{tool_name}'{tk} {label}: "
+            f"{size} chars ({type(tool_result).__name__}); preview: {preview}{suffix}")
+
+
+def log_tool_result(node_logger, node_name, tool_name, toolkit_id, tool_result, label='response'):
+    # INFO = bounded summary; full body only at DEBUG (capped) for deep debugging.
+    node_logger.info(tool_result_summary(node_name, tool_name, toolkit_id, tool_result, label))
+    if node_logger.isEnabledFor(logging.DEBUG):
+        body = tool_result if isinstance(tool_result, str) else str(tool_result)
+        node_logger.debug("ToolNode '%s' full %s: %s", node_name, label, body[:100_000])
+
 
 def _hitl_decisions_reducer(current: list | None, update: list | None) -> list:
     """Reducer for the ``hitl_decisions`` state field.
