@@ -736,7 +736,8 @@ class EliteAClient:
                     exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
                     auto_approve_sensitive_actions: bool = False,
                     openai_compatible: Optional[bool] = None,
-                    child_dispatcher: Optional[Any] = None):
+                    child_dispatcher: Optional[Any] = None,
+                    user_declined_mcp_servers: Optional[list] = None):
         if tools is None:
             tools = []
         if chat_history is None:
@@ -828,7 +829,8 @@ class EliteAClient:
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
-                                      child_dispatcher=child_dispatcher)
+                                      child_dispatcher=child_dispatcher,
+                                      user_declined_mcp_servers=user_declined_mcp_servers)
         if runtime == 'langchain':
             return LangChainAssistant(self, data, llm,
                                       chat_history, app_type,
@@ -837,7 +839,8 @@ class EliteAClient:
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
-                                      child_dispatcher=child_dispatcher).runnable()
+                                      child_dispatcher=child_dispatcher,
+                                      user_declined_mcp_servers=user_declined_mcp_servers).runnable()
         elif runtime == 'llama':
             raise NotImplementedError("LLama runtime is not supported")
 

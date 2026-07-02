@@ -1,4 +1,5 @@
 import io
+import logging
 
 from langchain_core.tools import ToolException
 from pptx import Presentation
@@ -6,8 +7,47 @@ from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from langchain_core.documents import Document
 
+logger = logging.getLogger(__name__)
+
 
 class EliteAPowerPointLoader:
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        total_pages = 0
+        if file_content:
+            try:
+                prs = Presentation(io.BytesIO(file_content))
+                total_pages = len(prs.slides)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to read slide count for %s: %s", filename, exc)
+
+        range_hint = f"Valid range 1..{total_pages}. " if total_pages else ""
+        return {
+            "unit": "pages",
+            "total_pages": total_pages,
+            "instruction_for_readFile": {
+                "first_class_params": {
+                    "page_number": (
+                        "integer (1-indexed) — single slide to read. "
+                        f"{range_hint}Omit to read the whole presentation."
+                    ),
+                },
+                "extra_params": {
+                    "extract_images": (
+                        "boolean — when true, each image shape is transcribed "
+                        "via the AI vision model (requires an LLM to be configured)"
+                    ),
+                },
+                "notes": (
+                    "Use page_number to read one slide at a time and keep tokens bounded. "
+                    "Image transcription adds latency proportional to the number of images "
+                    "on the requested slide."
+                ),
+            },
+        }
 
     def __init__(self, file_path=None, file_content=None, mode=None, **unstructured_kwargs):
         if file_path:
