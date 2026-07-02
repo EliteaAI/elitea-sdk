@@ -53,8 +53,7 @@ def build_dynamic_application_schema(variables: list, app_name: str = "Applicati
                     default=default_value
                 ))
 
-        logger.info(f"[APP_SCHEMA] Built dynamic schema for '{app_name}' with {len(variables)} variables: "
-                   f"{[v.get('name') for v in variables if isinstance(v, dict)]}")
+        logger.info(f"[APP_SCHEMA] Built dynamic schema for '{app_name}' with {len(variables)} variables")
 
     # Create a unique model name based on the application name
     # Clean the name to be a valid Python identifier
