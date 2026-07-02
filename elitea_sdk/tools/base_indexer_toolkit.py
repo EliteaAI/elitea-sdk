@@ -948,6 +948,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         )
     
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
+        from ..runtime.langchain.interfaces.llm_processor import add_documents
         self._ensure_vectorstore_initialized()
         index_meta = super().get_index_meta(index_name)
         if not index_meta:
@@ -955,7 +956,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 f"There is no existing index_meta for collection '{index_name}'. Initializing it.",
                 tool_name="index_data"
             )
-            from ..runtime.langchain.interfaces.llm_processor import add_documents
             created_on = time.time()
             metadata = {
                 "collection": index_name,
@@ -975,6 +975,41 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata["history"] = json.dumps([metadata])
             index_meta_doc = Document(page_content=f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}", metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc])
+        else:
+            # Reindex: the collection already has an index_meta row. Reset it to
+            # in_progress with a fresh created_on so the start event (emitted right after)
+            # carries state=in_progress instead of the previous run's terminal state.
+            # Without this the platform's reconcile-on-stop registry never populates for a
+            # reindex (it only registers on in_progress), so a stopped reindex stays stuck.
+            now = time.time()
+            metadata = copy.deepcopy(index_meta.get("metadata", {}))
+            metadata["state"] = IndexerKeywords.INDEX_META_IN_PROGRESS.value
+            metadata["created_on"] = now
+            metadata["updated_on"] = now
+            metadata["error"] = None
+            # Reset run linkage like the fresh-init branch: a previous (e.g. completed)
+            # run may have left task_id stamped, and the platform's reconcile guard skips
+            # rows whose task_id doesn't match the stopping task — leaving a stopped
+            # reindex stuck. Clearing it lets this run's task_id be (re)stamped/matched.
+            metadata["task_id"] = None
+            metadata["conversation_id"] = None
+            # Append a new run entry to history (like fresh-init records the run) instead of
+            # leaving history[-1] pointing at the previous run's terminal state; also makes
+            # is_reindex (len(history) > 1) correct for this run.
+            history_raw = metadata.pop("history", "[]")
+            try:
+                history = json.loads(history_raw) if history_raw and history_raw.strip() else []
+                if not isinstance(history, list):
+                    history = []
+            except (json.JSONDecodeError, TypeError):
+                history = []
+            history.append(dict(metadata))  # history key already popped -> no nesting
+            metadata["history"] = json.dumps(history)
+            index_meta_doc = Document(
+                page_content=index_meta.get("content", f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}"),
+                metadata=metadata,
+            )
+            add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta.get("id")])
 
     def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None):
         """Update `index_meta` document with optional time-based throttling.
@@ -1118,6 +1153,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "indexed": metadata.get("indexed", 0),
             "updated": metadata.get("updated", 0),
             "toolkit_id": metadata.get("toolkit_id"),
+            "created_at": metadata.get("created_on"),
+            "updated_on": metadata.get("updated_on"),
         }
         
         # Emit the event
