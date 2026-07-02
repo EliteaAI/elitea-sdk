@@ -994,6 +994,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # reindex stuck. Clearing it lets this run's task_id be (re)stamped/matched.
             metadata["task_id"] = None
             metadata["conversation_id"] = None
+            # Append a new run entry to history (like fresh-init records the run) instead of
+            # leaving history[-1] pointing at the previous run's terminal state; also makes
+            # is_reindex (len(history) > 1) correct for this run.
+            history_raw = metadata.pop("history", "[]")
+            try:
+                history = json.loads(history_raw) if history_raw and history_raw.strip() else []
+                if not isinstance(history, list):
+                    history = []
+            except (json.JSONDecodeError, TypeError):
+                history = []
+            history.append(dict(metadata))  # history key already popped -> no nesting
+            metadata["history"] = json.dumps(history)
             index_meta_doc = Document(
                 page_content=index_meta.get("content", f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}"),
                 metadata=metadata,
