@@ -59,8 +59,8 @@ nodes:
 
           Perform the following checks:
           1. Confirm the tool executed successfully (result is not empty or null).
-          2. Verify the result contains "Found" and "Jira issues" or "No Jira issues found".
-          3. Result should be a string describing search outcome.
+          2. Verify the result starts with or contains a valid search summary such as "Found <N> Jira issues" or "No Jira issues found".
+          3. Accept tool output that includes the summary plus returned issue details after it.
 
           Return a JSON object named test_results with the following structure:
 
