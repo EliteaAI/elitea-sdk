@@ -948,6 +948,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         )
     
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
+        from ..runtime.langchain.interfaces.llm_processor import add_documents
         self._ensure_vectorstore_initialized()
         index_meta = super().get_index_meta(index_name)
         if not index_meta:
@@ -955,7 +956,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 f"There is no existing index_meta for collection '{index_name}'. Initializing it.",
                 tool_name="index_data"
             )
-            from ..runtime.langchain.interfaces.llm_processor import add_documents
             created_on = time.time()
             metadata = {
                 "collection": index_name,
@@ -981,7 +981,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # carries state=in_progress instead of the previous run's terminal state.
             # Without this the platform's reconcile-on-stop registry never populates for a
             # reindex (it only registers on in_progress), so a stopped reindex stays stuck.
-            from ..runtime.langchain.interfaces.llm_processor import add_documents
             now = time.time()
             metadata = copy.deepcopy(index_meta.get("metadata", {}))
             metadata["state"] = IndexerKeywords.INDEX_META_IN_PROGRESS.value
