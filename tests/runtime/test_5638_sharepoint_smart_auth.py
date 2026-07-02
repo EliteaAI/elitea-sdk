@@ -8,9 +8,18 @@ stops re-prompting. For the built-in SharePoint toolkit (delegated OAuth) the lo
 propagated out, the indexer re-emitted the auth event, and Skip looped forever.
 
 Fix: ``get_tools`` loads unhandled built-in toolkits one at a time and, on
-``McpAuthorizationRequired``, routes them through the SAME deferred-proxy mechanism used for
-MCP toolkits (``_build_deferred_mcp_auth_tools`` + ``mcp_auth_control``). These tests lock in
-that behaviour without any network access.
+``McpAuthorizationRequired``, builds deferred proxies via ``_build_deferred_mcp_auth_tools`` with
+``reraise_on_invoke=True``. When the LLM invokes such a proxy:
+
+- if the server was skipped (``user_declined_mcp_servers``) it returns ``status="declined"`` so the
+  loop terminates;
+- otherwise it RE-RAISES the stored rich ``McpAuthorizationRequired`` in place — exactly as
+  ``discover_mcp_tools`` does for real MCP servers — so the indexer ``on_tool_error`` callback emits
+  the ``mcp_authorization_required`` event and the Authorize/Skip dialog appears. (A built-in
+  SharePoint site is not an MCP server, so routing through ``mcp_auth_control`` ->
+  ``discover_mcp_tools`` would fail silently and never surface the dialog.)
+
+These tests lock in that behaviour without any network access.
 """
 
 import json
@@ -100,8 +109,15 @@ def test_declined_sharepoint_returns_declined_proxy_no_raise(monkeypatch):
     assert _find(tools, "mcp_auth_control") is not None
 
 
-def test_no_token_sharepoint_returns_authorization_required_proxy(monkeypatch):
-    """First run, no token, not declined -> authorization_required proxy (not an eager raise)."""
+def test_no_token_sharepoint_raises_mcp_auth_required_on_proxy_invoke(monkeypatch):
+    """First run, no token, not declined -> invoking the proxy RAISES McpAuthorizationRequired
+    (not an eager raise at load, and not an inert JSON payload).
+
+    The re-raise is how the built-in toolkit surfaces the Authorize/Skip dialog: it propagates to
+    the indexer on_tool_error callback which emits mcp_authorization_required. A JSON
+    'authorization_required' payload would instead tell the LLM to call mcp_auth_control ->
+    discover_mcp_tools, which cannot probe a non-MCP SharePoint site, so the dialog would never
+    appear (issue #5638)."""
     def loader(tool):
         raise _auth_error()
 
@@ -111,8 +127,12 @@ def test_no_token_sharepoint_returns_authorization_required_proxy(monkeypatch):
 
     proxies = _proxy_tools(tools)
     assert proxies, "expected a deferred auth proxy when SharePoint has no token"
-    payload = _invoke_proxy(proxies[0])
-    assert payload["status"] == "authorization_required"
+    # Loading must not have raised; the raise happens only when the LLM invokes the proxy.
+    with pytest.raises(McpAuthorizationRequired) as exc_info:
+        proxies[0].func()
+    # The rich exception (with the metadata the UI keys on) is preserved through the re-raise.
+    assert exc_info.value.server_url == SITE_URL
+    assert (exc_info.value.resource_metadata or {}).get("resource_name") == "SharePoint"
     assert _find(tools, "mcp_auth_control") is not None
 
 
@@ -134,8 +154,9 @@ def test_app_only_sharepoint_loads_normally(monkeypatch):
     assert _find(tools, "mcp_auth_control") is None
 
 
-def test_other_declined_site_still_requires_authorization(monkeypatch):
-    """A DIFFERENT declined site must not decline this one -> authorization_required."""
+def test_other_declined_site_still_raises_mcp_auth_required(monkeypatch):
+    """A DIFFERENT declined site must not decline this one -> the proxy still RAISES
+    McpAuthorizationRequired on invoke (so the Authorize dialog surfaces for this site)."""
     def loader(tool):
         raise _auth_error()
 
@@ -150,7 +171,8 @@ def test_other_declined_site_still_requires_authorization(monkeypatch):
 
     proxies = _proxy_tools(tools)
     assert proxies
-    assert _invoke_proxy(proxies[0])["status"] == "authorization_required"
+    with pytest.raises(McpAuthorizationRequired):
+        proxies[0].func()
 
 
 def test_auth_failure_does_not_abort_sibling_toolkits(monkeypatch):
