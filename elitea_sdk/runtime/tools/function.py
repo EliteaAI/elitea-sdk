@@ -14,7 +14,7 @@ from langgraph.errors import GraphBubbleUp
 from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
-from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict
+from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +376,9 @@ alita_client = elitea_client
                     "tool_result": tool_result,
                 }, config=config
             )
-            logger.info(f"ToolNode response: {tool_result}")
+            _tool_meta = getattr(self.tool, 'metadata', None) or {}
+            log_tool_result(logger, self.name, getattr(self.tool, 'name', None),
+                            _tool_meta.get('toolkit_id'), tool_result)
 
             # handler for PyodideSandboxTool
             if self._is_pyodide_tool():
