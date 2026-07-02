@@ -1091,9 +1091,47 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             if 'settings' not in tool:
                 tool['settings'] = {}
             tool['settings']['tokens'] = mcp_tokens
-    elitea_loaded = elitea_tools(unhandled_tools, elitea_client, llm, memory_store)
-    tools += elitea_loaded
-    logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {len(elitea_loaded)} tools")
+    # Load unhandled (built-in) toolkits one at a time so an OAuth requirement from a
+    # delegated toolkit (e.g. SharePoint) is isolated: it must NOT abort loading of the
+    # remaining tools, and it must be routed through the SAME deferred-proxy mechanism
+    # used for MCP toolkits. Otherwise the eager McpAuthorizationRequired raised at tool
+    # load time propagates out of get_tools() and the agent re-prompts every turn — so
+    # "Skip" never terminates (issue #5638).
+    _elitea_loaded_count = 0
+    for _u_tool in unhandled_tools:
+        try:
+            _loaded = elitea_tools([_u_tool], elitea_client, llm, memory_store)
+            tools += _loaded
+            _elitea_loaded_count += len(_loaded)
+        except McpAuthorizationRequired as auth_err:
+            # Built-in delegated-OAuth toolkit needs browser OAuth. Build deferred proxy
+            # tools: when the user has already skipped this server, the proxy returns
+            # status="declined" (LLM stops asking); otherwise status="authorization_required"
+            # (LLM drives the auth flow via mcp_auth_control). The caught exception already
+            # carries the fully-resolved server_url, so declined-matching works without any
+            # toolkit-specific URL re-derivation.
+            if not getattr(auth_err, "toolkit_type", None):
+                auth_err.toolkit_type = _u_tool.get("type")
+            _proxies = _build_deferred_mcp_auth_tools(
+                _u_tool, auth_err, mcp_tokens=mcp_tokens,
+                user_declined_mcp_servers=user_declined_mcp_servers,
+            )
+            if _proxies:
+                _inject_display_metadata(_u_tool, _proxies)
+                tools.extend(_proxies)
+                _elitea_loaded_count += len(_proxies)
+                if not _mcp_auth_control_added:
+                    tools.extend(_make_mcp_auth_control_tool(
+                        deduplicated_tools, mcp_tokens=mcp_tokens,
+                        user_declined_mcp_servers=user_declined_mcp_servers,
+                        ignored_mcp_servers=ignored_mcp_servers,
+                    ))
+                    _mcp_auth_control_added = True
+                logger.info(
+                    "[Toolkit Auth] Deferred authorization for built-in toolkit '%s' with %d proxy tool(s)",
+                    _u_tool.get("type"), len(_proxies),
+                )
+    logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {_elitea_loaded_count} tools")
 
     # Add MCP tools registered via elitea-mcp CLI (static registry)
     # Note: Tools with type='mcp' are already handled in main loop above
