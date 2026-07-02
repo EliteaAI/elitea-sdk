@@ -11,7 +11,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError, BaseModel, create_model
 
 from .application import Application
-from ..langchain.utils import _extract_json
+from ..langchain.utils import _extract_json, log_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,9 @@ Answer must be JSON only extractable by JSON.LOADS."""
             from ..langchain.utils import extract_text_from_completion
             content_text = extract_text_from_completion(completion)
             result = _extract_json(content_text.strip())
-            logger.info(f"ToolNode tool params: {result}")
+            _tk = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_id')
+            log_tool_result(logger, self.name, getattr(self.tool, 'name', None),
+                            _tk, result, label='tool params')
         try:
             tool_result = self.tool.invoke(result, config=config, kwargs=kwargs)
             dispatch_custom_event(
@@ -106,7 +108,9 @@ Answer must be JSON only extractable by JSON.LOADS."""
                 except TypeError:
                     logger.error(f"ToolNode tool result is not JSON serializable: {tool_result}")
                     message_result = str(tool_result)
-            logger.info(f"ToolNode response: {tool_result}")
+            _tk = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_id')
+            log_tool_result(logger, self.name, getattr(self.tool, 'name', None),
+                            _tk, tool_result)
             if not self.output_variables:
                 return {"messages": [{"role": "assistant", "content": message_result}]}
             else:

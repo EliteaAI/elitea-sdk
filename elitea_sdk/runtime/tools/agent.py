@@ -10,6 +10,8 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
+from ..langchain.utils import log_tool_result
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,7 +59,9 @@ class AgentNode(BaseTool):
             message_result = tool_result
             if isinstance(tool_result, dict) or isinstance(tool_result, list):
                 message_result = dumps(tool_result)
-            logger.info(f"AgentNode response: {tool_result}")
+            _tk = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_id')
+            log_tool_result(logger, self.name, getattr(self.tool, 'name', None),
+                            _tk, tool_result)
             if not self.output_variables:
                 return {"messages": [{"role": "assistant", "content": message_result}]}
             else:
