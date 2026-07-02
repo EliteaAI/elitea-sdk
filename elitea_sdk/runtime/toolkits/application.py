@@ -69,15 +69,16 @@ def _build_application_description(
 ) -> Optional[str]:
     """Build an enriched description for an Application tool.
 
-    Appends a configured-capabilities list (toolkit names) so the orchestrator LLM
-    knows what domain areas the subagent covers when choosing which agent to delegate a
-    task to. Enrichment is based purely on the agent's static configuration at bind time.
+    Appends a structured capabilities list derived from the nested agent's configured
+    toolkits so the orchestrator LLM knows what the agent can handle and which individual
+    tools are available. Enrichment is based purely on the agent's static configuration
+    at bind time.
     """
     if not tools:
         return base_description
 
     _seen_labels = set()
-    _capabilities = []
+    _capability_lines = []
     for tool in tools:
         _type = str(tool.get('type') or '')
         _label = (
@@ -88,15 +89,20 @@ def _build_application_description(
         if not _label or _label in _seen_labels:
             continue
         _seen_labels.add(_label)
-        _capabilities.append(_label)
+        _settings = tool.get('settings') or {}
+        _selected = _settings.get('selected_tools') or []
+        if _selected:
+            _capability_lines.append(f"{_label}: {', '.join(_selected)}")
+        else:
+            _capability_lines.append(_label)
 
-    if not _capabilities:
+    if not _capability_lines:
         return base_description
 
     parts = []
     if base_description:
         parts.append(base_description.rstrip())
-    parts.append("Configured capabilities: " + ", ".join(_capabilities) + ".")
+    parts.append("Configured capabilities:\n" + "\n".join(f"- {c}" for c in _capability_lines))
 
     return "\n".join(parts)
 
@@ -222,6 +228,7 @@ class ApplicationToolkit(BaseToolkit):
             app_details.get("description"),
             version_details.get('tools', []),
         )
+
         return cls(tools=[Application(name=app_name,
                                       description=description,
                                       application=app,
