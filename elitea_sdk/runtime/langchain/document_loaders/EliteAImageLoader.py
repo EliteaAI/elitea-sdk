@@ -1,6 +1,7 @@
+import logging
 from io import BytesIO
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from PIL import Image
 from langchain_core.document_loaders import BaseLoader
@@ -13,11 +14,74 @@ from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size
 from ..constants import DEFAULT_MULTIMODAL_PROMPT
 from ..tools.utils import image_to_byte_array, bytes_to_base64
 
+logger = logging.getLogger(__name__)
+
 Image.MAX_IMAGE_PIXELS = 300_000_000
+
+# Images have no chunk unit, so above this ceiling they can't be read in bounded
+# pieces — the guard advertises full_read_allowed=False. Aligns with ~5 MB vision limit.
+MAX_IMAGE_READ_BYTES = 5 * 1024 * 1024
 
 
 class EliteAImageLoader(BaseLoader):
     """Loads image files using an LLM vision model for advanced analysis, including SVG support."""
+
+    @classmethod
+    def get_file_metadata(cls, *, filename: str,
+                          file_content=None,
+                          file_size=None) -> dict:
+        """Report image dimensions/bytes; images are read whole (multimodal), no chunking (PRE-12 #5443)."""
+        width, height = cls._read_dimensions(filename, file_content)
+
+        effective_size = file_size if file_size is not None else (
+            len(file_content) if file_content else None
+        )
+        oversized = effective_size is not None and effective_size > MAX_IMAGE_READ_BYTES
+
+        dims_note = (
+            f"Image is {width}x{height} px. " if width and height else ""
+        )
+        meta = {
+            "unit": None,
+            "instruction_for_readFile": {
+                "first_class_params": {},
+                "notes": (
+                    f"{dims_note}Images are read whole via the AI vision model "
+                    f"(multimodal) and have no chunking — there are no line/page/row "
+                    f"range parameters. read_file returns the model's transcription "
+                    f"of the image."
+                ),
+            },
+        }
+        if width and height:
+            meta["image_width"] = width
+            meta["image_height"] = height
+
+        if oversized:
+            meta["read_limits"] = {"full_read_allowed": False}
+            meta["instruction_for_readFile"]["notes"] = (
+                f"{dims_note}This image is {effective_size} bytes, above the "
+                f"{MAX_IMAGE_READ_BYTES}-byte read limit. Images have no chunking "
+                f"(they are read whole, multimodally), so a bounded read is not "
+                f"possible — the full read is refused."
+            )
+        return meta
+
+    @classmethod
+    def _read_dimensions(cls, filename: str, file_content) -> tuple:
+        """Return (width, height) in px, or (None, None) on failure/corrupt content."""
+        if not file_content:
+            return None, None
+        try:
+            if Path(filename).suffix.lower() == ".svg":
+                svg_content = preprocess_svg_for_rendering(file_content)
+                drawing = svg2rlg(BytesIO(svg_content))
+                return int(drawing.width), int(drawing.height)
+            with Image.open(BytesIO(file_content)) as image:
+                return image.width, image.height
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to read image dimensions for %s: %s", filename, exc)
+            return None, None
 
     def __init__(self, file_path=None, **kwargs):
         # Handle both positional and keyword arguments for file_path
