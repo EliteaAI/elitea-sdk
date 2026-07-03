@@ -23,16 +23,18 @@ from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.content_parser import UNSUPPORTED_FILE_TYPE_MESSAGE
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files                       #
 # ------------------------------------------------------------------ #
 # read_document/read_file can target any file on the drive. Executable
 # and compiled-binary files are never parseable as documents and carry
-# needless risk, so they are refused up-front (before download) with a
-# clear ToolException. This is a deny-list of true binaries only — it
-# intentionally does NOT include script/code extensions (e.g. .sh, .bat,
-# .ps1) that are legitimately readable as text/code today.
+# needless risk, so they are refused up-front (before download) with the
+# same unsupported-file-type message the rest of the read pipeline uses.
+# This is a deny-list of true binaries only — it intentionally does NOT
+# include script/code extensions (e.g. .sh, .bat, .ps1) that are
+# legitimately readable as text/code today.
 BLOCKED_BINARY_EXTENSIONS = frozenset({
     # Windows executables / libraries
     ".exe", ".dll", ".com", ".scr", ".cpl", ".sys", ".drv", ".msi", ".msix",
@@ -52,10 +54,7 @@ def _reject_if_executable(path: str) -> None:
     """
     ext = os.path.splitext(path or "")[1].lower()
     if ext in BLOCKED_BINARY_EXTENSIONS:
-        raise ToolException(
-            f"Reading '{ext}' files is not supported. Executable and binary "
-            f"files (e.g. .exe, .dll, .bin) cannot be read as documents."
-        )
+        raise ToolException(UNSUPPORTED_FILE_TYPE_MESSAGE)
 
 
 # ------------------------------------------------------------------ #

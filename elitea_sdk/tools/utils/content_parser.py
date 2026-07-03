@@ -15,6 +15,14 @@ from ...runtime.utils.utils import IndexerKeywords
 
 logger = getLogger(__name__)
 
+# Single source of truth for the "unsupported file type" error so every read
+# path (parse_file_content, load_file_docs, the SharePoint read guard, ...)
+# surfaces the exact same message to users.
+UNSUPPORTED_FILE_TYPE_MESSAGE = (
+    "Not supported type of files entered. "
+    "Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only."
+)
+
 image_processing_prompt='''
 You are an AI model designed for analyzing images. Your task is to accurately describe the content of the given image. Depending on the type of image, follow these specific instructions:
 
@@ -91,8 +99,7 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
     )
 
     if not loader:
-        return ToolException(
-            "Not supported type of files entered. Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only.")
+        return ToolException(UNSUPPORTED_FILE_TYPE_MESSAGE)
 
     try:
         if hasattr(loader, 'get_content'):
@@ -134,8 +141,7 @@ def load_file_docs(file_name=None, file_content=None, is_capture_image: bool = F
         excel_by_sheets=excel_by_sheets
     )
     if not loader:
-        return ToolException(
-            "Not supported type of files entered. Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only.")
+        return ToolException(UNSUPPORTED_FILE_TYPE_MESSAGE)
     return loader.load()
 
 def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
