@@ -788,10 +788,12 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                   page_number: Optional[int] = None, sheet_name: Optional[str] = None,
                   excel_by_sheets: bool = False):
         """Reads file located at the specified server-relative path."""
+        file_name = path.split('/')[-1]
+
+        self._validate_file_extension(file_name)
         try:
             file_bytes = self.load_file_content_in_bytes(path)
-            file_name = path.split('/')[-1]
-            return parse_file_content(
+            result = parse_file_content(
                 file_name=file_name,
                 file_content=file_bytes,
                 is_capture_image=is_capture_image,
@@ -800,6 +802,13 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 excel_by_sheets=excel_by_sheets,
                 llm=self.llm,
             )
+            # parse_file_content returns (does not raise) a ToolException on
+            # failure. Raise it so the tool call is flagged as errored and the
+            # UI renders it as a proper (red) error, consistent with
+            # read_file_from_sharing_link.
+            if isinstance(result, ToolException):
+                raise result
+            return result
         except ToolException:
             raise
         except Exception as e:
@@ -2024,29 +2033,23 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         except DownloadError as e:
             raise ToolException(f"Failed to download file '{e.file_name}': {e.cause}") from e
 
-    def _validate_sharing_link_file(self, file_name: str, file_size: Optional[int]) -> None:
-        """Validate file type and size before downloading from sharing link.
+    def _validate_file_extension(self, file_name: str) -> None:
+        """Validate that a file's extension is supported and not dangerous.
+
+        Enforces only type/extension rules — callers apply their own size policy
+        separately (sharing links cap size, ``read_file`` does not). Produces the
+        same user-friendly messages the sharing-link path uses so unsupported
+        files surface a clear error instead of a raw decoder failure.
 
         Args:
-            file_name: Name of the file from Graph API metadata
-            file_size: Size of the file in bytes (may be None if unavailable)
+            file_name: Name of the file (with extension).
 
         Raises:
-            ToolException: If file type is unsupported or file is too large
+            ToolException: If the file has no extension, an unsupported
+                extension, or a suspicious intermediate (double) extension.
         """
         from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
 
-        max_size = self._max_size_for_file(file_name)
-        if file_size is not None and file_size > max_size:
-            raise ToolException(
-                _format_oversize_message(
-                    file_name, max_size,
-                    is_image=(max_size == self._SHARING_LINK_MAX_IMAGE_SIZE),
-                    actual_bytes=file_size,
-                )
-            )
-
-        # Check file extension against loaders_map
         ext = self._get_file_extension(file_name)
 
         if not ext:
@@ -2081,6 +2084,28 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         f"File '{file_name}' has suspicious double extension. "
                         f"Files with intermediate extensions like '{intermediate_ext}' are not allowed."
                     )
+
+    def _validate_sharing_link_file(self, file_name: str, file_size: Optional[int]) -> None:
+        """Validate file type and size before downloading from sharing link.
+
+        Args:
+            file_name: Name of the file from Graph API metadata
+            file_size: Size of the file in bytes (may be None if unavailable)
+
+        Raises:
+            ToolException: If file type is unsupported or file is too large
+        """
+        max_size = self._max_size_for_file(file_name)
+        if file_size is not None and file_size > max_size:
+            raise ToolException(
+                _format_oversize_message(
+                    file_name, max_size,
+                    is_image=(max_size == self._SHARING_LINK_MAX_IMAGE_SIZE),
+                    actual_bytes=file_size,
+                )
+            )
+
+        self._validate_file_extension(file_name)
 
     def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False) -> str:
         """Read a file from a SharePoint/OneDrive sharing link.
