@@ -155,15 +155,7 @@ ReadMultipleFilesInput = create_model(
 EditFileInput = create_model(
     "EditFileInput",
     file_path=(str, Field(description="Path to the file to edit. Must be a text file (markdown, txt, csv, json, xml, html, yaml, etc.)")),
-    file_query=(str, Field(description="""Edit instructions with OLD/NEW markers. Format:
-OLD <<<<
-old content to replace
->>>> OLD
-NEW <<<<
-new content
->>>> NEW
-
-Multiple OLD/NEW pairs can be provided for multiple edits.""", json_schema_extra={'multiline': True})),
+    file_query=(str, Field(description="Edit instructions using OLD/NEW marker pairs. Each pair must have an OLD block (opening line: 'OLD <<<<', closing line: '>>>> OLD') containing the exact text to replace, and a NEW block (opening line: 'NEW <<<<', closing line: '>>>> NEW') containing the replacement text. Markers must be on their own dedicated lines. Multiple OLD/NEW pairs are supported for multiple edits in a single call.", json_schema_extra={'multiline': True})),
     branch=(Optional[str], Field(description="Branch name. If None, uses active branch.", default=None)),
     commit_message=(Optional[str], Field(description="Commit message for the change (VCS toolkits only)", default=None)),
 )
