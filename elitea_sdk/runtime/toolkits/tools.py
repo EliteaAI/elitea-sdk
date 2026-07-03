@@ -938,7 +938,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 tool_handled = True
                 # MCP Config toolkit - pre-configured MCP servers (stdio or http)
                 # Handle both explicit 'mcp_config' type and dynamic names like 'mcp_playwright'
-                logger.info(f"Processing mcp_config toolkit: {tool}")
+                logger.info(f"Processing mcp_config toolkit: type={tool['type']}, name={tool.get('name')}, id={tool.get('id')}")
                 try:
                     settings = tool.get('settings', {})
 
@@ -949,7 +949,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         server_name = tool['type'][4:]  # Remove 'mcp_' prefix
 
                     if not server_name:
-                        logger.error(f"❌ No server_name found for mcp_config toolkit: {tool}")
+                        logger.error(f"❌ No server_name found for mcp_config toolkit: type={tool['type']}, name={tool.get('name')}, id={tool.get('id')}")
                         continue
 
                     if ignored_mcp_servers or user_declined_mcp_servers:
