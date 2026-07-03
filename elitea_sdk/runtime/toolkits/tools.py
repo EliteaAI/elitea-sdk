@@ -1150,8 +1150,8 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     ))
                     _mcp_auth_control_added = True
                 logger.info(
-                    "[Toolkit Auth] Deferred authorization for built-in toolkit '%s' with %d proxy tool(s)",
-                    _u_tool.get("type"), len(_proxies),
+                    "[Toolkit Auth] Deferred authorization for built-in toolkit with %d proxy tool(s)",
+                    len(_proxies),
                 )
     logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {_elitea_loaded_count} tools")
 
