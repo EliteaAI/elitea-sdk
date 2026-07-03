@@ -23,18 +23,21 @@ from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...runtime.utils.utils import IndexerKeywords
-from ..utils.content_parser import UNSUPPORTED_FILE_TYPE_MESSAGE
 
 # ------------------------------------------------------------------ #
-#  Read-safety: block executable / binary files                       #
+#  Read-safety: block executable / binary files (read_document only)  #
 # ------------------------------------------------------------------ #
-# read_document/read_file can target any file on the drive. Executable
-# and compiled-binary files are never parseable as documents and carry
+# read_document can target any file on the drive. Executable and
+# compiled-binary files are never parseable as documents and carry
 # needless risk, so they are refused up-front (before download) with the
-# same unsupported-file-type message the rest of the read pipeline uses.
-# This is a deny-list of true binaries only — it intentionally does NOT
-# include script/code extensions (e.g. .sh, .bat, .ps1) that are
-# legitimately readable as text/code today.
+# standard unsupported-file-type message. This is a deny-list of true
+# binaries only — it intentionally does NOT include script/code
+# extensions (e.g. .sh, .bat, .ps1) that are legitimately readable as
+# text/code today. Scoped to this tool; no shared pipeline changes.
+_UNSUPPORTED_FILE_TYPE_MESSAGE = (
+    "Not supported type of files entered. "
+    "Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only."
+)
 BLOCKED_BINARY_EXTENSIONS = frozenset({
     # Windows executables / libraries
     ".exe", ".dll", ".com", ".scr", ".cpl", ".sys", ".drv", ".msi", ".msix",
@@ -54,7 +57,7 @@ def _reject_if_executable(path: str) -> None:
     """
     ext = os.path.splitext(path or "")[1].lower()
     if ext in BLOCKED_BINARY_EXTENSIONS:
-        raise ToolException(UNSUPPORTED_FILE_TYPE_MESSAGE)
+        raise ToolException(_UNSUPPORTED_FILE_TYPE_MESSAGE)
 
 
 # ------------------------------------------------------------------ #
