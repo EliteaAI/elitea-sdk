@@ -800,15 +800,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 excel_by_sheets=excel_by_sheets,
                 llm=self.llm,
             )
-            # parse_file_content returns (does not raise) a ToolException when a
-            # file cannot be parsed - e.g. an unsupported binary like .mp4 that
-            # falls through to the text loader and fails to decode, producing a
-            # raw "chardet confidence too low ..." message. Replace it with a
-            # clean, user-facing error and RAISE it so the tool call is flagged
-            # as errored (rendered red in the UI, consistent with
-            # read_file_from_sharing_link). The raw decoder detail is kept in the
-            # server logs only. Text/code files with uncommon extensions decode
-            # successfully and never reach this branch, so they are unaffected.
             if isinstance(result, ToolException):
                 logging.error(
                     "Graph read_file could not parse '%s': %s", file_name, result)
