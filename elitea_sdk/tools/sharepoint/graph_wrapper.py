@@ -791,7 +791,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         try:
             file_bytes = self.load_file_content_in_bytes(path)
             file_name = path.split('/')[-1]
-            return parse_file_content(
+            result = parse_file_content(
                 file_name=file_name,
                 file_content=file_bytes,
                 is_capture_image=is_capture_image,
@@ -800,6 +800,18 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 excel_by_sheets=excel_by_sheets,
                 llm=self.llm,
             )
+            if isinstance(result, ToolException):
+                logging.error(
+                    "Graph read_file could not parse '%s': %s", file_name, result)
+                raise ToolException(
+                    f"Could not read '{file_name}'. The file type may be "
+                    f"unsupported or the file may be unreadable. Supported formats "
+                    f"include documents (PDF, DOCX, XLSX, PPTX), text files (TXT, "
+                    f"MD, CSV, JSON, HTML, XML), images (PNG, JPG, JPEG, GIF, WEBP, "
+                    f"BMP, SVG), and common code files. Archives (ZIP, RAR), media "
+                    f"(MP4, MP3), and executables are not supported."
+                )
+            return result
         except ToolException:
             raise
         except Exception as e:
