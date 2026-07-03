@@ -66,7 +66,7 @@ def normalize_app_type(app_type: str) -> str:
     """
     normalized = _APP_TYPE_ALIASES.get(app_type, APP_TYPE_AGENT)
     if app_type and app_type != normalized:
-        logger.debug(f"Normalized app_type '{app_type}' -> '{normalized}'")
+        logger.debug("Normalized app_type to canonical form")
     return normalized
 
 
@@ -410,7 +410,11 @@ class EliteAClient:
             "anthropic" in model_name_lower or "claude" in model_name_lower
         )
 
-        logger.debug(f"Creating {'ChatAnthropic' if is_anthropic else 'ChatOpenAI'} model: {model_name} with config: {model_config}")
+        logger.debug(
+            "Creating %s model (model_name_provided=%s)",
+            "ChatAnthropic" if is_anthropic else "ChatOpenAI",
+            bool(model_name),
+        )
 
         try:
             from tools import this  # pylint: disable=E0401,C0415
