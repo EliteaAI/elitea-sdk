@@ -53,8 +53,7 @@ def build_dynamic_application_schema(variables: list, app_name: str = "Applicati
                     default=default_value
                 ))
 
-        logger.info(f"[APP_SCHEMA] Built dynamic schema for '{app_name}' with {len(variables)} variables: "
-                   f"{[v.get('name') for v in variables if isinstance(v, dict)]}")
+        logger.info(f"[APP_SCHEMA] Built dynamic schema for '{app_name}' with {len(variables)} variables")
 
     # Create a unique model name based on the application name
     # Clean the name to be a valid Python identifier
@@ -158,6 +157,37 @@ class ApplicationToolkit(BaseToolkit):
             # Use standard endpoints for same-project access
             app_details = client.get_app_details(application_id)
             version_details = client.get_app_version_details(application_id, application_version_id)
+
+        # Resolve {{secret.xxx}} placeholders in MCP tool settings before passing to the SDK
+        _tools = version_details.get('tools')
+        if isinstance(_tools, list):
+            import re as _re
+            _secret_pat = _re.compile(r"\{\{secret\.([A-Za-z0-9_]+)\}\}")
+
+            def _resolve_secrets(val):
+                if isinstance(val, str):
+                    def _sub(m):
+                        try:
+                            resolved = client.unsecret(m.group(1))
+                            return resolved if resolved is not None else m.group(0)
+                        except Exception:
+                            return m.group(0)
+                    return _secret_pat.sub(_sub, val)
+                if isinstance(val, dict):
+                    return {k: _resolve_secrets(v) for k, v in val.items()}
+                if isinstance(val, list):
+                    return [_resolve_secrets(v) for v in val]
+                return val
+
+            resolved_tools = []
+            for _tool in _tools:
+                if (isinstance(_tool, dict) and isinstance(_tool.get('type'), str)
+                        and (_tool['type'] == 'mcp' or _tool['type'].startswith('mcp_'))
+                        and 'settings' in _tool):
+                    _tool = {**_tool, 'settings': _resolve_secrets(_tool['settings'])}
+                resolved_tools.append(_tool)
+            version_details = {**version_details, 'tools': resolved_tools}
+
         # Embedded sub-agents intentionally have null llm_settings; fall back to caller's LLM.
         llm_settings = version_details.get('llm_settings') or {}
         _model_name = llm_settings.get('model_name')
