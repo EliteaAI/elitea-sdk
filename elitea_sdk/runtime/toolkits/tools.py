@@ -1,3 +1,4 @@
+import contextvars
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -51,6 +52,35 @@ from .security import is_toolkit_blocked, is_tool_blocked, get_blocked_tools_for
 
 
 logger = logging.getLogger(__name__)
+
+
+# --- Application-tool recursion guard (issue #5680) ---
+# Loading an `application`-type tool recurses into ApplicationToolkit.get_toolkit ->
+# LangChainAssistant -> get_tools, which can re-enter this module for the nested agent.
+# Self/circular references (A->A, A->B->A) would otherwise recurse until Python raises
+# `maximum recursion depth exceeded`, emitting huge tracebacks in a tight loop.
+#
+# These ContextVars thread the current load path (set of (application_id,
+# application_version_id) pairs) and its depth through the recursion WITHOUT changing the
+# signatures of the intermediate modules it crosses (tools.py -> application.py -> client.py
+# -> assistant.py -> tools.py). ContextVars also propagate into the copied contexts used for
+# parallel sub-agent execution (see llm.py), so cycles are caught across the fan-out too.
+# Precedent: _PENDING_TOOL_MESSAGES in runtime/tools/llm.py.
+#
+# This guard enforces cycle-freedom and a runaway-depth backstop ONLY. It intentionally does
+# NOT enforce the "leaf-only" business rule (a subagent must not itself contain subagents) —
+# that lives in the backend/UI config layer where full agent_type info is available. The
+# backstop is deliberately generous so legitimate pipeline-of-pipelines composition is not
+# broken here; the crash is prevented by the cycle check, not the depth cap.
+_APP_LOAD_STACK: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    '_app_load_stack', default=frozenset(),
+)
+_APP_LOAD_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    '_app_load_depth', default=0,
+)
+# Anti-runaway backstop only — NOT the business nesting limit. Keep aligned with
+# MAX_SUB_AGENT_DEPTH in pylon_main elitea_core/utils/publish_utils.py.
+_MAX_APP_NESTING_BACKSTOP = 25
 
 
 class _DeferredMcpAuthInput(PydanticBaseModel):
@@ -675,6 +705,34 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                            f"agent_type={agent_type}, "
                            f"raw_settings={tool.get('settings')}")
 
+                # --- Cycle + runaway-depth guard (issue #5680) ---
+                # Refuse to re-enter an (application_id, application_version_id) already on the
+                # current load path, and cap absolute depth as a backstop. Fires BEFORE the
+                # recursive call, so a self/circular reference costs one clear log line instead
+                # of a Python `maximum recursion depth exceeded` and ~80-frame traceback.
+                app_key = (
+                    int(tool['settings']['application_id']),
+                    int(tool['settings']['application_version_id']),
+                )
+                load_stack = _APP_LOAD_STACK.get()
+                load_depth = _APP_LOAD_DEPTH.get()
+                if app_key in load_stack:
+                    logger.warning(
+                        f"Circular application reference detected: app {app_key[0]} "
+                        f"(v{app_key[1]}) already in load path {sorted(load_stack)} — "
+                        f"skipping tool '{tool.get('name', 'unknown')}'"
+                    )
+                    continue
+                if load_depth >= _MAX_APP_NESTING_BACKSTOP:
+                    logger.warning(
+                        f"Application nesting depth {load_depth} reached backstop "
+                        f"{_MAX_APP_NESTING_BACKSTOP} at app {app_key[0]} (v{app_key[1]}) — "
+                        f"skipping tool '{tool.get('name', 'unknown')}'"
+                    )
+                    continue
+
+                stack_token = _APP_LOAD_STACK.set(load_stack | {app_key})
+                depth_token = _APP_LOAD_DEPTH.set(load_depth + 1)
                 try:
                     tools.extend(ApplicationToolkit.get_toolkit(
                         elitea_client,
@@ -701,6 +759,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     # requires user action.
                     logger.error(f"Skipping application tool '{tool.get('name', 'unknown')}': {app_err}")
                     continue
+                finally:
+                    # Restore the load path on every exit (return, continue, or raise) so
+                    # sibling tools and the parent frame see the correct depth/stack.
+                    _APP_LOAD_STACK.reset(stack_token)
+                    _APP_LOAD_DEPTH.reset(depth_token)
             elif tool['type'] == 'memory':
                 tool_handled = True
                 memory_tools = MemoryToolkit.get_toolkit(
