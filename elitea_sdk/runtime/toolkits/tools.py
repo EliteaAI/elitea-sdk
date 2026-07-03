@@ -690,10 +690,14 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         fallback_llm=llm,  # Fallback for embedded sub-agents with null llm_settings
                         user_declined_mcp_servers=user_declined_mcp_servers,
                     ).get_tools())
+                except McpAuthorizationRequired:
+                    # OAuth authorization required by nested agent's toolkit — propagate so the
+                    # frontend error handler can emit the mcp_authorization_required event.
+                    raise
                 except Exception as app_err:
-                    # Gracefully skip application tools that fail to load (e.g., deleted agents,
-                    # or participants whose nested MCP requires auth — Application._run() rebuilds
-                    # the assistant on invocation, so init-time failures are non-fatal).
+                    # Gracefully skip application tools that fail to load (e.g., deleted agents).
+                    # McpAuthorizationRequired is re-raised above as it is never transient and
+                    # requires user action.
                     logger.error(f"Skipping application tool '{tool.get('name', 'unknown')}': {app_err}")
                     continue
             elif tool['type'] == 'memory':
