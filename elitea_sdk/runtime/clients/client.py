@@ -410,7 +410,11 @@ class EliteAClient:
             "anthropic" in model_name_lower or "claude" in model_name_lower
         )
 
-        logger.debug(f"Creating {'ChatAnthropic' if is_anthropic else 'ChatOpenAI'} model: {model_name}")
+        logger.debug(
+            "Creating %s model (model_name_provided=%s)",
+            "ChatAnthropic" if is_anthropic else "ChatOpenAI",
+            bool(model_name),
+        )
 
         try:
             from tools import this  # pylint: disable=E0401,C0415
