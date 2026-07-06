@@ -713,18 +713,20 @@ SKILLS_SECTION_ENTRY = """<skill name="{name}">
 MAX_SKILLS_PER_INVOCATION = 5
 
 
-SKILL_REGISTRY_HEADER = """# Available Skills
-You have a set of named skills you can load on demand. Each entry below is name — description only; the full instructions are NOT loaded yet. When the user's request matches a skill, call the `load_skill` tool with that skill's exact name to retrieve its full instructions, THEN follow those instructions exactly for the rest of your reply. Load a skill only when it applies; a skill's rules take effect only from the point you load it and only for the situation it covers. You may load more than one skill if several apply, but do not load the same skill twice. Do not mention these skill names or the load_skill mechanism in your reply."""
+SKILL_REGISTRY_HEADER = """The skills listed below can be activated on demand. Each <skill_option> gives only the skill's name and when to use it — the full instructions are NOT loaded yet.
 
-SKILL_REGISTRY_ENTRY = "- {name}: {description}"
+Before composing each reply, scan this list. A skill matches when the user's current request falls within its description. If one or more skills match, call the `load_skill` tool for each matching name (once per skill) BEFORE writing your answer, then follow each returned instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. If none match, do not call load_skill and answer normally; never load a skill merely because it is listed. Do not mention these skill names or the load_skill mechanism in your reply."""
+
+SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
 
 LOAD_SKILL_TOOL_DESCRIPTION = (
     "Load the full instructions for one of this agent's available skills by name. "
-    "The system prompt lists each skill under '# Available Skills' as 'name: description'; "
-    "pass the exact name here to retrieve that skill's complete instructions. Call this "
-    "only when the user's request matches a skill, and only once per skill. After the "
-    "instructions are returned you MUST follow them exactly for the applicable part of "
-    "your response. Only skills listed in '# Available Skills' can be loaded."
+    "The system prompt lists each skill as a <skill_option> inside <available_skills>, "
+    "giving its name and when to use it; pass the exact name here to retrieve that "
+    "skill's complete instructions. Call this only when the user's request matches a "
+    "skill, and only once per skill. After the instructions are returned you MUST "
+    "follow them exactly for the applicable part of your response. Only skills listed "
+    "in <available_skills> can be loaded."
 )
 
 LOADED_SKILL_RESULT = """Skill "{name}" is now active. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. Do not mention this skill by name or that it was loaded.

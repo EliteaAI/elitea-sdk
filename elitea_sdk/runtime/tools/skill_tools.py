@@ -97,10 +97,13 @@ def render_skill_registry_index(attached_skills) -> str:
     )
     entries = [
         SKILL_REGISTRY_ENTRY.format(
-            name=s.get('name'),
-            description=(s.get('description') or '').strip() or '(no description)',
+            name=' '.join(str(s.get('name') or '').split()),
+            description=' '.join(str(s.get('description') or '').split()) or '(no description)',
         )
         for s in ordered
     ]
     logger.info("[Skills] Rendered registry index with %d skills into cached prefix", len(ordered))
-    return SKILL_REGISTRY_HEADER + "\n\n" + "\n".join(entries)
+    return (
+        "<available_skills>\n" + SKILL_REGISTRY_HEADER + "\n\n"
+        + "\n".join(entries) + "\n</available_skills>"
+    )
