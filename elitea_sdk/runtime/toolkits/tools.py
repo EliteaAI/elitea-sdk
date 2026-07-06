@@ -718,16 +718,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 load_depth = _APP_LOAD_DEPTH.get()
                 if app_key in load_stack:
                     logger.warning(
-                        f"Circular application reference detected: app {app_key[0]} "
-                        f"(v{app_key[1]}) already in load path {sorted(load_stack)} — "
-                        f"skipping tool '{tool.get('name', 'unknown')}'"
+                        "Circular application reference detected; skipping nested application tool."
                     )
                     continue
                 if load_depth >= _MAX_APP_NESTING_BACKSTOP:
                     logger.warning(
                         f"Application nesting depth {load_depth} reached backstop "
-                        f"{_MAX_APP_NESTING_BACKSTOP} at app {app_key[0]} (v{app_key[1]}) — "
-                        f"skipping tool '{tool.get('name', 'unknown')}'"
+                        f"{_MAX_APP_NESTING_BACKSTOP}; skipping nested application tool."
                     )
                     continue
 
