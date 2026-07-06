@@ -10,7 +10,7 @@ cached prefix.
 import logging
 import re
 from typing import List, Optional
-from xml.sax.saxutils import escape as _xml_escape
+from xml.sax.saxutils import escape as xml_escape
 
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.tools import BaseTool
@@ -126,8 +126,8 @@ def render_skill_registry_index(attached_skills) -> str:
     # a defensive no-op and never diverges from the loadable name.
     entries = [
         SKILL_REGISTRY_ENTRY.format(
-            name=_xml_escape(' '.join(str(s.get('name') or '').split()), {'"': '&quot;'}),
-            description=_xml_escape(
+            name=xml_escape(' '.join(str(s.get('name') or '').split()), {'"': '&quot;'}),
+            description=xml_escape(
                 ' '.join(str(s.get('description') or '').split()) or '(no description)'
             ),
         )

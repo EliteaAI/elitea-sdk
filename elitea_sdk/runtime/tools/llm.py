@@ -631,7 +631,7 @@ class LLMNode(BaseTool):
             configurable.get('attached_skills'), configurable.get('invoked_skills')
         )
 
-        def _with_skill_tools(tools):
+        def merge_skill_tools(tools):
             # Duplicate tool names in the bind list are rejected by Anthropic; if
             # another toolkit already claims the name, the pre-existing tool wins
             # (additive principle) and progressive disclosure is skipped this turn.
@@ -658,7 +658,7 @@ class LLMNode(BaseTool):
             # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
             # This ensures Planner tools are available even on first message when
             # Smart Tools Selection finds matching toolkits.
-            return _with_skill_tools(list(selected_tools) + list(self.always_bind_tools or []))
+            return merge_skill_tools(list(selected_tools) + list(self.always_bind_tools or []))
 
         # Check if lazy tools mode is enabled and we have a registry
         if self.lazy_tools_mode and self.tool_registry is not None:
@@ -671,8 +671,8 @@ class LLMNode(BaseTool):
                     f"{len(self.always_bind_tools)} always-bind tools: "
                     f"{[t.name for t in self.always_bind_tools]}"
                 )
-                return _with_skill_tools(combined_tools)
-            return _with_skill_tools(list(meta_tools))
+                return merge_skill_tools(combined_tools)
+            return merge_skill_tools(list(meta_tools))
 
         # Traditional mode - bind actual tools
         # Fix for #3382: Include always_bind_tools even when lazy mode is disabled
@@ -706,7 +706,7 @@ class LLMNode(BaseTool):
                 )
                 base_tools.extend(additional_tools)
 
-        return _with_skill_tools(base_tools)
+        return merge_skill_tools(base_tools)
 
     def _get_meta_tools(self) -> List[BaseTool]:
         """
