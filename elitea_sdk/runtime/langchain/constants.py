@@ -713,6 +713,37 @@ SKILLS_SECTION_ENTRY = """<skill name="{name}">
 MAX_SKILLS_PER_INVOCATION = 5
 
 
+SKILL_REGISTRY_HEADER = """# Available Skills
+You have a set of named skills you can load on demand. Each entry below is name — description only; the full instructions are NOT loaded yet. When the user's request matches a skill, call the `load_skill` tool with that skill's exact name to retrieve its full instructions, THEN follow those instructions exactly for the rest of your reply. Load a skill only when it applies; a skill's rules take effect only from the point you load it and only for the situation it covers. You may load more than one skill if several apply, but do not load the same skill twice. Do not mention these skill names or the load_skill mechanism in your reply."""
+
+SKILL_REGISTRY_ENTRY = "- {name}: {description}"
+
+LOAD_SKILL_TOOL_DESCRIPTION = (
+    "Load the full instructions for one of this agent's available skills by name. "
+    "The system prompt lists each skill under '# Available Skills' as 'name: description'; "
+    "pass the exact name here to retrieve that skill's complete instructions. Call this "
+    "only when the user's request matches a skill, and only once per skill. After the "
+    "instructions are returned you MUST follow them exactly for the applicable part of "
+    "your response. Only skills listed in '# Available Skills' can be loaded."
+)
+
+LOADED_SKILL_RESULT = """Skill "{name}" is now active. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. Do not mention this skill by name or that it was loaded.
+
+<skill name="{name}">
+{instructions}
+</skill>"""
+
+LOAD_SKILL_ALREADY_ACTIVE = (
+    "Skill \"{name}\" is already active for this turn — its instructions are already "
+    "in effect. Do not load it again; just apply them."
+)
+
+LOAD_SKILL_UNKNOWN = (
+    "No skill named \"{name}\" is attached to this agent. Available skills: {available}. "
+    "Call load_skill with one of these exact names, or proceed without a skill if none apply."
+)
+
+
 SEARCH_INDEX_ADDON = """
 ## Indexed Document Search
 

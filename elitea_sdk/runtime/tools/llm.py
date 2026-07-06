@@ -29,6 +29,7 @@ from ..langchain.utils import (
 )
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from .skill_tools import build_load_skill_tools, render_skill_registry_index
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
 
@@ -618,17 +619,22 @@ class LLMNode(BaseTool):
         Returns:
             List of filtered tools (or meta-tools + always-bind tools in lazy mode)
         """
+        configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
+        # Progressive-disclosure load_skill tool, rebuilt each turn so it closes over
+        # the current attached_skills/invoked_skills (empty ⇒ [] ⇒ no tool bound).
+        skill_tools = build_load_skill_tools(
+            configurable.get('attached_skills'), configurable.get('invoked_skills')
+        )
+
         # Check for dynamically selected tools from pre-LLM selection
-        if config is not None:
-            configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
-            selected_tools = configurable.get('selected_tools')
-            if selected_tools:
-                logger.info(f"[DynamicToolSelection] Using {len(selected_tools)} pre-selected tools")
-                # Fix for #3290: Always include always_bind_tools (e.g., Planner tools) with
-                # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
-                # This ensures Planner tools are available even on first message when
-                # Smart Tools Selection finds matching toolkits.
-                return list(selected_tools) + list(self.always_bind_tools or [])
+        selected_tools = configurable.get('selected_tools')
+        if selected_tools:
+            logger.info(f"[DynamicToolSelection] Using {len(selected_tools)} pre-selected tools")
+            # Fix for #3290: Always include always_bind_tools (e.g., Planner tools) with
+            # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
+            # This ensures Planner tools are available even on first message when
+            # Smart Tools Selection finds matching toolkits.
+            return list(selected_tools) + list(self.always_bind_tools or []) + skill_tools
 
         # Check if lazy tools mode is enabled and we have a registry
         if self.lazy_tools_mode and self.tool_registry is not None:
@@ -641,8 +647,8 @@ class LLMNode(BaseTool):
                     f"{len(self.always_bind_tools)} always-bind tools: "
                     f"{[t.name for t in self.always_bind_tools]}"
                 )
-                return combined_tools
-            return meta_tools
+                return combined_tools + skill_tools
+            return list(meta_tools) + skill_tools
 
         # Traditional mode - bind actual tools
         # Fix for #3382: Include always_bind_tools even when lazy mode is disabled
@@ -676,7 +682,7 @@ class LLMNode(BaseTool):
                 )
                 base_tools.extend(additional_tools)
 
-        return base_tools
+        return base_tools + skill_tools
 
     def _get_meta_tools(self) -> List[BaseTool]:
         """
@@ -1100,6 +1106,16 @@ class LLMNode(BaseTool):
                 system_content = f"{system_content}\n\n{tool_index}"
                 logger.debug("[LazyTools] Injected tool index into system prompt")
 
+            # Progressive-disclosure skill registry index → CACHED static prefix.
+            # Ungated by lazy_tools_mode: the registry belongs in the cached block
+            # regardless of tool mode. Rendered in a fixed (skill_id, name) order so
+            # block 1 stays byte-stable across turns and never busts the cache.
+            skill_registry = render_skill_registry_index(configurable.get('attached_skills'))
+            if skill_registry:
+                system_content = (
+                    f"{system_content}\n\n{skill_registry}" if system_content else skill_registry
+                )
+
             # Per-turn skills injection. elitea_core resolves the
             # ~skill-name token(s) from THIS user message and threads the resolved bodies
             # through invoke_config["configurable"]["invoked_skills"]. The rendered SKILLS
@@ -1231,7 +1247,8 @@ class LLMNode(BaseTool):
         should_bind_tools = (
             len(self.tool_names or []) > 0 or
             (self.lazy_tools_mode and self.tool_registry is not None) or
-            bool(self.available_tools)  # Bind available tools even when lazy mode auto-disabled
+            bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
+            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
         )
 
         if should_bind_tools:

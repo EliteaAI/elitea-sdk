@@ -397,6 +397,7 @@ class Application(BaseTool):
             parent_configurable.pop('selected_tools', None)
             parent_configurable.pop('selected_toolkits', None)
             parent_configurable.pop('invoked_skills', None)
+            parent_configurable.pop('attached_skills', None)
             if self.client and self.args_runnable:
                 # Standalone child runs as a root graph with its own checkpointer.
                 # Strip ALL parent pregel internals so the child doesn't inherit
