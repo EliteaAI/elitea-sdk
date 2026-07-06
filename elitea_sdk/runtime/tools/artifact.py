@@ -53,6 +53,12 @@ BASIC_CREATE_FILEDATA_DESCRIPTION = (
 
 BASIC_APPEND_FILEDATA_DESCRIPTION = "Stringified content to append"
 
+# skip_size_check is deprecated (Epic #5431): accepted-but-inert on the read tools.
+SKIP_SIZE_CHECK_DEPRECATION_MSG = (
+    "skip_size_check is deprecated and now inert; the size guard always applies. "
+    "Use start_line/end_line (or get_file_metadata + extra_params) for large files."
+)
+
 
 class ArtifactWrapper(NonCodeIndexerToolkit):
     bucket: str
@@ -65,7 +71,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         bucket_name: str = None,
         offset: Optional[int] = None,
         limit: Optional[int] = None,
-        skip_size_check: bool = True
+        skip_size_check: bool = None
     ) -> dict:
         """
         Read multiple files in batch from an artifact bucket.
@@ -75,11 +81,14 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             bucket_name: Bucket name. If not provided, uses toolkit-configured default bucket.
             offset: Starting line number for all files (1-indexed)
             limit: Number of lines to read from offset for all files
-            skip_size_check: If True, skip content size limit check and return full content
+            skip_size_check: Deprecated and inert; the size guard always applies per file.
 
         Returns:
             Dict mapping file paths to their content
         """
+        if skip_size_check is True:
+            logging.warning(SKIP_SIZE_CHECK_DEPRECATION_MSG)
+
         results = {}
 
         # Convert offset/limit to start_line/end_line for read_file
@@ -90,12 +99,10 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             try:
                 if path.startswith('/'):
                     content = self.read_file(filepath=path, bucket_name=bucket_name,
-                                            start_line=start_line, end_line=end_line,
-                                            skip_size_check=skip_size_check)
+                                            start_line=start_line, end_line=end_line)
                 else:
                     content = self.read_file(filename=path, bucket_name=bucket_name,
-                                            start_line=start_line, end_line=end_line,
-                                            skip_size_check=skip_size_check)
+                                            start_line=start_line, end_line=end_line)
                 results[path] = content
             except Exception as e:
                 results[path] = f"Error reading file: {str(e)}"
@@ -225,10 +232,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 description="Number of lines to read from offset for all files",
                 default=None,
                 ge=1
-            )),
-            skip_size_check=(bool, Field(
-                description="If True, skip content size limit check and return full file content.",
-                default=True
             )),
         )
 
@@ -488,8 +491,9 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                   filepath: str = None,
                   start_line: int = None,
                   end_line: int = None,
-                  skip_size_check: bool = True,
-                  extra_params: str = None):
+                  skip_size_check: bool = None,
+                  extra_params: str = None,
+                  _bypass_size_limit: bool = False):
         """
         Read a file from the artifact bucket.
         
@@ -511,7 +515,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             filepath: Full path in /{bucket}/{filename} format (alternative to filename+bucket_name)
             start_line: Starting line number (1-indexed, inclusive) for partial read
             end_line: Ending line number (1-indexed, inclusive) for partial read
-            skip_size_check: If True, skip content size limit check and return full content
+            skip_size_check: Deprecated and inert; the size guard always applies.
             extra_params: JSON-encoded string of per-file-type options
                 discovered via ``get_file_metadata`` (e.g.
                 ``{"sheet_name": "Sheet1", "start_row": 1, "end_row": 100}``).
@@ -519,6 +523,9 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         Returns:
             File content or error message if content exceeds size limit
         """
+        if skip_size_check is True:
+            logging.warning(SKIP_SIZE_CHECK_DEPRECATION_MSG)
+
         # Handle filepath parameter - extract bucket and filename
         if filepath:
             try:
@@ -581,8 +588,9 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                     "end_row inside extra_params for row-based slicing."
                 )
 
-        # Check content size limit (after slicing if applicable)
-        if not skip_size_check and isinstance(content, str) and len(content) > self.max_single_read_size:
+        # Check content size limit (after slicing if applicable).
+        # Guard always applies for LLM/pipeline calls; only internal callers bypass it.
+        if not _bypass_size_limit and isinstance(content, str) and len(content) > self.max_single_read_size:
             line_count = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
             if start_line is not None or end_line is not None:
                 return f"[Content ({line_count} lines) still exceeds size limit. Use smaller range.]"
@@ -610,7 +618,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         Returns:
             File content as string
         """
-        return self.read_file(filename=file_path, bucket_name=bucket_name, skip_size_check=True)
+        return self.read_file(filename=file_path, bucket_name=bucket_name, _bypass_size_limit=True)
     
     def _write_file(
         self,
@@ -965,9 +973,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                     sheet_name=(Optional[str], Field(
                         description="Specifies which sheet to read. If it is None, then full document will be read.",
                         default=None)),
-                    skip_size_check=(bool, Field(
-                        description="If True, skip content size limit check and return full file content.",
-                        default=True)),
                     extra_params=(Optional[str], Field(
                         description=(
                             "JSON-encoded string of per-file-type options. "
