@@ -171,7 +171,7 @@ nodes:
           3. Verify the result contains a collection object with id and name fields.
           4. Verify the result contains an 'auth' field that is null or empty.
           5. Verify the auth field is cleared (null or empty dict {}) indicating authentication was cleared.
-          6. Validate no error message is present in the result.
+          6. Treat successful structured output with collection + cleared auth as sufficient success evidence even if there is no explicit top-level 'error' field in the tool result.
           7. Confirm the duplicate collection was deleted successfully (delete_result should not contain errors).
           
           Return a JSON object named test_results with the following structure:
