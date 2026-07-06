@@ -31,7 +31,7 @@ from ..utils.mcp_oauth import (
     normalize_mcp_url,
 )
 from ...tools.utils import clean_string
-from ..utils.utils import safe_config_summary
+from ..utils.utils import safe_config_summary, mask_secret
 from elitea_sdk.tools import _inject_toolkit_id, _inject_display_metadata, _patch_tool_invoke
 
 # Human-readable display names for all internal tools.
@@ -88,6 +88,41 @@ def _infer_proxy_tool_names(tool: dict, settings: dict) -> List[str]:
         or "server"
     )
     return [f"mcp_authorize_{_safe_tool_name(str(fallback_label))}"]
+
+
+def _build_provided_settings(settings: dict) -> Optional[Dict[str, Any]]:
+    """Build a masked provided_settings dict from toolkit settings containing OAuth client credentials."""
+    _client_id = settings.get('client_id')
+    _client_secret = settings.get('client_secret')
+    if not _client_id and not _client_secret:
+        return None
+    _ps: Dict[str, Any] = {}
+    if _client_id:
+        _ps['mcp_client_id'] = _client_id
+    if _client_secret:
+        _sv = (
+            _client_secret.get_secret_value()
+            if hasattr(_client_secret, 'get_secret_value')
+            else str(_client_secret)
+        )
+        _ps['mcp_client_secret'] = mask_secret(_sv)
+    _scopes = settings.get('scopes')
+    if _scopes:
+        _ps['scopes'] = _scopes
+    return _ps or None
+
+
+def _annotate_mcp_auth_error(auth_err: Any, tool: dict) -> None:
+    """Attach toolkit_type, toolkit_id, and provided_settings to a McpAuthorizationRequired exception."""
+    auth_err.toolkit_type = tool['type']
+    if not getattr(auth_err, 'toolkit_id', None):
+        _tid = tool.get('id')
+        if _tid is not None:
+            auth_err.toolkit_id = _tid
+    if not getattr(auth_err, 'provided_settings', None):
+        _ps = _build_provided_settings(tool.get('settings') or {})
+        if _ps:
+            auth_err.provided_settings = _ps
 
 
 def _build_deferred_mcp_auth_tools(
@@ -462,6 +497,34 @@ def _make_mcp_auth_control_tool(
                 exc.server_url = normalized_url
             if not getattr(exc, "tool_name", None):
                 exc.tool_name = tool_name or ""
+            # Attach pre-configured credentials and toolkit_id if not already set
+            if not getattr(exc, 'provided_settings', None) or not getattr(exc, 'toolkit_id', None):
+                for _tc in tool_configs:
+                    if not isinstance(_tc, dict):
+                        continue
+                    _tc_settings = _tc.get('settings') or {}
+                    _tc_url = (
+                        _tc_settings.get('url')
+                        or (_tc_settings.get('server_config') or {}).get('url')
+                    )
+                    if _tc_url and _is_http_url(_tc_url):
+                        try:
+                            _tc_canonical = canonical_resource(normalize_mcp_url(_tc_url))
+                        except Exception:
+                            _tc_canonical = _tc_url
+                        if _tc_canonical != normalized_url:
+                            continue
+                    elif _tc_url:
+                        continue
+                    if not getattr(exc, 'toolkit_id', None):
+                        _tid = _tc.get('id')
+                        if _tid is not None:
+                            exc.toolkit_id = _tid
+                    if not getattr(exc, 'provided_settings', None):
+                        _ps = _build_provided_settings(_tc_settings)
+                        if _ps:
+                            exc.provided_settings = _ps
+                    break
             raise
         except Exception as exc:
             logger.warning("[MCP Auth] mcp_auth_control discovery failed for %s: %s", normalized_url, exc)
@@ -836,7 +899,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             message="MCP server skipped by user",
                             server_url=canonical_url or url,
                         )
-                        _fake_auth_err.toolkit_type = tool.get('type', 'mcp')
+                        _annotate_mcp_auth_error(_fake_auth_err, tool)
                         _declined_proxies = _build_deferred_mcp_auth_tools(
                             tool, _fake_auth_err, mcp_tokens=mcp_tokens, force_declined=True
                         )
@@ -909,7 +972,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         client=elitea_client,
                         **settings).get_tools()
                 except McpAuthorizationRequired as auth_err:
-                    auth_err.toolkit_type = tool['type']
+                    _annotate_mcp_auth_error(auth_err, tool)
                     _is_pipeline_node = (
                         pipeline_node_toolkit_names is not None
                         and tool.get('toolkit_name', '') in pipeline_node_toolkit_names
@@ -1002,7 +1065,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                 message="MCP server skipped by user",
                                 server_url=_fake_skip_url,
                             )
-                            _fake_auth_err.toolkit_type = tool.get('type', 'mcp_config')
+                            _annotate_mcp_auth_error(_fake_auth_err, tool)
                             _declined_proxies = _build_deferred_mcp_auth_tools(
                                 tool, _fake_auth_err, mcp_tokens=mcp_tokens, force_declined=True
                             )
@@ -1039,7 +1102,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     tools.extend(toolkit_tools)
                     logger.info(f"✅ Successfully added {len(toolkit_tools)} tools from McpConfigToolkit ({server_name})")
                 except McpAuthorizationRequired as auth_err:
-                    auth_err.toolkit_type = tool['type']
+                    _annotate_mcp_auth_error(auth_err, tool)
                     _is_pipeline_node = (
                         pipeline_node_toolkit_names is not None
                         and tool.get('toolkit_name', '') in pipeline_node_toolkit_names
