@@ -141,6 +141,35 @@ class TestExtractJsonContentEmbedded:
 
 
 # ---------------------------------------------------------------------------
+# extract_json_content: body-only object repair (Anthropic prefill-less)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJsonContentBodyOnly:
+    """Anthropic extended thinking disables assistant prefill, so the model
+    can emit an object *body* — ``"key": val, ...}`` — without the leading
+    ``{``. extract_json_content must prepend the missing brace and parse."""
+
+    def test_body_only_single_field(self):
+        assert extract_json_content('"a": 1}') == {"a": 1}
+
+    def test_body_only_multiple_fields(self):
+        result = extract_json_content('"name": "test", "count": 3}')
+        assert result == {"name": "test", "count": 3}
+
+    def test_body_only_with_leading_whitespace(self):
+        assert extract_json_content('  \n  "x": true}  ') == {"x": True}
+
+    def test_body_only_repair_skipped_when_brace_present(self):
+        """The heuristic requires ``{`` to be absent — a nested body-only
+        object with an inner ``{`` falls through to _find_json_bounds and
+        yields the first balanced object (not the intended repair). This
+        limitation is intentional: body-only repair must not double-brace
+        already-braced input."""
+        assert extract_json_content('prefix {"a": 1}') == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
 # extract_json_content: error cases
 # ---------------------------------------------------------------------------
 

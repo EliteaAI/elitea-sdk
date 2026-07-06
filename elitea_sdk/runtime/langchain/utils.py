@@ -239,6 +239,15 @@ def extract_json_content(text: str) -> dict | list:
                         pass
                     break
 
+    # Repair: body-only object. Anthropic extended thinking disables assistant
+    # prefill, so the model emits '"key": val, ...}' without its leading '{'.
+    stripped = clean.strip()
+    if stripped.endswith('}') and '{' not in stripped and '":' in stripped:
+        try:
+            return json.loads('{' + stripped)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     raise ValueError('Cannot extract JSON from text')
 
 
