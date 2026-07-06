@@ -72,11 +72,12 @@ logger = logging.getLogger(__name__)
 # that lives in the backend/UI config layer where full agent_type info is available. The
 # backstop is deliberately generous so legitimate pipeline-of-pipelines composition is not
 # broken here; the crash is prevented by the cycle check, not the depth cap.
+# The load path itself is the single source of truth: a key is added only when it is not
+# already present, so the current nesting depth is exactly len(_APP_LOAD_STACK). No separate
+# depth ContextVar is needed (it would always equal the stack size and be one more thing to
+# keep in sync).
 _APP_LOAD_STACK: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
     '_app_load_stack', default=frozenset(),
-)
-_APP_LOAD_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
-    '_app_load_depth', default=0,
 )
 # Anti-runaway backstop only — NOT the business nesting limit. Keep aligned with
 # MAX_SUB_AGENT_DEPTH in pylon_main elitea_core/utils/publish_utils.py.
@@ -715,7 +716,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     int(tool['settings']['application_version_id']),
                 )
                 load_stack = _APP_LOAD_STACK.get()
-                load_depth = _APP_LOAD_DEPTH.get()
+                load_depth = len(load_stack)  # depth == number of ancestors on the load path
                 if app_key in load_stack:
                     logger.warning(
                         "Circular application reference detected; skipping nested application tool."
@@ -729,7 +730,6 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     continue
 
                 stack_token = _APP_LOAD_STACK.set(load_stack | {app_key})
-                depth_token = _APP_LOAD_DEPTH.set(load_depth + 1)
                 try:
                     tools.extend(ApplicationToolkit.get_toolkit(
                         elitea_client,
@@ -760,7 +760,6 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     # Restore the load path on every exit (return, continue, or raise) so
                     # sibling tools and the parent frame see the correct depth/stack.
                     _APP_LOAD_STACK.reset(stack_token)
-                    _APP_LOAD_DEPTH.reset(depth_token)
             elif tool['type'] == 'memory':
                 tool_handled = True
                 memory_tools = MemoryToolkit.get_toolkit(

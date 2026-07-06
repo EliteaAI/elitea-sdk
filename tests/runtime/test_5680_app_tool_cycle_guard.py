@@ -157,11 +157,14 @@ def test_deep_noncyclic_chain_trips_backstop(caplog):
 
 
 def test_contextvars_restored_after_load(caplog):
-    """The load-path ContextVars must return to their defaults after get_tools completes."""
+    """The load-path ContextVar must return to its default after get_tools completes.
+
+    The load stack is the single source of truth (depth == len(stack)), so restoring the stack
+    to empty restores the depth to zero too.
+    """
     registry = {(1, 1): [_app_tool(2, 2, 'b')], (2, 2): []}
     with patch.object(tools_mod.ApplicationToolkit, 'get_toolkit',
                       _make_fake_get_toolkit(registry)):
         get_tools([_app_tool(1, 1, 'a')], elitea_client=_client())
 
     assert tools_mod._APP_LOAD_STACK.get() == frozenset()
-    assert tools_mod._APP_LOAD_DEPTH.get() == 0
