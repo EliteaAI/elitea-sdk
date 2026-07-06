@@ -186,6 +186,7 @@ class McpAuthorizationRequired(ToolException):
             "status": self.status,
             "tool_name": self.tool_name,
             "toolkit_type": self.toolkit_type,
+            "toolkit_id": getattr(self, "toolkit_id", None),
         }
 
 
