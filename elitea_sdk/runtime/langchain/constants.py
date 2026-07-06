@@ -1,3 +1,5 @@
+import re
+
 DEFAULT_MULTIMODAL_PROMPT = """
 ## Image Type: Diagrams (e.g., Sequence Diagram, Context Diagram, Component Diagram)
 **Prompt**:
@@ -723,13 +725,20 @@ LOAD_SKILL_TOOL_DESCRIPTION = (
     "Load the full instructions for one of this agent's available skills by name. "
     "The system prompt lists each skill as a <skill_option> inside <available_skills>, "
     "giving its name and when to use it; pass the exact name here to retrieve that "
-    "skill's complete instructions. Call this only when the user's request matches a "
-    "skill, and only once per skill. After the instructions are returned you MUST "
+    "skill's complete instructions. Call this for every skill whose description "
+    "matches the user's request — if you are unsure whether a skill matches, load "
+    "it — but only once per skill. After the instructions are returned you MUST "
     "follow them exactly for the applicable part of your response. Only skills listed "
     "in <available_skills> can be loaded."
 )
 
-LOADED_SKILL_RESULT = """Skill "{name}" is now active. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. In later turns, apply them only when the request again falls within this skill's scope. Do not mention this skill by name or that it was loaded.
+LOADED_SKILL_PREFIX = 'Skill "{name}" is now active'
+
+LOADED_SKILL_PREFIX_RE = re.compile(
+    '^' + re.escape(LOADED_SKILL_PREFIX).replace(re.escape('{name}'), '([^"]+)')
+)
+
+LOADED_SKILL_RESULT = LOADED_SKILL_PREFIX + """. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. In later turns, apply them only when the request again falls within this skill's scope. Do not mention this skill by name or that it was loaded.
 
 <skill name="{name}">
 {instructions}

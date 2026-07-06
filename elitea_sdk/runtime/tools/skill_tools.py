@@ -8,7 +8,6 @@ cached prefix.
 """
 
 import logging
-import re
 from typing import List, Optional
 from xml.sax.saxutils import escape as xml_escape
 
@@ -20,16 +19,13 @@ from ..langchain.constants import (
     LOAD_SKILL_ALREADY_ACTIVE,
     LOAD_SKILL_TOOL_DESCRIPTION,
     LOAD_SKILL_UNKNOWN,
+    LOADED_SKILL_PREFIX_RE,
     LOADED_SKILL_RESULT,
     SKILL_REGISTRY_ENTRY,
     SKILL_REGISTRY_HEADER,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# Anchored on the fixed prefix of LOADED_SKILL_RESULT (constants.py) — keep in sync.
-_LOADED_SKILL_PREFIX_RE = re.compile(r'^Skill "([^"]+)" is now active')
 
 
 def loaded_skill_names_from_messages(messages) -> set:
@@ -41,7 +37,7 @@ def loaded_skill_names_from_messages(messages) -> set:
     for message in messages or []:
         content = getattr(message, 'content', None)
         if getattr(message, 'type', '') == 'tool' and isinstance(content, str):
-            match = _LOADED_SKILL_PREFIX_RE.match(content)
+            match = LOADED_SKILL_PREFIX_RE.match(content)
             if match:
                 names.add(match.group(1).strip().lower())
     return names
@@ -64,7 +60,7 @@ class LoadSkillTool(BaseTool):
         "toolkit_name": "skills",
         "display_name": "Skills",
     }
-    _served: set = PrivateAttr(default_factory=set)
+    _already_loaded: set = PrivateAttr(default_factory=set)
 
     def _load(self, skill: str) -> str:
         query = (skill or '').strip()
@@ -89,17 +85,17 @@ class LoadSkillTool(BaseTool):
         if matched.get('skill_id') in invoked_ids or (name or '').strip().lower() in invoked_names:
             logger.info("[Skills] load_skill %r already active via ~name", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
-        if (name or '').strip().lower() in self._served:
+        if (name or '').strip().lower() in self._already_loaded:
             logger.info("[Skills] load_skill %r already loaded in this conversation", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
-        self._served.add((name or '').strip().lower())
+        self._already_loaded.add((name or '').strip().lower())
         logger.info("[Skills] load_skill served %r", name)
         return LOADED_SKILL_RESULT.format(name=name, instructions=matched.get('instructions') or '')
 
     def mark_already_loaded(self, names) -> None:
         """Seed the already-loaded set (called by the tool loop with names derived
         from the conversation history before each invocation)."""
-        self._served.update((n or '').strip().lower() for n in names or ())
+        self._already_loaded.update((n or '').strip().lower() for n in names or ())
 
     def _run(self, skill: str, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
         return self._load(skill)
