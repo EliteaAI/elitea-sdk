@@ -715,7 +715,7 @@ MAX_SKILLS_PER_INVOCATION = 5
 
 SKILL_REGISTRY_HEADER = """The skills listed below can be activated on demand. Each <skill_option> gives only the skill's name and when to use it — the full instructions are NOT loaded yet.
 
-Before composing each reply, scan this list. A skill matches when the user's current request falls within its description. If one or more skills match, call the `load_skill` tool for each matching name (once per skill) BEFORE writing your answer, then follow each returned instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. If none match, do not call load_skill and answer normally; never load a skill merely because it is listed. Do not mention these skill names or the load_skill mechanism in your reply."""
+Before composing each reply, scan this list and decide which skills match. A skill matches when the user's current request falls within its description. You MUST call the `load_skill` tool for EVERY matching skill BEFORE writing your answer — if several match, load all of them, then reconcile their instructions with full information; never skip a matching skill based on its one-line description alone. If you are unsure whether a skill matches, load it: loading an unneeded skill is cheap, missing a needed one is not. Follow each loaded instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. Only when no skill plausibly matches, answer normally without calling load_skill. Do not mention these skill names or the load_skill mechanism in your reply."""
 
 SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
 
@@ -729,7 +729,7 @@ LOAD_SKILL_TOOL_DESCRIPTION = (
     "in <available_skills> can be loaded."
 )
 
-LOADED_SKILL_RESULT = """Skill "{name}" is now active. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. Do not mention this skill by name or that it was loaded.
+LOADED_SKILL_RESULT = """Skill "{name}" is now active. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. In later turns, apply them only when the request again falls within this skill's scope. Do not mention this skill by name or that it was loaded.
 
 <skill name="{name}">
 {instructions}

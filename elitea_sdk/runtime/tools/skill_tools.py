@@ -8,7 +8,9 @@ cached prefix.
 """
 
 import logging
+import re
 from typing import List, Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.tools import BaseTool
@@ -26,8 +28,27 @@ from ..langchain.constants import (
 logger = logging.getLogger(__name__)
 
 
+# Anchored on the fixed prefix of LOADED_SKILL_RESULT (constants.py) — keep in sync.
+_LOADED_SKILL_PREFIX_RE = re.compile(r'^Skill "([^"]+)" is now active')
+
+
+def loaded_skill_names_from_messages(messages) -> set:
+    """Names (lowercased) of skills whose loaded bodies are present in the given
+    message history. Derived from context rather than stored state: if
+    summarization drops a body, its name disappears from this set and a genuine
+    re-load becomes possible again."""
+    names = set()
+    for message in messages or []:
+        content = getattr(message, 'content', None)
+        if getattr(message, 'type', '') == 'tool' and isinstance(content, str):
+            match = _LOADED_SKILL_PREFIX_RE.match(content)
+            if match:
+                names.add(match.group(1).strip().lower())
+    return names
+
+
 class LoadSkillInput(BaseModel):
-    skill: str = Field(description="Exact name of the skill to load, as listed under '# Available Skills'.")
+    skill: str = Field(description="Exact name of the skill to load, as listed inside <available_skills> in the system prompt.")
 
 
 class LoadSkillTool(BaseTool):
@@ -68,12 +89,17 @@ class LoadSkillTool(BaseTool):
         if matched.get('skill_id') in invoked_ids or (name or '').strip().lower() in invoked_names:
             logger.info("[Skills] load_skill %r already active via ~name", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
-        if name in self._served:
-            logger.info("[Skills] load_skill %r already served this turn", name)
+        if (name or '').strip().lower() in self._served:
+            logger.info("[Skills] load_skill %r already loaded in this conversation", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
-        self._served.add(name)
+        self._served.add((name or '').strip().lower())
         logger.info("[Skills] load_skill served %r", name)
         return LOADED_SKILL_RESULT.format(name=name, instructions=matched.get('instructions') or '')
+
+    def mark_already_loaded(self, names) -> None:
+        """Seed the already-loaded set (called by the tool loop with names derived
+        from the conversation history before each invocation)."""
+        self._served.update((n or '').strip().lower() for n in names or ())
 
     def _run(self, skill: str, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
         return self._load(skill)
@@ -85,7 +111,7 @@ class LoadSkillTool(BaseTool):
 def build_load_skill_tools(attached_skills, invoked_skills=None) -> List[BaseTool]:
     if not attached_skills:
         return []
-    logger.info("[Skills] Binding load_skill with %d attached skills", len(attached_skills))
+    logger.debug("[Skills] Binding load_skill with %d attached skills", len(attached_skills))
     return [LoadSkillTool(attached_skills=attached_skills, invoked_skills=invoked_skills or [])]
 
 
@@ -95,10 +121,15 @@ def render_skill_registry_index(attached_skills) -> str:
     ordered = sorted(
         attached_skills, key=lambda s: (s.get('skill_id') or 0, s.get('name') or '')
     )
+    # Escape XML specials so a description (free text) cannot forge registry
+    # structure. Names are platform-validated to [a-z0-9-] so escaping them is
+    # a defensive no-op and never diverges from the loadable name.
     entries = [
         SKILL_REGISTRY_ENTRY.format(
-            name=' '.join(str(s.get('name') or '').split()),
-            description=' '.join(str(s.get('description') or '').split()) or '(no description)',
+            name=_xml_escape(' '.join(str(s.get('name') or '').split()), {'"': '&quot;'}),
+            description=_xml_escape(
+                ' '.join(str(s.get('description') or '').split()) or '(no description)'
+            ),
         )
         for s in ordered
     ]

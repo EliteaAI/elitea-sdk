@@ -29,7 +29,12 @@ from ..langchain.utils import (
 )
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
-from .skill_tools import build_load_skill_tools, render_skill_registry_index
+from .skill_tools import (
+    LoadSkillTool,
+    build_load_skill_tools,
+    loaded_skill_names_from_messages,
+    render_skill_registry_index,
+)
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
 
@@ -626,6 +631,25 @@ class LLMNode(BaseTool):
             configurable.get('attached_skills'), configurable.get('invoked_skills')
         )
 
+        def _with_skill_tools(tools):
+            # Duplicate tool names in the bind list are rejected by Anthropic; if
+            # another toolkit already claims the name, the pre-existing tool wins
+            # (additive principle) and progressive disclosure is skipped this turn.
+            if not skill_tools:
+                return tools
+            taken = {getattr(t, 'name', None) for t in tools}
+            merged = list(tools)
+            for skill_tool in skill_tools:
+                if skill_tool.name in taken:
+                    logger.warning(
+                        "[Skills] Tool name %r already bound by another toolkit — "
+                        "skipping the progressive-disclosure skill tool this turn",
+                        skill_tool.name,
+                    )
+                else:
+                    merged.append(skill_tool)
+            return merged
+
         # Check for dynamically selected tools from pre-LLM selection
         selected_tools = configurable.get('selected_tools')
         if selected_tools:
@@ -634,7 +658,7 @@ class LLMNode(BaseTool):
             # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
             # This ensures Planner tools are available even on first message when
             # Smart Tools Selection finds matching toolkits.
-            return list(selected_tools) + list(self.always_bind_tools or []) + skill_tools
+            return _with_skill_tools(list(selected_tools) + list(self.always_bind_tools or []))
 
         # Check if lazy tools mode is enabled and we have a registry
         if self.lazy_tools_mode and self.tool_registry is not None:
@@ -647,8 +671,8 @@ class LLMNode(BaseTool):
                     f"{len(self.always_bind_tools)} always-bind tools: "
                     f"{[t.name for t in self.always_bind_tools]}"
                 )
-                return combined_tools + skill_tools
-            return list(meta_tools) + skill_tools
+                return _with_skill_tools(combined_tools)
+            return _with_skill_tools(list(meta_tools))
 
         # Traditional mode - bind actual tools
         # Fix for #3382: Include always_bind_tools even when lazy mode is disabled
@@ -682,7 +706,7 @@ class LLMNode(BaseTool):
                 )
                 base_tools.extend(additional_tools)
 
-        return base_tools + skill_tools
+        return _with_skill_tools(base_tools)
 
     def _get_meta_tools(self) -> List[BaseTool]:
         """
@@ -2560,6 +2584,17 @@ class LLMNode(BaseTool):
                 # fan-out partition (#4993) and the sequential loop resolve
                 # tools identically.
                 tool_to_execute = self._resolve_tool_to_execute(tool_name, config)
+
+                # Progressive disclosure (#5698): seed load_skill with the skills
+                # whose bodies are already present in this conversation's context,
+                # so a re-load (this turn or a later one) returns "already active"
+                # instead of appending a duplicate body. Derived from history, not
+                # stored state — if summarization drops a body, the guard clears
+                # and a genuine re-load is allowed again.
+                if isinstance(tool_to_execute, LoadSkillTool):
+                    tool_to_execute.mark_already_loaded(
+                        loaded_skill_names_from_messages(new_messages)
+                    )
 
                 if tool_to_execute:
                     try:
