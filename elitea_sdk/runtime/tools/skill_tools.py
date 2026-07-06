@@ -32,11 +32,25 @@ def loaded_skill_names_from_messages(messages) -> set:
     """Names (lowercased) of skills whose loaded bodies are present in the given
     message history. Derived from context rather than stored state: if
     summarization drops a body, its name disappears from this set and a genuine
-    re-load becomes possible again."""
+    re-load becomes possible again.
+
+    Only ToolMessages whose tool_call_id maps back to a load_skill call (via the
+    owning AIMessage's tool_calls) are counted, so another tool's output that
+    happens to start with the loaded-skill marker cannot suppress a genuine
+    load. Unmappable ids fail open (not counted): the worst case is one
+    duplicate body, never a permanently unloadable skill."""
     names = set()
+    call_tool_names = {}
     for message in messages or []:
+        for tool_call in getattr(message, 'tool_calls', None) or []:
+            call_id = tool_call.get('id') if isinstance(tool_call, dict) else getattr(tool_call, 'id', None)
+            call_name = tool_call.get('name') if isinstance(tool_call, dict) else getattr(tool_call, 'name', None)
+            if call_id:
+                call_tool_names[call_id] = call_name
         content = getattr(message, 'content', None)
         if getattr(message, 'type', '') == 'tool' and isinstance(content, str):
+            if call_tool_names.get(getattr(message, 'tool_call_id', None)) != 'load_skill':
+                continue
             match = LOADED_SKILL_PREFIX_RE.match(content)
             if match:
                 names.add(match.group(1).strip().lower())
@@ -80,14 +94,20 @@ class LoadSkillTool(BaseTool):
                 name=skill, available=', '.join(available_names) or '(none)'
             )
         name = matched.get('name')
-        invoked_ids = {s.get('skill_id') for s in self.invoked_skills}
+        matched_id = matched.get('skill_id')
+        invoked_ids = {
+            s.get('skill_id') for s in self.invoked_skills if s.get('skill_id') is not None
+        }
         invoked_names = {(s.get('name') or '').strip().lower() for s in self.invoked_skills}
-        if matched.get('skill_id') in invoked_ids or (name or '').strip().lower() in invoked_names:
+        if (matched_id is not None and matched_id in invoked_ids) \
+                or (name or '').strip().lower() in invoked_names:
             logger.info("[Skills] load_skill %r already active via ~name", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
         if (name or '').strip().lower() in self._already_loaded:
             logger.info("[Skills] load_skill %r already loaded in this conversation", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
+        # The execution loop rebuilds this tool per resolution and dedups via
+        # mark_already_loaded() seeding; this add only covers same-instance reuse.
         self._already_loaded.add((name or '').strip().lower())
         logger.info("[Skills] load_skill served %r", name)
         return LOADED_SKILL_RESULT.format(name=name, instructions=matched.get('instructions') or '')
@@ -117,9 +137,9 @@ def render_skill_registry_index(attached_skills) -> str:
     ordered = sorted(
         attached_skills, key=lambda s: (s.get('skill_id') or 0, s.get('name') or '')
     )
-    # Escape XML specials so a description (free text) cannot forge registry
-    # structure. Names are platform-validated to [a-z0-9-] so escaping them is
-    # a defensive no-op and never diverges from the loadable name.
+    # Escape XML specials so a free-text description cannot forge registry
+    # structure (names are platform-validated to [a-z0-9-], so escaping them
+    # never diverges from the loadable name).
     entries = [
         SKILL_REGISTRY_ENTRY.format(
             name=xml_escape(' '.join(str(s.get('name') or '').split()), {'"': '&quot;'}),
