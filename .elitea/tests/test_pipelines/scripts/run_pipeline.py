@@ -459,6 +459,42 @@ def process_pipeline_result(
                             
                             break
     
+    # PRIORITY 1b: Check thinking_steps for test_passed (LLM validation when not terminal node)
+    # When an LLM validation node is followed by cleanup nodes, its output goes to thinking_steps
+    # instead of chat_history. This handles that case.
+    if test_passed is None and isinstance(result_data, dict) and "thinking_steps" in result_data:
+        thinking_steps = result_data.get("thinking_steps", [])
+        for step in thinking_steps:
+            if isinstance(step, dict):
+                text = step.get("text", "")
+                if isinstance(text, str) and text.strip().startswith("{"):
+                    try:
+                        parsed_content = json.loads(text)
+                        if isinstance(parsed_content, dict):
+                            # Check for explicit test_passed from validation node
+                            if "test_passed" in parsed_content:
+                                test_passed = parsed_content["test_passed"]
+                                if isinstance(output, dict):
+                                    output["result"] = parsed_content
+                                else:
+                                    output = parsed_content
+                                if logger:
+                                    logger.debug(f"Found test_passed={test_passed} in thinking_steps")
+                                # Don't break - continue to find the latest test_passed value
+                            # Check for test_results structure
+                            elif "test_results" in parsed_content:
+                                test_results = parsed_content.get("test_results", {})
+                                if isinstance(test_results, dict) and "test_passed" in test_results:
+                                    test_passed = test_results.get("test_passed")
+                                    if isinstance(output, dict):
+                                        output["result"] = test_results
+                                    else:
+                                        output = test_results
+                                    if logger:
+                                        logger.debug(f"Found test_passed={test_passed} in thinking_steps.test_results")
+                    except json.JSONDecodeError:
+                        pass
+
     # PRIORITY 2: Check for tool execution errors (only if test_passed not already determined)
     # This prevents false positives where LLM says "test passed" but a tool actually failed
     # However, for negative tests, validation nodes set test_passed first, so we skip error detection
