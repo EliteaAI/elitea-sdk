@@ -1624,18 +1624,37 @@ class GitHubClient(BaseModel):
         # All retries exhausted
         raise ToolException(f"File not found `{file_path}` on branch `{branch}` after {max_retries} attempts. Error: {str(last_exception)}")
 
-    def read_file(self, file_path: str, branch: Optional[str] = None, repo_name: Optional[str] = None) -> str:
+    def read_file(self, file_path: str, branch: Optional[str] = None, repo_name: Optional[str] = None,
+                  start_line: Optional[int] = None, end_line: Optional[int] = None):
         """
         Read a file from the active branch
         Parameters:
             file_path(str): the file path
             branch (Optional[str]): The branch to read the file from. Defaults to the active branch.
             repo_name (Optional[str]): Name of the repository in format 'owner/repo'
+            start_line (Optional[int]): Starting line number (1-indexed, inclusive) for partial read.
+            end_line (Optional[int]): Ending line number (1-indexed, inclusive) for partial read.
 
         Returns:
-            str: The file contents as a string
+            The file contents as a string, or a structured content_too_large
+            guidance object (dict) if it exceeds the size limit.
         """
-        return self._read_file(file_path, branch if branch else self.active_branch, repo_name)
+        from ..utils.text_operations import apply_line_slice
+        from ..utils.file_metadata import guard_text_read
+
+        content = self._read_file(file_path, branch if branch else self.active_branch, repo_name)
+
+        if start_line is not None or end_line is not None:
+            offset = start_line if start_line is not None else 1
+            limit = (end_line - offset + 1) if end_line is not None else None
+            content = apply_line_slice(content, offset=offset, limit=limit)
+
+        requested = (
+            f"start_line={start_line}, end_line={end_line}"
+            if (start_line is not None or end_line is not None)
+            else "full file read"
+        )
+        return guard_text_read(content, file_path, requested=requested)
     
     def _write_file(
         self,

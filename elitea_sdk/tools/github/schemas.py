@@ -56,7 +56,9 @@ ReadFile = create_model(
     "ReadFile",
     file_path=(str, Field(description="The path to the file to read, e.g. `src/main.py`")),
     branch=(Optional[str], Field(description="The branch to read the file from, e.g. `main`", default=None)),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
+    start_line=(Optional[int], Field(default=None, ge=1, description="Starting line number (1-indexed, inclusive). Omit to read from the beginning.")),
+    end_line=(Optional[int], Field(default=None, ge=1, description="Ending line number (1-indexed, inclusive). Omit to read to the end.")),
 )
 
 UpdateFile = create_model(
