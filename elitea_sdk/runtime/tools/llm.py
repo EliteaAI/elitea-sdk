@@ -519,7 +519,7 @@ class LLMNode(BaseTool):
             "Structured-output primary path failed (%s); delegating to JSON-prompt fallback",
             type(original_error).__name__,
         )
-        logger.debug("Original structured-output error: %s", format_exc())
+        logger.info("Original structured-output error: %s", format_exc())
         return self._structured_via_json_prompt(llm_client, messages, struct_model, config)
 
     def _format_structured_output_result(self, result: dict, messages: List, initial_completion: Any) -> dict:
