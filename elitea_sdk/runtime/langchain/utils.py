@@ -171,6 +171,20 @@ def extract_json_content(text: str) -> dict | list:
     except (json.JSONDecodeError, ValueError):
         pass
 
+    # Repair: body-only object. Anthropic extended thinking disables assistant
+    # prefill, so the model emits '"key": val, ...}' without its leading '{'.
+    # Must run BEFORE _find_json_bounds — otherwise a nested list-mapping shape
+    # like '"question": [{"id": 1}], "rs": null}' has _find_json_bounds grab
+    # the inner '{...}' and silently return the wrong object.
+    # Gated on startswith('"') so plain embedded JSON ('Here: {"a": 1}') is not
+    # pre-empted.
+    stripped = clean.strip()
+    if stripped.startswith('"') and stripped.endswith('}'):
+        try:
+            return json.loads('{' + stripped)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     json_start, json_end = _find_json_bounds(clean)
     if json_start is not None:
         try:
@@ -192,15 +206,6 @@ def extract_json_content(text: str) -> dict | list:
                     except (json.JSONDecodeError, ValueError):
                         pass
                     break
-
-    # Repair: body-only object. Anthropic extended thinking disables assistant
-    # prefill, so the model emits '"key": val, ...}' without its leading '{'.
-    stripped = clean.strip()
-    if stripped.endswith('}') and '{' not in stripped and '":' in stripped:
-        try:
-            return json.loads('{' + stripped)
-        except (json.JSONDecodeError, ValueError):
-            pass
 
     raise ValueError('Cannot extract JSON from text')
 
