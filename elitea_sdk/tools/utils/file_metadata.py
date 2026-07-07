@@ -424,6 +424,15 @@ def get_file_metadata(
         )
 
 
+#: Appended unconditionally to every over-limit response's notes so the
+#: caller is never tempted to guess a start/end value.
+GET_FILE_METADATA_DIRECTIVE = (
+    "For the exact count (lines/rows/pages/sheets) and full structural "
+    "details (sheet names, attachment list, etc.), call get_file_metadata on "
+    "this same file before choosing a range. Do not guess a start/end value."
+)
+
+
 def build_over_limit_response(
     metadata: Dict[str, Any],
     *,
@@ -455,5 +464,9 @@ def build_over_limit_response(
         limit_chars=limit_chars,
         actual_chars=actual_chars,
         requested=requested,
+    )
+    existing_notes = model.instruction_for_readFile.notes or ""
+    model.instruction_for_readFile.notes = (
+        f"{existing_notes} {GET_FILE_METADATA_DIRECTIVE}".strip()
     )
     return _dump(model)

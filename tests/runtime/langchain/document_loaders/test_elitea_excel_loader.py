@@ -18,6 +18,7 @@ from openpyxl import Workbook
 from elitea_sdk.runtime.langchain.document_loaders.EliteAExcelLoader import (
     EXCEL_READ_LIMIT_ERROR,
     EXCEL_MAX_FULL_READ_FILE_SIZE,
+    ExcelReadLimitExceeded,
     check_excel_read_limits,
     list_excel_sheets,
     read_excel_rows,
@@ -183,6 +184,12 @@ def test_check_excel_read_limits_rejects_large_text_budget(tmp_path):
         check_excel_read_limits(path, raise_on_violation=True)
 
     assert "output size=" in str(exc.value)
+    # ExcelReadLimitExceeded (Phase 4, #5446) IS a ValueError, and carries the
+    # already-computed estimate so a caller can build structured guidance
+    # without re-sampling the workbook.
+    assert isinstance(exc.value, ExcelReadLimitExceeded)
+    assert exc.value.estimate.target_sheet == "S"
+    assert exc.value.estimate.violations
 
 
 def test_check_excel_read_limits_counts_embedded_images(tmp_path):
@@ -206,6 +213,8 @@ def test_check_excel_read_limits_rejects_too_many_images(tmp_path):
         check_excel_read_limits(path, raise_on_violation=True)
 
     assert "embedded images=" in str(exc.value)
+    assert isinstance(exc.value, ExcelReadLimitExceeded)
+    assert exc.value.estimate.embedded_images == 33
 
 
 def test_check_excel_read_limits_partial_scope_uses_requested_range(tmp_path):
@@ -228,6 +237,8 @@ def test_check_excel_read_limits_rejects_large_full_read_by_file_size(tmp_path):
 
     assert "file size=" in str(exc.value)
     assert str(EXCEL_MAX_FULL_READ_FILE_SIZE) in str(exc.value)
+    assert isinstance(exc.value, ExcelReadLimitExceeded)
+    assert exc.value.estimate.file_size_bytes > EXCEL_MAX_FULL_READ_FILE_SIZE
 
 
 def test_check_excel_read_limits_allows_large_file_partial_read_when_scope_is_safe(tmp_path):

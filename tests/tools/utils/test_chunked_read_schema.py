@@ -3,8 +3,9 @@
 Covers:
   * Base/fallback output carries the discriminator + schema_version and validates.
   * Excel reference output conforms (unit + flat total_<unit> + required read_limits).
-  * build_over_limit_response reuses metadata, flips ONLY the discriminator,
-    adds context, and stays machine-detectable.
+  * build_over_limit_response reuses metadata, flips the discriminator, adds
+    context, appends the unconditional get_file_metadata directive to notes,
+    and stays machine-detectable.
   * A loader returning a non-conformant read_limits fails validation
     (enforcement bites future loaders).
   * Raw file content (str / dict) has NO discriminator — content is
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 
 from elitea_sdk.tools.utils.file_metadata import (
     DEFAULT_MAX_OUTPUT_CHARS,
+    GET_FILE_METADATA_DIRECTIVE,
     RESULT_STATUS_KEY,
     SCHEMA_VERSION,
     ResultStatus,
@@ -88,11 +90,15 @@ def test_over_limit_reuses_metadata_and_flips_only_discriminator():
         meta, actual_chars=870123, limit_chars=200000, requested="full read"
     )
 
-    # Only the discriminator changed (+ added context + pinned full_read_allowed).
+    # Discriminator changed (+ added context + pinned full_read_allowed). The
+    # instruction block is otherwise reused verbatim except that "notes" gains
+    # the unconditional get_file_metadata directive (Phase 4, #5446).
     assert over[RESULT_STATUS_KEY] == ResultStatus.CONTENT_TOO_LARGE.value
     assert over["unit"] == meta["unit"]
     assert over["total_rows"] == meta["total_rows"]
-    assert over["instruction_for_readFile"] == meta["instruction_for_readFile"]
+    assert over["instruction_for_readFile"]["extra_params"] == meta["instruction_for_readFile"]["extra_params"]
+    assert GET_FILE_METADATA_DIRECTIVE in over["instruction_for_readFile"]["notes"]
+    assert GET_FILE_METADATA_DIRECTIVE not in meta["instruction_for_readFile"]["notes"]
     # max_output_chars survives; full_read_allowed is pinned False on over-limit.
     assert over["read_limits"]["max_output_chars"] == meta["read_limits"]["max_output_chars"]
     assert over["read_limits"]["full_read_allowed"] is False
@@ -103,6 +109,18 @@ def test_over_limit_reuses_metadata_and_flips_only_discriminator():
         "requested": "full read",
     }
     validate_chunked_read_response(over)
+
+
+def test_over_limit_notes_carry_directive_even_with_empty_notes():
+    # A metadata dict with no notes of its own still gets the directive —
+    # the append is unconditional, not "only if there's already text".
+    bare_meta = {
+        RESULT_STATUS_KEY: ResultStatus.FILE_METADATA.value,
+        "read_limits": {"max_output_chars": DEFAULT_MAX_OUTPUT_CHARS, "full_read_allowed": True},
+        "instruction_for_readFile": {"first_class_params": {}, "extra_params": {}, "notes": ""},
+    }
+    over = build_over_limit_response(bare_meta, actual_chars=999, limit_chars=200000)
+    assert over["instruction_for_readFile"]["notes"] == GET_FILE_METADATA_DIRECTIVE
 
 
 def test_docx_metadata_carries_read_limits_baseline():
