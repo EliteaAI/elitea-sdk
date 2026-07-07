@@ -721,6 +721,12 @@ Before composing each reply, scan this list and decide which skills match. A ski
 
 SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
 
+SKILL_REMINDER_SUFFIX = (
+    "Before answering: check <available_skills> in your instructions and call "
+    "load_skill for every skill matching this request. Earlier replies in this "
+    "conversation do not mean a skill is active now."
+)
+
 LOAD_SKILL_TOOL_DESCRIPTION = (
     "Load the full instructions for one of this agent's available skills by name. "
     "The system prompt lists each skill as a <skill_option> inside <available_skills>, "

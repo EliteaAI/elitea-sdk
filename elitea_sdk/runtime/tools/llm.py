@@ -19,7 +19,13 @@ try:
 except ImportError:
     _SCRATCHPAD_KEY = '__pregel_scratchpad'
 
-from ..langchain.constants import ELITEA_RS, SKILLS_SECTION_HEADER, SKILLS_SECTION_ENTRY, MAX_SKILLS_PER_INVOCATION
+from ..langchain.constants import (
+    ELITEA_RS,
+    MAX_SKILLS_PER_INVOCATION,
+    SKILL_REMINDER_SUFFIX,
+    SKILLS_SECTION_ENTRY,
+    SKILLS_SECTION_HEADER,
+)
 from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
@@ -1136,11 +1142,13 @@ class LLMNode(BaseTool):
             # byte-stable across turns. Advertised only when a LoadSkillTool
             # survived the merge — on a name collision the registry would point
             # the model at the imposter tool.
+            skill_registry_advertised = False
             if configurable.get('attached_skills'):
                 prebuilt_filtered_tools = self.get_filtered_tools(config=config)
                 if any(isinstance(t, LoadSkillTool) for t in prebuilt_filtered_tools):
                     skill_registry = render_skill_registry_index(configurable.get('attached_skills'))
                     if skill_registry:
+                        skill_registry_advertised = True
                         system_content = (
                             f"{system_content}\n\n{skill_registry}" if system_content else skill_registry
                         )
@@ -1162,6 +1170,15 @@ class LLMNode(BaseTool):
             skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
             if skills_section:
                 logger.info("[Skills] Injected per-turn skills section into system prompt")
+            # Recency counterweight: the registry sits in the cached prefix, far from
+            # the decision point, and loses to transcript anchoring on small models.
+            # A one-line reminder in the (already uncached) dynamic suffix puts the
+            # instruction last, where it competes with the conversation itself.
+            if skill_registry_advertised:
+                skills_section = (
+                    f"{skills_section}\n\n{SKILL_REMINDER_SUFFIX}" if skills_section
+                    else SKILL_REMINDER_SUFFIX
+                )
 
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
