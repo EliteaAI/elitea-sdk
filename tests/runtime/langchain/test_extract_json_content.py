@@ -160,12 +160,20 @@ class TestExtractJsonContentBodyOnly:
     def test_body_only_with_leading_whitespace(self):
         assert extract_json_content('  \n  "x": true}  ') == {"x": True}
 
-    def test_body_only_repair_skipped_when_brace_present(self):
-        """The heuristic requires ``{`` to be absent — a nested body-only
-        object with an inner ``{`` falls through to _find_json_bounds and
-        yields the first balanced object (not the intended repair). This
-        limitation is intentional: body-only repair must not double-brace
-        already-braced input."""
+    def test_body_only_with_nested_list_value(self):
+        """Exact shape from issue #5682: list-mapping output. Repair must
+        run before _find_json_bounds, otherwise the inner object is grabbed
+        and returned as the whole result — silent corruption."""
+        result = extract_json_content('"question": [{"id": 1}], "ELITEA_RS": null}')
+        assert result == {"question": [{"id": 1}], "ELITEA_RS": None}
+
+    def test_body_only_with_nested_object_value(self):
+        result = extract_json_content('"data": {"inner": "v"}, "n": 1}')
+        assert result == {"data": {"inner": "v"}, "n": 1}
+
+    def test_body_only_repair_skipped_for_embedded_json(self):
+        """Text prefix followed by braced JSON must not be treated as a
+        body-only fragment — the ``startswith('"')`` gate ensures that."""
         assert extract_json_content('prefix {"a": 1}') == {"a": 1}
 
 
