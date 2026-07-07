@@ -25,6 +25,42 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...runtime.utils.utils import IndexerKeywords
 
 # ------------------------------------------------------------------ #
+#  Read-safety: block executable / binary files (read_document only)  #
+# ------------------------------------------------------------------ #
+# read_document can target any file on the drive. Executable and
+# compiled-binary files are never parseable as documents and carry
+# needless risk, so they are refused up-front (before download) with the
+# standard unsupported-file-type message. This is a deny-list of true
+# binaries only — it intentionally does NOT include script/code
+# extensions (e.g. .sh, .bat, .ps1) that are legitimately readable as
+# text/code today. Scoped to this tool; no shared pipeline changes.
+_UNSUPPORTED_FILE_TYPE_MESSAGE = (
+    "Not supported type of files entered. "
+    "Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only."
+)
+BLOCKED_BINARY_EXTENSIONS = frozenset({
+    # Windows executables / libraries
+    ".exe", ".dll", ".com", ".scr", ".cpl", ".sys", ".drv", ".msi", ".msix",
+    # Unix / macOS executables, libraries, installers, disk images
+    ".bin", ".so", ".dylib", ".o", ".a", ".lib", ".obj", ".elf", ".out",
+    ".app", ".dmg", ".pkg", ".deb", ".rpm", ".apk", ".run",
+    # Compiled bytecode
+    ".class", ".pyc", ".pyo",
+})
+
+
+def _reject_if_executable(path: str) -> None:
+    """Raise ToolException when *path* points at an executable/binary file.
+
+    Guards read_document/read_file before any network download so blocked
+    files never reach the backend.
+    """
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext in BLOCKED_BINARY_EXTENSIONS:
+        raise ToolException(_UNSUPPORTED_FILE_TYPE_MESSAGE)
+
+
+# ------------------------------------------------------------------ #
 #  Pydantic tool-input schemas (unchanged)                            #
 # ------------------------------------------------------------------ #
 
@@ -576,6 +612,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                   sheet_name: Optional[str] = None,
                   excel_by_sheets: bool = False):
         """ Reads file located at the specified server-relative path. """
+        _reject_if_executable(path)
         self._sync_backend_context()
         return self._backend.read_file(
             path, is_capture_image, page_number, sheet_name, excel_by_sheets)
