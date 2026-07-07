@@ -25,6 +25,7 @@ from xlrd import open_workbook
 from langchain_core.documents import Document
 from .EliteATableLoader import EliteATableLoader
 from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
+from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,14 @@ class ExcelReadEstimate:
     file_size_bytes: Optional[int]
     is_unbounded_read: bool
     violations: List[str]
+
+
+class ExcelReadLimitExceeded(ValueError):
+    """Raised on over-limit; carries the already-computed estimate."""
+
+    def __init__(self, message: str, *, estimate: ExcelReadEstimate):
+        super().__init__(message)
+        self.estimate = estimate
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +147,7 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
                             sheet_name: Optional[str] = None,
                             start_row: Optional[int] = None,
                             end_row: Optional[int] = None,
-                            max_output_chars: int = 200000,
+                            max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
                             raise_on_violation: bool = False) -> ExcelReadEstimate:
     """Estimate an Excel request and optionally reject unsafe reads."""
     extension, openable = _open_source(file_name, source)
@@ -238,7 +247,10 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
     )
 
     if violations and raise_on_violation:
-        raise ValueError(f"{EXCEL_READ_LIMIT_ERROR} Details: {'; '.join(violations)}")
+        raise ExcelReadLimitExceeded(
+            f"{EXCEL_READ_LIMIT_ERROR} Details: {'; '.join(violations)}",
+            estimate=estimate,
+        )
 
     return estimate
 
@@ -424,6 +436,68 @@ def _read_xls_rows(openable, sheet_name, start_row, end_row,
         "content": "\n".join(lines),
     }
 
+def build_excel_metadata_from_estimate(estimate: ExcelReadEstimate) -> dict:
+    """Build the get_file_metadata-shaped dict directly from an estimate."""
+    sheets = estimate.sheets
+    read_limits = {
+        "max_output_chars": DEFAULT_MAX_OUTPUT_CHARS,
+        "full_read_allowed": estimate.is_unbounded_read and not estimate.violations,
+        "excel_max_request_rows": EXCEL_MAX_REQUEST_ROWS,
+        "excel_max_embedded_images": EXCEL_MAX_IMAGE_COUNT,
+        "excel_full_read_max_bytes": EXCEL_MAX_FULL_READ_FILE_SIZE,
+        "estimated_total_rows": estimate.total_rows_workbook,
+        "estimated_request_rows": estimate.requested_rows,
+        "estimated_output_chars": estimate.estimated_output_chars,
+        "embedded_images": estimate.embedded_images,
+        "file_size_bytes": estimate.file_size_bytes,
+    }
+    instruction = {
+        "extra_params": {
+            "sheet_name": (
+                "string (optional) — name of the sheet to read. If omitted, "
+                "the first sheet is used. Available sheets: "
+                + ", ".join(s.get("name", "") for s in sheets) if sheets else
+                "string (optional) — name of the sheet to read."
+            ),
+            "start_row": (
+                "integer (1-indexed, inclusive) — first row to return. "
+                "Defaults to 1 if omitted."
+            ),
+            "end_row": (
+                "integer (1-indexed, inclusive) — last row to return. "
+                "If omitted, reads to the end of the sheet."
+            ),
+            "include_headers": (
+                "boolean (default true) — when true the header row is "
+                "prepended to the output for column context."
+            ),
+            "header_row": (
+                "integer (default 1) — 1-indexed row treated as the header."
+            ),
+            "evaluate_formulas": (
+                "boolean (default false) — when true, formulas without "
+                "cached values are evaluated using a Python engine. "
+                "This can be slow for large workbooks."
+            ),
+        },
+        "notes": (
+            "For large workbooks, call read_file with a small "
+            "start_row/end_row range to keep memory and tokens bounded. "
+            "Pass extra_params as a JSON string. Full reads are rejected "
+            "when workbook metadata suggests they exceed safe row, text, "
+            "or embedded-image limits."
+        ),
+    }
+    return {
+        "unit": "rows",
+        "total_rows": estimate.total_rows_workbook,
+        "total_sheets": len(sheets),
+        "sheets": sheets,
+        "read_limits": read_limits,
+        "instruction_for_readFile": instruction,
+    }
+
+
 class EliteAExcelLoader(EliteATableLoader):
     sheet_name: str = None
     file_name: str = None
@@ -442,83 +516,26 @@ class EliteAExcelLoader(EliteATableLoader):
         loader class from ``loaders_map``. Advertises available sheets and
         the extra_params that ``read_file`` can accept.
         """
-        sheets: List[dict] = []
-        total_rows = 0
-        # read_limits universal keys (PRE-1 #5432): max_output_chars and
-        # full_read_allowed are REQUIRED by the contract. Everything else is
-        # Excel-specific and therefore type-prefixed so no other loader assumes
-        # the key exists. ``excel_full_read_max_bytes`` is a raw-bytes pre-gate
-        # (reject a full read before sampling rows) — a different unit and
-        # purpose than the universal output-chars cap.
-        read_limits = {
-            "max_output_chars": 200000,
-            "full_read_allowed": False,
-            "excel_max_request_rows": EXCEL_MAX_REQUEST_ROWS,
-            "excel_max_embedded_images": EXCEL_MAX_IMAGE_COUNT,
-            "excel_full_read_max_bytes": EXCEL_MAX_FULL_READ_FILE_SIZE,
-        }
-        if file_content:
-            try:
-                estimate = check_excel_read_limits(file_content, file_name=filename)
-                sheets = estimate.sheets
-                total_rows = estimate.total_rows_workbook
-                read_limits["estimated_total_rows"] = estimate.total_rows_workbook
-                read_limits["estimated_request_rows"] = estimate.requested_rows
-                read_limits["estimated_output_chars"] = estimate.estimated_output_chars
-                read_limits["embedded_images"] = estimate.embedded_images
-                read_limits["file_size_bytes"] = estimate.file_size_bytes
-                read_limits["full_read_allowed"] = (
-                    estimate.is_unbounded_read and not estimate.violations
-                )
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning("Failed to list excel sheets for %s: %s",
-                               filename, e)
-
-        instruction = {
-            "extra_params": {
-                "sheet_name": (
-                    "string (optional) — name of the sheet to read. If omitted, "
-                    "the first sheet is used. Available sheets: "
-                    + ", ".join(s.get("name", "") for s in sheets) if sheets else
-                    "string (optional) — name of the sheet to read."
-                ),
-                "start_row": (
-                    "integer (1-indexed, inclusive) — first row to return. "
-                    "Defaults to 1 if omitted."
-                ),
-                "end_row": (
-                    "integer (1-indexed, inclusive) — last row to return. "
-                    "If omitted, reads to the end of the sheet."
-                ),
-                "include_headers": (
-                    "boolean (default true) — when true the header row is "
-                    "prepended to the output for column context."
-                ),
-                "header_row": (
-                    "integer (default 1) — 1-indexed row treated as the header."
-                ),
-                "evaluate_formulas": (
-                    "boolean (default false) — when true, formulas without "
-                    "cached values are evaluated using a Python engine. "
-                    "This can be slow for large workbooks."
-                ),
-            },
-            "notes": (
-                "For large workbooks, call read_file with a small "
-                "start_row/end_row range to keep memory and tokens bounded. "
-                "Pass extra_params as a JSON string. Full reads are rejected "
-                "when workbook metadata suggests they exceed safe row, text, "
-                "or embedded-image limits."
-            ),
-        }
-        return {
-            "unit": "rows",
-            "total_rows": total_rows,
-            "total_sheets": len(sheets),
-            "sheets": sheets,
-            "read_limits": read_limits,
-            "instruction_for_readFile": instruction,
-        }
+        if not file_content:
+            return build_excel_metadata_from_estimate(ExcelReadEstimate(
+                sheets=[], total_rows_workbook=0, target_sheet=None,
+                target_sheet_total_rows=0, requested_start_row=1,
+                requested_end_row=0, requested_rows=0, sampled_rows=0,
+                sampled_chars=0, estimated_output_chars=0, embedded_images=0,
+                file_size_bytes=file_size, is_unbounded_read=False, violations=[],
+            ))
+        try:
+            estimate = check_excel_read_limits(file_content, file_name=filename)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("Failed to list excel sheets for %s: %s", filename, e)
+            estimate = ExcelReadEstimate(
+                sheets=[], total_rows_workbook=0, target_sheet=None,
+                target_sheet_total_rows=0, requested_start_row=1,
+                requested_end_row=0, requested_rows=0, sampled_rows=0,
+                sampled_chars=0, estimated_output_chars=0, embedded_images=0,
+                file_size_bytes=file_size, is_unbounded_read=False, violations=[],
+            )
+        return build_excel_metadata_from_estimate(estimate)
 
     def __init__(self, **kwargs):
         if not kwargs.get('file_path'):

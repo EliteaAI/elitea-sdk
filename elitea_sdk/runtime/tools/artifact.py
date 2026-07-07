@@ -27,9 +27,19 @@ from ...runtime.utils.content_appender import (
     get_param_description_blocks,
 )
 from ...runtime.utils.utils import IndexerKeywords
-from ...tools.utils.file_metadata import build_error_response
-
-DEFAULT_MAX_SINGLE_READ_SIZE = 200000
+from ...tools.utils.file_metadata import (
+    DEFAULT_MAX_OUTPUT_CHARS,
+    RESULT_STATUS_KEY,
+    SCHEMA_VERSION,
+    ResultStatus,
+    build_error_response,
+    build_over_limit_response,
+    get_file_metadata as get_file_metadata_dict,
+)
+from ...runtime.langchain.document_loaders.EliteAExcelLoader import (
+    ExcelReadLimitExceeded,
+    build_excel_metadata_from_estimate,
+)
 
 BASIC_CREATE_FILE_DESCRIPTION = """Create a new file OR overwrite/replace an existing file entirely in the artifact bucket. Supports two modes:
 1. Create from content: Use 'filedata' parameter to create or fully overwrite files with text or rich formats
@@ -62,7 +72,7 @@ SKIP_SIZE_CHECK_DEPRECATION_MSG = (
 
 class ArtifactWrapper(NonCodeIndexerToolkit):
     bucket: str
-    max_single_read_size: int = DEFAULT_MAX_SINGLE_READ_SIZE
+    max_single_read_size: int = DEFAULT_MAX_OUTPUT_CHARS
     artifact: Optional[Any] = None
 
     def read_multiple_files(
@@ -84,7 +94,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             skip_size_check: Deprecated and inert; the size guard always applies per file.
 
         Returns:
-            Dict mapping file paths to their content
+            Dict mapping each file path to its content, or a structured
+            content_too_large object per-file if it exceeds the size limit.
         """
         if skip_size_check is True:
             logging.warning(SKIP_SIZE_CHECK_DEPRECATION_MSG)
@@ -521,7 +532,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 ``{"sheet_name": "Sheet1", "start_row": 1, "end_row": 100}``).
             
         Returns:
-            File content or error message if content exceeds size limit
+            File content (str or dict), or a structured content_too_large
+            object if it exceeds the size limit.
         """
         if skip_size_check is True:
             logging.warning(SKIP_SIZE_CHECK_DEPRECATION_MSG)
@@ -561,17 +573,29 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 if not isinstance(parsed_extra, dict):
                     raise ToolException("extra_params JSON must decode to an object")
 
-        # Use Artifact client's get() method (now uses S3 API internally)
-        content = self.artifact.get(
-            artifact_name=full_key,
-            bucket_name=target_bucket,
-            is_capture_image=is_capture_image,
-            page_number=page_number,
-            sheet_name=sheet_name,
-            excel_by_sheets=excel_by_sheets,
-            llm=self.llm,
-            extra_params=parsed_extra,
+        requested = (
+            extra_params if extra_params
+            else f"start_line={start_line}, end_line={end_line}" if (start_line is not None or end_line is not None)
+            else "full file read"
         )
+
+        # Use Artifact client's get() method (now uses S3 API internally)
+        try:
+            content = self.artifact.get(
+                artifact_name=full_key,
+                bucket_name=target_bucket,
+                is_capture_image=is_capture_image,
+                page_number=page_number,
+                sheet_name=sheet_name,
+                excel_by_sheets=excel_by_sheets,
+                llm=self.llm,
+                extra_params=parsed_extra,
+            )
+        except ExcelReadLimitExceeded as e:
+            # Build guidance from the estimate already in hand — no re-download.
+            if _bypass_size_limit:
+                raise
+            return self._excel_over_limit_response(e.estimate, filename=full_key, requested=requested)
 
         # Apply line range slicing if requested (for text content only)
         if isinstance(content, str) and (start_line is not None or end_line is not None):
@@ -588,15 +612,61 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                     "end_row inside extra_params for row-based slicing."
                 )
 
-        # Check content size limit (after slicing if applicable).
-        # Guard always applies for LLM/pipeline calls; only internal callers bypass it.
-        if not _bypass_size_limit and isinstance(content, str) and len(content) > self.max_single_read_size:
-            line_count = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
-            if start_line is not None or end_line is not None:
-                return f"[Content ({line_count} lines) still exceeds size limit. Use smaller range.]"
-            return f"[Content has {line_count} lines and exceeds size limit. Use partial read options.]"
+        # Check content size limit (after slicing if applicable). Guard always
+        # applies for LLM/pipeline calls; only internal callers bypass it.
+        if _bypass_size_limit:
+            return content
+        actual_chars = self._measure_content_chars(content)
+        if actual_chars > self.max_single_read_size:
+            return self._over_limit_response(
+                content, full_key, actual_chars=actual_chars, requested=requested,
+                had_range=(start_line is not None or end_line is not None),
+            )
 
         return content
+
+    @staticmethod
+    def _measure_content_chars(content) -> int:
+        """Serialized size of a read_file result, str or dict alike."""
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, bytes):
+            return len(content)
+        try:
+            return len(json.dumps(content, default=str, ensure_ascii=False))
+        except (TypeError, ValueError):
+            return len(str(content))
+
+    def _over_limit_response(self, content, full_key: str, *, actual_chars: int,
+                             requested: str, had_range: bool) -> dict:
+        """Build the structured content_too_large guidance object."""
+        metadata = get_file_metadata_dict(full_key, file_content=None)
+        if metadata.get(RESULT_STATUS_KEY) == ResultStatus.ERROR.value:
+            return metadata
+
+        # Skip for page/row-oriented units (PDF/PPTX/Excel) — a line count
+        # there would be meaningless next to unit="pages"/"rows".
+        if isinstance(content, str) and not had_range and metadata.get("unit") in (None, "lines"):
+            total_lines = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
+            metadata["total_lines"] = total_lines
+            metadata["unit"] = "lines"
+
+        return build_over_limit_response(
+            metadata, actual_chars=actual_chars,
+            limit_chars=self.max_single_read_size, requested=requested,
+        )
+
+    def _excel_over_limit_response(self, estimate, *, filename: str, requested: str) -> dict:
+        """Build content_too_large guidance from an already-computed Excel estimate."""
+        metadata = build_excel_metadata_from_estimate(estimate)
+        metadata[RESULT_STATUS_KEY] = ResultStatus.FILE_METADATA.value
+        metadata["schema_version"] = SCHEMA_VERSION
+        metadata["filename"] = filename
+        actual_chars = estimate.estimated_output_chars
+        return build_over_limit_response(
+            metadata, actual_chars=actual_chars,
+            limit_chars=self.max_single_read_size, requested=requested,
+        )
 
     def _read_file(
         self,

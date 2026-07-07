@@ -11,6 +11,7 @@ from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map, LoaderProperties
 from ...runtime.langchain.document_loaders.EliteATextLoader import EliteATextLoader
+from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = getLogger(__name__)
@@ -110,6 +111,9 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
                                     extension=extension,
                                     loader_extra_config=loader_kwargs,
                                     llm=llm)
+    except ExcelReadLimitExceeded:
+        # Must propagate, not get flattened into a ToolException below.
+        raise
     except Exception as e:
         # Surface full underlying error message (including nested causes) so that
         # JSONDecodeError or other specific issues are not hidden behind
