@@ -433,6 +433,38 @@ GET_FILE_METADATA_DIRECTIVE = (
 )
 
 
+def guard_text_read(
+    content: str,
+    filename: str,
+    *,
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+    requested: Optional[str] = None,
+) -> Any:
+    """Return *content* unchanged if within the cap, else over-limit guidance.
+
+    For VCS-style readers (GitHub/GitLab/Bitbucket/ADO/LocalGit) where a read
+    always yields a fully-downloaded ``str`` — no dict/Excel-style results, so
+    ``total_lines`` is computed directly from the content already in hand, no
+    re-fetch or extra I/O.
+    """
+    actual_chars = len(content)
+    if actual_chars <= max_output_chars:
+        return content
+
+    metadata = get_file_metadata(filename, file_content=None)
+    if metadata.get(RESULT_STATUS_KEY) == ResultStatus.ERROR.value:
+        return metadata
+
+    if metadata.get("unit") in (None, "lines"):
+        total_lines = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
+        metadata["total_lines"] = total_lines
+        metadata["unit"] = "lines"
+
+    return build_over_limit_response(
+        metadata, actual_chars=actual_chars, limit_chars=max_output_chars, requested=requested,
+    )
+
+
 def build_over_limit_response(
     metadata: Dict[str, Any],
     *,
