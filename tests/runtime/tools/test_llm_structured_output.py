@@ -662,9 +662,17 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
         assert final_messages == loop_messages
         assert len(final_messages) == 4
 
-    def test_propagates_exception_when_fallback_also_fails(self):
+    def test_returns_graceful_fallback_when_parsing_fails(self):
         """If both structured-output parsing AND content extraction fail, the
-        original exception must propagate — never silently return None/empty."""
+        JSON-prompt fallback path must produce a graceful ``_create_fallback_completion``
+        (content in ELITEA_RS, required fields set to None) rather than raising.
+
+        Rationale: A pipeline that crashes mid-graph loses all state; a graceful
+        fallback lets downstream nodes and the UI see the raw model output.
+        The broadened ``_synthesize_structured`` trigger routes
+        ``OutputParserException`` (Anthropic extended-thinking case) through
+        ``_structured_via_json_prompt`` which never raises on unparseable text.
+        """
         messages = [HumanMessage(content="ask")]
         loop_messages = [
             HumanMessage(content="ask"),
@@ -672,15 +680,21 @@ class TestInvokeWithStructuredOutputToolCallingBranch:
             _tool_msg(),
             _ai_clean("done"),
         ]
-        unparseable = AIMessage(content="this is not json at all")
+        # llm_client.invoke returns AIMessage(content="planning") from _build_node_with_mocks;
+        # _structured_via_json_prompt will try to extract JSON from that text, fail,
+        # then produce a fallback completion with the text in ELITEA_RS.
         node, struct_model, llm_client, _ = self._build_node_with_mocks(
             loop_messages,
             second_call_behavior=OutputParserException("parse failed"),
-            plain_call_response=unparseable,
         )
 
-        with pytest.raises(OutputParserException):
-            node._invoke_with_structured_output(llm_client, messages, struct_model, config={})
+        completion, _, _ = node._invoke_with_structured_output(
+            llm_client, messages, struct_model, config={}
+        )
+
+        # Fallback: required list field is None, raw content lands in ELITEA_RS.
+        assert completion.question is None
+        assert getattr(completion, ELITEA_RS) == "planning"
 
     def test_thinking_off_anthropic_no_regression(self):
         """Anthropic without extended thinking returns plain string content;
@@ -1515,17 +1529,20 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         assert "json_schema" not in wso_calls
 
 
-# ─── _handle_structured_output_fallback: chain still tries all methods ──────
+# ─── _handle_structured_output_fallback: delegates to JSON-prompt path ─────
 
 
 class TestHandleStructuredOutputFallbackThinkingModel:
-    """Verify the fallback chain (json_mode → function_calling → plain text)
-    still attempts function_calling. For thinking-Anthropic, function_calling is
-    transparently rerouted to json_schema by ``__get_struct_output_model``, so
-    the chain is safe — no separate skip-guard is needed."""
+    """The fallback now delegates to ``_structured_via_json_prompt`` instead of
+    running the old json_mode → function_calling → plain-text cascade.
+    That cascade repeated the same failing strategy (all three routes hit the
+    same Anthropic-prefill limitation) and crashed on list ``content`` from
+    extended-thinking responses. The JSON-prompt path is provider-agnostic,
+    list-aware, and code-fence tolerant."""
 
-    def test_non_thinking_anthropic_still_tries_function_calling_in_fallback(self):
-        """Non-regression: non-thinking Anthropic must still try function_calling."""
+    def test_fallback_delegates_to_json_prompt_path(self):
+        """Fallback must delegate to ``_structured_via_json_prompt`` and no longer
+        invoke ``__get_struct_output_model`` at all."""
         llm = _AnthropicNonThinkingLLM()
         node = _make_llm_node()
         node.client = llm
@@ -1540,18 +1557,27 @@ class TestHandleStructuredOutputFallbackThinkingModel:
 
         node._LLMNode__get_struct_output_model = patched_get_struct_output
 
-        # Plain client invoke returns parseable JSON
-        json_response = AIMessage(content='{"question": [{"id": "q1"}], "rs": ""}')
-        llm.invoke = lambda msgs, config=None: json_response
+        delegated = {}
+
+        def spy_via_json_prompt(client, messages, model, config):
+            delegated["called"] = True
+            return AIMessage(content='{"question": [{"id": "q1"}], "rs": ""}')
+
+        node._structured_via_json_prompt = spy_via_json_prompt
 
         messages = [HumanMessage(content="list please")]
-        node._handle_structured_output_fallback(
+        result = node._handle_structured_output_fallback(
             llm, messages, struct_model, {}, ValueError("initial")
         )
 
-        assert "function_calling" in method_calls, (
-            "Non-thinking Anthropic fallback must attempt function_calling"
+        assert delegated.get("called") is True, (
+            "Fallback must delegate to _structured_via_json_prompt"
         )
+        assert method_calls == [], (
+            "Fallback must not attempt __get_struct_output_model retries; "
+            f"got: {method_calls}"
+        )
+        assert result is not None
 
 
 # ---------------------------------------------------------------------------
