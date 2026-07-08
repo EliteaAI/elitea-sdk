@@ -52,7 +52,10 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         """Track a skipped document during indexing."""
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
-        self._indexing_stats.documents_skipped_error.add(doc_id)
+        if reason == "filtered":
+            self._indexing_stats.documents_skipped_filtered.add(doc_id)
+        else:
+            self._indexing_stats.documents_skipped_error.add(doc_id)
 
     def _track_runtime_skipped(self, item_name: str, reason: str = "extension"):
         """Track a runtime skipped item during indexing (e.g., attachments, artifacts)."""
@@ -91,6 +94,15 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
         self._indexing_stats.items_processed += 1
+
+    def _track_document_unchanged(self, doc_identifier: str):
+        """Track a document matched by incremental dedup — same updated_on as the
+        indexed copy, so we skipped re-indexing it. Not a failure; counted separately
+        from documents_skipped_* so the report can distinguish 'nothing to do' from
+        'something went wrong'."""
+        if not hasattr(self, '_indexing_stats'):
+            self._init_indexing_stats()
+        self._indexing_stats.documents_already_indexed.add(doc_identifier)
 
     def _track_dependent_item_skipped(self, item_name: str):
         """
