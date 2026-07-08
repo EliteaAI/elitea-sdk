@@ -49,8 +49,14 @@ class IndexingStats:
 
     # For non-code toolkits (documents/runtime)
     documents_skipped_error: Set[str] = field(default_factory=set)
+    documents_skipped_filtered: Set[str] = field(default_factory=set)
     runtime_skipped_extension: Set[str] = field(default_factory=set)
     runtime_skipped_error: Set[str] = field(default_factory=set)
+
+    # Documents already indexed with the same updated_on hash — matched by
+    # incremental dedup (clean_index=False) and intentionally not re-indexed.
+    # Not a failure: parent is unchanged, so we skip it to save work.
+    documents_already_indexed: Set[str] = field(default_factory=set)
 
     # Dependent/child items that failed within successful parent documents
     # These are tracked separately since the parent document was still indexed
@@ -66,7 +72,10 @@ class IndexingStats:
             len(self.files_skipped_empty) +
             len(self.files_unsupported_extension)
         )
-        documents_skipped_count = len(self.documents_skipped_error)
+        documents_skipped_count = (
+            len(self.documents_skipped_error) +
+            len(self.documents_skipped_filtered)
+        )
         runtime_skipped_count = (
             len(self.runtime_skipped_extension) +
             len(self.runtime_skipped_error)
@@ -96,6 +105,8 @@ class IndexingStats:
                 "count": documents_skipped_count,
                 "error": sorted(self.documents_skipped_error),
                 "error_count": len(self.documents_skipped_error),
+                "filtered": sorted(self.documents_skipped_filtered),
+                "filtered_count": len(self.documents_skipped_filtered),
             },
             "runtime_skipped": {
                 "count": runtime_skipped_count,
@@ -107,7 +118,11 @@ class IndexingStats:
             "dependent_items_skipped": {
                 "count": dependent_items_count,
                 "items": sorted(self.dependent_items_skipped),
-            }
+            },
+            "documents_already_indexed": {
+                "count": len(self.documents_already_indexed),
+                "items": sorted(self.documents_already_indexed),
+            },
         }
 
     def get_summary(self) -> str:
@@ -123,6 +138,7 @@ class IndexingStats:
 
         # Count document/runtime-related skips (top-level)
         doc_skips = (len(self.documents_skipped_error) +
+                    len(self.documents_skipped_filtered) +
                     len(self.runtime_skipped_extension) +
                     len(self.runtime_skipped_error))
 
@@ -173,6 +189,12 @@ class IndexingStats:
             if len(sorted_doc_error) > 5:
                 lines.append(f"    ... and {len(sorted_doc_error) - 5} more")
 
+        if self.documents_skipped_filtered:
+            sorted_doc_filtered = sorted(self.documents_skipped_filtered)
+            lines.append(f"  - Documents filtered out ({len(sorted_doc_filtered)}): {', '.join(sorted_doc_filtered[:5])}")
+            if len(sorted_doc_filtered) > 5:
+                lines.append(f"    ... and {len(sorted_doc_filtered) - 5} more")
+
         if self.runtime_skipped_extension:
             sorted_runtime_ext = sorted(self.runtime_skipped_extension)
             lines.append(f"  - Runtime skipped (extension) ({len(sorted_runtime_ext)}): {', '.join(sorted_runtime_ext[:5])}")
@@ -192,6 +214,15 @@ class IndexingStats:
             lines.append(f"  - Failed sub-items: {', '.join(sorted_dependent[:5])}")
             if len(sorted_dependent) > 5:
                 lines.append(f"    ... and {len(sorted_dependent) - 5} more")
+
+        # Documents that matched by incremental dedup — not skipped in the failure
+        # sense, so tracked in their own section to keep counts unambiguous.
+        if self.documents_already_indexed:
+            sorted_unchanged = sorted(self.documents_already_indexed)
+            lines.append(f"\nAlready indexed, unchanged ({len(sorted_unchanged)}): "
+                         f"{', '.join(sorted_unchanged[:5])}")
+            if len(sorted_unchanged) > 5:
+                lines.append(f"    ... and {len(sorted_unchanged) - 5} more")
 
         return "\n".join(lines)
 
@@ -412,17 +443,34 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # so docs_count counts chunks instead of files. Use items_processed from stats
             # which tracks actual file count.
             # Detection: if docs_count equals chunks and items_processed differs, it's code indexer.
-            if (skipped_data and skipped_data.get("items_processed", 0) > 0
+            # Subtract already-indexed (unchanged, dedup-matched) docs from items_processed so
+            # that a non-code indexer with all-unchanged docs (docs_count=0, chunks=0,
+            # items_processed=N) doesn't get its docs_count inflated back to N.
+            unchanged_count = (
+                skipped_data.get("documents_already_indexed", {}).get("count", 0)
+                if skipped_data else 0
+            )
+            effective_processed = (
+                (skipped_data.get("items_processed", 0) - unchanged_count)
+                if skipped_data else 0
+            )
+            if (skipped_data and effective_processed > 0
                     and docs_count == succeeded_chunks_count
-                    and docs_count != skipped_data["items_processed"]):
-                docs_count = skipped_data["items_processed"]
+                    and docs_count != effective_processed):
+                docs_count = effective_processed
+
+            unchanged_detail = (
+                f" {unchanged_count} document(s) already indexed (unchanged)."
+                if unchanged_count > 0 else ""
+            )
 
             # Use docs_count for user-facing messages (number of documents)
             # Use succeeded_chunks_count for internal tracking (number of chunks in vector store)
             if failed_chunks_count > 0 and succeeded_chunks_count > 0:
                 final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
                 status = "partly_indexed"
-                message = (f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks). "
+                message = (f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks)."
+                           f"{unchanged_detail} "
                            f"Failed to index {failed_chunks_count} chunks.{issues_detail}{skipped_summary}")
             elif failed_chunks_count > 0 >= succeeded_chunks_count:
                 final_state = IndexerKeywords.INDEX_META_FAILED.value
@@ -431,7 +479,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             elif docs_count > 0:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = "ok"
-                message = f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks).{skipped_summary}"
+                message = (f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks)."
+                           f"{unchanged_detail}{skipped_summary}")
+            elif unchanged_count > 0:
+                final_state = IndexerKeywords.INDEX_META_COMPLETED.value
+                status = "ok"
+                message = (f"No new documents to index; {unchanged_count} document(s) already indexed "
+                           f"(unchanged).{skipped_summary}")
             else:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = "ok"
@@ -699,6 +753,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             key = key if isinstance(key, str) else str(key)
             if key in indexed_keys and index_name == indexed_data[key]['metadata'].get('collection'):
                 if self.compare_fn(document, indexed_data[key]):
+                    if hasattr(self, '_track_document_unchanged'):
+                        self._track_document_unchanged(
+                            document.metadata.get('path')
+                            or document.metadata.get('name')
+                            or key
+                        )
                     continue
                 yield document
                 docs_to_remove.update(self.remove_ids_fn(indexed_data, key))
