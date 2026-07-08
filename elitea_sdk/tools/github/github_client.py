@@ -1678,33 +1678,10 @@ class GitHubClient(BaseModel):
             per-file cap, or a short skip notice once the batch's cumulative
             cap is reached (remaining files are not fetched at all).
         """
-        from ..utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS, measure_result_chars
-
-        start_line = offset
-        end_line = (offset + limit - 1) if (offset is not None and limit is not None) else None
-
-        results: Dict[str, Any] = {}
-        # One shared budget for the whole batch, not just per file — many
-        # small-but-full files can sum to the same freeze risk as one big one.
-        cumulative_chars = 0
-
-        for file_path in file_paths:
-            if cumulative_chars >= DEFAULT_MAX_OUTPUT_CHARS:
-                results[file_path] = (
-                    f"Skipped: the batch's cumulative {DEFAULT_MAX_OUTPUT_CHARS}-character "
-                    "read limit was already reached by earlier files in this call. "
-                    "Read this file individually with read_file."
-                )
-                continue
-            try:
-                content = self.read_file(file_path, branch=branch, start_line=start_line, end_line=end_line)
-                results[file_path] = content
-                cumulative_chars += measure_result_chars(content)
-            except Exception as e:
-                results[file_path] = f"Error reading file: {str(e)}"
-                logger.error(f"Failed to read {file_path}: {e}")
-
-        return results
+        # Route through the shared capped batch reader so the cumulative-cap
+        # loop lives in one place, not one copy per toolkit.
+        from ..utils.file_metadata import capped_read_multiple_files
+        return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     def _write_file(
         self,

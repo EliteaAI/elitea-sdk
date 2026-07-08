@@ -252,6 +252,45 @@ def measure_result_chars(content: Any) -> int:
         return len(str(content))
 
 
+def capped_read_multiple_files(read_file, file_paths, *, branch=None, offset=None, limit=None):
+    """Batch read routed through a toolkit's public (capped) ``read_file``.
+
+    Single shared implementation of the per-file + cumulative cap loop for the
+    VCS toolkits (GitHub/GitLab/...), whose wrappers cherry-pick methods rather
+    than sharing a common base, so this lives as a module function they each
+    call with one line instead of copying the loop. *read_file* is the bound
+    ``self.read_file`` (the capped one). Each result is a plain string, a
+    ``content_too_large`` guidance dict if that file alone exceeds the per-file
+    cap, or a skip notice once the batch's cumulative budget is reached
+    (remaining files are not fetched at all).
+    """
+    start_line = offset
+    end_line = (offset + limit - 1) if (offset is not None and limit is not None) else None
+
+    results: Dict[str, Any] = {}
+    # One shared budget for the whole batch, not just per file — many
+    # small-but-full files can sum to the same freeze risk as one big one.
+    cumulative_chars = 0
+
+    for file_path in file_paths:
+        if cumulative_chars >= DEFAULT_MAX_OUTPUT_CHARS:
+            results[file_path] = (
+                f"Skipped: the batch's cumulative {DEFAULT_MAX_OUTPUT_CHARS}-character "
+                "read limit was already reached by earlier files in this call. "
+                "Read this file individually with read_file."
+            )
+            continue
+        try:
+            content = read_file(file_path, branch=branch, start_line=start_line, end_line=end_line)
+            results[file_path] = content
+            cumulative_chars += measure_result_chars(content)
+        except Exception as e:
+            results[file_path] = f"Error reading file: {e}"
+            logger.error("Failed to read %s: %s", file_path, e)
+
+    return results
+
+
 def _count_lines(file_content) -> int:
     """Count lines in *file_content* (bytes, bytearray, or str) without decoding.
 
