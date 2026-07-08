@@ -106,7 +106,6 @@ class GitHubClient(BaseModel):
     # Import file operation methods from BaseCodeToolApiWrapper
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
     read_file_chunk = BaseCodeToolApiWrapper.read_file_chunk
-    read_multiple_files = BaseCodeToolApiWrapper.read_multiple_files
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
 
@@ -1642,8 +1641,9 @@ class GitHubClient(BaseModel):
         from ..utils.text_operations import apply_line_slice
         from ..utils.file_metadata import guard_text_read
 
-        content = self._read_file(file_path, branch if branch else self.active_branch, repo_name)
+        full_content = self._read_file(file_path, branch if branch else self.active_branch, repo_name)
 
+        content = full_content
         if start_line is not None or end_line is not None:
             offset = start_line if start_line is not None else 1
             limit = (end_line - offset + 1) if end_line is not None else None
@@ -1654,8 +1654,58 @@ class GitHubClient(BaseModel):
             if (start_line is not None or end_line is not None)
             else "full file read"
         )
-        return guard_text_read(content, file_path, requested=requested)
-    
+        return guard_text_read(content, file_path, requested=requested, full_content=full_content)
+
+    def read_multiple_files(
+        self,
+        file_paths: List[str],
+        branch: str = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Read multiple files in batch, capped both per-file and cumulatively.
+
+        Args:
+            file_paths: List of file paths to read
+            branch: Branch name (None for active branch)
+            offset: Starting line number for all files (1-indexed)
+            limit: Number of lines to read from offset for all files
+
+        Returns:
+            Dict mapping each file path to its content: a plain string, a
+            structured content_too_large object if that file alone exceeds the
+            per-file cap, or a short skip notice once the batch's cumulative
+            cap is reached (remaining files are not fetched at all).
+        """
+        from ..utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS, measure_result_chars
+
+        start_line = offset
+        end_line = (offset + limit - 1) if (offset is not None and limit is not None) else None
+
+        results: Dict[str, Any] = {}
+        # One shared budget for the whole batch, not just per file — many
+        # small-but-full files can sum to the same freeze risk as one big one.
+        cumulative_chars = 0
+
+        for file_path in file_paths:
+            if cumulative_chars >= DEFAULT_MAX_OUTPUT_CHARS:
+                results[file_path] = (
+                    f"Skipped: the batch's cumulative {DEFAULT_MAX_OUTPUT_CHARS}-character "
+                    "read limit was already reached by earlier files in this call. "
+                    "Read this file individually with read_file."
+                )
+                continue
+            try:
+                content = self.read_file(file_path, branch=branch, start_line=start_line, end_line=end_line)
+                results[file_path] = content
+                cumulative_chars += measure_result_chars(content)
+            except Exception as e:
+                results[file_path] = f"Error reading file: {str(e)}"
+                logger.error(f"Failed to read {file_path}: {e}")
+
+        return results
+
     def _write_file(
         self,
         file_path: str,
