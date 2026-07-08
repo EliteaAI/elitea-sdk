@@ -70,7 +70,9 @@ GitLabReadFile = create_model(
     "GitLabReadFileModel",
     file_path=(str, Field(description="Path of the file to read")),
     branch=(str, Field(description=branch_description)),
-    repository=(Optional[str], Field(description="Name of the repository", default=None))
+    repository=(Optional[str], Field(description="Name of the repository", default=None)),
+    start_line=(Optional[int], Field(default=None, description="Starting line number (1-indexed, inclusive) for a partial read. Omit to read from the beginning.")),
+    end_line=(Optional[int], Field(default=None, description="Ending line number (1-indexed, inclusive) for a partial read. Omit to read to the end.")),
 )
 
 GitLabUpdateFile = create_model(
@@ -378,28 +380,52 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(e)
 
-    def read_file(self, file_path: str, branch: str, repository: Optional[str] = None) -> str:
-        """Reads a file from the gitlab repo."""
+    def read_file(self, file_path: str, branch: str, repository: Optional[str] = None,
+                  start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+        """Reads a file from the gitlab repo.
+
+        Supports a bounded partial read via start_line/end_line (1-indexed,
+        inclusive). Returns the file contents as a string, or a structured
+        content_too_large guidance object (dict) if it exceeds the size limit.
+        """
+        from ..utils.text_operations import apply_line_slice
+        from ..utils.file_metadata import guard_text_read
 
         try:
             repo_instance = self._get_repo(repository)
             file = repo_instance.files.get(file_path, branch)
-            return file.decode().decode("utf-8")
+            full_content = file.decode().decode("utf-8")
         except Exception as e:
             return ToolException(e)
 
+        content = full_content
+        if start_line is not None or end_line is not None:
+            offset = start_line if start_line is not None else 1
+            limit = (end_line - offset + 1) if end_line is not None else None
+            content = apply_line_slice(content, offset=offset, limit=limit)
+
+        requested = (
+            f"start_line={start_line}, end_line={end_line}"
+            if (start_line is not None or end_line is not None)
+            else "full file read"
+        )
+        return guard_text_read(content, file_path, requested=requested, full_content=full_content)
+
     def _read_file(self, file_path: str, branch: str, **kwargs) -> str:
         """
-        Internal read_file used by BaseCodeToolApiWrapper.edit_file.
-        Delegates to the public `read_file` implementation which supports an optional repository argument.
-        The repository may be passed via kwargs or provided earlier through `update_file` which sets
-        a temporary attribute `_tmp_repository_for_edit`.
+        Internal uncapped read used by edit_file/append_file — returns the full
+        raw file content, never the capped guidance object the public read_file
+        may return. The repository is taken from the temporary attribute
+        `_tmp_repository_for_edit` set earlier by `update_file`.
         """
         # Repository from temporary context, then None
         repository = getattr(self, "_tmp_repository_for_edit", None)
         try:
-            # Public read_file signature: read_file(file_path, branch, repository=None)
-            return self.read_file(file_path, branch, repository)
+            # Fetch raw content directly (uncapped) — this internal path feeds
+            # edit_file, which must operate on the full file, not capped guidance.
+            repo_instance = self._get_repo(repository)
+            file = repo_instance.files.get(file_path, branch)
+            return file.decode().decode("utf-8")
         except Exception as e:
             raise ToolException(f"Can't extract file content (`{file_path}`) due to error:\n{str(e)}")
 
@@ -486,7 +512,9 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         try:
             if not content:
                 return "Content to be added is empty. Append file won't be completed"
-            file_content = self.read_file(file_path, branch)
+            # Uncapped internal read — append must operate on the full file, not
+            # a capped guidance object.
+            file_content = self._read_file(file_path, branch)
             updated_file_content = f"{file_content}\n{content}"
             commit = {
                 "branch": branch,

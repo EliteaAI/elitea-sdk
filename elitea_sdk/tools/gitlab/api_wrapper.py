@@ -1,5 +1,6 @@
 # api_wrapper.py
 import fnmatch
+import logging
 from typing import Any, ClassVar, Dict, List, Optional
 
 from gitlab import GitlabGetError
@@ -12,6 +13,8 @@ from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.content_parser import parse_file_content
 from .utils import get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
+
+logger = logging.getLogger(__name__)
 
 AppendFileModel = create_model(
     "AppendFileModel",
@@ -35,6 +38,8 @@ ReadFileModel = create_model(
     "ReadFileModel",
     file_path=(str, Field(description="The path of the file")),
     branch=(str, Field(description="The branch to read the file from")),
+    start_line=(Optional[int], Field(default=None, description="Starting line number (1-indexed, inclusive) for a partial read. Omit to read from the beginning.")),
+    end_line=(Optional[int], Field(default=None, description="Ending line number (1-indexed, inclusive) for a partial read. Omit to read to the end.")),
 )
 UpdateFileModel = create_model(
     "UpdateFileModel",
@@ -127,9 +132,58 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     # Import file operation methods from BaseCodeToolApiWrapper
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
     read_file_chunk = BaseCodeToolApiWrapper.read_file_chunk
-    read_multiple_files = BaseCodeToolApiWrapper.read_multiple_files
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
+
+    def read_multiple_files(
+        self,
+        file_paths: List[str],
+        branch: str = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Read multiple files in batch, capped both per-file and cumulatively.
+
+        Args:
+            file_paths: List of file paths to read
+            branch: Branch name (None for active branch)
+            offset: Starting line number for all files (1-indexed)
+            limit: Number of lines to read from offset for all files
+
+        Returns:
+            Dict mapping each file path to its content: a plain string, a
+            structured content_too_large object if that file alone exceeds the
+            per-file cap, or a short skip notice once the batch's cumulative
+            cap is reached (remaining files are not fetched at all).
+        """
+        from ..utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS, measure_result_chars
+
+        start_line = offset
+        end_line = (offset + limit - 1) if (offset is not None and limit is not None) else None
+
+        results: Dict[str, Any] = {}
+        # One shared budget for the whole batch, not just per file — many
+        # small-but-full files can sum to the same freeze risk as one big one.
+        cumulative_chars = 0
+
+        for file_path in file_paths:
+            if cumulative_chars >= DEFAULT_MAX_OUTPUT_CHARS:
+                results[file_path] = (
+                    f"Skipped: the batch's cumulative {DEFAULT_MAX_OUTPUT_CHARS}-character "
+                    "read limit was already reached by earlier files in this call. "
+                    "Read this file individually with read_file."
+                )
+                continue
+            try:
+                content = self.read_file(file_path, branch, start_line=start_line, end_line=end_line)
+                results[file_path] = content
+                cumulative_chars += measure_result_chars(content)
+            except Exception as e:
+                results[file_path] = f"Error reading file: {str(e)}"
+                logger.error(f"Failed to read {file_path}: {e}")
+
+        return results
 
     @staticmethod
     def _sanitize_url(url: str) -> str:
@@ -251,7 +305,13 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         """
         # Default to active branch if branch is None, consistent with other methods
         branch = branch if branch else self._active_branch
-        return str(self.read_file(file_path, branch))
+        # Fetch parsed content directly (uncapped) — this internal path feeds
+        # edit_file, which must operate on the full file, not capped guidance.
+        self.set_active_branch(branch)
+        file = self.repo_instance.files.get(file_path, branch)
+        return str(parse_file_content(file_name=file_path,
+                                      file_content=file.decode(),
+                                      llm=self.llm))
 
     def create_branch(self, branch_name: str) -> str:
         try:
@@ -423,14 +483,50 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
 
             return "Created file " + file_path
 
-    def read_file(self, file_path: str, branch: str) -> str:
+    def read_file(self, file_path: str, branch: str,
+                  start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+        """
+        Read a file from the specified branch.
+
+        Parameters:
+            file_path: the file path
+            branch: the branch to read the file from (defaults to the active branch)
+            start_line: starting line number (1-indexed, inclusive) for a partial read
+            end_line: ending line number (1-indexed, inclusive) for a partial read
+
+        Returns:
+            The file contents as a string, or a structured content_too_large
+            guidance object (dict) if it exceeds the size limit.
+        """
+        from ..utils.text_operations import apply_line_slice
+        from ..utils.file_metadata import guard_text_read, guard_nontext_read
+
         # Default to active branch if branch is None
         branch = branch if branch else self._active_branch
         self.set_active_branch(branch)
         file = self.repo_instance.files.get(file_path, branch)
-        return parse_file_content(file_name=file_path,
-                                  file_content=file.decode(),
-                                  llm=self.llm)
+        full_content = parse_file_content(file_name=file_path,
+                                          file_content=file.decode(),
+                                          llm=self.llm)
+
+        requested = (
+            f"start_line={start_line}, end_line={end_line}"
+            if (start_line is not None or end_line is not None)
+            else "full file read"
+        )
+
+        # Non-str results (e.g. parsed .xlsx dict) have no line structure; slicing
+        # and line-oriented guidance don't apply — guard them as non-chunkable.
+        if not isinstance(full_content, str):
+            return guard_nontext_read(full_content, file_path, requested=requested)
+
+        content = full_content
+        if start_line is not None or end_line is not None:
+            offset = start_line if start_line is not None else 1
+            limit = (end_line - offset + 1) if end_line is not None else None
+            content = apply_line_slice(content, offset=offset, limit=limit)
+
+        return guard_text_read(content, file_path, requested=requested, full_content=full_content)
     
     def _write_file(
         self,
@@ -558,7 +654,9 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             if not content:
                 return "Content to be added is empty. Append file won't be completed"
             self.set_active_branch(branch)
-            file_content = self.read_file(file_path, branch)
+            # Uncapped internal read — append must operate on the full file, not
+            # a capped guidance object.
+            file_content = self._read_file(file_path, branch)
             updated_file_content = f"{file_content}\n{content}"
             commit = {
                 "branch": branch,

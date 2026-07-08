@@ -499,6 +499,56 @@ def guard_text_read(
     )
 
 
+def guard_nontext_read(
+    content: Any,
+    filename: str,
+    *,
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+    requested: Optional[str] = None,
+) -> Any:
+    """Guard a non-text (parsed dict) read result against the output cap.
+
+    For VCS readers whose ``read_file`` may return a structured result rather
+    than a ``str`` (e.g. GitLab's ``.xlsx`` path yields a dict via
+    ``parse_file_content``). Such results have no line structure, so an
+    over-limit one cannot be chunked by line — this returns a
+    ``content_too_large`` guidance object that says so explicitly
+    (``full_read_allowed=False``, no ``start_line``/``end_line`` advertised)
+    rather than passing the oversized payload through to context.
+
+    Returns *content* unchanged when within the cap.
+    """
+    actual_chars = measure_result_chars(content)
+    if actual_chars <= max_output_chars:
+        return content
+
+    metadata = get_file_metadata(filename, file_content=None)
+    if metadata.get(RESULT_STATUS_KEY) == ResultStatus.ERROR.value:
+        return metadata
+
+    metadata["unit"] = None
+    metadata["read_limits"] = {
+        **metadata.get("read_limits", {}),
+        "full_read_allowed": False,
+    }
+    metadata["instruction_for_readFile"] = {
+        "first_class_params": {},
+        "notes": (
+            f"This file's parsed content is {actual_chars} characters, exceeding "
+            f"the {max_output_chars}-character read limit. It is not a "
+            f"line-oriented text file, so it cannot be read in bounded line "
+            f"chunks (start_line/end_line do not apply). Reading it in full is "
+            f"refused. Use a dedicated export/query tool for this file type "
+            f"instead of read_file."
+        ),
+    }
+
+    return build_over_limit_response(
+        metadata, actual_chars=actual_chars, limit_chars=max_output_chars,
+        requested=requested, include_metadata_directive=False,
+    )
+
+
 def build_over_limit_response(
     metadata: Dict[str, Any],
     *,
