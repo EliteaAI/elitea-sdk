@@ -1,6 +1,5 @@
 # api_wrapper.py
 import fnmatch
-import logging
 from typing import Any, ClassVar, Dict, List, Optional
 
 from gitlab import GitlabGetError
@@ -13,8 +12,6 @@ from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.content_parser import parse_file_content
 from .utils import get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
-
-logger = logging.getLogger(__name__)
 
 AppendFileModel = create_model(
     "AppendFileModel",
@@ -142,48 +139,10 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         offset: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """
-        Read multiple files in batch, capped both per-file and cumulatively.
-
-        Args:
-            file_paths: List of file paths to read
-            branch: Branch name (None for active branch)
-            offset: Starting line number for all files (1-indexed)
-            limit: Number of lines to read from offset for all files
-
-        Returns:
-            Dict mapping each file path to its content: a plain string, a
-            structured content_too_large object if that file alone exceeds the
-            per-file cap, or a short skip notice once the batch's cumulative
-            cap is reached (remaining files are not fetched at all).
-        """
-        from ..utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS, measure_result_chars
-
-        start_line = offset
-        end_line = (offset + limit - 1) if (offset is not None and limit is not None) else None
-
-        results: Dict[str, Any] = {}
-        # One shared budget for the whole batch, not just per file — many
-        # small-but-full files can sum to the same freeze risk as one big one.
-        cumulative_chars = 0
-
-        for file_path in file_paths:
-            if cumulative_chars >= DEFAULT_MAX_OUTPUT_CHARS:
-                results[file_path] = (
-                    f"Skipped: the batch's cumulative {DEFAULT_MAX_OUTPUT_CHARS}-character "
-                    "read limit was already reached by earlier files in this call. "
-                    "Read this file individually with read_file."
-                )
-                continue
-            try:
-                content = self.read_file(file_path, branch, start_line=start_line, end_line=end_line)
-                results[file_path] = content
-                cumulative_chars += measure_result_chars(content)
-            except Exception as e:
-                results[file_path] = f"Error reading file: {str(e)}"
-                logger.error(f"Failed to read {file_path}: {e}")
-
-        return results
+        # Route through the shared capped batch reader so the cumulative-cap
+        # loop lives in one place, not one copy per toolkit.
+        from ..utils.file_metadata import capped_read_multiple_files
+        return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     @staticmethod
     def _sanitize_url(url: str) -> str:
