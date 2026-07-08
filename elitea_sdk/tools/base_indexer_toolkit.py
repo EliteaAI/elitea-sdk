@@ -493,7 +493,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
             # Final update should always be forced (pass chunks count for indexed_chunks field)
             self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
-                                   error=message if status != "ok" else None, skipped=skipped_data)
+                                   error=message if status != "ok" else None, skipped=skipped_data,
+                                   docs_count=docs_count)
             self._emit_index_event(index_name)
             #
             return {"status": status, "message": message}
@@ -1071,7 +1072,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             )
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta.get("id")])
 
-    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None):
+    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None, docs_count: Optional[int] = None):
         """Update `index_meta` document with optional time-based throttling.
 
         Args:
@@ -1147,15 +1148,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 if total_fetched > 0:
                     # Explicit total_fetched provided
                     metadata["total"] = total_fetched
-                    metadata["indexed"] = total_fetched - total_skipped
+                    metadata["indexed"] = docs_count if docs_count is not None else total_fetched - total_skipped
                 elif total_skipped > items_processed:
                     # Code indexer: items_processed and total_skipped are disjoint
                     metadata["total"] = items_processed + total_skipped
-                    metadata["indexed"] = items_processed
+                    metadata["indexed"] = docs_count if docs_count is not None else items_processed
                 else:
                     # Non-code indexer: items_processed is all fetched, skipped is subset
                     metadata["total"] = items_processed
-                    metadata["indexed"] = items_processed - total_skipped
+                    metadata["indexed"] = docs_count if docs_count is not None else items_processed - total_skipped
             else:
                 # Fallback: if no skipped data, use chunks count for backward compatibility
                 metadata["indexed"] = metadata["indexed_chunks"]
