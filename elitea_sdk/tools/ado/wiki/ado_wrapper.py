@@ -10,7 +10,7 @@ from azure.devops.exceptions import AzureDevOpsServiceError
 from azure.devops.v7_0.core import CoreClient
 from azure.devops.v7_0.wiki import WikiClient, WikiPageCreateOrUpdateParameters, WikiCreateParametersV2, \
     WikiPageMoveParameters
-from azure.devops.v7_0.wiki.models import GitVersionDescriptor
+from azure.devops.v7_0.wiki.models import GitVersionDescriptor, WikiPagesBatchRequest
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from msrest.authentication import BasicAuthentication
@@ -26,6 +26,12 @@ from ...utils.content_parser import parse_file_content
 from ....runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
+# Azure DevOps REST resource GUID for POST /wiki/wikis/{wikiIdentifier}/pagesBatch.
+# Public API contract, mirrored from azure/devops/v7_0/wiki/wiki_client.get_pages_batch.
+# We call Client._send directly (bypassing WikiClient.get_pages_batch) so we can read
+# the x-ms-continuationtoken response header for pagination.
+ADO_WIKI_PAGES_BATCH_LOCATION_ID = "71323c46-2592-4398-8771-ced73dd87207"
 
 GetWikiInput = create_model(
     "GetWikiInput",
@@ -673,39 +679,81 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Unable to modify wiki page: {str(e)}")
             return ToolException(f"Unable to modify wiki page: {str(e)}")
 
-    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None, title_contains: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
+    def _iter_wiki_pages(self, wiki_identifier: str, batch_size: int = 100) -> Generator:
+        """Yield every WikiPageDetail across all batches.
+
+        The SDK's WikiClient.get_pages_batch returns only the deserialized body and
+        discards the raw response, so the x-ms-continuationtoken header — which
+        drives pagination — is unreachable through the public API. We reproduce
+        the same call via the underlying Client._send so we can read the header.
+        """
+        route_values = {
+            'project': self._client._serialize.url('project', self.project, 'str'),
+            'wikiIdentifier': self._client._serialize.url('wiki_identifier', wiki_identifier, 'str'),
+        }
+        continuation_token: Optional[str] = None
+        while True:
+            request_body = WikiPagesBatchRequest(top=batch_size, continuation_token=continuation_token)
+            content = self._client._serialize.body(request_body, 'WikiPagesBatchRequest')
+            response = self._client._send(
+                http_method='POST',
+                location_id=ADO_WIKI_PAGES_BATCH_LOCATION_ID,
+                version='7.0',
+                route_values=route_values,
+                content=content,
+            )
+            for page in self._client._deserialize('[WikiPageDetail]', self._client._unwrap_collection(response)):
+                yield page
+            continuation_token = response.headers.get('x-ms-continuationtoken')
+            if not continuation_token:
+                break
+
+    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None, path_contains: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
         self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
-        pages = self._client.get_pages_batch(pages_batch_request={}, project=self.project, wiki_identifier=wiki_identifier)
-        #
+        pages = self._iter_wiki_pages(wiki_identifier)
+        needle = path_contains.lower() if path_contains else None
         for page in pages:
+            self._indexing_stats.total_fetched += 1
+            title = page.path.rsplit("/", 1)[-1]
+            if needle and needle not in page.path.lower():
+                self._track_skipped_document(page.path, reason="filtered")
+                continue
             self._track_processed_item()
             content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_identifier, id=page.id, include_content=True).page.content
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            title = page.path.rsplit("/", 1)[-1]
-            if not title_contains or (title_contains and title_contains.lower() in title.lower()):
-                if chunking_tool:
-                    yield Document(page_content='', metadata={
-                        'id': str(page.id),
-                        'path': page.path,
-                        'title': title,
-                        'updated_on': content_hash,
-                        IndexerKeywords.CONTENT_IN_BYTES.value: content.encode("utf-8")
-                    })
-                else:
-                    yield Document(page_content=content, metadata={
-                        'id': str(page.id),
-                        'path': page.path,
-                        'title': title,
-                        'updated_on': content_hash
-                    })
+            if chunking_tool:
+                yield Document(page_content='', metadata={
+                    'id': str(page.id),
+                    'path': page.path,
+                    'title': title,
+                    'updated_on': content_hash,
+                    IndexerKeywords.CONTENT_IN_BYTES.value: content.encode("utf-8")
+                })
+            else:
+                yield Document(page_content=content, metadata={
+                    'id': str(page.id),
+                    'path': page.path,
+                    'title': title,
+                    'updated_on': content_hash
+                })
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
         return {
             'chunking_tool': (Literal['markdown', ''], Field(description="Name of chunking tool", default='markdown')),
             "wiki_identifier": (Optional[str], Field(default=None, description="Wiki identifier to index, e.g., 'ABCProject.wiki'. If not provided, uses the default wiki identifier from toolkit configuration.")),
-            'title_contains': (Optional[str], Field(default=None, description="Optional filter to include only pages with titles containing exact this string")),
+            'path_contains': (Optional[str], Field(
+                default=None,
+                description=(
+                    "Optional case-insensitive substring filter applied to the full wiki page path. "
+                    "A page is included when the substring appears anywhere in its path, so "
+                    "filtering by a parent folder name also pulls in all descendants. "
+                    "Examples: 'design' matches '/Architecture/Design Records' and "
+                    "'/Architecture/Design Records/API'. Leave empty ('' or omit) to index "
+                    "all pages."
+                )
+            )),
         }
 
     @extend_with_parent_available_tools
