@@ -175,11 +175,11 @@ nodes:
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Tool ran without throwing an exception
           2. no_errors: Output does NOT contain error indicators
-          3. has_manual_test: Response contains Manual test creation
-          4. has_generic_test: Response contains Generic test creation
+          3. has_manual_test: Response contains Manual test creation under the manualTest alias
+          4. has_generic_test: Response contains Generic test creation under the genericTest alias
           5. has_issue_ids: Both tests have issueIds assigned
           6. has_keys: Both tests have Jira keys assigned
-          7. all_tests_created: Result is a list with 2 test creation confirmations
+          7. all_tests_created: Response confirms exactly 2 created tests in the single aliased mutation response
 
           Return JSON test_results:
           {{
@@ -190,7 +190,7 @@ nodes:
             "has_generic_test": boolean,
             "has_issue_ids": boolean,
             "has_keys": boolean,
-            "all_tests_created": boolean (checks if 2 tests were created),
+            "all_tests_created": boolean (true when the single response object confirms exactly 2 created tests),
             "tests_created_count": integer (number of tests created, should be 2),
             "success_indicator_found": "which indicator was found or 'none'",
             "error_indicator_found": "which error indicator was found or 'none'",

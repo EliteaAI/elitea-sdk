@@ -1,3 +1,5 @@
+import re
+
 DEFAULT_MULTIMODAL_PROMPT = """
 ## Image Type: Diagrams (e.g., Sequence Diagram, Context Diagram, Component Diagram)
 **Prompt**:
@@ -711,6 +713,52 @@ SKILLS_SECTION_ENTRY = """<skill name="{name}">
 </skill>"""
 
 MAX_SKILLS_PER_INVOCATION = 5
+
+
+SKILL_REGISTRY_HEADER = """The skills listed below can be activated on demand. Each <skill_option> gives only the skill's name and when to use it — the full instructions are NOT loaded yet.
+
+Before composing each reply, scan this list and decide which skills match. A skill matches when the user's current request falls within its description. You MUST call the `load_skill` tool for EVERY matching skill BEFORE writing your answer — if several match, load all of them, then reconcile their instructions with full information; never skip a matching skill based on its one-line description alone. If you are unsure whether a skill matches, load it: loading an unneeded skill is cheap, missing a needed one is not. Follow each loaded instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. If loaded skills contradict each other, reconcile them silently and output ONLY the final answer: never describe the conflict, name the skills, or show drafts and adjustments in your reply. Only when no skill plausibly matches, answer normally without calling load_skill. Do not mention these skill names or the load_skill mechanism in your reply."""
+
+SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
+
+SKILL_REMINDER_SUFFIX = (
+    "Before answering: check <available_skills> in your instructions and call "
+    "load_skill for every skill matching this request. Earlier replies in this "
+    "conversation do not mean a skill is active now."
+)
+
+LOAD_SKILL_TOOL_DESCRIPTION = (
+    "Load the full instructions for one of this agent's available skills by name. "
+    "The system prompt lists each skill as a <skill_option> inside <available_skills>, "
+    "giving its name and when to use it; pass the exact name here to retrieve that "
+    "skill's complete instructions. Call this for every skill whose description "
+    "matches the user's request — if you are unsure whether a skill matches, load "
+    "it — but only once per skill. After the instructions are returned you MUST "
+    "follow them exactly for the applicable part of your response. Only skills listed "
+    "in <available_skills> can be loaded."
+)
+
+LOADED_SKILL_PREFIX = 'Skill "{name}" is now active'
+
+LOADED_SKILL_PREFIX_RE = re.compile(
+    '^' + re.escape(LOADED_SKILL_PREFIX).replace(re.escape('{name}'), '([^"]+)')
+)
+
+LOADED_SKILL_RESULT = LOADED_SKILL_PREFIX + """. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. In later turns, apply them only when the request again falls within this skill's scope. Do not mention this skill by name or that it was loaded.
+
+<skill name="{name}">
+{instructions}
+</skill>"""
+
+LOAD_SKILL_ALREADY_ACTIVE = (
+    "Skill \"{name}\" is already active for this turn — its instructions are already "
+    "in effect. Do not load it again; just apply them."
+)
+
+LOAD_SKILL_UNKNOWN = (
+    "No skill named \"{name}\" is attached to this agent. Available skills: {available}. "
+    "Call load_skill with one of these exact names, or proceed without a skill if none apply."
+)
 
 
 SEARCH_INDEX_ADDON = """

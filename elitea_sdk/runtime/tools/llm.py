@@ -19,7 +19,13 @@ try:
 except ImportError:
     _SCRATCHPAD_KEY = '__pregel_scratchpad'
 
-from ..langchain.constants import ELITEA_RS, SKILLS_SECTION_HEADER, SKILLS_SECTION_ENTRY, MAX_SKILLS_PER_INVOCATION
+from ..langchain.constants import (
+    ELITEA_RS,
+    MAX_SKILLS_PER_INVOCATION,
+    SKILL_REMINDER_SUFFIX,
+    SKILLS_SECTION_ENTRY,
+    SKILLS_SECTION_HEADER,
+)
 from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
@@ -29,6 +35,12 @@ from ..langchain.utils import (
 )
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from .skill_tools import (
+    LoadSkillTool,
+    build_load_skill_tools,
+    loaded_skill_names_from_messages,
+    render_skill_registry_index,
+)
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
 
@@ -579,17 +591,39 @@ class LLMNode(BaseTool):
         Returns:
             List of filtered tools (or meta-tools + always-bind tools in lazy mode)
         """
+        configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
+        # Rebuilt per call: closes over this turn's attached_skills/invoked_skills.
+        skill_tools = build_load_skill_tools(
+            configurable.get('attached_skills'), configurable.get('invoked_skills')
+        )
+
+        def merge_skill_tools(tools):
+            # Anthropic rejects duplicate tool names in the bind list; on a name
+            # collision the pre-existing tool wins and load_skill is skipped.
+            if not skill_tools:
+                return tools
+            taken = {getattr(t, 'name', None) for t in tools}
+            merged = list(tools)
+            for skill_tool in skill_tools:
+                if skill_tool.name in taken:
+                    logger.warning(
+                        "[Skills] Tool name %r already bound by another toolkit — "
+                        "skipping the progressive-disclosure skill tool this turn",
+                        skill_tool.name,
+                    )
+                else:
+                    merged.append(skill_tool)
+            return merged
+
         # Check for dynamically selected tools from pre-LLM selection
-        if config is not None:
-            configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
-            selected_tools = configurable.get('selected_tools')
-            if selected_tools:
-                logger.info(f"[DynamicToolSelection] Using {len(selected_tools)} pre-selected tools")
-                # Fix for #3290: Always include always_bind_tools (e.g., Planner tools) with
-                # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
-                # This ensures Planner tools are available even on first message when
-                # Smart Tools Selection finds matching toolkits.
-                return list(selected_tools) + list(self.always_bind_tools or [])
+        selected_tools = configurable.get('selected_tools')
+        if selected_tools:
+            logger.info(f"[DynamicToolSelection] Using {len(selected_tools)} pre-selected tools")
+            # Fix for #3290: Always include always_bind_tools (e.g., Planner tools) with
+            # dynamically selected tools. Use `or []` to handle None/falsy gracefully.
+            # This ensures Planner tools are available even on first message when
+            # Smart Tools Selection finds matching toolkits.
+            return merge_skill_tools(list(selected_tools) + list(self.always_bind_tools or []))
 
         # Check if lazy tools mode is enabled and we have a registry
         if self.lazy_tools_mode and self.tool_registry is not None:
@@ -602,8 +636,8 @@ class LLMNode(BaseTool):
                     f"{len(self.always_bind_tools)} always-bind tools: "
                     f"{[t.name for t in self.always_bind_tools]}"
                 )
-                return combined_tools
-            return meta_tools
+                return merge_skill_tools(combined_tools)
+            return merge_skill_tools(list(meta_tools))
 
         # Traditional mode - bind actual tools
         # Fix for #3382: Include always_bind_tools even when lazy mode is disabled
@@ -637,7 +671,7 @@ class LLMNode(BaseTool):
                 )
                 base_tools.extend(additional_tools)
 
-        return base_tools
+        return merge_skill_tools(base_tools)
 
     def _get_meta_tools(self) -> List[BaseTool]:
         """
@@ -1044,6 +1078,9 @@ class LLMNode(BaseTool):
                     )
                     hitl_ctx = None
 
+        # Set in the system branch (gates the skill registry), reused at bind time.
+        prebuilt_filtered_tools = None
+
         # there are 2 possible flows here: LLM node from pipeline (with prompt and task)
         # or standalone LLM node for chat (with messages only)
         if 'system' in func_args.keys():
@@ -1061,6 +1098,27 @@ class LLMNode(BaseTool):
                 system_content = f"{system_content}\n\n{tool_index}"
                 logger.debug("[LazyTools] Injected tool index into system prompt")
 
+            # Skill registry (names + descriptions) goes into the CACHED prefix,
+            # rendered in fixed (skill_id, name) order so the block stays
+            # byte-stable across turns. Advertised only when a LoadSkillTool
+            # survived the merge — on a name collision the registry would point
+            # the model at the imposter tool.
+            skill_registry_advertised = False
+            if configurable.get('attached_skills'):
+                prebuilt_filtered_tools = self.get_filtered_tools(config=config)
+                if any(isinstance(t, LoadSkillTool) for t in prebuilt_filtered_tools):
+                    skill_registry = render_skill_registry_index(configurable.get('attached_skills'))
+                    if skill_registry:
+                        skill_registry_advertised = True
+                        system_content = (
+                            f"{system_content}\n\n{skill_registry}" if system_content else skill_registry
+                        )
+                else:
+                    logger.warning(
+                        "[Skills] load_skill not bound (name collision) — "
+                        "suppressing skill registry injection this turn"
+                    )
+
             # Per-turn skills injection. elitea_core resolves the
             # ~skill-name token(s) from THIS user message and threads the resolved bodies
             # through invoke_config["configurable"]["invoked_skills"]. The rendered SKILLS
@@ -1073,6 +1131,15 @@ class LLMNode(BaseTool):
             skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
             if skills_section:
                 logger.info("[Skills] Injected per-turn skills section into system prompt")
+            # Recency counterweight: the registry sits in the cached prefix, far from
+            # the decision point, and loses to transcript anchoring on small models.
+            # A one-line reminder in the (already uncached) dynamic suffix puts the
+            # instruction last, where it competes with the conversation itself.
+            if skill_registry_advertised:
+                skills_section = (
+                    f"{skills_section}\n\n{SKILL_REMINDER_SUFFIX}" if skills_section
+                    else SKILL_REMINDER_SUFFIX
+                )
 
             task_content = func_args.get('task')
             if not isinstance(task_content, (str, list)):
@@ -1192,11 +1259,15 @@ class LLMNode(BaseTool):
         should_bind_tools = (
             len(self.tool_names or []) > 0 or
             (self.lazy_tools_mode and self.tool_registry is not None) or
-            bool(self.available_tools)  # Bind available tools even when lazy mode auto-disabled
+            bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
+            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
         )
 
         if should_bind_tools:
-            filtered_tools = self.get_filtered_tools(config=config)
+            filtered_tools = (
+                prebuilt_filtered_tools if prebuilt_filtered_tools is not None
+                else self.get_filtered_tools(config=config)
+            )
             if filtered_tools:
                 logger.info(f"Binding {len(filtered_tools)} tools to LLM: {[t.name for t in filtered_tools]}")
                 llm_client = self.client.bind_tools(filtered_tools)
@@ -2504,6 +2575,14 @@ class LLMNode(BaseTool):
                 # fan-out partition (#4993) and the sequential loop resolve
                 # tools identically.
                 tool_to_execute = self._resolve_tool_to_execute(tool_name, config)
+
+                # Seed load_skill with bodies already in context so a re-load
+                # answers "already active" (#5698); semantics documented on
+                # loaded_skill_names_from_messages.
+                if isinstance(tool_to_execute, LoadSkillTool):
+                    tool_to_execute.mark_already_loaded(
+                        loaded_skill_names_from_messages(new_messages)
+                    )
 
                 if tool_to_execute:
                     try:
