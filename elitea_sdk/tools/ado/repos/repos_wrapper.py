@@ -32,6 +32,33 @@ from ...utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_P
 logger = logging.getLogger(__name__)
 
 
+def _relabel_guidance_offset_limit(result: Any) -> Any:
+    """Rewrite over-limit guidance's start_line/end_line params to offset/limit.
+
+    The shared guard helper advertises start_line/end_line, but ADO's read_file
+    tool takes offset/limit — relabel so a caller's retry uses valid arg names.
+    Non-guidance results (plain str) pass through unchanged.
+    """
+    if not isinstance(result, dict):
+        return result
+    instr = result.get("instruction_for_readFile")
+    if not isinstance(instr, dict) or "first_class_params" not in instr:
+        return result
+    total_lines = result.get("total_lines")
+    range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
+    instr["first_class_params"] = {
+        "offset": (
+            f"integer (1-indexed, inclusive) — first line to read. "
+            f"{range_hint}Omit to read from the beginning."
+        ),
+        "limit": (
+            "integer — maximum number of lines to return from offset. "
+            "Omit to read to the end."
+        ),
+    }
+    return result
+
+
 class GitChange:
     """
     Custom GitChange class introduced because not found in azure.devops.v7_0.git.models
@@ -961,6 +988,44 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             return ToolException(msg)
 
+    def read_file(self, file_path: str, branch: str,
+                  offset: Optional[int] = None, limit: Optional[int] = None) -> Any:
+        """
+        Read a file from the given branch in Azure DevOps.
+
+        Parameters:
+            file_path(str): the file path
+            branch(str): repository branch
+            offset(int, optional): starting line number (1-indexed, inclusive) for a partial read.
+            limit(int, optional): maximum number of lines to return from the offset.
+
+        Returns:
+            The file contents as a string, or a structured content_too_large
+            guidance object (dict) if it exceeds the size limit.
+        """
+        from ...utils.text_operations import apply_line_slice
+        from ...utils.file_metadata import guard_text_read
+
+        # Fetch the full file via the uncapped internal reader (no slicing here) so
+        # total_lines in any over-limit guidance reflects the whole file.
+        full_content = self._read_file(file_path, branch)
+        if not isinstance(full_content, str):
+            return full_content
+
+        content = full_content
+        if offset is not None or limit is not None:
+            content = apply_line_slice(content, offset=offset, limit=limit)
+
+        requested = (
+            f"offset={offset}, limit={limit}"
+            if (offset is not None or limit is not None)
+            else "full file read"
+        )
+        result = guard_text_read(content, file_path, requested=requested, full_content=full_content)
+        # Relabel the shared helper's start_line/end_line guidance to this tool's
+        # actual offset/limit params so a retry from the guidance is a valid call.
+        return _relabel_guidance_offset_limit(result)
+
     def _write_file(self, file_path: str, content: str, branch: str = None, commit_message: str = None) -> str:
         """Write content to a file in Azure DevOps by creating an edit commit.
 
@@ -1352,9 +1417,9 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 "args_schema": ArgsSchema.BranchName.value,
             },
             {
-                "ref": self._read_file,
+                "ref": self.read_file,
                 "name": "read_file",
-                "description": self._read_file.__doc__,
+                "description": self.read_file.__doc__,
                 "args_schema": ArgsSchema.ReadFile.value,
             },
             {

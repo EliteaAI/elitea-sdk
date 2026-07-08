@@ -52,6 +52,8 @@ ReadFileModel = create_model(
     "ReadFileModel",
     file_path=(str, Field(description="The path of the file")),
     branch=(str, Field(description="The branch to read the file from")),
+    start_line=(Optional[int], Field(default=None, ge=1, description="Starting line number (1-indexed, inclusive) for a partial read. Omit to read from the beginning.")),
+    end_line=(Optional[int], Field(default=None, ge=1, description="Ending line number (1-indexed, inclusive) for a partial read. Omit to read to the end.")),
 )
 
 SetActiveBranchModel = create_model(
@@ -140,9 +142,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
     # functionally identical. The method itself is still available for internal use.
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
 
-    # Import file operation methods from BaseCodeToolApiWrapper
+    # Import file operation methods from BaseCodeToolApiWrapper.
+    # read_multiple_files is NOT cherry-picked here — the base version reads via
+    # the uncapped _read_file. Bitbucket defines its own capped override below.
     read_file_chunk = BaseCodeToolApiWrapper.read_file_chunk
-    read_multiple_files = BaseCodeToolApiWrapper.read_multiple_files
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
     url: str = ''
@@ -546,13 +549,53 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Failed to list files: {str(e)}")
 
-    def read_file(self, file_path: str, branch: str) -> str:
-        """Read the contents of a file in the repository."""
+    def read_file(self, file_path: str, branch: str,
+                  start_line: Optional[int] = None, end_line: Optional[int] = None) -> Any:
+        """Read the contents of a file in the repository.
+
+        Parameters:
+            file_path(str): the file path
+            branch(str): branch name (by default: active_branch)
+            start_line(int, optional): starting line number (1-indexed, inclusive) for a partial read.
+            end_line(int, optional): ending line number (1-indexed, inclusive) for a partial read.
+
+        Returns:
+            The file contents as a string, or a structured content_too_large
+            guidance object (dict) if it exceeds the size limit.
+        """
+        from ..utils.text_operations import apply_line_slice
+        from ..utils.file_metadata import guard_text_read
+
         try:
-            return self._read_file(file_path, branch)
+            full_content = self._read_file(file_path, branch)
         except Exception as e:
             raise ToolException(f"Failed to read file {file_path}: {str(e)}")
-    
+
+        content = full_content
+        if start_line is not None or end_line is not None:
+            offset = start_line if start_line is not None else 1
+            limit = (end_line - offset + 1) if end_line is not None else None
+            content = apply_line_slice(content, offset=offset, limit=limit)
+
+        requested = (
+            f"start_line={start_line}, end_line={end_line}"
+            if (start_line is not None or end_line is not None)
+            else "full file read"
+        )
+        return guard_text_read(content, file_path, requested=requested, full_content=full_content)
+
+    def read_multiple_files(self, file_paths: List[str], branch: str = None,
+                            offset: Optional[int] = None, limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Read multiple files in batch, capped both per-file and cumulatively.
+
+        Each result is a plain string, a content_too_large guidance dict if that
+        file alone exceeds the per-file cap, or a skip notice once the batch's
+        cumulative cap is reached (remaining files are not fetched at all).
+        """
+        from ..utils.file_metadata import capped_read_multiple_files
+        return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
+
     def _write_file(
         self,
         file_path: str,
