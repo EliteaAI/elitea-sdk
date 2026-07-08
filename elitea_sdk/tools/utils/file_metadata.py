@@ -236,6 +236,22 @@ def build_error_response(
     return payload
 
 
+def measure_result_chars(content: Any) -> int:
+    """Serialized size of a single read result, str or structured dict alike.
+
+    Shared by batch-read loops (e.g. ``read_multiple_files``) that need to
+    track a running cumulative total across heterogeneous per-file results —
+    plain string content next to a ``content_too_large`` guidance dict.
+    """
+    if isinstance(content, (str, bytes)):
+        return len(content)
+    try:
+        import json
+        return len(json.dumps(content, default=str, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return len(str(content))
+
+
 def _count_lines(file_content) -> int:
     """Count lines in *file_content* (bytes, bytearray, or str) without decoding.
 
@@ -425,7 +441,10 @@ def get_file_metadata(
 
 
 #: Appended unconditionally to every over-limit response's notes so the
-#: caller is never tempted to guess a start/end value.
+#: caller is never tempted to guess a start/end value. Only appropriate where
+#: get_file_metadata is actually registered as a callable tool (artifact/bucket
+#: toolkit) — VCS-style readers never register it, so guard_text_read builds
+#: its own self-contained note instead (see guard_text_read).
 GET_FILE_METADATA_DIRECTIVE = (
     "For the exact count (lines/rows/pages/sheets) and full structural "
     "details (sheet names, attachment list, etc.), call get_file_metadata on "
@@ -439,13 +458,23 @@ def guard_text_read(
     *,
     max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
     requested: Optional[str] = None,
+    full_content: Optional[str] = None,
 ) -> Any:
     """Return *content* unchanged if within the cap, else over-limit guidance.
 
     For VCS-style readers (GitHub/GitLab/Bitbucket/ADO/LocalGit) where a read
-    always yields a fully-downloaded ``str`` — no dict/Excel-style results, so
-    ``total_lines`` is computed directly from the content already in hand, no
-    re-fetch or extra I/O.
+    always yields a fully-downloaded ``str`` — no dict/Excel-style results, no
+    ``get_file_metadata`` tool registered either. The over-limit note is
+    self-contained (total line count + a valid start_line/end_line range),
+    built the same way :func:`build_line_range_metadata` already does for
+    text-family artifact loaders — no external tool call needed to retry.
+
+    *content* is what's measured against the cap (the caller's own slice, if
+    any, is what's actually being returned). *full_content* is the true
+    pre-slice content used to compute ``total_lines`` — pass it whenever the
+    caller may have already sliced *content* by line, so the reported total
+    reflects the whole file rather than just the slice. Defaults to *content*
+    when omitted (no slicing occurred).
     """
     actual_chars = len(content)
     if actual_chars <= max_output_chars:
@@ -455,13 +484,18 @@ def guard_text_read(
     if metadata.get(RESULT_STATUS_KEY) == ResultStatus.ERROR.value:
         return metadata
 
-    if metadata.get("unit") in (None, "lines"):
-        total_lines = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
-        metadata["total_lines"] = total_lines
-        metadata["unit"] = "lines"
+    line_meta = build_line_range_metadata(
+        full_content if full_content is not None else content, file_type_note="file",
+    )
+    metadata["unit"] = line_meta["unit"]
+    metadata["total_lines"] = line_meta["total_lines"]
+    metadata["instruction_for_readFile"] = line_meta["instruction_for_readFile"]
+    if "read_limits" in line_meta:
+        metadata["read_limits"] = {**metadata.get("read_limits", {}), **line_meta["read_limits"]}
 
     return build_over_limit_response(
         metadata, actual_chars=actual_chars, limit_chars=max_output_chars, requested=requested,
+        include_metadata_directive=False,
     )
 
 
@@ -471,6 +505,7 @@ def build_over_limit_response(
     actual_chars: int,
     limit_chars: int,
     requested: Optional[str] = None,
+    include_metadata_directive: bool = True,
 ) -> Dict[str, Any]:
     """Build the over-limit guidance response from a file's metadata.
 
@@ -485,6 +520,12 @@ def build_over_limit_response(
     contract-conformant dict). It must carry ``read_limits`` (guaranteed for
     anything produced by :func:`get_file_metadata`); the model validator rejects
     a guidance object without it.
+
+    ``include_metadata_directive`` appends :data:`GET_FILE_METADATA_DIRECTIVE`
+    to the notes. Only correct when ``get_file_metadata`` is actually
+    registered as a callable tool (artifact/bucket toolkit). Callers whose
+    metadata is already self-contained (e.g. ``guard_text_read`` for VCS-style
+    readers, which have no such tool) pass ``False``.
     """
     model = validate_chunked_read_response(metadata)
     model.result_status = ResultStatus.CONTENT_TOO_LARGE
@@ -497,8 +538,9 @@ def build_over_limit_response(
         actual_chars=actual_chars,
         requested=requested,
     )
-    existing_notes = model.instruction_for_readFile.notes or ""
-    model.instruction_for_readFile.notes = (
-        f"{existing_notes} {GET_FILE_METADATA_DIRECTIVE}".strip()
-    )
+    if include_metadata_directive:
+        existing_notes = model.instruction_for_readFile.notes or ""
+        model.instruction_for_readFile.notes = (
+            f"{existing_notes} {GET_FILE_METADATA_DIRECTIVE}".strip()
+        )
     return _dump(model)
