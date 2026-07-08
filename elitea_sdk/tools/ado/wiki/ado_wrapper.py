@@ -708,15 +708,15 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             if not continuation_token:
                 break
 
-    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None, title_contains: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
+    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None, path_contains: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
         self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
         pages = self._iter_wiki_pages(wiki_identifier)
-        needle = title_contains.lower() if title_contains else None
+        needle = path_contains.lower() if path_contains else None
         for page in pages:
             self._indexing_stats.total_fetched += 1
             title = page.path.rsplit("/", 1)[-1]
-            if needle and needle not in title.lower() and needle not in page.path.lower():
+            if needle and needle not in page.path.lower():
                 self._track_skipped_document(page.path, reason="filtered")
                 continue
             self._track_processed_item()
@@ -743,12 +743,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         return {
             'chunking_tool': (Literal['markdown', ''], Field(description="Name of chunking tool", default='markdown')),
             "wiki_identifier": (Optional[str], Field(default=None, description="Wiki identifier to index, e.g., 'ABCProject.wiki'. If not provided, uses the default wiki identifier from toolkit configuration.")),
-            'title_contains': (Optional[str], Field(
+            'path_contains': (Optional[str], Field(
                 default=None,
                 description=(
-                    "Optional case-insensitive substring filter. A page is included when the "
-                    "substring appears in its leaf title OR anywhere in its wiki path, so "
-                    "filtering by a parent folder name also pulls in descendants. "
+                    "Optional case-insensitive substring filter applied to the full wiki page path. "
+                    "A page is included when the substring appears anywhere in its path, so "
+                    "filtering by a parent folder name also pulls in all descendants. "
                     "Examples: 'design' matches '/Architecture/Design Records' and "
                     "'/Architecture/Design Records/API'. Leave empty ('' or omit) to index "
                     "all pages."
