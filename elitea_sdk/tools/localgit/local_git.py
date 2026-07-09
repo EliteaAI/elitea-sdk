@@ -8,6 +8,8 @@ from git import Repo
 from pydantic import BaseModel, Field, create_model, model_validator
 from langchain_core.tools import ToolException
 
+from typing import List
+
 from ..elitea_base import BaseToolApiWrapper, extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.text_operations import parse_old_new_markers, apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
@@ -111,6 +113,24 @@ FolderFiles = create_model(
     folder_path=(str, Field(description="Folder path e.g test/ to list files from"))
 )
 
+# Branch-free file-op schemas: LocalGit reads the checked-out working tree and
+# has no per-call branch, so its tool schemas must not advertise one (the shared
+# defaults do) — else the LLM passes branch and the call raises TypeError.
+ReadMultipleFiles = create_model(
+    "ReadMultipleFiles",
+    file_paths=(List[str], Field(description="List of file paths to read", min_length=1)),
+    offset=(Optional[int], Field(default=None, ge=1, description="Starting line number for all files (1-indexed)")),
+    limit=(Optional[int], Field(default=None, ge=1, description="Number of lines to read from offset for all files"))
+)
+
+GrepFile = create_model(
+    "GrepFile",
+    file_path=(str, Field(description="Path to the specific FILE to search within, e.g. 'src/main.py'. Must be a file path, not a directory.")),
+    pattern=(str, Field(description="Text or regex pattern to find in the file's content. Works like grep/ripgrep.")),
+    is_regex=(bool, Field(default=True, description="Treat pattern as regular expression (default: True). Set False for exact literal matching.")),
+    context_lines=(int, Field(default=2, ge=0, description="Lines of context to show before/after each match (default: 2)."))
+)
+
 UpdateFileContentByLines = create_model(
     "UpdateFileCommitByLines",
     file_path=(str, Field(description="File path e.g test/inventory.py to update in")),
@@ -138,6 +158,10 @@ class LocalGit(BaseToolApiWrapper):
     read_file_chunk = BaseCodeToolApiWrapper.read_file_chunk
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
+
+    def _get_file_operation_schemas(self):
+        # Override the decorator's branch-carrying defaults with branch-free ones.
+        return {"read_multiple_files": ReadMultipleFiles, "grep_file": GrepFile}
 
     @model_validator(mode='before')
     @classmethod

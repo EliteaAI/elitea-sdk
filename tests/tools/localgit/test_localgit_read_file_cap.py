@@ -100,6 +100,19 @@ def test_localgit_internal_read_file_is_uncapped_for_edit(tmp_path):
     assert isinstance(wrapper.read_file("big.py"), dict)
 
 
+def test_localgit_file_op_schemas_advertise_no_branch(tmp_path):
+    # LocalGit has no per-call branch; its tool schemas must not advertise one,
+    # or the LLM passes branch and read_multiple_files raises TypeError.
+    wrapper = _make_localgit(tmp_path, {})
+    tools = {t["name"]: t for t in wrapper.get_available_tools()}
+
+    rmf_fields = tools["read_multiple_files"]["args_schema"].model_fields
+    assert "branch" not in rmf_fields
+    assert set(rmf_fields) == {"file_paths", "offset", "limit"}
+
+    assert "branch" not in tools["grep_file"]["args_schema"].model_fields
+
+
 class TestLocalGitReadMultipleFilesCumulativeCap:
     def test_small_batch_all_returned_normally(self, tmp_path):
         wrapper = _make_localgit(tmp_path, {"a.py": "hello a", "b.py": "hello b"})
