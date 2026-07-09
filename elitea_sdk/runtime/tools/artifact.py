@@ -34,6 +34,7 @@ from ...tools.utils.file_metadata import (
     ResultStatus,
     build_error_response,
     build_over_limit_response,
+    capped_read_multiple_files,
     get_file_metadata as get_file_metadata_dict,
 )
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import (
@@ -84,7 +85,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         skip_size_check: bool = None
     ) -> dict:
         """
-        Read multiple files in batch from an artifact bucket.
+        Read multiple files in batch from an artifact bucket, capped both
+        per-file and cumulatively across the batch.
 
         Args:
             file_paths: List of file paths to read (can be full paths like /bucket/file.txt or relative like folder/file.txt)
@@ -94,30 +96,24 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             skip_size_check: Deprecated and inert; the size guard always applies per file.
 
         Returns:
-            Dict mapping each file path to its content, or a structured
-            content_too_large object per-file if it exceeds the size limit.
+            Dict mapping each file path to its content: a plain string, a
+            structured content_too_large object if that file alone exceeds
+            the per-file cap, or a short skip notice once the batch's
+            cumulative cap is reached (remaining files are not fetched at all).
         """
         if skip_size_check is True:
             logging.warning(SKIP_SIZE_CHECK_DEPRECATION_MSG)
 
-        results = {}
+        def _read_one(path, branch=None, start_line=None, end_line=None):
+            if path.startswith('/'):
+                return self.read_file(filepath=path, bucket_name=bucket_name,
+                                       start_line=start_line, end_line=end_line)
+            return self.read_file(filename=path, bucket_name=bucket_name,
+                                   start_line=start_line, end_line=end_line)
 
-        # Convert offset/limit to start_line/end_line for read_file
-        start_line = offset
-        end_line = (offset + limit - 1) if (offset is not None and limit is not None) else None
-
-        for path in file_paths:
-            try:
-                if path.startswith('/'):
-                    content = self.read_file(filepath=path, bucket_name=bucket_name,
-                                            start_line=start_line, end_line=end_line)
-                else:
-                    content = self.read_file(filename=path, bucket_name=bucket_name,
-                                            start_line=start_line, end_line=end_line)
-                results[path] = content
-            except Exception as e:
-                results[path] = f"Error reading file: {str(e)}"
-        return results
+        # Shared cumulative-budget loop (Epic #5431 Phase 5 pattern) — bounds
+        # the whole batch at one 200K-char budget, not per file × N.
+        return capped_read_multiple_files(_read_one, file_paths, offset=offset, limit=limit)
 
     def search_file(
         self,

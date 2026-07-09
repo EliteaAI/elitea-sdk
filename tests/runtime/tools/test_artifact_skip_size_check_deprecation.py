@@ -132,9 +132,11 @@ def test_read_multiple_files_true_is_inert_and_warns(caplog):
     assert SKIP_SIZE_CHECK_DEPRECATION_MSG in caplog.text
 
 
-def test_read_multiple_files_independent_guidance_no_aggregate_cap():
-    # Two oversized files each get their own structured guidance — the cap is
-    # per-file, not aggregated across the batch (Phase 4, #5446).
+def test_read_multiple_files_each_over_cap_file_gets_own_guidance():
+    # Two files that each individually exceed the per-file cap get their own
+    # structured guidance dicts. The batch-wide cumulative cap (#5780) is
+    # measured against each guidance dict's own (small) serialized size, not
+    # the oversized file it refused to return, so it isn't tripped here.
     wrapper = ArtifactWrapper.model_construct(
         bucket="test-bucket", max_single_read_size=MAX, artifact=MagicMock(),
     )
