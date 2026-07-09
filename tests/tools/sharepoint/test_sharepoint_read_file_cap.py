@@ -172,6 +172,11 @@ def test_sharepoint_excel_over_limit_no_sheet_name_suggests_sheet_name():
     notes = result["instruction_for_readFile"]["notes"]
     assert "start_row" not in notes and "header_row" not in notes and "evaluate_formulas" not in notes
     assert GET_FILE_METADATA_DIRECTIVE not in notes
+    # Shared builder diagnostics must survive — SharePoint guidance is not thinner
+    # than other Excel callers' just because read_document's surface is narrower.
+    for field in ("excel_max_request_rows", "excel_full_read_max_bytes",
+                  "estimated_total_rows", "file_size_bytes", "embedded_images"):
+        assert field in result["read_limits"]
 
 
 def test_sharepoint_excel_over_limit_with_sheet_name_refuses_plainly():
