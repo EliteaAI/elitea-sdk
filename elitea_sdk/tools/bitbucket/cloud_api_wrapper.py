@@ -15,7 +15,6 @@ from requests import Response
 from ..utils.text_operations import parse_old_new_markers
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
 
 # Type variable for generic return type
 T = TypeVar('T')
