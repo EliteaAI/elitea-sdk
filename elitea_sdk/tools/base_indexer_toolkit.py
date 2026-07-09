@@ -456,7 +456,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 (skipped_data.get("items_processed", 0) - unchanged_count)
                 if skipped_data else 0
             )
+            # succeeded_chunks_count > 0 guard: the heuristic reinterprets docs_count as
+            # a file count only when the run actually produced chunks. Otherwise
+            # (e.g. reindex where every doc was unchanged and dedup-skipped)
+            # docs_count == succeeded_chunks_count == 0 would falsely trigger the
+            # rewrite and inflate the "indexed" count to effective_processed.
             if (skipped_data and effective_processed > 0
+                    and succeeded_chunks_count > 0
                     and docs_count == succeeded_chunks_count
                     and docs_count != effective_processed):
                 docs_count = effective_processed
