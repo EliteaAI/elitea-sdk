@@ -525,6 +525,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         image_pattern = r"!\[(.*?)\]\((.*?)\)"
         matches = re.findall(image_pattern, page_content)
+        total_images = len(matches)
 
         # Initialize repos_wrapper once for all attachments in this page
         repos_wrapper = None
@@ -533,7 +534,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         if has_attachments:
             repos_wrapper = self._get_repos_wrapper(wiki_identified)
 
-        for image_name, image_url in matches:
+        for img_idx, (image_name, image_url) in enumerate(matches, start=1):
+            logger.debug(f"[ADO wiki index] Processing image {img_idx}/{total_images}: '{image_name}' -> '{image_url}'")
             # BUG 1 fix: skip images with empty URLs — cannot fetch or resolve them
             if not image_url:
                 logger.warning(f"Skipping image '{image_name}': empty URL, leaving original markdown unchanged.")
@@ -767,32 +769,27 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         # Normalize hyphens to spaces so users can pass either the URL slug form
         # ("Feature-Analysis-and-Background") or the display form ("Feature Analysis and Background").
         needle = path_contains.lower().replace("-", " ") if path_contains else None
-        for page in pages:
+        for page_idx, page in enumerate(pages, start=1):
             self._indexing_stats.total_fetched += 1
             title = page.path.rsplit("/", 1)[-1]
             if needle and needle not in page.path.lower().replace("-", " "):
+                logger.debug(f"[ADO wiki index] Page #{page_idx} skipped by path_contains filter: '{page.path}' (id={page.id})")
                 self._track_skipped_document(page.path, reason="filtered")
                 continue
+            logger.debug(f"[ADO wiki index] Loading page #{page_idx}: '{page.path}' (id={page.id})")
             self._track_processed_item()
             raw_content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_identifier, id=page.id, include_content=True).page.content
             # Hash the raw source, not the LLM-augmented version — LLM output is
             # non-deterministic and would break incremental dedup across runs.
             content_hash = hashlib.sha256((raw_content or "").encode("utf-8")).hexdigest()
 
+            # Image processing intentionally deferred to _process_document, which runs after
+            # _reduce_duplicates. Doing it here would fire one LLM call per referenced image on
+            # every page every run, even for pages the dedup would immediately discard.
             content = raw_content
-            if self._index_process_images:
-                try:
-                    content = self._process_images(
-                        raw_content,
-                        wiki_identified=wiki_identifier,
-                        image_description_prompt=image_description_prompt,
-                    )
-                except Exception as e:
-                    logger.warning(f"Image processing failed for page '{page.path}': {str(e)}. Falling back to raw content.")
-                    content = raw_content
 
             # Capture attachment references off the raw markdown so _process_document
-            # can enumerate them even after Option A rewrote the URLs in `content`.
+            # can enumerate them.
             attachment_paths = (
                 self._extract_attachment_paths(raw_content) if self._index_include_attachments else []
             )
@@ -890,17 +887,62 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         sig_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
         document.metadata['updated_on'] = f"{current}{self._PARTIAL_MARKER}{sig_hash}"
 
+    def _apply_image_processing_to_parent(self, document: Document) -> None:
+        """Rewrite inline image markdown on the parent page using LLM descriptions.
+
+        Called from _process_document (post-dedup) instead of _base_loader so we only
+        pay LLM cost for pages that will actually be re-indexed. Mutates the parent
+        Document in place: either metadata[CONTENT_IN_BYTES] (chunker path) or
+        page_content (no-chunker path). Failures fall back silently to raw content
+        — the raw content is already what's stored, so no rollback needed.
+        """
+        if not getattr(self, "_index_process_images", False):
+            return
+        content_in_bytes_key = IndexerKeywords.CONTENT_IN_BYTES.value
+        raw_bytes = document.metadata.get(content_in_bytes_key)
+        if raw_bytes is not None:
+            raw_content = raw_bytes.decode("utf-8", errors="replace") if isinstance(raw_bytes, (bytes, bytearray)) else str(raw_bytes)
+        else:
+            raw_content = document.page_content or ""
+        if not raw_content:
+            return
+        wiki_identifier = getattr(self, "_index_wiki_identifier", None) or self._resolve_wiki_identifier(None)
+        image_description_prompt = getattr(self, "_index_image_description_prompt", None)
+        try:
+            enriched = self._process_images(
+                raw_content,
+                wiki_identified=wiki_identifier,
+                image_description_prompt=image_description_prompt,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Image processing failed for page '{document.metadata.get('path', '')}': {str(e)}. "
+                f"Falling back to raw content."
+            )
+            return
+        if enriched == raw_content:
+            return
+        if raw_bytes is not None:
+            document.metadata[content_in_bytes_key] = enriched.encode("utf-8")
+        else:
+            document.page_content = enriched
+
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
-        """Emit each referenced /.attachments/ file as a dependent Document.
+        """Emit each referenced /.attachments/ file as a dependent Document, and
+        optionally rewrite the parent page's inline images with LLM descriptions.
 
         The base indexer calls this after _base_loader for every parent document
-        that survived dedup. We only act when include_attachments=True; otherwise
-        there's nothing to do. Attachment bytes are downloaded from the
-        wikiMaster branch via the same ReposApiWrapper the tool-side image
-        processing uses, then handed off to the indexer pipeline via
-        CONTENT_IN_BYTES so parse_file_content can extract text (or an LLM
-        description for images) uniformly with other non-code indexers.
+        that survived dedup. Two independent, opt-in steps:
+
+        1. process_images: rewrite ![alt](url) markdown on the parent using an LLM
+           description of each image. Done here (not in _base_loader) so LLM cost
+           scales with changed-page count, not total-page count.
+        2. include_attachments: emit each /.attachments/ reference as a dependent
+           Document via CONTENT_IN_BYTES so the standard content parser extracts
+           text (or an LLM description for images/PDFs) uniformly with other
+           non-code indexers.
         """
+        self._apply_image_processing_to_parent(document)
         if not getattr(self, "_index_include_attachments", False):
             return
         attachment_paths = document.metadata.get(self._INDEXER_ATTACHMENTS_META_KEY) or []
@@ -919,15 +961,18 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         parent_id = document.metadata.get('id')
         parent_path = document.metadata.get('path', '')
         failed_names: List[str] = []
+        total_attachments = len(attachment_paths)
 
-        for att_url in attachment_paths:
+        for att_idx, att_url in enumerate(attachment_paths, start=1):
             file_path = unquote(att_url.lstrip('/'))
             file_name = file_path.rsplit('/', 1)[-1]
             if not self._matches_extension_filter(file_name):
                 # Extension filter is an explicit user choice, not a failure —
                 # do not perturb the parent's hash.
+                logger.debug(f"[ADO wiki index] Attachment {att_idx}/{total_attachments} skipped by extension filter for page '{parent_path}': '{file_name}'")
                 self._track_runtime_skipped(file_name, reason="extension")
                 continue
+            logger.debug(f"[ADO wiki index] Downloading attachment {att_idx}/{total_attachments} for page '{parent_path}': '{file_path}'")
             try:
                 attachment_bytes = self._download_attachment_with_retry(repos_wrapper, file_path)
             except Exception as e:
@@ -942,6 +987,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 self._track_skipped_file_empty(file_name)
                 failed_names.append(file_name)
                 continue
+            logger.debug(f"[ADO wiki index] Attachment {att_idx}/{total_attachments} fetched ({len(attachment_bytes)} bytes): '{file_name}'")
 
             # Use blob content hash as updated_on so unchanged attachments dedup across runs.
             att_hash = hashlib.sha256(attachment_bytes).hexdigest()
