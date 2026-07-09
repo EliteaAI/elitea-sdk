@@ -726,10 +726,24 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
     def _base_loader(self, wiql: str, **kwargs) -> Generator[Document, None, None]:
         self._init_indexing_stats()
-        ref_items = self._client.query_by_wiql(Wiql(query=wiql)).work_items
-        for ref in ref_items:
+        result = self._client.query_by_wiql(Wiql(query=wiql))
+        # Flat queries (FROM workitems) populate .work_items; tree/link queries
+        # (FROM workitemLinks ... MODE (Recursive)) populate .work_item_relations
+        # with .source/.target references and leave .work_items as None.
+        work_item_ids = []
+        seen = set()
+        for ref in result.work_items or []:
+            if ref.id not in seen:
+                seen.add(ref.id)
+                work_item_ids.append(ref.id)
+        for rel in result.work_item_relations or []:
+            for endpoint in (getattr(rel, 'target', None), getattr(rel, 'source', None)):
+                if endpoint is not None and endpoint.id is not None and endpoint.id not in seen:
+                    seen.add(endpoint.id)
+                    work_item_ids.append(endpoint.id)
+        for wi_id in work_item_ids:
             self._track_processed_item()
-            wi = self._client.get_work_item(id=ref.id, project=self.project, expand='all')
+            wi = self._client.get_work_item(id=wi_id, project=self.project, expand='all')
             yield Document(page_content=json.dumps(wi.fields), metadata={
                 'id': str(wi.id),
                 'type': wi.fields.get('System.WorkItemType', ''),
