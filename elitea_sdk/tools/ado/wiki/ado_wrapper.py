@@ -1,8 +1,9 @@
 import hashlib
 import logging
 import re
+import time
 import requests
-from typing import Generator, Literal, Optional
+from typing import Generator, List, Literal, Optional
 from urllib.parse import unquote
 
 from azure.devops.connection import Connection
@@ -487,6 +488,34 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Unexpected error during wiki page retrieval: {str(e)}")
             return ToolException(f"Unexpected error during wiki page retrieval: {str(e)}")
 
+    def _get_repos_wrapper(self, wiki_identified: str) -> Optional["ReposApiWrapper"]:
+        """Return a ReposApiWrapper bound to the wikiMaster branch of the given wiki.
+
+        Cached per wiki identifier on the instance so index-time processing of many
+        pages doesn't rebuild the wrapper (and its azure-devops Connection) per page.
+        Returns None when the wiki cannot be resolved — callers must handle that.
+        """
+        cache = self.__dict__.setdefault("_repos_wrapper_cache", {})
+        cached = cache.get(wiki_identified)
+        if cached is not None:
+            return cached
+        try:
+            wiki = self._client.get_wiki(project=self.project, wiki_identifier=wiki_identified)
+            repos_wrapper = ReposApiWrapper(
+                organization_url=self.organization_url,
+                project=self.project,
+                token=self.token.get_secret_value(),
+                repository_id=wiki.repository_id,
+                base_branch="wikiMaster",
+                active_branch="wikiMaster",
+                llm=self.llm,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize repos wrapper for wiki '{wiki_identified}': {str(e)}")
+            return None
+        cache[wiki_identified] = repos_wrapper
+        return repos_wrapper
+
     def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None):
         if image_description_prompt and self.llm is None:
             raise ToolException(
@@ -500,23 +529,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         # Initialize repos_wrapper once for all attachments in this page
         repos_wrapper = None
         has_attachments = any(url.startswith("/.attachments/") for _, url in matches)
-        
+
         if has_attachments:
-            try:
-                wiki_master_branch = "wikiMaster"
-                wiki = self._client.get_wiki(project=self.project, wiki_identifier=wiki_identified)
-                repository_id = wiki.repository_id
-                repos_wrapper = ReposApiWrapper(
-                    organization_url=self.organization_url,
-                    project=self.project,
-                    token=self.token.get_secret_value(),
-                    repository_id=repository_id,
-                    base_branch=wiki_master_branch,
-                    active_branch=wiki_master_branch,
-                    llm=self.llm
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize repos wrapper for wiki '{wiki_identified}': {str(e)}")
+            repos_wrapper = self._get_repos_wrapper(wiki_identified)
 
         for image_name, image_url in matches:
             # BUG 1 fix: skip images with empty URLs — cannot fetch or resolve them
@@ -708,9 +723,46 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             if not continuation_token:
                 break
 
-    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None, path_contains: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
+    _INDEXER_ATTACHMENTS_META_KEY = "_ado_wiki_attachments"
+
+    _ATTACHMENT_MARKDOWN_RE = re.compile(r"!?\[(?:[^\]]*)\]\(([^)]+)\)")
+
+    def _extract_attachment_paths(self, page_content: str) -> List[str]:
+        """Return unique /.attachments/ paths referenced anywhere in page_content.
+
+        Matches both image markdown (``![alt](url)``) and regular link markdown
+        (``[text](url)``) so that non-image attachments — PDFs, .md/.docx files,
+        anything a user drops onto a wiki page — are also picked up. Only
+        wiki-repo attachments are returned; external URLs are not stored in the
+        wiki git repo and cannot be pulled as dependent docs.
+        """
+        seen: dict[str, None] = {}
+        for url in self._ATTACHMENT_MARKDOWN_RE.findall(page_content or ""):
+            url = url.strip().split(" ", 1)[0]  # strip an optional markdown title: [t](url "title")
+            if url and url.startswith("/.attachments/"):
+                seen.setdefault(url, None)
+        return list(seen.keys())
+
+    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
+                     path_contains: Optional[str] = None,
+                     process_images: bool = False,
+                     image_description_prompt: Optional[str] = None,
+                     include_attachments: bool = False,
+                     include_extensions: Optional[List[str]] = None,
+                     skip_extensions: Optional[List[str]] = None,
+                     **kwargs) -> Generator[Document, None, None]:
         self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
+
+        # Stash indexing-time flags on the instance so _process_document (called
+        # later by the base indexer, without kwargs) can read them.
+        self._index_wiki_identifier = wiki_identifier
+        self._index_process_images = bool(process_images)
+        self._index_image_description_prompt = image_description_prompt
+        self._index_include_attachments = bool(include_attachments)
+        self._index_include_extensions = include_extensions or []
+        self._index_skip_extensions = skip_extensions or []
+
         pages = self._iter_wiki_pages(wiki_identifier)
         # Normalize hyphens to spaces so users can pass either the URL slug form
         # ("Feature-Analysis-and-Background") or the display form ("Feature Analysis and Background").
@@ -722,23 +774,196 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 self._track_skipped_document(page.path, reason="filtered")
                 continue
             self._track_processed_item()
-            content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_identifier, id=page.id, include_content=True).page.content
-            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            raw_content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_identifier, id=page.id, include_content=True).page.content
+            # Hash the raw source, not the LLM-augmented version — LLM output is
+            # non-deterministic and would break incremental dedup across runs.
+            content_hash = hashlib.sha256((raw_content or "").encode("utf-8")).hexdigest()
+
+            content = raw_content
+            if self._index_process_images:
+                try:
+                    content = self._process_images(
+                        raw_content,
+                        wiki_identified=wiki_identifier,
+                        image_description_prompt=image_description_prompt,
+                    )
+                except Exception as e:
+                    logger.warning(f"Image processing failed for page '{page.path}': {str(e)}. Falling back to raw content.")
+                    content = raw_content
+
+            # Capture attachment references off the raw markdown so _process_document
+            # can enumerate them even after Option A rewrote the URLs in `content`.
+            attachment_paths = (
+                self._extract_attachment_paths(raw_content) if self._index_include_attachments else []
+            )
+
+            metadata = {
+                'id': str(page.id),
+                'path': page.path,
+                'title': title,
+                'updated_on': content_hash,
+            }
+            if attachment_paths:
+                metadata[self._INDEXER_ATTACHMENTS_META_KEY] = attachment_paths
             if chunking_tool:
-                yield Document(page_content='', metadata={
-                    'id': str(page.id),
-                    'path': page.path,
-                    'title': title,
-                    'updated_on': content_hash,
-                    IndexerKeywords.CONTENT_IN_BYTES.value: content.encode("utf-8")
-                })
+                metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = (content or "").encode("utf-8")
+                yield Document(page_content='', metadata=metadata)
             else:
-                yield Document(page_content=content, metadata={
-                    'id': str(page.id),
-                    'path': page.path,
-                    'title': title,
-                    'updated_on': content_hash
-                })
+                yield Document(page_content=content or "", metadata=metadata)
+
+    def _remove_metadata_keys(self) -> List[str]:
+        """Drop the transient attachment-paths list before documents are written to the vector store."""
+        return super()._remove_metadata_keys() + [self._INDEXER_ATTACHMENTS_META_KEY]
+
+    def _matches_extension_filter(self, name: str) -> bool:
+        """Apply include_extensions/skip_extensions using the Confluence convention:
+        glob-like patterns matched against the file name (case-insensitive). Empty
+        include_extensions means "process everything not in skip_extensions".
+        """
+        for pattern in self._index_skip_extensions:
+            if re.match(re.escape(pattern).replace(r'\*', '.*') + '$', name, re.IGNORECASE):
+                return False
+        if not self._index_include_extensions:
+            return True
+        return any(
+            re.match(re.escape(pattern).replace(r'\*', '.*') + '$', name, re.IGNORECASE)
+            for pattern in self._index_include_extensions
+        )
+
+    _ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
+    _ATTACHMENT_DOWNLOAD_INITIAL_BACKOFF = 0.5  # seconds; doubles each retry
+    _PARTIAL_MARKER = "::partial::"
+
+    # Only retry exceptions whose class is inherently transient. Auth/404 errors
+    # from the ADO SDK typically raise AzureDevOpsServiceError too; retrying
+    # those is wasted time but bounded (~1.5s worst case) and the caller still
+    # sees the original exception on final failure.
+    _TRANSIENT_DOWNLOAD_EXCEPTIONS = (
+        requests.RequestException,
+        ConnectionError,
+        TimeoutError,
+        AzureDevOpsServiceError,
+    )
+
+    def _download_attachment_with_retry(self, repos_wrapper, file_path: str) -> bytes:
+        """Fetch an attachment blob with short exponential backoff.
+
+        Retries a bounded number of times on network-class exceptions only;
+        after the final attempt the last exception is re-raised so the caller
+        can decide how to record the failure.
+        """
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, self._ATTACHMENT_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                return repos_wrapper.download_file(path=file_path)
+            except self._TRANSIENT_DOWNLOAD_EXCEPTIONS as e:
+                last_exc = e
+                if attempt >= self._ATTACHMENT_DOWNLOAD_ATTEMPTS:
+                    break
+                delay = self._ATTACHMENT_DOWNLOAD_INITIAL_BACKOFF * (2 ** (attempt - 1))
+                logger.info(
+                    f"Attachment download attempt {attempt}/{self._ATTACHMENT_DOWNLOAD_ATTEMPTS} "
+                    f"failed for '{file_path}': {e}. Retrying in {delay:.1f}s."
+                )
+                time.sleep(delay)
+        # loop exhausted without a successful return
+        raise last_exc  # type: ignore[misc]
+
+    def _mark_parent_partial(self, document: Document, failed_names: List[str]) -> None:
+        """Suffix the parent page's updated_on with a deterministic failure marker.
+
+        Without this, a page whose raw markdown is unchanged but whose attachments
+        failed to index would be dedup-skipped on the next run — stranding the
+        failed attachments until the page itself is edited. Perturbing the hash
+        forces `_reduce_duplicates` to yield the parent again next run, which
+        re-fires `_process_document` and gives the attachments another chance.
+
+        The marker is derived from the sorted set of failed file names, so it is
+        stable across runs with the same failure set (no thrash on the marker
+        itself). If failures resolve, the parent's hash returns to the clean
+        raw-content form and the loop terminates naturally.
+        """
+        current = document.metadata.get('updated_on', '')
+        if self._PARTIAL_MARKER in current:
+            return  # already marked in this run
+        signature = ",".join(sorted(set(failed_names)))
+        sig_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+        document.metadata['updated_on'] = f"{current}{self._PARTIAL_MARKER}{sig_hash}"
+
+    def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        """Emit each referenced /.attachments/ file as a dependent Document.
+
+        The base indexer calls this after _base_loader for every parent document
+        that survived dedup. We only act when include_attachments=True; otherwise
+        there's nothing to do. Attachment bytes are downloaded from the
+        wikiMaster branch via the same ReposApiWrapper the tool-side image
+        processing uses, then handed off to the indexer pipeline via
+        CONTENT_IN_BYTES so parse_file_content can extract text (or an LLM
+        description for images) uniformly with other non-code indexers.
+        """
+        if not getattr(self, "_index_include_attachments", False):
+            return
+        attachment_paths = document.metadata.get(self._INDEXER_ATTACHMENTS_META_KEY) or []
+        if not attachment_paths:
+            return
+
+        wiki_identifier = getattr(self, "_index_wiki_identifier", None) or self._resolve_wiki_identifier(None)
+        repos_wrapper = self._get_repos_wrapper(wiki_identifier)
+        if repos_wrapper is None:
+            for att_url in attachment_paths:
+                self._track_dependent_item_skipped(att_url)
+            # Whole page's attachments are stranded — force re-processing next run.
+            self._mark_parent_partial(document, [unquote(u.lstrip('/')).rsplit('/', 1)[-1] for u in attachment_paths])
+            return
+
+        parent_id = document.metadata.get('id')
+        parent_path = document.metadata.get('path', '')
+        failed_names: List[str] = []
+
+        for att_url in attachment_paths:
+            file_path = unquote(att_url.lstrip('/'))
+            file_name = file_path.rsplit('/', 1)[-1]
+            if not self._matches_extension_filter(file_name):
+                # Extension filter is an explicit user choice, not a failure —
+                # do not perturb the parent's hash.
+                self._track_runtime_skipped(file_name, reason="extension")
+                continue
+            try:
+                attachment_bytes = self._download_attachment_with_retry(repos_wrapper, file_path)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to download attachment '{att_url}' for wiki page "
+                    f"'{parent_path}' after {self._ATTACHMENT_DOWNLOAD_ATTEMPTS} attempt(s): {e}"
+                )
+                self._track_dependent_item_skipped(file_name)
+                failed_names.append(file_name)
+                continue
+            if not attachment_bytes:
+                self._track_skipped_file_empty(file_name)
+                failed_names.append(file_name)
+                continue
+
+            # Use blob content hash as updated_on so unchanged attachments dedup across runs.
+            att_hash = hashlib.sha256(attachment_bytes).hexdigest()
+            file_ext = ("." + file_name.rsplit('.', 1)[-1]) if '.' in file_name else ''
+            attachment_id = f"{parent_id}::{file_path}"
+
+            yield Document(
+                page_content='',
+                metadata={
+                    'id': attachment_id,
+                    'name': file_name,
+                    'path': file_path,
+                    'parent_page_id': parent_id,
+                    'parent_page_path': parent_path,
+                    'updated_on': att_hash,
+                    IndexerKeywords.CONTENT_FILE_NAME.value: file_ext,
+                    IndexerKeywords.CONTENT_IN_BYTES.value: attachment_bytes,
+                },
+            )
+
+        if failed_names:
+            self._mark_parent_partial(document, failed_names)
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
@@ -758,6 +983,51 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     "'/Architecture/Design Records/API'. Leave empty ('' or omit) to index "
                     "all pages."
                 )
+            )),
+            'process_images': (Optional[bool], Field(
+                default=False,
+                description=(
+                    "If True, replace inline image markdown in each page with an LLM-generated "
+                    "description of the image, so image content becomes part of the page's "
+                    "searchable text. Requires an LLM to be configured on the toolkit. "
+                    "Deduplication (updated_on) is computed against the raw page markdown "
+                    "before rewriting, so non-deterministic LLM output does not force a "
+                    "re-index every run. Costs one LLM call per referenced image per changed page."
+                ),
+            )),
+            'image_description_prompt': (Optional[str], Field(
+                default=None,
+                description=(
+                    "Optional custom prompt used when generating image descriptions. Only "
+                    "applied when process_images=True or include_attachments=True. If omitted, "
+                    "the default image description prompt is used."
+                ),
+            )),
+            'include_attachments': (Optional[bool], Field(
+                default=False,
+                description=(
+                    "If True, also index each /.attachments/ file referenced by wiki pages as "
+                    "its own dependent document. Attachment bytes are pulled from the wikiMaster "
+                    "branch of the wiki's backing git repo and passed through the standard "
+                    "content parser (LLM description for images/PDFs, text for supported files). "
+                    "External image URLs (http/https) are not indexed — only files stored in the "
+                    "wiki repo. Independent of process_images: enabling both means image content "
+                    "is searchable both inline in the parent page and as a standalone row."
+                ),
+            )),
+            'include_extensions': (Optional[List[str]], Field(
+                default=[],
+                description=(
+                    "Glob-style file-name patterns to include when indexing attachments, e.g. "
+                    "[\"*.png\", \"*.pdf\"]. Empty list means include everything not in skip_extensions."
+                ),
+            )),
+            'skip_extensions': (Optional[List[str]], Field(
+                default=[],
+                description=(
+                    "Glob-style file-name patterns to skip when indexing attachments, e.g. "
+                    "[\"*.zip\", \"*.exe\"]. Evaluated before include_extensions."
+                ),
             )),
         }
 
