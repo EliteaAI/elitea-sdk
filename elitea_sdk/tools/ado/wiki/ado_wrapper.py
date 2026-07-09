@@ -712,11 +712,13 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
         pages = self._iter_wiki_pages(wiki_identifier)
-        needle = path_contains.lower() if path_contains else None
+        # Normalize hyphens to spaces so users can pass either the URL slug form
+        # ("Feature-Analysis-and-Background") or the display form ("Feature Analysis and Background").
+        needle = path_contains.lower().replace("-", " ") if path_contains else None
         for page in pages:
             self._indexing_stats.total_fetched += 1
             title = page.path.rsplit("/", 1)[-1]
-            if needle and needle not in page.path.lower():
+            if needle and needle not in page.path.lower().replace("-", " "):
                 self._track_skipped_document(page.path, reason="filtered")
                 continue
             self._track_processed_item()
@@ -749,6 +751,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     "Optional case-insensitive substring filter applied to the full wiki page path. "
                     "A page is included when the substring appears anywhere in its path, so "
                     "filtering by a parent folder name also pulls in all descendants. "
+                    "Hyphens and spaces are treated as equivalent, so you can pass either the "
+                    "URL slug form ('Feature-Analysis-and-Background') or the display form "
+                    "('Feature Analysis and Background') and both will match the same pages. "
                     "Examples: 'design' matches '/Architecture/Design Records' and "
                     "'/Architecture/Design Records/API'. Leave empty ('' or omit) to index "
                     "all pages."
