@@ -42,7 +42,7 @@ def _relabel_guidance_offset_limit(result: Any) -> Any:
     if not isinstance(result, dict):
         return result
     instr = result.get("instruction_for_readFile")
-    if not isinstance(instr, dict) or "first_class_params" not in instr:
+    if not isinstance(instr, dict) or not instr.get("first_class_params"):
         return result
     total_lines = result.get("total_lines")
     range_hint = f"Valid range 1..{total_lines}. " if total_lines else ""
@@ -1014,7 +1014,12 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
         content = full_content
         if offset is not None or limit is not None:
-            content = apply_line_slice(content, offset=offset, limit=limit)
+            # apply_line_slice only applies limit when offset is set — default
+            # offset to 1 so a limit-only call reads from the start, not the
+            # whole file.
+            content = apply_line_slice(
+                content, offset=offset if offset is not None else 1, limit=limit
+            )
 
         requested = (
             f"offset={offset}, limit={limit}"

@@ -86,6 +86,33 @@ def test_ado_offset_limit_slices_before_cap():
     assert result == "line 2\nline 3\n"
 
 
+def test_ado_limit_only_reads_head_not_whole_file():
+    # apply_line_slice ignores limit when offset is None, so read_file must
+    # default offset to 1 for a limit-only call to behave as a head read.
+    lines = [f"line {i}" for i in range(1, 6)]
+    wrapper = _make_ado({"src/main.py": "\n".join(lines)})
+
+    result = wrapper.read_file("src/main.py", "main", limit=3)
+
+    assert result == "line 1\nline 2\nline 3\n"
+
+
+def test_ado_single_line_over_cap_guidance_is_not_relabeled():
+    # A single-physical-line file over the cap gets the shared helper's
+    # refuse-and-explain response (empty first_class_params). The relabel
+    # helper must not re-inject offset/limit into that empty dict — doing so
+    # would contradict the "bounded read is not possible" notes.
+    huge_single_line = "x" * (200_000 + 1)
+    wrapper = _make_ado({"bundle.min.js": huge_single_line})
+
+    result = wrapper.read_file("bundle.min.js", "main")
+
+    assert isinstance(result, dict)
+    assert result["read_limits"]["full_read_allowed"] is False
+    assert result["instruction_for_readFile"]["first_class_params"] == {}
+    assert "refused" in result["instruction_for_readFile"]["notes"]
+
+
 def test_ado_small_slice_of_huge_file_avoids_cap():
     huge_lines = [f"line {i}" for i in range(1, 100000)]
     wrapper = _make_ado({"huge.py": "\n".join(huge_lines)})
