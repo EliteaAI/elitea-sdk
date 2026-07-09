@@ -27,6 +27,7 @@ from langchain_core.tools import ToolException
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content
+from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ..utils.http_utils import (
     stream_download_to_tempfile,
     FileSizeLimitExceeded,
@@ -813,6 +814,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 )
             return result
         except ToolException:
+            raise
+        except ExcelReadLimitExceeded:
+            # Carries a pre-computed estimate the facade uses to build guidance;
+            # must not be flattened into the generic message below.
             raise
         except Exception as e:
             # Log full detail server-side, but keep the user/LLM-facing message

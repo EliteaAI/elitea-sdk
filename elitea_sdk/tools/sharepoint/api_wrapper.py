@@ -11,7 +11,7 @@ Authentication precedence (evaluated in order):
 import logging
 import os
 import re
-from typing import Optional, Generator, List, Any
+from typing import Optional, Generator, List, Any, Dict
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -22,6 +22,11 @@ from .graph_wrapper import SharepointGraphWrapper
 from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
+from ..utils.file_metadata import (
+    DEFAULT_MAX_OUTPUT_CHARS, build_over_limit_response, guard_nontext_read, guard_text_read,
+)
+from ..utils.text_operations import apply_line_slice
+from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
 
 # ------------------------------------------------------------------ #
@@ -58,6 +63,64 @@ def _reject_if_executable(path: str) -> None:
     ext = os.path.splitext(path or "")[1].lower()
     if ext in BLOCKED_BINARY_EXTENSIONS:
         raise ToolException(_UNSUPPORTED_FILE_TYPE_MESSAGE)
+
+
+def _sharepoint_excel_over_limit_response(
+    estimate, *, filename: str, sheet_name: Optional[str], requested: str,
+) -> Dict[str, Any]:
+    """Build content_too_large guidance for an ExcelReadLimitExceeded catch.
+
+    read_document has no row-range params (unlike the artifact toolkit's
+    read_file), so the only narrowing lever it exposes is sheet_name. If a
+    sheet_name was already supplied and it's still over limit, there is
+    nothing further to suggest — refuse plainly instead of looping.
+    """
+    sheets = estimate.sheets
+    sheet_names = [s.get("name", "") for s in sheets]
+    actual_chars = estimate.estimated_output_chars or estimate.sampled_chars or (DEFAULT_MAX_OUTPUT_CHARS + 1)
+
+    metadata: Dict[str, Any] = {
+        "filename": filename,
+        "unit": "rows",
+        "total_rows": estimate.total_rows_workbook,
+        "total_sheets": len(sheets),
+        "sheets": sheets,
+        "read_limits": {
+            "max_output_chars": DEFAULT_MAX_OUTPUT_CHARS,
+            "full_read_allowed": False,
+        },
+    }
+
+    if sheet_name is None and sheet_names:
+        metadata["instruction_for_readFile"] = {
+            "first_class_params": {
+                "sheet_name": (
+                    "string — name of a single sheet to read instead of the "
+                    "whole workbook. Available sheets: " + ", ".join(sheet_names)
+                ),
+            },
+            "notes": (
+                f"This workbook exceeds the {DEFAULT_MAX_OUTPUT_CHARS}-character "
+                "read limit. Retry read_document with sheet_name set to one of "
+                "the sheets listed above to read a smaller subset."
+            ),
+        }
+    else:
+        metadata["instruction_for_readFile"] = {
+            "first_class_params": {},
+            "notes": (
+                (f"Sheet '{sheet_name}' " if sheet_name else "This workbook ")
+                + f"still exceeds the {DEFAULT_MAX_OUTPUT_CHARS}-character read "
+                "limit even at the narrowest scope read_document supports. "
+                "Reading it in full is refused; no smaller read is available "
+                "through this tool."
+            ),
+        }
+
+    return build_over_limit_response(
+        metadata, actual_chars=actual_chars, limit_chars=DEFAULT_MAX_OUTPUT_CHARS,
+        requested=requested, include_metadata_directive=False,
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -129,7 +192,11 @@ ReadDocument = create_model(
     sheet_name=(Optional[str], Field(
         description="Specifies which sheet to read. "
                     "If it is None, then full document will be read.",
-        default=None))
+        default=None)),
+    start_line=(Optional[int], Field(default=None, ge=1,
+        description="Starting line number (1-indexed, inclusive) for a partial read")),
+    end_line=(Optional[int], Field(default=None, ge=1,
+        description="Ending line number (1-indexed, inclusive) for a partial read")),
 )
 
 ReadFromSharingLink = create_model(
@@ -610,12 +677,40 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                   is_capture_image: bool = False,
                   page_number: Optional[int] = None,
                   sheet_name: Optional[str] = None,
-                  excel_by_sheets: bool = False):
+                  excel_by_sheets: bool = False,
+                  start_line: Optional[int] = None,
+                  end_line: Optional[int] = None):
         """ Reads file located at the specified server-relative path. """
         _reject_if_executable(path)
         self._sync_backend_context()
-        return self._backend.read_file(
-            path, is_capture_image, page_number, sheet_name, excel_by_sheets)
+
+        requested = (
+            f"start_line={start_line}, end_line={end_line}"
+            if (start_line is not None or end_line is not None)
+            else "full file read"
+        )
+        try:
+            result = self._backend.read_file(
+                path, is_capture_image, page_number, sheet_name, excel_by_sheets)
+        except ExcelReadLimitExceeded as e:
+            # Pre-parse estimate already computed; build read_document-specific
+            # guidance rather than the parser's own extra_params-based message.
+            return _sharepoint_excel_over_limit_response(
+                e.estimate, filename=path, sheet_name=sheet_name, requested=requested)
+        # rest_wrapper may return a ToolException instead of raising; pass through
+        # as-is rather than feeding an error object into the guard functions.
+        if isinstance(result, ToolException):
+            return result
+        # Excel etc. parse to a dict with no line structure — not chunkable by line.
+        if not isinstance(result, str):
+            return guard_nontext_read(result, path, requested=requested)
+
+        content = result
+        if start_line is not None or end_line is not None:
+            offset = start_line if start_line is not None else 1
+            limit = (end_line - offset + 1) if end_line is not None else None
+            content = apply_line_slice(content, offset=offset, limit=limit)
+        return guard_text_read(content, path, requested=requested, full_content=result)
 
     def upload_file(self, folder_path: str, filepath: Optional[str] = None,
                     filedata: Optional[str] = None, filename: Optional[str] = None,
