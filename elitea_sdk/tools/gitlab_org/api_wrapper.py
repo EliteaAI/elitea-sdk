@@ -11,6 +11,8 @@ from pydantic.fields import Field
 from ..elitea_base import BaseToolApiWrapper, BaseCodeToolApiWrapper
 from ..gitlab.utils import get_diff_w_position, get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
+from ..utils.text_operations import apply_line_slice
+from ..utils.file_metadata import guard_text_read
 
 logger = logging.getLogger(__name__)
 
@@ -388,9 +390,6 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         inclusive). Returns the file contents as a string, or a structured
         content_too_large guidance object (dict) if it exceeds the size limit.
         """
-        from ..utils.text_operations import apply_line_slice
-        from ..utils.file_metadata import guard_text_read
-
         try:
             repo_instance = self._get_repo(repository)
             file = repo_instance.files.get(file_path, branch)

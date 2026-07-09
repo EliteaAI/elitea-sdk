@@ -10,6 +10,8 @@ from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.content_parser import parse_file_content
+from ..utils.text_operations import apply_line_slice
+from ..utils.file_metadata import guard_text_read, guard_nontext_read, capped_read_multiple_files
 from .utils import get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
 
@@ -141,7 +143,6 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     ) -> Dict[str, Any]:
         # Route through the shared capped batch reader so the cumulative-cap
         # loop lives in one place, not one copy per toolkit.
-        from ..utils.file_metadata import capped_read_multiple_files
         return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     @staticmethod
@@ -457,9 +458,6 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             The file contents as a string, or a structured content_too_large
             guidance object (dict) if it exceeds the size limit.
         """
-        from ..utils.text_operations import apply_line_slice
-        from ..utils.file_metadata import guard_text_read, guard_nontext_read
-
         # Default to active branch if branch is None
         branch = branch if branch else self._active_branch
         self.set_active_branch(branch)

@@ -15,6 +15,8 @@ from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
+from ..utils.text_operations import apply_line_slice
+from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
 
 logger = logging.getLogger(__name__)
 
@@ -563,9 +565,6 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             The file contents as a string, or a structured content_too_large
             guidance object (dict) if it exceeds the size limit.
         """
-        from ..utils.text_operations import apply_line_slice
-        from ..utils.file_metadata import guard_text_read
-
         try:
             full_content = self._read_file(file_path, branch)
         except Exception as e:
@@ -593,7 +592,6 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         file alone exceeds the per-file cap, or a skip notice once the batch's
         cumulative cap is reached (remaining files are not fetched at all).
         """
-        from ..utils.file_metadata import capped_read_multiple_files
         return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     def _write_file(

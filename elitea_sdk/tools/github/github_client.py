@@ -16,6 +16,8 @@ from langchain_core.tools import ToolException
 
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils import normalize_pem_key
+from ..utils.text_operations import apply_line_slice
+from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
 
 from .schemas import (
     GitHubAuthConfig,
@@ -1638,9 +1640,6 @@ class GitHubClient(BaseModel):
             The file contents as a string, or a structured content_too_large
             guidance object (dict) if it exceeds the size limit.
         """
-        from ..utils.text_operations import apply_line_slice
-        from ..utils.file_metadata import guard_text_read
-
         full_content = self._read_file(file_path, branch if branch else self.active_branch, repo_name)
 
         content = full_content
@@ -1680,7 +1679,6 @@ class GitHubClient(BaseModel):
         """
         # Route through the shared capped batch reader so the cumulative-cap
         # loop lives in one place, not one copy per toolkit.
-        from ..utils.file_metadata import capped_read_multiple_files
         return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     def _write_file(
