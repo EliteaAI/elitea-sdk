@@ -26,7 +26,9 @@ from ..utils.file_metadata import (
     DEFAULT_MAX_OUTPUT_CHARS, build_over_limit_response, guard_nontext_read, guard_text_read,
 )
 from ..utils.text_operations import apply_line_slice
-from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
+from ...runtime.langchain.document_loaders.EliteAExcelLoader import (
+    ExcelReadLimitExceeded, build_excel_metadata_from_estimate,
+)
 from ...runtime.utils.utils import IndexerKeywords
 
 # ------------------------------------------------------------------ #
@@ -75,21 +77,14 @@ def _sharepoint_excel_over_limit_response(
     sheet_name was already supplied and it's still over limit, there is
     nothing further to suggest — refuse plainly instead of looping.
     """
-    sheets = estimate.sheets
-    sheet_names = [s.get("name", "") for s in sheets]
+    sheet_names = [s.get("name", "") for s in estimate.sheets]
     actual_chars = estimate.estimated_output_chars or estimate.sampled_chars or (DEFAULT_MAX_OUTPUT_CHARS + 1)
 
-    metadata: Dict[str, Any] = {
-        "filename": filename,
-        "unit": "rows",
-        "total_rows": estimate.total_rows_workbook,
-        "total_sheets": len(sheets),
-        "sheets": sheets,
-        "read_limits": {
-            "max_output_chars": DEFAULT_MAX_OUTPUT_CHARS,
-            "full_read_allowed": False,
-        },
-    }
+    # Reuse the shared builder for the full diagnostic metadata (row/image/byte
+    # limits etc.), then replace only instruction_for_readFile to reflect
+    # read_document's narrower surface (sheet_name, no row range).
+    metadata: Dict[str, Any] = build_excel_metadata_from_estimate(estimate)
+    metadata["filename"] = filename
 
     if sheet_name is None and sheet_names:
         metadata["instruction_for_readFile"] = {
