@@ -491,10 +491,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 status = "ok"
                 message = f"No new documents to index.{skipped_summary}"
 
-            # Final update should always be forced (pass chunks count for indexed_chunks field)
+            # Final update should always be forced (pass chunks count for indexed_chunks field).
+            # Include unchanged docs in the indexed count so the UI reflects total items
+            # currently in the vector store, not just newly indexed ones.
+            indexed_total = docs_count + unchanged_count
             self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
                                    error=message if status != "ok" else None, skipped=skipped_data,
-                                   docs_count=docs_count)
+                                   docs_count=indexed_total)
             self._emit_index_event(index_name)
             #
             return {"status": status, "message": message}
