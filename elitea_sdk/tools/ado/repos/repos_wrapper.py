@@ -28,6 +28,8 @@ from ..utils import generate_diff, get_content_from_generator
 from ...code_indexer_toolkit import CodeIndexerToolkit
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
+from ...utils.text_operations import apply_line_slice
+from ...utils.file_metadata import guard_text_read
 
 logger = logging.getLogger(__name__)
 
@@ -1003,9 +1005,6 @@ class ReposApiWrapper(CodeIndexerToolkit):
             The file contents as a string, or a structured content_too_large
             guidance object (dict) if it exceeds the size limit.
         """
-        from ...utils.text_operations import apply_line_slice
-        from ...utils.file_metadata import guard_text_read
-
         # Fetch the full file via the uncapped internal reader (no slicing here) so
         # total_lines in any over-limit guidance reflects the whole file.
         full_content = self._read_file(file_path, branch)

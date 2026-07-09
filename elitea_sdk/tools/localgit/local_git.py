@@ -2,14 +2,15 @@ import glob
 import logging
 import os
 from traceback import format_exc
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Dict, Optional
 
 from git import Repo
 from pydantic import BaseModel, Field, create_model, model_validator
 from langchain_core.tools import ToolException
 
 from ..elitea_base import BaseToolApiWrapper, extend_with_file_operations, BaseCodeToolApiWrapper
-from ..utils.text_operations import parse_old_new_markers
+from ..utils.text_operations import parse_old_new_markers, apply_line_slice
+from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
 
 logger = logging.getLogger(__name__)
 CREATE_FILE_PROMPT = """Create new file in your local repository."""
@@ -100,7 +101,9 @@ CheckoutBranch = create_model(
 
 ReadFile = create_model(
     "ReadFile",
-    file_path=(str, Field(description="File path e.g test/inventory.py to read content from"))
+    file_path=(str, Field(description="File path e.g test/inventory.py to read content from")),
+    start_line=(Optional[int], Field(default=None, ge=1, description="Starting line number (1-indexed, inclusive) for a partial read")),
+    end_line=(Optional[int], Field(default=None, ge=1, description="Ending line number (1-indexed, inclusive) for a partial read"))
 )
 
 FolderFiles = create_model(
@@ -133,7 +136,6 @@ class LocalGit(BaseToolApiWrapper):
     # Import file operation methods from BaseCodeToolApiWrapper
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
     read_file_chunk = BaseCodeToolApiWrapper.read_file_chunk
-    read_multiple_files = BaseCodeToolApiWrapper.read_multiple_files
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
 
@@ -199,30 +201,53 @@ class LocalGit(BaseToolApiWrapper):
         self.repo.git.checkout(branch_name)
         return 'Successfully checked out branch {}'.format(branch_name)
 
-    def read_file(self, file_path: str) -> str:
+    def read_file(self, file_path: str,
+                  start_line: Optional[int] = None, end_line: Optional[int] = None) -> Any:
         """ Read file from repository """
-        file_path = os.path.normpath(os.path.join(self.repo.working_dir, file_path))
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            with open(file_path, 'r') as f:
-                return f.read()
-        else:
-            return "File '{}' cannot be read because it is not existed".format(file_path)
+        full_path = os.path.normpath(os.path.join(self.repo.working_dir, file_path))
+        if not (os.path.exists(full_path) and os.path.isfile(full_path)):
+            return "File '{}' cannot be read because it is not existed".format(full_path)
+        with open(full_path, 'r') as f:
+            full_content = f.read()
+
+        content = full_content
+        if start_line is not None or end_line is not None:
+            offset = start_line if start_line is not None else 1
+            limit = (end_line - offset + 1) if end_line is not None else None
+            content = apply_line_slice(content, offset=offset, limit=limit)
+
+        requested = (
+            f"start_line={start_line}, end_line={end_line}"
+            if (start_line is not None or end_line is not None)
+            else "full file read"
+        )
+        return guard_text_read(content, file_path, requested=requested, full_content=full_content)
     
     def _read_file(self, file_path: str, branch: str = None, **kwargs) -> str:
+        """Raw uncapped read for internal callers (edit_file/search_file/read_file_chunk),
+        which slice/search the full content and must not get the public read_file guard output."""
+        full_path = os.path.normpath(os.path.join(self.repo.working_dir, file_path))
+        if os.path.exists(full_path) and os.path.isfile(full_path):
+            with open(full_path, 'r') as f:
+                return f.read()
+        return "File '{}' cannot be read because it is not existed".format(full_path)
+
+    def read_multiple_files(self, file_paths,
+                            offset: Optional[int] = None, limit: Optional[int] = None) -> Dict[str, Any]:
         """
-        Read a file from the repository with optional partial read support.
-        
-        Parameters:
-            file_path: the file path (relative to repo root)
-            branch: branch name (not used for local git, always reads from working dir)
-            **kwargs: Additional parameters (offset, limit, head, tail) - currently ignored,
-                     partial read handled client-side by base class methods
-        
-        Returns:
-            File content as string
+        Read multiple files in batch, capped both per-file and cumulatively.
+
+        Each result is a plain string, a content_too_large guidance dict if that
+        file alone exceeds the per-file cap, or a skip notice once the batch's
+        cumulative cap is reached (remaining files are not fetched at all).
         """
-        return self.read_file(file_path)
-    
+        # Shim swallows the shared reader's branch kwarg: LocalGit reads the
+        # checked-out working tree and has no per-call branch.
+        return capped_read_multiple_files(
+            lambda fp, branch=None, **kw: self.read_file(fp, **kw),
+            file_paths, offset=offset, limit=limit,
+        )
+
     def _write_file(
         self,
         file_path: str,
@@ -338,7 +363,9 @@ class LocalGit(BaseToolApiWrapper):
         try:
             file_path: str = file_query.split("\n")[0]
             file_path = os.path.normpath(os.path.join(self.repo.working_dir, file_path))
-            file_content = self.read_file(file_path)
+            # Use raw uncapped read: this content is edited and written back, so it
+            # must not be the guard-capped output the public read_file tool returns.
+            file_content = self._read_file(file_path)
             updated_file_content = file_content
             for old, new in parse_old_new_markers(file_query):  # Use shared utility
                 if not old.strip():
