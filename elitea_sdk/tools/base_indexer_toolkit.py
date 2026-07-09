@@ -454,7 +454,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 (skipped_data.get("items_processed", 0) - unchanged_count)
                 if skipped_data else 0
             )
+            # succeeded_chunks_count > 0 guard: the heuristic reinterprets docs_count as
+            # a file count only when the run actually produced chunks. Otherwise
+            # (e.g. reindex where every doc was unchanged and dedup-skipped)
+            # docs_count == succeeded_chunks_count == 0 would falsely trigger the
+            # rewrite and inflate the "indexed" count to effective_processed.
             if (skipped_data and effective_processed > 0
+                    and succeeded_chunks_count > 0
                     and docs_count == succeeded_chunks_count
                     and docs_count != effective_processed):
                 docs_count = effective_processed
@@ -580,6 +586,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Track successfully processed documents (base documents that produced at least one chunk)
             if dependent_docs_counter > 0:
                 result["docs_count"] += 1
+            else:
+                # Base doc yielded zero chunks (empty content, chunker returned nothing,
+                # or every chunk got filtered as empty/parse-error). Nothing lands in the
+                # vector store for this doc, but it was fetched — record it as skipped so
+                # the reported invariant `total_fetched = items_processed + total_skipped`
+                # still holds and the UI's `indexed / total` reflects reality. Skip if the
+                # doc was already tracked deeper (chunker or filter level) to avoid
+                # double-counting.
+                if not self._is_base_doc_tracked_as_skipped(base_doc):
+                    if hasattr(self, '_track_skipped_document'):
+                        self._track_skipped_document(_doc_name, reason="error")
             # After each base document, try a non-forced meta update; throttling handled inside index_meta_update
             try:
                 self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, result["count"], update_force=False)
@@ -637,8 +654,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 )
             elif chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
-                    # content is empty, yield as is
-                    yield document
+                    # Content bytes are empty (e.g. an empty ADO wiki page).
+                    # Track so the number shows up in indexing stats instead of
+                    # silently disappearing between "fetched" and "indexed",
+                    # and drop the document — yielding it downstream would end up
+                    # in the vector store with no content.
+                    source_name = document.metadata.get('id') or document.metadata.get('name') or document.metadata.get('path') or 'unknown'
+                    if hasattr(self, '_track_skipped_file_empty'):
+                        self._track_skipped_file_empty(str(source_name))
                     continue
                 # apply parsing based on content type resolved from chunking_tool
                 content_type = file_extension_by_chunker(chunking_tool)
@@ -670,6 +693,43 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             meta_lower.get('path') or
             'unknown'
         )
+
+    def _is_base_doc_tracked_as_skipped(self, base_doc: Document) -> bool:
+        """Return True if any identifier of ``base_doc`` already appears in a skip set.
+
+        Prevents double-counting when ``_filter_parsing_errors`` or the empty-content-bytes
+        path already recorded the document, and the outer per-base-doc fallback in
+        ``_save_index_generator`` would otherwise add it again to a different category.
+        """
+        stats = getattr(self, '_indexing_stats', None)
+        if stats is None:
+            return False
+        meta = base_doc.metadata or {}
+        candidates = {
+            str(meta.get('id') or ''),
+            str(meta.get('name') or ''),
+            str(meta.get('path') or ''),
+            str(meta.get('file_path') or ''),
+            self._extract_doc_name(meta),
+        }
+        candidates.discard('')
+        candidates.discard('unknown')
+        if not candidates:
+            return False
+        for skip_set in (
+            stats.files_skipped_whitelist,
+            stats.files_skipped_blacklist,
+            stats.files_skipped_read_error,
+            stats.files_skipped_empty,
+            stats.files_unsupported_extension,
+            stats.documents_skipped_error,
+            stats.documents_skipped_filtered,
+            stats.runtime_skipped_extension,
+            stats.runtime_skipped_error,
+        ):
+            if candidates & skip_set:
+                return True
+        return False
 
     def _collect_dependencies(self, documents: Generator[Document, None, None]):
         for document in documents:
