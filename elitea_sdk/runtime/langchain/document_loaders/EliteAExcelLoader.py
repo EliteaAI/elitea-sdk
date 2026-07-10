@@ -141,23 +141,60 @@ def _count_xlsx_images(source: Union[str, bytes, io.BytesIO],
         )
 
 
-def _sample_sheet_output(source, sheet_name: str, sheet_total_rows: int,
-                         file_name: Optional[str]) -> tuple:
-    """Sample a sheet's leading rows and extrapolate its full output size.
+def _list_sheets_and_sample(source: Union[str, bytes, io.BytesIO],
+                            file_name: Optional[str] = None,
+                            sample_limit: int = EXCEL_SAMPLE_ROW_LIMIT) -> tuple:
+    """Open the workbook once and return sheet dims plus leading-row samples.
 
-    Returns ``(sampled_chars, estimated_full_chars)`` for one sheet.
+    Returns ``(sheets, sample_chars_by_name)`` where ``sheets`` matches
+    ``list_excel_sheets`` and ``sample_chars_by_name`` maps each sheet to the
+    formatted char count of its first ``sample_limit`` rows. A single open keeps
+    the whole-workbook guard O(1) in sheet count instead of reopening per sheet.
     """
-    sample_end = min(sheet_total_rows, EXCEL_SAMPLE_ROW_LIMIT)
-    if sample_end < 1:
-        return 0, 0
-    sample_result = read_excel_rows(
-        source, sheet_name=sheet_name, start_row=1, end_row=sample_end,
-        include_headers=False, file_name=file_name,
-    )
-    sampled_chars = len(sample_result.get("content", ""))
-    if sheet_total_rows > sample_end:
-        return sampled_chars, int((sampled_chars / sample_end) * sheet_total_rows)
-    return sampled_chars, sampled_chars
+    extension, openable = _open_source(file_name, source)
+
+    if extension in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
+        wb = load_workbook(openable, read_only=True, data_only=True)
+        try:
+            sheets = []
+            samples = {}
+            for name in wb.sheetnames:
+                ws = wb[name]
+                sheets.append({
+                    "name": name,
+                    "max_row": ws.max_row if ws.max_row is not None else 0,
+                    "max_column": ws.max_column if ws.max_column is not None else 0,
+                })
+                lines = [
+                    _format_row(row) for row in
+                    ws.iter_rows(min_row=1, max_row=sample_limit, values_only=True)
+                ]
+                samples[name] = len("\n".join(lines))
+            return sheets, samples
+        finally:
+            wb.close()
+    elif extension == '.xls':
+        file_contents = None
+        path = None
+        if isinstance(openable, io.BytesIO):
+            file_contents = openable.getvalue()
+        else:
+            path = openable
+        wb = open_workbook(filename=path, file_contents=file_contents)
+        sheets = []
+        samples = {}
+        for name in wb.sheet_names():
+            sh = wb.sheet_by_name(name)
+            sheets.append({"name": name, "max_row": sh.nrows, "max_column": sh.ncols})
+            sample_end = min(sh.nrows, sample_limit)
+            lines = [
+                _format_row([sh.cell(r, c).value for c in range(sh.ncols)])
+                for r in range(sample_end)
+            ]
+            samples[name] = len("\n".join(lines))
+        return sheets, samples
+    else:
+        raise ValueError(f"Unsupported workbook extension for sheet listing: {extension}")
 
 
 def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
@@ -170,7 +207,15 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
                             raise_on_violation: bool = False) -> ExcelReadEstimate:
     """Estimate an Excel request and optionally reject unsafe reads."""
     extension, openable = _open_source(file_name, source)
-    sheets = list_excel_sheets(source, file_name=file_name)
+    # A full workbook read materializes every sheet (see _read_xlsx), so for that
+    # case list and sample leading rows in a single open — reopening per sheet is
+    # ~quadratic in sheet count and defeats the guard's own purpose.
+    maybe_whole_workbook = sheet_name is None and start_row is None and end_row is None
+    sample_chars_by_name = None
+    if maybe_whole_workbook:
+        sheets, sample_chars_by_name = _list_sheets_and_sample(source, file_name=file_name)
+    else:
+        sheets = list_excel_sheets(source, file_name=file_name)
     total_rows_workbook = sum(sheet.get("max_row", 0) or 0 for sheet in sheets)
 
     target_sheet_info = None
@@ -186,11 +231,7 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
     target_sheet = target_sheet_info["name"] if target_sheet_info else None
     target_sheet_total_rows = target_sheet_info.get("max_row", 0) if target_sheet_info else 0
     file_size_bytes = _get_source_size(source)
-    # A full workbook read materializes every sheet (see _read_xlsx). Scope the
-    # estimate to the whole workbook, not just the first sheet, in that case.
-    whole_workbook_read = (
-        sheet_name is None and start_row is None and end_row is None and bool(sheets)
-    )
+    whole_workbook_read = maybe_whole_workbook and bool(sheets)
     requested_start_row = start_row if start_row is not None and start_row > 0 else 1
     requested_end_row = end_row if end_row is not None else target_sheet_total_rows
     if target_sheet_total_rows > 0:
@@ -228,17 +269,22 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
     sampled_chars = 0
     estimated_output_chars = 0
     if not violations and whole_workbook_read:
-        # Sum sampled/estimated output across every sheet the full read returns.
+        # Sum sampled/estimated output across every sheet the full read returns,
+        # reusing the single-open samples from _list_sheets_and_sample above.
         for sheet in sheets:
             sheet_rows = sheet.get("max_row", 0) or 0
             if sheet_rows < 1:
                 continue
-            sheet_sampled, sheet_estimated = _sample_sheet_output(
-                openable, sheet["name"], sheet_rows, file_name,
-            )
-            sampled_rows += min(sheet_rows, EXCEL_SAMPLE_ROW_LIMIT)
+            sampled_this_sheet = min(sheet_rows, EXCEL_SAMPLE_ROW_LIMIT)
+            sheet_sampled = sample_chars_by_name.get(sheet["name"], 0)
+            sampled_rows += sampled_this_sheet
             sampled_chars += sheet_sampled
-            estimated_output_chars += sheet_estimated
+            if sheet_rows > sampled_this_sheet and sampled_this_sheet > 0:
+                estimated_output_chars += int(
+                    (sheet_sampled / sampled_this_sheet) * sheet_rows
+                )
+            else:
+                estimated_output_chars += sheet_sampled
     elif not violations and target_sheet and requested_rows > 0:
         sample_end_row = min(
             requested_end_row,
