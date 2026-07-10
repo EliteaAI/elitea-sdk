@@ -59,6 +59,28 @@ def _make_anthropic_system_content(text: str, model: Any) -> Any:
     return text
 
 
+def _rebuild_ai_message_without_calls(msg: AIMessage, keep_call_ids: set) -> AIMessage:
+    """Rebuild *msg* keeping only tool calls whose id is in *keep_call_ids*.
+
+    Critically, prunes matching ``tool_use`` blocks from ``.content`` in
+    lockstep. langchain_anthropic serializes from ``.content`` and re-emits any
+    ``tool_use`` block whose id is missing from ``.tool_calls``, so trimming
+    ``.tool_calls`` alone leaves orphaned blocks that crash the next Anthropic
+    call (issue #5768). Other content blocks and message metadata are preserved.
+    """
+    kept_calls = [tc for tc in (msg.tool_calls or []) if tc.get('id') in keep_call_ids]
+
+    content = msg.content
+    if isinstance(content, list):
+        content = [
+            b for b in content
+            if not (isinstance(b, dict) and b.get('type') == 'tool_use'
+                    and b.get('id') not in keep_call_ids)
+        ]
+
+    return msg.model_copy(update={'content': content, 'tool_calls': kept_calls})
+
+
 def _create_swarm_handoff_tool(*, agent_name: str, description: Optional[str] = None):
     """Build a swarm handoff tool with a strongly-recommended `task` argument.
 
@@ -975,11 +997,13 @@ class Assistant:
                             orphaned_calls.append(tc)
                             logger.warning(f"[SWARM] Filtering orphaned tool_call: {tc_id}")
 
-                    if orphaned_calls and not valid_calls:
-                        if msg.content:
-                            cleaned_messages.append(AIMessage(content=msg.content))
-                    elif orphaned_calls:
-                        cleaned_messages.append(AIMessage(content=msg.content, tool_calls=valid_calls))
+                    if orphaned_calls:
+                        # Strip orphaned tool_use blocks from .content too — trimming
+                        # only .tool_calls leaves them for langchain_anthropic to re-emit.
+                        valid_ids = {tc.get('id') for tc in valid_calls}
+                        rebuilt = _rebuild_ai_message_without_calls(msg, valid_ids)
+                        if valid_calls or rebuilt.content:
+                            cleaned_messages.append(rebuilt)
                     else:
                         cleaned_messages.append(msg)
                 else:
@@ -1042,16 +1066,13 @@ class Assistant:
                 if hasattr(response, 'tool_calls') and response.tool_calls:
                     transfer_calls = [tc for tc in response.tool_calls if tc.get('name', '').startswith('transfer_to_')]
                     if len(transfer_calls) > 1:
-                        from langchain_core.messages import AIMessage
                         logger.warning(
                             f"[SWARM] LLM emitted {len(transfer_calls)} simultaneous handoff calls. "
                             f"Keeping only the first: {transfer_calls[0].get('name')}"
                         )
                         non_transfer = [tc for tc in response.tool_calls if not tc.get('name', '').startswith('transfer_to_')]
-                        response = AIMessage(
-                            content=response.content,
-                            tool_calls=non_transfer + [transfer_calls[0]],
-                        )
+                        keep_ids = {tc.get('id') for tc in non_transfer + [transfer_calls[0]]}
+                        response = _rebuild_ai_message_without_calls(response, keep_ids)
 
                 # Emit swarm agent response event
                 if config:
