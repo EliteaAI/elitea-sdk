@@ -18,6 +18,8 @@ from openpyxl import Workbook
 from elitea_sdk.runtime.langchain.document_loaders.EliteAExcelLoader import (
     EXCEL_READ_LIMIT_ERROR,
     EXCEL_MAX_FULL_READ_FILE_SIZE,
+    EXCEL_MAX_REQUEST_ROWS,
+    EliteAExcelLoader,
     ExcelReadLimitExceeded,
     check_excel_read_limits,
     list_excel_sheets,
@@ -255,3 +257,83 @@ def test_check_excel_read_limits_allows_large_file_partial_read_when_scope_is_sa
 
     assert estimate.requested_rows == 1
     assert estimate.file_size_bytes > EXCEL_MAX_FULL_READ_FILE_SIZE
+
+
+# --- Multi-sheet workbook guard (#5713) ---------------------------------------
+# A full read materializes every sheet. Each sheet may individually pass the
+# per-sheet thresholds while the workbook total blows past the output cap.
+
+
+def test_full_workbook_read_sums_text_budget_across_all_sheets(tmp_path):
+    # 20 sheets x ~15k chars each = ~300k >> 200k cap, though no single sheet trips it.
+    big_value = "x" * 3_000
+    sheets = {
+        f"Sheet{idx}": [["h1"]] + [[big_value] for _ in range(5)]
+        for idx in range(20)
+    }
+    path = _build_workbook(tmp_path, sheets)
+
+    with pytest.raises(ExcelReadLimitExceeded) as exc:
+        check_excel_read_limits(path, raise_on_violation=True)
+
+    assert "output size=" in str(exc.value)
+    # The rejected estimate reflects the whole workbook, not just sheet 0.
+    assert exc.value.estimate.estimated_output_chars > 200_000
+
+
+def test_full_workbook_read_sums_rows_across_all_sheets(tmp_path):
+    # No single sheet exceeds EXCEL_MAX_REQUEST_ROWS, but the sum does.
+    per_sheet = (EXCEL_MAX_REQUEST_ROWS // 2) + 100
+    sheets = {
+        f"Sheet{idx}": [[idx] for _ in range(per_sheet)]
+        for idx in range(3)
+    }
+    path = _build_workbook(tmp_path, sheets)
+
+    with pytest.raises(ExcelReadLimitExceeded) as exc:
+        check_excel_read_limits(path, raise_on_violation=True)
+
+    assert "requested rows=" in str(exc.value)
+    assert exc.value.estimate.requested_rows == per_sheet * 3
+
+
+def test_full_workbook_read_allows_small_multi_sheet_workbook(tmp_path):
+    path = _build_workbook(tmp_path, {
+        "A": [["h1", "h2"], [1, 2], [3, 4]],
+        "B": [["x"], [10], [20]],
+    })
+
+    estimate = check_excel_read_limits(path, raise_on_violation=True)
+
+    assert estimate.is_unbounded_read
+    assert estimate.requested_rows == 6
+    assert estimate.estimated_output_chars < 200_000
+
+
+def test_named_sheet_read_scopes_to_that_sheet_only(tmp_path):
+    # A tiny target sheet must pass even when a sibling sheet is enormous.
+    big_value = "x" * 5_000
+    path = _build_workbook(tmp_path, {
+        "Small": [["h1"], ["ok"]],
+        "Huge": [["h1"]] + [[big_value] for _ in range(200)],
+    })
+
+    estimate = check_excel_read_limits(
+        path, sheet_name="Small", raise_on_violation=True)
+
+    assert estimate.target_sheet == "Small"
+    assert estimate.estimated_output_chars < 200_000
+
+
+def test_get_content_full_read_rejects_oversized_multi_sheet_workbook(tmp_path):
+    big_value = "x" * 3_000
+    sheets = {
+        f"Sheet{idx}": [["h1"]] + [[big_value] for _ in range(5)]
+        for idx in range(20)
+    }
+    path = _build_workbook(tmp_path, sheets)
+
+    loader = EliteAExcelLoader(file_path=path, file_name=path)
+
+    with pytest.raises(ExcelReadLimitExceeded):
+        loader.get_content()

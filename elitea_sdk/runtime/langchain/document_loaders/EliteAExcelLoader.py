@@ -141,6 +141,25 @@ def _count_xlsx_images(source: Union[str, bytes, io.BytesIO],
         )
 
 
+def _sample_sheet_output(source, sheet_name: str, sheet_total_rows: int,
+                         file_name: Optional[str]) -> tuple:
+    """Sample a sheet's leading rows and extrapolate its full output size.
+
+    Returns ``(sampled_chars, estimated_full_chars)`` for one sheet.
+    """
+    sample_end = min(sheet_total_rows, EXCEL_SAMPLE_ROW_LIMIT)
+    if sample_end < 1:
+        return 0, 0
+    sample_result = read_excel_rows(
+        source, sheet_name=sheet_name, start_row=1, end_row=sample_end,
+        include_headers=False, file_name=file_name,
+    )
+    sampled_chars = len(sample_result.get("content", ""))
+    if sheet_total_rows > sample_end:
+        return sampled_chars, int((sampled_chars / sample_end) * sheet_total_rows)
+    return sampled_chars, sampled_chars
+
+
 def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
                             *,
                             file_name: Optional[str] = None,
@@ -167,20 +186,28 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
     target_sheet = target_sheet_info["name"] if target_sheet_info else None
     target_sheet_total_rows = target_sheet_info.get("max_row", 0) if target_sheet_info else 0
     file_size_bytes = _get_source_size(source)
+    # A full workbook read materializes every sheet (see _read_xlsx). Scope the
+    # estimate to the whole workbook, not just the first sheet, in that case.
+    whole_workbook_read = (
+        sheet_name is None and start_row is None and end_row is None and bool(sheets)
+    )
     requested_start_row = start_row if start_row is not None and start_row > 0 else 1
     requested_end_row = end_row if end_row is not None else target_sheet_total_rows
     if target_sheet_total_rows > 0:
         requested_end_row = min(requested_end_row, target_sheet_total_rows)
-    requested_rows = 0
-    if target_sheet_total_rows > 0 and requested_start_row <= requested_end_row:
-        requested_rows = requested_end_row - requested_start_row + 1
+    if whole_workbook_read:
+        requested_rows = total_rows_workbook
+    else:
+        requested_rows = 0
+        if target_sheet_total_rows > 0 and requested_start_row <= requested_end_row:
+            requested_rows = requested_end_row - requested_start_row + 1
 
     embedded_images = 0
     if extension in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
         embedded_images = _count_xlsx_images(source, file_name=file_name)
 
-    is_unbounded_read = (
-        start_row is None and end_row is None and requested_rows == target_sheet_total_rows
+    is_unbounded_read = start_row is None and end_row is None and (
+        whole_workbook_read or requested_rows == target_sheet_total_rows
     )
 
     violations = []
@@ -197,11 +224,22 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
             f"embedded images={embedded_images} exceeds limit {EXCEL_MAX_IMAGE_COUNT}"
         )
 
-    sample_end_row = requested_end_row
     sampled_rows = 0
     sampled_chars = 0
     estimated_output_chars = 0
-    if not violations and target_sheet and requested_rows > 0:
+    if not violations and whole_workbook_read:
+        # Sum sampled/estimated output across every sheet the full read returns.
+        for sheet in sheets:
+            sheet_rows = sheet.get("max_row", 0) or 0
+            if sheet_rows < 1:
+                continue
+            sheet_sampled, sheet_estimated = _sample_sheet_output(
+                openable, sheet["name"], sheet_rows, file_name,
+            )
+            sampled_rows += min(sheet_rows, EXCEL_SAMPLE_ROW_LIMIT)
+            sampled_chars += sheet_sampled
+            estimated_output_chars += sheet_estimated
+    elif not violations and target_sheet and requested_rows > 0:
         sample_end_row = min(
             requested_end_row,
             requested_start_row + EXCEL_SAMPLE_ROW_LIMIT - 1,
@@ -580,15 +618,14 @@ class EliteAExcelLoader(EliteATableLoader):
         When ``start_row``/``end_row`` are set (EL-4389 row-range mode),
         returns a dict with the streaming row slice instead.
         """
-        # Row-range fast path - streams via openpyxl read_only.
-        requested_start_row = self.start_row if self.start_row is not None else 1
-        requested_end_row = self.end_row
+        # Pass the caller's real start_row/end_row (preserving None) so the guard
+        # can distinguish a genuine full read from a bounded range.
         check_excel_read_limits(
             self.file_path,
             file_name=self.file_name,
             sheet_name=self.sheet_name,
-            start_row=requested_start_row,
-            end_row=requested_end_row,
+            start_row=self.start_row,
+            end_row=self.end_row,
             raise_on_violation=True,
         )
 
@@ -596,7 +633,7 @@ class EliteAExcelLoader(EliteATableLoader):
             return read_excel_rows(
                 self.file_path,
                 sheet_name=self.sheet_name,
-                start_row=requested_start_row,
+                start_row=self.start_row if self.start_row is not None else 1,
                 end_row=self.end_row,
                 include_headers=bool(self.include_headers),
                 header_row=int(self.header_row) if self.header_row else 1,
