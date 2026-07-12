@@ -2048,6 +2048,250 @@ def test_one_parallel_child_completes_other_pauses():
 
 
 # ---------------------------------------------------------------------------
+# #5778 depth-3: two-level parallel HITL (container-of-containers)
+#
+# A tier-2 "container" Application can ITSELF fan out over its own tier-3
+# leaves via `_run_parallel_application_calls`. When a leaf pauses, the
+# container's own dict-bridge cycle produces a `parallel_sensitive_tools`
+# aggregate (see application.py `_run`'s `while ... response['hitl_interrupt']`
+# loop) — this is exactly the shape a real container-of-containers bubbles up
+# to the root as ITS OWN `hitl_interrupt` sentinel. `NestedContainerApplication`
+# mocks that shape directly (mirrors `DictBridgeInterruptingApplication`, but
+# its first-pause payload is a nested aggregate with one `pending` leaf entry,
+# not a flat `sensitive_tool` interrupt).
+# ---------------------------------------------------------------------------
+
+
+class NestedContainerApplication:
+    """Mock tier-2 container whose OWN prior fan-out already paused a tier-3
+    leaf. Its first invoke() returns a `parallel_sensitive_tools` aggregate
+    (one pending leaf) instead of a flat `sensitive_tool` interrupt — the
+    shape the root's `_run_parallel_application_calls` must flatten (#5778)
+    instead of collapsing to one entry keyed by the container's own id."""
+
+    def __init__(self, output, leaf_tool_call_id, leaf_tool_name):
+        self.output = output
+        self.leaf_tool_call_id = leaf_tool_call_id
+        self.leaf_tool_name = leaf_tool_name
+        self.calls = []
+
+    def invoke(self, payload, config=None):
+        self.calls.append({'payload': payload, 'config': config})
+        if isinstance(payload, dict) and payload.get('hitl_resume'):
+            # Regrouped resume: Application._run's `_grandchild_decisions`
+            # branch passes `hitl_decisions` (list) here instead of a single
+            # action/value pair. Record which decision the leaf received.
+            decisions = payload.get('hitl_decisions') or []
+            for d in decisions:
+                if d.get('tool_call_id') == self.leaf_tool_call_id:
+                    self.calls[-1]['leaf_decision'] = d
+            return {'output': self.output, 'execution_finished': True}
+        return {
+            'output': 'Need approval (nested)',
+            'execution_finished': False,
+            'hitl_interrupt': {
+                'type': 'hitl',
+                'guardrail_type': 'parallel_sensitive_tools',
+                'message': 'container leaf(s) awaiting approval',
+                'pending': [{
+                    'type': 'hitl',
+                    'guardrail_type': 'sensitive_tool',
+                    'message': f'approve {self.leaf_tool_name}?',
+                    'tool_name': self.leaf_tool_name,
+                    'tool_call_id': self.leaf_tool_call_id,
+                }],
+            },
+        }
+
+
+def test_two_level_parallel_both_grandchildren_pause_aggregate():
+    """Root fans out 2 containers; each container's OWN single leaf paused.
+    The root's aggregate must surface exactly 2 pending cards at LEAF
+    granularity (not 2 container-level cards) — each keeps its leaf's own
+    tool_call_id and is tagged with `_via_call_id` pointing at its immediate
+    container, and the two `_via_call_id`s are distinct."""
+    parent_memory = MemorySaver()
+    container_x = NestedContainerApplication('X-done', 'leaf-1', 'create_file')
+    container_y = NestedContainerApplication('Y-done', 'leaf-2', 'delete_file')
+    tools = [_subagent('container_x', container_x), _subagent('container_y', container_y)]
+
+    llm = MultiAppParentLLM(tool_a='container_x', tool_b='container_y',
+                            id_a='call-X', id_b='call-Y')
+    runnable = _build_parent_runnable(parent_memory, llm, tools)
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both containers')]},
+        config={'configurable': {'thread_id': 'two-level-pause-thread'}},
+    )
+
+    assert result['execution_finished'] is False
+    interrupts = result['hitl_interrupts']
+    assert len(interrupts) == 2, (
+        f'expected 2 leaf-level pending cards (not container-level), got: {interrupts}'
+    )
+    by_id = {i['tool_call_id']: i for i in interrupts}
+    # Leaf ids are preserved verbatim — NOT overwritten with the container's
+    # own call id ('call-X'/'call-Y'). This is the core #5778 bug fix.
+    assert set(by_id) == {'leaf-1', 'leaf-2'}, (
+        f'pending entries must be keyed by the LEAF tool_call_id, got: {set(by_id)}'
+    )
+    assert by_id['leaf-1']['tool_name'] == 'create_file'
+    assert by_id['leaf-2']['tool_name'] == 'delete_file'
+    # Each leaf entry breadcrumbs back to its OWN immediate container.
+    assert by_id['leaf-1']['_via_call_id'] == 'call-X'
+    assert by_id['leaf-2']['_via_call_id'] == 'call-Y'
+    assert by_id['leaf-1']['_via_call_id'] != by_id['leaf-2']['_via_call_id']
+
+
+def test_two_level_parallel_resume_routes_to_correct_grandchild():
+    """Resume with 2 hitl_decisions keyed by LEAF tool_call_id + _via_call_id
+    (approve leaf-1 under container_x, reject leaf-2 under container_y). Each
+    decision must reach the correct leaf under the correct container, and the
+    run completes without a lingering interrupt."""
+    parent_memory = MemorySaver()
+    container_x = NestedContainerApplication('X-done', 'leaf-1', 'create_file')
+    container_y = NestedContainerApplication('Y-done', 'leaf-2', 'delete_file')
+    tools = [_subagent('container_x', container_x), _subagent('container_y', container_y)]
+    thread_config = {'configurable': {'thread_id': 'two-level-resume-thread'}}
+
+    initial_llm = MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y')
+    initial_runnable = _build_parent_runnable(parent_memory, initial_llm, tools)
+    initial_result = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both containers')]},
+        config=thread_config,
+    )
+    assert initial_result['execution_finished'] is False
+    assert len(initial_result['hitl_interrupts']) == 2
+
+    resumed_llm = MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y')
+    resumed_runnable = _build_parent_runnable(parent_memory, resumed_llm, tools)
+    resume_result = resumed_runnable.invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'leaf-1', '_via_call_id': 'call-X', 'action': 'approve', 'value': ''},
+            {'tool_call_id': 'leaf-2', '_via_call_id': 'call-Y', 'action': 'reject', 'value': 'no'},
+        ]},
+        config=thread_config,
+    )
+
+    # Each container was resumed with the regrouped hitl_decisions list
+    # (Application._run's `_grandchild_decisions` branch), and the decision
+    # for its OWN leaf is the one it received (not the sibling's).
+    assert container_x.calls[-1]['leaf_decision']['action'] == 'approve'
+    assert container_y.calls[-1]['leaf_decision']['action'] == 'reject'
+
+    # Both containers completed, and the run finished with no lingering pause.
+    assert resume_result['execution_finished'] is True
+    assert resume_result['output'] == 'parent-done'
+    final_contents = resumed_llm.calls[-1]
+    assert 'X-done' in final_contents and 'Y-done' in final_contents
+
+
+def test_two_level_ancestry_chain_stamped():
+    """A grandchild's nested_config['metadata']['parent_agent_path'] must
+    have 2 entries (root->container, container->leaf) with distinct call_ids,
+    while `parent_agent_name` still equals only the IMMEDIATE parent
+    (backward compat, #5778).
+
+    `_hitl_parallel_call_id` (the id stamped into `parent_agent_path`) is only
+    populated on the PARALLEL fan-out path (`__hitl_parallel_call_id__`,
+    llm.py's `_run_one`, set only inside `_run_parallel_application_calls`) —
+    a plain sequential single tool_call never sets it. So this tree must
+    exercise 2-way parallel dispatch at BOTH levels (root -> 2 containers in
+    parallel; the container under test -> 2 leaves in parallel) to actually
+    populate distinct call_ids, matching the real mechanism rather than
+    asserting on a code path that never sets `_hitl_parallel_call_id`.
+    """
+    captured_nested_configs = []
+
+    class RecordingLeaf:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def invoke(self, payload, config=None):
+            captured_nested_configs.append((self.tag, config))
+            return {'output': f'{self.tag}-done', 'execution_finished': True}
+
+    # Level 2: container fans out to 2 leaves in parallel (one turn, two
+    # tool_calls) so `_run_parallel_application_calls` stamps a distinct
+    # `__hitl_parallel_call_id__` for each leaf.
+    leaf_1_tool = Application(
+        name='leaf_1', description='leaf worker 1',
+        application=RecordingLeaf('leaf_1'), return_type='str', client=None,
+        is_subgraph=True,
+    )
+    leaf_2_tool = Application(
+        name='leaf_2', description='leaf worker 2',
+        application=RecordingLeaf('leaf_2'), return_type='str', client=None,
+        is_subgraph=True,
+    )
+
+    container_llm = MultiAppParentLLM(tool_a='leaf_1', tool_b='leaf_2',
+                                      id_a='call-leaf-1', id_b='call-leaf-2')
+    container_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'container', 'tools': [], 'meta': {}},
+        client=container_llm,
+        tools=[leaf_1_tool, leaf_2_tool],
+        memory=None,
+        app_type='predict',
+        is_subgraph=True,
+    )
+    container_runnable = container_assistant.runnable()
+
+    container_x_tool = Application(
+        name='container_x', description='tier-2 container X',
+        application=container_runnable, return_type='str', client=None,
+        is_subgraph=True,
+    )
+
+    # Root fans out to a SECOND container in parallel too, purely so the
+    # root->container hop also exercises the parallel path (distinct call_id
+    # per root-level branch), matching how #5778 actually arises in practice
+    # (root fanning out over containers that themselves fan out over leaves).
+    container_y_tool = Application(
+        name='container_y', description='tier-2 container Y (unused branch)',
+        application=StaticApplication(output='Y-done'), return_type='str',
+        client=None, is_subgraph=True,
+    )
+
+    root_llm = MultiAppParentLLM(tool_a='container_x', tool_b='container_y',
+                                 id_a='call-container-x', id_b='call-container-y')
+    root_memory = MemorySaver()
+    root_runnable = _build_parent_runnable(
+        root_memory, root_llm, [container_x_tool, container_y_tool]
+    )
+    result = root_runnable.invoke(
+        {'messages': [HumanMessage(content='Go')]},
+        config={'configurable': {'thread_id': 'ancestry-chain-thread'}},
+    )
+    assert result['execution_finished'] is True
+
+    assert len(captured_nested_configs) == 2
+    by_tag = dict(captured_nested_configs)
+    leaf_1_nested_config = by_tag['leaf_1']
+
+    path = leaf_1_nested_config['metadata']['parent_agent_path']
+    assert len(path) == 2, f'expected root->container->leaf chain of 2 entries, got: {path}'
+    assert path[0]['name'] == 'container_x'
+    assert path[1]['name'] == 'leaf_1'
+    assert path[0]['call_id'] == 'call-container-x'
+    assert path[1]['call_id'] == 'call-leaf-1'
+    assert path[0]['call_id'] != path[1]['call_id'], (
+        f'each ancestry entry must carry its OWN distinct call_id, got: {path}'
+    )
+    # parent_agent_name is unchanged: still ONLY the immediate parent's name
+    # (backward compat — existing 1-level consumers read this single field).
+    assert leaf_1_nested_config['metadata']['parent_agent_name'] == 'leaf_1'
+
+    leaf_2_nested_config = by_tag['leaf_2']
+    leaf_2_path = leaf_2_nested_config['metadata']['parent_agent_path']
+    assert leaf_2_path[1]['call_id'] == 'call-leaf-2'
+    # Sibling leaves under the SAME container share the container hop but
+    # have distinct ids for their own hop.
+    assert leaf_2_path[0]['call_id'] == path[0]['call_id']
+    assert leaf_2_path[1]['call_id'] != path[1]['call_id']
+
+
+# ---------------------------------------------------------------------------
 # Multi-round parallel HITL (issue #4993 follow-up)
 #
 # The single-round parallel design assumed: all children pause once -> one

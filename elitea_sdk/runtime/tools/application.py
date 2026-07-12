@@ -390,7 +390,23 @@ class Application(BaseTool):
         _parent_name = self.metadata.get('original_name') or self.metadata.get('display_name')
         nested_metadata = dict(invoke_config['metadata']) if invoke_config and invoke_config.get('metadata') else {}
         if _parent_name:
+            # `parent_agent_name` is a single overwrite — it always reflects
+            # the IMMEDIATE parent only, which is enough for depth-1 UI
+            # labelling but loses the chain at depth-2+ (#5778: a grandchild
+            # only ever sees its own direct container's name, not the root's).
+            # Keep it unchanged for backward compat, and ADD a running
+            # `parent_agent_path` list (inherited + this level appended) so
+            # deeper consumers (ancestry-aware UI, resume routing) can walk
+            # the full chain without reconstructing it from checkpoints.
             nested_metadata['parent_agent_name'] = _parent_name
+            _inherited_path = list(
+                (invoke_config or {}).get('metadata', {}).get('parent_agent_path', [])
+            )
+            _inherited_path.append({
+                'name': _parent_name,
+                'call_id': _hitl_parallel_call_id or None,
+            })
+            nested_metadata['parent_agent_path'] = _inherited_path
         nested_config = {}
         if invoke_config and invoke_config.get('configurable'):
             parent_configurable = dict(invoke_config['configurable'])
@@ -435,14 +451,43 @@ class Application(BaseTool):
                 "[APP_RUN] Resuming deferred child '%s' (parallel batch) with: %s",
                 self.name, _hitl_parallel_resume,
             )
-            response = self.application.invoke(
-                {
-                    "hitl_resume": True,
-                    "hitl_action": _hitl_parallel_resume.get("action", "approve"),
-                    "hitl_value": _hitl_parallel_resume.get("value", ""),
-                },
-                config=nested_config,
-            )
+            _grandchild_decisions = _hitl_parallel_resume.get('decisions')
+            if _grandchild_decisions:
+                # #5778 depth-3: this child is ITSELF a container whose own
+                # pause was a nested `parallel_sensitive_tools` aggregate (its
+                # leaves paused underneath it, see llm.py's
+                # grandchild_decisions_by_via_id grouping). It must be resumed
+                # with the LIST of per-leaf decisions, not a single
+                # action/value pair, so its OWN graph re-enters the
+                # `guardrail_type == 'parallel_sensitive_tools'` resume branch
+                # and routes each decision to the correct leaf.
+                #
+                # Channel choice: pass `hitl_decisions` (list) in the invoke
+                # payload rather than inventing a new config key. This reuses
+                # already-proven machinery in langraph_agent.py:
+                #   `_is_hitl_resume` recognizes a non-empty `hitl_decisions`
+                #   list (treats it as a resume trigger) and
+                #   `_extract_hitl_resume` copies `input_data['hitl_decisions']`
+                #   straight into `resume['hitl_decisions']`, which then feeds
+                #   the existing `guardrail_type == 'parallel_sensitive_tools'`
+                #   resume branch (same one exercised by the working 1-level
+                #   parallel HITL tests) — no new resume channel needed.
+                response = self.application.invoke(
+                    {
+                        "hitl_resume": True,
+                        "hitl_decisions": list(_grandchild_decisions),
+                    },
+                    config=nested_config,
+                )
+            else:
+                response = self.application.invoke(
+                    {
+                        "hitl_resume": True,
+                        "hitl_action": _hitl_parallel_resume.get("action", "approve"),
+                        "hitl_value": _hitl_parallel_resume.get("value", ""),
+                    },
+                    config=nested_config,
+                )
         else:
             try:
                 response = self.application.invoke(
@@ -516,12 +561,21 @@ class Application(BaseTool):
             # restored into the parent's LLM history on resume. The child
             # preserves its own pending in its own checkpoint for its own
             # resume cycle.
-            child_hitl_for_parent = {
-                **child_hitl,
-                '_parent_tool_name': self.name,
-                '_parent_tool_args': {'task': kwargs.get('task', '')},
-            }
-            # The {**child_hitl} spread copies the CHILD's own _pending_messages.
+            child_hitl_for_parent = dict(child_hitl)
+            # setdefault (not overwrite): matches the GraphInterrupt path above
+            # (line ~475-476). #5778 — when `child_hitl` is itself a nested
+            # `parallel_sensitive_tools` aggregate (a container-of-container
+            # whose own leaves paused), it may already carry
+            # `_parent_tool_name`/`_parent_tool_args` stamped by ITS OWN
+            # `_run_parallel_application_calls`/dict-bridge cycle one level
+            # down. Overwriting here would destroy that inner attribution;
+            # setdefault only fills it in when absent (i.e. for a direct,
+            # non-nested single-tool pause).
+            child_hitl_for_parent.setdefault('_parent_tool_name', self.name)
+            child_hitl_for_parent.setdefault(
+                '_parent_tool_args', {'task': kwargs.get('task', '')}
+            )
+            # The dict(child_hitl) copy carries the CHILD's own _pending_messages.
             # Always drop them so they can't leak into the parent checkpoint;
             # only the parent's pending is meaningful when restored into the
             # parent's LLM history on resume.

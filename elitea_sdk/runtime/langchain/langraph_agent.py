@@ -2057,7 +2057,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         for d in decisions:
                             if not isinstance(d, dict):
                                 continue
-                            persisted.append({
+                            entry = {
                                 'tool_name': d.get('tool_name', ''),
                                 'toolkit_name': d.get('toolkit_name', ''),
                                 'toolkit_type': d.get('toolkit_type', ''),
@@ -2065,7 +2065,17 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 'action_label': d.get('action_label', ''),
                                 'user_feedback': d.get('value', ''),
                                 'tool_call_id': d.get('tool_call_id', ''),
-                            })
+                            }
+                            # #5778 depth-3: a decision targeting a GRANDCHILD
+                            # carries `_via_call_id` (the immediate container's
+                            # tool_call_id it must be routed through). Without
+                            # forwarding it here, `state['hitl_decisions']` read
+                            # back by LLMNode's `_run_parallel_application_calls`
+                            # would lose the breadcrumb and the decision could
+                            # never be regrouped to the correct container.
+                            if d.get('_via_call_id'):
+                                entry['_via_call_id'] = d['_via_call_id']
+                            persisted.append(entry)
                         if persisted:
                             self.update_state(config, {'hitl_decisions': persisted})
                         logger.info(

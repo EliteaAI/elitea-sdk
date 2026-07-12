@@ -2319,10 +2319,24 @@ class LLMNode(BaseTool):
 
         # Map prior decisions (this turn's resume) by the PARENT Application
         # tool_call_id so each paused child resumes from its own checkpoint.
+        #
+        # #5778 depth-3: a decision may instead target a GRANDCHILD (a leaf
+        # paused two levels down, under one of THIS level's containers). Such
+        # a decision's own tool_call_id is the leaf's id (never one of THIS
+        # level's immediate children), but it carries `_via_call_id` pointing
+        # at the immediate container it must be routed through. Group those
+        # separately so each container gets its OWN sub-list of grandchild
+        # decisions instead of being silently skipped (the original bug: the
+        # root's decisions_by_id could never match a container id when every
+        # decision was keyed by a leaf id).
         decisions_by_id = {}
+        grandchild_decisions_by_via_id: Dict[str, list] = {}
         for decision in (hitl_decisions or []):
             tcid = decision.get('tool_call_id')
-            if tcid:
+            via_id = decision.get('_via_call_id')
+            if via_id:
+                grandchild_decisions_by_via_id.setdefault(via_id, []).append(decision)
+            elif tcid:
                 decisions_by_id[tcid] = decision
 
         loop = asyncio.get_running_loop()
@@ -2333,12 +2347,39 @@ class LLMNode(BaseTool):
             child_config = dict(config)
             child_config['configurable'] = dict(config.get('configurable', {}))
             decision = decisions_by_id.get(tool_call_id)
+            grandchild_decisions = grandchild_decisions_by_via_id.get(tool_call_id)
             if decision is not None:
                 # Resume this child from its checkpoint with the user's decision
                 # (the derived child thread_id is keyed by this tool_call_id).
                 child_config['configurable']['__hitl_parallel_resume__'] = {
                     'action': decision.get('action', 'approve'),
                     'value': decision.get('value', decision.get('user_feedback', '')),
+                }
+            elif grandchild_decisions:
+                # This child is itself a container: its OWN prior pause was a
+                # nested `parallel_sensitive_tools` aggregate (issue #5778). Pass
+                # the whole sub-list through so Application._run can resume the
+                # container's graph with `hitl_decisions` (list) rather than a
+                # single action/value pair — the container's own LLMNode then
+                # re-runs ITS `_run_parallel_application_calls` and routes each
+                # decision to the correct leaf via the existing single-level
+                # `decisions_by_id` machinery one level down.
+                #
+                # CONSUME one hop of the routing chain: `_via_call_id` pointed
+                # this decision at THIS container (call_id == tool_call_id here).
+                # One level down, the decision's own `tool_call_id` (the leaf id)
+                # IS a direct child, so it must land in the container's
+                # `decisions_by_id`, not be re-bucketed as a grandchild. Drop the
+                # now-consumed `_via_call_id` so the child level routes it as a
+                # direct decision. (If depth-4+ is ever supported, this becomes a
+                # stack pop instead of a single strip.)
+                _forwarded = []
+                for _d in grandchild_decisions:
+                    _d2 = dict(_d)
+                    _d2.pop('_via_call_id', None)
+                    _forwarded.append(_d2)
+                child_config['configurable']['__hitl_parallel_resume__'] = {
+                    'decisions': _forwarded,
                 }
             # Deferred mode must stay sticky ACROSS resume, not just on the fresh
             # run. A resumed child whose LLM picks a DIFFERENT sensitive tool on
@@ -2393,10 +2434,38 @@ class LLMNode(BaseTool):
         # Build ONE aggregated interrupt for all paused children. Each entry is
         # the single-shape sensitive-tool payload, re-keyed to the PARENT
         # Application tool_call_id so the resume decision routes back here.
+        #
+        # #5778 depth-3: a paused child can ITSELF be a container whose own
+        # pause was already a `parallel_sensitive_tools` aggregate (its own
+        # leaves paused underneath it). Flattening that nested aggregate to a
+        # single entry keyed by the container's tool_call_id (old behaviour)
+        # would overwrite the leaf's own tool_call_id and permanently sever the
+        # UI-displayed card's id from the id the resume decision must target —
+        # decisions_by_id (below, on this container's NEXT resume) would then
+        # never match, and the leaf's pause could never be answered. Instead,
+        # surface each nested leaf entry as its OWN top-level pending item,
+        # preserving its original tool_call_id and stamping `_via_call_id` with
+        # THIS level's container id so a later resume can be regrouped and
+        # routed back down (see the grandchild_decisions_by_via_id map above).
         pending_payload = []
         for spec, sentinel in pending_deferred:
             _tn, _ta, tool_call_id, _tool = spec
-            entry = dict(sentinel.get('hitl_interrupt') or {})
+            nested_aggregate = sentinel.get('hitl_interrupt') or {}
+            nested_pending = nested_aggregate.get('pending')
+            if isinstance(nested_pending, list) and nested_pending:
+                # The paused child is itself a container: unpack its leaves.
+                for leaf_entry in nested_pending:
+                    if not isinstance(leaf_entry, dict):
+                        continue
+                    flat_entry = dict(leaf_entry)
+                    # Leaf's own tool_call_id is preserved as-is (NOT
+                    # overwritten with the container's id) — the UI card and
+                    # the eventual resume decision both key off the leaf id.
+                    flat_entry['_via_call_id'] = tool_call_id
+                    flat_entry.pop('_pending_messages', None)
+                    pending_payload.append(flat_entry)
+                continue
+            entry = dict(nested_aggregate)
             entry['tool_call_id'] = tool_call_id
             # Label the paused card with the sub-agent it originated from so the
             # UI can group N stacked approvals by sub-agent name (issue #4993).
