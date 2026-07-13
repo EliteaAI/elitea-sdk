@@ -841,6 +841,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     # Opt-in parallelism: default 1 preserves pre-refactor serial behaviour for
     # existing callers. Callers set `workers=N` to fan out per-doc pipelines.
     _DEFAULT_WORKERS = 1
+    # Hard cap on concurrent per-doc pipelines. Higher values risk ADO REST 429s,
+    # LLM rate limits, and pgvector pool exhaustion.
+    _MAX_WORKERS = 10
 
     def _base_loader(
         self,
@@ -856,7 +859,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         # Expose worker count to _save_index_generator (base-doc executor) and
         # any downstream per-doc work. Defaults to _DEFAULT_WORKERS so the tool
         # works out of the box; pass workers=1 to force serial.
-        self._index_workers = max(1, int(workers)) if workers else self._DEFAULT_WORKERS
+        raw_workers = int(workers) if workers else self._DEFAULT_WORKERS
+        if raw_workers > self._MAX_WORKERS:
+            logger.warning(
+                "workers=%s exceeds cap %s (ADO REST quota + pgvector pool "
+                "headroom); clamping to %s.",
+                raw_workers, self._MAX_WORKERS, self._MAX_WORKERS,
+            )
+        self._index_workers = max(1, min(raw_workers, self._MAX_WORKERS))
         # Stash the indexing knobs so _fetch_work_item_document (running on a
         # worker thread) can read them without receiving them as arguments.
         self._index_process_images = bool(process_images) if process_images else False
@@ -1090,14 +1100,15 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             "wiql": (str, Field(description="WIQL (Work Item Query Language) query string to select and filter Azure DevOps work items.")),
             "workers": (Optional[int], Field(
                 default=None,
+                ge=1,
+                le=10,
                 description=(
                     "Maximum number of work items processed concurrently. Applies "
                     "to both the initial REST fetch (get_work_item per id) and the "
                     "per-item indexing pipeline (attachments, chunking). Defaults "
-                    "to 4, which fits inside the default pgvector pool. Raise "
-                    "cautiously — high values can saturate the ADO REST quota, "
-                    "the LLM rate limit, or the vectorstore connection pool. "
-                    "Pass 1 to force serial."
+                    "to 1 (serial). Capped at 10 to stay within ADO REST quota, "
+                    "LLM rate limits, and the pgvector connection pool. Values "
+                    "above 10 are clamped."
                 ),
             )),
             "process_images": (Optional[bool], Field(

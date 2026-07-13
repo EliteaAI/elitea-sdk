@@ -789,6 +789,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     # Opt-in parallelism: default 1 preserves pre-refactor serial behaviour for
     # existing callers. Callers set `workers=N` to fan out per-doc pipelines.
     _DEFAULT_WORKERS = 1
+    # Hard cap on concurrent per-doc pipelines. Higher values risk ADO REST 429s,
+    # LLM rate limits, and pgvector pool exhaustion.
+    _MAX_WORKERS = 10
 
     def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
                      path_contains: Optional[str] = None,
@@ -811,7 +814,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         self._index_include_extensions = include_extensions or []
         self._index_skip_extensions = skip_extensions or []
         # Expose worker count to later stages (image LLM, attachment downloads).
-        self._index_workers = max(1, int(workers)) if workers else self._DEFAULT_WORKERS
+        raw_workers = int(workers) if workers else self._DEFAULT_WORKERS
+        if raw_workers > self._MAX_WORKERS:
+            logger.warning(
+                "workers=%s exceeds cap %s (ADO REST quota + pgvector pool "
+                "headroom); clamping to %s.",
+                raw_workers, self._MAX_WORKERS, self._MAX_WORKERS,
+            )
+        self._index_workers = max(1, min(raw_workers, self._MAX_WORKERS))
 
         pages = self._iter_wiki_pages(wiki_identifier)
         # Normalize hyphens to spaces so users can pass either the URL slug form
@@ -1232,13 +1242,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )),
             'workers': (Optional[int], Field(
                 default=None,
+                ge=1,
+                le=10,
                 description=(
                     "Maximum number of pages fetched concurrently from Azure DevOps. "
                     "Also caps concurrency for downstream per-page work (image LLM "
-                    "descriptions, attachment downloads). Defaults to 4, which fits "
-                    "comfortably inside the default pgvector pool (20 connections). "
-                    "Raise cautiously — high values can saturate the ADO REST quota, "
-                    "the LLM rate limit, or the vectorstore connection pool."
+                    "descriptions, attachment downloads). Defaults to 1 (serial). "
+                    "Capped at 10 to stay within ADO REST quota, LLM rate limits, "
+                    "and the pgvector connection pool. Values above 10 are clamped."
                 ),
             )),
         }
