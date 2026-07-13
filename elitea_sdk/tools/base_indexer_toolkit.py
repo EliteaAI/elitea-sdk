@@ -1,7 +1,9 @@
 import copy
 import json
 import logging
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, List, Dict, Generator, Set
@@ -518,8 +520,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         self._log_tool_event(f"Base documents are ready for indexing. {base_total} base documents in total to index.")
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         #
-        base_doc_counter = 0
-        pg_vector_add_docs_chunk = []
+        pg_vector_add_docs_chunk: list = []
 
         def _flush_chunk(chunk: list):
             """Flush a chunk of documents to the vectorstore, tracking failures in result."""
@@ -537,57 +538,135 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 if error_msg not in result.setdefault("errors", []):
                     result["errors"].append(error_msg)
 
-        for base_doc in base_documents:
-            base_doc_counter += 1
+        def _run_pipeline(base_doc: Document) -> List[Document]:
+            """Full serial pipeline for one base doc → materialized chunk list.
+            Safe to invoke from a worker thread: the nested-pool guards inside
+            ``_collect_dependencies`` and ``_apply_loaders_chunkers`` force the
+            serial branch when called off the main thread, so we never nest
+            executors. All side effects (skip trackers, metadata mutation on
+            the doc's own dict) are thread-safe: set.add is GIL-safe and each
+            worker touches only its own doc."""
+            docs_gen = self._extend_data((base_doc for _ in range(1)))
+            docs_gen = self._collect_dependencies(docs_gen)
+            docs_gen = self._apply_loaders_chunkers(docs_gen, chunking_tool, chunking_config)
+            docs_gen = self._clean_metadata(docs_gen)
+            return list(docs_gen)
+
+        def _consume_pipeline_output(base_doc: Document, base_doc_counter: int, chunks: List[Document]) -> None:
+            """Main-thread-only. Applies index_name/collection metadata, buffers
+            chunks, and updates per-base-doc counters + skip trackers. Kept
+            single-writer to preserve original ordering of side effects."""
             _doc_name = self._extract_doc_name(base_doc.metadata)
-            self._log_tool_event(f"Processing document #{base_doc_counter}: '{_doc_name}'.")
-
-            # (base_doc for _ in range(1)) - wrap single base_doc to Generator in order to reuse existing code
-            documents = self._extend_data((base_doc for _ in range(1)))  # update content of not-reduced base document if needed (for sharepoint and similar)
-            documents = self._collect_dependencies(documents)  # collect dependencies for base documents
-            self._log_tool_event(f"Dependent documents for '{_doc_name}' were processed. "
-                                 f"Applying chunking tool '{chunking_tool if chunking_tool else "default"}' if specified and preparing documents for indexing...")
-            documents = self._apply_loaders_chunkers(documents, chunking_tool, chunking_config)
-            documents = self._clean_metadata(documents)
-
-            logger.debug(f"Indexing base document #{base_doc_counter}: {base_doc} and all dependent documents: {documents}")
+            logger.debug(f"Indexing base document #{base_doc_counter}: {base_doc} with {len(chunks)} dependent chunks")
 
             dependent_docs_counter = 0
-            #
-            for doc in documents:
+            for doc in chunks:
                 if not doc.page_content:
                     # To avoid case when all documents have empty content
                     # See llm_processor.add_documents which exclude metadata of docs with empty content
                     continue
-                #
                 if 'id' not in doc.metadata or 'updated_on' not in doc.metadata:
                     logger.warning(f"Document is missing required metadata field 'id' or 'updated_on': {doc.metadata}")
-                #
-                # if index_name is provided, add it to metadata of each document
                 if index_name:
                     if not doc.metadata.get('collection'):
                         doc.metadata['collection'] = index_name
                     else:
                         doc.metadata['collection'] += f";{index_name}"
-                #
                 pg_vector_add_docs_chunk.append(doc)
                 dependent_docs_counter += 1
                 if len(pg_vector_add_docs_chunk) >= self.max_docs_per_add:
                     _flush_chunk(pg_vector_add_docs_chunk)
-                    pg_vector_add_docs_chunk = []
+                    pg_vector_add_docs_chunk.clear()
 
             msg = f"Indexed document #{base_doc_counter} '{_doc_name}' out of {base_total} (with {dependent_docs_counter} chunks)."
             logger.debug(msg)
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
-            # Track successfully processed documents (base documents that produced at least one chunk)
             if dependent_docs_counter > 0:
                 result["docs_count"] += 1
-            # After each base document, try a non-forced meta update; throttling handled inside index_meta_update
+            else:
+                # Base doc yielded zero chunks (empty content, chunker returned nothing,
+                # or every chunk got filtered as empty/parse-error). Track as skipped so
+                # `total_fetched = items_processed + total_skipped` still holds. Skip if
+                # the doc was already tracked deeper to avoid double-counting.
+                if not self._is_base_doc_tracked_as_skipped(base_doc):
+                    if hasattr(self, '_track_skipped_document'):
+                        self._track_skipped_document(_doc_name, reason="error")
             try:
                 self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, result["count"], update_force=False)
             except Exception as exc:  # best-effort, do not break indexing
                 logger.warning(f"Failed to update index meta during indexing process for index '{index_name}': {exc}")
+
+        workers = getattr(self, "_index_workers", 1) or 1
+
+        if workers <= 1:
+            # Serial path — identical semantics to the pre-Phase-6 loop.
+            base_doc_counter = 0
+            for base_doc in base_documents:
+                base_doc_counter += 1
+                _doc_name = self._extract_doc_name(base_doc.metadata)
+                self._log_tool_event(f"Processing document #{base_doc_counter}: '{_doc_name}'.")
+                self._log_tool_event(
+                    f"Dependent documents for '{_doc_name}' were processed. "
+                    f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
+                )
+                chunks = _run_pipeline(base_doc)
+                _consume_pipeline_output(base_doc, base_doc_counter, chunks)
+            if pg_vector_add_docs_chunk:
+                _flush_chunk(pg_vector_add_docs_chunk)
+            return
+
+        # Parallel path — outer per-base-doc executor with unordered dispatch.
+        # This is where cross-doc parallelism lives: previously the outer for-loop
+        # was serial and only fed 1 doc into the inner Phase 4/5 executors, so
+        # they only ever saw 1 in-flight task. Now the full pipeline runs per
+        # worker (with inner parallelism disabled via the nested-pool guards),
+        # so N base docs are truly processed concurrently.
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="indexer-base",
+        )
+        try:
+            in_flight: Dict[Any, Any] = {}  # future -> (base_doc, counter)
+            counter = 0
+            doc_iter = iter(base_documents)
+
+            def _submit_next() -> bool:
+                nonlocal counter
+                try:
+                    base_doc = next(doc_iter)
+                except StopIteration:
+                    return False
+                counter += 1
+                _doc_name = self._extract_doc_name(base_doc.metadata)
+                self._log_tool_event(f"Processing document #{counter}: '{_doc_name}'.")
+                self._log_tool_event(
+                    f"Dependent documents for '{_doc_name}' were processed. "
+                    f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
+                )
+                in_flight[executor.submit(_run_pipeline, base_doc)] = (base_doc, counter)
+                return True
+
+            for _ in range(workers):
+                if not _submit_next():
+                    break
+
+            while in_flight:
+                done, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    base_doc, base_doc_counter = in_flight.pop(future)
+                    try:
+                        chunks = future.result()
+                    except Exception as exc:
+                        from traceback import format_exc
+                        logger.error(f"Pipeline failed for base doc #{base_doc_counter}: {format_exc()}")
+                        result.setdefault("errors", []).append(str(exc))
+                        chunks = []
+                    _consume_pipeline_output(base_doc, base_doc_counter, chunks)
+                    _submit_next()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
         if pg_vector_add_docs_chunk:
             _flush_chunk(pg_vector_add_docs_chunk)
 
@@ -627,39 +706,87 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     continue
                 yield doc
 
-        for document in documents:
+        def _chunk_one(document):
+            """Per-doc chunking. Returns a list of chunk Documents (materialized).
+            Safe to run on a worker thread — mutates only the doc's own metadata
+            and calls _track_* (set.add — GIL-safe). Uses a per-call shallow
+            copy of chunking_config to avoid cross-worker mutation."""
+            local_config = dict(chunking_config)
             if content_type := document.metadata.get(IndexerKeywords.CONTENT_FILE_NAME.value, None):
                 # apply parsing based on content type and chunk if chunker was applied to parent doc
                 content = document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)
-                yield from _filter_parsing_errors(
+                return list(_filter_parsing_errors(
                     process_document_by_type(
                         document=document,
                         content=content,
-                        extension_source=content_type, llm=self.llm, chunking_config=chunking_config),
+                        extension_source=content_type, llm=self.llm, chunking_config=local_config),
                     source_name=content_type
-                )
-            elif chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
+                ))
+            if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
-                    # content is empty, yield as is
-                    yield document
-                    continue
+                    # Content bytes are empty (e.g. an empty ADO wiki page).
+                    # Track so the number shows up in indexing stats instead of
+                    # silently disappearing between "fetched" and "indexed",
+                    # and drop the document — yielding it downstream would end up
+                    # in the vector store with no content.
+                    source_name = document.metadata.get('id') or document.metadata.get('name') or document.metadata.get('path') or 'unknown'
+                    if hasattr(self, '_track_skipped_file_empty'):
+                        self._track_skipped_file_empty(str(source_name))
+                    return []
                 # apply parsing based on content type resolved from chunking_tool
                 content_type = file_extension_by_chunker(chunking_tool)
                 source_name = document.metadata.get('id') or document.metadata.get('name') or content_type
-                yield from _filter_parsing_errors(
+                return list(_filter_parsing_errors(
                     process_document_by_type(
                         document=document,
                         content=content_in_bytes,
-                        extension_source=content_type, llm=self.llm, chunking_config=chunking_config),
+                        extension_source=content_type, llm=self.llm, chunking_config=local_config),
                     source_name=source_name
-                )
-            elif chunking_tool:
+                ))
+            if chunking_tool:
                 # apply default chunker from toolkit config. No parsing.
                 chunker = chunkers.get(chunking_tool)
-                yield from chunker(file_content_generator=iter([document]), config=chunking_config)
-            else:
-                # return as is if neither chunker nor content type are specified
-                yield document
+                return list(chunker(file_content_generator=iter([document]), config=local_config))
+            # return as is if neither chunker nor content type are specified
+            return [document]
+
+        workers = getattr(self, "_index_workers", 1) or 1
+        # Nested-pool guard: when called from an outer indexer worker thread
+        # (Phase 6 base-doc executor), fall back to serial to avoid explosive
+        # thread fan-out. The outer pool already provides cross-doc parallelism.
+        if workers <= 1 or threading.current_thread() is not threading.main_thread():
+            for document in documents:
+                yield from _chunk_one(document)
+            return
+
+        # Unordered fan-out mirrors _collect_dependencies_parallel (Phase 4).
+        # Workers do the heavy per-doc chunker LLM parse; yielding as-completed
+        # keeps the pool saturated when one doc (e.g. large PDF, multi-sheet
+        # Excel) is much slower than the others. Doc order is not required
+        # downstream — add_documents writes chunks independently.
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="indexer-chunk",
+        )
+        try:
+            in_flight: set = set()
+            doc_iter = iter(documents)
+            for _ in range(workers):
+                try:
+                    in_flight.add(executor.submit(_chunk_one, next(doc_iter)))
+                except StopIteration:
+                    break
+            while in_flight:
+                done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    chunks = future.result()
+                    try:
+                        in_flight.add(executor.submit(_chunk_one, next(doc_iter)))
+                    except StopIteration:
+                        pass
+                    yield from chunks
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
     
     def _extend_data(self, documents: Generator[Document, None, None]):
         yield from documents
@@ -674,58 +801,158 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             'unknown'
         )
 
+    def _is_base_doc_tracked_as_skipped(self, base_doc: Document) -> bool:
+        """Return True if any identifier of ``base_doc`` already appears in a skip set.
+
+        Prevents double-counting when ``_filter_parsing_errors`` or the empty-content-bytes
+        path already recorded the document, and the outer per-base-doc fallback in
+        ``_save_index_generator`` would otherwise add it again to a different category.
+        """
+        stats = getattr(self, '_indexing_stats', None)
+        if stats is None:
+            return False
+        meta = base_doc.metadata or {}
+        candidates = {
+            str(meta.get('id') or ''),
+            str(meta.get('name') or ''),
+            str(meta.get('path') or ''),
+            str(meta.get('file_path') or ''),
+            self._extract_doc_name(meta),
+        }
+        candidates.discard('')
+        candidates.discard('unknown')
+        if not candidates:
+            return False
+        for skip_set in (
+            stats.files_skipped_whitelist,
+            stats.files_skipped_blacklist,
+            stats.files_skipped_read_error,
+            stats.files_skipped_empty,
+            stats.files_unsupported_extension,
+            stats.documents_skipped_error,
+            stats.documents_skipped_filtered,
+            stats.runtime_skipped_extension,
+            stats.runtime_skipped_error,
+        ):
+            if candidates & skip_set:
+                return True
+        return False
+
     def _collect_dependencies(self, documents: Generator[Document, None, None]):
+        # Parallelism opt-in: subclasses (e.g. AzureDevOpsApiWrapper) set
+        # self._index_workers from tool params. Absent → 1 → identical to
+        # the original serial path. When >1, we fan out _process_document calls
+        # (per-page image LLM + attachment downloads) across a bounded worker
+        # pool while keeping all yields and metadata mutation on the main
+        # thread so downstream _apply_loaders_chunkers / add_documents see the
+        # same deterministic order as the serial version.
+        workers = getattr(self, "_index_workers", 1) or 1
+
+        # Nested-pool guard: when called from an outer indexer worker thread
+        # (Phase 6 base-doc executor), fall back to serial. The outer pool
+        # already provides cross-doc parallelism; nesting would multiply threads.
+        if workers <= 1 or threading.current_thread() is not threading.main_thread():
+            yield from self._collect_dependencies_serial(documents)
+            return
+
+        yield from self._collect_dependencies_parallel(documents, workers)
+
+    def _collect_dependencies_serial(self, documents: Generator[Document, None, None]):
         for document in documents:
-            # Build a case-insensitive lookup for important metadata keys
-            meta = document.metadata
-            meta_lower = {k.lower(): v for k, v in meta.items()}
-
-            doc_id = (
-                    meta_lower.get('id') or
-                    meta_lower.get('path') or
-                    meta_lower.get('name') or
-                    meta_lower.get('file_path') or
-                    meta_lower.get('source') or
-                    'unknown'
+            yield from self._emit_document_with_deps(
+                document,
+                list(self._process_document(document)),
             )
-            doc_display = {
-                k: meta_lower.get(k)
-                for k in ('id', 'name', 'path', 'link', 'created', 'updated_on')
-                if meta_lower.get(k) is not None
-            }
-            logger.debug(f"_collect_dependencies: processing document — {doc_display}")
 
-            doc_name = self._extract_doc_name(meta)
-            self._log_tool_event(message=f"Collecting the dependencies for document "
-                                         f"'{doc_name}' (ID: '{doc_id}') to collect dependencies if any...")
+    def _collect_dependencies_parallel(
+        self,
+        documents: Generator[Document, None, None],
+        workers: int,
+    ):
+        def _work(doc):
+            # Materialize the per-doc generator on the worker so image LLM /
+            # attachment I/O overlap. All state mutation stays on main thread.
+            return doc, list(self._process_document(doc))
 
-            # Stream dependencies immediately for faster embedding start.
-            # Yield each dependent doc as it's ready, collect IDs, then yield parent last
-            # with merged dependent_docs (combining any pre-set IDs with collected ones).
-            parent_id = document.metadata.get('id', None)
-            collected_dep_ids = []
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="indexer-doc",
+        )
+        try:
+            # Unordered dispatch: results flow through as they complete, so a
+            # single slow document (large PDF vision parse, big attachment)
+            # cannot leave the other workers idle. Doc order is not required —
+            # add_documents writes chunks independently and _reduce_duplicates
+            # already ran upstream.
+            in_flight: set = set()
+            doc_iter = iter(documents)
+            for _ in range(workers):
+                try:
+                    in_flight.add(executor.submit(_work, next(doc_iter)))
+                except StopIteration:
+                    break
+            while in_flight:
+                done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    document, deps = future.result()
+                    try:
+                        in_flight.add(executor.submit(_work, next(doc_iter)))
+                    except StopIteration:
+                        pass
+                    yield from self._emit_document_with_deps(document, deps)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
-            for dep in self._process_document(document):
-                # Collect dependency ID for parent's dependent_docs
-                dep_id = dep.metadata.get('id', '')
-                if dep_id:
-                    collected_dep_ids.append(dep_id)
+    def _emit_document_with_deps(self, document: Document, deps: List[Document]):
+        """Yield dependents (with parent-refs set) then the parent with merged
+        dependent_docs metadata. Shared body of serial + parallel paths — keeps
+        the yield contract identical."""
+        # Build a case-insensitive lookup for important metadata keys
+        meta = document.metadata
+        meta_lower = {k.lower(): v for k, v in meta.items()}
 
-                # Set parent reference on dependency
-                dep.metadata[IndexerKeywords.PARENT.value] = parent_id
-                yield dep
+        doc_id = (
+                meta_lower.get('id') or
+                meta_lower.get('path') or
+                meta_lower.get('name') or
+                meta_lower.get('file_path') or
+                meta_lower.get('source') or
+                'unknown'
+        )
+        doc_display = {
+            k: meta_lower.get(k)
+            for k in ('id', 'name', 'path', 'link', 'created', 'updated_on')
+            if meta_lower.get(k) is not None
+        }
+        logger.debug(f"_collect_dependencies: processing document — {doc_display}")
 
-            # Merge collected dep IDs with any existing dependent_docs on parent
-            existing_deps = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
-            collected_deps_str = ','.join(collected_dep_ids)
+        doc_name = self._extract_doc_name(meta)
+        self._log_tool_event(message=f"Collecting the dependencies for document "
+                                     f"'{doc_name}' (ID: '{doc_id}') to collect dependencies if any...")
 
-            if existing_deps and collected_deps_str:
-                document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = f"{existing_deps},{collected_deps_str}"
-            elif collected_deps_str:
-                document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = collected_deps_str
-            # else: keep existing_deps as-is (or empty)
+        parent_id = document.metadata.get('id', None)
+        parent_updated_on = document.metadata.get('updated_on')
+        collected_dep_ids = []
 
-            yield document
+        for dep in deps:
+            dep_id = dep.metadata.get('id', '')
+            if dep_id:
+                collected_dep_ids.append(dep_id)
+            dep.metadata[IndexerKeywords.PARENT.value] = parent_id
+            if parent_updated_on is not None:
+                dep.metadata.setdefault('updated_on', parent_updated_on)
+            yield dep
+
+        existing_deps = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
+        collected_deps_str = ','.join(collected_dep_ids)
+
+        if existing_deps and collected_deps_str:
+            document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = f"{existing_deps},{collected_deps_str}"
+        elif collected_deps_str:
+            document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = collected_deps_str
+        # else: keep existing_deps as-is (or empty)
+
+        yield document
 
     def _clean_metadata(self, documents: Generator[Document, None, None]):
         for document in documents:
@@ -1221,7 +1448,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "updated_on": metadata.get("updated_on"),
         }
         
-        # Emit the event
+        # Emit the event — skip silently when no ambient LangChain run context
+        # exists (e.g. standalone script mode), matching the guard in
+        # BaseToolApiWrapper._log_tool_event.
+        if self._runnable_config is None and not self._has_ambient_runnable_context():
+            return
         try:
             dispatch_custom_event("index_data_status", event_data)
             logger.debug(
@@ -1245,7 +1476,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "toolkit_id": self.toolkit_id,
             "project_id": self.elitea.project_id,
         }
-        # Emit the event
+        # Emit the event — skip silently when no ambient LangChain run context
+        # exists (e.g. standalone script mode).
+        if self._runnable_config is None and not self._has_ambient_runnable_context():
+            return
         try:
             dispatch_custom_event("index_data_removed", event_data)
             logger.debug(

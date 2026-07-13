@@ -228,10 +228,17 @@ class BaseToolApiWrapper(BaseModel):
                 tool_name = 'tool_progress'
 
             logger.info(message)
-            
+
             # Use provided config, fall back to instance config
             effective_config = config or self._runnable_config
-            
+
+            # Skip dispatch when there's no ambient LangChain run to dispatch to
+            # (e.g., wrapper invoked directly from a script or test). Without a
+            # run_id, dispatch_custom_event raises; that's a benign UX artifact of
+            # standalone use, not a real error, so avoid the noisy warning.
+            if effective_config is None and not self._has_ambient_runnable_context():
+                return
+
             dispatch_custom_event(
                 name="thinking_step",
                 data={
@@ -243,6 +250,33 @@ class BaseToolApiWrapper(BaseModel):
             )
         except Exception as e:
             logger.warning(f"Failed to dispatch progress event: {str(e)}")
+
+    @staticmethod
+    def _has_ambient_runnable_context() -> bool:
+        """Return True when we're currently inside a LangChain runnable/agent
+        that owns a run_id we can dispatch events to.
+
+        Uses the LangChain contextvar directly rather than trying to dispatch and
+        catching the resulting exception, so we don't rely on brittle string
+        matching against LangChain's error message.
+        """
+        try:
+            from langchain_core.runnables.config import var_child_runnable_config
+        except Exception:
+            return False
+        try:
+            ambient = var_child_runnable_config.get()
+        except LookupError:
+            return False
+        if not ambient:
+            return False
+        # Presence of a callback manager with a parent run is what
+        # dispatch_custom_event ultimately requires.
+        if ambient.get("run_id"):
+            return True
+        callbacks = ambient.get("callbacks")
+        parent_run_id = getattr(callbacks, "parent_run_id", None)
+        return bool(parent_run_id)
 
 
     def run(self, mode: str, *args: Any, **kwargs: Any):
