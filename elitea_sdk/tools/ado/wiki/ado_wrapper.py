@@ -1,8 +1,10 @@
 import hashlib
 import logging
 import re
+import threading
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from typing import Generator, List, Literal, Optional
 from urllib.parse import unquote
 
@@ -526,6 +528,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         image_pattern = r"!\[(.*?)\]\((.*?)\)"
         matches = re.findall(image_pattern, page_content)
         total_images = len(matches)
+        if total_images == 0:
+            return page_content
 
         # Initialize repos_wrapper once for all attachments in this page
         repos_wrapper = None
@@ -534,25 +538,36 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         if has_attachments:
             repos_wrapper = self._get_repos_wrapper(wiki_identified)
 
-        for img_idx, (image_name, image_url) in enumerate(matches, start=1):
-            logger.debug(f"[ADO wiki index] Processing image {img_idx}/{total_images}: '{image_name}' -> '{image_url}'")
-            # BUG 1 fix: skip images with empty URLs — cannot fetch or resolve them
+        def _describe_image(item):
+            """Fetch + LLM-describe a single image. Runs on a worker thread.
+
+            Returns (image_name, image_url, description) on success or
+            (image_name, image_url, None) if the image was skipped for any reason —
+            the caller then leaves the original markdown untouched (matches the
+            prior serial behavior).
+            """
+            img_idx, image_name, image_url = item
+            logger.debug(
+                f"[ADO wiki index] Processing image {img_idx}/{total_images}: '{image_name}' -> '{image_url}'"
+            )
             if not image_url:
                 logger.warning(f"Skipping image '{image_name}': empty URL, leaving original markdown unchanged.")
-                continue
-
+                return image_name, image_url, None
             if image_url.startswith("/.attachments/"):
                 try:
                     if repos_wrapper is None:
                         raise Exception("Repos wrapper not initialized")
-                    description = self.process_attachment(attachment_url=image_url,
-                                                          attachment_name=image_name,
-                                                          image_description_prompt=image_description_prompt,
-                                                          repos_wrapper=repos_wrapper)
+                    description = self.process_attachment(
+                        attachment_url=image_url,
+                        attachment_name=image_name,
+                        image_description_prompt=image_description_prompt,
+                        repos_wrapper=repos_wrapper,
+                    )
                 except Exception as e:
-                    # Skip rather than replace with a corrupted description
-                    logger.warning(f"Skipping image '{image_name}': error parsing attachment '{image_url}': {str(e)}")
-                    continue
+                    logger.warning(
+                        f"Skipping image '{image_name}': error parsing attachment '{image_url}': {str(e)}"
+                    )
+                    return image_name, image_url, None
             else:
                 try:
                     response = requests.get(image_url)
@@ -562,13 +577,39 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                         file_content=file_content,
                         file_name="image.png",
                         llm=self.llm,
-                        prompt=image_description_prompt
+                        prompt=image_description_prompt,
                     )
                 except Exception as e:
-                    # BUG 2 fix: skip rather than replace with a corrupted literal description
-                    logger.warning(f"Skipping image '{image_name}': error fetching external image '{image_url}': {str(e)}")
-                    continue
+                    logger.warning(
+                        f"Skipping image '{image_name}': error fetching external image '{image_url}': {str(e)}"
+                    )
+                    return image_name, image_url, None
+            return image_name, image_url, description
 
+        # If the outer _collect_dependencies runs pages in parallel (Phase 4),
+        # this call already sits on a worker thread — nesting another pool
+        # here would multiply concurrent LLM calls beyond the user's
+        # parallelism budget. Keep it serial in that case.
+        outer_parallel = threading.current_thread() is not threading.main_thread()
+        max_workers = min(getattr(self, "_index_workers", self._DEFAULT_WORKERS), total_images)
+        items = [(i, name, url) for i, (name, url) in enumerate(matches, start=1)]
+        if max_workers <= 1 or outer_parallel:
+            results = [_describe_image(item) for item in items]
+        else:
+            # Bounded fan-out per page. Descriptions are pure I/O + LLM calls, no
+            # shared mutable state; page_content is patched serially on the main
+            # thread once results are back. executor.map preserves input order,
+            # which is irrelevant here (str.replace is by-substring) but keeps
+            # semantics identical to the serial loop.
+            with ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="ado-wiki-img",
+            ) as executor:
+                results = list(executor.map(_describe_image, items))
+
+        for image_name, image_url, description in results:
+            if description is None:
+                continue
             new_image_markdown = f"![{image_name}]({description})"
             page_content = page_content.replace(f"![{image_name}]({image_url})", new_image_markdown)
         return page_content
@@ -745,6 +786,13 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 seen.setdefault(url, None)
         return list(seen.keys())
 
+    # Opt-in parallelism: default 1 preserves pre-refactor serial behaviour for
+    # existing callers. Callers set `workers=N` to fan out per-doc pipelines.
+    _DEFAULT_WORKERS = 1
+    # Hard cap on concurrent per-doc pipelines. Higher values risk ADO REST 429s,
+    # LLM rate limits, and pgvector pool exhaustion.
+    _MAX_WORKERS = 10
+
     def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
                      path_contains: Optional[str] = None,
                      process_images: bool = False,
@@ -752,6 +800,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                      include_attachments: bool = False,
                      include_extensions: Optional[List[str]] = None,
                      skip_extensions: Optional[List[str]] = None,
+                     workers: Optional[int] = None,
                      **kwargs) -> Generator[Document, None, None]:
         self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
@@ -764,49 +813,119 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         self._index_include_attachments = bool(include_attachments)
         self._index_include_extensions = include_extensions or []
         self._index_skip_extensions = skip_extensions or []
+        # Expose worker count to later stages (image LLM, attachment downloads).
+        raw_workers = int(workers) if workers else self._DEFAULT_WORKERS
+        if raw_workers > self._MAX_WORKERS:
+            logger.warning(
+                "workers=%s exceeds cap %s (ADO REST quota + pgvector pool "
+                "headroom); clamping to %s.",
+                raw_workers, self._MAX_WORKERS, self._MAX_WORKERS,
+            )
+        self._index_workers = max(1, min(raw_workers, self._MAX_WORKERS))
 
         pages = self._iter_wiki_pages(wiki_identifier)
         # Normalize hyphens to spaces so users can pass either the URL slug form
         # ("Feature-Analysis-and-Background") or the display form ("Feature Analysis and Background").
         needle = path_contains.lower().replace("-", " ") if path_contains else None
-        for page_idx, page in enumerate(pages, start=1):
-            self._indexing_stats.total_fetched += 1
-            title = page.path.rsplit("/", 1)[-1]
-            if needle and needle not in page.path.lower().replace("-", " "):
-                logger.debug(f"[ADO wiki index] Page #{page_idx} skipped by path_contains filter: '{page.path}' (id={page.id})")
-                self._track_skipped_document(page.path, reason="filtered")
-                continue
-            logger.debug(f"[ADO wiki index] Loading page #{page_idx}: '{page.path}' (id={page.id})")
-            self._track_processed_item()
-            raw_content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_identifier, id=page.id, include_content=True).page.content
-            # Hash the raw source, not the LLM-augmented version — LLM output is
-            # non-deterministic and would break incremental dedup across runs.
-            content_hash = hashlib.sha256((raw_content or "").encode("utf-8")).hexdigest()
 
-            # Image processing intentionally deferred to _process_document, which runs after
-            # _reduce_duplicates. Doing it here would fire one LLM call per referenced image on
-            # every page every run, even for pages the dedup would immediately discard.
-            content = raw_content
+        def _fetch_page_content(page):
+            """Fetch a page's content — pure I/O, safe to run on a worker thread.
 
-            # Capture attachment references off the raw markdown so _process_document
-            # can enumerate them.
-            attachment_paths = (
-                self._extract_attachment_paths(raw_content) if self._index_include_attachments else []
+            Returns (page, raw_content). Any exception propagates via Future.result().
+            """
+            resp = self._client.get_page_by_id(
+                project=self.project,
+                wiki_identifier=wiki_identifier,
+                id=page.id,
+                include_content=True,
             )
+            return page, resp.page.content
 
-            metadata = {
-                'id': str(page.id),
-                'path': page.path,
-                'title': title,
-                'updated_on': content_hash,
-            }
-            if attachment_paths:
-                metadata[self._INDEXER_ATTACHMENTS_META_KEY] = attachment_paths
-            if chunking_tool:
-                metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = (content or "").encode("utf-8")
-                yield Document(page_content='', metadata=metadata)
-            else:
-                yield Document(page_content=content or "", metadata=metadata)
+        # Bounded, in-order producer/consumer. We keep at most `parallelism`
+        # fetches in flight and always yield in the order pages were emitted by
+        # _iter_wiki_pages, so _reduce_duplicates + stats stay deterministic.
+        # State mutation (`_indexing_stats`, `_track_*`, `yield`) all runs on
+        # the main thread; workers only do HTTP + return bytes.
+        executor = ThreadPoolExecutor(
+            max_workers=self._index_workers,
+            thread_name_prefix="ado-wiki-fetch",
+        )
+        try:
+            futures_queue: "list[tuple[int, str, str, object]]" = []  # (page_idx, path, page_id, future)
+            page_iter = enumerate(pages, start=1)
+
+            def _submit_next():
+                try:
+                    page_idx, page = next(page_iter)
+                except StopIteration:
+                    return False
+                # Filter-first: don't spend an HTTP GET on pages that path_contains excludes.
+                if needle and needle not in page.path.lower().replace("-", " "):
+                    self._indexing_stats.total_fetched += 1
+                    logger.debug(
+                        f"[ADO wiki index] Page #{page_idx} skipped by path_contains filter: "
+                        f"'{page.path}' (id={page.id})"
+                    )
+                    self._track_skipped_document(page.path, reason="filtered")
+                    # Re-submit so we still fill the pool with a real fetch.
+                    return _submit_next()
+                fut = executor.submit(_fetch_page_content, page)
+                futures_queue.append((page_idx, page.path, page.id, fut))
+                return True
+
+            # Prime the pool.
+            for _ in range(self._index_workers):
+                if not _submit_next():
+                    break
+
+            while futures_queue:
+                page_idx, page_path, page_id, fut = futures_queue.pop(0)
+                # Submit next before waiting so the pool stays saturated.
+                _submit_next()
+                self._indexing_stats.total_fetched += 1
+                logger.debug(f"[ADO wiki index] Loading page #{page_idx}: '{page_path}' (id={page_id})")
+                self._track_processed_item()
+                try:
+                    page, raw_content = fut.result()
+                except Exception as e:
+                    logger.warning(
+                        f"[ADO wiki index] Failed to fetch page #{page_idx} '{page_path}' "
+                        f"(id={page_id}): {e}. Skipping."
+                    )
+                    self._track_skipped_document(page_path, reason="error")
+                    continue
+
+                title = page.path.rsplit("/", 1)[-1]
+                # Hash the raw source, not the LLM-augmented version — LLM output is
+                # non-deterministic and would break incremental dedup across runs.
+                content_hash = hashlib.sha256((raw_content or "").encode("utf-8")).hexdigest()
+
+                # Image processing intentionally deferred to _process_document, which runs after
+                # _reduce_duplicates. Doing it here would fire one LLM call per referenced image on
+                # every page every run, even for pages the dedup would immediately discard.
+                content = raw_content
+
+                # Capture attachment references off the raw markdown so _process_document
+                # can enumerate them.
+                attachment_paths = (
+                    self._extract_attachment_paths(raw_content) if self._index_include_attachments else []
+                )
+
+                metadata = {
+                    'id': str(page.id),
+                    'path': page.path,
+                    'title': title,
+                    'updated_on': content_hash,
+                }
+                if attachment_paths:
+                    metadata[self._INDEXER_ATTACHMENTS_META_KEY] = attachment_paths
+                if chunking_tool:
+                    metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = (content or "").encode("utf-8")
+                    yield Document(page_content='', metadata=metadata)
+                else:
+                    yield Document(page_content=content or "", metadata=metadata)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _remove_metadata_keys(self) -> List[str]:
         """Drop the transient attachment-paths list before documents are written to the vector store."""
@@ -963,50 +1082,96 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         failed_names: List[str] = []
         total_attachments = len(attachment_paths)
 
+        # Filter-first: skip extension-excluded items before scheduling any work
+        # so the executor pool stays saturated with useful downloads.
+        eligible: List[tuple] = []  # (att_idx, att_url, file_path, file_name)
         for att_idx, att_url in enumerate(attachment_paths, start=1):
             file_path = unquote(att_url.lstrip('/'))
             file_name = file_path.rsplit('/', 1)[-1]
             if not self._matches_extension_filter(file_name):
-                # Extension filter is an explicit user choice, not a failure —
-                # do not perturb the parent's hash.
-                logger.debug(f"[ADO wiki index] Attachment {att_idx}/{total_attachments} skipped by extension filter for page '{parent_path}': '{file_name}'")
+                logger.debug(
+                    f"[ADO wiki index] Attachment {att_idx}/{total_attachments} skipped by extension filter for page '{parent_path}': '{file_name}'"
+                )
                 self._track_runtime_skipped(file_name, reason="extension")
                 continue
-            logger.debug(f"[ADO wiki index] Downloading attachment {att_idx}/{total_attachments} for page '{parent_path}': '{file_path}'")
-            try:
-                attachment_bytes = self._download_attachment_with_retry(repos_wrapper, file_path)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to download attachment '{att_url}' for wiki page "
-                    f"'{parent_path}' after {self._ATTACHMENT_DOWNLOAD_ATTEMPTS} attempt(s): {e}"
-                )
-                self._track_dependent_item_skipped(file_name)
-                failed_names.append(file_name)
-                continue
-            if not attachment_bytes:
-                self._track_skipped_file_empty(file_name)
-                failed_names.append(file_name)
-                continue
-            logger.debug(f"[ADO wiki index] Attachment {att_idx}/{total_attachments} fetched ({len(attachment_bytes)} bytes): '{file_name}'")
+            eligible.append((att_idx, att_url, file_path, file_name))
 
-            # Use blob content hash as updated_on so unchanged attachments dedup across runs.
-            att_hash = hashlib.sha256(attachment_bytes).hexdigest()
-            file_ext = ("." + file_name.rsplit('.', 1)[-1]) if '.' in file_name else ''
-            attachment_id = f"{parent_id}::{file_path}"
+        if not eligible:
+            return
 
-            yield Document(
-                page_content='',
-                metadata={
-                    'id': attachment_id,
-                    'name': file_name,
-                    'path': file_path,
-                    'parent_page_id': parent_id,
-                    'parent_page_path': parent_path,
-                    'updated_on': att_hash,
-                    IndexerKeywords.CONTENT_FILE_NAME.value: file_ext,
-                    IndexerKeywords.CONTENT_IN_BYTES.value: attachment_bytes,
-                },
+        def _fetch(item):
+            """Download a single attachment. Pure I/O; safe on worker threads."""
+            att_idx, att_url, file_path, file_name = item
+            logger.debug(
+                f"[ADO wiki index] Downloading attachment {att_idx}/{total_attachments} for page '{parent_path}': '{file_path}'"
             )
+            try:
+                data = self._download_attachment_with_retry(repos_wrapper, file_path)
+                return item, data, None
+            except Exception as e:
+                return item, None, e
+
+        # If we're already running inside an outer per-page worker (Phase 4 in
+        # _collect_dependencies), the parallelism budget is spent on pages —
+        # nesting another pool here would give O(N^2) concurrent downloads and
+        # risk saturating the ADO REST quota or connection pool. Keep the inner
+        # loop serial in that case; each page still has its own worker thread.
+        outer_parallel = threading.current_thread() is not threading.main_thread()
+        max_workers = min(getattr(self, "_index_workers", self._DEFAULT_WORKERS), len(eligible))
+        if max_workers <= 1 or outer_parallel:
+            results_iter = (_fetch(item) for item in eligible)
+            executor = None
+        else:
+            # Bounded fan-out for this page's attachment downloads. executor.map
+            # yields in input order so dependent Documents are still yielded in
+            # deterministic order, which keeps _reduce_duplicates and downstream
+            # progress logging predictable.
+            executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="ado-wiki-att",
+            )
+            results_iter = executor.map(_fetch, eligible)
+
+        try:
+            for item, attachment_bytes, err in results_iter:
+                att_idx, att_url, file_path, file_name = item
+                if err is not None:
+                    logger.warning(
+                        f"Failed to download attachment '{att_url}' for wiki page "
+                        f"'{parent_path}' after {self._ATTACHMENT_DOWNLOAD_ATTEMPTS} attempt(s): {err}"
+                    )
+                    self._track_dependent_item_skipped(file_name)
+                    failed_names.append(file_name)
+                    continue
+                if not attachment_bytes:
+                    self._track_skipped_file_empty(file_name)
+                    failed_names.append(file_name)
+                    continue
+                logger.debug(
+                    f"[ADO wiki index] Attachment {att_idx}/{total_attachments} fetched ({len(attachment_bytes)} bytes): '{file_name}'"
+                )
+
+                # Use blob content hash as updated_on so unchanged attachments dedup across runs.
+                att_hash = hashlib.sha256(attachment_bytes).hexdigest()
+                file_ext = ("." + file_name.rsplit('.', 1)[-1]) if '.' in file_name else ''
+                attachment_id = f"{parent_id}::{file_path}"
+
+                yield Document(
+                    page_content='',
+                    metadata={
+                        'id': attachment_id,
+                        'name': file_name,
+                        'path': file_path,
+                        'parent_page_id': parent_id,
+                        'parent_page_path': parent_path,
+                        'updated_on': att_hash,
+                        IndexerKeywords.CONTENT_FILE_NAME.value: file_ext,
+                        IndexerKeywords.CONTENT_IN_BYTES.value: attachment_bytes,
+                    },
+                )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         if failed_names:
             self._mark_parent_partial(document, failed_names)
@@ -1073,6 +1238,18 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 description=(
                     "Glob-style file-name patterns to skip when indexing attachments, e.g. "
                     "[\"*.zip\", \"*.exe\"]. Evaluated before include_extensions."
+                ),
+            )),
+            'workers': (Optional[int], Field(
+                default=None,
+                ge=1,
+                le=10,
+                description=(
+                    "Maximum number of pages fetched concurrently from Azure DevOps. "
+                    "Also caps concurrency for downstream per-page work (image LLM "
+                    "descriptions, attachment downloads). Defaults to 1 (serial). "
+                    "Capped at 10 to stay within ADO REST quota, LLM rate limits, "
+                    "and the pgvector connection pool. Values above 10 are clamped."
                 ),
             )),
         }

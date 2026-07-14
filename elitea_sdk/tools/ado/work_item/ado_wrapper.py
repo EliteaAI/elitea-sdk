@@ -2,12 +2,15 @@ import json
 import logging
 import re
 import urllib.parse
-from typing import Dict, List, Generator, Optional
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from io import BytesIO
+from typing import Any, Dict, List, Generator, Optional
 
 from azure.devops.connection import Connection
 from azure.devops.v7_1.core import CoreClient
 from azure.devops.v7_1.wiki import WikiClient
 from azure.devops.v7_1.work_item_tracking import TeamContext, Wiql, WorkItemTrackingClient
+from azure.devops.v7_1.work_item_tracking.models import CommentCreate
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -17,6 +20,7 @@ from pydantic import model_validator
 from pydantic.fields import Field
 
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
+from ...utils import get_file_bytes_from_artifact, detect_mime_type
 from ...utils.content_parser import parse_file_content
 from ....runtime.utils.utils import IndexerKeywords
 
@@ -107,6 +111,16 @@ ADOGetWorkItemTypeFields = create_model(
     "ADOGetWorkItemTypeFields",
     work_item_type=(Optional[str], Field(description="Work item type to get fields for (e.g., 'Task', 'Bug', 'Test Case', 'Epic'). Default is 'Task'.", default="Task")),
     force_refresh=(Optional[bool], Field(description="If True, reload field definitions from Azure DevOps. Use this if project configuration has changed.", default=False))
+)
+
+ADOAttachFileToWorkItem = create_model(
+    "ADOAttachFileToWorkItem",
+    work_item_id=(int, Field(description="ID of the work item to attach the file to")),
+    filepath=(str, Field(description="File path in format /{bucket}/{filename} pointing to the artifact to attach. Any file type is supported (image, PDF, document, etc.). Get this from a file/image generation or upload tool response.")),
+    filename=(Optional[str], Field(description="Filename to use for the ADO attachment, e.g. 'diagram.png'. If not provided, uses the original filename from the artifact. Should include file extension.", default=None)),
+    inline_field=(Optional[str], Field(description="Optional HTML-typed work item field reference name (e.g. 'System.Description', 'Microsoft.VSTS.TCM.ReproSteps'). If provided, an <img> tag (for images) or <a> link (for other file types) is appended to that field's current value so the attachment renders inline. Requires the field to accept HTML.", default=None)),
+    add_as_comment=(Optional[bool], Field(description="If True, also add a work item comment containing the inline image/link reference. Default is False.", default=False)),
+    comment=(Optional[str], Field(description="Optional 'comment' attribute stored on the AttachedFile relation itself (a short caption/description of the attachment).", default=None)),
 )
 
 class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
@@ -724,8 +738,146 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error unlinking work items from wiki page '{page_name}': {str(e)}")
             return ToolException(f"An unexpected error occurred while unlinking work items from wiki page '{page_name}': {str(e)}")
 
-    def _base_loader(self, wiql: str, **kwargs) -> Generator[Document, None, None]:
+    def attach_file_to_work_item(
+        self,
+        work_item_id: int,
+        filepath: str,
+        filename: Optional[str] = None,
+        inline_field: Optional[str] = None,
+        add_as_comment: bool = False,
+        comment: Optional[str] = None,
+    ):
+        """Attach a file from artifact storage to an Azure DevOps work item.
+
+        Uploads the file as an ADO attachment, adds it to the work item as an
+        AttachedFile relation, and optionally embeds it inline in an HTML field
+        (e.g. System.Description) and/or as a work item comment. Images render
+        inline via an <img> tag; other file types are rendered as a link.
+        """
+        if not self._client:
+            return ToolException("Azure DevOps client not initialized.")
+
+        try:
+            file_bytes, artifact_filename = get_file_bytes_from_artifact(self.elitea, filepath)
+        except Exception as e:
+            return ToolException(f"Failed to retrieve artifact '{filepath}': {e}")
+
+        if not file_bytes:
+            return ToolException(f"Artifact '{filepath}' not found or empty")
+
+        resolved_filename = filename or artifact_filename
+        if not resolved_filename:
+            return ToolException("Filename could not be resolved from artifact or arguments.")
+
+        mime_type = detect_mime_type(file_bytes, resolved_filename)
+        is_image = mime_type.startswith("image/")
+
+        try:
+            attachment_ref = self._client.create_attachment(
+                upload_stream=BytesIO(file_bytes),
+                project=self.project,
+                file_name=resolved_filename,
+                upload_type="Simple",
+            )
+        except Exception as e:
+            logger.error(f"Error uploading attachment '{resolved_filename}' to ADO: {e}")
+            return ToolException(f"Error uploading attachment '{resolved_filename}': {e}")
+
+        attachment_url = getattr(attachment_ref, "url", None)
+        attachment_id = getattr(attachment_ref, "id", None)
+        if not attachment_url:
+            return ToolException("ADO did not return an attachment URL after upload.")
+
+        relation_value = {"rel": "AttachedFile", "url": attachment_url, "attributes": {"name": resolved_filename}}
+        if comment:
+            relation_value["attributes"]["comment"] = comment
+
+        patch_document = [{"op": "add", "path": "/relations/-", "value": relation_value}]
+
+        if inline_field:
+            try:
+                work_item = self._client.get_work_item(id=work_item_id, project=self.project, fields=[inline_field])
+                current_value = (work_item.fields or {}).get(inline_field, "") or ""
+            except Exception as e:
+                logger.warning(f"Could not read field '{inline_field}' on WI {work_item_id}: {e}")
+                current_value = ""
+            new_value = current_value + self._build_inline_markup(attachment_url, resolved_filename, is_image)
+            patch_document.append({"op": "add", "path": f"/fields/{inline_field}", "value": new_value})
+
+        try:
+            self._client.update_work_item(document=patch_document, id=work_item_id, project=self.project)
+        except Exception as e:
+            logger.error(f"Error attaching file to work item {work_item_id}: {e}")
+            return ToolException(f"Error attaching file to work item {work_item_id}: {e}")
+
+        if add_as_comment:
+            try:
+                comment_html = self._build_inline_markup(attachment_url, resolved_filename, is_image)
+                self._client.add_comment(
+                    request=CommentCreate(text=comment_html),
+                    project=self.project,
+                    work_item_id=work_item_id,
+                )
+            except Exception as e:
+                logger.warning(f"Attached file but failed to add comment on WI {work_item_id}: {e}")
+
+        return {
+            "work_item_id": work_item_id,
+            "attachment_id": attachment_id,
+            "attachment_url": attachment_url,
+            "filename": resolved_filename,
+            "mime_type": mime_type,
+            "inline_field": inline_field,
+            "message": f"File '{resolved_filename}' attached to work item {work_item_id}.",
+        }
+
+    @staticmethod
+    def _build_inline_markup(url: str, filename: str, is_image: bool) -> str:
+        safe_name = filename.replace('"', '&quot;')
+        if is_image:
+            return f'<div><img src="{url}" alt="{safe_name}" /></div>'
+        return f'<div><a href="{url}">{safe_name}</a></div>'
+
+    # Opt-in parallelism: default 1 preserves pre-refactor serial behaviour for
+    # existing callers. Callers set `workers=N` to fan out per-doc pipelines.
+    _DEFAULT_WORKERS = 1
+    # Hard cap on concurrent per-doc pipelines. Higher values risk ADO REST 429s,
+    # LLM rate limits, and pgvector pool exhaustion.
+    _MAX_WORKERS = 10
+
+    def _base_loader(
+        self,
+        wiql: str,
+        workers: Optional[int] = None,
+        process_images: Optional[bool] = None,
+        image_description_prompt: Optional[str] = None,
+        fields: Optional[List[str]] = None,
+        sanitize: Optional[bool] = True,
+        **kwargs,
+    ) -> Generator[Document, None, None]:
         self._init_indexing_stats()
+        # Expose worker count to _save_index_generator (base-doc executor) and
+        # any downstream per-doc work. Defaults to _DEFAULT_WORKERS so the tool
+        # works out of the box; pass workers=1 to force serial.
+        raw_workers = int(workers) if workers else self._DEFAULT_WORKERS
+        if raw_workers > self._MAX_WORKERS:
+            logger.warning(
+                "workers=%s exceeds cap %s (ADO REST quota + pgvector pool "
+                "headroom); clamping to %s.",
+                raw_workers, self._MAX_WORKERS, self._MAX_WORKERS,
+            )
+        self._index_workers = max(1, min(raw_workers, self._MAX_WORKERS))
+        # Stash the indexing knobs so _fetch_work_item_document (running on a
+        # worker thread) can read them without receiving them as arguments.
+        self._index_process_images = bool(process_images) if process_images else False
+        self._index_image_description_prompt = image_description_prompt
+        self._index_fields = list(fields) if fields else None
+        # sanitize=True (default): strip HTML tags and collapse identity dicts
+        # to their displayName before serializing page_content. sanitize=False
+        # restores the pre-refactor behavior (raw HTML strings, full identity
+        # dicts). process_images still injects image descriptions when on;
+        # they survive sanitize=False as <img image-description="..."> markup.
+        self._index_sanitize = True if sanitize is None else bool(sanitize)
         result = self._client.query_by_wiql(Wiql(query=wiql))
         # Flat queries (FROM workitems) populate .work_items; tree/link queries
         # (FROM workitemLinks ... MODE (Recursive)) populate .work_item_relations
@@ -741,20 +893,166 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 if endpoint is not None and endpoint.id is not None and endpoint.id not in seen:
                     seen.add(endpoint.id)
                     work_item_ids.append(endpoint.id)
-        for wi_id in work_item_ids:
-            self._track_processed_item()
-            wi = self._client.get_work_item(id=wi_id, project=self.project, expand='all')
-            yield Document(page_content=json.dumps(wi.fields), metadata={
+
+        # Fetch work item details concurrently — each get_work_item is an
+        # independent REST call, so this is a straight I/O win. Yield in the
+        # order of `work_item_ids` so downstream _reduce_duplicates + stats
+        # stay deterministic. State mutation stays on the main thread.
+        max_workers = max(1, self._index_workers)
+        if max_workers <= 1 or len(work_item_ids) <= 1:
+            for wi_id in work_item_ids:
+                self._track_processed_item()
+                yield self._fetch_work_item_document(wi_id)
+            return
+
+        executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="ado-wi-fetch",
+        )
+        try:
+            pending: Dict[Any, int] = {}  # future -> index (O(1) lookup on completion)
+            id_iter = enumerate(work_item_ids)
+            next_yield_idx = 0
+            ready: Dict[int, Document] = {}
+
+            def _submit_next() -> bool:
+                try:
+                    idx, wi_id = next(id_iter)
+                except StopIteration:
+                    return False
+                pending[executor.submit(self._fetch_work_item_document, wi_id)] = idx
+                return True
+
+            for _ in range(max_workers):
+                if not _submit_next():
+                    break
+
+            while pending or ready:
+                # Drain any contiguous ready items first (in-order yield).
+                while next_yield_idx in ready:
+                    self._track_processed_item()
+                    yield ready.pop(next_yield_idx)
+                    next_yield_idx += 1
+                if not pending:
+                    break
+                done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = pending.pop(future)
+                    ready[idx] = future.result()
+                    _submit_next()
+            # Drain any tail
+            while next_yield_idx in ready:
+                self._track_processed_item()
+                yield ready.pop(next_yield_idx)
+                next_yield_idx += 1
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _fetch_work_item_document(self, wi_id) -> Document:
+        """Fetch one work item and wrap it as a base Document. Pure I/O — safe
+        to call from a worker thread. No shared-state mutation.
+
+        Four optional indexing knobs are read from self (set by _base_loader):
+        - _index_process_images: describe embedded <img> tags via the LLM
+        - _index_image_description_prompt: prompt override for those calls
+        - _index_fields: keep only these field reference names in page_content
+        - _index_sanitize: strip HTML + flatten identity dicts before dumping
+          the payload. Defaults to True; pass sanitize=False to _base_loader
+          to preserve the pre-refactor shape.
+        """
+        process_images = getattr(self, "_index_process_images", False)
+        image_prompt = getattr(self, "_index_image_description_prompt", None)
+        fields_filter = getattr(self, "_index_fields", None)
+        sanitize = getattr(self, "_index_sanitize", True)
+
+        wi = self._client.get_work_item(id=wi_id, project=self.project, expand='all')
+        raw_fields = dict(wi.fields or {})
+
+        # Describe embedded images before HTML gets sanitized so the image
+        # text survives as [image: ...] in the final payload.
+        if process_images:
+            for name, value in list(raw_fields.items()):
+                if not isinstance(value, str) or '<img' not in value:
+                    continue
+                try:
+                    soup = BeautifulSoup(value, 'html.parser')
+                    for img in soup.find_all('img'):
+                        src = img.get('src')
+                        if not src:
+                            continue
+                        try:
+                            description = self.parse_attachment_by_url(
+                                src, image_description_prompt=image_prompt,
+                            )
+                            img['image-description'] = description
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "image description failed for %s on work item %s: %s",
+                                src, wi_id, exc,
+                            )
+                    raw_fields[name] = str(soup)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "process_images pass failed for field %s on work item %s: %s",
+                        name, wi_id, exc,
+                    )
+
+        selected_names = fields_filter if fields_filter else list(raw_fields.keys())
+        filtered: Dict[str, Any] = {}
+        for name in selected_names:
+            if name not in raw_fields:
+                continue
+            value = raw_fields[name]
+            if sanitize:
+                value = self._flatten_identity(value)
+                if isinstance(value, str):
+                    value = self._sanitize_html(value)
+            filtered[name] = value
+
+        return Document(
+            page_content=json.dumps(filtered, ensure_ascii=False, default=str),
+            metadata={
                 'id': str(wi.id),
-                'type': wi.fields.get('System.WorkItemType', ''),
-                'title': wi.fields.get('System.Title', ''),
-                'state': wi.fields.get('System.State', ''),
-                'area': wi.fields.get('System.AreaPath', ''),
-                'reason': wi.fields.get('System.Reason', ''),
-                'iteration': wi.fields.get('System.IterationPath', ''),
-                'updated_on': wi.fields.get('System.ChangedDate', ''),
-                'attachment_ids': {rel.url.split('/')[-1]:rel.attributes.get('name', '') for rel in wi.relations or [] if rel.rel == 'AttachedFile'}
-            })
+                'type': raw_fields.get('System.WorkItemType', ''),
+                'title': raw_fields.get('System.Title', ''),
+                'state': raw_fields.get('System.State', ''),
+                'area': raw_fields.get('System.AreaPath', ''),
+                'reason': raw_fields.get('System.Reason', ''),
+                'iteration': raw_fields.get('System.IterationPath', ''),
+                'updated_on': raw_fields.get('System.ChangedDate', ''),
+                'attachment_ids': {
+                    rel.url.split('/')[-1]: rel.attributes.get('name', '')
+                    for rel in wi.relations or [] if rel.rel == 'AttachedFile'
+                },
+            },
+        )
+
+    @staticmethod
+    def _flatten_identity(value):
+        """Azure identity fields (AssignedTo, CreatedBy, ...) are dicts with a
+        displayName plus a bag of avatar URLs and descriptors. Collapse them to
+        just the displayName to cut ~1 KB per identity out of the payload."""
+        if isinstance(value, dict) and 'displayName' in value:
+            return value.get('displayName')
+        return value
+
+    @staticmethod
+    def _sanitize_html(value: str) -> str:
+        """Strip HTML tags while preserving image-description text added by the
+        process_images pass. Non-HTML strings are returned unchanged so plain
+        field values (dates, ids, paths) do not go through the parser."""
+        if '<' not in value:
+            return value
+        soup = BeautifulSoup(value, 'html.parser')
+        for img in soup.find_all('img'):
+            description = img.get('image-description') or img.get('alt')
+            if description:
+                img.replace_with(f"[image: {description}]")
+            else:
+                img.extract()
+        text = soup.get_text(separator='\n')
+        lines = [ln.strip() for ln in text.splitlines()]
+        return '\n'.join(ln for ln in lines if ln)
 
     def get_attachment_content(self, attachment_id):
         content_generator = self._client.get_attachment_content(id=attachment_id, download=True)
@@ -799,7 +1097,66 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
         return {
-            "wiql": (str, Field(description="WIQL (Work Item Query Language) query string to select and filter Azure DevOps work items."))
+            "wiql": (str, Field(description="WIQL (Work Item Query Language) query string to select and filter Azure DevOps work items.")),
+            "workers": (Optional[int], Field(
+                default=None,
+                ge=1,
+                le=10,
+                description=(
+                    "Maximum number of work items processed concurrently. Applies "
+                    "to both the initial REST fetch (get_work_item per id) and the "
+                    "per-item indexing pipeline (attachments, chunking). Defaults "
+                    "to 1 (serial). Capped at 10 to stay within ADO REST quota, "
+                    "LLM rate limits, and the pgvector connection pool. Values "
+                    "above 10 are clamped."
+                ),
+            )),
+            "process_images": (Optional[bool], Field(
+                default=False,
+                description=(
+                    "If True, scan HTML work-item fields for <img> tags and "
+                    "describe each image via the LLM before sanitizing HTML, "
+                    "so screenshots inside System.Description, ReproSteps, "
+                    "etc. become searchable as text. Costs one LLM call per "
+                    "image. Default False."
+                ),
+            )),
+            "image_description_prompt": (Optional[str], Field(
+                default=None,
+                description=(
+                    "Optional prompt to steer image description output. "
+                    "Ignored unless process_images=True."
+                ),
+            )),
+            "fields": (Optional[List[str]], Field(
+                default=None,
+                description=(
+                    "Whitelist of work-item field reference names to include "
+                    "in the indexed content — e.g. ['System.Title', "
+                    "'System.Description', 'System.State', "
+                    "'Microsoft.VSTS.Common.AcceptanceCriteria', "
+                    "'Microsoft.VSTS.TCM.ReproSteps']. If omitted or empty, "
+                    "all fields returned by Azure DevOps are indexed, which "
+                    "includes revision/watermark/board-column bookkeeping "
+                    "that inflates the payload. Metadata columns (title, "
+                    "state, area, iteration, updated_on) on the resulting "
+                    "Document are always populated regardless of this list."
+                ),
+            )),
+            "sanitize": (Optional[bool], Field(
+                default=True,
+                description=(
+                    "If True (default), strip HTML tags from string fields "
+                    "and collapse Azure identity dicts (AssignedTo, "
+                    "CreatedBy, etc.) to their displayName before indexing, "
+                    "cutting payload size and making the JSON dump readable. "
+                    "Image descriptions inserted by process_images are "
+                    "preserved as '[image: ...]' text. Set to False to "
+                    "restore the pre-refactor shape (raw HTML strings and "
+                    "full identity dicts) — useful if a downstream consumer "
+                    "parses the JSON expecting the original schema."
+                ),
+            )),
         }
 
     def get_available_tools(self):
@@ -870,5 +1227,11 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 "description": self.get_work_item_type_fields.__doc__,
                 "args_schema": ADOGetWorkItemTypeFields,
                 "ref": self.get_work_item_type_fields,
+            },
+            {
+                "name": "attach_file_to_work_item",
+                "description": self.attach_file_to_work_item.__doc__,
+                "args_schema": ADOAttachFileToWorkItem,
+                "ref": self.attach_file_to_work_item,
             }
         ]
