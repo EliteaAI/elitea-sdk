@@ -9,6 +9,7 @@ from elitea_sdk.runtime.langchain.assistant import Assistant
 from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable
 from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
 from elitea_sdk.runtime.tools.application import Application
+from elitea_sdk.runtime.tools.llm import LLMNode
 from elitea_sdk.runtime.toolkits.application import ApplicationToolkit
 from elitea_sdk.runtime.toolkits.security import configure_sensitive_tools, reset_sensitive_tools
 
@@ -849,12 +850,11 @@ def test_nested_child_graph_resume_restores_pending_messages_locally():
 
 
 class FakeApplicationClient:
-    """Minimal client whose .application() returns a pre-built child runnable.
+    """Minimal client whose .application() returns its configured child runnable.
 
-    Mirrors elitea_sdk.runtime.clients.client.Client.application: returns the
-    SAME runnable on every call so the child's checkpointer survives the
-    parent's pause/resume cycle (which re-enters Application._run and rebuilds
-    the child via client.application()).
+    Tests may replace ``child_runnable`` with a freshly compiled graph sharing
+    the same checkpointer to model a process/worker reconstruction. This mirrors
+    production's ``Client.application`` rebuild on every Application._run call.
 
     The child must be a root LangGraphAgentRunnable (not a CompiledStateGraph
     subgraph), because Application._run strips ``__pregel_task_id`` from
@@ -2108,8 +2108,8 @@ def test_two_level_parallel_both_grandchildren_pause_aggregate():
     """Root fans out 2 containers; each container's OWN single leaf paused.
     The root's aggregate must surface exactly 2 pending cards at LEAF
     granularity (not 2 container-level cards) — each keeps its leaf's own
-    tool_call_id and is tagged with `_via_call_id` pointing at its immediate
-    container, and the two `_via_call_id`s are distinct."""
+    tool_call_id and receives a public aggregate-unique interrupt_id. Private
+    routing remains checkpoint-only."""
     parent_memory = MemorySaver()
     container_x = NestedContainerApplication('X-done', 'leaf-1', 'create_file')
     container_y = NestedContainerApplication('Y-done', 'leaf-2', 'delete_file')
@@ -2136,14 +2136,19 @@ def test_two_level_parallel_both_grandchildren_pause_aggregate():
     )
     assert by_id['leaf-1']['tool_name'] == 'create_file'
     assert by_id['leaf-2']['tool_name'] == 'delete_file'
-    # Each leaf entry breadcrumbs back to its OWN immediate container.
-    assert by_id['leaf-1']['_via_call_id'] == 'call-X'
-    assert by_id['leaf-2']['_via_call_id'] == 'call-Y'
-    assert by_id['leaf-1']['_via_call_id'] != by_id['leaf-2']['_via_call_id']
+    assert len({entry['interrupt_id'] for entry in interrupts}) == 2
+    assert all('_via_call_id' not in entry for entry in interrupts)
+
+    raw_interrupt = runnable._get_hitl_interrupt(runnable.get_state(
+        {'configurable': {'thread_id': 'two-level-pause-thread'}},
+    ))
+    raw_by_id = {entry['tool_call_id']: entry for entry in raw_interrupt['pending']}
+    assert raw_by_id['leaf-1']['_via_call_id'] == 'call-X'
+    assert raw_by_id['leaf-2']['_via_call_id'] == 'call-Y'
 
 
 def test_two_level_parallel_resume_routes_to_correct_grandchild():
-    """Resume with 2 hitl_decisions keyed by LEAF tool_call_id + _via_call_id
+    """Resume with UI-shaped decisions keyed by public interrupt_id
     (approve leaf-1 under container_x, reject leaf-2 under container_y). Each
     decision must reach the correct leaf under the correct container, and the
     run completes without a lingering interrupt."""
@@ -2161,13 +2166,19 @@ def test_two_level_parallel_resume_routes_to_correct_grandchild():
     )
     assert initial_result['execution_finished'] is False
     assert len(initial_result['hitl_interrupts']) == 2
+    interrupts_by_tool = {
+        entry['tool_call_id']: entry
+        for entry in initial_result['hitl_interrupts']
+    }
 
     resumed_llm = MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y')
     resumed_runnable = _build_parent_runnable(parent_memory, resumed_llm, tools)
     resume_result = resumed_runnable.invoke(
         {'hitl_decisions': [
-            {'tool_call_id': 'leaf-1', '_via_call_id': 'call-X', 'action': 'approve', 'value': ''},
-            {'tool_call_id': 'leaf-2', '_via_call_id': 'call-Y', 'action': 'reject', 'value': 'no'},
+            {'interrupt_id': interrupts_by_tool['leaf-1']['interrupt_id'],
+             'tool_call_id': 'leaf-1', 'action': 'approve', 'value': ''},
+            {'interrupt_id': interrupts_by_tool['leaf-2']['interrupt_id'],
+             'tool_call_id': 'leaf-2', 'action': 'reject', 'value': 'no'},
         ]},
         config=thread_config,
     )
@@ -2183,6 +2194,98 @@ def test_two_level_parallel_resume_routes_to_correct_grandchild():
     assert resume_result['output'] == 'parent-done'
     final_contents = resumed_llm.calls[-1]
     assert 'X-done' in final_contents and 'Y-done' in final_contents
+
+
+def test_duplicate_leaf_tool_call_ids_route_by_public_interrupt_id():
+    """Two sibling containers may reuse the same graph-local leaf call id.
+
+    The public interrupt ids remain distinct and are sufficient for the server
+    to hydrate each private container route from the parked checkpoint.
+    """
+    parent_memory = MemorySaver()
+    container_x = NestedContainerApplication('X-done', 'leaf-shared', 'create_file')
+    container_y = NestedContainerApplication('Y-done', 'leaf-shared', 'delete_file')
+    tools = [_subagent('container_x', container_x), _subagent('container_y', container_y)]
+    config = {'configurable': {'thread_id': 'duplicate-leaf-id-thread'}}
+
+    initial = _build_parent_runnable(
+        parent_memory,
+        MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y'),
+        tools,
+    ).invoke({'messages': [HumanMessage(content='Delegate both')]}, config=config)
+
+    assert [entry['tool_call_id'] for entry in initial['hitl_interrupts']] == [
+        'leaf-shared', 'leaf-shared',
+    ]
+    by_tool_name = {entry['tool_name']: entry for entry in initial['hitl_interrupts']}
+    assert by_tool_name['create_file']['interrupt_id'] != \
+        by_tool_name['delete_file']['interrupt_id']
+    assert all('_via_call_id' not in entry for entry in initial['hitl_interrupts'])
+
+    resumed = _build_parent_runnable(
+        parent_memory,
+        MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y'),
+        tools,
+    ).invoke({'hitl_decisions': [
+        {'interrupt_id': by_tool_name['create_file']['interrupt_id'],
+         'tool_call_id': 'leaf-shared', 'action': 'approve', 'value': ''},
+        {'interrupt_id': by_tool_name['delete_file']['interrupt_id'],
+         'tool_call_id': 'leaf-shared', 'action': 'reject', 'value': 'no'},
+    ]}, config=config)
+
+    assert resumed['execution_finished'] is True
+    assert container_x.calls[-1]['leaf_decision']['action'] == 'approve'
+    assert container_y.calls[-1]['leaf_decision']['action'] == 'reject'
+
+
+def test_nested_public_interrupt_id_is_stable_when_sibling_order_changes():
+    stable_first = LLMNode._parallel_interrupt_id(
+        'container-call', 'nested-interrupt-uuid', None,
+    )
+    stable_after_sibling_retired = LLMNode._parallel_interrupt_id(
+        'container-call', 'nested-interrupt-uuid', None,
+    )
+    fallback_first = LLMNode._parallel_interrupt_id(
+        'container-call', 'legacy-leaf-call', 0,
+    )
+    fallback_after_sibling_retired = LLMNode._parallel_interrupt_id(
+        'container-call', 'legacy-leaf-call', 1,
+    )
+
+    assert stable_first == stable_after_sibling_retired
+    assert fallback_first == fallback_after_sibling_retired
+
+
+def test_parallel_decision_hydration_trusts_only_checkpoint_routes():
+    checkpoint_interrupt = {
+        'pending': [
+            {'interrupt_id': 'public-a', 'tool_call_id': 'leaf-shared',
+             '_via_call_id': 'checkpoint-route-a',
+             '_nested_interrupt_id': 'nested-public-a'},
+            {'interrupt_id': 'public-b', 'tool_call_id': 'leaf-shared',
+             '_via_call_id': 'checkpoint-route-b'},
+        ],
+    }
+
+    hydrated = LangGraphAgentRunnable._hydrate_parallel_hitl_decisions([
+        {'interrupt_id': 'public-a', 'tool_call_id': 'leaf-shared',
+         '_via_call_id': 'client-forged-route',
+         '_nested_interrupt_id': 'client-forged-nested', 'action': 'approve'},
+        {'interrupt_id': 'unknown', 'tool_call_id': 'leaf-shared',
+         '_via_call_id': 'client-forged-route', 'action': 'approve'},
+        {'tool_call_id': 'leaf-shared', '_via_call_id': 'client-forged-route',
+         'action': 'approve'},
+        {'tool_call_id': 'unknown-leaf',
+         '_via_call_id': 'client-forged-route', 'action': 'approve'},
+    ], checkpoint_interrupt)
+
+    assert hydrated == [{
+        'interrupt_id': 'public-a',
+        'tool_call_id': 'leaf-shared',
+        '_via_call_id': 'checkpoint-route-a',
+        '_nested_interrupt_id': 'nested-public-a',
+        'action': 'approve',
+    }]
 
 
 def test_two_level_ancestry_chain_stamped():
@@ -2278,6 +2381,8 @@ def test_two_level_ancestry_chain_stamped():
     assert path[0]['call_id'] != path[1]['call_id'], (
         f'each ancestry entry must carry its OWN distinct call_id, got: {path}'
     )
+    assert path[0]['sibling_ordinal'] == 1
+    assert path[1]['sibling_ordinal'] == 1
     # parent_agent_name is unchanged: still ONLY the immediate parent's name
     # (backward compat — existing 1-level consumers read this single field).
     assert leaf_1_nested_config['metadata']['parent_agent_name'] == 'leaf_1'
@@ -2289,6 +2394,7 @@ def test_two_level_ancestry_chain_stamped():
     # have distinct ids for their own hop.
     assert leaf_2_path[0]['call_id'] == path[0]['call_id']
     assert leaf_2_path[1]['call_id'] != path[1]['call_id']
+    assert leaf_2_path[1]['sibling_ordinal'] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2504,10 +2610,15 @@ def test_parallel_fanout_parks_when_child_dispatcher_present():
     assert set(specs) == {'call-A', 'call-B'}
     assert specs['call-A']['name'] == 'child_a'
     assert specs['call-B']['name'] == 'child_b'
-    assert specs['call-A']['child_thread_id'] == 'park-thread:child_a:call-A'
-    assert specs['call-B']['child_thread_id'] == 'park-thread:child_b:call-B'
+    assert specs['call-A']['child_thread_id'].startswith('park-thread:dispatch_')
+    assert specs['call-A']['child_thread_id'].endswith(':child_a:call-A')
+    assert specs['call-B']['child_thread_id'].startswith('park-thread:dispatch_')
+    assert specs['call-B']['child_thread_id'].endswith(':child_b:call-B')
+    assert specs['call-A']['dispatch_epoch'] == specs['call-B']['dispatch_epoch']
     assert specs['call-A']['input'] == {'task': 'Run A'}
     assert specs['call-B']['index'] == 1
+    assert specs['call-A']['sibling_ordinal'] == 1
+    assert specs['call-B']['sibling_ordinal'] == 2
     # Parked = NOTHING ran in-process (durable dispatch is pylon_main's job).
     assert child_a.calls == []
     assert child_b.calls == []
@@ -2593,15 +2704,7 @@ def test_parallel_reconcile_assembles_child_results_and_completes():
     parent_memory = MemorySaver()
     parent_thread_id = 'reconcile-thread'
 
-    # 1. Children already ran durably (separate tasks) and wrote their own
-    #    checkpoints under the derived child_thread_ids.
-    a_done = _materialise_completed_child(
-        parent_memory, f'{parent_thread_id}:child_a:call-A', 'A-RESULT')
-    b_done = _materialise_completed_child(
-        parent_memory, f'{parent_thread_id}:child_b:call-B', 'B-RESULT')
-    assert a_done['execution_finished'] and b_done['execution_finished']
-
-    # 2. Parent fans out and PARKS (dispatcher present).
+    # 1. Parent fans out and PARKS (dispatcher present).
     child_a = DictBridgeInterruptingApplication('unused', 'create_file')
     child_b = DictBridgeInterruptingApplication('unused', 'delete_file')
     tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
@@ -2613,11 +2716,21 @@ def test_parallel_reconcile_assembles_child_results_and_completes():
         {'messages': [HumanMessage(content='Delegate both')]}, config=cfg)
     assert parked['parallel_parked'] is True
 
+    # 2. Children run durably under the epoch-scoped ids from the persisted roster.
+    specs = {spec['tool_call_id']: spec for spec in parked['parallel_dispatch']}
+    a_done = _materialise_completed_child(
+        parent_memory, specs['call-A']['child_thread_id'], 'A-RESULT')
+    b_done = _materialise_completed_child(
+        parent_memory, specs['call-B']['child_thread_id'], 'B-RESULT')
+    assert a_done['execution_finished'] and b_done['execution_finished']
+
     # 3. pylon_main re-invokes the parked parent once both children settled.
     reconcile_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
     reconcile_runnable = _build_parent_runnable_with_dispatcher(
         parent_memory, reconcile_llm, tools, dispatcher=object())
-    result = reconcile_runnable.invoke({'parallel_reconcile': 'epoch-1'}, config=cfg)
+    result = reconcile_runnable.invoke(
+        {'parallel_reconcile': parked['dispatch_epoch']}, config=cfg,
+    )
 
     # Parent completed by synthesizing from BOTH child results.
     assert result['execution_finished'] is True
@@ -2630,17 +2743,38 @@ def test_parallel_reconcile_assembles_child_results_and_completes():
     assert 'parallel_parked' not in result
     assert not result.get('hitl_interrupts')
 
+    calls_after_first_reconcile = len(reconcile_llm.calls)
+    duplicate = reconcile_runnable.invoke(
+        {'parallel_reconcile': parked['dispatch_epoch']}, config=cfg,
+    )
+    assert duplicate['execution_finished'] is True
+    assert duplicate['parallel_dispatch'] == []
+    assert len(reconcile_llm.calls) == calls_after_first_reconcile
 
-def test_parallel_reconcile_reads_missing_child_as_placeholder():
-    """A child whose checkpoint is absent (never dispatched / lost) reconciles
-    to a non-empty placeholder ToolMessage rather than crashing or hanging, so
-    the parent can still close out the turn."""
+    # A later turn may receive provider-reused call ids. Its persisted epoch and
+    # child checkpoints must still be a new generation.
+    fresh_runnable = _build_parent_runnable_with_dispatcher(
+        parent_memory,
+        MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B'),
+        tools,
+        dispatcher=object(),
+    )
+    fresh = fresh_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both again')]}, config=cfg,
+    )
+    assert fresh['parallel_parked'] is True
+    assert fresh['dispatch_epoch'] != parked['dispatch_epoch']
+    assert {
+        spec['child_thread_id'] for spec in fresh['parallel_dispatch']
+    }.isdisjoint({
+        spec['child_thread_id'] for spec in parked['parallel_dispatch']
+    })
+
+
+def test_parallel_reconcile_keeps_parent_parked_when_child_is_missing():
+    """Missing durable child state is retryable and cannot finalize the parent."""
     parent_memory = MemorySaver()
     parent_thread_id = 'reconcile-missing-thread'
-    # Only child_a materialised; child_b's checkpoint is intentionally absent.
-    _materialise_completed_child(
-        parent_memory, f'{parent_thread_id}:child_a:call-A', 'A-RESULT')
-
     child_a = DictBridgeInterruptingApplication('unused', 'create_file')
     child_b = DictBridgeInterruptingApplication('unused', 'delete_file')
     tools = [_subagent('child_a', child_a), _subagent('child_b', child_b)]
@@ -2648,17 +2782,762 @@ def test_parallel_reconcile_reads_missing_child_as_placeholder():
     park_runnable = _build_parent_runnable_with_dispatcher(
         parent_memory, park_llm, tools, dispatcher=object())
     cfg = {'configurable': {'thread_id': parent_thread_id}}
-    park_runnable.invoke(
+    parked = park_runnable.invoke(
         {'messages': [HumanMessage(content='Delegate both')]}, config=cfg)
+    specs = {spec['tool_call_id']: spec for spec in parked['parallel_dispatch']}
+    # Only child_a materialises; child_b's checkpoint is intentionally absent.
+    _materialise_completed_child(
+        parent_memory, specs['call-A']['child_thread_id'], 'A-RESULT')
 
     reconcile_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
     reconcile_runnable = _build_parent_runnable_with_dispatcher(
         parent_memory, reconcile_llm, tools, dispatcher=object())
-    result = reconcile_runnable.invoke({'parallel_reconcile': 'epoch-1'}, config=cfg)
+    result = reconcile_runnable.invoke(
+        {'parallel_reconcile': parked['dispatch_epoch']}, config=cfg,
+    )
+
+    assert result['execution_finished'] is False
+    assert result['parallel_parked'] is True
+    assert result['parallel_dispatch'] == []
+    # No partial ToolMessages are committed and the parent never synthesizes.
+    assert reconcile_llm.calls == []
+    checkpoint = reconcile_runnable.get_state(cfg)
+    assert checkpoint.values['parallel_tasks']['parked'] is True
+
+
+def test_parked_parent_ignores_duplicate_non_reconcile_delivery():
+    """A transport retry cannot re-advertise and relaunch the child roster."""
+    memory = MemorySaver()
+    thread_id = 'parked-duplicate-thread'
+    tools = [
+        _subagent('child_a', DictBridgeInterruptingApplication('unused', 'create_file')),
+        _subagent('child_b', DictBridgeInterruptingApplication('unused', 'delete_file')),
+    ]
+    parent_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable_with_dispatcher(
+        memory, parent_llm, tools, dispatcher=object(),
+    )
+    config = {'configurable': {'thread_id': thread_id}}
+    parked = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]}, config=config,
+    )
+    calls_before_retry = len(parent_llm.calls)
+
+    duplicate = runnable.invoke(
+        {'messages': [HumanMessage(content='Duplicate delivery')]}, config=config,
+    )
+
+    assert parked['parallel_dispatch']
+    assert duplicate['parallel_waiting'] is True
+    assert duplicate['parallel_dispatch'] == []
+    assert duplicate['dispatch_epoch'] == parked['dispatch_epoch']
+    assert len(parent_llm.calls) == calls_before_retry
+
+
+def test_stale_reconcile_epoch_waits_without_readvertising_children():
+    memory = MemorySaver()
+    tools = [
+        _subagent('child_a', DictBridgeInterruptingApplication('unused', 'create_file')),
+        _subagent('child_b', DictBridgeInterruptingApplication('unused', 'delete_file')),
+    ]
+    llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable_with_dispatcher(memory, llm, tools, dispatcher=object())
+    config = {'configurable': {'thread_id': 'stale-reconcile-thread'}}
+    parked = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]}, config=config,
+    )
+
+    stale = runnable.invoke({'parallel_reconcile': 'wrong-epoch'}, config=config)
+
+    assert stale['execution_finished'] is False
+    assert stale['parallel_waiting'] is True
+    assert stale['parallel_dispatch'] == []
+    assert stale['dispatch_epoch'] == parked['dispatch_epoch']
+
+
+def test_parallel_reconcile_turns_terminal_child_failures_into_tool_results():
+    """A failed/missing child cannot leave the already-drained gate parked forever."""
+    memory = MemorySaver()
+    thread_id = 'reconcile-terminal-errors-thread'
+    tools = [
+        _subagent('child_a', DictBridgeInterruptingApplication('unused', 'create_file')),
+        _subagent('child_b', DictBridgeInterruptingApplication('unused', 'delete_file')),
+    ]
+    park_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    config = {'configurable': {'thread_id': thread_id}}
+    parked = _build_parent_runnable_with_dispatcher(
+        memory, park_llm, tools, dispatcher=object(),
+    ).invoke({'messages': [HumanMessage(content='Delegate both')]}, config=config)
+
+    reconcile_llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable_with_dispatcher(
+        memory, reconcile_llm, tools, dispatcher=object(),
+    )
+    result = runnable.invoke({
+        'parallel_reconcile': parked['dispatch_epoch'],
+        'parallel_terminal_errors': {
+            parked['parallel_dispatch'][0]['child_thread_id']: {'error': 'child A failed'},
+            parked['parallel_dispatch'][1]['child_thread_id']: {'error': 'child B was not dispatched'},
+        },
+    }, config=config)
 
     assert result['execution_finished'] is True
-    final_tool_contents = reconcile_llm.calls[-1]
-    # child_a's real result and a non-empty placeholder for the missing child.
-    assert 'A-RESULT' in final_tool_contents
-    assert any('child_b' in c or 'no result' in c.lower()
-               for c in final_tool_contents)
+    assert result['output'] == 'parent-done'
+    assert any('child A failed' in item for item in reconcile_llm.calls[-1])
+    assert any('child B was not dispatched' in item for item in reconcile_llm.calls[-1])
+
+
+def test_parallel_reconcile_keeps_parent_parked_when_child_is_paused_or_unreadable():
+    for status in ('paused', 'unreadable'):
+        parent_memory = MemorySaver()
+        thread_id = f'reconcile-{status}-thread'
+        tools = [
+            _subagent('child_a', DictBridgeInterruptingApplication('unused', 'create_file')),
+            _subagent('child_b', DictBridgeInterruptingApplication('unused', 'delete_file')),
+        ]
+        config = {'configurable': {'thread_id': thread_id}}
+        parked_runnable = _build_parent_runnable_with_dispatcher(
+            parent_memory, MultiAppParentLLM(), tools, dispatcher=object(),
+        )
+        parked = parked_runnable.invoke(
+            {'messages': [HumanMessage(content='Delegate both')]}, config=config,
+        )
+        reconcile_runnable = _build_parent_runnable_with_dispatcher(
+            parent_memory, MultiAppParentLLM(), tools, dispatcher=object(),
+        )
+
+        with patch.object(
+            LangGraphAgentRunnable, '_read_child_result',
+            return_value=(status, None),
+        ):
+            payload = {'parallel_reconcile': parked['dispatch_epoch']}
+            if status == 'paused':
+                payload['parallel_terminal_errors'] = {
+                    spec['child_thread_id']: {'error': 'stale failure'}
+                    for spec in parked['parallel_dispatch']
+                }
+            result = reconcile_runnable.invoke(payload, config=config)
+
+        assert result['parallel_parked'] is True
+        assert result['execution_finished'] is False
+        assert result['parallel_dispatch'] == []
+        assert reconcile_runnable.get_state(config).values[
+            'parallel_tasks'
+        ]['parked'] is True
+
+
+# ── #5778 depth-3: REAL 3-tier graph — container self-restores its own pending ──
+#
+# The existing depth-3 tests (NestedContainerApplication) MOCK the container's
+# hitl_interrupt shape, so the container never has a real LLM node that could
+# re-plan from scratch — they cannot detect the pending-messages loss. These
+# tests build a GENUINE middle tier: a real Assistant().runnable() container
+# whose own LLM fans out two real leaf Applications, one of which completes and
+# one of which pauses at a sensitive tool. On resume the container must restore
+# the completed leaf's ToolMessage from its own durable raw interrupt payload,
+# NOT re-plan and re-invoke the finished leaf.
+
+
+class _ContainerFanoutBound:
+    """Container LLM: fans out leaf_done + leaf_pause in ONE turn, then
+    synthesizes a final answer once both leaves have produced ToolMessages."""
+
+    def __init__(self, root, tools):
+        self.root = root
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        tool_contents = [str(m.content) for m in tool_messages]
+        self.root.calls.append(tool_contents)
+        have_done = any('leaf-done-result' in c for c in tool_contents)
+        have_pause = any('leaf-pause-result' in c for c in tool_contents)
+        if have_done and have_pause:
+            return AIMessage(content='container-complete')
+        # Fan out BOTH leaves in a single assistant turn.
+        return AIMessage(
+            content='',
+            tool_calls=[
+                {'name': 'leaf_done', 'args': {'task': 'Resolve name'},
+                 'id': 'call-leaf-done', 'type': 'tool_call'},
+                {'name': 'leaf_pause', 'args': {'task': 'Resolve surname'},
+                 'id': 'call-leaf-pause', 'type': 'tool_call'},
+            ],
+        )
+
+
+class ContainerFanoutLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _ContainerFanoutBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _ContainerFanoutBound(self, []).invoke(messages, config=config)
+
+
+class _RootToContainerBound:
+    """Root LLM: single tool call to the container, then final answer."""
+
+    def __init__(self, root, tools):
+        self.root = root
+        self.tools = list(tools)
+
+    def invoke(self, messages, config=None):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        tool_contents = [str(m.content) for m in tool_messages]
+        self.root.calls.append(tool_contents)
+        if tool_contents:
+            return AIMessage(content='root-complete')
+        return AIMessage(
+            content='',
+            tool_calls=[{
+                'name': 'full_name_resolver', 'args': {'task': 'Resolve full name'},
+                'id': 'call-container', 'type': 'tool_call',
+            }],
+        )
+
+
+class RootToContainerLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.calls = []
+
+    @property
+    def _get_model_default_parameters(self):
+        return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        return _RootToContainerBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _RootToContainerBound(self, []).invoke(messages, config=config)
+
+
+def _build_real_container_runnable(
+    leaf_pause_executions, *, memory=None, leaf_done_app=None,
+    leaf_pause_app=None,
+):
+    """Build a REAL tier-2 container Assistant().runnable() whose LLM fans out
+    two leaf Applications, using the SAME leaf doubles the working depth-2 tests
+    use so this test isolates the NESTING (a container between root and leaves),
+    not a different leaf-raise path:
+
+      * leaf_done  → StaticApplication (completes immediately with a result)
+      * leaf_pause → DictBridgeInterruptingApplication (RETURNS a sensitive_tool
+        hitl_interrupt in its response dict — the dict-bridge shape a real
+        standalone child takes — so the container's fan-out collects a deferred
+        sentinel and aggregates, exactly like the working root-level case).
+
+    The container has its OWN MemorySaver (thread_id-scoped) so its paused state
+    persists across the parent's resume — mirroring production, where
+    client.application() rebuilds the container with the indexer's PostgresSaver.
+    """
+    leaf_done_app = leaf_done_app or StaticApplication(output='leaf-done-result')
+    leaf_done_tool = _subagent('leaf_done', leaf_done_app)
+
+    # leaf_pause records each resume so we can assert its sensitive op ran once.
+    leaf_pause_app = leaf_pause_app or _RecordingDictBridgeApplication(
+        'leaf-pause-result', 'surname_op', leaf_pause_executions)
+    leaf_pause_tool = _subagent('leaf_pause', leaf_pause_app)
+
+    container_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'fan out leaves', 'tools': [], 'meta': {}},
+        client=ContainerFanoutLLM(), tools=[leaf_done_tool, leaf_pause_tool],
+        memory=memory or MemorySaver(), app_type='predict', is_subgraph=False,
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    return (
+        container_assistant.runnable(), leaf_done_app, leaf_pause_app,
+        container_assistant.memory,
+    )
+
+
+class _RecordingDictBridgeApplication:
+    """Like DictBridgeInterruptingApplication but records resume executions so a
+    test can assert the sensitive op ran exactly once across pause/resume."""
+
+    def __init__(self, output, tool_name, executions):
+        self.output = output
+        self.tool_name = tool_name
+        self.executions = executions
+        self.calls = []
+
+    def invoke(self, payload, config=None):
+        self.calls.append({'payload': payload, 'config': config})
+        if isinstance(payload, dict) and payload.get('hitl_resume'):
+            self.executions.append(payload)
+            return {'output': self.output, 'execution_finished': True}
+        return {
+            'output': 'Need approval',
+            'execution_finished': False,
+            'hitl_interrupt': {
+                'type': 'hitl',
+                'guardrail_type': 'sensitive_tool',
+                'message': f'approve {self.tool_name}?',
+                'tool_name': self.tool_name,
+            },
+        }
+
+
+def test_rebuilt_container_restores_pending_messages_from_raw_checkpoint_interrupt():
+    """#5778 nested-tier bug: a container (tier-2) whose own fan-out completed
+    ONE leaf and paused on a SIBLING leaf must, on resume, restore the completed
+    leaf's ToolMessage from its own raw durable checkpoint interrupt — NOT
+    re-plan from scratch and re-invoke the already-completed leaf. The resume
+    uses a newly compiled runnable sharing only the checkpointer, approximating
+    a new worker process. Converges in exactly one resume round.
+    """
+    reset_sensitive_tools()
+    configure_sensitive_tools({'demo_kit': ['surname_op']})
+
+    leaf_pause_executions = []
+    (
+        container_runnable, leaf_done_app, leaf_pause_app, container_memory,
+    ) = _build_real_container_runnable(leaf_pause_executions)
+    application_client = FakeApplicationClient(container_runnable)
+
+    container_tool = Application(
+        name='full_name_resolver',
+        description='Resolves a full name by fanning out to two leaves',
+        application=container_runnable,
+        return_type='str',
+        client=application_client,
+        is_subgraph=True,
+        args_runnable={'application_id': 42, 'application_version_id': 1,
+                       'is_subgraph': True},
+    )
+
+    parent_memory = MemorySaver()
+    thread_config = {'configurable': {'thread_id': 'depth3-container-thread'}}
+
+    # Initial run: root → container → fan out both leaves; leaf_pause pauses.
+    initial_runnable = _build_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool])
+    initial_result = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Resolve Roman Mitusov')]},
+        config=thread_config,
+    )
+
+    assert initial_result['execution_finished'] is False, (
+        f'expected a pause at the leaf sensitive tool, got: {initial_result}'
+    )
+    # The sensitive tool must NOT have run yet.
+    assert leaf_pause_executions == []
+    # leaf_done completed exactly once during the initial fan-out.
+    assert len(leaf_done_app.calls) == 1, (
+        f'leaf_done should have completed once on the initial run; '
+        f'got {len(leaf_done_app.calls)} calls'
+    )
+
+    # The container's own raw paused checkpoint must durably carry its completed
+    # leaf's ToolMessage in the interrupt payload. No update_state write is made
+    # against the paused child: doing so would replace the checkpoint task and
+    # make the interrupt unresumable.
+    container_cfg = {'configurable': {
+        'thread_id': 'depth3-container-thread:full_name_resolver'}}
+    container_state = container_runnable.get_state(container_cfg)
+
+    def _tool_contents(dict_msgs):
+        out = []
+        for msg in dict_msgs or []:
+            if isinstance(msg, dict) and msg.get('type') == 'tool':
+                out.append(str(msg.get('data', {}).get('content', '')))
+            elif isinstance(msg, ToolMessage):
+                out.append(str(msg.content))
+        return out
+
+    payload_pending = []
+    for task in getattr(container_state, 'tasks', None) or []:
+        for intr in getattr(task, 'interrupts', None) or []:
+            v = getattr(intr, 'value', None)
+            if isinstance(v, dict) and v.get('_pending_messages'):
+                payload_pending = v['_pending_messages']
+    durable_contents = _tool_contents(payload_pending)
+    assert any('leaf-done-result' in c for c in durable_contents), (
+        f"container raw interrupt must durably hold the completed leaf's "
+        f"ToolMessage (payload={payload_pending!r})"
+    )
+
+    # Recompile the middle-tier graph with the same checkpointer and leaf test
+    # doubles, then make subsequent Application rebuilds return this new object.
+    # No in-memory runnable state from the initial execution is relied upon.
+    rebuilt_container, _, _, _ = _build_real_container_runnable(
+        leaf_pause_executions,
+        memory=container_memory,
+        leaf_done_app=leaf_done_app,
+        leaf_pause_app=leaf_pause_app,
+    )
+    assert rebuilt_container is not container_runnable
+    application_client.child_runnable = rebuilt_container
+    # Resume with a per-leaf decision (the shape the UI sends for an aggregate
+    # pause) keyed by the paused leaf's tool_call_id.
+    resume_runnable = _build_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool])
+    resume_result = resume_runnable.invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-leaf-pause', 'action': 'approve', 'value': ''},
+        ]},
+        config=thread_config,
+    )
+
+    # (a) leaf_done must NOT be re-invoked on resume — still exactly one call.
+    assert len(leaf_done_app.calls) == 1, (
+        f'leaf_done must not be re-invoked on resume (container must restore its '
+        f'result from its own checkpoint, not re-plan from scratch); got '
+        f'{len(leaf_done_app.calls)} calls'
+    )
+    # (b) the sensitive tool ran exactly once (approved).
+    assert len(leaf_pause_executions) == 1
+    # (c) converges in this single resume call.
+    assert resume_result['execution_finished'] is True, (
+        f'the container must converge in one resume round; got: {resume_result}'
+    )
+    assert resume_result['output'] == 'root-complete'
+
+    reset_sensitive_tools()
+
+
+def _build_single_container_with_two_pausing_leaves(thread_id):
+    first_executions = []
+    second_executions = []
+    first_leaf = _RecordingDictBridgeApplication(
+        'leaf-done-result', 'first_sensitive_op', first_executions,
+    )
+    second_leaf = _RecordingDictBridgeApplication(
+        'leaf-pause-result', 'second_sensitive_op', second_executions,
+    )
+    container_runnable, _, _, _ = _build_real_container_runnable(
+        second_executions,
+        leaf_done_app=first_leaf,
+        leaf_pause_app=second_leaf,
+    )
+    container_tool = Application(
+        name='full_name_resolver',
+        description='Resolves a full name by fanning out to two leaves',
+        application=container_runnable,
+        return_type='str',
+        client=FakeApplicationClient(container_runnable),
+        is_subgraph=True,
+        args_runnable={
+            'application_id': 42,
+            'application_version_id': 1,
+            'is_subgraph': True,
+        },
+    )
+    runnable = _build_parent_runnable(
+        MemorySaver(), RootToContainerLLM(), [container_tool],
+    )
+    return (
+        runnable,
+        {'configurable': {'thread_id': thread_id}},
+        first_executions,
+        second_executions,
+    )
+
+
+def test_single_container_bubbles_and_resumes_all_parallel_leaf_interrupts():
+    """A -> single B -> two pausing C leaves must preserve B's raw aggregate.
+
+    The child runnable's public ``hitl_interrupt`` is intentionally only the
+    first UI card.  Application must read the child's authoritative checkpoint
+    even when B itself was invoked sequentially; otherwise A sees one decision,
+    resumes one leaf, and repeatedly replays B to discover the sibling.
+    """
+    (
+        initial_runnable, config, first_executions, second_executions,
+    ) = _build_single_container_with_two_pausing_leaves(
+        'single-container-two-pauses',
+    )
+
+    initial = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Resolve John Smith')]},
+        config=config,
+    )
+
+    assert initial['execution_finished'] is False
+    assert len(initial['hitl_interrupts']) == 2
+    assert {entry['tool_call_id'] for entry in initial['hitl_interrupts']} == {
+        'call-leaf-done', 'call-leaf-pause',
+    }
+    raw_parent = initial_runnable._get_hitl_interrupt(
+        initial_runnable.get_state(config),
+    )
+    assert raw_parent['guardrail_type'] == 'parallel_sensitive_tools'
+    assert len(raw_parent['pending']) == 2
+
+    resumed = initial_runnable.invoke(
+        {
+            'hitl_decisions': [
+                {
+                    'interrupt_id': entry['interrupt_id'],
+                    'tool_call_id': entry['tool_call_id'],
+                    'action': 'approve',
+                    'value': '',
+                }
+                for entry in initial['hitl_interrupts']
+            ],
+        },
+        config=config,
+    )
+
+    assert resumed['execution_finished'] is True
+    assert resumed['output'] == 'root-complete'
+    assert len(first_executions) == 1
+    assert len(second_executions) == 1
+
+
+def test_single_container_partial_decision_keeps_remaining_public_id_stable():
+    runnable, config, first_executions, second_executions = (
+        _build_single_container_with_two_pausing_leaves(
+            'single-container-partial-decisions',
+        )
+    )
+    initial = runnable.invoke(
+        {'messages': [HumanMessage(content='Resolve John Smith')]},
+        config=config,
+    )
+    by_call = {
+        entry['tool_call_id']: entry
+        for entry in initial['hitl_interrupts']
+    }
+
+    after_first = runnable.invoke(
+        {'hitl_decisions': [{
+            'interrupt_id': by_call['call-leaf-done']['interrupt_id'],
+            'tool_call_id': 'call-leaf-done',
+            'action': 'approve',
+            'value': '',
+        }]},
+        config=config,
+    )
+
+    assert after_first['execution_finished'] is False
+    assert len(after_first['hitl_interrupts']) == 1
+    remaining = after_first['hitl_interrupts'][0]
+    assert remaining['tool_call_id'] == 'call-leaf-pause'
+    assert remaining['interrupt_id'] == by_call['call-leaf-pause']['interrupt_id']
+    assert len(first_executions) == 1
+    assert second_executions == []
+
+    finished = runnable.invoke(
+        {'hitl_decisions': [{
+            'interrupt_id': by_call['call-leaf-pause']['interrupt_id'],
+            'tool_call_id': 'call-leaf-pause',
+            'action': 'approve',
+            'value': '',
+        }]},
+        config=config,
+    )
+
+    assert finished['execution_finished'] is True
+    assert len(first_executions) == 1
+    assert len(second_executions) == 1
+
+
+def test_real_parallel_containers_route_duplicate_leaf_ids_through_nested_interrupt_ids():
+    """A real A -> (B1, B2) -> C graph keeps interrupt ids scoped per tier.
+
+    Both compiled B graphs use the same graph-local paused leaf call id. A must
+    expose distinct root-scoped public ids, then restore each B-scoped id while
+    consuming the private routing hop so B's checkpoint hydration accepts it.
+    """
+    x_executions = []
+    y_executions = []
+    x_runnable, x_done, _, _ = _build_real_container_runnable(x_executions)
+    y_runnable, y_done, _, _ = _build_real_container_runnable(y_executions)
+
+    def _container_tool(name, runnable):
+        return Application(
+            name=name, description=f'{name} real compiled container',
+            application=runnable, return_type='str',
+            client=FakeApplicationClient(runnable), is_subgraph=True,
+            args_runnable={
+                'application_id': name,
+                'application_version_id': 1,
+                'is_subgraph': True,
+            },
+        )
+
+    tools = [
+        _container_tool('container_x', x_runnable),
+        _container_tool('container_y', y_runnable),
+    ]
+    memory = MemorySaver()
+    config = {'configurable': {'thread_id': 'real-duplicate-leaf-thread'}}
+    initial_runnable = _build_parent_runnable(
+        memory,
+        MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y'),
+        tools,
+    )
+    initial = initial_runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both real containers')]},
+        config=config,
+    )
+
+    interrupts = initial['hitl_interrupts']
+    assert initial['execution_finished'] is False
+    assert len(interrupts) == 2
+    assert [entry['tool_call_id'] for entry in interrupts] == [
+        'call-leaf-pause', 'call-leaf-pause',
+    ]
+    assert len({entry['interrupt_id'] for entry in interrupts}) == 2
+    assert all('_via_call_id' not in entry for entry in interrupts)
+    assert all('_nested_interrupt_id' not in entry for entry in interrupts)
+
+    raw = initial_runnable._get_hitl_interrupt(
+        initial_runnable.get_state(config),
+    )
+    assert all(entry.get('_nested_interrupt_id') for entry in raw['pending'])
+    assert all(
+        entry['_nested_interrupt_id'] != entry['interrupt_id']
+        for entry in raw['pending']
+    )
+
+    resumed = _build_parent_runnable(
+        memory,
+        MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y'),
+        tools,
+    ).invoke({'hitl_decisions': [
+        {
+            'interrupt_id': entry['interrupt_id'],
+            'tool_call_id': entry['tool_call_id'],
+            'action': 'approve',
+            'value': '',
+        }
+        for entry in interrupts
+    ]}, config=config)
+
+    assert resumed['execution_finished'] is True
+    assert resumed['output'] == 'parent-done'
+    assert len(x_done.calls) == 1 and len(y_done.calls) == 1
+    assert len(x_executions) == 1 and len(y_executions) == 1
+
+
+class _TwoRoundDictBridgeApplication:
+    """A leaf that pauses on a FIRST sensitive tool, and after that decision
+    diverges to a SECOND distinct sensitive tool (pauses again), then completes.
+    Reads the resume action from either the scalar shape or the per-leaf
+    hitl_decisions list (depth-3 aggregate resume forwards the list)."""
+
+    def __init__(self, output, first_tool, second_tool, executions):
+        self.output = output
+        self.first_tool = first_tool
+        self.second_tool = second_tool
+        self.executions = executions
+        self.calls = []
+        self._diverged = False
+
+    def _pause(self, tool_name):
+        return {
+            'output': 'need approval',
+            'execution_finished': False,
+            'hitl_interrupt': {
+                'type': 'hitl',
+                'guardrail_type': 'sensitive_tool',
+                'message': f'approve {tool_name}?',
+                'tool_name': tool_name,
+            },
+        }
+
+    def invoke(self, payload, config=None):
+        self.calls.append({'payload': payload, 'config': config})
+        is_resume = isinstance(payload, dict) and payload.get('hitl_resume')
+        if not is_resume:
+            return self._pause(self.first_tool)
+        self.executions.append(payload)
+        if not self._diverged:
+            self._diverged = True
+            return self._pause(self.second_tool)
+        return {'output': self.output, 'execution_finished': True}
+
+
+def test_container_tier_staggered_leaf_pauses_each_restore_independently():
+    """#5778 nested-tier: a container's leaf pauses across TWO rounds (it
+    diverges to a second sensitive tool) while a SIBLING leaf stays completed
+    from round 1. Across both rounds the container must keep restoring the
+    completed sibling from its OWN checkpoint — the completed leaf is invoked
+    exactly ONCE total, and the run converges after the second approval.
+    """
+    reset_sensitive_tools()
+    configure_sensitive_tools({'demo_kit': ['first_op', 'second_op']})
+
+    leaf_done_app = StaticApplication(output='leaf-done-result')
+    leaf_pause_execs = []
+    leaf_pause_app = _TwoRoundDictBridgeApplication(
+        'leaf-pause-result', 'first_op', 'second_op', leaf_pause_execs)
+
+    container_assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'fan out leaves', 'tools': [], 'meta': {}},
+        client=ContainerFanoutLLM(),
+        tools=[_subagent('leaf_done', leaf_done_app),
+               _subagent('leaf_pause', leaf_pause_app)],
+        memory=MemorySaver(), app_type='predict', is_subgraph=False,
+        middleware=[SensitiveToolGuardMiddleware()],
+    )
+    container_runnable = container_assistant.runnable()
+
+    container_tool = Application(
+        name='full_name_resolver', description='Resolves a full name',
+        application=container_runnable, return_type='str',
+        client=FakeApplicationClient(container_runnable), is_subgraph=True,
+        args_runnable={'application_id': 42, 'application_version_id': 1,
+                       'is_subgraph': True},
+    )
+
+    parent_memory = MemorySaver()
+    thread_config = {'configurable': {'thread_id': 'depth3-staggered-thread'}}
+
+    # Round 0: initial fan-out. leaf_done completes; leaf_pause pauses on first_op.
+    r0 = _build_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool]).invoke(
+        {'messages': [HumanMessage(content='Resolve Roman Mitusov')]},
+        config=thread_config,
+    )
+    assert r0['execution_finished'] is False
+    assert len(leaf_done_app.calls) == 1
+
+    # Round 1: approve first_op → leaf_pause diverges to second_op (pauses again).
+    r1 = _build_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool]).invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-leaf-pause', 'action': 'approve', 'value': ''}]},
+        config=thread_config,
+    )
+    assert r1['execution_finished'] is False, (
+        f'container should pause AGAIN on the second sensitive tool; got: {r1}'
+    )
+    assert r0['hitl_interrupts'][0]['interrupt_id'] != r1['hitl_interrupts'][0]['interrupt_id']
+    # leaf_done still NOT re-invoked while the container re-planned round 2.
+    assert len(leaf_done_app.calls) == 1, (
+        f'leaf_done must stay completed (invoked once) across the staggered '
+        f're-pause; got {len(leaf_done_app.calls)} calls'
+    )
+
+    # Round 2: approve second_op → leaf_pause completes, run converges.
+    r2 = _build_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool]).invoke(
+        {'hitl_decisions': [
+            {'tool_call_id': 'call-leaf-pause', 'action': 'approve', 'value': ''}]},
+        config=thread_config,
+    )
+    assert r2['execution_finished'] is True, (
+        f'container must converge after the second approval; got: {r2}'
+    )
+    # leaf_done invoked exactly once across BOTH rounds — never re-run.
+    assert len(leaf_done_app.calls) == 1
+    assert r2['output'] == 'root-complete'
+
+    reset_sensitive_tools()
