@@ -264,6 +264,8 @@ def load_mcp_servers_config(config_path: Optional[str] = None) -> Dict[str, Any]
 
 
 _server_configs: Optional[Dict[str, Any]] = None
+_mcp_config_schema_cache: Dict[str, tuple[Dict[str, Any], type[BaseModel]]] = {}
+_mcp_config_cache_lock = threading.RLock()
 
 
 def refresh_mcp_server_configs(
@@ -284,7 +286,12 @@ def refresh_mcp_server_configs(
     if not isinstance(server_configs, dict):
         raise TypeError("MCP server configuration must be an object")
 
-    _server_configs = deepcopy(server_configs)
+    snapshot = deepcopy(server_configs)
+    with _mcp_config_cache_lock:
+        _server_configs = snapshot
+        for server_name, (cached_config, _) in list(_mcp_config_schema_cache.items()):
+            if snapshot.get(server_name) != cached_config:
+                _mcp_config_schema_cache.pop(server_name, None)
     return _server_configs
 
 
@@ -970,6 +977,12 @@ def get_mcp_config_toolkit_schemas() -> List[BaseModel]:
     logger.debug(f"[MCP Config] >>> Found {len(servers)} servers")
 
     for server_name, config in servers.items():
+        with _mcp_config_cache_lock:
+            cached = _mcp_config_schema_cache.get(server_name)
+        if cached and cached[0] == config:
+            schemas.append(cached[1])
+            continue
+
         server_type = config.get('type', 'stdio')
         server_schema = config.get('config_schema', {'properties': {}})
         description = config.get('description', f'MCP server: {server_name}')
@@ -1083,6 +1096,9 @@ def get_mcp_config_toolkit_schemas() -> List[BaseModel]:
         elif server_type == 'stdio':
             model.check_connection = staticmethod(_create_check_connection_for_stdio(server_name, config))
 
+        with _mcp_config_cache_lock:
+            if _server_configs and _server_configs.get(server_name) == config:
+                _mcp_config_schema_cache[server_name] = (deepcopy(config), model)
         schemas.append(model)
 
     return schemas
