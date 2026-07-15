@@ -38,6 +38,7 @@ mcp_servers:
 """
 
 import asyncio
+from copy import deepcopy
 import logging
 import os
 import threading
@@ -265,11 +266,33 @@ def load_mcp_servers_config(config_path: Optional[str] = None) -> Dict[str, Any]
 _server_configs: Optional[Dict[str, Any]] = None
 
 
+def refresh_mcp_server_configs(
+    server_configs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Atomically replace the MCP definition snapshot used by new toolkits.
+
+    Passing definitions avoids file I/O when the hosting runtime has already
+    reloaded its configuration. With no argument, the normal configuration
+    sources are read again. Existing toolkit instances keep their current
+    connection settings; subsequent schema/toolkit construction uses the new
+    snapshot.
+    """
+    global _server_configs
+
+    if server_configs is None:
+        server_configs = load_mcp_servers_config()
+    if not isinstance(server_configs, dict):
+        raise TypeError("MCP server configuration must be an object")
+
+    _server_configs = deepcopy(server_configs)
+    return _server_configs
+
+
 def get_mcp_server_config(server_name: str) -> Optional[Dict[str, Any]]:
     """Get configuration for a specific MCP server."""
     global _server_configs
     if _server_configs is None:
-        _server_configs = load_mcp_servers_config()
+        refresh_mcp_server_configs()
     return _server_configs.get(server_name)
 
 
@@ -277,7 +300,7 @@ def get_all_mcp_server_configs() -> Dict[str, Any]:
     """Get all configured MCP server definitions."""
     global _server_configs
     if _server_configs is None:
-        _server_configs = load_mcp_servers_config()
+        refresh_mcp_server_configs()
     return _server_configs
 
 
