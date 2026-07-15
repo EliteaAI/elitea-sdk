@@ -11,7 +11,7 @@ Resume is handled via Command(resume={"action": "approve|reject|edit", "value": 
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional, TypedDict
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.runnables import Runnable, RunnableConfig
@@ -28,6 +28,41 @@ HITL_VALID_ACTIONS = {HITL_ACTION_APPROVE, HITL_ACTION_REJECT, HITL_ACTION_EDIT}
 
 # State key used for HITL interrupt metadata
 HITL_STATE_KEY = "hitl_interrupt"
+
+# Stable serialized routing keys shared by the parallel pause and resume paths.
+# The leading-underscore fields are checkpoint-private and must never be
+# accepted from, or exposed to, the UI transport.
+HITL_INTERRUPT_ID_KEY = "interrupt_id"
+HITL_TOOL_CALL_ID_KEY = "tool_call_id"
+HITL_VIA_CALL_ID_KEY = "_via_call_id"
+HITL_NESTED_INTERRUPT_ID_KEY = "_nested_interrupt_id"
+HITL_PRIVATE_ROUTING_KEYS = (
+    HITL_VIA_CALL_ID_KEY,
+    HITL_NESTED_INTERRUPT_ID_KEY,
+)
+
+
+class PendingHITLEntry(TypedDict, total=False):
+    """Serialized pending-item contract for parallel HITL routing.
+
+    Guardrail-specific entries may carry additional display fields. Pause and
+    resume routing share only this documented subset; private route hops are
+    restored exclusively from the authoritative checkpoint.
+    """
+
+    type: str
+    guardrail_type: str
+    tool_name: str
+    toolkit_name: str
+    toolkit_type: str
+    tool_args: dict[str, Any]
+    message: str
+    available_actions: list[str]
+    parent_agent_name: str
+    interrupt_id: str
+    tool_call_id: str
+    _via_call_id: str
+    _nested_interrupt_id: str
 
 
 class HITLNode(Runnable):

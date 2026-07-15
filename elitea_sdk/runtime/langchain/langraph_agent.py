@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Union, Any, Optional, Annotated, get_type_hints
+from typing import Union, Any, Optional, Annotated, get_type_hints, cast
 from uuid import uuid4
 from typing import Dict
 
@@ -32,7 +32,13 @@ from .utils import (
 )
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
 from ..tools.function import FunctionTool, PIPELINE_BLOCKED_KEY
-from ..tools.hitl import HITLNode
+from ..tools.hitl import (
+    HITLNode,
+    HITL_INTERRUPT_ID_KEY,
+    HITL_PRIVATE_ROUTING_KEYS,
+    HITL_TOOL_CALL_ID_KEY,
+    PendingHITLEntry,
+)
 from ..tools.indexer_tool import IndexerNode
 from ..tools.llm import LLMNode
 from ..tools.loop import LoopNode
@@ -2738,15 +2744,19 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         exactly one pending entry.
         """
         pending = interrupt_value.get('pending') or []
-        pending = [p for p in pending if isinstance(p, dict)]
-        by_interrupt_id = {
-            p.get('interrupt_id'): p
+        pending = [
+            cast(PendingHITLEntry, p)
             for p in pending
-            if p.get('interrupt_id')
+            if isinstance(p, dict)
+        ]
+        by_interrupt_id = {
+            p.get(HITL_INTERRUPT_ID_KEY): p
+            for p in pending
+            if p.get(HITL_INTERRUPT_ID_KEY)
         }
-        by_tool_call_id: dict[str, list[dict]] = {}
+        by_tool_call_id: dict[str, list[PendingHITLEntry]] = {}
         for entry in pending:
-            tool_call_id = entry.get('tool_call_id')
+            tool_call_id = entry.get(HITL_TOOL_CALL_ID_KEY)
             if tool_call_id:
                 by_tool_call_id.setdefault(tool_call_id, []).append(entry)
 
@@ -2757,10 +2767,10 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             decision = dict(raw_decision)
             # Never trust a transport-supplied private route, even when the
             # public id is malformed. Only a checkpoint match may add it back.
-            decision.pop('_via_call_id', None)
-            decision.pop('_nested_interrupt_id', None)
+            for key in HITL_PRIVATE_ROUTING_KEYS:
+                decision.pop(key, None)
             match = None
-            interrupt_id = decision.get('interrupt_id')
+            interrupt_id = decision.get(HITL_INTERRUPT_ID_KEY)
             if interrupt_id:
                 match = by_interrupt_id.get(interrupt_id)
                 if match is None:
@@ -2769,22 +2779,24 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         interrupt_id,
                     )
                     continue
-            elif decision.get('tool_call_id'):
-                candidates = by_tool_call_id.get(decision['tool_call_id'], [])
+            elif decision.get(HITL_TOOL_CALL_ID_KEY):
+                candidates = by_tool_call_id.get(
+                    decision[HITL_TOOL_CALL_ID_KEY], []
+                )
                 if len(candidates) == 1:
                     match = candidates[0]
                 elif len(candidates) > 1:
                     logger.warning(
                         "[HITL] Ambiguous legacy decision for duplicate "
                         "tool_call_id=%s; interrupt_id is required",
-                        decision['tool_call_id'],
+                        decision[HITL_TOOL_CALL_ID_KEY],
                     )
                     continue
                 else:
                     logger.warning(
                         "[HITL] Ignoring legacy decision for unknown "
                         "tool_call_id=%s",
-                        decision['tool_call_id'],
+                        decision[HITL_TOOL_CALL_ID_KEY],
                     )
                     continue
             else:
@@ -2794,26 +2806,23 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 continue
 
             if match is not None:
-                if match.get('tool_call_id'):
-                    decision['tool_call_id'] = match['tool_call_id']
-                if match.get('_via_call_id'):
-                    decision['_via_call_id'] = match['_via_call_id']
-                else:
-                    decision.pop('_via_call_id', None)
-                if match.get('_nested_interrupt_id'):
-                    decision['_nested_interrupt_id'] = match[
-                        '_nested_interrupt_id'
+                if match.get(HITL_TOOL_CALL_ID_KEY):
+                    decision[HITL_TOOL_CALL_ID_KEY] = match[
+                        HITL_TOOL_CALL_ID_KEY
                     ]
-                else:
-                    decision.pop('_nested_interrupt_id', None)
+                for key in HITL_PRIVATE_ROUTING_KEYS:
+                    if match.get(key):
+                        decision[key] = match[key]
+                    else:
+                        decision.pop(key, None)
             hydrated.append(decision)
         return hydrated
 
     # Internal payload keys that must never leak to the UI/transport layer.
     _HITL_INTERNAL_KEYS = (
         'tool_args_raw', '_pending_messages',
-        '_parent_tool_name', '_parent_tool_args', '_parent_tool_call_id', '_via_call_id',
-        '_nested_interrupt_id',
+        '_parent_tool_name', '_parent_tool_args', '_parent_tool_call_id',
+        *HITL_PRIVATE_ROUTING_KEYS,
         'nested_config',
     )
 

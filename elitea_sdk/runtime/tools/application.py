@@ -360,10 +360,20 @@ class Application(BaseTool):
             logger.debug(f"[APP_RUN] Variable defaults: {self.variable_defaults}")
             logger.debug(f"[APP_RUN] Merged variables: {list(merged_vars.keys())}")
 
-            # Force is_subgraph=False: the child runs standalone here, so it
-            # must be a LangGraphAgentRunnable, not a CompiledStateGraph
-            # (checkpointer=True) which langgraph rejects as a root graph. (#5046)
-            runnable_args = {**self.args_runnable, 'is_subgraph': False}
+            # The rebuilt child is a standalone root graph. It must therefore
+            # be a LangGraphAgentRunnable rather than a CompiledStateGraph
+            # (checkpointer=True), which langgraph rejects as a root. (#5046)
+            #
+            # Also pin the intentional hybrid dispatch boundary (#5778): the
+            # outer graph may durably park + dispatch this Application, while
+            # the rebuilt child's own fan-out stays in-process. Keep this
+            # override at the call boundary so widening args_runnable in the
+            # future cannot accidentally enable unsupported recursive parking.
+            runnable_args = {
+                **self.args_runnable,
+                'is_subgraph': False,
+                'child_dispatcher': None,
+            }
             application_runnable = self.client.application(
                 **runnable_args, application_variables=application_variables,
             )

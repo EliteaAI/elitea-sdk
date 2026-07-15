@@ -933,6 +933,7 @@ def test_standalone_application_path_bubbles_hitl_through_rebuild_cycle():
     child_runnable = child_assistant.runnable()
 
     fake_client = FakeApplicationClient(child_runnable)
+    leaked_child_dispatcher = object()
 
     parent_tool = Application(
         name='child_graph',
@@ -945,6 +946,9 @@ def test_standalone_application_path_bubbles_hitl_through_rebuild_cycle():
             'application_id': 99,
             'application_version_id': 1,
             'is_subgraph': True,        # registered True; _run forces False
+            # Simulate a future args-forwarding refactor. The nested rebuild
+            # must still enforce the supported hybrid execution boundary.
+            'child_dispatcher': leaked_child_dispatcher,
         },
     )
 
@@ -982,6 +986,7 @@ def test_standalone_application_path_bubbles_hitl_through_rebuild_cycle():
     # a root LangGraphAgentRunnable, not a CompiledStateGraph subgraph).
     assert len(fake_client.application_calls) == 1
     assert fake_client.application_calls[0]['kwargs']['is_subgraph'] is False
+    assert fake_client.application_calls[0]['kwargs']['child_dispatcher'] is None
 
     assert initial_result['execution_finished'] is False
     assert initial_result['hitl_interrupt']['tool_name'] == 'create_file'
@@ -1005,6 +1010,7 @@ def test_standalone_application_path_bubbles_hitl_through_rebuild_cycle():
     # Rebuild branch fires again on resume (Application._run re-runs).
     assert len(fake_client.application_calls) == 2
     assert fake_client.application_calls[1]['kwargs']['is_subgraph'] is False
+    assert fake_client.application_calls[1]['kwargs']['child_dispatcher'] is None
 
     # Side-effecting tool ran exactly once across the pause/resume cycle.
     assert len(executed) == 1

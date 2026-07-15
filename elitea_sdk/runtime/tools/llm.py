@@ -3,7 +3,7 @@ import contextvars
 import json
 import logging
 from traceback import format_exc
-from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING
+from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.exceptions import OutputParserException
@@ -36,6 +36,13 @@ from ..langchain.utils import (
 )
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from .hitl import (
+    HITL_INTERRUPT_ID_KEY,
+    HITL_NESTED_INTERRUPT_ID_KEY,
+    HITL_TOOL_CALL_ID_KEY,
+    HITL_VIA_CALL_ID_KEY,
+    PendingHITLEntry,
+)
 from .skill_tools import (
     LoadSkillTool,
     build_load_skill_tools,
@@ -2393,8 +2400,8 @@ class LLMNode(BaseTool):
         decisions_by_id = {}
         grandchild_decisions_by_via_id: Dict[str, list] = {}
         for decision in (hitl_decisions or []):
-            tcid = decision.get('tool_call_id')
-            via_id = decision.get('_via_call_id')
+            tcid = decision.get(HITL_TOOL_CALL_ID_KEY)
+            via_id = decision.get(HITL_VIA_CALL_ID_KEY)
             if via_id:
                 grandchild_decisions_by_via_id.setdefault(via_id, []).append(decision)
             elif tcid:
@@ -2439,17 +2446,17 @@ class LLMNode(BaseTool):
                 _forwarded = []
                 for _d in grandchild_decisions:
                     _d2 = dict(_d)
-                    _d2.pop('_via_call_id', None)
+                    _d2.pop(HITL_VIA_CALL_ID_KEY, None)
                     # The root aggregate exposes a root-scoped public id, while
                     # this container's own checkpoint stores its original
                     # child-scoped id. Restore that inner public id as the route
                     # hop is consumed so the child's checkpoint-authoritative
                     # hydration can validate the decision.
                     _nested_interrupt_id = _d2.pop(
-                        '_nested_interrupt_id', None,
+                        HITL_NESTED_INTERRUPT_ID_KEY, None,
                     )
                     if _nested_interrupt_id:
-                        _d2['interrupt_id'] = _nested_interrupt_id
+                        _d2[HITL_INTERRUPT_ID_KEY] = _nested_interrupt_id
                     _forwarded.append(_d2)
                 child_config['configurable']['__hitl_parallel_resume__'] = {
                     'decisions': _forwarded,
@@ -2521,7 +2528,7 @@ class LLMNode(BaseTool):
         # preserving its original tool_call_id and stamping `_via_call_id` with
         # THIS level's container id so a later resume can be regrouped and
         # routed back down (see the grandchild_decisions_by_via_id map above).
-        pending_payload = []
+        pending_payload: list[PendingHITLEntry] = []
         for spec, sentinel in pending_deferred:
             _tn, _ta, tool_call_id, _tool = spec
             nested_aggregate = sentinel.get('hitl_interrupt') or {}
@@ -2531,21 +2538,23 @@ class LLMNode(BaseTool):
                 for leaf_index, leaf_entry in enumerate(nested_pending):
                     if not isinstance(leaf_entry, dict):
                         continue
-                    flat_entry = dict(leaf_entry)
+                    flat_entry = cast(PendingHITLEntry, dict(leaf_entry))
                     # Leaf's own tool_call_id is preserved as-is (NOT
                     # overwritten with the container's id) — the UI card and
                     # the eventual resume decision both key off the leaf id.
-                    flat_entry['_via_call_id'] = tool_call_id
-                    if flat_entry.get('interrupt_id'):
-                        flat_entry['_nested_interrupt_id'] = flat_entry[
-                            'interrupt_id'
+                    flat_entry[HITL_VIA_CALL_ID_KEY] = tool_call_id
+                    if flat_entry.get(HITL_INTERRUPT_ID_KEY):
+                        flat_entry[HITL_NESTED_INTERRUPT_ID_KEY] = flat_entry[
+                            HITL_INTERRUPT_ID_KEY
                         ]
-                    nested_interrupt_id = flat_entry.get('_nested_interrupt_id')
-                    flat_entry['interrupt_id'] = self._parallel_interrupt_id(
+                    nested_interrupt_id = flat_entry.get(
+                        HITL_NESTED_INTERRUPT_ID_KEY
+                    )
+                    flat_entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
                         tool_call_id,
                         str(
                             nested_interrupt_id
-                            or flat_entry.get('tool_call_id')
+                            or flat_entry.get(HITL_TOOL_CALL_ID_KEY)
                             or flat_entry.get('tool_name')
                             or ''
                         ),
@@ -2554,10 +2563,10 @@ class LLMNode(BaseTool):
                     flat_entry.pop('_pending_messages', None)
                     pending_payload.append(flat_entry)
                 continue
-            entry = dict(nested_aggregate)
-            entry['tool_call_id'] = tool_call_id
-            nested_interrupt_id = nested_aggregate.get('interrupt_id')
-            entry['interrupt_id'] = self._parallel_interrupt_id(
+            entry = cast(PendingHITLEntry, dict(nested_aggregate))
+            entry[HITL_TOOL_CALL_ID_KEY] = tool_call_id
+            nested_interrupt_id = nested_aggregate.get(HITL_INTERRUPT_ID_KEY)
+            entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
                 tool_call_id,
                 str(
                     nested_interrupt_id
