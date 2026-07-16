@@ -6,6 +6,7 @@ import logging
 import re
 import types
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 from langchain_core.messages.base import message_to_dict
 from langchain_core.tools import BaseTool, StructuredTool
@@ -283,6 +284,12 @@ class SensitiveToolGuardMiddleware(Middleware):
 
         interrupt_payload = {
             'type': 'hitl',
+            # Unique per logical sensitive invocation and persisted inside the
+            # LangGraph interrupt checkpoint. Parent aggregate layers derive
+            # their public routing ids from this value, so a later HITL round
+            # for the same wrapper/tool cannot overwrite the prior card or hit
+            # an idempotency tombstone from the previous approval.
+            'interrupt_id': f'hitl_{uuid4().hex}',
             'guardrail_type': 'sensitive_tool',
             'node_name': 'sensitive_tool_guard',
             'message': sensitive_tool_context['policy_message'],

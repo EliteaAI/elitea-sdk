@@ -232,6 +232,97 @@ def test_two_different_subagents_get_isolated_thread_ids():
     assert b.calls[0]['config']['configurable']['thread_id'] == 'shared-parent:writer'
 
 
+def test_sequential_application_call_stamps_non_null_ancestry_call_id():
+    """A single Application call still carries its wrapper tool-call identity.
+
+    The ancestry contract must not depend on the parallel-only private config
+    key; sequential nested UI events need the same stable invocation key.
+    """
+    captured = StaticApplication(output='ok')
+    app = Application(
+        name='analyst', description='child', application=captured,
+        return_type='str', client=None, is_subgraph=True,
+    )
+
+    app.invoke(
+        {'type': 'tool_call', 'name': 'analyst', 'id': 'call-sequential',
+         'args': {'task': 'analyze'}},
+        config={'configurable': {'thread_id': 'parent-thread'}},
+    )
+
+    metadata = captured.calls[0]['config']['metadata']
+    assert metadata['parent_agent_call_id'] == 'call-sequential'
+    assert metadata['parent_agent_path'] == [{
+        'name': 'analyst', 'call_id': 'call-sequential',
+    }]
+
+
+def test_parallel_sibling_ordinal_is_consumed_into_path_not_inherited():
+    captured = StaticApplication(output='ok')
+    app = Application(
+        name='analyst', description='child', application=captured,
+        return_type='str', client=None, is_subgraph=True,
+    )
+
+    app.invoke(
+        {'type': 'tool_call', 'name': 'analyst', 'id': 'call-parallel',
+         'args': {'task': 'analyze'}},
+        config={
+            'configurable': {'thread_id': 'parent-thread'},
+            'metadata': {'sibling_ordinal': 3},
+        },
+    )
+
+    metadata = captured.calls[0]['config']['metadata']
+    assert metadata['parent_agent_path'][-1]['sibling_ordinal'] == 3
+    assert 'sibling_ordinal' not in metadata
+
+
+def test_application_rebuilds_runnable_per_invocation_without_shared_mutation():
+    """Dynamic child variables stay invocation-local under concurrent use."""
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    created = []
+    created_lock = threading.Lock()
+
+    class InvocationRunnable:
+        def __init__(self, task):
+            self.task = task
+
+        def invoke(self, payload, config=None):
+            return {'output': self.task}
+
+    class DynamicClient:
+        def application(self, **kwargs):
+            task = kwargs['application_variables']['task']['value']
+            runnable = InvocationRunnable(task)
+            with created_lock:
+                created.append(runnable)
+            return runnable
+
+    original = StaticApplication(output='must-remain-installed')
+    app = Application(
+        name='dynamic_child', description='child', application=original,
+        return_type='str', client=DynamicClient(), is_subgraph=True,
+        args_runnable={'application_id': 1},
+    )
+    tasks = [f'task-{index}' for index in range(16)]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outputs = list(pool.map(
+            lambda task: app._run(
+                task=task,
+                config={'configurable': {'thread_id': f'parent-{task}'}},
+            )['output'],
+            tasks,
+        ))
+
+    assert outputs == tasks
+    assert len(created) == len(tasks)
+    assert app.application is original
+
+
 # --- G2: result collapse via LLMNode ------------------------------------------
 
 

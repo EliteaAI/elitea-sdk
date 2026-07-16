@@ -299,7 +299,10 @@ class TestHitlBubbleUp:
             "hitl_interrupt": hitl_payload,
         }
 
-        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+        config = {
+            "configurable": {"thread_id": "t1"},
+            "metadata": {"parent_agent_call_id": "call-child-original"},
+        }
 
         with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
             mock_interrupt.side_effect = GraphInterrupt([{"value": hitl_payload}])
@@ -313,6 +316,7 @@ class TestHitlBubbleUp:
             assert called_payload["tool_name"] == "jira_create_issue"
             assert called_payload["_parent_tool_name"] == "ChildAgent"
             assert called_payload["_parent_tool_args"] == {"task": "do work"}
+            assert called_payload["_parent_tool_call_id"] == "call-child-original"
 
     def test_resume_routes_to_child(self):
         """On resume, interrupt() returns the user's decision which is
@@ -334,7 +338,10 @@ class TestHitlBubbleUp:
             {"output": "Ticket created", "execution_finished": True},
         ]
 
-        config = {"configurable": {"thread_id": "t1"}, "metadata": {}}
+        config = {
+            "configurable": {"thread_id": "t1"},
+            "metadata": {"parent_agent_call_id": "call-child-original"},
+        }
         resume_value = {"action": "approve", "value": ""}
 
         with patch("elitea_sdk.runtime.tools.application.interrupt") as mock_interrupt:
@@ -345,6 +352,7 @@ class TestHitlBubbleUp:
         assert called_payload["tool_name"] == "jira_create_issue"
         assert called_payload["_parent_tool_name"] == "ChildAgent"
         assert called_payload["_parent_tool_args"] == {"task": "do work"}
+        assert called_payload["_parent_tool_call_id"] == "call-child-original"
 
         assert mock_app.invoke.call_count == 2
         resume_call_args = mock_app.invoke.call_args_list[1]

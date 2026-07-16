@@ -3,7 +3,8 @@ import contextvars
 import json
 import logging
 from traceback import format_exc
-from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING
+from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING, cast
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
@@ -35,6 +36,13 @@ from ..langchain.utils import (
 )
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from .hitl import (
+    HITL_INTERRUPT_ID_KEY,
+    HITL_NESTED_INTERRUPT_ID_KEY,
+    HITL_TOOL_CALL_ID_KEY,
+    HITL_VIA_CALL_ID_KEY,
+    PendingHITLEntry,
+)
 from .skill_tools import (
     LoadSkillTool,
     build_load_skill_tools,
@@ -1346,8 +1354,8 @@ class LLMNode(BaseTool):
             # len(scratchpad.resume) (positional, prior rounds) + 1 (this cycle's
             # null). Consume them all here so the aggregate interrupt() lands past
             # them and actually raises. Child decisions ride the SEPARATE
-            # `hitl_decisions` state channel, so consuming the parent's resume
-            # values never robs a child of its answer.
+            # invocation-scoped `hitl_decisions` resume context, so consuming the
+            # parent's resume values never robs a child of its answer.
             scratchpad = configurable.get(_SCRATCHPAD_KEY)
             n_positional = (
                 len(scratchpad.resume)
@@ -1361,13 +1369,28 @@ class LLMNode(BaseTool):
                     has_null = scratchpad.get_null_resume(False) is not None
                 except Exception:  # pragma: no cover - defensive
                     has_null = False
-            n_prior = n_positional + (1 if has_null else 0)
+            # A true Application fan-out resumes its children from the
+            # invocation-scoped decision list; its next aggregate interrupt
+            # must therefore advance past the current Command null resume too.
+            # A sequential A -> B bridge for a raw aggregate bubbled from inside
+            # B is different (even if the saved assistant turn also contained a
+            # regular tool). Application._run
+            # must consume the current Command value itself and forward the
+            # complete decision list to B. Eating that null here strands B at
+            # its old checkpoint and makes the leaves replay one by one.
+            consume_current_null = not hitl_ctx.get(
+                'sequential_application_bridge', False,
+            )
+            n_prior = n_positional + (
+                1 if has_null and consume_current_null else 0
+            )
             if n_prior:
                 logger.info(
                     "[HITL] Consuming %d pending parent resume value(s) before "
                     "parallel sub-agent re-fanout (multi-round): %d positional "
                     "+ %d null",
-                    n_prior, n_positional, 1 if has_null else 0,
+                    n_prior, n_positional,
+                    1 if has_null and consume_current_null else 0,
                 )
                 for _i in range(n_prior):
                     try:
@@ -1471,7 +1494,15 @@ class LLMNode(BaseTool):
         # Handle both tool-calling and regular responses
         if hasattr(completion, 'tool_calls') and completion.tool_calls:
             # Handle iterative tool-calling and execution
-            hitl_decisions = state.get('hitl_decisions') if isinstance(state, dict) else None
+            # The invocation-scoped resume context carries checkpoint-hydrated
+            # private routing fields. Prefer it over the durable audit channel so
+            # `_via_call_id` / `_nested_interrupt_id` never need to be persisted
+            # in graph state or surfaced with ordinary state values.
+            hitl_decisions = (
+                hitl_ctx.get('hitl_decisions')
+                if hitl_ctx and isinstance(hitl_ctx.get('hitl_decisions'), list)
+                else state.get('hitl_decisions') if isinstance(state, dict) else None
+            )
 
             # __perform_tool_calling deduplicates the completion against
             # `messages` internally (multi-tool sibling HITL resume case),
@@ -1502,6 +1533,7 @@ class LLMNode(BaseTool):
                 # checkpoint to assemble ToolMessages and continue the loop.
                 output_msgs['parallel_tasks'] = {
                     'parked': True,
+                    'dispatch_epoch': parked_holder.get('dispatch_epoch'),
                     'children': parked_holder.get('children', {}),
                 }
                 return output_msgs
@@ -2221,17 +2253,31 @@ class LLMNode(BaseTool):
         carries NO live tool object — only the identity pylon_main needs to spawn
         the child and the SDK needs to read its checkpoint back on reconcile.
 
-        The derived ``child_thread_id`` MUST match the in-process scheme in
-        ``application.py`` (``f"{parent}:{name}:{call_id}"``) so the reconcile
-        pass reads each child from the exact checkpoint the child wrote.
+        The durable ``child_thread_id`` includes the persisted dispatch epoch so
+        a provider that reuses tool-call ids on a later turn cannot reopen an old
+        child checkpoint.
         """
         configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
         parent_thread_id = configurable.get('thread_id')
+        metadata = config.get('metadata', {}) if isinstance(config, dict) else {}
+        call_ids = [str(spec[2] or '') for spec in app_specs]
+        if any(not call_id for call_id in call_ids) or len(set(call_ids)) != len(call_ids):
+            logger.warning(
+                "[PARALLEL] durable dispatch requires unique non-empty tool-call ids; "
+                "falling back to in-process gather",
+            )
+            return None
+        # One random generation per fan-out, persisted in parallel_tasks. It is
+        # stable for retries of this park but distinct across fresh turns even if
+        # a provider reuses the same tool-call ids on the same parent thread.
+        dispatch_epoch = f"dispatch_{uuid4().hex}"
+        inherited_path = metadata.get('parent_agent_path')
+        inherited_path = list(inherited_path) if isinstance(inherited_path, list) else []
         specs = {}
         for index, (tool_name, tool_args, tool_call_id, tool) in enumerate(app_specs):
             app_name = getattr(tool, 'name', None) or tool_name
             child_thread_id = (
-                f"{parent_thread_id}:{app_name}:{tool_call_id}"
+                f"{parent_thread_id}:{dispatch_epoch}:{app_name}:{tool_call_id}"
                 if parent_thread_id else None
             )
             # Display label for the UI card, mirroring the gather aggregate's
@@ -2252,11 +2298,16 @@ class LLMNode(BaseTool):
             runnable = getattr(tool, 'args_runnable', None) or {}
             specs[tool_call_id] = self._jsonsafe_spec({
                 'tool_call_id': tool_call_id,
+                'parent_agent_call_id': tool_call_id,
+                'parent_agent_path': inherited_path,
+                'dispatch_epoch': dispatch_epoch,
+                'dispatch_id': f'{dispatch_epoch}:{tool_call_id}',
                 'name': app_name,
                 'display_name': display_name,
                 'input': tool_args,
                 'child_thread_id': child_thread_id,
                 'index': index,
+                'sibling_ordinal': index + 1,
                 'application_id': runnable.get('application_id'),
                 'application_version_id': runnable.get('application_version_id'),
                 'version_details': runnable.get('version_details'),
@@ -2285,6 +2336,23 @@ class LLMNode(BaseTool):
                 return value
             return None
         return _coerce(spec)
+
+    @staticmethod
+    def _parallel_interrupt_id(
+        container_call_id: str, leaf_call_id: str, _ordinal: int | None,
+    ) -> str:
+        """Return a stable public id unique within a flattened HITL aggregate.
+
+        Leaf tool-call ids are only graph-local and can legitimately repeat in
+        sibling sub-orchestrators. Scope them by the immediate container call,
+        then expose only the opaque UUID-derived value to clients.
+        """
+        # The immediate container scopes graph-local leaf identities. Do not
+        # include the pending-list ordinal: after one sibling resolves, the
+        # surviving card is re-emitted at a different position and must retain
+        # the public id already shown to the client.
+        route = f"{container_call_id}\x1f{leaf_call_id}"
+        return f"hitl_{uuid5(NAMESPACE_URL, route).hex}"
 
     async def _run_parallel_application_calls(
         self, app_specs, new_messages, config, hitl_decisions=None,
@@ -2319,26 +2387,79 @@ class LLMNode(BaseTool):
 
         # Map prior decisions (this turn's resume) by the PARENT Application
         # tool_call_id so each paused child resumes from its own checkpoint.
+        #
+        # #5778 depth-3: a decision may instead target a GRANDCHILD (a leaf
+        # paused two levels down, under one of THIS level's containers). Such
+        # a decision's own tool_call_id is the leaf's id (never one of THIS
+        # level's immediate children), but it carries `_via_call_id` pointing
+        # at the immediate container it must be routed through. Group those
+        # separately so each container gets its OWN sub-list of grandchild
+        # decisions instead of being silently skipped (the original bug: the
+        # root's decisions_by_id could never match a container id when every
+        # decision was keyed by a leaf id).
         decisions_by_id = {}
+        grandchild_decisions_by_via_id: Dict[str, list] = {}
         for decision in (hitl_decisions or []):
-            tcid = decision.get('tool_call_id')
-            if tcid:
+            tcid = decision.get(HITL_TOOL_CALL_ID_KEY)
+            via_id = decision.get(HITL_VIA_CALL_ID_KEY)
+            if via_id:
+                grandchild_decisions_by_via_id.setdefault(via_id, []).append(decision)
+            elif tcid:
                 decisions_by_id[tcid] = decision
 
         loop = asyncio.get_running_loop()
 
-        async def _run_one(spec):
+        async def _run_one(sibling_ordinal, spec):
             tool_name, tool_args, tool_call_id, tool = spec
             envelope = {"type": "tool_call", "id": tool_call_id, "args": tool_args, "name": tool_name}
             child_config = dict(config)
             child_config['configurable'] = dict(config.get('configurable', {}))
+            child_config['metadata'] = dict(config.get('metadata', {}))
+            child_config['metadata']['sibling_ordinal'] = sibling_ordinal
             decision = decisions_by_id.get(tool_call_id)
+            grandchild_decisions = grandchild_decisions_by_via_id.get(tool_call_id)
             if decision is not None:
                 # Resume this child from its checkpoint with the user's decision
                 # (the derived child thread_id is keyed by this tool_call_id).
                 child_config['configurable']['__hitl_parallel_resume__'] = {
                     'action': decision.get('action', 'approve'),
                     'value': decision.get('value', decision.get('user_feedback', '')),
+                }
+            elif grandchild_decisions:
+                # This child is itself a container: its OWN prior pause was a
+                # nested `parallel_sensitive_tools` aggregate (issue #5778). Pass
+                # the whole sub-list through so Application._run can resume the
+                # container's graph with `hitl_decisions` (list) rather than a
+                # single action/value pair — the container's own LLMNode then
+                # re-runs ITS `_run_parallel_application_calls` and routes each
+                # decision to the correct leaf via the existing single-level
+                # `decisions_by_id` machinery one level down.
+                #
+                # CONSUME one hop of the routing chain: `_via_call_id` pointed
+                # this decision at THIS container (call_id == tool_call_id here).
+                # One level down, the decision's own `tool_call_id` (the leaf id)
+                # IS a direct child, so it must land in the container's
+                # `decisions_by_id`, not be re-bucketed as a grandchild. Drop the
+                # now-consumed `_via_call_id` so the child level routes it as a
+                # direct decision. (If depth-4+ is ever supported, this becomes a
+                # stack pop instead of a single strip.)
+                _forwarded = []
+                for _d in grandchild_decisions:
+                    _d2 = dict(_d)
+                    _d2.pop(HITL_VIA_CALL_ID_KEY, None)
+                    # The root aggregate exposes a root-scoped public id, while
+                    # this container's own checkpoint stores its original
+                    # child-scoped id. Restore that inner public id as the route
+                    # hop is consumed so the child's checkpoint-authoritative
+                    # hydration can validate the decision.
+                    _nested_interrupt_id = _d2.pop(
+                        HITL_NESTED_INTERRUPT_ID_KEY, None,
+                    )
+                    if _nested_interrupt_id:
+                        _d2[HITL_INTERRUPT_ID_KEY] = _nested_interrupt_id
+                    _forwarded.append(_d2)
+                child_config['configurable']['__hitl_parallel_resume__'] = {
+                    'decisions': _forwarded,
                 }
             # Deferred mode must stay sticky ACROSS resume, not just on the fresh
             # run. A resumed child whose LLM picks a DIFFERENT sensitive tool on
@@ -2362,7 +2483,8 @@ class LLMNode(BaseTool):
         # below. return_exceptions keeps one child's failure from cancelling the
         # rest (per-child isolation, issue #4993).
         results = await asyncio.gather(
-            *[_run_one(spec) for spec in app_specs], return_exceptions=True,
+            *[_run_one(index + 1, spec) for index, spec in enumerate(app_specs)],
+            return_exceptions=True,
         )
 
         pending_deferred = []
@@ -2393,11 +2515,69 @@ class LLMNode(BaseTool):
         # Build ONE aggregated interrupt for all paused children. Each entry is
         # the single-shape sensitive-tool payload, re-keyed to the PARENT
         # Application tool_call_id so the resume decision routes back here.
-        pending_payload = []
+        #
+        # #5778 depth-3: a paused child can ITSELF be a container whose own
+        # pause was already a `parallel_sensitive_tools` aggregate (its own
+        # leaves paused underneath it). Flattening that nested aggregate to a
+        # single entry keyed by the container's tool_call_id (old behaviour)
+        # would overwrite the leaf's own tool_call_id and permanently sever the
+        # UI-displayed card's id from the id the resume decision must target —
+        # decisions_by_id (below, on this container's NEXT resume) would then
+        # never match, and the leaf's pause could never be answered. Instead,
+        # surface each nested leaf entry as its OWN top-level pending item,
+        # preserving its original tool_call_id and stamping `_via_call_id` with
+        # THIS level's container id so a later resume can be regrouped and
+        # routed back down (see the grandchild_decisions_by_via_id map above).
+        pending_payload: list[PendingHITLEntry] = []
         for spec, sentinel in pending_deferred:
             _tn, _ta, tool_call_id, _tool = spec
-            entry = dict(sentinel.get('hitl_interrupt') or {})
-            entry['tool_call_id'] = tool_call_id
+            nested_aggregate = sentinel.get('hitl_interrupt') or {}
+            nested_pending = nested_aggregate.get('pending')
+            if isinstance(nested_pending, list) and nested_pending:
+                # The paused child is itself a container: unpack its leaves.
+                for leaf_index, leaf_entry in enumerate(nested_pending):
+                    if not isinstance(leaf_entry, dict):
+                        continue
+                    flat_entry = cast(PendingHITLEntry, dict(leaf_entry))
+                    # Leaf's own tool_call_id is preserved as-is (NOT
+                    # overwritten with the container's id) — the UI card and
+                    # the eventual resume decision both key off the leaf id.
+                    flat_entry[HITL_VIA_CALL_ID_KEY] = tool_call_id
+                    if flat_entry.get(HITL_INTERRUPT_ID_KEY):
+                        flat_entry[HITL_NESTED_INTERRUPT_ID_KEY] = flat_entry[
+                            HITL_INTERRUPT_ID_KEY
+                        ]
+                    nested_interrupt_id = flat_entry.get(
+                        HITL_NESTED_INTERRUPT_ID_KEY
+                    )
+                    flat_entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
+                        tool_call_id,
+                        str(
+                            nested_interrupt_id
+                            or flat_entry.get(HITL_TOOL_CALL_ID_KEY)
+                            or flat_entry.get('tool_name')
+                            or ''
+                        ),
+                        None if nested_interrupt_id else leaf_index,
+                    )
+                    flat_entry.pop('_pending_messages', None)
+                    pending_payload.append(flat_entry)
+                continue
+            entry = cast(PendingHITLEntry, dict(nested_aggregate))
+            entry[HITL_TOOL_CALL_ID_KEY] = tool_call_id
+            nested_interrupt_id = nested_aggregate.get(HITL_INTERRUPT_ID_KEY)
+            entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
+                tool_call_id,
+                str(
+                    nested_interrupt_id
+                    or ':'.join(filter(None, (
+                        tool_call_id,
+                        nested_aggregate.get('tool_name'),
+                        nested_aggregate.get('message'),
+                    )))
+                ),
+                None if nested_interrupt_id else len(pending_payload),
+            )
             # Label the paused card with the sub-agent it originated from so the
             # UI can group N stacked approvals by sub-agent name (issue #4993).
             # Falls back to the call name when metadata is absent.
@@ -2524,14 +2704,19 @@ class LLMNode(BaseTool):
                 # today's in-process gather (Track 1 baseline, CLI/tests intact).
                 if self.child_dispatcher is not None and parked_holder is not None:
                     children = self._build_parallel_dispatch_specs(app_specs, config)
-                    parked_holder['parked'] = True
-                    parked_holder['children'] = children
-                    logger.info(
-                        "[PARALLEL] child_dispatcher present — parking %d sub-agent(s) "
-                        "for durable dispatch instead of in-process gather", len(children),
-                    )
-                    _PENDING_TOOL_MESSAGES.set([])
-                    return new_messages, current_completion
+                    if children is not None:
+                        parked_holder['parked'] = True
+                        parked_holder['children'] = children
+                        parked_holder['dispatch_epoch'] = next(
+                            (spec.get('dispatch_epoch') for spec in children.values()),
+                            None,
+                        )
+                        logger.info(
+                            "[PARALLEL] child_dispatcher present — parking %d sub-agent(s) "
+                            "for durable dispatch instead of in-process gather", len(children),
+                        )
+                        _PENDING_TOOL_MESSAGES.set([])
+                        return new_messages, current_completion
                 try:
                     await self._run_parallel_application_calls(
                         app_specs, new_messages, config,

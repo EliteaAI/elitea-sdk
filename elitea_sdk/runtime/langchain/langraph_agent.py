@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Union, Any, Optional, Annotated, get_type_hints
+from typing import Union, Any, Optional, Annotated, get_type_hints, cast
 from uuid import uuid4
 from typing import Dict
 
@@ -32,7 +32,13 @@ from .utils import (
 )
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
 from ..tools.function import FunctionTool, PIPELINE_BLOCKED_KEY
-from ..tools.hitl import HITLNode
+from ..tools.hitl import (
+    HITLNode,
+    HITL_INTERRUPT_ID_KEY,
+    HITL_PRIVATE_ROUTING_KEYS,
+    HITL_TOOL_CALL_ID_KEY,
+    PendingHITLEntry,
+)
 from ..tools.indexer_tool import IndexerNode
 from ..tools.llm import LLMNode
 from ..tools.loop import LoopNode
@@ -1838,6 +1844,37 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # Check for HITL dynamic interrupt - these have interrupt payloads in state
                 hitl_interrupt = self._get_hitl_interrupt(checkpoint_state)
 
+                # A parked parent already handed its immutable roster to the
+                # durable dispatcher. Ordinary input (including a duplicated
+                # transport delivery) must not run the graph or advertise that
+                # roster again; only the matching reconcile epoch may consume
+                # it. pylon_main keeps the original message open meanwhile.
+                checkpoint_values = (
+                    checkpoint_state.values
+                    if hasattr(checkpoint_state, 'values') and checkpoint_state.values
+                    else {}
+                )
+                parked_parallel = checkpoint_values.get('parallel_tasks') or {}
+                if (
+                    isinstance(parked_parallel, dict)
+                    and parked_parallel.get('parked')
+                    and not self._is_parallel_reconcile(input)
+                ):
+                    logger.info(
+                        "[PARALLEL] thread %s is already parked; ignoring "
+                        "non-reconcile delivery", thread_id,
+                    )
+                    return {
+                        "output": None,
+                        "thread_id": thread_id,
+                        "execution_finished": False,
+                        "parallel_parked": True,
+                        "parallel_waiting": True,
+                        "dispatch_epoch": parked_parallel.get('dispatch_epoch'),
+                        "parallel_dispatch": [],
+                        "messages": checkpoint_values.get('messages', []),
+                    }
+
                 # ── Stale HITL detection ────────────────────────────────
                 # A pending HITL interrupt exists but the incoming message
                 # is NOT an HITL resume action.  This means the user
@@ -1892,13 +1929,20 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # sub-agent results.
                     epoch = (input.pop('parallel_reconcile', None)
                              or config.get('configurable', {}).get('parallel_reconcile'))
+                    terminal_errors = input.pop('parallel_terminal_errors', None) or {}
                     logger.info(
                         "[PARALLEL] reconcile epoch=%s for thread %s — "
                         "assembling settled child results", epoch, thread_id,
                     )
                     result = self._resume_parallel_reconcile(
-                        config, thread_id, *args, **kwargs
+                        config, thread_id, epoch, *args,
+                        terminal_errors=terminal_errors,
+                        **kwargs
                     )
+                    if isinstance(result, dict) and result.pop(
+                        '_parallel_reconcile_noop', False,
+                    ):
+                        return result
                     # Read the LATEST checkpoint (the reconcile continuation)
                     # below, not the stale parked one.
                     config.get('configurable', {}).pop('checkpoint_id', None)
@@ -1930,7 +1974,15 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             'tool_name': ctx_tool_name,
                             'toolkit_name': ctx_toolkit_name,
                             'tool_args': tool_args if isinstance(tool_args, dict) else {},
-                            'tool_call_id': f"call_{uuid4().hex[:24]}",
+                            # A bubbled child pause must resume the SAME parent
+                            # Application invocation. Minting a fresh id on each
+                            # approval re-fires the suborchestrator under a new
+                            # UI/checkpoint identity and can replay completed
+                            # leaf work from the beginning.
+                            'tool_call_id': (
+                                hitl_interrupt.get('_parent_tool_call_id')
+                                or f"call_{uuid4().hex[:24]}"
+                            ),
                             'action': hitl_resume_value.get('action', 'approve'),
                             'value': hitl_resume_value.get('value', ''),
                         }
@@ -1971,6 +2023,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         # captured them as '_pending_messages' in the interrupt
                         # payload.  Inject them into graph state now so the
                         # re-executed LLMNode sees the full conversation.
+                        # The raw interrupt payload is part of the durable paused
+                        # checkpoint and survives runnable/process reconstruction.
+                        # Do not mutate a paused graph with update_state merely to
+                        # copy this data into another channel: that creates a newer
+                        # checkpoint without the interrupt task and breaks resume.
                         pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
                         if pending_msgs_dicts:
                             # Remove the trailing AIMessage that triggered the
@@ -2013,7 +2070,6 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
-
                     elif guardrail_type == 'parallel_sensitive_tools':
                         # Parallel sub-agent fan-out resume (issue #4993).
                         # The aggregate interrupt paused N children at once; the
@@ -2027,6 +2083,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         decisions = hitl_resume_value.get('hitl_decisions') or []
                         if not isinstance(decisions, list):
                             decisions = []
+                        decisions = self._hydrate_parallel_hitl_decisions(
+                            decisions, hitl_interrupt,
+                        )
+                        # Command(resume=...) and the durable audit write below
+                        # must both use the checkpoint-authoritative route.  The
+                        # client never needs to receive or echo `_via_call_id`.
+                        hitl_resume_value['hitl_decisions'] = decisions
 
                         pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
                         original_ai_dict = self._extract_last_ai_message_dict(pending_msgs_dicts)
@@ -2041,6 +2104,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             'content': (original_ai_dict or {}).get('content', '')
                                 if isinstance(original_ai_dict, dict) else '',
                             'hitl_decisions': list(decisions),
+                            # Application._run stamps bubbled child aggregates.
+                            # In that sequential bridge the wrapper's own
+                            # interrupt() must consume the current Command value;
+                            # a true root fan-out consumes it in LLMNode instead.
+                            'sequential_application_bridge': bool(
+                                hitl_interrupt.get('_parent_tool_name')
+                            ),
                         }
                         if original_ai_dict is not None:
                             resume_ctx['original_ai_message'] = original_ai_dict
@@ -2050,14 +2120,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 resume_ctx['pending_messages'] = trimmed
                         hitl_resume_ctx = resume_ctx
                         config['configurable']['_hitl_resume_context'] = resume_ctx
-
                         # Persist each per-child decision to state for the
                         # blocked-tool set + audit trail (reducer appends).
                         persisted = []
                         for d in decisions:
                             if not isinstance(d, dict):
                                 continue
-                            persisted.append({
+                            entry = {
                                 'tool_name': d.get('tool_name', ''),
                                 'toolkit_name': d.get('toolkit_name', ''),
                                 'toolkit_type': d.get('toolkit_type', ''),
@@ -2065,7 +2134,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 'action_label': d.get('action_label', ''),
                                 'user_feedback': d.get('value', ''),
                                 'tool_call_id': d.get('tool_call_id', ''),
-                            })
+                                'interrupt_id': d.get('interrupt_id', ''),
+                            }
+                            # Private routing stays in `_hitl_resume_context` for
+                            # this invocation. The durable state channel is an
+                            # audit record and must not expose checkpoint routes.
+                            persisted.append(entry)
                         if persisted:
                             self.update_state(config, {'hitl_decisions': persisted})
                         logger.info(
@@ -2299,6 +2373,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         _parked = _pt_state.get('parallel_tasks') or {}
         if isinstance(_parked, dict) and _parked.get('parked'):
             children = _parked.get('children') or {}
+            dispatch_epoch = _parked.get('dispatch_epoch')
             logger.info(
                 "[PARALLEL] parent parked with %d child(ren) for durable dispatch "
                 "(thread_id=%s)", len(children), thread_id,
@@ -2308,6 +2383,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 "thread_id": thread_id,
                 "execution_finished": False,
                 "parallel_parked": True,
+                "dispatch_epoch": dispatch_epoch,
                 "parallel_dispatch": list(children.values()),
                 "messages": _pt_state.get('messages', []),
             }
@@ -2406,14 +2482,15 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         independent durable task (a separate fork-pool process) but wrote to the
         SAME checkpointer keyed by ``child_thread_id``, so the parent reads it
         back here — NOT from the ephemeral arbiter result. Returns
-        ``(status, output)`` where status is ``'completed' | 'paused' | 'missing'``.
+        ``(status, output)`` where status is
+        ``'completed' | 'paused' | 'missing' | 'unreadable'``.
         Output is taken from an explicit ``output`` channel when present, else
         from the last non-Human message — mirroring how the runnable derives a
         run's output, so it is robust whether or not ``output`` is a declared
         state channel.
         """
         if not child_thread_id or not self.checkpointer:
-            return 'missing', None
+            return 'unreadable', None
         child_config = {'configurable': {'thread_id': child_thread_id}}
         try:
             child_state = self.get_state(child_config)
@@ -2422,7 +2499,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 "[PARALLEL] reconcile: failed to read child checkpoint %s: %s",
                 child_thread_id, e,
             )
-            return 'missing', None
+            return 'unreadable', None
         values = child_state.values if (hasattr(child_state, 'values') and child_state.values) else {}
         if not values:
             return 'missing', None
@@ -2445,7 +2522,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             )
         return 'completed', output
 
-    def _assemble_parallel_reconcile(self, config):
+    def _assemble_parallel_reconcile(self, config, terminal_errors=None):
         """Build ToolMessages for a parked parent's settled children (#4993).
 
         Reads the parent checkpoint's ``parallel_tasks`` channel for the child
@@ -2464,23 +2541,56 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         ordered = sorted(children.values(), key=lambda c: c.get('index', 0))
         tool_messages = []
         all_terminal = True
+        terminal_errors = terminal_errors if isinstance(terminal_errors, dict) else {}
         for spec in ordered:
             tool_call_id = spec.get('tool_call_id')
-            status, output = self._read_child_result(spec.get('child_thread_id'))
+            child_thread_id = spec.get('child_thread_id')
+            status, output = self._read_child_result(child_thread_id)
             if status == 'paused':
+                # A real checkpoint pause is authoritative. A stale/error side
+                # channel must never convert an actionable HITL pause to failure.
                 all_terminal = False
-            if status == 'missing':
-                output = (
-                    f"Sub-agent '{spec.get('display_name') or spec.get('name')}' "
-                    "produced no result."
+                logger.warning(
+                    "[PARALLEL] reconcile: child '%s' remains paused",
+                    spec.get('display_name') or spec.get('name'),
                 )
+                continue
+            if status != 'completed':
+                terminal_error = terminal_errors.get(child_thread_id)
+                if terminal_error:
+                    error_text = (
+                        terminal_error.get('error')
+                        if isinstance(terminal_error, dict)
+                        else str(terminal_error)
+                    )
+                    tool_messages.append(ToolMessage(
+                        content=json.dumps(
+                            {'error': error_text or 'Parallel child failed'},
+                            ensure_ascii=False,
+                        ),
+                        tool_call_id=tool_call_id,
+                    ))
+                    logger.warning(
+                        "[PARALLEL] reconcile: child '%s' failed terminally; "
+                        "forwarding an error ToolMessage",
+                        spec.get('display_name') or spec.get('name'),
+                    )
+                    continue
+                all_terminal = False
+                logger.warning(
+                    "[PARALLEL] reconcile: child '%s' is %s; parent remains parked",
+                    spec.get('display_name') or spec.get('name'), status,
+                )
+                continue
             tool_messages.append(ToolMessage(
                 content=output if output is not None else '',
                 tool_call_id=tool_call_id,
             ))
         return tool_messages, all_terminal
 
-    def _resume_parallel_reconcile(self, config, thread_id, *args, **kwargs):
+    def _resume_parallel_reconcile(
+        self, config, thread_id, epoch, *args, terminal_errors=None, **kwargs,
+    ):
         """Re-enter a parked parent after its children settled (#4993).
 
         Appends one ToolMessage per child (assembled from child checkpoints),
@@ -2491,19 +2601,76 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         re-run the agent. ``_tool_call_already_completed`` in the LLMNode skips
         any duplicate tool_calls the LLM might re-emit, so re-entry is safe.
         """
-        tool_messages, all_terminal = self._assemble_parallel_reconcile(config)
+        parent_state = self.get_state(config)
+        values = parent_state.values if (hasattr(parent_state, 'values') and parent_state.values) else {}
+        parked = values.get('parallel_tasks') or {}
+        expected_epoch = parked.get('dispatch_epoch')
+        is_parked = bool(parked.get('parked'))
+        if not is_parked or not expected_epoch:
+            logger.info(
+                "[PARALLEL] reconcile ignored for non-parked thread %s "
+                "(received=%s last=%s)",
+                thread_id, epoch, parked.get('last_reconciled_epoch'),
+            )
+            return self._parallel_reconcile_noop_result(
+                config, thread_id, waiting=False,
+            )
+        if str(epoch) != str(expected_epoch):
+            logger.warning(
+                "[PARALLEL] reconcile epoch mismatch for thread %s: expected=%s received=%s",
+                thread_id, expected_epoch, epoch,
+            )
+            return self._parallel_reconcile_noop_result(
+                config, thread_id, waiting=True,
+            )
+
+        tool_messages, all_terminal = self._assemble_parallel_reconcile(
+            config, terminal_errors=terminal_errors,
+        )
         logger.info(
             "[PARALLEL] reconcile: assembled %d child ToolMessage(s) "
             "(all_terminal=%s) for thread %s",
             len(tool_messages), all_terminal, thread_id,
         )
+        if not all_terminal:
+            # Reconcile is retryable. Never clear ``parallel_tasks`` or append a
+            # partial result set while any child is paused, absent, or could not
+            # be read from the durable checkpointer.
+            return self._parallel_reconcile_noop_result(
+                config, thread_id, waiting=True,
+            )
         entry_node = self._parallel_reconcile_entry_node()
         self.update_state(
             config,
-            {'messages': tool_messages, 'parallel_tasks': None},
+            {
+                'messages': tool_messages,
+                'parallel_tasks': {
+                    'parked': False,
+                    'dispatch_epoch': None,
+                    'children': {},
+                    'last_reconciled_epoch': expected_epoch,
+                },
+            },
             as_node=entry_node,
         )
         return super().invoke(None, config=config, *args, **kwargs)
+
+    def _parallel_reconcile_noop_result(self, config, thread_id, *, waiting):
+        """Return current durable state without executing or re-advertising children."""
+        state = self.get_state(config)
+        values = state.values if (hasattr(state, 'values') and state.values) else {}
+        parked = values.get('parallel_tasks') or {}
+        return {
+            '_parallel_reconcile_noop': True,
+            'output': values.get('output'),
+            'thread_id': thread_id if waiting else None,
+            'execution_finished': not waiting,
+            'parallel_parked': waiting,
+            'parallel_waiting': True,
+            'dispatch_epoch': parked.get('dispatch_epoch'),
+            'parallel_dispatch': [],
+            'messages': values.get('messages', []),
+        }
 
     def _parallel_reconcile_entry_node(self):
         """Node to attribute the reconcile state update to (#4993).
@@ -2563,10 +2730,100 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             return [p for p in pending if isinstance(p, dict)]
         return [interrupt_value]
 
+    @staticmethod
+    def _hydrate_parallel_hitl_decisions(
+        decisions: list, interrupt_value: dict,
+    ) -> list[dict]:
+        """Restore private nested routes from the authoritative checkpoint.
+
+        ``interrupt_id`` is public and unique within one aggregate.  The
+        ``_via_call_id`` routing hop is deliberately private: accepting it from
+        the UI couples transport payloads to graph internals and fails when two
+        sibling graphs reuse the same leaf ``tool_call_id``.  Legacy clients that
+        omit ``interrupt_id`` are supported only when their tool-call id matches
+        exactly one pending entry.
+        """
+        pending = interrupt_value.get('pending') or []
+        pending = [
+            cast(PendingHITLEntry, p)
+            for p in pending
+            if isinstance(p, dict)
+        ]
+        by_interrupt_id = {
+            p.get(HITL_INTERRUPT_ID_KEY): p
+            for p in pending
+            if p.get(HITL_INTERRUPT_ID_KEY)
+        }
+        by_tool_call_id: dict[str, list[PendingHITLEntry]] = {}
+        for entry in pending:
+            tool_call_id = entry.get(HITL_TOOL_CALL_ID_KEY)
+            if tool_call_id:
+                by_tool_call_id.setdefault(tool_call_id, []).append(entry)
+
+        hydrated = []
+        for raw_decision in decisions:
+            if not isinstance(raw_decision, dict):
+                continue
+            decision = dict(raw_decision)
+            # Never trust a transport-supplied private route, even when the
+            # public id is malformed. Only a checkpoint match may add it back.
+            for key in HITL_PRIVATE_ROUTING_KEYS:
+                decision.pop(key, None)
+            match = None
+            interrupt_id = decision.get(HITL_INTERRUPT_ID_KEY)
+            if interrupt_id:
+                match = by_interrupt_id.get(interrupt_id)
+                if match is None:
+                    logger.warning(
+                        "[HITL] Ignoring decision for unknown interrupt_id=%s",
+                        interrupt_id,
+                    )
+                    continue
+            elif decision.get(HITL_TOOL_CALL_ID_KEY):
+                candidates = by_tool_call_id.get(
+                    decision[HITL_TOOL_CALL_ID_KEY], []
+                )
+                if len(candidates) == 1:
+                    match = candidates[0]
+                elif len(candidates) > 1:
+                    logger.warning(
+                        "[HITL] Ambiguous legacy decision for duplicate "
+                        "tool_call_id=%s; interrupt_id is required",
+                        decision[HITL_TOOL_CALL_ID_KEY],
+                    )
+                    continue
+                else:
+                    logger.warning(
+                        "[HITL] Ignoring legacy decision for unknown "
+                        "tool_call_id=%s",
+                        decision[HITL_TOOL_CALL_ID_KEY],
+                    )
+                    continue
+            else:
+                logger.warning(
+                    "[HITL] Ignoring decision without interrupt_id or tool_call_id",
+                )
+                continue
+
+            if match is not None:
+                if match.get(HITL_TOOL_CALL_ID_KEY):
+                    decision[HITL_TOOL_CALL_ID_KEY] = match[
+                        HITL_TOOL_CALL_ID_KEY
+                    ]
+                for key in HITL_PRIVATE_ROUTING_KEYS:
+                    if match.get(key):
+                        decision[key] = match[key]
+                    else:
+                        decision.pop(key, None)
+            hydrated.append(decision)
+        return hydrated
+
     # Internal payload keys that must never leak to the UI/transport layer.
     _HITL_INTERNAL_KEYS = (
         'tool_args_raw', '_pending_messages',
-        '_parent_tool_name', '_parent_tool_args', 'nested_config',
+        '_parent_tool_name', '_parent_tool_args', '_parent_tool_call_id',
+        *HITL_PRIVATE_ROUTING_KEYS,
+        'nested_config',
     )
 
     @classmethod
