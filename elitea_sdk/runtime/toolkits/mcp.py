@@ -188,6 +188,7 @@ class McpToolkit(BaseToolkit):
         cache_ttl: int = 300,
         ssl_verify: bool = True,
         toolkit_name: str = None,
+        toolkit_type: str = "mcp",
         client = None,
         **kwargs
     ) -> 'McpToolkit':
@@ -271,6 +272,7 @@ class McpToolkit(BaseToolkit):
         # Generate tools from the MCP server
         toolkit.tools = cls._create_tools_from_server(
             toolkit_name=toolkit_name,
+            toolkit_type=toolkit_type,
             connection_config=connection_config,
             timeout=timeout,
             selected_tools=selected_tools,
@@ -285,6 +287,7 @@ class McpToolkit(BaseToolkit):
     def _create_tools_from_server(
         cls,
         toolkit_name: str,
+        toolkit_type: str,
         connection_config: McpConnectionConfig,
         timeout: int,
         selected_tools: List[str],
@@ -304,6 +307,7 @@ class McpToolkit(BaseToolkit):
             # Use synchronous HTTP discovery for toolkit initialization
             tool_metadata_list, session_id = cls._discover_tools_sync(
                 toolkit_name=toolkit_name,
+                toolkit_type=toolkit_type,
                 connection_config=connection_config,
                 timeout=timeout,
                 ssl_verify=ssl_verify,
@@ -327,6 +331,7 @@ class McpToolkit(BaseToolkit):
                 server_tool = cls._create_tool_from_dict(
                     tool_dict=tool_metadata,
                     toolkit_name=toolkit_name,
+                    toolkit_type=toolkit_type,
                     connection_config=connection_config,
                     timeout=timeout,
                     client=client,
@@ -355,7 +360,13 @@ class McpToolkit(BaseToolkit):
             
             # Only fall back to static discovery for existing toolkits with a client
             logger.info(f"Falling back to static discovery for toolkit '{toolkit_name}'")
-            tools = cls._create_tools_static(toolkit_name, selected_tools, timeout, client)
+            tools = cls._create_tools_static(
+                toolkit_name,
+                toolkit_type,
+                selected_tools,
+                timeout,
+                client,
+            )
 
         # Don't add inspection tool to agent - it's only for internal use by toolkit
         # inspection_tool = cls._create_inspection_tool(
@@ -377,6 +388,7 @@ class McpToolkit(BaseToolkit):
     def _discover_tools_sync(
         cls,
         toolkit_name: str,
+        toolkit_type: str,
         connection_config: McpConnectionConfig,
         timeout: int,
         ssl_verify: bool = True,
@@ -403,6 +415,7 @@ class McpToolkit(BaseToolkit):
                 return loop.run_until_complete(
                     cls._discover_tools_async(
                         toolkit_name=toolkit_name,
+                        toolkit_type=toolkit_type,
                         connection_config=connection_config,
                         timeout=timeout,
                         ssl_verify=ssl_verify,
@@ -427,6 +440,7 @@ class McpToolkit(BaseToolkit):
                 all_tools, server_session_id = asyncio.run(
                     cls._discover_tools_async(
                         toolkit_name=toolkit_name,
+                        toolkit_type=toolkit_type,
                         connection_config=connection_config,
                         timeout=timeout,
                         ssl_verify=ssl_verify,
@@ -448,6 +462,7 @@ class McpToolkit(BaseToolkit):
     async def _discover_tools_async(
         cls,
         toolkit_name: str,
+        toolkit_type: str,
         connection_config: McpConnectionConfig,
         timeout: int,
         ssl_verify: bool = True,
@@ -491,7 +506,10 @@ class McpToolkit(BaseToolkit):
             headers=headers,
             timeout=timeout,
             ssl_verify=ssl_verify,
-            configured_auth=configured_auth
+            configured_auth=configured_auth,
+            tool_name=toolkit_name,
+            toolkit_type=toolkit_type,
+            toolkit_name=toolkit_name,
         )
         
         server_session_id = None
@@ -553,6 +571,7 @@ class McpToolkit(BaseToolkit):
         cls,
         tool_dict: Dict[str, Any],
         toolkit_name: str,
+        toolkit_type: str,
         connection_config: McpConnectionConfig,
         timeout: int,
         client,
@@ -592,7 +611,7 @@ class McpToolkit(BaseToolkit):
                 original_tool_name=tool_name,  # Store original name for MCP server invocation
                 session_id=session_id,  # Pass session ID for stateful SSE servers
                 ssl_verify=ssl_verify,  # Pass SSL verification setting
-                metadata={"toolkit_name": toolkit_name, "toolkit_type": "mcp"}
+                metadata={"toolkit_name": toolkit_name, "toolkit_type": toolkit_type}
             )
         except Exception as e:
             logger.error(f"Failed to create MCP tool '{tool_name}' from toolkit '{toolkit_name}': {e}")
@@ -602,6 +621,7 @@ class McpToolkit(BaseToolkit):
     def _create_tools_static(
         cls,
         toolkit_name: str,
+        toolkit_type: str,
         selected_tools: List[str],
         timeout: int,
         client
@@ -635,6 +655,7 @@ class McpToolkit(BaseToolkit):
                 # Create the tool
                 server_tool = cls._create_single_tool(
                     toolkit_name=toolkit_name,
+                    toolkit_type=toolkit_type,
                     available_tool=available_tool,
                     timeout=timeout,
                     client=client
@@ -671,6 +692,7 @@ class McpToolkit(BaseToolkit):
         cls,
         tool_metadata,
         toolkit_name: str,
+        toolkit_type: str,
         timeout: int,
         client
     ) -> Optional[BaseTool]:
@@ -692,7 +714,7 @@ class McpToolkit(BaseToolkit):
                 client=client,
                 server=tool_metadata.server,
                 tool_timeout_sec=timeout,
-                metadata={"toolkit_name": toolkit_name, "toolkit_type": name}
+                metadata={"toolkit_name": toolkit_name, "toolkit_type": toolkit_type}
             )
         except Exception as e:
             logger.error(f"Failed to create MCP tool '{tool_name}' from server '{tool_metadata.server}': {e}")
@@ -702,6 +724,7 @@ class McpToolkit(BaseToolkit):
     def _create_single_tool(
         cls,
         toolkit_name: str,
+        toolkit_type: str,
         available_tool: Dict[str, Any],
         timeout: int,
         client
@@ -727,7 +750,7 @@ class McpToolkit(BaseToolkit):
                 client=client,
                 server=toolkit_name,
                 tool_timeout_sec=timeout,
-                metadata={"toolkit_name": toolkit_name, "toolkit_type": name}
+                metadata={"toolkit_name": toolkit_name, "toolkit_type": toolkit_type}
             )
         except Exception as e:
             logger.error(f"Failed to create MCP tool '{tool_name}' from toolkit '{toolkit_name}': {e}")
@@ -834,6 +857,7 @@ def get_tools(tool_config: dict, elitea_client, llm=None, memory_store=None) -> 
         cache_ttl=safe_int(settings.get('cache_ttl'), 300),
         ssl_verify=settings.get('ssl_verify', True),
         toolkit_name=toolkit_name,
+        toolkit_type=tool_config.get('type', 'mcp'),
         client=elitea_client
     ).get_tools()
 

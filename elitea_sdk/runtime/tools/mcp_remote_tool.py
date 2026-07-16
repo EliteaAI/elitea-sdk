@@ -130,7 +130,10 @@ class McpRemoteTool(McpServerTool):
                 session_id=self.session_id,
                 headers=headers,
                 timeout=self.tool_timeout_sec,
-                ssl_verify=self.ssl_verify
+                ssl_verify=self.ssl_verify,
+                tool_name=self.name,
+                toolkit_type=(self.metadata or {}).get("toolkit_type"),
+                toolkit_name=(self.metadata or {}).get("toolkit_name"),
             )
             
             # Execute tool call (client auto-detects SSE vs Streamable HTTP)

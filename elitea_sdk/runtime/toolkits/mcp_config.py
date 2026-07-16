@@ -356,6 +356,7 @@ class McpConfigToolkit(BaseToolkit):
         selected_tools: Optional[List[str]] = None,
         excluded_tools: Optional[List[str]] = None,
         toolkit_name: Optional[str] = None,
+        toolkit_type: Optional[str] = None,
         client=None,
         mcp_tokens: Optional[Dict[str, Any]] = None,
         **kwargs
@@ -398,6 +399,7 @@ class McpConfigToolkit(BaseToolkit):
                 selected_tools=selected_tools,
                 excluded_tools=excluded_tools,
                 toolkit_name=toolkit_name or server_name,
+                toolkit_type=toolkit_type,
                 client=client,
                 mcp_tokens=mcp_tokens,
             )
@@ -584,6 +586,7 @@ class McpConfigToolkit(BaseToolkit):
             selected_tools: Optional[List[str]],
             excluded_tools: Optional[List[str]],
             toolkit_name: str,
+            toolkit_type: Optional[str] = None,
             client=None,
             mcp_tokens: Optional[Dict[str, Any]] = None,  # Add parameter
     ) -> List[BaseTool]:
@@ -677,6 +680,7 @@ class McpConfigToolkit(BaseToolkit):
             ssl_verify=ssl_verify,
             selected_tools=selected_tools or [],
             toolkit_name=toolkit_name,
+            toolkit_type=toolkit_type or f"mcp_{server_name}",
             client=client,
             session_id=session_id,
         )

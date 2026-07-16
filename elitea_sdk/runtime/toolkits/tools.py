@@ -143,9 +143,107 @@ def _build_provided_settings(settings: dict) -> Optional[Dict[str, Any]]:
     return _ps or None
 
 
+def _normalize_mcp_toolkit_type(tool_type: Optional[str], server_name: Optional[str] = None) -> str:
+    """Resolve a stable MCP toolkit_type, preferring prebuilt-style mcp_<server>."""
+    normalized_type = str(tool_type or "").strip()
+    normalized_server = str(server_name or "").strip()
+
+    if normalized_type.startswith("mcp_") and normalized_type != "mcp_config":
+        return normalized_type
+
+    if normalized_type in {"mcp", "mcp_config"} and normalized_server:
+        return f"mcp_{_safe_tool_name(normalized_server).lower()}"
+
+    return normalized_type or "mcp"
+
+
+def _resolve_mcp_toolkit_identity(
+    tool: dict,
+    tool_configs: Optional[list] = None,
+    normalized_url: Optional[str] = None,
+    requested_tool_name: Optional[str] = None,
+) -> tuple[str, str]:
+    """Resolve (toolkit_name, toolkit_type) from a toolkit config dict.
+
+    When ``tool_configs`` is provided the function also searches the full list by
+    URL match and alias intersection, which lets callers pass a minimal sentinel
+    dict (e.g. ``{"type": "mcp"}``) plus the runtime server URL to obtain the
+    correct prebuilt identity.  Without ``tool_configs`` the function falls back
+    to deriving identity from ``tool`` alone.
+    """
+    settings = tool.get("settings") if isinstance(tool.get("settings"), dict) else {}
+    server_name = str(settings.get("server_name") or "").strip()
+
+    toolkit_name = str(
+        tool.get("toolkit_name") or tool.get("name") or server_name or tool.get("type") or "MCP toolkit"
+    ).strip()
+    if _is_http_url(toolkit_name) and server_name:
+        toolkit_name = server_name
+
+    toolkit_type = _normalize_mcp_toolkit_type(tool.get("type"), server_name)
+
+    if not tool_configs:
+        return toolkit_name, toolkit_type
+
+    # Search tool_configs by URL match first, then alias intersection.
+    fallback_name = requested_tool_name or normalized_url or toolkit_name
+    lookup_names = {
+        str(normalized_url or "").strip().lower(),
+        str(requested_tool_name or "").strip().lower(),
+    }
+    lookup_names.discard("")
+
+    for _tc in tool_configs:
+        if not isinstance(_tc, dict):
+            continue
+        _tc_type = str(_tc.get("type") or "").strip()
+        if not (_tc_type == "mcp" or _tc_type == "mcp_config" or _tc_type.startswith("mcp_")):
+            continue
+
+        _settings = _tc.get("settings") if isinstance(_tc.get("settings"), dict) else {}
+        _server_name = str(_settings.get("server_name") or "").strip()
+        _resolved_type = _normalize_mcp_toolkit_type(_tc_type, _server_name)
+        _toolkit_name = str(
+            _tc.get("toolkit_name") or _tc.get("name") or _server_name or _resolved_type or fallback_name
+        ).strip()
+        if _is_http_url(_toolkit_name) and _server_name:
+            _toolkit_name = _server_name
+
+        _tc_url = _settings.get("url") or (_settings.get("server_config") or {}).get("url")
+        if _tc_url and _is_http_url(_tc_url):
+            try:
+                _tc_normalized = canonical_resource(normalize_mcp_url(_tc_url))
+            except Exception:
+                _tc_normalized = canonical_resource(_tc_url)
+            if normalized_url and normalized_url == _tc_normalized:
+                return _toolkit_name, _resolved_type or toolkit_type
+
+        _aliases = {_toolkit_name.lower(), _server_name.lower(), _tc_type.lower()}
+        if _resolved_type:
+            _aliases.add(_resolved_type.lower())
+        _aliases.discard("")
+        if lookup_names and lookup_names.intersection(_aliases):
+            return _toolkit_name, _resolved_type or toolkit_type
+
+    return toolkit_name, toolkit_type
+
+
 def _annotate_mcp_auth_error(auth_err: Any, tool: dict) -> None:
-    """Attach toolkit_type, toolkit_id, and provided_settings to a McpAuthorizationRequired exception."""
-    auth_err.toolkit_type = tool['type']
+    """Attach toolkit identity and metadata to a McpAuthorizationRequired exception."""
+    toolkit_label, resolved_toolkit_type = _resolve_mcp_toolkit_identity(tool)
+
+    current_toolkit_type = str(getattr(auth_err, 'toolkit_type', '') or '').strip()
+    if not current_toolkit_type or current_toolkit_type in {'mcp', 'mcp_config'}:
+        auth_err.toolkit_type = resolved_toolkit_type
+
+    current_toolkit_name = str(getattr(auth_err, 'toolkit_name', '') or '').strip()
+    if toolkit_label and (not current_toolkit_name or _is_http_url(current_toolkit_name)):
+        auth_err.toolkit_name = toolkit_label
+
+    if toolkit_label:
+        current_tool_name = str(getattr(auth_err, 'tool_name', '') or '').strip()
+        if not current_tool_name or _is_http_url(current_tool_name):
+            auth_err.tool_name = toolkit_label
     if not getattr(auth_err, 'toolkit_id', None):
         _tid = tool.get('id')
         if _tid is not None:
@@ -169,8 +267,19 @@ def _build_deferred_mcp_auth_tools(
     multiple MCP toolkits are unauthenticated.
     """
     settings = dict(tool.get("settings") or {})
-    toolkit_type = str(tool.get("type") or auth_err.toolkit_type or "mcp")
-    toolkit_name = str(tool.get("toolkit_name") or _infer_server_name(tool, settings) or toolkit_type)
+    resolved_toolkit_name, resolved_toolkit_type = _resolve_mcp_toolkit_identity(tool)
+
+    exception_toolkit_type = str(getattr(auth_err, "toolkit_type", "") or "").strip()
+    if exception_toolkit_type and exception_toolkit_type not in {"mcp", "mcp_config"}:
+        toolkit_type = exception_toolkit_type
+    else:
+        toolkit_type = resolved_toolkit_type
+
+    exception_toolkit_name = str(getattr(auth_err, "toolkit_name", "") or "").strip()
+    if exception_toolkit_name and not _is_http_url(exception_toolkit_name):
+        toolkit_name = exception_toolkit_name
+    else:
+        toolkit_name = str(resolved_toolkit_name or _infer_server_name(tool, settings) or toolkit_type)
     proxy_names = _infer_proxy_tool_names(tool, settings)
 
     server_url = auth_err.server_url
@@ -443,6 +552,17 @@ def _make_mcp_auth_control_tool(
                 next_step="respond_without_tool",
             )
 
+        # Strip the proxy prefix so alias matching works: "mcp_authorize_EpamStaffing" → "EpamStaffing"
+        _lookup_tool_name = tool_name or ""
+        if _lookup_tool_name.lower().startswith("mcp_authorize_"):
+            _lookup_tool_name = _lookup_tool_name[len("mcp_authorize_"):]
+        resolved_toolkit_name, resolved_toolkit_type = _resolve_mcp_toolkit_identity(
+            tool={"type": "mcp"},
+            tool_configs=tool_configs,
+            normalized_url=normalized_url,
+            requested_tool_name=_lookup_tool_name or server_url,
+        )
+
         # Early return if the server was already declined in this conversation.
         # Do NOT call discover_mcp_tools — that would raise McpAuthorizationRequired
         # again and trigger another auth dialog even though the user already skipped.
@@ -495,11 +615,13 @@ def _make_mcp_auth_control_tool(
                     )
 
         # Look up token from mcp_tokens (canonical key first, then raw URL, then Atlassian alternate)
+        # Prebuilt MCP toolkits store tokens keyed by toolkit_type (e.g. "mcp_github").
         auth_headers: Dict[str, str] = {}
         token_session_id: Optional[str] = None
         if mcp_tokens:
             _atlassian_alt = mcp_alternate_resource(normalized_url) if normalized_url else None
-            for lookup_key in [normalized_url, server_url, _atlassian_alt]:
+            _tt_lookup = resolved_toolkit_type if resolved_toolkit_type not in {"mcp", "mcp_config"} else None
+            for lookup_key in [normalized_url, server_url, _tt_lookup, _atlassian_alt]:
                 if not lookup_key:
                     continue
                 token_data = mcp_tokens.get(lookup_key)
@@ -526,8 +648,14 @@ def _make_mcp_auth_control_tool(
         except McpAuthorizationRequired as exc:
             if not getattr(exc, "server_url", None):
                 exc.server_url = normalized_url
-            if not getattr(exc, "tool_name", None):
-                exc.tool_name = tool_name or ""
+            existing_tool_name = getattr(exc, "tool_name", None)
+            if not existing_tool_name or _is_http_url(existing_tool_name):
+                exc.tool_name = tool_name or resolved_toolkit_name
+            if not getattr(exc, "toolkit_name", None):
+                exc.toolkit_name = resolved_toolkit_name
+            _exc_type = str(getattr(exc, "toolkit_type", "") or "").strip()
+            if not _exc_type or _exc_type in {"mcp", "mcp_config"}:
+                exc.toolkit_type = resolved_toolkit_type
             # Attach pre-configured credentials and toolkit_id if not already set
             if not getattr(exc, 'provided_settings', None) or not getattr(exc, 'toolkit_id', None):
                 for _tc in tool_configs:
@@ -931,10 +1059,26 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 # or was explicitly declined (user clicked Skip on the auth dialog).
                 if url:
                     canonical_url = canonical_resource(url)
+                    _tool_toolkit_type = _normalize_mcp_toolkit_type(
+                        tool.get("type"),
+                        (tool.get("settings") or {}).get("server_name"),
+                    )
                     _should_skip = bool(
                         ignored_mcp_servers
                         and (canonical_url in ignored_mcp_servers or url in ignored_mcp_servers)
                     )
+                    # For prebuilt MCP toolkits the FE stores the OAuth token keyed by
+                    # toolkit_type (e.g. "mcp_github") but adds the server URL to
+                    # ignored_mcp_servers.  If a valid token exists under toolkit_type,
+                    # the server has been authorised — clear the skip flag so the token
+                    # is injected and the real tools are loaded.
+                    if _should_skip and mcp_tokens and _tool_toolkit_type:
+                        if mcp_tokens.get(_tool_toolkit_type):
+                            _should_skip = False
+                            logger.info(
+                                "[MCP Auth] Overriding ignored_mcp_servers skip — "
+                                "token found under toolkit_type key"
+                            )
                     if not _should_skip and user_declined_mcp_servers:
                         for _dec in user_declined_mcp_servers:
                             _dec_url = (
@@ -982,6 +1126,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     logger.debug("[MCP Auth] Looking up token for MCP server")
                     logger.debug("[MCP Auth] Token lookup — %d known servers", len(mcp_tokens))
                     lookup_candidates = [canonical_url, url]
+                    # Prebuilt MCP toolkits store tokens under toolkit_type key (e.g. "mcp_github")
+                    _tt_for_lookup = _tool_toolkit_type if (url and _tool_toolkit_type) else _normalize_mcp_toolkit_type(
+                        tool.get("type"), (tool.get("settings") or {}).get("server_name")
+                    )
+                    if _tt_for_lookup and _tt_for_lookup not in {"mcp", "mcp_config"}:
+                        lookup_candidates.append(_tt_for_lookup)
                     atlassian_alt = mcp_alternate_resource(canonical_url)
                     if atlassian_alt:
                         lookup_candidates.append(atlassian_alt)
@@ -1026,15 +1176,17 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     settings['session_id'] = session_id
                     logger.debug("[MCP Auth] Passing session_id to toolkit")
                 try:
+                    resolved_toolkit_name, resolved_toolkit_type = _resolve_mcp_toolkit_identity(tool)
                     mcp_tools = McpToolkit.get_toolkit(
-                        toolkit_name=tool.get('toolkit_name', ''),
+                        toolkit_name=resolved_toolkit_name,
+                        toolkit_type=resolved_toolkit_type,
                         client=elitea_client,
                         **settings).get_tools()
                 except McpAuthorizationRequired as auth_err:
                     _annotate_mcp_auth_error(auth_err, tool)
                     _is_pipeline_node = (
                         pipeline_node_toolkit_names is not None
-                        and tool.get('toolkit_name', '') in pipeline_node_toolkit_names
+                        and (resolved_toolkit_name in pipeline_node_toolkit_names)
                     )
                     if _is_pipeline_node:
                         # Pipeline nodes call tools directly — deferred stubs are useless.
@@ -1140,7 +1292,10 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                     _mcp_auth_control_added = True
                             continue
 
-                    toolkit_name = tool.get('toolkit_name', '') or server_name
+                    toolkit_name = str(tool.get('toolkit_name', '') or tool.get('name', '') or server_name)
+                    if _is_http_url(toolkit_name):
+                        toolkit_name = server_name
+                    toolkit_type = _normalize_mcp_toolkit_type(tool.get('type'), server_name)
                     selected_tools = settings.get('selected_tools', [])
                     excluded_tools = settings.get('excluded_tools', [])
 
@@ -1153,6 +1308,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         selected_tools=selected_tools if selected_tools else None,
                         excluded_tools=excluded_tools if excluded_tools else None,
                         toolkit_name=toolkit_name,
+                        toolkit_type=toolkit_type,
                         client=elitea_client,
                         mcp_tokens=mcp_tokens,
                     ).get_tools()

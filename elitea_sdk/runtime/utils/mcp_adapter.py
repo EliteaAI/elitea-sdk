@@ -46,7 +46,10 @@ class UnifiedMcpClient:
         timeout: int = 300,
         transport: str = "auto",
         ssl_verify: bool = True,
-        configured_auth: bool = False
+        configured_auth: bool = False,
+        tool_name: Optional[str] = None,
+        toolkit_type: Optional[str] = None,
+        toolkit_name: Optional[str] = None,
     ):
         """
         Initialize the unified MCP client.
@@ -62,6 +65,11 @@ class UnifiedMcpClient:
                 database configuration (not an OAuth token acquired at runtime). When True,
                 a 401 raises ValueError asking the user to fix their credentials instead of
                 triggering the OAuth flow.
+            tool_name: Optional tool/display name used in auth-required payloads.
+            toolkit_type: Optional toolkit type (e.g., "mcp", "mcp_github") used
+                in auth-required payloads.
+            toolkit_name: Optional toolkit display/config name used in auth-required
+                payloads.
         """
         self.url = url
         self.session_id = session_id or str(uuid.uuid4())
@@ -70,6 +78,9 @@ class UnifiedMcpClient:
         self.transport = transport
         self.ssl_verify = ssl_verify
         self.configured_auth = configured_auth
+        self.tool_name = tool_name
+        self.toolkit_type = toolkit_type
+        self.toolkit_name = toolkit_name
 
         # Internal state
         self._client = None
@@ -473,7 +484,9 @@ class UnifiedMcpClient:
             www_authenticate=auth_header,
             resource_metadata=metadata,
             status=401,
-            tool_name=self.url,
+            tool_name=self.tool_name or self.url,
+            toolkit_type=self.toolkit_type or "mcp",
+            toolkit_name=self.toolkit_name or self.tool_name or self.url,
         )
 
     @property
