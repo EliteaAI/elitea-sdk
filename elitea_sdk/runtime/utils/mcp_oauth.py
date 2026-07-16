@@ -162,6 +162,7 @@ class McpAuthorizationRequired(ToolException):
         status: Optional[int] = None,
         tool_name: Optional[str] = None,
         toolkit_type: Optional[str] = None,
+        toolkit_name: Optional[str] = None,
     ):
         super().__init__(message)
         self.server_url = server_url
@@ -171,6 +172,7 @@ class McpAuthorizationRequired(ToolException):
         self.status = status
         self.tool_name = tool_name
         self.toolkit_type = toolkit_type
+        self.toolkit_name = toolkit_name
 
     def to_dict(self) -> Dict[str, Any]:
         authorization_servers = getattr(self, "authorization_servers", None)
@@ -185,6 +187,7 @@ class McpAuthorizationRequired(ToolException):
             "authorization_servers": authorization_servers,
             "status": self.status,
             "tool_name": self.tool_name,
+            "toolkit_name": self.toolkit_name,
             "toolkit_type": self.toolkit_type,
             "toolkit_id": getattr(self, "toolkit_id", None),
         }
