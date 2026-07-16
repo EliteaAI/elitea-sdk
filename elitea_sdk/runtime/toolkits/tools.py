@@ -260,6 +260,7 @@ def _build_deferred_mcp_auth_tools(
     mcp_tokens: Optional[dict] = None,
     user_declined_mcp_servers: Optional[list] = None,
     force_declined: bool = False,
+    reraise_on_invoke: bool = False,
 ) -> List[StructuredTool]:
     """Build proxy tools that trigger MCP auth only when actually invoked.
 
@@ -340,6 +341,8 @@ def _build_deferred_mcp_auth_tools(
             arguments: Optional[Dict[str, Any]] = None,
             _tool_name: str = resolved_name,
             _declined: bool = _server_is_declined,
+            _reraise: bool = reraise_on_invoke,
+            _stored_auth_err: McpAuthorizationRequired = auth_err,
         ) -> str:
             _ = arguments
             if _declined:
@@ -358,6 +361,15 @@ def _build_deferred_mcp_auth_tools(
                     ),
                     next_step="use_other_tools_or_report",
                 )
+            if _reraise:
+                # Built-in delegated-OAuth toolkits (e.g. SharePoint) are NOT MCP servers, so the
+                # mcp_auth_control -> discover_mcp_tools probe cannot surface their auth dialog.
+                # Re-raise the stored rich McpAuthorizationRequired in place — exactly as
+                # discover_mcp_tools does for real MCP servers — so it propagates to the indexer
+                # callback (on_tool_error) which emits the mcp_authorization_required event with
+                # the toolkit's metadata (resource_name, configuration_uuid, authorization_servers)
+                # and pauses the run for the Authorize/Skip UI (issue #5638).
+                raise _stored_auth_err
             # This proxy was created because toolkit loading already failed with
             # McpAuthorizationRequired — any token in mcp_tokens was rejected by
             # the server (expired or invalid). Do not short-circuit with a token
@@ -384,6 +396,15 @@ def _build_deferred_mcp_auth_tools(
                 f"Gateway for '{toolkit_name}' MCP server operations. "
                 f"ALWAYS call this tool when any task involves '{toolkit_name}' before responding to the user. "
                 "The tool result will tell you exactly what to do next."
+            )
+        elif reraise_on_invoke:
+            # Built-in delegated-OAuth toolkit: invoking this proxy triggers the auth dialog
+            # directly (it re-raises), so the LLM must NOT be told to chain mcp_auth_control.
+            _proxy_description = (
+                f"Access gateway for '{toolkit_name}' tools. "
+                f"'{toolkit_name}' requires authorization before its tools can be used. "
+                f"When the user requests any '{toolkit_name}' operation, call this tool immediately "
+                "to trigger the authorization flow — do NOT tell the user these tools are unavailable."
             )
         else:
             _proxy_description = (
@@ -1373,9 +1394,48 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             if 'settings' not in tool:
                 tool['settings'] = {}
             tool['settings']['tokens'] = mcp_tokens
-    elitea_loaded = elitea_tools(unhandled_tools, elitea_client, llm, memory_store)
-    tools += elitea_loaded
-    logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {len(elitea_loaded)} tools")
+    # Load unhandled (built-in) toolkits one at a time so an OAuth requirement from a
+    # delegated toolkit (e.g. SharePoint) is isolated: it must NOT abort loading of the
+    # remaining tools, and it must be routed through the SAME deferred-proxy mechanism
+    # used for MCP toolkits. Otherwise the eager McpAuthorizationRequired raised at tool
+    # load time propagates out of get_tools() and the agent re-prompts every turn — so
+    # "Skip" never terminates (issue #5638).
+    _elitea_loaded_count = 0
+    for _u_tool in unhandled_tools:
+        try:
+            _loaded = elitea_tools([_u_tool], elitea_client, llm, memory_store)
+            tools += _loaded
+            _elitea_loaded_count += len(_loaded)
+        except McpAuthorizationRequired as auth_err:
+            # Built-in delegated-OAuth toolkit needs browser OAuth. Build deferred proxy
+            # tools: when the user has already skipped this server, the proxy returns
+            # status="declined" (LLM stops asking); otherwise status="authorization_required"
+            # (LLM drives the auth flow via mcp_auth_control). The caught exception already
+            # carries the fully-resolved server_url, so declined-matching works without any
+            # toolkit-specific URL re-derivation.
+            if not getattr(auth_err, "toolkit_type", None):
+                auth_err.toolkit_type = _u_tool.get("type")
+            _proxies = _build_deferred_mcp_auth_tools(
+                _u_tool, auth_err, mcp_tokens=mcp_tokens,
+                user_declined_mcp_servers=user_declined_mcp_servers,
+                reraise_on_invoke=True,
+            )
+            if _proxies:
+                _inject_display_metadata(_u_tool, _proxies)
+                tools.extend(_proxies)
+                _elitea_loaded_count += len(_proxies)
+                if not _mcp_auth_control_added:
+                    tools.extend(_make_mcp_auth_control_tool(
+                        deduplicated_tools, mcp_tokens=mcp_tokens,
+                        user_declined_mcp_servers=user_declined_mcp_servers,
+                        ignored_mcp_servers=ignored_mcp_servers,
+                    ))
+                    _mcp_auth_control_added = True
+                logger.info(
+                    "[Toolkit Auth] Deferred authorization for built-in toolkit with %d proxy tool(s)",
+                    len(_proxies),
+                )
+    logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {_elitea_loaded_count} tools")
 
     # Add MCP tools registered via elitea-mcp CLI (static registry)
     # Note: Tools with type='mcp' are already handled in main loop above
