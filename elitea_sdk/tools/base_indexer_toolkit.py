@@ -242,15 +242,15 @@ class IndexTools(str, Enum):
 
 RemoveIndexParams = create_model(
     "RemoveIndexParams",
-    index_name=(Optional[str], Field(description="Optional index name (max 7 characters)", default="", max_length=7)),
+    index_name=(Optional[str], Field(description="Optional index name (max 32 characters)", default="", max_length=32)),
 )
 
 BaseSearchParams = create_model(
     "BaseSearchParams",
     query=(str, Field(description="Query text to search in the index")),
     index_name=(Optional[str], Field(
-        description="Optional index name (max 7 characters). Leave empty to search across all datasets",
-        default="", max_length=7)),
+        description="Optional index name (max 32 characters). Leave empty to search across all datasets",
+        default="", max_length=32)),
     filter=(Optional[dict | str], Field(
         description="Filter to apply to the search results. Can be a dictionary or a JSON string.",
         default={},
@@ -286,7 +286,7 @@ BaseSearchParams = create_model(
 BaseStepbackSearchParams = create_model(
     "BaseStepbackSearchParams",
     query=(str, Field(description="Query text to search in the index")),
-    index_name=(Optional[str], Field(description="Optional index name (max 7 characters)", default="", max_length=7)),
+    index_name=(Optional[str], Field(description="Optional index name (max 32 characters)", default="", max_length=32)),
     messages=(Optional[List], Field(description="Chat messages for stepback search context", default=[])),
     filter=(Optional[dict | str], Field(
         description="Filter to apply to the search results. Can be a dictionary or a JSON string.",
@@ -1526,7 +1526,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         index_params = {
             "index_name": (
                 str,
-                Field(description="Index name (max 7 characters)", min_length=1, max_length=7)
+                Field(description="Index name (max 32 characters)", min_length=1, max_length=32)
             ),
             "clean_index": (
                 Optional[bool],
