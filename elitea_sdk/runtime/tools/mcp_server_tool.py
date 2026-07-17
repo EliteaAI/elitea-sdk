@@ -71,6 +71,11 @@ class McpServerTool(BaseTool):
             if t == "boolean":
                 return bool
             if t == "object":
+                # If no properties defined and additionalProperties is true/unset,
+                # use dict[str, Any] to preserve arbitrary nested objects
+                if not field.get("properties") and field.get("additionalProperties", True):
+                    from typing import Dict
+                    return Dict[str, Any]
                 return McpServerTool.create_pydantic_model_from_schema(field, name.capitalize())
             if t == "array":
                 items = field.get("items", {})
