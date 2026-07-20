@@ -16,7 +16,7 @@ from ..runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
 
-INDEX_TOOL_NAMES = ['index_data', 'remove_index', 'list_collections', 'search_index', 'stepback_search_index',
+INDEX_TOOL_NAMES = ['index_data', 'remove_index', 'list_indexes', 'search_index', 'stepback_search_index',
                             'stepback_summary_index']
 
 LoaderSchema = create_model(
@@ -459,13 +459,13 @@ class BaseVectorStoreToolApiWrapper(BaseToolApiWrapper):
         deleted_count = self._init_vector_store()._clean_collection(index_name=index_name)
 
         if index_name and deleted_count == 0:
-            raise ToolException(f"Index '{index_name}' not found. Available collections: {self.list_collections()}")
+            raise ToolException(f"Index '{index_name}' not found. Available indexes: {self.list_indexes()}")
 
         return (f"Collection '{index_name}' has been removed from the vector store.\n"
-                f"Available collections: {self.list_collections()}")
+                f"Available indexes: {self.list_indexes()}")
 
-    def list_collections(self):
-        """Lists all collections in the vector store."""
+    def list_indexes(self):
+        """Lists all indexes in the vector store."""
         vectorstore_wrapper = self._init_vector_store()
         return vectorstore_wrapper.list_collections()
 
@@ -596,11 +596,11 @@ class BaseVectorStoreToolApiWrapper(BaseToolApiWrapper):
                 "args_schema": RemoveIndexParams
             },
             {
-                "name": "list_collections",
-                "mode": "list_collections",
-                "ref": self.list_collections,
-                "description": self.list_collections.__doc__,
-                "args_schema": create_model("ListCollectionsParams")  # No parameters
+                "name": "list_indexes",
+                "mode": "list_indexes",
+                "ref": self.list_indexes,
+                "description": self.list_indexes.__doc__,
+                "args_schema": create_model("ListIndexesParams")  # No parameters
             },
 
         ]

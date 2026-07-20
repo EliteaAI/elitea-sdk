@@ -426,8 +426,8 @@ class LocalSetupStrategy(SetupStrategy):
         # Check if indexing tools are selected
         selected_tools = config.get('selected_tools', [])
         logger.info(f"[INDEXING DEBUG] selected_tools from config: {selected_tools}")
-        indexing_tools = {'index_data', 'search_index', 'stepback_search_index', 
-                          'stepback_summary_index', 'remove_index', 'list_collections'}
+        indexing_tools = {'index_data', 'search_index', 'stepback_search_index',
+                          'stepback_summary_index', 'remove_index', 'list_indexes'}
         has_indexing_tools = bool(set(selected_tools) & indexing_tools)
         logger.info(f"[INDEXING DEBUG] has_indexing_tools: {has_indexing_tools}, intersection: {set(selected_tools) & indexing_tools}")
         
@@ -557,8 +557,8 @@ class LocalSetupStrategy(SetupStrategy):
         
         # Auto-detect indexing tools and add pgvector_configuration + embedding_model if needed
         selected_tools = file_config.get('selected_tools', [])
-        indexing_tools = {'index_data', 'search_index', 'stepback_search_index', 
-                          'stepback_summary_index', 'remove_index', 'list_collections'}
+        indexing_tools = {'index_data', 'search_index', 'stepback_search_index',
+                          'stepback_summary_index', 'remove_index', 'list_indexes'}
         has_indexing_tools = bool(set(selected_tools) & indexing_tools)
         
         if has_indexing_tools:
