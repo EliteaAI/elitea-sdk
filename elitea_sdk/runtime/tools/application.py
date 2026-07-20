@@ -1,4 +1,5 @@
 import json
+from uuid import uuid4
 
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 from ..models.agent_response import AgentResponse
@@ -182,6 +183,13 @@ class Application(BaseTool):
         if isinstance(input, dict) and input.get("type") == "tool_call":
             tool_call_id = input.get("id")
             input = input["args"]
+        # Repair a provider-supplied null id (#5750): `was_tool_call_format` keeps
+        # the "were we invoked via ToolCall-dict format at all" sentinel below
+        # decoupled from whether the id value itself is usable, so a synthesized
+        # id never has to look like "no ToolCall format was used".
+        was_tool_call_format = tool_call_id is not None
+        if was_tool_call_format and not tool_call_id:
+            tool_call_id = f"synth_{uuid4().hex[:24]}"
         schema_values = self.args_schema(**input).model_dump() if self.args_schema else {}
         extras = {k: v for k, v in input.items() if k not in schema_values and k != 'chat_history'}
         all_kwargs = {**kwargs, **extras, **schema_values}
@@ -233,7 +241,7 @@ class Application(BaseTool):
         # giving every event of one invocation a shared per-invocation key. We
         # OVERRIDE rather than setdefault so a nested grandchild stamps its OWN
         # call id (the inherited parent value must not win at the deeper level).
-        if tool_call_id is not None:
+        if was_tool_call_format:
             config = dict(config)
             config['metadata'] = dict(config.get('metadata') or {})
             config['metadata']['parent_agent_call_id'] = tool_call_id
@@ -255,7 +263,7 @@ class Application(BaseTool):
         # When invoked from LangGraph's ToolNode, wrap plain str/dict results in a ToolMessage.
         # ToolNode (langgraph >= 0.3) rejects any return type that is not ToolMessage or Command,
         # raising: TypeError: Tool <name> returned unexpected type: <class 'str'>
-        if tool_call_id is not None:
+        if was_tool_call_format:
             if isinstance(result, ToolMessage):
                 # Already a ToolMessage (e.g. is_subgraph path); ensure tool_call_id is set
                 if not result.tool_call_id:
