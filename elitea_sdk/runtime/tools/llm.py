@@ -32,6 +32,7 @@ from ..langchain.utils import (
     create_pydantic_model,
     extract_json_content,
     make_anthropic_compatible_schema,
+    normalize_null_tool_call_ids,
     propagate_the_input_mapping,
 )
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
@@ -2628,6 +2629,7 @@ class LLMNode(BaseTool):
                                      pending_capture_base=None, parked_holder=None):
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
+        normalize_null_tool_call_ids(completion)
 
         # Per-call independent approval (issue #5303): a sensitive tool the user
         # rejects is NOT excluded from future turns. The blocked tool stays bound
@@ -2931,6 +2933,7 @@ class LLMNode(BaseTool):
                 # ToolMessage tells the model the call was declined and to
                 # continue the remaining work; no forced rebinding or nudge turn.
                 current_completion = llm_client.invoke(new_messages, config=config)
+                normalize_null_tool_call_ids(current_completion)
                 new_messages.append(current_completion)
 
                 # Check if we still have tool calls
@@ -3121,8 +3124,9 @@ class LLMNode(BaseTool):
                         # the same current_completion that still has the original tool_calls
                         try:
                             current_completion = llm_client.invoke(new_messages, config=config)
+                            normalize_null_tool_call_ids(current_completion)
                             new_messages.append(current_completion)
-                            
+
                             # Continue to process any new tool calls in the fresh completion
                             if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:
                                 logger.info(f"LLM requested {len(current_completion.tool_calls)} more tool calls after truncation")

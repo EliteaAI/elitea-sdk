@@ -3,9 +3,10 @@ import copy
 import json
 import logging
 import re
+from uuid import uuid4
 from pydantic import create_model, Field, JsonValue
 from typing import Tuple, TypedDict, Any, Optional, Annotated
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.graph import add_messages
 
 from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
@@ -254,6 +255,44 @@ def extract_json_content(text: str) -> dict | list:
                     break
 
     raise ValueError('Cannot extract JSON from text')
+
+
+def normalize_null_tool_call_ids(message: AIMessage) -> AIMessage:
+    """Repair provider-supplied null ``tool_calls[].id`` in place (#5750).
+
+    LangChain's ``default_tool_parser`` and ``langchain_anthropic``'s
+    ``extract_tool_calls`` set ``id`` to ``None`` (never absent) when the raw
+    provider payload lacks a usable id, which later crashes
+    ``ToolMessage(tool_call_id=None)`` construction. Synthesizes a fresh,
+    unique ``synth_`` id per falsy id — never a shared placeholder, so
+    multiple repaired calls in one turn don't collide in id-keyed dispatch.
+
+    Anthropic-style list ``content`` positionally pairs each repaired
+    ``tool_calls[i]`` with the i-th ``tool_use`` content block (skipping
+    other block types), since ``langchain_anthropic`` matches those blocks
+    to ``tool_calls`` by id equality and would otherwise emit a duplicate
+    ``tool_use`` block for the still-null one.
+    """
+    tool_calls = getattr(message, 'tool_calls', None)
+    if not tool_calls:
+        return message
+
+    tool_use_blocks = None
+    if isinstance(message.content, list):
+        tool_use_blocks = [
+            block for block in message.content
+            if isinstance(block, dict) and block.get('type') == 'tool_use'
+        ]
+
+    for i, tool_call in enumerate(tool_calls):
+        if tool_call.get('id'):
+            continue
+        new_id = f"synth_{uuid4().hex[:24]}"
+        tool_call['id'] = new_id
+        if tool_use_blocks is not None and i < len(tool_use_blocks) and not tool_use_blocks[i].get('id'):
+            tool_use_blocks[i]['id'] = new_id
+
+    return message
 
 
 def _extract_json(json_string: str) -> dict:
