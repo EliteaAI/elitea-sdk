@@ -868,3 +868,94 @@ def test_one_child_fails_does_not_cancel_sibling():
     by_id = {m.tool_call_id: m for m in follow_up[0] if isinstance(m, ToolMessage)}
     assert by_id['call-B'].content == 'B-done'
     assert 'Error' in by_id['call-A'].content or 'child blew up' in by_id['call-A'].content
+
+
+# --- #5750: null tool_call_id crashes ToolMessage construction ----------------
+#
+# A raw provider tool-call payload with a null/missing "id" parses through
+# LangChain's default_tool_parser/tool_call() as {'id': None, ...} — never
+# {'id': ''}. Elitea's `tool_call.get('id', '')` pattern only guards an
+# ABSENT key, so `tool_call_id` stayed None all the way to ToolMessage
+# construction, which pydantic rejects. `normalize_null_tool_call_ids` now
+# repairs a null id to a fresh `synth_...` id (unique per call, never a
+# shared placeholder) before the completion reaches any ToolMessage-building
+# code, so both the parallel fan-out and sequential loops complete normally.
+
+
+def test_null_tool_call_id_repaired_in_parallel_fan_out():
+    """One of two parallel Application calls carries a None id (as a raw
+    provider payload with a null/missing "id" parses today). The completion
+    is repaired before fan-out, so both children run and both results come
+    back as real ToolMessages — no garbled top-level AIMessage."""
+    child_a = StaticApplication(output='A-done')
+    child_b = StaticApplication(output='B-done')
+    parent = MultiAppParentLLM(tool_a='child_a', tool_b='child_b',
+                               id_a=None, id_b='call-B')
+    runnable = _build_assistant(
+        parent, [_app('child_a', child_a), _app('child_b', child_b)]).runnable()
+
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'null-id-thread'}},
+    )
+
+    assert child_a.calls and child_b.calls
+    tool_messages = [m for m in result['messages'] if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 2
+    ids = [m.tool_call_id for m in tool_messages]
+    assert all(ids), 'no tool_call_id may be empty/None'
+    assert len(set(ids)) == 2, 'repaired ids must be unique, not a shared placeholder'
+    by_id = {m.tool_call_id: m for m in tool_messages}
+    assert 'call-B' in by_id, 'the real id must survive untouched'
+    repaired_id = next(i for i in ids if i != 'call-B')
+    assert repaired_id.startswith('synth_')
+
+    final = result['messages'][-1]
+    assert isinstance(final, AIMessage)
+    assert 'tool_call_id' not in final.content
+    assert 'valid string' not in final.content
+
+
+def test_null_tool_call_id_repaired_in_single_sequential_call():
+    """The same repair applies to the plain sequential (non-parallel) tool
+    loop for a single ordinary tool call — this is not parallel-fan-out-only."""
+    child = StaticApplication(output='solo-done')
+    parent = MultiAppParentLLM(tool_a='solo_child', tool_b='solo_child',
+                               id_a=None, id_b=None)
+    parent.invoke_calls = []
+
+    class _SingleCallBound:
+        def __init__(self, root):
+            self.root = root
+
+        def invoke(self, messages, config=None):
+            self.root.invoke_calls.append(list(messages))
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            if tool_messages:
+                return AIMessage(content=f'parent saw: {tool_messages[-1].content}')
+            # A single Application call never qualifies for the 2+-Application
+            # parallel batch, so this falls through to the sequential loop.
+            return AIMessage(
+                content='',
+                tool_calls=[{'name': 'solo_child', 'args': {'task': 'Run'},
+                            'id': None, 'type': 'tool_call'}],
+            )
+
+    parent.bind_tools = lambda tools, **kw: _SingleCallBound(parent)
+    runnable = _build_assistant(parent, [_app('solo_child', child)]).runnable()
+
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate once')]},
+        config={'configurable': {'thread_id': 'null-id-solo-thread'}},
+    )
+
+    assert child.calls, 'the sequential tool body ran'
+    tool_messages = [m for m in result['messages'] if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].tool_call_id.startswith('synth_')
+    assert tool_messages[0].content == 'solo-done'
+
+    final = result['messages'][-1]
+    assert isinstance(final, AIMessage)
+    assert 'tool_call_id' not in final.content
+    assert 'valid string' not in final.content
