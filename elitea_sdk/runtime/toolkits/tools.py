@@ -25,6 +25,7 @@ from ...tools.memory import MemoryToolkit
 from ..utils.mcp_oauth import (
     canonical_resource,
     McpAuthorizationRequired,
+    McpContext,
     build_mcp_auth_decision_result,
     _is_http_url,
     mcp_alternate_resource,
@@ -790,14 +791,22 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
-def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, user_declined_mcp_servers: Optional[list] = None, pipeline_node_toolkit_names: Optional[set] = None, skipped_pipeline_toolkit_names: Optional[set] = None) -> list:
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None) -> list:
     """
     Process tool configurations and return instantiated tools.
 
     Args:
         current_participant_id: The participant ID of the agent being predicted to.
             Used to filter out self-references (prevent agent from calling itself).
+        mcp_context: All MCP-related parameters bundled together. See McpContext for fields.
     """
+    mcp_context = mcp_context or McpContext()
+    mcp_tokens = mcp_context.tokens
+    ignored_mcp_servers = mcp_context.ignored_servers
+    user_declined_mcp_servers = mcp_context.user_declined_servers
+    pipeline_node_toolkit_names = mcp_context.pipeline_node_toolkit_names
+    skipped_pipeline_toolkit_names = mcp_context.skipped_pipeline_toolkit_names
+
     # Sanitize tools_list to handle corrupted tool configurations
     sanitized_tools = []
     seen_toolkit_ids = set()  # Track seen toolkit IDs for deduplication
@@ -1407,6 +1416,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             tools += _loaded
             _elitea_loaded_count += len(_loaded)
         except McpAuthorizationRequired as auth_err:
+            # When the caller is test_toolkit_tool (not an agent chat session) it needs
+            # the raw exception so the indexer can emit mcp_authorization_required to
+            # the frontend — proxy tools are meaningless in that context.
+            if mcp_context.reraise_on_auth_required:
+                raise
             # Built-in delegated-OAuth toolkit needs browser OAuth. Build deferred proxy
             # tools: when the user has already skipped this server, the proxy returns
             # status="declined" (LLM stops asking); otherwise status="authorization_required"

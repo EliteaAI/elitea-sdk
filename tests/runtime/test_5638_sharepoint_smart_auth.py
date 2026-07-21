@@ -30,7 +30,7 @@ from langchain_core.tools import StructuredTool
 import elitea_sdk.tools as elitea_tools_mod
 from elitea_sdk.runtime.toolkits import tools as runtime_tools
 from elitea_sdk.runtime.toolkits.tools import get_tools
-from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
+from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired, McpContext
 
 SITE_URL = "https://tenant.sharepoint.com/sites/demo"
 OAUTH_ENDPOINT = "https://login.microsoftonline.com/tenant-id"
@@ -99,7 +99,7 @@ def test_declined_sharepoint_returns_declined_proxy_no_raise(monkeypatch):
 
     tools = get_tools(
         [_sharepoint_tool()],
-        user_declined_mcp_servers=[{"server_url": SITE_URL}],
+        mcp_context=McpContext(user_declined_servers=[{"server_url": SITE_URL}]),
     )
 
     proxies = _proxy_tools(tools)
@@ -123,7 +123,7 @@ def test_no_token_sharepoint_raises_mcp_auth_required_on_proxy_invoke(monkeypatc
 
     _patch_sharepoint_loader(monkeypatch, loader)
 
-    tools = get_tools([_sharepoint_tool()], user_declined_mcp_servers=None)
+    tools = get_tools([_sharepoint_tool()])
 
     proxies = _proxy_tools(tools)
     assert proxies, "expected a deferred auth proxy when SharePoint has no token"
@@ -164,9 +164,9 @@ def test_other_declined_site_still_raises_mcp_auth_required(monkeypatch):
 
     tools = get_tools(
         [_sharepoint_tool()],
-        user_declined_mcp_servers=[
+        mcp_context=McpContext(user_declined_servers=[
             {"server_url": "https://other-tenant.sharepoint.com/sites/other"}
-        ],
+        ]),
     )
 
     proxies = _proxy_tools(tools)
@@ -194,7 +194,7 @@ def test_auth_failure_does_not_abort_sibling_toolkits(monkeypatch):
     sibling = _sharepoint_tool(site_url="https://tenant.sharepoint.com/sites/other", oauth=False)
     sibling["id"] = 43  # avoid dedup by id
 
-    tools = get_tools([failing, sibling], user_declined_mcp_servers=None)
+    tools = get_tools([failing, sibling])
 
     # Sibling still loaded despite the first toolkit's auth failure.
     assert _find(tools, "sibling_action") is not None

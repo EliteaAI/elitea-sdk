@@ -400,6 +400,7 @@ class Assistant:
 
         # Lazy import to avoid circular dependency
         from ..toolkits.tools import get_tools
+        from ..utils.mcp_oauth import McpContext
         version_tools = data['tools']
 
         # Handle internal tools from both locations:
@@ -467,13 +468,15 @@ class Assistant:
             memory_store=self.store,
             memory=self.memory,
             debug_mode=debug_mode,
-            mcp_tokens=mcp_tokens,
             conversation_id=conversation_id,
-            ignored_mcp_servers=ignored_mcp_servers,
             current_participant_id=self.current_participant_id,
-            user_declined_mcp_servers=user_declined_mcp_servers or data.get("user_declined_mcp_servers"),
-            pipeline_node_toolkit_names=pipeline_node_toolkit_names,
-            skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
+            mcp_context=McpContext(
+                tokens=mcp_tokens,
+                ignored_servers=ignored_mcp_servers,
+                user_declined_servers=user_declined_mcp_servers or data.get("user_declined_mcp_servers"),
+                pipeline_node_toolkit_names=pipeline_node_toolkit_names,
+                skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
+            ),
         )
         if tools:
             # Deduplicate keeping the last occurrence, scoped per (name, toolkit_name) so that
