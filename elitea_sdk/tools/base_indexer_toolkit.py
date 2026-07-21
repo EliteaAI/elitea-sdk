@@ -1021,17 +1021,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def remove_ids_fn(self, idx_data, key: str):
         raise NotImplementedError("Subclasses must implement this method")
 
+    def list_indexes(self):
+        """Lists all indexes in the vector store."""
+        return super().list_collections()
+
     def remove_index(self, index_name: str = ""):
         """Cleans the indexed data in the collection."""
         deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
 
         if index_name and deleted_count == 0:
-            raise ToolException(f"Index '{index_name}' not found. Available collections: {self.list_collections()}")
+            raise ToolException(f"Index '{index_name}' not found. Available indexes: {self.list_indexes()}")
 
         self._emit_index_data_removed_event(index_name)
-        return (f"Collection '{index_name}' has been removed from the vector store.\n"
-                f"Available collections: {self.list_collections()}") if index_name \
-            else "All collections have been removed from the vector store." 
+        return (f"Index '{index_name}' has been removed from the vector store.\n"
+                f"Available indexes: {self.list_indexes()}") if index_name \
+            else "All indexes have been removed from the vector store."
 
     def _build_collection_filter(self, filter: dict | str, index_name: str = "") -> dict:
         """Builds a filter for the collection based on the provided suffix."""
@@ -1093,9 +1097,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         Returns:
             List of documents with requested fields, or error message string.
         """
-        available_collections = super().list_collections()
-        if index_name and index_name not in available_collections:
-            return f"Collection '{index_name}' not found. Available collections: {available_collections}"
+        available_indexes = self.list_indexes()
+        if index_name and index_name not in available_indexes:
+            return f"Index '{index_name}' not found. Available indexes: {available_indexes}"
 
         filter = self._build_collection_filter(filter, index_name)
         found_docs = super().search_documents(
@@ -1250,18 +1254,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         Reads the initiator hint from (in order):
           1. ``self._index_meta_config["initiator"]`` — set by callers of ``index_data`` via
              the ``_initiator`` kwarg (see ``index_data``).
-          2. ``self._runnable_config["configurable"]["initiator"]`` — set by the pylon
-             indexer worker on the RunnableConfig before invoking the tool.
-          3. ``self._runnable_config["metadata"]["initiator"]`` — same source, alternate key.
+          2. ``self._runnable_config["metadata"]["initiator"]`` — set by the pylon
+             indexer worker on the RunnableConfig.metadata before invoking the tool.
         Any value whose string form equals ``"schedule"`` (case-insensitive) is treated as
         scheduler-triggered.
         """
         def _pluck(config):
             if not isinstance(config, dict):
                 return None
-            configurable = config.get("configurable")
-            if isinstance(configurable, dict) and configurable.get("initiator"):
-                return configurable.get("initiator")
             metadata = config.get("metadata")
             if isinstance(metadata, dict) and metadata.get("initiator"):
                 return metadata.get("initiator")
@@ -1280,7 +1280,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 from langchain_core.runnables.config import var_child_runnable_config
                 ambient = var_child_runnable_config.get()
                 candidate = _pluck(ambient) if ambient else None
-            except (ImportError, LookupError, Exception):
+            except (ImportError, LookupError) as e:
+                logger.debug(f"Ambient runnable config unavailable, skipping initiator lookup: {e}")
                 candidate = None
         if candidate is None:
             return False
@@ -1403,9 +1404,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata["indexed_chunks"] = self.get_indexed_count(index_name)
             metadata["updated"] = result
             # Promote a successful completion to 'scheduled_reindex' when the run was
-            # triggered by the platform scheduler AND this is not the first indexing
-            # run (i.e. history already has at least one non-'created' entry before
-            # this one). Initial indexing keeps state='completed' even under scheduler.
+            # triggered by the platform scheduler AND at least one prior run already
+            # completed. History at this point always contains the current run's
+            # 'in_progress' entry (appended by index_meta_init on both fresh and reindex
+            # paths). So after filtering the permanent 'created' marker:
+            #   - first indexing:      previous_runs = [in_progress]        len=1 → keep 'completed'
+            #   - Nth reindex (N>=2):  previous_runs = [..., in_progress]   len>1 → promote
             if state == IndexerKeywords.INDEX_META_COMPLETED.value and self._is_scheduled_run():
                 previous_history_raw = metadata.get("history", "[]")
                 try:
@@ -1631,8 +1635,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             {
                 "name": IndexTools.LIST_INDEXES.value,
                 "mode": IndexTools.LIST_INDEXES.value,
-                "ref": self.list_collections,
-                "description": self.list_collections.__doc__,
+                "ref": self.list_indexes,
+                "description": self.list_indexes.__doc__,
                 "args_schema": create_model("ListIndexesParams")
             },
             {
