@@ -696,6 +696,26 @@ class McpConfigToolkit(BaseToolkit):
                     headers = {}
                 headers['Authorization'] = f"{token_type} {access_token}"
 
+        # Internal Elitea MCP servers authenticate with the caller's personal token. When the
+        # server definition carries no Authorization header template to substitute into, fall
+        # back to the token so dispatch does not silently 401. Scoped to configs that supply a
+        # personal_token; OAuth-based servers keep the header set above.
+        personal_token = user_config.get('personal_token')
+        if personal_token and not any(
+            isinstance(key, str) and key.lower() == 'authorization' for key in (headers or {})
+        ):
+            if headers is None:
+                headers = {}
+            headers['Authorization'] = f"Bearer {personal_token}"
+        elif not personal_token and isinstance(headers, dict):
+            # No token to substitute: drop an Authorization header still holding an unresolved
+            # {placeholder} so the server returns a clean auth error instead of a literal-token 401.
+            for key in list(headers):
+                value = headers[key]
+                if (isinstance(key, str) and key.lower() == 'authorization'
+                        and isinstance(value, str) and '{' in value and '}' in value):
+                    headers.pop(key)
+
         # Normalize deprecated Atlassian /v1/sse URL to /v1/mcp/authv2 for the actual connection
         connection_url = normalize_mcp_url(url)
 
