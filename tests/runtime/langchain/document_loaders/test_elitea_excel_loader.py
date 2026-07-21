@@ -337,3 +337,59 @@ def test_get_content_full_read_rejects_oversized_multi_sheet_workbook(tmp_path):
 
     with pytest.raises(ExcelReadLimitExceeded):
         loader.get_content()
+
+
+def _build_write_only_workbook(tmp_path, sheets):
+    """Create an .xlsx via write_only=True, which never emits a <dimension>
+    tag (openpyxl worksheet/_write_only.py has no calculate_dimension), so
+    read_only max_row/max_column come back None instead of the real count.
+    """
+    wb = Workbook(write_only=True)
+    for name, rows in sheets.items():
+        ws = wb.create_sheet(title=name)
+        for r in rows:
+            ws.append(r)
+    path = tmp_path / "wb_write_only.xlsx"
+    wb.save(path)
+
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.filename.startswith("xl/worksheets/sheet"):
+                assert b"<dimension" not in archive.read(info.filename)
+
+    return str(path)
+
+
+def test_list_excel_sheets_falls_back_when_dimension_tag_missing(tmp_path):
+    path = _build_write_only_workbook(tmp_path, {
+        "Alpha": [["h1", "h2"], [1, 2], [3, 4]],
+    })
+
+    sheets = list_excel_sheets(path)
+
+    assert sheets[0]["max_row"] == 3
+    assert sheets[0]["max_column"] == 2
+
+
+def test_check_excel_read_limits_counts_rows_when_dimension_tag_missing(tmp_path):
+    path = _build_write_only_workbook(tmp_path, {
+        "Alpha": [["h1", "h2"]] + [[i, i * 2] for i in range(50)],
+    })
+
+    estimate = check_excel_read_limits(path, raise_on_violation=True)
+
+    assert estimate.total_rows_workbook == 51
+    assert estimate.requested_rows == 51
+
+
+def test_read_excel_rows_returns_body_when_dimension_tag_missing(tmp_path):
+    path = _build_write_only_workbook(tmp_path, {
+        "Alpha": [["h1", "h2"]] + [[i, i * 2] for i in range(50)],
+    })
+
+    result = read_excel_rows(path, sheet_name="Alpha", start_row=2, end_row=6)
+
+    assert result["total_rows"] == 51
+    assert result["end_row"] == 6
+    body_lines = result["content"].splitlines()[1:]
+    assert len(body_lines) == 5
