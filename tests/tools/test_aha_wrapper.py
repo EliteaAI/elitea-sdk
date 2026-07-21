@@ -320,8 +320,8 @@ class TestToolRegistry:
         w = _wrapper()
         tools = w.get_available_tools()
         names = {t["name"] for t in tools}
-        # 19 M2 read tools + 11 M3 write/dispatcher tools = 30
-        assert len(tools) == 30
+        # 19 M2 read tools + 11 M3 write/dispatcher tools + 5 report/analysis tools = 35
+        assert len(tools) == 35
         # Spot-check every category
         assert {"get_feature", "list_features", "search", "get_page", "get_feature_gql"} <= names
         assert {"find_project", "search_records", "read_records"} <= names
@@ -334,6 +334,13 @@ class TestToolRegistry:
             "fields_metadata",
             "field_options_metadata",
             "attach_file",
+        } <= names
+        assert {
+            "get_report_data",
+            "get_report_columns_and_filters",
+            "get_report_filter_options",
+            "manage_report",
+            "analyze_records",
         } <= names
 
     def test_each_tool_has_required_shape(self):
@@ -745,3 +752,210 @@ class TestDispatchers:
         w = _wrapper()
         with pytest.raises(ToolException, match="unsupported record_type"):
             w.read_records(record_type="sprint", reference_or_id="S-1")
+
+
+class TestReports:
+    def test_get_report_data_list_view_url(self):
+        w = _wrapper()
+        payload = {"columns": [{"name": "Name"}], "rows": [{"Name": "F1"}]}
+        resp = _rest_stub(payload)
+        with patch.object(w._session, "request", return_value=resp) as req:
+            out = w.get_report_data("123")
+        method, url = req.call_args[0][:2]
+        assert method == "GET"
+        assert url.endswith("/custom_reports/123/list_view")
+        assert out == payload
+
+    def test_get_report_data_pivot_view_url(self):
+        w = _wrapper()
+        resp = _rest_stub({"pivot": {"rows": []}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.get_report_data("42", view="pivot")
+        assert req.call_args[0][1].endswith("/custom_reports/42/pivot_view")
+
+    def test_get_report_data_rejects_bad_view(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="Unsupported report view"):
+            w.get_report_data("42", view="chart")
+
+    def test_get_report_data_requires_id(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="report_id is required"):
+            w.get_report_data("  ")
+
+    def test_get_report_columns_and_filters_extracts_sections(self):
+        w = _wrapper()
+        payload = {
+            "columns": [{"name": "Name"}, {"name": "Status"}],
+            "filters": [{"name": "Workflow status", "options": ["Open", "Closed"]}],
+            "rows": [{"Name": "F1"}],
+        }
+        resp = _rest_stub(payload)
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.get_report_columns_and_filters("7")
+        assert out == {
+            "columns": [{"name": "Name"}, {"name": "Status"}],
+            "filters": [{"name": "Workflow status", "options": ["Open", "Closed"]}],
+        }
+
+    def test_get_report_columns_and_filters_defaults_empty(self):
+        w = _wrapper()
+        resp = _rest_stub({"rows": []})
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.get_report_columns_and_filters("7")
+        assert out == {"columns": [], "filters": []}
+
+    def test_get_report_filter_options_returns_options(self):
+        w = _wrapper()
+        payload = {
+            "filters": [
+                {"name": "Workflow status", "options": ["Open", "In progress", "Closed"]},
+                {"name": "Owner", "options": [{"id": 1, "name": "Alice"}]},
+            ]
+        }
+        resp = _rest_stub(payload)
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.get_report_filter_options("7", "workflow status")
+        assert out == ["Open", "In progress", "Closed"]
+
+    def test_get_report_filter_options_case_insensitive_match(self):
+        w = _wrapper()
+        resp = _rest_stub({"filters": [{"name": "Owner", "choices": ["Alice", "Bob"]}]})
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.get_report_filter_options("7", "OWNER")
+        assert out == ["Alice", "Bob"]
+
+    def test_get_report_filter_options_missing_filter_raises(self):
+        w = _wrapper()
+        resp = _rest_stub({"filters": [{"name": "Status"}]})
+        with patch.object(w._session, "request", return_value=resp):
+            with pytest.raises(ToolException, match="No filter named"):
+                w.get_report_filter_options("7", "Owner")
+
+    def test_get_report_filter_options_non_enumerable_raises(self):
+        w = _wrapper()
+        resp = _rest_stub({"filters": [{"name": "Search"}]})  # no options key
+        with patch.object(w._session, "request", return_value=resp):
+            with pytest.raises(ToolException, match="not enumerable"):
+                w.get_report_filter_options("7", "Search")
+
+    def test_get_report_filter_options_requires_filter_name(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="filter_name is required"):
+            w.get_report_filter_options("7", "  ")
+
+    def test_manage_report_rejects_unsupported_action(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="unsupported action"):
+            w.manage_report(action="patch")
+
+    def test_manage_report_create_raises_not_supported(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="does not support report management"):
+            w.manage_report(action="create", properties={"name": "R"})
+
+    def test_manage_report_update_raises_not_supported(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="does not support report management"):
+            w.manage_report(action="update", report_id="7", properties={"name": "R"})
+
+    def test_manage_report_delete_raises_not_supported(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="does not support report management"):
+            w.manage_report(action="delete", report_id="7")
+
+
+class TestAnalyzeRecords:
+    def test_analyze_aggregates_types_status_and_assignee(self):
+        w = _wrapper()
+        # Two features + one release; two share a workflow_status name.
+        records = {
+            "features/DEVELOP-1": {
+                "feature": {
+                    "id": 1,
+                    "workflow_status": {"name": "In progress"},
+                    "assigned_to_user": {"name": "Alice"},
+                    "updated_at": "2026-06-01T00:00:00Z",
+                    "tags": ["ml", "urgent"],
+                }
+            },
+            "features/DEVELOP-2": {
+                "feature": {
+                    "id": 2,
+                    "workflow_status": {"name": "Closed"},
+                    "updated_at": "2026-06-05T00:00:00Z",
+                    "tags": [{"name": "ml"}, {"name": "backlog"}],
+                }
+            },
+            "releases/DEVELOP-R-1": {
+                "release": {
+                    "id": 100,
+                    "workflow_status": "In progress",
+                    "updated_at": "2026-05-20T00:00:00Z",
+                }
+            },
+        }
+
+        def fake_request(method, url, **kwargs):
+            for key, payload in records.items():
+                if url.endswith(f"/{key}"):
+                    return _rest_stub(payload)
+            return _rest_stub({}, ok=False, status=404, text="not found")
+
+        with patch.object(w._session, "request", side_effect=fake_request):
+            out = w.analyze_records(
+                references=[
+                    {"record_type": "feature", "reference_or_id": "DEVELOP-1"},
+                    {"record_type": "feature", "reference_or_id": "DEVELOP-2"},
+                    {"record_type": "release", "reference_or_id": "DEVELOP-R-1"},
+                ]
+            )
+
+        assert out["count"] == 3
+        assert out["by_record_type"] == {"feature": 2, "release": 1}
+        assert out["by_workflow_status"] == {"In progress": 2, "Closed": 1}
+        assert out["by_assigned_to"] == {"Alice": 1}
+        assert out["updated_at"]["min"] == "2026-05-20T00:00:00Z"
+        assert out["updated_at"]["max"] == "2026-06-05T00:00:00Z"
+        assert out["tags"] == ["backlog", "ml", "urgent"]
+        assert out["errors"] == []
+
+    def test_analyze_records_records_fetch_errors(self):
+        w = _wrapper()
+
+        def fake_request(method, url, **kwargs):
+            if url.endswith("/features/GOOD-1"):
+                return _rest_stub({"feature": {"id": 1}})
+            return _rest_stub({}, ok=False, status=404, text='{"error":"not found"}')
+
+        with patch.object(w._session, "request", side_effect=fake_request):
+            out = w.analyze_records(
+                references=[
+                    {"record_type": "feature", "reference_or_id": "GOOD-1"},
+                    {"record_type": "feature", "reference_or_id": "MISSING-1"},
+                ]
+            )
+
+        assert out["count"] == 1
+        assert out["by_record_type"] == {"feature": 1}
+        assert len(out["errors"]) == 1
+        assert "MISSING-1" in out["errors"][0]["reference"]
+
+    def test_analyze_records_rejects_empty_list(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="references list is empty"):
+            w.analyze_records(references=[])
+
+    def test_analyze_records_flags_malformed_entries(self):
+        w = _wrapper()
+        with patch.object(w._session, "request") as req:
+            out = w.analyze_records(
+                references=[
+                    {"record_type": "feature"},  # missing ref
+                    {"reference_or_id": "X"},  # missing type
+                    "not-a-dict",  # type: ignore[list-item]
+                ]
+            )
+        req.assert_not_called()
+        assert out["count"] == 0
+        assert len(out["errors"]) == 3

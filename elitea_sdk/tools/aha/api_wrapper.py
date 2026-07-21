@@ -496,6 +496,84 @@ AhaReadRecordsInput = create_model(
     fields=FIELDS_FIELD,
 )
 
+# ----- Reports & analysis schemas -----
+
+_REPORT_VIEW_DESC = (
+    "Report view. `list` returns the flat tabular view "
+    "(`GET /custom_reports/{id}/list_view`); `pivot` returns the pivoted "
+    "aggregation (`GET /custom_reports/{id}/pivot_view`). Defaults to `list`."
+)
+
+AhaGetReportDataInput = create_model(
+    "AhaGetReportDataInput",
+    report_id=(str, Field(description="Aha custom-report ID (numeric).")),
+    view=(
+        Optional[str],
+        Field(default="list", description=_REPORT_VIEW_DESC),
+    ),
+    output_format=OUTPUT_FORMAT_FIELD,
+)
+
+AhaGetReportColumnsAndFiltersInput = create_model(
+    "AhaGetReportColumnsAndFiltersInput",
+    report_id=(str, Field(description="Aha custom-report ID (numeric).")),
+    view=(
+        Optional[str],
+        Field(default="list", description=_REPORT_VIEW_DESC),
+    ),
+)
+
+AhaGetReportFilterOptionsInput = create_model(
+    "AhaGetReportFilterOptionsInput",
+    report_id=(str, Field(description="Aha custom-report ID (numeric).")),
+    filter_name=(
+        str,
+        Field(description="Name of the filter to enumerate (case-insensitive)."),
+    ),
+    view=(
+        Optional[str],
+        Field(default="list", description=_REPORT_VIEW_DESC),
+    ),
+)
+
+AhaManageReportInput = create_model(
+    "AhaManageReportInput",
+    action=(
+        str,
+        Field(
+            description=(
+                "`create`, `update`, or `delete`. Aha's REST API does not expose "
+                "report CRUD, so any action raises a clean ToolException."
+            )
+        ),
+    ),
+    report_id=(
+        Optional[str],
+        Field(default=None, description="Report ID for `update`/`delete` actions."),
+    ),
+    properties=(
+        Optional[Dict[str, Any]],
+        Field(
+            default=None,
+            description="Field/value map for `create`/`update` actions.",
+        ),
+    ),
+)
+
+AhaAnalyzeRecordsInput = create_model(
+    "AhaAnalyzeRecordsInput",
+    references=(
+        List[Dict[str, str]],
+        Field(
+            description=(
+                "Records to summarise. Each entry is `{record_type, reference_or_id}` "
+                "using the same vocabulary as `read_records`."
+            ),
+        ),
+    ),
+    output_format=OUTPUT_FORMAT_FIELD,
+)
+
 
 class AhaApiWrapper(BaseToolApiWrapper):
     """Aha! transport wrapper.
@@ -1430,6 +1508,225 @@ class AhaApiWrapper(BaseToolApiWrapper):
             "Accepted: feature, requirement, release, initiative, epic, idea, product, page."
         )
 
+    # ----- Reports (custom_reports) -----
+    #
+    # Aha! REST v1 exposes exactly two report endpoints:
+    #   GET /custom_reports/{id}/list_view
+    #   GET /custom_reports/{id}/pivot_view
+    # There is no list-all endpoint, no separate columns/filters resource,
+    # and no CRUD. The tools below map the requested surface onto that
+    # reality — a shared underlying fetch, with post-processing for the
+    # metadata-style tools.
+
+    @staticmethod
+    def _report_view_path(report_id: str, view: Optional[str]) -> str:
+        rt = (view or "list").strip().lower()
+        if rt not in {"list", "pivot"}:
+            raise ToolException(
+                f"Unsupported report view '{view}'. Accepted: 'list' or 'pivot'."
+            )
+        if not (report_id or "").strip():
+            raise ToolException("report_id is required")
+        return f"custom_reports/{report_id}/{rt}_view"
+
+    def get_report_data(
+        self,
+        report_id: str,
+        view: Optional[str] = "list",
+        output_format: Optional[str] = "json",
+    ):
+        """Fetch the rendered data of an Aha custom report.
+
+        Calls Aha's ``GET /custom_reports/{id}/list_view`` (or
+        ``/pivot_view``) and returns the payload as-is. Use
+        ``get_report_columns_and_filters`` to inspect the report's schema.
+        """
+        payload = self._rest_get(self._report_view_path(report_id, view))
+        return self._format_output(payload, output_format)
+
+    def get_report_columns_and_filters(
+        self,
+        report_id: str,
+        view: Optional[str] = "list",
+    ) -> Dict[str, Any]:
+        """Return the columns and filter definitions embedded in a report.
+
+        Aha! does not expose a separate metadata endpoint for reports;
+        column and filter definitions arrive inside the same ``list_view``
+        / ``pivot_view`` payload. This tool fetches that payload once and
+        extracts the ``columns`` and ``filters`` sections so agents don't
+        have to parse the full body.
+        """
+        payload = self._rest_get(self._report_view_path(report_id, view))
+        return {
+            "columns": payload.get("columns") or [],
+            "filters": payload.get("filters") or [],
+        }
+
+    def get_report_filter_options(
+        self,
+        report_id: str,
+        filter_name: str,
+        view: Optional[str] = "list",
+    ) -> List[Any]:
+        """Enumerate the values available for a report filter.
+
+        Best-effort: Aha! only returns enumerable options for filters whose
+        underlying field is a fixed vocabulary (e.g. workflow status). For
+        free-text or numeric filters the payload does not carry options —
+        this tool raises ``ToolException`` in that case so callers know to
+        surface the constraint rather than silently returning an empty list.
+        """
+        if not (filter_name or "").strip():
+            raise ToolException("filter_name is required")
+        payload = self._rest_get(self._report_view_path(report_id, view))
+        filters = payload.get("filters") or []
+        target = filter_name.strip().lower()
+        for entry in filters:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("label") or "").strip().lower()
+            if name != target:
+                continue
+            options = entry.get("options") or entry.get("choices") or entry.get("values")
+            if isinstance(options, list):
+                return options
+            raise ToolException(
+                f"Filter '{filter_name}' is not enumerable — its options are "
+                "not exposed by Aha! (typically free-text or numeric filters)."
+            )
+        available = sorted(
+            {str(e.get("name") or e.get("label") or "").strip() for e in filters if isinstance(e, dict)}
+            - {""}
+        )
+        raise ToolException(
+            f"No filter named '{filter_name}' on report {report_id}. "
+            f"Available: {', '.join(available) or '(none)'}"
+        )
+
+    def manage_report(
+        self,
+        action: str,
+        report_id: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+    ):
+        """Create/update/delete Aha reports — **not supported by the REST API**.
+
+        Aha's REST API does not expose report CRUD; custom reports are
+        managed exclusively through the Aha! UI. This tool raises a clean
+        ``ToolException`` describing that constraint so callers can surface
+        the limitation to end users rather than silently failing.
+        """
+        act = (action or "").strip().lower()
+        if act not in {"create", "update", "delete"}:
+            raise ToolException(
+                f"manage_report: unsupported action '{action}'. "
+                "Accepted: create, update, delete."
+            )
+        raise ToolException(
+            "Aha! REST API does not support report management — reports "
+            "are managed via the Aha! UI only. Use `get_report_data` and "
+            "`get_report_columns_and_filters` to read existing reports."
+        )
+
+    # ----- Aggregate analysis -----
+
+    def analyze_records(
+        self,
+        references: List[Dict[str, str]],
+        output_format: Optional[str] = "json",
+    ) -> Dict[str, Any]:
+        """Summarise a set of Aha records without an LLM.
+
+        Fetches each ``{record_type, reference_or_id}`` pair via
+        ``read_records`` and returns a compact aggregate:
+
+        * ``count`` — total records considered
+        * ``by_record_type`` — count per record_type
+        * ``by_workflow_status`` — count per status name (records with one)
+        * ``by_assigned_to`` — count per assignee name
+        * ``updated_at`` — ``{min, max}`` if any records expose it
+        * ``tags`` — sorted list of unique tags across the set
+        * ``errors`` — per-reference error messages (fetch failures)
+
+        Records that fail to fetch are recorded in ``errors`` and skipped
+        from the aggregation so a single bad reference doesn't poison the
+        entire summary.
+        """
+        if not references:
+            raise ToolException("analyze_records: references list is empty")
+
+        totals = {
+            "count": 0,
+            "by_record_type": {},  # type: Dict[str, int]
+            "by_workflow_status": {},  # type: Dict[str, int]
+            "by_assigned_to": {},  # type: Dict[str, int]
+            "updated_at": {"min": None, "max": None},
+            "tags": set(),  # type: ignore[var-annotated]
+            "errors": [],  # type: List[Dict[str, str]]
+        }
+
+        def _bump(bucket: str, key: Optional[str]) -> None:
+            if not key:
+                return
+            counts = totals[bucket]  # type: ignore[index]
+            counts[key] = counts.get(key, 0) + 1
+
+        for entry in references:
+            if not isinstance(entry, dict):
+                totals["errors"].append({"reference": str(entry), "error": "not a dict"})
+                continue
+            rt = str(entry.get("record_type") or "").strip().lower()
+            ref = str(entry.get("reference_or_id") or "").strip()
+            if not rt or not ref:
+                totals["errors"].append(
+                    {"reference": str(entry), "error": "record_type and reference_or_id required"}
+                )
+                continue
+            try:
+                record = self.read_records(record_type=rt, reference_or_id=ref)
+            except ToolException as exc:
+                totals["errors"].append({"reference": f"{rt}:{ref}", "error": str(exc)})
+                continue
+            if not isinstance(record, dict):
+                totals["errors"].append(
+                    {"reference": f"{rt}:{ref}", "error": "read_records returned non-dict"}
+                )
+                continue
+
+            totals["count"] += 1
+            _bump("by_record_type", rt)
+
+            wf = record.get("workflow_status")
+            if isinstance(wf, dict):
+                _bump("by_workflow_status", wf.get("name"))
+            elif isinstance(wf, str):
+                _bump("by_workflow_status", wf)
+
+            assigned = record.get("assigned_to_user")
+            if isinstance(assigned, dict):
+                _bump("by_assigned_to", assigned.get("name") or assigned.get("email"))
+
+            updated = record.get("updated_at")
+            if isinstance(updated, str) and updated:
+                cur_min = totals["updated_at"]["min"]
+                cur_max = totals["updated_at"]["max"]
+                totals["updated_at"]["min"] = updated if cur_min is None else min(cur_min, updated)
+                totals["updated_at"]["max"] = updated if cur_max is None else max(cur_max, updated)
+
+            tags = record.get("tags")
+            if isinstance(tags, list):
+                for tag in tags:
+                    if isinstance(tag, str) and tag:
+                        totals["tags"].add(tag)
+                    elif isinstance(tag, dict):
+                        name = tag.get("name")
+                        if isinstance(name, str) and name:
+                            totals["tags"].add(name)
+
+        totals["tags"] = sorted(totals["tags"])  # type: ignore[assignment]
+        return self._format_output(totals, output_format)
+
     # ----- Tool registry -----
 
     def get_available_tools(self) -> List[Dict[str, Any]]:
@@ -1619,5 +1916,37 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 "description": self.attach_file.__doc__,
                 "args_schema": AhaAttachFileInput,
                 "ref": self.attach_file,
+            },
+            # Reports
+            {
+                "name": "get_report_data",
+                "description": self.get_report_data.__doc__,
+                "args_schema": AhaGetReportDataInput,
+                "ref": self.get_report_data,
+            },
+            {
+                "name": "get_report_columns_and_filters",
+                "description": self.get_report_columns_and_filters.__doc__,
+                "args_schema": AhaGetReportColumnsAndFiltersInput,
+                "ref": self.get_report_columns_and_filters,
+            },
+            {
+                "name": "get_report_filter_options",
+                "description": self.get_report_filter_options.__doc__,
+                "args_schema": AhaGetReportFilterOptionsInput,
+                "ref": self.get_report_filter_options,
+            },
+            {
+                "name": "manage_report",
+                "description": self.manage_report.__doc__,
+                "args_schema": AhaManageReportInput,
+                "ref": self.manage_report,
+            },
+            # Aggregate analysis
+            {
+                "name": "analyze_records",
+                "description": self.analyze_records.__doc__,
+                "args_schema": AhaAnalyzeRecordsInput,
+                "ref": self.analyze_records,
             },
         ]
