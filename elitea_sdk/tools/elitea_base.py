@@ -11,6 +11,12 @@ from pydantic import BaseModel, create_model, Field, SecretStr
 
 # from elitea_sdk.runtime.langchain.interfaces.llm_processor import get_embeddings
 from .chunkers import markdown_chunker
+from .index_params import (
+    INDEX_NAME_MAX_LENGTH,
+    RemoveIndexParams,
+    build_base_search_params,
+    build_base_stepback_search_params,
+)
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.utils.utils import IndexerKeywords
 
@@ -32,12 +38,16 @@ LoaderSchema = create_model(
 # Base Vector Store Schema Models
 BaseIndexParams = create_model(
     "BaseIndexParams",
-    index_name=(str, Field(description="Index name (max 32 characters)", min_length=1, max_length=32)),
+    index_name=(str, Field(
+        description=f"Index name (max {INDEX_NAME_MAX_LENGTH} characters)",
+        min_length=1, max_length=INDEX_NAME_MAX_LENGTH)),
 )
 
 BaseCodeIndexParams = create_model(
     "BaseCodeIndexParams",
-    index_name=(str, Field(description="Index name (max 32 characters)", min_length=1, max_length=32)),
+    index_name=(str, Field(
+        description=f"Index name (max {INDEX_NAME_MAX_LENGTH} characters)",
+        min_length=1, max_length=INDEX_NAME_MAX_LENGTH)),
     clean_index=(Optional[bool], Field(default=False, description="Optional flag to enforce clean existing index before indexing new data")),
     progress_step=(Optional[int], Field(default=5, ge=0, le=100,
                          description="Optional step size for progress reporting during indexing")),
@@ -47,72 +57,8 @@ BaseCodeIndexParams = create_model(
 
 )
 
-RemoveIndexParams = create_model(
-    "RemoveIndexParams",
-    index_name=(Optional[str], Field(description="Optional index name (max 32 characters)", default="", max_length=32)),
-)
-
-BaseSearchParams = create_model(
-    "BaseSearchParams",
-    query=(str, Field(description="Query text to search in the index")),
-    index_name=(Optional[str], Field(
-        description="Optional index name (max 32 characters). Leave empty to search across all datasets",
-        default="", max_length=32)),
-    filter=(Optional[dict], Field(
-        description="Filter to apply to the search results. Can be a dictionary or a JSON string.",
-        default={},
-        examples=["{\"key\": \"value\"}", "{\"status\": \"active\"}"]
-    )),
-    cut_off=(Optional[float], Field(description="Cut-off score for search results", default=0.5, ge=0, le=1)),
-    search_top=(Optional[int], Field(description="Number of top results to return", default=10, ge=0)),
-    full_text_search=(Optional[Dict[str, Any]], Field(
-        description="Full text search parameters. Can be a dictionary with search options.",
-        default=None
-    )),
-    extended_search=(Optional[List[str]], Field(
-        description="List of additional fields to include in the search results.",
-        default=None
-    )),
-    reranker=(Optional[dict], Field(
-        description="Reranker configuration. Can be a dictionary with reranking parameters.",
-        default={}
-    )),
-    reranking_config=(Optional[Dict[str, Dict[str, Any]]], Field(
-        description="Reranking configuration. Can be a dictionary with reranking settings.",
-        default=None
-    )),
-)
-
-BaseStepbackSearchParams = create_model(
-    "BaseStepbackSearchParams",
-    query=(str, Field(description="Query text to search in the index")),
-    index_name=(Optional[str], Field(description="Optional index name (max 32 characters)", default="", max_length=32)),
-    messages=(Optional[List], Field(description="Chat messages for stepback search context", default=[])),
-    filter=(Optional[dict], Field(
-        description="Filter to apply to the search results. Can be a dictionary or a JSON string.",
-        default={},
-        examples=["{\"key\": \"value\"}", "{\"status\": \"active\"}"]
-    )),
-    cut_off=(Optional[float], Field(description="Cut-off score for search results", default=0.5, ge=0, le=1)),
-    search_top=(Optional[int], Field(description="Number of top results to return", default=10, ge=0)),
-    full_text_search=(Optional[Dict[str, Any]], Field(
-        description="Full text search parameters. Can be a dictionary with search options.",
-        default=None
-    )),
-    extended_search=(Optional[List[str]], Field(
-        description="List of additional fields to include in the search results.",
-        default=None
-    )),
-    reranker=(Optional[dict], Field(
-        description="Reranker configuration. Can be a dictionary with reranking parameters.",
-        default={}
-    )),
-    reranking_config=(Optional[Dict[str, Dict[str, Any]]], Field(
-        description="Reranking configuration. Can be a dictionary with reranking settings.",
-        default=None
-    )),
-
-)
+BaseSearchParams = build_base_search_params(cut_off_default=0.5)
+BaseStepbackSearchParams = build_base_stepback_search_params(cut_off_default=0.5)
 
 BaseIndexDataParams = create_model(
     "indexData",
