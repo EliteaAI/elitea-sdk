@@ -141,6 +141,22 @@ def _count_xlsx_images(source: Union[str, bytes, io.BytesIO],
         )
 
 
+def _resolve_sheet_size(ws) -> tuple:
+    """Return (max_row, max_column), falling back to a streaming scan when the
+    worksheet has no <dimension> tag (e.g. written via openpyxl write_only=True),
+    which leaves read_only max_row/max_column as None with no fallback in openpyxl.
+    """
+    if ws.max_row is not None:
+        return ws.max_row, ws.max_column
+    max_row = max_col = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                max_row = max(max_row, cell.row)
+                max_col = max(max_col, cell.column)
+    return max_row, max_col
+
+
 def _list_sheets_and_sample(source: Union[str, bytes, io.BytesIO],
                             file_name: Optional[str] = None,
                             sample_limit: int = EXCEL_SAMPLE_ROW_LIMIT) -> tuple:
@@ -160,10 +176,11 @@ def _list_sheets_and_sample(source: Union[str, bytes, io.BytesIO],
             samples = {}
             for name in wb.sheetnames:
                 ws = wb[name]
+                max_row, max_col = _resolve_sheet_size(ws)
                 sheets.append({
                     "name": name,
-                    "max_row": ws.max_row if ws.max_row is not None else 0,
-                    "max_column": ws.max_column if ws.max_column is not None else 0,
+                    "max_row": max_row,
+                    "max_column": max_col,
                 })
                 lines = [
                     _format_row(row) for row in
@@ -355,10 +372,11 @@ def list_excel_sheets(source: Union[str, bytes, io.BytesIO],
             result = []
             for name in wb.sheetnames:
                 ws = wb[name]
+                max_row, max_col = _resolve_sheet_size(ws)
                 result.append({
                     "name": name,
-                    "max_row": ws.max_row if ws.max_row is not None else 0,
-                    "max_column": ws.max_column if ws.max_column is not None else 0,
+                    "max_row": max_row,
+                    "max_column": max_col,
                 })
             return result
         finally:
@@ -442,7 +460,7 @@ def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
                 f"Sheet '{sheet_name}' not found. Available: {wb.sheetnames}"
             )
         ws = wb[sheet_name]
-        total_rows = ws.max_row or 0
+        total_rows, _ = _resolve_sheet_size(ws)
         effective_end = min(end_row, total_rows) if end_row is not None else total_rows
 
         header_line = None
