@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any],
                                    llm_client: Any,
                                    elitea_client: Optional[Any] = None,
-                                   mcp_tokens: Optional[Dict[str, Any]] = None,
                                    use_prefix: bool = False,
-                                   reraise_on_auth_required: bool = False) -> List[Any]:
+                                   mcp_context=None) -> List[Any]:
     """
     Instantiate a toolkit with LLM client support.
     
@@ -28,11 +27,10 @@ def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any],
         toolkit_config: Configuration dictionary for the toolkit
         llm_client: LLM client instance for tools that need LLM capabilities
         elitea_client: Optional additional client instance
-        mcp_tokens: Optional dictionary of MCP OAuth tokens by server URL
         use_prefix: If True, tools get prefixed with toolkit_name to prevent collisions
-                   (for agent use). If False, tools use base names only (for testing interface).
-                   Default False for backward compatibility with testing.
-    
+                   (for agent use). If False, tools use base names only (for testing).
+        mcp_context: Optional McpContext bundling all MCP-related params.
+
     Returns:
         List of instantiated tools from the toolkit
         
@@ -70,10 +68,8 @@ def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any],
             'name': toolkit_name,  # Always pass name for provider toolkits
             'toolkit_name': toolkit_name if (use_prefix or toolkit_type == 'mcp') else None
         }
-        
-        # Get tools using the toolkit configuration with clients
-        # Parameter order: get_tools(tools_list, elitea_client, llm, memory_store, debug_mode, mcp_tokens)
-        tools = get_tools([tool_config], elitea_client, llm_client, mcp_tokens=mcp_tokens, reraise_on_auth_required=reraise_on_auth_required)
+
+        tools = get_tools([tool_config], elitea_client, llm_client, mcp_context=mcp_context)
         
         if not tools:
             logger.warning(f"No tools returned for toolkit {toolkit_name}")

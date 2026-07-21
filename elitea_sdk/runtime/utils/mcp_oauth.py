@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -147,6 +148,38 @@ def build_mcp_auth_decision_result(**kwargs) -> str:
         ensure_ascii=True,
         separators=(",", ":"),
     )
+
+
+@dataclass
+class McpContext:
+    """Bundles all MCP-related context passed through the tool-loading pipeline.
+
+    Replaces the individual mcp_* parameters on get_tools() so that adding new
+    options does not keep growing its already-large parameter list.
+
+    Attributes:
+        tokens: OAuth tokens keyed by server URL (was mcp_tokens).
+        ignored_servers: Server URLs to skip entirely (was ignored_mcp_servers).
+        user_declined_servers: Servers the user has declined auth for
+            (was user_declined_mcp_servers).
+        pipeline_node_toolkit_names: Toolkit names referenced by the current
+            pipeline node; used to track which MCPs were skipped
+            (was pipeline_node_toolkit_names).
+        skipped_pipeline_toolkit_names: Mutable set populated during loading with
+            toolkit names that were skipped/declined; read back by the pipeline
+            (was skipped_pipeline_toolkit_names).
+        reraise_on_auth_required: When True, McpAuthorizationRequired raised by a
+            built-in toolkit (e.g. SharePoint delegated) is re-raised instead of
+            being converted to deferred proxy tools.  Set by test_toolkit_tool so
+            the indexer worker can emit the mcp_authorization_required socket event
+            to the frontend.  Has no effect on MCP toolkit paths.
+    """
+    tokens: Optional[Dict[str, Any]] = field(default=None)
+    ignored_servers: Optional[list] = field(default=None)
+    user_declined_servers: Optional[list] = field(default=None)
+    pipeline_node_toolkit_names: Optional[set] = field(default=None)
+    skipped_pipeline_toolkit_names: Optional[set] = field(default=None)
+    reraise_on_auth_required: bool = field(default=False)
 
 
 class McpAuthorizationRequired(ToolException):

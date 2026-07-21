@@ -1397,6 +1397,7 @@ class EliteAClient:
 
         try:
             from ..utils.toolkit_utils import instantiate_toolkit_with_client
+            from ..utils.mcp_oauth import McpContext
             from langchain_core.runnables import RunnableConfig
             import time
 
@@ -1431,12 +1432,16 @@ class EliteAClient:
                     "execution_time_seconds": 0.0
                 }
 
-            # Instantiate the toolkit with client and LLM support.
-            # reraise_on_auth_required=True ensures McpAuthorizationRequired is not
-            # silently converted to proxy tools — it propagates to the indexer worker
-            # which emits mcp_authorization_required to the frontend.
+            # Instantiate the toolkit. McpContext(reraise_on_auth_required=True) ensures
+            # McpAuthorizationRequired is not silently converted to proxy tools — it
+            # propagates to the indexer worker which emits mcp_authorization_required
+            # to the frontend.
             try:
-                tools = instantiate_toolkit_with_client(toolkit_config, llm, self, mcp_tokens=mcp_tokens, use_prefix=False, reraise_on_auth_required=True)
+                tools = instantiate_toolkit_with_client(
+                    toolkit_config, llm, self,
+                    mcp_context=McpContext(tokens=mcp_tokens, reraise_on_auth_required=True),
+                    use_prefix=False,
+                )
             except McpAuthorizationRequired:
                 logger.info(f"McpAuthorizationRequired detected, re-raising")
                 raise
