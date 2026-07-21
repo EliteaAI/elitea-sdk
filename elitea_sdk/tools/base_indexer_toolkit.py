@@ -13,6 +13,12 @@ from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import create_model, Field, SecretStr
 
+from .index_params import (
+    INDEX_NAME_MAX_LENGTH,
+    RemoveIndexParams,
+    build_base_search_params,
+    build_base_stepback_search_params,
+)
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
@@ -238,80 +244,12 @@ class IndexTools(str, Enum):
     STEPBACK_SEARCH_INDEX = "stepback_search_index"
     STEPBACK_SUMMARY_INDEX = "stepback_summary_index"
     REMOVE_INDEX = "remove_index"
-    LIST_COLLECTIONS = "list_collections"
+    LIST_INDEXES = "list_indexes"
 
-RemoveIndexParams = create_model(
-    "RemoveIndexParams",
-    index_name=(Optional[str], Field(description="Optional index name (max 7 characters)", default="", max_length=7)),
+BaseSearchParams = build_base_search_params(
+    cut_off_default=DEFAULT_CUT_OFF, include_output_fields=True
 )
-
-BaseSearchParams = create_model(
-    "BaseSearchParams",
-    query=(str, Field(description="Query text to search in the index")),
-    index_name=(Optional[str], Field(
-        description="Optional index name (max 7 characters). Leave empty to search across all datasets",
-        default="", max_length=7)),
-    filter=(Optional[dict | str], Field(
-        description="Filter to apply to the search results. Can be a dictionary or a JSON string.",
-        default={},
-        examples=["{\"key\": \"value\"}", "{\"status\": \"active\"}"]
-    )),
-    cut_off=(Optional[float], Field(description="Cut-off score for search results", default=DEFAULT_CUT_OFF, ge=0, le=1)),
-    search_top=(Optional[int], Field(description="Number of top results to return", default=10, gt=0)),
-    full_text_search=(Optional[Dict[str, Any]], Field(
-        description="Full text search parameters. Can be a dictionary with search options.",
-        default=None
-    )),
-    extended_search=(Optional[List[str]], Field(
-        description="List of additional fields to include in the search results.",
-        default=None
-    )),
-    reranker=(Optional[dict], Field(
-        description="Reranker configuration. Can be a dictionary with reranking parameters.",
-        default={}
-    )),
-    reranking_config=(Optional[Dict[str, Dict[str, Any]]], Field(
-        description="Reranking configuration. Can be a dictionary with reranking settings.",
-        default=None
-    )),
-    output_fields=(Optional[List[str]], Field(
-        description="Fields to include in output. Supports: 'page_content', 'score', 'metadata' (all metadata), "
-                    "or 'metadata.<field>' for specific metadata fields (e.g., 'metadata.source'). "
-                    "If None or empty, returns all fields.",
-        default=None,
-        examples=[["metadata", "score"], ["page_content", "metadata.source"], ["metadata.id", "metadata.source"]]
-    )),
-)
-
-BaseStepbackSearchParams = create_model(
-    "BaseStepbackSearchParams",
-    query=(str, Field(description="Query text to search in the index")),
-    index_name=(Optional[str], Field(description="Optional index name (max 7 characters)", default="", max_length=7)),
-    messages=(Optional[List], Field(description="Chat messages for stepback search context", default=[])),
-    filter=(Optional[dict | str], Field(
-        description="Filter to apply to the search results. Can be a dictionary or a JSON string.",
-        default={},
-        examples=["{\"key\": \"value\"}", "{\"status\": \"active\"}"]
-    )),
-    cut_off=(Optional[float], Field(description="Cut-off score for search results", default=DEFAULT_CUT_OFF, ge=0, le=1)),
-    search_top=(Optional[int], Field(description="Number of top results to return", default=10, gt=0)),
-    full_text_search=(Optional[Dict[str, Any]], Field(
-        description="Full text search parameters. Can be a dictionary with search options.",
-        default=None
-    )),
-    extended_search=(Optional[List[str]], Field(
-        description="List of additional fields to include in the search results.",
-        default=None
-    )),
-    reranker=(Optional[dict], Field(
-            description="Reranker configuration. Can be a dictionary with reranking parameters.",
-            default={}
-        )),
-    reranking_config=(Optional[Dict[str, Dict[str, Any]]], Field(
-            description="Reranking configuration. Can be a dictionary with reranking settings.",
-            default=None
-        )),
-)
+BaseStepbackSearchParams = build_base_stepback_search_params(cut_off_default=DEFAULT_CUT_OFF)
 
 
 class BaseIndexerToolkit(VectorStoreWrapperBase):
@@ -401,6 +339,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "meta_update_interval",
             INDEX_META_UPDATE_INTERVAL,
         )
+        # Optional initiator hint (e.g. 'schedule', 'user', 'llm') — used by
+        # index_meta_update to promote a successful completion to
+        # 'scheduled_reindex' when the run came from the platform scheduler.
+        initiator_hint = kwargs.get("_initiator")
+        if initiator_hint:
+            self._index_meta_config["initiator"] = initiator_hint
 
         result = {"count": 0, "failed_count": 0, "docs_count": 0}
         #
@@ -1015,17 +959,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def remove_ids_fn(self, idx_data, key: str):
         raise NotImplementedError("Subclasses must implement this method")
 
+    def list_indexes(self):
+        """Lists all indexes in the vector store."""
+        return super().list_collections()
+
     def remove_index(self, index_name: str = ""):
         """Cleans the indexed data in the collection."""
         deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
 
         if index_name and deleted_count == 0:
-            raise ToolException(f"Index '{index_name}' not found. Available collections: {self.list_collections()}")
+            raise ToolException(f"Index '{index_name}' not found. Available indexes: {self.list_indexes()}")
 
         self._emit_index_data_removed_event(index_name)
-        return (f"Collection '{index_name}' has been removed from the vector store.\n"
-                f"Available collections: {self.list_collections()}") if index_name \
-            else "All collections have been removed from the vector store." 
+        return (f"Index '{index_name}' has been removed from the vector store.\n"
+                f"Available indexes: {self.list_indexes()}") if index_name \
+            else "All indexes have been removed from the vector store."
 
     def _build_collection_filter(self, filter: dict | str, index_name: str = "") -> dict:
         """Builds a filter for the collection based on the provided suffix."""
@@ -1087,9 +1035,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         Returns:
             List of documents with requested fields, or error message string.
         """
-        available_collections = super().list_collections()
-        if index_name and index_name not in available_collections:
-            return f"Collection '{index_name}' not found. Available collections: {available_collections}"
+        available_indexes = self.list_indexes()
+        if index_name and index_name not in available_indexes:
+            return f"Index '{index_name}' not found. Available indexes: {available_indexes}"
 
         filter = self._build_collection_filter(filter, index_name)
         found_docs = super().search_documents(
@@ -1238,6 +1186,45 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             extended_search=extended_search
         )
     
+    def _is_scheduled_run(self) -> bool:
+        """Return True when the current indexing run was triggered by the platform scheduler.
+
+        Reads the initiator hint from (in order):
+          1. ``self._index_meta_config["initiator"]`` — set by callers of ``index_data`` via
+             the ``_initiator`` kwarg (see ``index_data``).
+          2. ``self._runnable_config["metadata"]["initiator"]`` — set by the pylon
+             indexer worker on the RunnableConfig.metadata before invoking the tool.
+        Any value whose string form equals ``"schedule"`` (case-insensitive) is treated as
+        scheduler-triggered.
+        """
+        def _pluck(config):
+            if not isinstance(config, dict):
+                return None
+            metadata = config.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("initiator"):
+                return metadata.get("initiator")
+            return None
+
+        candidate = None
+        cfg = getattr(self, "_index_meta_config", None)
+        if isinstance(cfg, dict):
+            candidate = cfg.get("initiator")
+        if not candidate:
+            candidate = _pluck(self._runnable_config)
+        if not candidate:
+            # Fall back to the ambient LangChain runnable config so this works when
+            # the tool is invoked via LangChain's contextvar-based propagation.
+            try:
+                from langchain_core.runnables.config import var_child_runnable_config
+                ambient = var_child_runnable_config.get()
+                candidate = _pluck(ambient) if ambient else None
+            except (ImportError, LookupError) as e:
+                logger.debug(f"Ambient runnable config unavailable, skipping initiator lookup: {e}")
+                candidate = None
+        if candidate is None:
+            return False
+        return str(candidate).strip().lower() == "schedule"
+
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         self._ensure_vectorstore_initialized()
@@ -1263,7 +1250,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # Initialize error field to keep track of the latest failure reason if any
                 "error": None,
             }
-            metadata["history"] = json.dumps([metadata])
+            created_entry = {**metadata, "state": IndexerKeywords.INDEX_META_CREATED.value}
+            metadata["history"] = json.dumps([created_entry, metadata])
             index_meta_doc = Document(page_content=f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}", metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc])
         else:
@@ -1353,6 +1341,25 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # indexed_chunks = number of chunks stored in vector store
             metadata["indexed_chunks"] = self.get_indexed_count(index_name)
             metadata["updated"] = result
+            # Promote a successful completion to 'scheduled_reindex' when the run was
+            # triggered by the platform scheduler AND at least one prior run already
+            # completed. History at this point always contains the current run's
+            # 'in_progress' entry (appended by index_meta_init on both fresh and reindex
+            # paths). So after filtering the permanent 'created' marker:
+            #   - first indexing:      previous_runs = [in_progress]        len=1 → keep 'completed'
+            #   - Nth reindex (N>=2):  previous_runs = [..., in_progress]   len>1 → promote
+            if state == IndexerKeywords.INDEX_META_COMPLETED.value and self._is_scheduled_run():
+                previous_history_raw = metadata.get("history", "[]")
+                try:
+                    previous_history = json.loads(previous_history_raw) if previous_history_raw and previous_history_raw.strip() else []
+                except (json.JSONDecodeError, TypeError):
+                    previous_history = []
+                previous_runs = [
+                    h for h in previous_history
+                    if isinstance(h, dict) and h.get("state") != IndexerKeywords.INDEX_META_CREATED.value
+                ]
+                if len(previous_runs) > 1:
+                    state = IndexerKeywords.INDEX_META_SCHEDULED_REINDEX.value
             metadata["state"] = state
             metadata["updated_on"] = time.time()
             # Attach error if provided, else clear on success
@@ -1426,11 +1433,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         
         metadata = index_meta.get("metadata", {})
         
-        # Determine if this is a reindex operation
+        # Determine if this is a reindex operation.
+        # The 'created' marker is a permanent history[0] entry from the initial index_meta_init,
+        # so it must be excluded when counting actual run entries.
         history_raw = metadata.get("history", "[]")
         try:
             history = json.loads(history_raw) if history_raw.strip() else []
-            is_reindex = len(history) > 1
+            run_entries = [h for h in history if h.get("state") != IndexerKeywords.INDEX_META_CREATED.value]
+            is_reindex = len(run_entries) > 1
         except (json.JSONDecodeError, TypeError):
             is_reindex = False
         
@@ -1500,7 +1510,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         When collections exist (or filter_by_collections=False), the following tools are available:
         - index_data: Load data to index
-        - list_collections: List available collections
+        - list_indexes: List available indexes
         - search_index: Search indexed documents
         - stepback_search_index: Search with stepback technique
         - stepback_summary_index: Generate summary using stepback
@@ -1526,7 +1536,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         index_params = {
             "index_name": (
                 str,
-                Field(description="Index name (max 7 characters)", min_length=1, max_length=7)
+                Field(
+                    description=f"Index name (max {INDEX_NAME_MAX_LENGTH} characters)",
+                    min_length=1, max_length=INDEX_NAME_MAX_LENGTH,
+                )
             ),
             "clean_index": (
                 Optional[bool],
@@ -1561,11 +1574,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 "args_schema": index_args_schema,
             },
             {
-                "name": IndexTools.LIST_COLLECTIONS.value,
-                "mode": IndexTools.LIST_COLLECTIONS.value,
-                "ref": self.list_collections,
-                "description": self.list_collections.__doc__,
-                "args_schema": create_model("ListCollectionsParams")
+                "name": IndexTools.LIST_INDEXES.value,
+                "mode": IndexTools.LIST_INDEXES.value,
+                "ref": self.list_indexes,
+                "description": self.list_indexes.__doc__,
+                "args_schema": create_model("ListIndexesParams")
             },
             {
                 "name": IndexTools.SEARCH_INDEX.value,

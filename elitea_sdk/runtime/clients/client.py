@@ -1413,7 +1413,8 @@ class EliteAClient:
                     config = RunnableConfig(
                         callbacks=callbacks,
                         configurable=runtime_config.get('configurable', {}),
-                        tags=runtime_config.get('tags', [])
+                        tags=runtime_config.get('tags', []),
+                        metadata=runtime_config.get('metadata', {})
                     )
 
             # Create LLM instance using the client's get_llm method
