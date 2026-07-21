@@ -48,15 +48,23 @@ _RESOURCE_PLURAL: Dict[str, str] = {
     "initiative": "initiatives",
     "product": "products",
     "goal": "goals",
+    "page": "pages",
     "to_do": "to_dos",
     "todo": "to_dos",
 }
 
-# Record types that ``manage_record`` can create/update via REST. Only a
-# small subset of Aha resources expose full create+update semantics in a
-# well-defined way; keep the whitelist tight so the tool cannot silently
-# hit unsupported endpoints.
-_MANAGEABLE_RECORD_TYPES = {"feature", "requirement", "idea"}
+# Record types that ``manage_record`` can create/update/delete via REST.
+# Keep the whitelist tight so the tool cannot silently hit unsupported
+# endpoints. Pages are Aha's "notes" resource and expose full CRUD via REST.
+_MANAGEABLE_RECORD_TYPES = {
+    "feature",
+    "requirement",
+    "idea",
+    "release",
+    "initiative",
+    "epic",
+    "page",
+}
 
 # GraphQL query strings — copied from aha-mcp v1.1.0.
 _QUERY_GET_PAGE = """
@@ -319,20 +327,30 @@ AhaManageRecordInput = create_model(
     "AhaManageRecordInput",
     action=(
         str,
-        Field(description="`create` to insert a new record, `update` to modify an existing one."),
+        Field(
+            description=(
+                "`create` to insert a new record, `update` to modify an existing "
+                "one, `delete` to remove one."
+            )
+        ),
     ),
     record_type=(
         str,
-        Field(description="Record type: `feature`, `requirement`, or `idea`."),
+        Field(
+            description=(
+                "Record type. Accepted: `feature`, `requirement`, `idea`, "
+                "`release`, `initiative`, `epic`, `page`."
+            )
+        ),
     ),
     record_id=(
         Optional[str],
         Field(
             default=None,
             description=(
-                "Existing record reference/ID. Required for `action='update'`. "
-                "For `action='create'` on a requirement, pass the parent feature "
-                "reference here."
+                "Existing record reference/ID. Required for `action='update'` "
+                "and `action='delete'`. For `action='create'` on a requirement, "
+                "pass the parent feature reference here."
             ),
         ),
     ),
@@ -341,8 +359,9 @@ AhaManageRecordInput = create_model(
         Field(
             default=None,
             description=(
-                "For `action='create'`: parent scope — release ref for features, "
-                "product ref for ideas. Ignored for updates."
+                "For `action='create'`: parent scope — release ref for features "
+                "and epics, product ref for ideas/releases/initiatives/pages, "
+                "feature ref for requirements. Ignored for updates and deletes."
             ),
         ),
     ),
@@ -1069,6 +1088,19 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- manage_record: create / update dispatcher -----
 
+    # Parent scope for ``manage_record(action='create', ...)``. The path
+    # segment before the plural is the parent resource; the value comes from
+    # ``parent_id`` (or ``record_id`` as a legacy alias).
+    _CREATE_PARENT_PATH: Dict[str, str] = {
+        "feature": "releases",
+        "requirement": "features",
+        "idea": "products",
+        "release": "products",
+        "initiative": "products",
+        "epic": "releases",
+        "page": "products",
+    }
+
     def manage_record(
         self,
         action: str,
@@ -1077,14 +1109,18 @@ class AhaApiWrapper(BaseToolApiWrapper):
         parent_id: Optional[str] = None,
         properties: Optional[Dict[str, Any]] = None,
     ):
-        """Create or update an Aha record.
+        """Create, update, or delete an Aha record.
 
-        - ``action='create'`` inserts under a parent scope. For a feature the
-          parent is a release (``parent_id`` or ``record_id`` may carry the
-          release reference); for a requirement it is the parent feature; for
-          an idea it is the product.
+        - ``action='create'`` inserts under a parent scope. Parent scoping:
+          feature → release, requirement → feature, idea → product, release →
+          product, initiative → product, epic → release, page → product. The
+          parent reference may be passed as ``parent_id`` (preferred) or as
+          ``record_id`` (legacy alias).
         - ``action='update'`` requires ``record_id`` (the record reference to
           modify).
+        - ``action='delete'`` requires ``record_id``. Returns ``{"deleted":
+          True, ...}`` on success — Aha's DELETE endpoints typically respond
+          with an empty body.
 
         ``properties`` is a dict of Aha field values (e.g. ``{"name": "…",
         "description": "…"}``). See Aha REST docs for field names.
@@ -1098,8 +1134,10 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 f"manage_record does not support record_type '{record_type}'. "
                 f"Accepted: {', '.join(sorted(_MANAGEABLE_RECORD_TYPES))}"
             )
-        if act not in {"create", "update"}:
-            raise ToolException("manage_record: action must be 'create' or 'update'")
+        if act not in {"create", "update", "delete"}:
+            raise ToolException(
+                "manage_record: action must be 'create', 'update', or 'delete'"
+            )
 
         plural = _RESOURCE_PLURAL[rt]
         singular = rt
@@ -1110,21 +1148,23 @@ class AhaApiWrapper(BaseToolApiWrapper):
             response = self._rest_put(f"{plural}/{record_id}", json={singular: props})
             return response.get(singular) or response
 
+        if act == "delete":
+            if not record_id:
+                raise ToolException("manage_record delete: record_id is required")
+            response = self._rest_delete(f"{plural}/{record_id}")
+            # Aha returns 204/empty on delete; surface a consistent shape.
+            return {"deleted": True, "record_type": rt, "record_id": record_id, **(response or {})}
+
         # create
         scope = parent_id or record_id
         if not scope:
+            parent_kind = self._CREATE_PARENT_PATH[rt].rstrip("s")
             raise ToolException(
                 f"manage_record create {rt}: parent_id is required "
-                f"({'release ref' if rt == 'feature' else 'feature ref' if rt == 'requirement' else 'product ref'})"
+                f"({parent_kind} ref)"
             )
-        if rt == "feature":
-            path = f"releases/{scope}/features"
-        elif rt == "requirement":
-            path = f"features/{scope}/requirements"
-        elif rt == "idea":
-            path = f"products/{scope}/ideas"
-        else:  # pragma: no cover — guarded above
-            raise ToolException(f"manage_record create not implemented for {rt}")
+        parent_plural = self._CREATE_PARENT_PATH[rt]
+        path = f"{parent_plural}/{scope}/{plural}"
 
         response = self._rest_post(path, json={singular: props})
         return response.get(singular) or response

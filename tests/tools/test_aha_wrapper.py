@@ -445,12 +445,161 @@ class TestManageRecord:
     def test_bad_record_type_rejected(self):
         w = _wrapper()
         with pytest.raises(ToolException, match="does not support record_type"):
-            w.manage_record(action="update", record_type="release", record_id="R-1", properties={})
+            w.manage_record(action="update", record_type="product", record_id="P-1", properties={})
 
     def test_bad_action_rejected(self):
         w = _wrapper()
-        with pytest.raises(ToolException, match="action must be 'create' or 'update'"):
+        with pytest.raises(
+            ToolException, match="action must be 'create', 'update', or 'delete'"
+        ):
+            w.manage_record(action="patch", record_type="feature")
+
+    # ----- delete action -----
+
+    def test_delete_feature_hits_features_url(self):
+        w = _wrapper()
+        resp = _rest_stub({})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            out = w.manage_record(
+                action="delete", record_type="feature", record_id="DEVELOP-1"
+            )
+        method, url = req.call_args[0][:2]
+        assert method == "DELETE"
+        assert url.endswith("/features/DEVELOP-1")
+        assert out["deleted"] is True
+        assert out["record_type"] == "feature"
+        assert out["record_id"] == "DEVELOP-1"
+
+    def test_delete_page_hits_pages_url(self):
+        w = _wrapper()
+        resp = _rest_stub({})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(action="delete", record_type="page", record_id="ABC-N-1")
+        method, url = req.call_args[0][:2]
+        assert method == "DELETE"
+        assert url.endswith("/pages/ABC-N-1")
+
+    def test_delete_requires_record_id(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="record_id is required"):
             w.manage_record(action="delete", record_type="feature")
+
+    # ----- create: new record types -----
+
+    def test_create_release_posts_under_product(self):
+        w = _wrapper()
+        resp = _rest_stub({"release": {"id": 10}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="create",
+                record_type="release",
+                parent_id="DEVELOP",
+                properties={"name": "R1"},
+            )
+        method, url = req.call_args[0][:2]
+        assert method == "POST"
+        assert url.endswith("/products/DEVELOP/releases")
+        assert req.call_args.kwargs["json"] == {"release": {"name": "R1"}}
+
+    def test_create_initiative_posts_under_product(self):
+        w = _wrapper()
+        resp = _rest_stub({"initiative": {"id": 11}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="create",
+                record_type="initiative",
+                parent_id="DEVELOP",
+                properties={"name": "Init1"},
+            )
+        assert req.call_args[0][1].endswith("/products/DEVELOP/initiatives")
+        assert req.call_args.kwargs["json"] == {"initiative": {"name": "Init1"}}
+
+    def test_create_epic_posts_under_release(self):
+        w = _wrapper()
+        resp = _rest_stub({"epic": {"id": 12}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="create",
+                record_type="epic",
+                parent_id="DEVELOP-R-1",
+                properties={"name": "E1"},
+            )
+        assert req.call_args[0][1].endswith("/releases/DEVELOP-R-1/epics")
+
+    def test_create_page_posts_under_product(self):
+        w = _wrapper()
+        resp = _rest_stub({"page": {"id": 13}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="create",
+                record_type="page",
+                parent_id="DEVELOP",
+                properties={"name": "Notes"},
+            )
+        assert req.call_args[0][1].endswith("/products/DEVELOP/pages")
+        assert req.call_args.kwargs["json"] == {"page": {"name": "Notes"}}
+
+    def test_create_release_requires_parent(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="parent_id is required"):
+            w.manage_record(action="create", record_type="release", properties={"name": "x"})
+
+    def test_create_page_requires_parent(self):
+        w = _wrapper()
+        with pytest.raises(ToolException, match="parent_id is required"):
+            w.manage_record(action="create", record_type="page", properties={"name": "x"})
+
+    # ----- update: new record types -----
+
+    def test_update_release_puts_to_releases_url(self):
+        w = _wrapper()
+        resp = _rest_stub({"release": {"id": 1, "name": "renamed"}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="update",
+                record_type="release",
+                record_id="DEVELOP-R-1",
+                properties={"name": "renamed"},
+            )
+        method, url = req.call_args[0][:2]
+        assert method == "PUT"
+        assert url.endswith("/releases/DEVELOP-R-1")
+
+    def test_update_epic_puts_to_epics_url(self):
+        w = _wrapper()
+        resp = _rest_stub({"epic": {"id": 2}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="update",
+                record_type="epic",
+                record_id="DEVELOP-E-1",
+                properties={"name": "n"},
+            )
+        assert req.call_args[0][1].endswith("/epics/DEVELOP-E-1")
+
+    def test_update_initiative_puts_to_initiatives_url(self):
+        w = _wrapper()
+        resp = _rest_stub({"initiative": {"id": 3}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="update",
+                record_type="initiative",
+                record_id="DEVELOP-I-1",
+                properties={"description": "d"},
+            )
+        assert req.call_args[0][1].endswith("/initiatives/DEVELOP-I-1")
+
+    def test_update_page_puts_to_pages_url(self):
+        w = _wrapper()
+        resp = _rest_stub({"page": {"id": 4}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            w.manage_record(
+                action="update",
+                record_type="page",
+                record_id="ABC-N-1",
+                properties={"name": "n"},
+            )
+        assert req.call_args[0][1].endswith("/pages/ABC-N-1")
 
 
 class TestCreateRecordLink:
