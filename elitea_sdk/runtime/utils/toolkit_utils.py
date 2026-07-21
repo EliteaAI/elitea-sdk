@@ -12,11 +12,12 @@ from .utils import safe_config_summary
 logger = logging.getLogger(__name__)
 
 
-def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any], 
-                                   llm_client: Any, 
+def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any],
+                                   llm_client: Any,
                                    elitea_client: Optional[Any] = None,
                                    mcp_tokens: Optional[Dict[str, Any]] = None,
-                                   use_prefix: bool = False) -> List[Any]:
+                                   use_prefix: bool = False,
+                                   reraise_on_auth_required: bool = False) -> List[Any]:
     """
     Instantiate a toolkit with LLM client support.
     
@@ -72,7 +73,7 @@ def instantiate_toolkit_with_client(toolkit_config: Dict[str, Any],
         
         # Get tools using the toolkit configuration with clients
         # Parameter order: get_tools(tools_list, elitea_client, llm, memory_store, debug_mode, mcp_tokens)
-        tools = get_tools([tool_config], elitea_client, llm_client, mcp_tokens=mcp_tokens)
+        tools = get_tools([tool_config], elitea_client, llm_client, mcp_tokens=mcp_tokens, reraise_on_auth_required=reraise_on_auth_required)
         
         if not tools:
             logger.warning(f"No tools returned for toolkit {toolkit_name}")

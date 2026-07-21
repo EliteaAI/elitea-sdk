@@ -1431,11 +1431,13 @@ class EliteAClient:
                     "execution_time_seconds": 0.0
                 }
 
-            # Instantiate the toolkit with client and LLM support
+            # Instantiate the toolkit with client and LLM support.
+            # reraise_on_auth_required=True ensures McpAuthorizationRequired is not
+            # silently converted to proxy tools — it propagates to the indexer worker
+            # which emits mcp_authorization_required to the frontend.
             try:
-                tools = instantiate_toolkit_with_client(toolkit_config, llm, self, mcp_tokens=mcp_tokens, use_prefix=False)
+                tools = instantiate_toolkit_with_client(toolkit_config, llm, self, mcp_tokens=mcp_tokens, use_prefix=False, reraise_on_auth_required=True)
             except McpAuthorizationRequired:
-                # Re-raise McpAuthorizationRequired to allow proper handling upstream
                 logger.info(f"McpAuthorizationRequired detected, re-raising")
                 raise
             except Exception as toolkit_error:
