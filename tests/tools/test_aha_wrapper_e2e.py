@@ -18,6 +18,19 @@ Optional (unlock more targeted tests):
   AHA_PAGE_REF         page reference number, e.g. ABC-N-1
   AHA_SEARCH_QUERY     free-text query used by search / search_documents (default: "test")
 
+Write lifecycle tests
+---------------------
+The ``manage_record`` lifecycle tests (create → read → update → delete)
+run only when their parent scope is available:
+
+  * feature / epic   need AHA_RELEASE_REF
+  * requirement      needs AHA_FEATURE_REF (an existing feature to nest under)
+  * release / initiative / idea / page   need AHA_PRODUCT_ID
+
+Each test names its artifact ``elitea-sdk-e2e-<uuid>`` and deletes it in a
+``finally`` block, so even a failed assertion still cleans up. If Aha
+rejects the account with 403, the test skips instead of leaving orphans.
+
 Skipping
 --------
 Tests that need optional refs are individually skipped when the ref is
@@ -31,6 +44,7 @@ Running
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 from langchain_core.tools import ToolException
@@ -286,3 +300,213 @@ def test_configuration_check_connection_rejects_bad_token():
     assert err is not None
     # Should be a friendly auth message, not a raw traceback / secret leak.
     assert "not-a-real-token" not in err
+
+
+# -----------------------------------------------------------------------------
+# manage_record write lifecycle (create → read → update → delete)
+# -----------------------------------------------------------------------------
+#
+# Each test creates a uniquely-named artifact, verifies it, updates it, and
+# deletes it in a ``finally`` block so a failed assertion still cleans up.
+# Any 403 from Aha is treated as "insufficient role" and skips instead of
+# leaving orphans. Parent scoping is env-driven and each test skips if its
+# parent ref isn't provided.
+
+
+def _unique_name(kind: str) -> str:
+    """Return a name unlikely to collide with existing records or other runs."""
+    return f"elitea-sdk-e2e-{kind}-{uuid.uuid4().hex[:8]}"
+
+
+def _record_ref(record: dict) -> str:
+    """Extract the reference/ID we can round-trip through read/update/delete."""
+    ref = record.get("reference_num") or record.get("id")
+    assert ref, f"Aha response missing reference_num/id: {record!r}"
+    return str(ref)
+
+
+def _try_delete(wrapper: AhaApiWrapper, record_type: str, ref: str) -> None:
+    """Best-effort delete used in test teardown — swallow all errors."""
+    if not ref:
+        return
+    try:
+        wrapper.manage_record(action="delete", record_type=record_type, record_id=ref)
+    except Exception:  # noqa: BLE001 — teardown must not mask the real failure
+        pass
+
+
+def _run_lifecycle(
+    wrapper: AhaApiWrapper,
+    record_type: str,
+    parent_id: str,
+    create_props: dict,
+    update_props: dict,
+) -> None:
+    """Create → read → update → delete, with 403-skip and finally-cleanup."""
+    created_ref: str = ""
+    try:
+        try:
+            created = wrapper.manage_record(
+                action="create",
+                record_type=record_type,
+                parent_id=parent_id,
+                properties=create_props,
+            )
+        except ToolException as exc:
+            _skip_on_permission_denied(exc)
+            raise
+
+        assert isinstance(created, dict) and created, f"empty create response: {created!r}"
+        created_ref = _record_ref(created)
+
+        # Read back — proves the record exists and is retrievable.
+        fetched = wrapper.read_records(record_type=record_type, reference_or_id=created_ref)
+        assert isinstance(fetched, dict) and fetched
+
+        # Update — proves the PUT route works and Aha accepts the payload.
+        try:
+            updated = wrapper.manage_record(
+                action="update",
+                record_type=record_type,
+                record_id=created_ref,
+                properties=update_props,
+            )
+        except ToolException as exc:
+            _skip_on_permission_denied(exc)
+            raise
+        assert isinstance(updated, dict) and updated
+
+        # Delete — proves the DELETE route works.
+        try:
+            deleted = wrapper.manage_record(
+                action="delete", record_type=record_type, record_id=created_ref
+            )
+        except ToolException as exc:
+            _skip_on_permission_denied(exc)
+            raise
+        assert deleted.get("deleted") is True
+        assert deleted.get("record_id") == created_ref
+        # Successful delete — nothing left to clean up in ``finally``.
+        created_ref = ""
+    finally:
+        _try_delete(wrapper, record_type, created_ref)
+
+
+def test_manage_record_feature_lifecycle(wrapper):
+    release_ref = _skip_without("AHA_RELEASE_REF")
+    name = _unique_name("feature")
+    _run_lifecycle(
+        wrapper,
+        record_type="feature",
+        parent_id=release_ref,
+        create_props={"name": name},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+def test_manage_record_requirement_lifecycle(wrapper):
+    feature_ref = _skip_without("AHA_FEATURE_REF")
+    name = _unique_name("req")
+    _run_lifecycle(
+        wrapper,
+        record_type="requirement",
+        parent_id=feature_ref,
+        create_props={"name": name},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+def test_manage_record_idea_lifecycle(wrapper):
+    product_ref = _skip_without("AHA_PRODUCT_ID")
+    name = _unique_name("idea")
+    _run_lifecycle(
+        wrapper,
+        record_type="idea",
+        parent_id=product_ref,
+        # Aha requires a submitter for ideas; the API defaults it to the
+        # token owner when we don't supply one, which is fine for the test.
+        create_props={"name": name, "description": "e2e-created; safe to delete"},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+def test_manage_record_release_lifecycle(wrapper):
+    product_ref = _skip_without("AHA_PRODUCT_ID")
+    name = _unique_name("release")
+    _run_lifecycle(
+        wrapper,
+        record_type="release",
+        parent_id=product_ref,
+        create_props={"name": name},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+def test_manage_record_initiative_lifecycle(wrapper):
+    product_ref = _skip_without("AHA_PRODUCT_ID")
+    name = _unique_name("initiative")
+    _run_lifecycle(
+        wrapper,
+        record_type="initiative",
+        parent_id=product_ref,
+        create_props={"name": name},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+def test_manage_record_epic_lifecycle(wrapper):
+    release_ref = _skip_without("AHA_RELEASE_REF")
+    name = _unique_name("epic")
+    _run_lifecycle(
+        wrapper,
+        record_type="epic",
+        parent_id=release_ref,
+        create_props={"name": name},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+def test_manage_record_page_lifecycle(wrapper):
+    product_ref = _skip_without("AHA_PRODUCT_ID")
+    name = _unique_name("page")
+    _run_lifecycle(
+        wrapper,
+        record_type="page",
+        parent_id=product_ref,
+        create_props={"name": name, "body": "e2e-created; safe to delete"},
+        update_props={"name": f"{name}-upd"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# manage_record error surfaces (independent of parent-scope availability)
+# -----------------------------------------------------------------------------
+
+
+def test_manage_record_delete_missing_record_raises(wrapper):
+    """Deleting a bogus reference should surface a clean 404 as ToolException."""
+    bogus = f"NOSUCH-{uuid.uuid4().hex[:6].upper()}"
+    with pytest.raises(ToolException):
+        wrapper.manage_record(action="delete", record_type="feature", record_id=bogus)
+
+
+def test_manage_record_read_deleted_record_fails(wrapper):
+    """After delete, reading the same ref should 404 (proves cleanup landed)."""
+    release_ref = _skip_without("AHA_RELEASE_REF")
+    name = _unique_name("feature-verify-del")
+    try:
+        created = wrapper.manage_record(
+            action="create",
+            record_type="feature",
+            parent_id=release_ref,
+            properties={"name": name},
+        )
+    except ToolException as exc:
+        _skip_on_permission_denied(exc)
+        raise
+    ref = _record_ref(created)
+
+    wrapper.manage_record(action="delete", record_type="feature", record_id=ref)
+
+    with pytest.raises(ToolException):
+        wrapper.read_records(record_type="feature", reference_or_id=ref)
