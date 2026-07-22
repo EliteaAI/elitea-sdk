@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime
 from io import BytesIO
 from traceback import format_exc
 from typing import Any, Optional, Generator, Literal
@@ -259,6 +260,21 @@ addFileToTestCase = create_model(
     )),
 )
 
+UpdateTestRunStatus = create_model(
+    "UpdateTestRunStatus",
+    test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
+    status=(str, Field(description="Manual test run status. Standard values: 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete'. Must match a status name configured in the project's Field Settings.")),
+    note=(Optional[str], Field(description="Optional execution note/comment to attach to the test log.", default=None)),
+)
+
+UploadAttachmentToTestRun = create_model(
+    "UploadAttachmentToTestRun",
+    test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
+    attachment_type=(Literal["test-case", "test-log"], Field(description="Where to attach the file: 'test-case' attaches to the test run's underlying test case; 'test-log' attaches to the test run's latest test log (execution record). QTest has no attachment slot on the bare test run itself.")),
+    filepath=(str, Field(description="File path in format /{bucket}/{filename} from artifact storage (covers both chat inline attachments and the Artifacts bucket)")),
+    filename=(Optional[str], Field(description="Name of the file to upload. If not provided, uses the original filename from artifact.", default=None)),
+)
+
 # Generic search model for any entity type
 GenericDqlSearch = create_model(
     "GenericDqlSearch",
@@ -420,6 +436,9 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
     def __instantiate_fields_api_instance(self) -> FieldApi:
         return swagger_client.FieldApi(self._client)
+
+    def __instantiate_test_log_api_instance(self) -> "swagger_client.TestLogApi":
+        return swagger_client.TestLogApi(self._client)
 
     def __get_field_definitions_cached(self) -> dict:
         """Get field definitions with session-level caching.
@@ -751,10 +770,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         headers = {
             "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
         }
-        
+
         properties_url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-cases/{test_case_id}/properties"
         properties_info_url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-cases/{test_case_id}/properties-info"
-        
+
         try:
             # Get properties with current values and field metadata
             props_response = requests.get(
@@ -764,12 +783,12 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             )
             props_response.raise_for_status()
             properties_data = props_response.json()
-            
+
             # Get properties-info with data types and allowed values
             info_response = requests.get(properties_info_url, headers=headers)
             info_response.raise_for_status()
             info_data = info_response.json()
-            
+
         except requests.exceptions.RequestException as e:
             stacktrace = format_exc()
             logger.error(f"Failed to call properties API: {stacktrace}")
@@ -777,42 +796,42 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"Unable to retrieve field definitions using properties API. "
                 f"Error: {stacktrace}"
             ) from e
-        
+
         # Step 3: Build field mapping by merging both responses
         field_mapping = {}
-        
+
         # Create lookup by field ID from properties-info
         metadata_by_id = {item['id']: item for item in info_data['metadata']}
-        
+
         # Data type mapping to determine 'multiple' flag
         MULTI_SELECT_TYPES = {
             'UserListDataType',
             'MultiSelectionDataType',
             'CheckListDataType'
         }
-        
+
         USER_FIELD_TYPES = {'UserListDataType'}
-        
+
         # System fields to exclude (same as in property mapping)
         excluded_fields = {'Shared', 'Projects Shared to'}
-        
+
         for prop in properties_data:
             field_name = prop.get('name')
             field_id = prop.get('id')
-            
+
             if not field_name or field_name in excluded_fields:
                 continue
-            
+
             # Get metadata for this field
             metadata = metadata_by_id.get(field_id, {})
             data_type_str = metadata.get('data_type')
-            
+
             # Determine data_type number (5 for user fields, None for others)
             data_type = 5 if data_type_str in USER_FIELD_TYPES else None
-            
+
             # Determine if multi-select
             is_multiple = data_type_str in MULTI_SELECT_TYPES
-            
+
             field_mapping[field_name] = {
                 'field_id': field_id,
                 'required': prop.get('required', False),
@@ -820,7 +839,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 'multiple': is_multiple,
                 'values': {}
             }
-            
+
             # Map allowed values from metadata
             allowed_values = metadata.get('allowed_values', [])
             for allowed_val in allowed_values:
@@ -828,12 +847,12 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 value_id = allowed_val.get('id')
                 if value_text and value_id:
                     field_mapping[field_name]['values'][value_text] = value_id
-        
+
         logger.info(
             f"Retrieved {len(field_mapping)} field definitions using properties API. "
             f"This method works for all users without Field Management permission."
         )
-        
+
         return field_mapping
 
     def __get_project_field_definitions(self) -> dict:
@@ -2247,6 +2266,169 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error uploading file: \n {stacktrace}")
             raise ToolException(f"Error uploading file to test case {test_case_id}: {str(e)}") from e
 
+    def __resolve_test_run_status_id(self, status: str) -> int:
+        """Resolve a manual-run status name (e.g. 'Passed') to its execution-status id.
+
+        submit_test_log rejects a bare status name with 400; StatusResource.id must
+        be an execution-status id. Those ids live in a dedicated project-level list
+        (GET /test-runs/execution-statuses), NOT in the test-run property fields
+        (that is a different id space and yields the 400). Match is case-insensitive.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
+        }
+        url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-runs/execution-statuses"
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        statuses = response.json() or []
+
+        by_name = {s.get('name'): s.get('id') for s in statuses if s.get('name')}
+        if status in by_name:
+            return by_name[status]
+        # case-insensitive fallback
+        for name, sid in by_name.items():
+            if name.lower() == status.lower():
+                return sid
+
+        allowed = ', '.join(sorted(by_name.keys()))
+        raise ValueError(
+            f"Status '{status}' is not a valid execution status in project "
+            f"{self.qtest_project_id}. Allowed values: {allowed}."
+        )
+
+    def update_test_run_status(self, test_run_id: str, status: str, note: str = None) -> str:
+        """Update a manual test run's execution result (status) in QTest.
+
+        Modifies the run's existing test log (PUT) rather than creating a new one.
+        """
+        try:
+            status_id = self.__resolve_test_run_status_id(status)
+
+            # Use the DQL search (same path as find_entity_by_id): it returns the
+            # run with its latest_test_log populated and its internal id. The
+            # direct GET /test-runs/{id} endpoint returns latest_test_log empty on
+            # this qTest instance, so we read everything from the search result.
+            test_run = self.__search_entity_by_id('test-runs', test_run_id)
+            if not test_run:
+                raise ToolException(
+                    f"Test run {test_run_id} not found in project {self.qtest_project_id}."
+                )
+            qtest_test_run_id = test_run.get('QTest Id')
+            latest_log = test_run.get('Latest Test Log') or {}
+            test_log_id = latest_log.get('Log Id')
+            if not test_log_id:
+                raise ToolException(
+                    f"Test run {test_run_id} has no test log to update in project "
+                    f"{self.qtest_project_id}."
+                )
+
+            # qTest requires exe_start_date/exe_end_date on the PUT and expects the
+            # run's ORIGINAL execution times (not now()); a fresh timestamp yields a
+            # 400. The search result carries them on the latest test log.
+            now = datetime.now()
+            exe_start = latest_log.get('Execution Start') or now
+            exe_end = latest_log.get('Execution End') or now
+            body = swagger_client.TestLogResource(
+                status=swagger_client.StatusResource(id=status_id, name=status),
+                exe_start_date=exe_start,
+                exe_end_date=exe_end,
+                note=note,
+            )
+
+            # TEMP DEBUG (remove after diagnosing the qTest 400): dump the resolved
+            # status id, the full parsed test-run (every property + latest log), and
+            # the serialized PUT body for side-by-side comparison. qTest returns
+            # opaque 400s, so we trace the exact request.
+            logger.info("[qtest-debug] resolved status '%s' -> execution-status id %s", status, status_id)
+            logger.info("[qtest-debug] test_run search result: %s", test_run)
+            logger.info(
+                "[qtest-debug] PUT body -> project=%s test_run_id=%s test_log_id=%s body=%s",
+                self.qtest_project_id, qtest_test_run_id, test_log_id, body.to_dict(),
+            )
+
+            test_log_api = self.__instantiate_test_log_api_instance()
+            # _preload_content=False returns the raw HTTP response and skips the
+            # TestLogResource deserialization, which crashes when the nested
+            # test-case has properties=None.
+            test_log_api.modify_test_log(
+                self.qtest_project_id, body, qtest_test_run_id, test_log_id,
+                _preload_content=False,
+            )
+
+            return (
+                f"Successfully updated test run {test_run_id} status to '{status}' "
+                f"in project {self.qtest_project_id}. Test log id: {test_log_id}."
+            )
+        except (ApiException, requests.exceptions.RequestException) as e:
+            stacktrace = format_exc()
+            logger.error(f"Exception when submitting test log for test run {test_run_id}: \n {stacktrace}")
+            raise ToolException(
+                f"Unable to update test run {test_run_id} status to '{status}' in project "
+                f"{self.qtest_project_id}. Exception: \n{stacktrace}"
+            ) from e
+        except ValueError as e:
+            raise ToolException(str(e)) from e
+
+    def upload_attachment_to_test_run(self, test_run_id: str, attachment_type: str,
+                                       filepath: str, filename: str = None) -> str:
+        """Upload a file from artifact storage and attach it to a test run's test case or latest test log."""
+        try:
+            # Resolve the actual attach target: qTest has no attachment slot on the
+            # bare test run, only on its test case or its latest test log. The DQL
+            # search (same path as find_entity_by_id) returns both the test case id
+            # and a populated latest_test_log; the direct GET /test-runs/{id}
+            # endpoint returns latest_test_log empty on this qTest instance.
+            test_run = self.__search_entity_by_id('test-runs', test_run_id)
+            if not test_run:
+                raise ToolException(
+                    f"Test run {test_run_id} not found in project {self.qtest_project_id}."
+                )
+            if attachment_type == 'test-case':
+                object_id = test_run.get('Test Case Id')
+                if not object_id:
+                    raise ToolException(f"Test run {test_run_id} has no associated test case.")
+                object_type = 'test-cases'
+            else:  # 'test-log'
+                latest_log = test_run.get('Latest Test Log') or {}
+                if not latest_log.get('Log Id'):
+                    raise ToolException(
+                        f"Test run {test_run_id} has no test log yet. "
+                        f"Submit a status with 'update_test_run_status' first."
+                    )
+                object_id = latest_log['Log Id']
+                object_type = 'test-logs'
+
+            artifact_client = self.elitea.artifact('__temp__')
+            file_bytes, artifact_filename = artifact_client.get_raw_content_by_filepath(filepath)
+            if not file_bytes:
+                raise ToolException(f"Failed to download artifact {filepath}")
+
+            resolved_filename = filename or artifact_filename
+
+            try:
+                import filetype
+                kind = filetype.guess(file_bytes)
+                mime_type = kind.mime if kind else 'application/octet-stream'
+            except ImportError:
+                mime_type = 'application/octet-stream'
+
+            attachment_id = self._upload_binary_file_to_qtest(
+                object_type, object_id, file_bytes, resolved_filename, mime_type
+            )
+
+            return (
+                f"File '{resolved_filename}' successfully uploaded to test run {test_run_id}'s "
+                f"{attachment_type} (object id {object_id}). Attachment ID: {attachment_id}"
+            )
+        except (ApiException, requests.exceptions.RequestException) as e:
+            stacktrace = format_exc()
+            logger.error(f"Exception when uploading attachment to test run {test_run_id}: \n {stacktrace}")
+            raise ToolException(
+                f"Failed to upload attachment to test run {test_run_id}: {e}"
+            ) from e
+        except ValueError as e:
+            raise ToolException(str(e)) from e
+
     def get_modules(self, parent_id: int = None, search: str = None):
         """
         :param int project_id: ID of the project (required)
@@ -2363,6 +2545,46 @@ EXAMPLES:
                 "description": "Upload file from artifact storage to QTest test case or specific test step.",
                 "args_schema": addFileToTestCase,
                 "ref": self.add_file_to_test_case,
+            },
+            {
+                "name": "update_test_run_status",
+                "mode": "update_test_run_status",
+                "description": """Update a manual test run's execution result (status) in QTest.
+
+Use this after manually executing a test to record Pass/Fail/etc. It updates the
+test run's existing execution log rather than creating a new run.
+
+Parameters:
+- test_run_id: Test run ID in format TR-123 or QTest numeric ID
+- status: One of 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete' (must match project's configured status names)
+- note: Optional execution note
+
+Examples:
+- Mark passed: test_run_id='TR-39', status='Passed'
+- Mark failed with note: test_run_id='TR-39', status='Failed', note='Login button unresponsive'
+""",
+                "args_schema": UpdateTestRunStatus,
+                "ref": self.update_test_run_status,
+            },
+            {
+                "name": "upload_attachment_to_test_run",
+                "mode": "upload_attachment_to_test_run",
+                "description": """Upload a file from artifact storage and attach it to a test run.
+
+QTest has no attachment slot on the bare test run — the file attaches to either
+the test run's underlying test case, or its latest test log (execution record).
+
+Parameters:
+- test_run_id: Test run ID in format TR-123 or QTest numeric ID
+- attachment_type: 'test-case' (attach to the test run's test case) or 'test-log' (attach to the latest execution log — requires a status to have been submitted first via update_test_run_status)
+- filepath: File path in format /{bucket}/{filename}, from either a chat inline attachment or the Artifacts bucket
+- filename: Optional override for the uploaded file's display name
+
+Examples:
+- Attach screenshot to latest run result: test_run_id='TR-39', attachment_type='test-log', filepath='/__temp__/screenshot.png'
+""",
+                "args_schema": UploadAttachmentToTestRun,
+                "ref": self.upload_attachment_to_test_run,
             },
             {
                 "name": "find_test_case_by_id",
