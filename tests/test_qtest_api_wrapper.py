@@ -673,3 +673,413 @@ def test_timeout_client_reraises_non_timeout_maxretry(monkeypatch):
 
     with pytest.raises(urllib3.exceptions.MaxRetryError):
         client.call_api('/x', 'GET')
+
+
+# ---------------------------------------------------------------------------
+# #5808 - manual test run status + attachment upload
+# ---------------------------------------------------------------------------
+
+def _patch_test_log_api(monkeypatch, response=None, raise_exc=None):
+    """Patch swagger_client.TestLogApi with a fake recording modify_test_log calls."""
+    import swagger_client
+    calls = []
+
+    class FakeTestLogApi:
+        def __init__(self, client):
+            pass
+
+        def modify_test_log(self, project_id, body, test_run_id, id, **kwargs):
+            calls.append({
+                'project_id': project_id, 'body': body,
+                'test_run_id': test_run_id, 'id': id, 'kwargs': kwargs,
+            })
+            if raise_exc:
+                raise raise_exc
+            return response
+
+    monkeypatch.setattr(swagger_client, 'TestLogApi', FakeTestLogApi)
+    return calls
+
+
+def _patch_search_entity(monkeypatch, test_run=None, raise_exc=None):
+    """Patch QtestApiWrapper.__search_entity_by_id to return a parsed test-run dict.
+
+    update_test_run_status / upload_attachment_to_test_run read the run via the DQL
+    search path (same as find_entity_by_id); it returns latest_test_log populated
+    where the direct GET /test-runs/{id} does not on this qTest instance. Returning
+    None models a not-found run.
+    """
+    calls = []
+
+    def fake_search(self, object_type, entity_id):
+        calls.append({'object_type': object_type, 'entity_id': entity_id})
+        if raise_exc:
+            raise raise_exc
+        return test_run
+
+    monkeypatch.setattr(
+        QtestApiWrapper, '_QtestApiWrapper__search_entity_by_id', fake_search
+    )
+    return calls
+
+
+def _patch_execution_statuses(monkeypatch, status_values=None):
+    """Patch requests.get so GET /test-runs/execution-statuses returns the project's
+    execution statuses (list[StatusResource]) mapping name -> id.
+
+    submit_test_log needs a StatusResource.id from THIS list, not from test-run
+    property fields (a different id space). status_values: {status_name: id}.
+    """
+    if status_values is None:
+        status_values = {'Passed': 601, 'Failed': 602, 'Blocked': 603, 'Incomplete': 604}
+
+    statuses_payload = [
+        {'id': sid, 'name': name} for name, sid in status_values.items()
+    ]
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, headers=None, params=None):
+        return _FakeResponse(statuses_payload)
+
+    import elitea_sdk.tools.qtest.api_wrapper as api_wrapper_module
+    monkeypatch.setattr(api_wrapper_module.requests, 'get', fake_get)
+    return status_values
+
+
+def _test_run_dict(qtest_id=12345, test_case_id=None, latest_test_log_id=None,
+                   exe_start=None, exe_end=None):
+    """Build a parsed test-run dict as returned by __search_entity_by_id('test-runs', ...)."""
+    run = {'QTest Id': qtest_id}
+    if test_case_id is not None:
+        run['Test Case Id'] = test_case_id
+    if latest_test_log_id is not None:
+        log = {'Log Id': latest_test_log_id}
+        if exe_start is not None:
+            log['Execution Start'] = exe_start
+        if exe_end is not None:
+            log['Execution End'] = exe_end
+        run['Latest Test Log'] = log
+    return run
+
+
+class _FakeSubmitTestLogResponse:
+    def __init__(self, log_id):
+        self.id = log_id
+
+
+class _FakeArtifactClient:
+    def __init__(self, file_bytes=b'binary-content', filename='report.png'):
+        self.file_bytes = file_bytes
+        self.filename = filename
+        self.calls = []
+
+    def get_raw_content_by_filepath(self, filepath):
+        self.calls.append(filepath)
+        return self.file_bytes, self.filename
+
+
+class _FakeElitea:
+    def __init__(self, artifact_client):
+        self._artifact_client = artifact_client
+
+    def artifact(self, bucket):
+        return self._artifact_client
+
+
+def test_update_test_run_status_happy_path_numeric_id(monkeypatch):
+    import swagger_client
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    values = _patch_execution_statuses(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(
+        latest_test_log_id=987,
+        exe_start='2026-05-11T16:24:53+00:00',
+        exe_end='2026-05-11T16:25:11+00:00',
+    ))
+    calls = _patch_test_log_api(monkeypatch, response=_FakeSubmitTestLogResponse(987))
+
+    result = wrapper.update_test_run_status('12345', 'Passed')
+
+    assert len(calls) == 1
+    assert calls[0]['project_id'] == 1
+    assert calls[0]['test_run_id'] == 12345
+    # Modifies the existing test log (PUT) by its id, not creating a new one.
+    assert calls[0]['id'] == 987
+    assert calls[0]['kwargs'].get('_preload_content') is False
+    body = calls[0]['body']
+    # Status must be sent by its resolved value id, not a bare name (else qTest 400).
+    assert body.status.id == values['Passed']
+    # qTest requires the run's ORIGINAL execution times, not now() (else 400).
+    assert body.exe_start_date == '2026-05-11T16:24:53+00:00'
+    assert body.exe_end_date == '2026-05-11T16:25:11+00:00'
+    assert body.exe_start_date is not None
+    assert body.exe_end_date is not None
+    assert '987' in result
+
+
+def test_update_test_run_status_resolves_tr_pid(monkeypatch):
+    import swagger_client
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_execution_statuses(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(qtest_id=999, latest_test_log_id=5))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    wrapper.update_test_run_status('TR-39', 'Passed')
+
+    # The internal run id used for the PUT comes from the search result's QTest Id.
+    assert calls[0]['test_run_id'] == 999
+
+
+def test_update_test_run_status_includes_note(monkeypatch):
+    import swagger_client
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_execution_statuses(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    wrapper.update_test_run_status('12345', 'Failed', note='some note')
+
+    assert calls[0]['body'].note == 'some note'
+
+
+def test_update_test_run_status_invalid_test_run_id_raises_tool_exception(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_execution_statuses(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=None)
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.update_test_run_status('TR-999', 'Passed')
+
+    assert 'TR-999' in str(exc_info.value)
+
+
+def test_update_test_run_status_api_exception_wrapped(monkeypatch):
+    import swagger_client
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_execution_statuses(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    api_exc = swagger_client.rest.ApiException(status=500, reason='Server Error')
+    _patch_test_log_api(monkeypatch, raise_exc=api_exc)
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.update_test_run_status('12345', 'Passed')
+
+    assert exc_info.value.__cause__ is api_exc
+
+
+def test_update_test_run_status_resolves_status_name_to_execution_status_id(monkeypatch):
+    """Status name is resolved to its execution-status id (GET /test-runs/
+    execution-statuses), never sent as a bare name — the root cause of the 400."""
+    import swagger_client
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    # get_fields must NOT be used: the id comes from execution-statuses, not FieldApi.
+    def boom_get_fields(self, *args, **kwargs):
+        raise AssertionError("get_fields must not be called; use execution-statuses")
+
+    monkeypatch.setattr(swagger_client.FieldApi, 'get_fields', boom_get_fields)
+
+    values = _patch_execution_statuses(monkeypatch, status_values={'Failed': 902})
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    wrapper.update_test_run_status('12345', 'Failed')
+
+    assert calls[0]['body'].status.id == values['Failed']
+
+
+def test_update_test_run_status_matches_status_case_insensitively(monkeypatch):
+    """A differently-cased status name still resolves to the execution-status id."""
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    values = _patch_execution_statuses(monkeypatch, status_values={'Passed': 601})
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    wrapper.update_test_run_status('12345', 'passed')
+
+    assert calls[0]['body'].status.id == values['Passed']
+
+
+def test_update_test_run_status_invalid_status_raises_with_allowed_values(monkeypatch):
+    """An unknown status name is rejected before submit, listing the allowed values."""
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_execution_statuses(monkeypatch, status_values={'Passed': 601, 'Failed': 602})
+    calls = _patch_test_log_api(monkeypatch, response=_FakeSubmitTestLogResponse(1))
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.update_test_run_status('12345', 'NotAStatus')
+
+    msg = str(exc_info.value)
+    assert 'NotAStatus' in msg
+    assert 'Passed' in msg and 'Failed' in msg
+    # submit must not be attempted with an invalid status
+    assert calls == []
+
+
+def test_upload_attachment_to_test_run_test_case_happy_path(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    artifact_client = _FakeArtifactClient()
+    wrapper.elitea = _FakeElitea(artifact_client)
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=555))
+
+    upload_calls = []
+
+    def fake_upload(self, object_type, object_id, file_bytes, filename, mime_type):
+        upload_calls.append({
+            'object_type': object_type, 'object_id': object_id,
+            'filename': filename, 'file_bytes': file_bytes,
+        })
+        return 'attach-1'
+
+    monkeypatch.setattr(QtestApiWrapper, '_upload_binary_file_to_qtest', fake_upload)
+
+    result = wrapper.upload_attachment_to_test_run('12345', 'test-case', '/__temp__/screenshot.png')
+
+    assert upload_calls[0]['object_type'] == 'test-cases'
+    assert upload_calls[0]['object_id'] == 555
+    assert artifact_client.calls == ['/__temp__/screenshot.png']
+    assert 'attach-1' in result
+
+
+def test_upload_attachment_to_test_run_test_log_happy_path(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    wrapper.elitea = _FakeElitea(_FakeArtifactClient())
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=777))
+
+    upload_calls = []
+
+    def fake_upload(self, object_type, object_id, file_bytes, filename, mime_type):
+        upload_calls.append({'object_type': object_type, 'object_id': object_id})
+        return 'attach-2'
+
+    monkeypatch.setattr(QtestApiWrapper, '_upload_binary_file_to_qtest', fake_upload)
+
+    wrapper.upload_attachment_to_test_run('12345', 'test-log', '/__temp__/screenshot.png')
+
+    assert upload_calls[0]['object_type'] == 'test-logs'
+    assert upload_calls[0]['object_id'] == 777
+
+
+def test_upload_attachment_to_test_run_test_log_missing_raises(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    wrapper.elitea = _FakeElitea(_FakeArtifactClient())
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.upload_attachment_to_test_run('12345', 'test-log', '/__temp__/screenshot.png')
+
+    assert 'update_test_run_status' in str(exc_info.value)
+
+
+def test_upload_attachment_to_test_run_test_case_missing_raises(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    wrapper.elitea = _FakeElitea(_FakeArtifactClient())
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=None))
+
+    with pytest.raises(ToolException):
+        wrapper.upload_attachment_to_test_run('12345', 'test-case', '/__temp__/screenshot.png')
+
+
+def test_upload_attachment_to_test_run_file_not_found(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    artifact_client = _FakeArtifactClient(file_bytes=None, filename=None)
+    wrapper.elitea = _FakeElitea(artifact_client)
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=555))
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.upload_attachment_to_test_run('12345', 'test-case', '/__temp__/missing.png')
+
+    assert '/__temp__/missing.png' in str(exc_info.value)
+
+
+def test_upload_attachment_to_test_run_chat_attachment_filepath(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    artifact_client = _FakeArtifactClient()
+    wrapper.elitea = _FakeElitea(artifact_client)
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=555))
+    monkeypatch.setattr(
+        QtestApiWrapper, '_upload_binary_file_to_qtest',
+        lambda self, object_type, object_id, file_bytes, filename, mime_type: 'attach-3'
+    )
+
+    result = wrapper.upload_attachment_to_test_run('12345', 'test-case', '/__temp__/screenshot.png')
+
+    assert artifact_client.calls == ['/__temp__/screenshot.png']
+    assert 'attach-3' in result
+
+
+def test_upload_attachment_to_test_run_artifacts_bucket_filepath(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    artifact_client = _FakeArtifactClient()
+    wrapper.elitea = _FakeElitea(artifact_client)
+
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=555))
+    monkeypatch.setattr(
+        QtestApiWrapper, '_upload_binary_file_to_qtest',
+        lambda self, object_type, object_id, file_bytes, filename, mime_type: 'attach-4'
+    )
+
+    result = wrapper.upload_attachment_to_test_run('12345', 'test-case', '/project-artifacts/report.pdf')
+
+    assert artifact_client.calls == ['/project-artifacts/report.pdf']
+    assert 'attach-4' in result
+
+
+def test_upload_attachment_to_test_run_resolves_tr_pid(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+    wrapper.elitea = _FakeElitea(_FakeArtifactClient())
+
+    run_calls = _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=555))
+    monkeypatch.setattr(
+        QtestApiWrapper, '_upload_binary_file_to_qtest',
+        lambda self, object_type, object_id, file_bytes, filename, mime_type: 'attach-5'
+    )
+
+    wrapper.upload_attachment_to_test_run('TR-39', 'test-case', '/__temp__/screenshot.png')
+
+    # The run is looked up by its TR pid via the DQL search path.
+    assert run_calls[0]['object_type'] == 'test-runs'
+    assert run_calls[0]['entity_id'] == 'TR-39'
