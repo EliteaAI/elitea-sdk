@@ -2069,17 +2069,18 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         # (a new comment bumps issue.fields.updated), so parent updated_on already
         # covers them. Attachments do not bump updated_on on every Jira instance,
         # so diff those specifically against the attach_* subset of the stored set.
+        # Reads the pre-populated `_attachments_data` (set in _process_issue_for_indexing
+        # from the JQL batch that already requested the 'attachment' field) — no extra
+        # REST call.
         if not getattr(self, '_include_attachments', False):
             return False
-        issue_key = document.metadata.get('issue_key')
-        if not issue_key:
+        if '_attachments_data' not in document.metadata:
             return False
         stored_attach = {
             s for s in (idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
             if isinstance(s, str) and s.startswith('attach_')
         }
-        issue = self._get_client().issue(issue_key, fields="attachment") or {}
-        attachments = issue.get('fields', {}).get('attachment', []) or []
+        attachments = document.metadata['_attachments_data']
         current = set()
         for attachment in attachments:
             filename = attachment.get('filename', '') or ''
@@ -2099,8 +2100,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         issue_key = base_document.metadata.get('issue_key')
         # get attachments content
         if self._include_attachments:
-            issue = client.issue(issue_key, fields="attachment")
-            attachments = issue.get('fields', {}).get('attachment', [])
+            attachments = base_document.metadata.pop('_attachments_data', None)
+            if attachments is None:
+                # Fallback: doc was constructed outside _base_loader.
+                issue = client.issue(issue_key, fields="attachment")
+                attachments = issue.get('fields', {}).get('attachment', [])
             for attachment in attachments:
                 # get extension
                 ext = f".{attachment['filename'].split('.')[-1].lower()}"
@@ -2274,6 +2278,12 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 "issuetype": issue["fields"].get("issuetype", {}).get("name") if issue["fields"].get("issuetype") else None,
                 "type": "jira_issue",
             }
+
+            # Preserve the attachment list already fetched in the JQL batch so
+            # _dependents_diverged and _process_document don't each re-fetch the
+            # issue for its attachment field.
+            if getattr(self, '_include_attachments', False):
+                metadata["_attachments_data"] = issue.get("fields", {}).get("attachment", []) or []
 
             return Document(page_content=content, metadata=metadata)
 
