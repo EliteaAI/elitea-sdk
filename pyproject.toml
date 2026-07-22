@@ -27,6 +27,7 @@ dependencies = [
     "httpcore==1.0.7",
     "urllib3>=2",
     "certifi==2024.8.30",
+    "truststore>=0.10.4",
     "aiohttp>=3.9.0",
 ]
 
