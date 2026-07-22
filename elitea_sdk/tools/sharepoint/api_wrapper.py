@@ -1210,19 +1210,32 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     page_id = page.get("id", "")
                     if allowed_page_ids is not None and page_id not in allowed_page_ids:
                         continue
-                    yield Document(
-                        page_content="",
-                        metadata={
-                            "source_type": "onenote",
-                            "id": page_id,
-                            "title": page.get("title", ""),
-                            "webUrl": page.get("webUrl", ""),
-                            "contentUrl": page.get("contentUrl", ""),
-                            "updated_on": page.get("lastModifiedDateTime", ""),
-                            "created_on": page.get("createdDateTime", ""),
-                            "section_id": sec_id,
-                        },
-                    )
+                    metadata = {
+                        "source_type": "onenote",
+                        "id": page_id,
+                        "title": page.get("title", ""),
+                        "webUrl": page.get("webUrl", ""),
+                        "contentUrl": page.get("contentUrl", ""),
+                        "updated_on": page.get("lastModifiedDateTime", ""),
+                        "created_on": page.get("createdDateTime", ""),
+                        "section_id": sec_id,
+                    }
+                    # Pre-populate the attachment list so _dependents_diverged
+                    # and _process_document share a single Graph call per page
+                    # instead of each fetching independently.
+                    if cfg.get("include_attachments", False) and hasattr(
+                        self._backend, "onenote_list_attachments"
+                    ):
+                        try:
+                            metadata["_attachments_data"] = (
+                                self._backend.onenote_list_attachments(page_id) or []
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "Failed to list attachments for OneNote page '%s': %s",
+                                page_id, exc,
+                            )
+                    yield Document(page_content="", metadata=metadata)
         except ToolException:
             raise
         except Exception as e:
@@ -1313,6 +1326,60 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                         logging.error("Failed while loading file content '%s': %s", file_path, e)
                 yield document
 
+    @staticmethod
+    def _onenote_attachment_passes_filters(
+        att_name: str,
+        include_patterns: list,
+        skip_patterns: list,
+    ) -> bool:
+        """Return True when the attachment name satisfies the OneNote
+        include/skip glob filters (`*` wildcard, case-insensitive)."""
+        if include_patterns and not any(
+            re.match(re.escape(pattern).replace(r'\*', '.*') + '$', att_name, re.IGNORECASE)
+            for pattern in include_patterns
+        ):
+            return False
+        if skip_patterns and any(
+            re.match(re.escape(pattern).replace(r'\*', '.*') + '$', att_name, re.IGNORECASE)
+            for pattern in skip_patterns
+        ):
+            return False
+        return True
+
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # OneNote pages mix two dep types in dependent_docs: attachments
+        # (attach_*, emitted from _process_document) and inline images
+        # (img_page_id_idx, emitted from _extend_data). Images are derived from
+        # the page content and are re-emitted whenever the parent's updated_on
+        # changes — so diff only the attach_* subset here.
+        if document.metadata.get('source_type') != 'onenote':
+            return False
+        cfg: dict = getattr(self, '_onenote_cfg', {}) or {}
+        if not cfg.get('include_attachments', False):
+            return False
+        if '_attachments_data' not in document.metadata:
+            return False
+        stored_attach = {
+            s for s in (idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+            if isinstance(s, str) and s.startswith('attach_')
+        }
+        attachments = document.metadata.get('_attachments_data') or []
+        skip_patterns: list = cfg.get('skip_extensions', []) or []
+        include_patterns: list = cfg.get('include_extensions', []) or []
+        current = set()
+        for attachment in attachments:
+            att_name: str = attachment.get('name', '') or ''
+            download_url: str = attachment.get('download_url', '') or ''
+            resource_id: str = attachment.get('resource_id') or att_name
+            if not att_name or not download_url:
+                continue
+            if not self._onenote_attachment_passes_filters(
+                att_name, include_patterns, skip_patterns
+            ):
+                continue
+            current.add(f"attach_{resource_id}")
+        return current != stored_attach
+
     def _process_document(self, base_document: Document) -> Generator[Document, None, None]:
         """Yield dependent documents for a OneNote page:
         - One Document per file attachment (when include_attachments=True)
@@ -1343,13 +1410,18 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         skip_patterns: list = cfg.get('skip_extensions', [])
         include_patterns: list = cfg.get('include_extensions', [])
 
-        try:
-            attachments = self._backend.onenote_list_attachments(page_id)
-        except Exception as e:
-            logging.error(
-                "Failed to list attachments for OneNote page '%s': %s", page_id, e
-            )
-            return
+        # Prefer the attachment list already fetched in _onenote_base_loader;
+        # fall back to a fresh Graph call for callers that bypass the loader.
+        if '_attachments_data' in base_document.metadata:
+            attachments = base_document.metadata.pop('_attachments_data') or []
+        else:
+            try:
+                attachments = self._backend.onenote_list_attachments(page_id)
+            except Exception as e:
+                logging.error(
+                    "Failed to list attachments for OneNote page '%s': %s", page_id, e
+                )
+                return
 
         for attachment in attachments:
             att_name: str = attachment.get('name', '')
@@ -1359,27 +1431,12 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             if not att_name or not download_url:
                 continue
 
-            if include_patterns and not any(
-                    re.match(
-                        re.escape(pattern).replace(r'\*', '.*') + '$',
-                        att_name, re.IGNORECASE,
-                    )
-                    for pattern in include_patterns
+            if not self._onenote_attachment_passes_filters(
+                att_name, include_patterns, skip_patterns
             ):
                 logging.debug(
-                    "Skipping OneNote attachment '%s' (not in include_extensions)", att_name
-                )
-                continue
-
-            if skip_patterns and any(
-                    re.match(
-                        re.escape(pattern).replace(r'\*', '.*') + '$',
-                        att_name, re.IGNORECASE,
-                    )
-                    for pattern in skip_patterns
-            ):
-                logging.debug(
-                    "Skipping OneNote attachment '%s' (matched skip pattern)", att_name
+                    "Skipping OneNote attachment '%s' (filtered by include/skip patterns)",
+                    att_name,
                 )
                 continue
 

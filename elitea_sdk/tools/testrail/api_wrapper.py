@@ -1349,6 +1349,22 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 'section_id': case.get('section_id') or -1,
                 'entity_type': 'test_case',
             }
+            # Pre-populate the attachment list so _dependents_diverged and
+            # _process_document share a single REST call per case instead of
+            # each fetching independently.
+            if self._include_attachments:
+                case_id = metadata['id']
+                try:
+                    resp = self._client.attachments.get_attachments_for_case(case_id=case_id)
+                    if isinstance(resp, dict) and 'attachments' in resp:
+                        attachments = resp['attachments']
+                    else:
+                        attachments = resp if isinstance(resp, list) else []
+                    metadata['_attachments_data'] = attachments
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch attachments for case {case_id}: {e}."
+                    )
             if chunking_tool:
                 # content is in metadata for chunking tool post-processing
                 metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = json.dumps(case).encode("utf-8")
@@ -1356,6 +1372,27 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             else:
                 page_content = json.dumps(case)
             yield Document(page_content=page_content, metadata=metadata)
+
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Attachments are the only dependents TestRail emits, and only when
+        # include_attachments is on for this run — strict set-equality on the
+        # whole stored dependent_docs is safe.
+        if not getattr(self, '_include_attachments', False):
+            return False
+        if '_attachments_data' not in document.metadata:
+            return False
+        stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+        attachments = document.metadata.get('_attachments_data') or []
+        skipped = getattr(self, '_skip_attachment_extensions', set()) or set()
+        current = set()
+        for attachment in attachments:
+            attachment_name = attachment.get('filename') or attachment.get('name') or ''
+            if get_file_extension(attachment_name) in skipped:
+                continue
+            att_id = attachment.get('id')
+            if att_id is not None:
+                current.add(f"attach_{att_id}")
+        return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
         """
@@ -1378,14 +1415,16 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             base_data = document.metadata
             case_id = base_data.get("id")
 
-            # get a list of attachments for the case
-            attachments_response = self._client.attachments.get_attachments_for_case(case_id=case_id)
-
-            # Extract attachments from response - handle both old and new API response formats
-            if isinstance(attachments_response, dict) and 'attachments' in attachments_response:
-                attachments = attachments_response['attachments']
+            # Prefer the attachment list already fetched in _base_loader; fall
+            # back to a fresh REST call for callers that bypass _base_loader.
+            if '_attachments_data' in base_data:
+                attachments = base_data.pop('_attachments_data') or []
             else:
-                attachments = attachments_response if isinstance(attachments_response, list) else []
+                attachments_response = self._client.attachments.get_attachments_for_case(case_id=case_id)
+                if isinstance(attachments_response, dict) and 'attachments' in attachments_response:
+                    attachments = attachments_response['attachments']
+                else:
+                    attachments = attachments_response if isinstance(attachments_response, list) else []
 
             # process each attachment to extract its content
             for attachment in attachments:

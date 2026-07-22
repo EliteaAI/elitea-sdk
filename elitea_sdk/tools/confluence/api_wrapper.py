@@ -1182,16 +1182,49 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         for document in loader._lazy_load(kwargs={}):
             if 'updated_on' not in document.metadata and 'when' in document.metadata:
                 document.metadata['updated_on'] = document.metadata['when']
+            # Pre-populate the attachment list so _dependents_diverged and
+            # _process_document share a single REST call per page instead of
+            # each fetching independently.
+            if self._index_include_attachments:
+                page_id = document.metadata.get('id')
+                if page_id:
+                    try:
+                        attachments = self.client.get_attachments_from_content(page_id) or {}
+                        document.metadata['_attachments_data'] = attachments.get('results') or []
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to fetch attachments for page {page_id}: {e}."
+                        )
             self._track_processed_item()
             yield document
+
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Attachments are the only dependents Confluence emits, and only when
+        # include_attachments is on for this run — strict set-equality on the
+        # whole stored dependent_docs is safe. Reads the list pre-populated by
+        # _base_loader; returns False if unavailable (e.g., transient fetch
+        # failure) to avoid stampeding a reindex on missing data.
+        if not getattr(self, '_index_include_attachments', False):
+            return False
+        if '_attachments_data' not in document.metadata:
+            return False
+        stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+        current = {a['id'] for a in document.metadata['_attachments_data'] if a.get('id')}
+        return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
         try:
             if self._index_include_attachments:
                 page_id = document.metadata.get('id')
-                attachments = self.client.get_attachments_from_content(page_id)
-                if not attachments or not attachments.get('results'):
+                attachment_results = document.metadata.pop('_attachments_data', None)
+                if attachment_results is None:
+                    # Fallback: attachment prefetch failed in _base_loader (logged there)
+                    # or this document was constructed outside the loader.
+                    fetched = self.client.get_attachments_from_content(page_id) or {}
+                    attachment_results = fetched.get('results') or []
+                if not attachment_results:
                     return f"No attachments found for page ID {page_id}."
+                attachments = {'results': attachment_results}
 
                 # Get attachment history for created/updated info
                 history_map = {}
@@ -1234,6 +1267,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                             '_links', {}).get('download') else ''
                     download_url = self.client.url.rstrip('/') + attachment_path
                     metadata = {
+                        'id': attachment['id'],
                         'name': title,
                         'size': attachment.get('extensions', {}).get('fileSize', None),
                         'creator': created_by,

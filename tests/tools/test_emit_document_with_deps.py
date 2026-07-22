@@ -119,7 +119,7 @@ class TestEmitDocumentWithDepsRegressionSurface:
             list(_wrapper()._emit_document_with_deps(parent, deps))
 
         # Only truthy dep ids are collected; empty ids are skipped.
-        assert parent.metadata[IndexerKeywords.DEPENDENT_DOCS.value] == "d1,d2"
+        assert parent.metadata[IndexerKeywords.DEPENDENT_DOCS.value] == "d1;d2"
 
     def test_yield_order_deps_then_parent(self):
         parent = _parent()
@@ -143,10 +143,10 @@ class TestEmitDocumentWithDepsRegressionSurface:
         # If a loader pre-populated dependent_docs on the parent, the emit helper
         # must append newly collected ids rather than clobber the existing list.
         parent = _parent()
-        parent.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = "old-a,old-b"
+        parent.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = "old-a;old-b"
         deps = [_dep(dep_id="new-1")]
 
         with patch.object(BaseIndexerToolkit, "_log_tool_event"):
             list(_wrapper()._emit_document_with_deps(parent, deps))
 
-        assert parent.metadata[IndexerKeywords.DEPENDENT_DOCS.value] == "old-a,old-b,new-1"
+        assert parent.metadata[IndexerKeywords.DEPENDENT_DOCS.value] == "old-a;old-b;new-1"
