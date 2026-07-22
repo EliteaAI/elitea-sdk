@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from langchain_core.documents import Document
@@ -5,6 +6,8 @@ from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
 from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit, IndexingStats
+
+logger = logging.getLogger(__name__)
 
 
 class NonCodeIndexerToolkit(BaseIndexerToolkit):
@@ -24,9 +27,44 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         return document.metadata.get('id')
 
     def compare_fn(self, document: Document, idx_data):
-        return (document.metadata.get('updated_on')
-                and idx_data['metadata'].get('updated_on')
-                and document.metadata.get('updated_on') == idx_data['metadata'].get('updated_on'))
+        same_updated_on = (
+            document.metadata.get('updated_on')
+            and idx_data['metadata'].get('updated_on')
+            and document.metadata.get('updated_on') == idx_data['metadata'].get('updated_on')
+        )
+        if not same_updated_on:
+            return False
+        # Same updated_on alone would let _reduce_duplicates skip the parent,
+        # which also skips _process_document — so attachments/children fetched
+        # there would never be reprocessed when their set diverges from the
+        # indexed copy (e.g., toggling include_attachments True on a rerun,
+        # or a source-side add/remove that didn't bump the parent's
+        # updated_on). Subclasses that emit dependents opt in via
+        # _dependents_diverged.
+        try:
+            if self._dependents_diverged(document, idx_data):
+                return False
+        except Exception as e:
+            logger.warning(
+                f"Failed to check dependent divergence for "
+                f"{document.metadata.get('id')}: {e}. Treating as changed."
+            )
+            return False
+        return True
+
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        """Return True to force reprocessing of a doc whose updated_on is
+        unchanged but whose dependent set (attachments, images, comments,
+        etc.) has diverged from the stored copy. Default False (opt out —
+        dedup uses updated_on alone).
+
+        Override in subclasses that emit dependent documents. Each
+        subclass owns its own diff strategy: strict set-equality,
+        prefix-filtered subset (when multiple dep types share
+        dependent_docs), presence-only check, etc. Read the stored set
+        via idx_data[IndexerKeywords.DEPENDENT_DOCS.value] (already
+        list-parsed by the vector adapter)."""
+        return False
 
     def remove_ids_fn(self, idx_data, key: str):
         return (idx_data[key]['all_chunks'] +

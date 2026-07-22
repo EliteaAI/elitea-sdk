@@ -1046,6 +1046,29 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         else:
             document.page_content = enriched
 
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Attachments are the only dependents ADO Wiki emits. The parent's
+        # updated_on is a sha256 of the raw page markdown, so any add/remove
+        # of an attachment reference in-content already forces reprocessing.
+        # The remaining case this catches is the include_attachments toggle
+        # (or extension-filter changes) where content is byte-identical but the
+        # emitted dependent set differs.
+        if not getattr(self, '_index_include_attachments', False):
+            return False
+        parent_id = document.metadata.get('id')
+        if not parent_id:
+            return False
+        attachment_paths = document.metadata.get(self._INDEXER_ATTACHMENTS_META_KEY) or []
+        current = set()
+        for att_url in attachment_paths:
+            file_path = unquote(att_url.lstrip('/'))
+            file_name = file_path.rsplit('/', 1)[-1]
+            if not self._matches_extension_filter(file_name):
+                continue
+            current.add(f"{parent_id}::{file_path}")
+        stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+        return current != stored
+
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
         """Emit each referenced /.attachments/ file as a dependent Document, and
         optionally rewrite the parent page's inline images with LLM descriptions.

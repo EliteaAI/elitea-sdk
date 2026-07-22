@@ -1357,6 +1357,32 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 page_content = json.dumps(case)
             yield Document(page_content=page_content, metadata=metadata)
 
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Attachments are the only dependents TestRail emits, and only when
+        # include_attachments is on for this run — strict set-equality on the
+        # whole stored dependent_docs is safe.
+        if not getattr(self, '_include_attachments', False):
+            return False
+        case_id = document.metadata.get('id')
+        if case_id is None:
+            return False
+        stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+        attachments_response = self._client.attachments.get_attachments_for_case(case_id=case_id)
+        if isinstance(attachments_response, dict) and 'attachments' in attachments_response:
+            attachments = attachments_response['attachments']
+        else:
+            attachments = attachments_response if isinstance(attachments_response, list) else []
+        skipped = getattr(self, '_skip_attachment_extensions', set()) or set()
+        current = set()
+        for attachment in attachments:
+            attachment_name = attachment.get('filename') or attachment.get('name') or ''
+            if get_file_extension(attachment_name) in skipped:
+                continue
+            att_id = attachment.get('id')
+            if att_id is not None:
+                current.add(f"attach_{att_id}")
+        return current != stored
+
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
         """
         Process an existing base document to extract relevant metadata for full document preparation.

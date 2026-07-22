@@ -2063,6 +2063,34 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             doc.metadata[IndexerKeywords.CONTENT_FILE_NAME.value] = f"base_doc{file_extension_by_chunker(self._chunking_tool)}"
             yield doc
 
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Jira mixes two dep types in dependent_docs: attachments (attach_*) and
+        # comments (raw id). Comments track the parent issue's updated timestamp
+        # (a new comment bumps issue.fields.updated), so parent updated_on already
+        # covers them. Attachments do not bump updated_on on every Jira instance,
+        # so diff those specifically against the attach_* subset of the stored set.
+        if not getattr(self, '_include_attachments', False):
+            return False
+        issue_key = document.metadata.get('issue_key')
+        if not issue_key:
+            return False
+        stored_attach = {
+            s for s in (idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+            if isinstance(s, str) and s.startswith('attach_')
+        }
+        issue = self._get_client().issue(issue_key, fields="attachment") or {}
+        attachments = issue.get('fields', {}).get('attachment', []) or []
+        current = set()
+        for attachment in attachments:
+            filename = attachment.get('filename', '') or ''
+            ext = f".{filename.split('.')[-1].lower()}" if '.' in filename else ''
+            if ext in self._skipped_attachment_extensions:
+                continue
+            att_id = attachment.get('id')
+            if att_id is not None:
+                current.add(f"attach_{att_id}")
+        return current != stored_attach
+
     def _process_document(self, base_document: Document) -> Generator[Document, None, None]:
         """
         Process a base document to extract and index Jira issues extra fields: comments, attachments, etc..

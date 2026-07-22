@@ -888,10 +888,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             yield dep
 
         existing_deps = document.metadata.get(IndexerKeywords.DEPENDENT_DOCS.value, '')
-        collected_deps_str = ','.join(collected_dep_ids)
+        collected_deps_str = ';'.join(collected_dep_ids)
 
         if existing_deps and collected_deps_str:
-            document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = f"{existing_deps},{collected_deps_str}"
+            document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = f"{existing_deps};{collected_deps_str}"
         elif collected_deps_str:
             document.metadata[IndexerKeywords.DEPENDENT_DOCS.value] = collected_deps_str
         # else: keep existing_deps as-is (or empty)

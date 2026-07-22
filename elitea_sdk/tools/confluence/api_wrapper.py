@@ -1185,6 +1185,20 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             self._track_processed_item()
             yield document
 
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Attachments are the only dependents Confluence emits, and only when
+        # include_attachments is on for this run — so a strict set-equality
+        # diff against the whole stored dependent_docs is safe here.
+        if not getattr(self, '_index_include_attachments', False):
+            return False
+        page_id = document.metadata.get('id')
+        if not page_id:
+            return False
+        stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+        attachments = self.client.get_attachments_from_content(page_id) or {}
+        current = {a['id'] for a in attachments.get('results', []) if a.get('id')}
+        return current != stored
+
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
         try:
             if self._index_include_attachments:
@@ -1234,6 +1248,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                             '_links', {}).get('download') else ''
                     download_url = self.client.url.rstrip('/') + attachment_path
                     metadata = {
+                        'id': attachment['id'],
                         'name': title,
                         'size': attachment.get('extensions', {}).get('fileSize', None),
                         'creator': created_by,
