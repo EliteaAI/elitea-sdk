@@ -118,6 +118,7 @@ class EliteADocxMammothLoader(BaseLoader):
         self.max_tokens = kwargs.get('max_tokens', 512)
         self.extracted_images_names = kwargs.get('extracted_images_names')
         self.read_images_only = kwargs.get('read_images_only', False)
+        self.image_cache = kwargs.get('image_cache')
         # Dedup cache: MD5(image_bytes) → transcript string
         self._image_cache = {}
         # Ordered list of image filenames as they appear in the document
@@ -225,9 +226,13 @@ class EliteADocxMammothLoader(BaseLoader):
             transcript = None
             if self.llm:
                 try:
+                    source = self.path or self.file_name or "docx"
                     transcript = perform_llm_prediction_for_image_bytes(
                         image_bytes, self.llm,
-                        self.prompt if self.prompt else image_processing_prompt)
+                        self.prompt if self.prompt else image_processing_prompt,
+                        cache=self.image_cache,
+                        image_name=f"{source}#{image_name}",
+                    )
                 except Exception:
                     transcript = None
 
@@ -702,9 +707,13 @@ class EliteADocxMammothLoader(BaseLoader):
             try:
                 image_bytes = file_rels[name].target_part.blob
                 if self.llm:
+                    source = self.path or self.file_name or "docx"
                     transcript = perform_llm_prediction_for_image_bytes(
                         image_bytes, self.llm,
-                        self.prompt if self.prompt else image_processing_prompt)
+                        self.prompt if self.prompt else image_processing_prompt,
+                        cache=self.image_cache,
+                        image_name=f"{source}#{name}",
+                    )
                 else:
                     transcript = "Transcript is not available"
                 results[name] = transcript

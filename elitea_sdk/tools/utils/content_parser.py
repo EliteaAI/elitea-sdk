@@ -59,7 +59,7 @@ Be as precise and thorough as possible in your responses. If something is unclea
 
 def parse_file_content(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                        sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False,
-                       prompt=None, extra_params: dict = None) -> str | ToolException:
+                       prompt=None, extra_params: dict = None, image_cache=None) -> str | ToolException:
     """Parse the content of a file based on its type and return the parsed content.
 
     Args:
@@ -89,6 +89,7 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
         excel_by_sheets=excel_by_sheets,
         prompt=prompt,
         extra_params=extra_params,
+        image_cache=image_cache,
     )
 
     if not loader:
@@ -100,7 +101,11 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
             return loader.get_content()
         else:
             extension = Path(file_path if file_path else file_name).suffix
-            loader_kwargs = get_loader_kwargs(loaders_map.get(extension), file_name, file_content, is_capture_image, page_number, sheet_name, llm, file_path, excel_by_sheets, extra_params=extra_params)
+            loader_kwargs = get_loader_kwargs(
+                loaders_map.get(extension), file_name, file_content, is_capture_image,
+                page_number, sheet_name, llm, file_path, excel_by_sheets,
+                extra_params=extra_params, image_cache=image_cache,
+            )
             if file_content:
                 return load_content_from_bytes(file_content=file_content,
                                                extension=extension,
@@ -144,7 +149,7 @@ def load_file_docs(file_name=None, file_content=None, is_capture_image: bool = F
 
 def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                     sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False, prompt=None,
-                    extra_params: dict = None):
+                    extra_params: dict = None, image_cache=None):
     """Build loader kwargs safely without deepcopying non-picklable objects like LLMs.
 
     We avoid copying keys that are going to be overridden by this function anyway
@@ -171,6 +176,7 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
         "prompt",
         "row_content",
         "json_documents",
+        "image_cache",
     }
 
     # Build a safe shallow copy without overridden keys to avoid deepcopy
@@ -188,7 +194,8 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
         "excel_by_sheets": excel_by_sheets,
         "prompt": prompt,
         "row_content": True,
-        "json_documents": False
+        "json_documents": False,
+        "image_cache": image_cache,
     })
     # Merge caller-provided extra_params LAST so they take precedence over
     # defaults from loaders_map. Sheet_name from extra_params overrides the
@@ -201,7 +208,7 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
 
 def prepare_loader(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                        sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False,
-                   prompt=None, extra_params: dict = None):
+                   prompt=None, extra_params: dict = None, image_cache=None):
         if (file_path and (file_name or file_content)) or (not file_path and (not file_name or file_content is None)):
             raise ToolException("Either (file_name and file_content) or file_path must be provided, but not both.")
 
@@ -210,7 +217,9 @@ def prepare_loader(file_name=None, file_content=None, is_capture_image: bool = F
         loader_object = loaders_map.get(extension)
         if not loader_object:
             loader_object = loaders_map.get('.txt')  # Default to text loader if no specific loader found
-        loader_kwargs = get_loader_kwargs(loader_object, file_name, file_content, is_capture_image, page_number, sheet_name, llm, file_path, excel_by_sheets, prompt, extra_params=extra_params)
+        loader_kwargs = get_loader_kwargs(loader_object, file_name, file_content, is_capture_image, page_number,
+                                          sheet_name, llm, file_path, excel_by_sheets, prompt,
+                                          extra_params=extra_params, image_cache=image_cache)
         # Filter loader_kwargs to those accepted by the loader class to avoid
         # TypeError when extra_params contains keys not recognised by that loader.
         try:

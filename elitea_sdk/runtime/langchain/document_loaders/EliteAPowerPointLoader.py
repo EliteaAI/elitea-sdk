@@ -64,6 +64,7 @@ class EliteAPowerPointLoader:
         self.llm = unstructured_kwargs.get('llm', None)
         self.prompt = unstructured_kwargs.get('prompt', "Describe image")
         self.pages_per_chunk = unstructured_kwargs.get('pages_per_chunk', 5)
+        self.image_cache = unstructured_kwargs.get('image_cache')
 
     def get_content(self):
         if hasattr(self, 'file_path'):
@@ -263,6 +264,8 @@ class EliteAPowerPointLoader:
 
     def read_pptx_slide(self, slide, index):
         text_content = f'Slide: {index}\n'
+        source = getattr(self, 'file_path', None) or 'pptx'
+        img_index = 0
         for shape in slide.shapes:
             try:
                 # Handle tables
@@ -276,7 +279,12 @@ class EliteAPowerPointLoader:
                     try:
                         image_blob = self._get_image_blob(shape)
                         if image_blob:
-                            caption = perform_llm_prediction_for_image_bytes(image_blob, self.llm, self.prompt)
+                            caption = perform_llm_prediction_for_image_bytes(
+                                image_blob, self.llm, self.prompt,
+                                cache=self.image_cache,
+                                image_name=f"{source}#slide{index}#img{img_index}",
+                            )
+                            img_index += 1
                             text_content += "\n**Image Transcript:**\n" + caption + "\n--------------------\n"
                     except Exception:
                         pass

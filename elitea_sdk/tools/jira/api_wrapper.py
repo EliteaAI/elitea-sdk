@@ -17,6 +17,7 @@ from requests.exceptions import HTTPError
 
 from ..exceptions import ToolkitConfigurationError
 from ..llm.img_utils import ImageDescriptionCache
+from ...runtime.langchain.document_loaders.utils import perform_llm_prediction_for_image_bytes
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import is_cookie_token, parse_cookie_string, get_file_bytes_from_artifact, detect_mime_type
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
@@ -508,7 +509,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
     verify_ssl: Optional[bool] = True
     custom_headers: Optional[Dict[str, str]] = {}
     _client: Jira = PrivateAttr()
-    _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=lambda: ImageDescriptionCache(max_size=50))
+    _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=ImageDescriptionCache)
     issue_search_pattern: str = r'/rest/api/\d+/search'
 
     @model_validator(mode='before')
@@ -1366,16 +1367,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         Returns:
             Generated description from the LLM
         """
-        # Check cache first to avoid redundant processing
-        cached_description = self._image_cache.get(image_data, image_name)
-        if cached_description:
-            logger.info(f"Using cached description for image: {image_name}")
-            return cached_description
-
         try:
             from PIL import Image, UnidentifiedImageError
-            from ..confluence.utils import image_to_byte_array, bytes_to_base64
-            from langchain_core.messages import HumanMessage
+            from ..confluence.utils import image_to_byte_array
 
             # Get the LLM instance
             llm = self.llm
@@ -1384,14 +1378,12 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                     "LLM is required for image processing but is not configured in this toolkit instance."
                 )
 
-            # Try to load and validate the image with PIL instead of using imghdr
+            # Validate the image with PIL and normalise to a consistent format
             try:
                 bio = BytesIO(image_data)
                 bio.seek(0)
                 image = Image.open(bio)
-                # Force load the image to validate it
                 image.load()
-                # Get format directly from PIL
                 image_format = image.format.lower() if image.format else "png"
             except UnidentifiedImageError:
                 logger.warning(f"PIL cannot identify the image format for {image_name}")
@@ -1402,45 +1394,26 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
             try:
                 byte_array = image_to_byte_array(image)
-                base64_string = bytes_to_base64(byte_array)
             except Exception as conv_error:
                 logger.warning(f"Error converting image {image_name}: {str(conv_error)}")
                 return f"[Error converting image {image_name}: {str(conv_error)}]"
 
-            # Use default or custom prompt
+            # Use default or custom prompt, augmented with any context.
             prompt = custom_prompt if custom_prompt else self._get_default_image_analysis_prompt()
-
-            # Add context information if available
             if image_name or context_text:
                 prompt += "\n\n## Additional Context Information:\n"
-
                 if image_name:
                     prompt += f"- Image Name/Reference: {image_name}\n"
-
                 if context_text:
                     prompt += f"- Surrounding Content: {context_text}\n"
-
                 prompt += "\nPlease incorporate this contextual information in your description when relevant."
 
-            # Perform LLM invocation with image
-            result = llm.invoke([
-                HumanMessage(
-                    content=[
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/{image_format};base64,{base64_string}"},
-                        },
-                    ]
-                )
-            ])
-
-            description = result.content
-
-            # Cache the result for future use
-            self._image_cache.set(image_data, description, image_name)
-
-            return description
+            return perform_llm_prediction_for_image_bytes(
+                byte_array, llm, prompt,
+                image_format=image_format,
+                cache=self._image_cache,
+                image_name=image_name,
+            )
         except Exception as e:
             logger.error(f"Error processing image with LLM: {str(e)}")
             return f"[Image processing error: {str(e)}]"
