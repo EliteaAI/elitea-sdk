@@ -16,6 +16,7 @@ from langchain_core.tools import ToolException
 
 from .base_wrapper import BaseSharepointWrapper
 from .utils import decode_sharepoint_string
+from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 
 
 class SharepointRestWrapper(BaseSharepointWrapper):
@@ -43,6 +44,9 @@ class SharepointRestWrapper(BaseSharepointWrapper):
         self._client_secret = client_secret   # plain text already
         self.elitea = elitea
         self.llm = llm
+        # Per-wrapper LRU cache for image → LLM-description dedup shared across
+        # every parse_file_content call issued by this wrapper instance.
+        self._image_cache = ImageDescriptionCache()
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
@@ -511,6 +515,7 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             sheet_name=sheet_name,
             excel_by_sheets=excel_by_sheets,
             llm=self.llm,
+            image_cache=self._image_cache,
         )
 
     def load_file_content_in_bytes(self, path: str) -> bytes:

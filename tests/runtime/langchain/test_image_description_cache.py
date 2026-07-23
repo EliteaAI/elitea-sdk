@@ -58,16 +58,22 @@ class TestImageDescriptionCache:
         assert cache.get(b"bytes", image_name="a.png", prompt="describe") == "hello"
 
     def test_empty_bytes_never_cache(self, monkeypatch):
+        # Assert on the storage side directly: set() must REFUSE to store empty
+        # bytes, not rely on get() short-circuiting to hide a broken set(). A
+        # get-side assertion would still pass if set() silently stored the
+        # entry, so we check `cache.cache` remains empty.
         module = _reload_cache_module(monkeypatch)
         cache = module.ImageDescriptionCache()
         cache.set(b"", "no-op", image_name="a", prompt="p")
-        assert cache.get(b"", image_name="a", prompt="p") is None
+        assert len(cache.cache) == 0, "set() must refuse empty bytes"
 
     def test_empty_description_not_stored(self, monkeypatch):
+        # Same rationale as test_empty_bytes_never_cache: assert on storage,
+        # not on get() short-circuiting.
         module = _reload_cache_module(monkeypatch)
         cache = module.ImageDescriptionCache()
         cache.set(b"data", "", image_name="a", prompt="p")
-        assert cache.get(b"data", image_name="a", prompt="p") is None
+        assert len(cache.cache) == 0, "set() must refuse empty description"
 
     def test_prompt_is_part_of_key(self, monkeypatch):
         """Same bytes + name, different prompt => must NOT return the stale value."""

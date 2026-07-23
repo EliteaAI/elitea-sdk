@@ -25,6 +25,7 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import parse_file_content, file_extension_by_chunker
 from ...runtime.utils.utils import IndexerKeywords
+from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 
 QTEST_ID = "QTest Id"
 
@@ -383,6 +384,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     _chunking_tool: Optional[str] = PrivateAttr(default=None)
     _extract_images: bool = PrivateAttr(default=False)
     _image_prompt: Optional[str] = PrivateAttr(default=None)
+    # Per-wrapper LRU cache for image → LLM-description dedup (see #5844).
+    _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=ImageDescriptionCache)
 
     @field_validator('base_url', mode='before')
     @classmethod
@@ -1139,7 +1142,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
             description = (
                 "\n\n"
-                f"Image Transcript: {parse_file_content(file_content=file_content, file_name=file_name, prompt=effective_prompt, llm=self.llm)}"
+                f"Image Transcript: {parse_file_content(file_content=file_content, file_name=file_name, prompt=effective_prompt, llm=self.llm, image_cache=self._image_cache)}"
                 "\n\n"
             )
 
