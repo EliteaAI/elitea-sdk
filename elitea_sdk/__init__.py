@@ -13,6 +13,13 @@ __all__ = ["runtime", "tools", "community"]
 
 import importlib
 
+# Route TLS verification through the OS trust store (DLP / TLS-interception support).
+# Must run before any HTTP client builds its SSLContext. Best-effort and idempotent;
+# opt out with ELITEA_DISABLE_SYSTEM_CA=1. See elitea_sdk/_system_ca.py.
+from ._system_ca import enable_system_ca
+
+enable_system_ca()
+
 def __getattr__(name):
     if name in __all__:
         module = importlib.import_module(f".{name}", __name__)

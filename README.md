@@ -66,6 +66,29 @@ export ELITEA_ENV_FILE=/path/to/your/.env
 elitea-cli agent chat
 ```
 
+### Enterprise TLS / DLP Environments
+
+By default, most Python HTTP libraries validate TLS certificates against the
+bundled [`certifi`](https://pypi.org/project/certifi/) CA store and ignore the
+operating system trust store. In corporate environments that perform TLS
+inspection (DLP proxies), traffic is re-signed with a private root CA that is
+installed into the **system** trust store — which those libraries would not see,
+causing `CERTIFICATE_VERIFY_FAILED` errors.
+
+To avoid this, the SDK automatically routes TLS verification through the operating
+system trust store via [`truststore`](https://pypi.org/project/truststore/). This
+is enabled by default and requires no configuration — just install your corporate
+root CA into the OS trust store as usual.
+
+To disable this behavior (fall back to the `certifi` bundle), set:
+
+```bash
+export ELITEA_DISABLE_SYSTEM_CA=1
+```
+
+For Git operations (dulwich/paramiko), you can additionally point at an explicit
+CA bundle with the standard `SSL_CERT_FILE` environment variable.
+
 Using the CLI for Interactive Chat
 ----------------------------------
 

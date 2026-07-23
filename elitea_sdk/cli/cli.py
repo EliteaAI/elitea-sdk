@@ -152,7 +152,12 @@ def main():
     warnings.filterwarnings('ignore', category=DeprecationWarning)
     warnings.filterwarnings('ignore', category=UserWarning)
     warnings.filterwarnings('ignore', message='Unverified HTTPS request')
-    
+
+    # Route TLS verification through the OS trust store (DLP support). Idempotent;
+    # opt out with ELITEA_DISABLE_SYSTEM_CA=1. See elitea_sdk/_system_ca.py.
+    from elitea_sdk._system_ca import enable_system_ca
+    enable_system_ca()
+
     try:
         cli()
     except KeyboardInterrupt:
