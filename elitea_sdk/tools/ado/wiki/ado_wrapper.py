@@ -36,6 +36,23 @@ logger = logging.getLogger(__name__)
 # the x-ms-continuationtoken response header for pagination.
 ADO_WIKI_PAGES_BATCH_LOCATION_ID = "71323c46-2592-4398-8771-ced73dd87207"
 
+# ADO Wiki inserts every attachment (images and non-image documents alike) using
+# image-markdown syntax `![name](/.attachments/<guid>.<ext>)`. Only URLs whose
+# extension is in this allow-list are treated as images by `_process_images`;
+# everything else is left untouched and handled by the `include_attachments`
+# dependent-doc path with its real extension.
+_IMAGE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tiff", ".tif", ".ico",
+)
+
+
+def _url_has_image_extension(url: str) -> bool:
+    """Return True if the URL path ends with a known image extension."""
+    if not url:
+        return False
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    return path.lower().endswith(_IMAGE_EXTENSIONS)
+
 GetWikiInput = create_model(
     "GetWikiInput",
     wiki_identified=(Optional[str], Field(default=None, description="Wiki ID or wiki name. If not provided, uses the default wiki identifier from toolkit configuration."))
@@ -554,6 +571,17 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 logger.warning(f"Skipping image '{image_name}': empty URL, leaving original markdown unchanged.")
                 return image_name, image_url, None
             if image_url.startswith("/.attachments/"):
+                # ADO Wiki uses image-markdown syntax for every attachment type
+                # (PDF, DOCX, ...), not just real images. Only treat this as an
+                # image if the URL extension is a known image type; otherwise
+                # leave the markdown untouched and let the `include_attachments`
+                # dependent-doc path handle it with the real extension.
+                if not _url_has_image_extension(image_url):
+                    logger.debug(
+                        f"Skipping non-image attachment '{image_name}' -> '{image_url}' in image processing; "
+                        f"will be handled by include_attachments path."
+                    )
+                    return image_name, image_url, None
                 try:
                     if repos_wrapper is None:
                         raise Exception("Repos wrapper not initialized")
@@ -566,6 +594,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error parsing attachment '{image_url}': {str(e)}"
+                    )
+                    return image_name, image_url, None
+                if isinstance(description, ToolException):
+                    logger.warning(
+                        f"Skipping image '{image_name}': attachment parser returned error for '{image_url}': "
+                        f"{str(description)}"
                     )
                     return image_name, image_url, None
             else:
@@ -582,6 +616,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error fetching external image '{image_url}': {str(e)}"
+                    )
+                    return image_name, image_url, None
+                if isinstance(description, ToolException):
+                    logger.warning(
+                        f"Skipping image '{image_name}': image parser returned error for '{image_url}': "
+                        f"{str(description)}"
                     )
                     return image_name, image_url, None
             return image_name, image_url, description
