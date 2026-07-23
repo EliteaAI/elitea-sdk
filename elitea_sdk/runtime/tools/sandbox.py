@@ -88,23 +88,15 @@ _DEFAULT_MEMORY_PRESSURE_PCT = 85
 _MIN_WASM_MEM_MB = 64  # below this Pyodide may fail to boot
 
 
-def _read_sandbox_limits_from_env() -> Dict[str, Any]:
-    """Resolve the sandbox resource limits and TLS-trust overrides from the env.
+def _read_sandbox_limits_from_env() -> Dict[str, Union[int, float]]:
+    """Resolve the four sandbox resource limits from the environment.
 
     Returns a dict: timeout_seconds, wasm_max_mem_mb, max_concurrent,
-    memory_pressure_pct, root_ca_path, allowed_pyodide_domains. A malformed
-    numeric value logs a warning and falls back to the safe default, so a bad
-    config can never produce an unlimited sandbox.
+    memory_pressure_pct. A malformed value logs a warning and falls back to the
+    safe default, so a bad config can never produce an unlimited sandbox.
 
     max_concurrent == 0      -> concurrency gate disabled
     memory_pressure_pct == 0 -> pressure gate disabled
-
-    TLS trust (both default OFF; absent config never weakens TLS):
-      PYODIDE_ROOT_CA_PATH  -> secure custom root CA, passed to deno as --cert.
-      ALLOWED_PYODIDE_DOMAINS -> unsafe fallback: comma-separated hosts that
-        bypass cert validation via --unsafely-ignore-certificate-errors, used
-        only when PYODIDE_ROOT_CA_PATH is unset. Precedence is resolved
-        downstream in BasePyodideSandbox._build_command().
     """
     def _num(env_name, default, cast, lo=None, hi=None):
         raw = os.environ.get(env_name)
@@ -126,30 +118,11 @@ def _read_sandbox_limits_from_env() -> Dict[str, Any]:
     # 0 is a valid "off" value for the gates, so allow it explicitly (lo=0).
     max_concurrent = _num("SANDBOX_MAX_CONCURRENT", _DEFAULT_MAX_CONCURRENT, int, lo=0)
     memory_pressure_pct = _num("SANDBOX_MEMORY_PRESSURE_PCT", _DEFAULT_MEMORY_PRESSURE_PCT, int, lo=0, hi=99)
-
-    # TLS trust overrides for sandbox outbound HTTPS. Both default to "off"
-    # (empty string -> None / empty list); absent config never weakens TLS.
-    root_ca_path = (os.environ.get("PYODIDE_ROOT_CA_PATH") or "").strip() or None
-    allowed_domains_raw = os.environ.get("ALLOWED_PYODIDE_DOMAINS") or ""
-    allowed_pyodide_domains = [d.strip() for d in allowed_domains_raw.split(",") if d.strip()]
-
-    # --cert wins over the unsafe bypass (see _build_command). If an operator
-    # sets both, the domain bypass is silently ignored — warn so the effective
-    # behavior is discoverable from logs, matching the gate-fallback logging above.
-    if root_ca_path and allowed_pyodide_domains:
-        logger.warning(
-            "Both PYODIDE_ROOT_CA_PATH and ALLOWED_PYODIDE_DOMAINS are set; "
-            "using the secure --cert path and ignoring ALLOWED_PYODIDE_DOMAINS (%r).",
-            allowed_pyodide_domains,
-        )
-
     return {
         "timeout_seconds": timeout_seconds,
         "wasm_max_mem_mb": wasm_max_mem_mb,
         "max_concurrent": max_concurrent,
         "memory_pressure_pct": memory_pressure_pct,
-        "root_ca_path": root_ca_path,
-        "allowed_pyodide_domains": allowed_pyodide_domains,
     }
 
 
@@ -458,12 +431,6 @@ class PyodideSandboxTool(BaseTool):
                 session_metadata=self.session_metadata,
                 timeout_seconds=limits["timeout_seconds"],
                 memory_limit_mb=limits["wasm_max_mem_mb"],
-                # .get() (not [...]) is deliberate: instances built via
-                # model_construct() may carry a stale _sandbox_limits dict from
-                # before these keys existed; default None preserves today's
-                # no-TLS-override behavior instead of raising KeyError.
-                root_ca_path=limits.get("root_ca_path"),
-                insecure_tls_domains=limits.get("allowed_pyodide_domains"),
             )
 
             # Update session state for stateful execution
