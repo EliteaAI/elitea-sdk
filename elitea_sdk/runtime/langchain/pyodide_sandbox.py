@@ -129,6 +129,8 @@ class BasePyodideSandbox:
         session_bytes: bytes | None = None,
         session_metadata: dict | None = None,
         memory_limit_mb: int | None = None,
+        root_ca_path: str | None = None,
+        insecure_tls_domains: list[str] | None = None,
     ) -> list[str]:
         """Build the Deno command with appropriate flags."""
         cmd = [
@@ -161,6 +163,21 @@ class BasePyodideSandbox:
             wasm_pages = int(memory_limit_mb) * 16
             cmd.append(f"--v8-flags=--wasm-max-mem-pages={wasm_pages}")
 
+        # TLS trust override for outbound sandbox HTTPS calls (both default off,
+        # so when neither is configured this block appends nothing and the
+        # command is byte-for-byte unchanged). --cert (a custom root CA) is the
+        # secure option and always wins when set; Deno reads the PEM in its own
+        # runtime, so it needs NO --allow-read on the CA file. The per-domain
+        # bypass is the fallback used only when no CA path is set, and only for
+        # the whitelisted hosts — it never disables validation globally. The two
+        # are mutually exclusive by construction.
+        if root_ca_path:
+            cmd.append(f"--cert={root_ca_path}")
+        elif insecure_tls_domains:
+            cmd.append(
+                f"--unsafely-ignore-certificate-errors={','.join(insecure_tls_domains)}"
+            )
+
         # Add the package and code
         cmd.extend([self.pkg_name, "-c", code])
 
@@ -190,6 +207,8 @@ class PyodideSandbox(BasePyodideSandbox):
         session_metadata: dict | None = None,
         timeout_seconds: float | None = None,
         memory_limit_mb: int | None = None,
+        root_ca_path: str | None = None,
+        insecure_tls_domains: list[str] | None = None,
     ) -> CodeExecutionResult:
         """Execute Python code asynchronously in a sandboxed Deno subprocess."""
         start_time = time.time()
@@ -203,6 +222,8 @@ class PyodideSandbox(BasePyodideSandbox):
             session_bytes=session_bytes,
             session_metadata=session_metadata,
             memory_limit_mb=memory_limit_mb,
+            root_ca_path=root_ca_path,
+            insecure_tls_domains=insecure_tls_domains,
         )
 
         process = await asyncio.create_subprocess_exec(
@@ -264,6 +285,8 @@ class SyncPyodideSandbox(BasePyodideSandbox):
         session_metadata: dict | None = None,
         timeout_seconds: float | None = None,
         memory_limit_mb: int | None = None,
+        root_ca_path: str | None = None,
+        insecure_tls_domains: list[str] | None = None,
     ) -> CodeExecutionResult:
         """Execute Python code synchronously in a sandboxed Deno subprocess."""
         start_time = time.time()
@@ -277,6 +300,8 @@ class SyncPyodideSandbox(BasePyodideSandbox):
             session_bytes=session_bytes,
             session_metadata=session_metadata,
             memory_limit_mb=memory_limit_mb,
+            root_ca_path=root_ca_path,
+            insecure_tls_domains=insecure_tls_domains,
         )
 
         try:
