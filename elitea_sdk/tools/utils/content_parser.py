@@ -338,11 +338,16 @@ def _load_content_from_bytes_with_prompt(file_content: bytes, extension: str = N
             os.remove(temp_file_path)
 
 
-def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None) \
+def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None, image_cache=None) \
         -> Generator[Document, None, None]:
-    """Process the content of a file based on its type using a configured loader cosidering the origin document."""
+    """Process the content of a file based on its type using a configured loader cosidering the origin document.
+
+    ``image_cache`` is threaded through to :func:`process_content_by_type` so that
+    image-carrying loaders (raster images, PDFs with embedded pictures, etc.) can
+    share a per-toolkit LRU across every document processed in an indexing run.
+    """
     try:
-        chunks = process_content_by_type(content, extension_source, llm, chunking_config)
+        chunks = process_content_by_type(content, extension_source, llm, chunking_config, image_cache=image_cache)
         chunks_counter = 0
         for chunk in chunks:
             chunks_counter += 1
