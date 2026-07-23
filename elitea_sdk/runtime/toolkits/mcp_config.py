@@ -175,7 +175,13 @@ class McpStdioSessionManager:
             'args': server_config.get('args', [])
         }
 
-        env = server_config.get('env', {})
+        # Layer CA env for child processes (Node/Deno) UNDER the user's config so an
+        # explicit server env value always wins. Unlike the other stdio spawn sites,
+        # this path does NOT copy os.environ, so the CA vars must be merged in here.
+        # The MCP SDK supplies PATH/HOME/etc via get_default_environment(), so passing
+        # only these keys is not a sparse-env regression.
+        from elitea_sdk._system_ca import get_child_process_ca_env
+        env = {**get_child_process_ca_env(), **server_config.get('env', {})}
         if env:
             mcp_config['env'] = env
 
