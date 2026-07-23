@@ -59,6 +59,47 @@ def _cache_token(cache_key: str, token: str, expires_in: Optional[int]) -> None:
         _oauth_token_cache[cache_key] = (token, expires_at)
 
 
+def _is_masked_secret(value: Optional[str]) -> bool:
+    """True if the value looks like a SecretStr masking artifact ('**********').
+
+    A non-empty string composed entirely of asterisks is the signature of a
+    SecretStr that was serialized via model_dump(mode='json') before reaching
+    the OAuth call (the root cause of #5956) — not a real credential.
+    """
+    return isinstance(value, str) and len(value) > 0 and set(value) == {'*'}
+
+
+def _log_oauth_token_failure(
+    error_msg: str,
+    client_secret: Optional[str],
+    token_url: str,
+    method: str,
+) -> None:
+    """Log an OAuth client_credentials token-exchange failure at ERROR level.
+
+    Logs the failure reason plus whether the client_secret arrived masked
+    (all-asterisk placeholder) or as a real value. The raw secret is never
+    logged — only the masked/not-masked signature — so this is safe to leave on
+    in any environment while still pinpointing the #5956 masking bug from logs.
+    """
+    token_domain = urlparse(token_url).netloc or 'unknown'
+    if _is_masked_secret(client_secret):
+        logger.error(
+            "OAuth client_credentials token exchange failed for %s (method=%s): %s. "
+            "client_secret was MASKED ('**********') before reaching the OAuth call "
+            "— this is a config-serialization bug (SecretStr masked by "
+            "model_dump(mode='json'), see #5956), not a wrong/expired credential.",
+            token_domain, method, error_msg,
+        )
+    else:
+        logger.error(
+            "OAuth client_credentials token exchange failed for %s (method=%s): %s. "
+            "client_secret was a real (non-masked) value, so the credential itself "
+            "or the token endpoint is likely at fault.",
+            token_domain, method, error_msg,
+        )
+
+
 def _obtain_oauth_token(
     client_id: str,
     client_secret: str,
@@ -123,18 +164,22 @@ def _obtain_oauth_token(
                 token_data = response.json()
                 access_token = token_data.get('access_token')
                 if not access_token:
-                    return None, "OAuth response did not contain 'access_token'"
-                
+                    err = "OAuth response did not contain 'access_token'"
+                    _log_oauth_token_failure(err, client_secret, token_url, method)
+                    return None, err
+
                 # Cache the token
                 cache_key = _get_oauth_cache_key(client_id, token_url, scope)
                 expires_in = token_data.get('expires_in')
                 _cache_token(cache_key, access_token, expires_in)
-                
+
                 logger.debug(f"OAuth token obtained successfully (expires_in: {expires_in})")
                 return access_token, None
             except json.JSONDecodeError as e:
-                return None, f"Failed to parse OAuth token response as JSON: {e}"
-        
+                err = f"Failed to parse OAuth token response as JSON: {e}"
+                _log_oauth_token_failure(err, client_secret, token_url, method)
+                return None, err
+
         # Handle error responses
         error_msg = f"OAuth token request failed with status {response.status_code}"
         try:
@@ -146,17 +191,26 @@ def _obtain_oauth_token(
         except Exception:
             if response.text:
                 error_msg = f"{error_msg}: {response.text[:500]}"
-        
+
+        _log_oauth_token_failure(error_msg, client_secret, token_url, method)
         return None, error_msg
-        
+
     except requests.exceptions.Timeout:
-        return None, f"OAuth token request to {token_url} timed out"
+        err = f"OAuth token request to {token_url} timed out"
+        _log_oauth_token_failure(err, client_secret, token_url, method)
+        return None, err
     except requests.exceptions.ConnectionError as e:
-        return None, f"Failed to connect to OAuth token endpoint {token_url}: {e}"
+        err = f"Failed to connect to OAuth token endpoint {token_url}: {e}"
+        _log_oauth_token_failure(err, client_secret, token_url, method)
+        return None, err
     except requests.exceptions.RequestException as e:
-        return None, f"OAuth token request failed: {e}"
+        err = f"OAuth token request failed: {e}"
+        _log_oauth_token_failure(err, client_secret, token_url, method)
+        return None, err
     except Exception as e:
-        return None, f"Unexpected error during OAuth token exchange: {e}"
+        err = f"Unexpected error during OAuth token exchange: {e}"
+        _log_oauth_token_failure(err, client_secret, token_url, method)
+        return None, err
 
 
 def _secret_to_str(value: Any) -> Optional[str]:
@@ -243,7 +297,13 @@ def get_toolkit_available_tools(settings: dict) -> dict:
     # Extract and merge openapi_configuration if present (same pattern as get_toolkit)
     openapi_configuration = settings.get('openapi_configuration') or {}
     if hasattr(openapi_configuration, 'model_dump'):
-        openapi_configuration = openapi_configuration.model_dump(mode='json')
+        # IMPORTANT: never use mode='json' here. It serializes SecretStr fields
+        # (client_secret, api_key) to the literal masked string '**********',
+        # irrecoverably destroying the real value before OAuth token exchange /
+        # API-key auth can use it (see #5956). Default mode='python' keeps them
+        # as live SecretStr instances; _secret_to_str()/get_secret_value()
+        # unwrap them later, right before use.
+        openapi_configuration = openapi_configuration.model_dump()
     if not isinstance(openapi_configuration, dict):
         openapi_configuration = {}
 
@@ -385,7 +445,9 @@ class EliteAOpenAPIToolkit(BaseToolkit):
 
         openapi_configuration = kwargs.get('openapi_configuration') or {}
         if hasattr(openapi_configuration, 'model_dump'):
-            openapi_configuration = openapi_configuration.model_dump(mode='json')
+            # See get_toolkit_available_tools() above: mode='json' would mask
+            # client_secret/api_key to '**********' and break OAuth (#5956).
+            openapi_configuration = openapi_configuration.model_dump()
         if not isinstance(openapi_configuration, dict):
             openapi_configuration = {}
 
@@ -473,9 +535,12 @@ def _build_headers_from_settings(settings: Dict[str, Any]) -> Dict[str, str]:
         logger.debug("Using OAuth Bearer token for authentication")
         return headers
     elif oauth_error:
-        # OAuth was configured but failed - log the error
-        # We'll still try API key auth as fallback
-        logger.warning(f"OAuth token exchange failed: {oauth_error}")
+        # OAuth was configured but failed. This is a hard failure of the primary
+        # auth strategy, not routine noise — log at ERROR. Detailed root cause
+        # (including whether the secret arrived masked, per #5956) is already
+        # logged by _log_oauth_token_failure() closer to the token request.
+        # We still fall through and try API key auth as a fallback.
+        logger.error(f"OAuth token exchange failed: {oauth_error}")
 
     # Legacy structure used by the custom OpenAPI UI
     auth = settings.get('authentication')
