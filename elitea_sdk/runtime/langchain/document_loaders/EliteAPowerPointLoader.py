@@ -282,7 +282,7 @@ class EliteAPowerPointLoader:
                             caption = perform_llm_prediction_for_image_bytes(
                                 image_blob, self.llm, self.prompt,
                                 cache=self.image_cache,
-                                image_name=f"{source}#slide{index}#img{img_index}",
+                                image_name=source,
                             )
                             img_index += 1
                             text_content += "\n**Image Transcript:**\n" + caption + "\n--------------------\n"

@@ -1,8 +1,11 @@
 """Unit tests for ImageDescriptionCache and perform_llm_prediction_for_image_bytes.
 
 Covers issue #5844: per-toolkit-instance LRU cache for LLM-generated image
-descriptions, keyed on md5(bytes) + image_name + md5(prompt). Also verifies
-the shared helper wired through the loaders honours the cache.
+descriptions, keyed on md5(bytes) + md5(prompt). ``image_name`` is accepted
+by the API for logging context only and is intentionally NOT part of the
+key, so that identical bytes referenced from different positions (repeated
+logos, reused assets across documents) hit the cache. Also verifies the
+shared helper wired through the loaders honours the cache.
 """
 
 import importlib
@@ -74,11 +77,15 @@ class TestImageDescriptionCache:
         assert cache.get(b"data", image_name="pic", prompt="promptB") is None
         assert cache.get(b"data", image_name="pic", prompt="promptA") == "desc-A"
 
-    def test_image_name_is_part_of_key(self, monkeypatch):
+    def test_image_name_is_NOT_part_of_key(self, monkeypatch):
+        # Same bytes + prompt should hit regardless of image_name — this is
+        # what enables cross-doc / cross-position dedup (e.g. a company logo
+        # repeated on every slide or reused across documents).
         module = _reload_cache_module(monkeypatch)
         cache = module.ImageDescriptionCache()
         cache.set(b"data", "for-a", image_name="a", prompt="p")
-        assert cache.get(b"data", image_name="b", prompt="p") is None
+        assert cache.get(b"data", image_name="b", prompt="p") == "for-a"
+        assert cache.get(b"data", image_name="", prompt="p") == "for-a"
 
     def test_lru_evicts_least_recently_used(self, monkeypatch):
         module = _reload_cache_module(monkeypatch)

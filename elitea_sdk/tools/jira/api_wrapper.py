@@ -1378,13 +1378,15 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                     "LLM is required for image processing but is not configured in this toolkit instance."
                 )
 
-            # Validate the image with PIL and normalise to a consistent format
+            # Validate the input image (raise on unidentifiable bytes) so we
+            # return a caller-friendly error instead of failing inside the LLM
+            # payload builder. Normalisation happens in image_to_byte_array,
+            # which always emits PNG bytes.
             try:
                 bio = BytesIO(image_data)
                 bio.seek(0)
                 image = Image.open(bio)
                 image.load()
-                image_format = image.format.lower() if image.format else "png"
             except UnidentifiedImageError:
                 logger.warning(f"PIL cannot identify the image format for {image_name}")
                 return f"[Could not identify image format for {image_name}]"
@@ -1410,7 +1412,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
             return perform_llm_prediction_for_image_bytes(
                 byte_array, llm, prompt,
-                image_format=image_format,
+                image_format="png",
                 cache=self._image_cache,
                 image_name=image_name,
             )

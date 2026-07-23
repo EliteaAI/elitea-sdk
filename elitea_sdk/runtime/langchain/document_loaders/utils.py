@@ -57,13 +57,13 @@ def perform_llm_prediction_for_image_bytes(
     """Performs LLM prediction for image content.
 
     When a cache is provided, consults it before invoking the LLM and populates
-    it after a successful call. The cache is keyed on the image bytes plus
-    image_name and prompt (see ImageDescriptionCache).
+    it after a successful call. The cache is keyed on md5(image bytes) + md5(prompt)
+    (see ImageDescriptionCache). ``image_name`` is used only for log context.
     """
     if cache is not None:
         cached = cache.get(image_bytes, image_name=image_name, prompt=prompt)
         if cached is not None:
-            logger.debug("Image description cache hit for '%s'", image_name or "<unnamed>")
+            logger.info("Image description cache hit for '%s'", image_name or "<unnamed>")
             return cached
     base64_string = bytes_to_base64(image_bytes)
     result = llm.invoke([

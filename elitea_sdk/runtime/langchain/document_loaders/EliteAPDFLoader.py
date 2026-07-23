@@ -152,12 +152,11 @@ class EliteAPDFLoader:
                 base_image = report.extract_image(xref)
                 img_bytes = base_image["image"]
                 image_format = base_image.get("ext", "png")
-                image_name = f"{source}#page{index}#img{i}"
                 text_content += "\n**Image Transcript:**\n" + perform_llm_prediction_for_image_bytes(
                     img_bytes, self.llm, self.prompt,
                     image_format=image_format,
                     cache=self.image_cache,
-                    image_name=image_name,
+                    image_name=source,
                 )  + "\n--------------------\n"
         return text_content
 

@@ -24,6 +24,7 @@ from elitea_sdk.tools.utils.available_tools_decorator import extend_with_parent_
 from ..llm.img_utils import ImageDescriptionCache
 from ..utils import is_cookie_token, parse_cookie_string
 from ...runtime.langchain.document_loaders.utils import perform_llm_prediction_for_image_bytes
+from ...runtime.langchain.utils import extract_text_from_completion
 from ...configurations.utils import _resolve_confluence_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
@@ -1526,18 +1527,20 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 result = llm.invoke([
                     HumanMessage(content=[{"type": "text", "text": prompt}])
                 ])
-                return result.content
+                return extract_text_from_completion(result)
 
             from PIL import Image, UnidentifiedImageError
             from .utils import image_to_byte_array
 
-            # Validate the image with PIL and normalise to a consistent format
+            # Validate the input image (raise on unidentifiable bytes) so we
+            # return a caller-friendly error instead of failing inside the LLM
+            # payload builder. Normalisation happens in image_to_byte_array,
+            # which always emits PNG bytes.
             try:
                 bio = BytesIO(image_data)
                 bio.seek(0)
                 image = Image.open(bio)
                 image.load()
-                image_format = image.format.lower() if image.format else "png"
             except UnidentifiedImageError:
                 logger.warning(f"PIL cannot identify the image format for {image_name}")
                 return f"[Could not identify image format for {image_name}]"
@@ -1553,7 +1556,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
             return perform_llm_prediction_for_image_bytes(
                 byte_array, llm, prompt,
-                image_format=image_format,
+                image_format="png",
                 cache=self._image_cache,
                 image_name=image_name,
             )
