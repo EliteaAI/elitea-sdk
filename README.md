@@ -66,6 +66,45 @@ export ELITEA_ENV_FILE=/path/to/your/.env
 elitea-cli agent chat
 ```
 
+### Enterprise TLS / DLP Environments
+
+By default, most Python HTTP libraries validate TLS certificates against the
+bundled [`certifi`](https://pypi.org/project/certifi/) CA store and ignore the
+operating system trust store. In corporate environments that perform TLS
+inspection (DLP proxies), traffic is re-signed with a private root CA that is
+installed into the **system** trust store — which those libraries would not see,
+causing `CERTIFICATE_VERIFY_FAILED` errors.
+
+To avoid this, the SDK automatically routes TLS verification through the operating
+system trust store via [`truststore`](https://pypi.org/project/truststore/). This
+is enabled by default and requires no configuration — just install your corporate
+root CA into the OS trust store as usual.
+
+**Child processes.** An in-process TLS patch does not cross a process boundary, so
+the SDK also exports CA settings for the subprocesses it spawns — the Deno/Pyodide
+code sandbox and Node-based stdio MCP servers (e.g. `npx @playwright/mcp`):
+
+| Runtime | Linux | macOS / Windows |
+|---------|-------|-----------------|
+| Deno    | `DENO_CERT` → system PEM + `DENO_TLS_CA_STORE=system` | `DENO_TLS_CA_STORE=system` (Deno ≥ 1.36) |
+| Node    | `NODE_EXTRA_CA_CERTS` → system PEM | `NODE_OPTIONS=--use-system-ca` (Node ≥ 22.15 only) |
+
+If `SSL_CERT_FILE` is set and points at a PEM bundle, that file takes precedence and
+is propagated to every runtime on all platforms.
+
+To disable all of this (fall back to the `certifi` bundle, set nothing for
+subprocesses), set:
+
+```bash
+export ELITEA_DISABLE_SYSTEM_CA=1
+```
+
+**Known limitations.** On **macOS/Windows with Node < 22.15**, Node's system-store
+flag is unavailable and the OS roots cannot be exported as a file — set
+`SSL_CERT_FILE` to a PEM containing your org root CA to cover that case. On minimal
+Linux images without `ca-certificates` installed, also set `SSL_CERT_FILE`. For Git
+operations (dulwich/paramiko), `SSL_CERT_FILE` is likewise honored.
+
 Using the CLI for Interactive Chat
 ----------------------------------
 
