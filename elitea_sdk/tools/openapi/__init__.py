@@ -50,11 +50,29 @@ def _get_cached_token(cache_key: str) -> Optional[str]:
         return token
 
 
-def _cache_token(cache_key: str, token: str, expires_in: Optional[int]) -> None:
+def _coerce_expires_in(expires_in: Any) -> float:
+    """Coerce an OAuth ``expires_in`` value to a positive number of seconds.
+
+    Providers disagree on the JSON type of ``expires_in``: the OAuth2 spec
+    (RFC 6749 §5.1) says it's a number, but Microsoft's token endpoints return
+    it as a *string* (e.g. "3600"). Doing ``time.time() + expires_in`` on a str
+    raised ``unsupported operand type(s) for +: 'float' and 'str'`` (#5956).
+
+    A valid int/float is preserved exactly (``float(3600) == 3600.0``); a
+    numeric string is parsed; anything missing, non-numeric, or non-positive
+    falls back to 1 hour.
+    """
+    try:
+        seconds = float(expires_in)
+    except (TypeError, ValueError):
+        return 3600.0
+    # Guard against 0 / negative / NaN — treat as "not provided".
+    return seconds if seconds > 0 else 3600.0
+
+
+def _cache_token(cache_key: str, token: str, expires_in: Optional[Any]) -> None:
     """Cache a token with its expiry time. Thread-safe."""
-    # Default to 1 hour if expires_in not provided
-    expires_in = expires_in or 3600
-    expires_at = time.time() + expires_in
+    expires_at = time.time() + _coerce_expires_in(expires_in)
     with _oauth_token_cache_lock:
         _oauth_token_cache[cache_key] = (token, expires_at)
 
