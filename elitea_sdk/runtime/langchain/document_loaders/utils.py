@@ -7,6 +7,7 @@ from PIL import Image
 
 from ..tools.utils import bytes_to_base64
 from ..utils import extract_text_from_completion
+from .image_cache import ImageDescriptionCache
 from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
@@ -45,8 +46,25 @@ def cleanse_data(document: str) -> str:
 
     return document
 
-def perform_llm_prediction_for_image_bytes(image_bytes: bytes, llm, prompt: str) -> str:
-    """Performs LLM prediction for image content."""
+def perform_llm_prediction_for_image_bytes(
+    image_bytes: bytes,
+    llm,
+    prompt: str,
+    image_format: str = "png",
+    cache: "ImageDescriptionCache | None" = None,
+    image_name: str = "",
+) -> str:
+    """Performs LLM prediction for image content.
+
+    When a cache is provided, consults it before invoking the LLM and populates
+    it after a successful call. The cache is keyed on md5(image bytes) + md5(prompt)
+    (see ImageDescriptionCache). ``image_name`` is used only for log context.
+    """
+    if cache is not None:
+        cached = cache.get(image_bytes, image_name=image_name, prompt=prompt)
+        if cached is not None:
+            logger.info("Image description cache hit for '%s'", image_name or "<unnamed>")
+            return cached
     base64_string = bytes_to_base64(image_bytes)
     result = llm.invoke([
         HumanMessage(
@@ -54,12 +72,15 @@ def perform_llm_prediction_for_image_bytes(image_bytes: bytes, llm, prompt: str)
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{base64_string}"},
+                    "image_url": {"url": f"data:image/{image_format};base64,{base64_string}"},
                 },
             ]
         )
     ])
-    return extract_text_from_completion(result)
+    description = extract_text_from_completion(result)
+    if cache is not None and description:
+        cache.set(image_bytes, description, image_name=image_name, prompt=prompt)
+    return description
 
 
 def ensure_min_image_size(image: Image.Image, min_dim: int = MIN_IMAGE_DIMENSION_FOR_LLM):

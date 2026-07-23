@@ -22,6 +22,7 @@ from pydantic.fields import Field
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import get_file_bytes_from_artifact, detect_mime_type
 from ...utils.content_parser import parse_file_content
+from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ....runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     _core_client: Optional[CoreClient] = PrivateAttr() # Add CoreClient instance
     _relation_types: Dict = PrivateAttr(default_factory=dict) # track actual relation types for instance
     _work_item_type_fields_cache: Dict[str, Dict] = PrivateAttr(default_factory=dict)  # Cache for work item type field definitions
+    _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=ImageDescriptionCache)
 
     class Config:
         arbitrary_types_allowed = True  # Allow arbitrary types (e.g., WorkItemTrackingClient, WikiClient, CoreClient)
@@ -485,7 +487,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     def parse_attachment_by_id(self, attachment_id, file_name, image_description_prompt):
         file_content = self.get_attachment_content(attachment_id)
         return parse_file_content(file_content=file_content, file_name=file_name,
-                                            llm=self.llm, prompt=image_description_prompt)
+                                            llm=self.llm, prompt=image_description_prompt,
+                                            image_cache=self._image_cache)
 
     def get_work_item(self, id: int, fields: Optional[list[str]] = None, as_of: Optional[str] = None, expand: Optional[str] = None, parse_attachments=False, image_description_prompt=None, process_images: bool = True):
         """Get a single work item by ID."""

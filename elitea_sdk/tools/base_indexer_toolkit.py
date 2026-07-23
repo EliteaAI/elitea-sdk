@@ -663,7 +663,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     process_document_by_type(
                         document=document,
                         content=content,
-                        extension_source=content_type, llm=self.llm, chunking_config=local_config),
+                        extension_source=content_type, llm=self.llm, chunking_config=local_config,
+                        image_cache=getattr(self, "_image_cache", None)),
                     source_name=content_type
                 ))
             if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
@@ -684,7 +685,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     process_document_by_type(
                         document=document,
                         content=content_in_bytes,
-                        extension_source=content_type, llm=self.llm, chunking_config=local_config),
+                        extension_source=content_type, llm=self.llm, chunking_config=local_config,
+                        image_cache=getattr(self, "_image_cache", None)),
                     source_name=source_name
                 ))
             if chunking_tool:

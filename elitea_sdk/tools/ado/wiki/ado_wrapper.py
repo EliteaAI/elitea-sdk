@@ -26,6 +26,7 @@ from ..repos import ReposApiWrapper
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.content_parser import parse_file_content
+from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ....runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     default_wiki_identifier: Optional[str] = None
     _client: Optional[WikiClient] = PrivateAttr()  # Private attribute for the wiki client
     _core_client: Optional[CoreClient] = PrivateAttr()  # Private attribute for the CoreClient client
+    _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=ImageDescriptionCache)
 
     class Config:
         arbitrary_types_allowed = True  # Allow arbitrary types (e.g., WorkItemTrackingClient)
@@ -612,6 +614,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                         file_name="image.png",
                         llm=self.llm,
                         prompt=image_description_prompt,
+                        image_cache=self._image_cache,
                     )
                 except Exception as e:
                     logger.warning(
@@ -661,7 +664,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             file_content=attachment_content,
             file_name=attachment_name,
             llm=self.llm,
-            prompt=image_description_prompt
+            prompt=image_description_prompt,
+            image_cache=self._image_cache,
         )
 
     def delete_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None):

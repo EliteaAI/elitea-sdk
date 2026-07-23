@@ -10,6 +10,7 @@ from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.content_parser import parse_file_content
+from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, guard_nontext_read, capped_read_multiple_files
 from .utils import get_position
@@ -127,6 +128,8 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     branch: Optional[str] = 'main'
     _git: Any = PrivateAttr()
     _active_branch: Any = PrivateAttr()
+    # Per-wrapper LRU cache for image → LLM-description dedup (see #5844).
+    _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=ImageDescriptionCache)
     
     # Import file operation methods from BaseCodeToolApiWrapper
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
@@ -271,7 +274,8 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         file = self.repo_instance.files.get(file_path, branch)
         return str(parse_file_content(file_name=file_path,
                                       file_content=file.decode(),
-                                      llm=self.llm))
+                                      llm=self.llm,
+                                      image_cache=self._image_cache))
 
     def create_branch(self, branch_name: str) -> str:
         try:
@@ -464,7 +468,8 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         file = self.repo_instance.files.get(file_path, branch)
         full_content = parse_file_content(file_name=file_path,
                                           file_content=file.decode(),
-                                          llm=self.llm)
+                                          llm=self.llm,
+                                          image_cache=self._image_cache)
 
         requested = (
             f"start_line={start_line}, end_line={end_line}"

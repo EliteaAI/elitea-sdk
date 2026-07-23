@@ -23,6 +23,8 @@ from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from elitea_sdk.tools.utils.available_tools_decorator import extend_with_parent_available_tools
 from ..llm.img_utils import ImageDescriptionCache
 from ..utils import is_cookie_token, parse_cookie_string
+from ...runtime.langchain.document_loaders.utils import perform_llm_prediction_for_image_bytes
+from ...runtime.langchain.utils import extract_text_from_completion
 from ...configurations.utils import _resolve_confluence_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
@@ -1501,48 +1503,44 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         Returns:
             Generated description from the LLM
         """
-        # Check cache first to avoid redundant processing
-        cached_description = self._image_cache.get(image_data, image_name)
-        if cached_description:
-            logger.info(f"Using cached description for image: {image_name}")
-            return cached_description
-
         try:
             # Get the LLM instance
             llm = self.llm
             if not llm:
                 return "[LLM not available for image processing]"
 
-            # If image_data is empty or None, do text-only analysis
-            if not image_data:
-                prompt = custom_prompt if custom_prompt else self._get_default_image_analysis_prompt()
-                if image_name or context_text:
-                    prompt += "\n\n## Additional Context Information:\n"
-                    if image_name:
-                        prompt += f"- Image Name/Reference: {image_name}\n"
-                    if context_text:
-                        prompt += f"- Surrounding Content: {context_text}\n"
-                    prompt += "\nPlease incorporate this contextual information in your description when relevant."
-                result = llm.invoke([
-                    HumanMessage(
-                        content=[{"type": "text", "text": prompt}]
-                    )
-                ])
-                description = result.content
-                self._image_cache.set(image_data, description, image_name)
-                return description
+            # Build prompt (with any contextual augmentation) — used by both text-only
+            # and image branches below.
+            prompt = custom_prompt if custom_prompt else self._get_default_image_analysis_prompt()
+            if image_name or context_text:
+                prompt += "\n\n## Additional Context Information:\n"
+                if image_name:
+                    prompt += f"- Image Name/Reference: {image_name}\n"
+                if context_text:
+                    prompt += f"- Surrounding Content: {context_text}\n"
+                prompt += "\nPlease incorporate this contextual information in your description when relevant."
 
-            from io import BytesIO
+            # Text-only analysis when there is no image payload. The shared helper is
+            # image-oriented and the byte-hash cache no-ops on empty input, so run
+            # this path directly.
+            if not image_data:
+                result = llm.invoke([
+                    HumanMessage(content=[{"type": "text", "text": prompt}])
+                ])
+                return extract_text_from_completion(result)
+
             from PIL import Image, UnidentifiedImageError
-            # Try to load and validate the image with PIL
+            from .utils import image_to_byte_array
+
+            # Validate the input image (raise on unidentifiable bytes) so we
+            # return a caller-friendly error instead of failing inside the LLM
+            # payload builder. Normalisation happens in image_to_byte_array,
+            # which always emits PNG bytes.
             try:
                 bio = BytesIO(image_data)
                 bio.seek(0)
                 image = Image.open(bio)
-                # Force load the image to validate it
                 image.load()
-                # Get format directly from PIL
-                image_format = image.format.lower() if image.format else "png"
             except UnidentifiedImageError:
                 logger.warning(f"PIL cannot identify the image format for {image_name}")
                 return f"[Could not identify image format for {image_name}]"
@@ -1551,49 +1549,17 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 return f"[Error loading image {image_name}: {str(img_error)}]"
 
             try:
-                # Convert image to base64
-                buffer = BytesIO()
-                image.save(buffer, format=image_format.upper())
-                buffer.seek(0)
-                base64_string = base64.b64encode(buffer.read()).decode('utf-8')
+                byte_array = image_to_byte_array(image)
             except Exception as conv_error:
                 logger.warning(f"Error converting image {image_name}: {str(conv_error)}")
                 return f"[Error converting image {image_name}: {str(conv_error)}]"
 
-            # Use default or custom prompt
-            prompt = custom_prompt if custom_prompt else self._get_default_image_analysis_prompt()
-
-            # Add context information if available
-            if image_name or context_text:
-                prompt += "\n\n## Additional Context Information:\n"
-
-                if image_name:
-                    prompt += f"- Image Name/Reference: {image_name}\n"
-
-                if context_text:
-                    prompt += f"- Surrounding Content: {context_text}\n"
-
-                prompt += "\nPlease incorporate this contextual information in your description when relevant."
-
-            # Perform LLM invocation with image
-            result = llm.invoke([
-                HumanMessage(
-                    content=[
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/{image_format};base64,{base64_string}"},
-                        },
-                    ]
-                )
-            ])
-
-            description = result.content
-
-            # Cache the result for future use
-            self._image_cache.set(image_data, description, image_name)
-
-            return description
+            return perform_llm_prediction_for_image_bytes(
+                byte_array, llm, prompt,
+                image_format="png",
+                cache=self._image_cache,
+                image_name=image_name,
+            )
         except Exception as e:
             logger.error(f"Error processing image with LLM: {str(e)}")
             return f"[Image processing error: {str(e)}]"

@@ -26,7 +26,8 @@ from langchain_core.tools import ToolException
 
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
-from ..utils.content_parser import parse_file_content
+from ..utils.content_parser import parse_file_content, parse_content_from_bytes
+from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ..utils.http_utils import (
     stream_download_to_tempfile,
@@ -89,6 +90,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         self.__site_id: Optional[str] = None
         self.__drive_id: Optional[str] = None
         self.__drives_cache: Optional[List[dict]] = None
+        # Per-wrapper LRU cache for image → LLM-description dedup. Same bytes
+        # (e.g. a logo repeated across pages or a screenshot embedded in many
+        # attachments) reuse the prior description within this wrapper instance.
+        self._image_cache = ImageDescriptionCache()
 
     # ------------------------------------------------------------------ #
     #  Low-level HTTP helpers                                              #
@@ -800,6 +805,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 sheet_name=sheet_name,
                 excel_by_sheets=excel_by_sheets,
                 llm=self.llm,
+                image_cache=self._image_cache,
             )
             if isinstance(result, ToolException):
                 logging.error(
@@ -1315,6 +1321,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 content_type=att_resp.headers.get("Content-Type", ""),
                 is_capture_image=capture_images,
                 llm=self.llm,
+                image_cache=self._image_cache,
             )
 
         except ToolException:
@@ -1434,6 +1441,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     file_content=img_bytes,
                     is_capture_image=True,
                     llm=self.llm,
+                    image_cache=self._image_cache,
                 )
                 if isinstance(result, str) and result.strip():
                     description = f"[image description: {result.strip()}]"
@@ -2146,7 +2154,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 try:
                     result = parse_file_content(
                         file_path=temp_path, llm=self.llm,
-                        is_capture_image=is_capture_image
+                        is_capture_image=is_capture_image,
+                        image_cache=self._image_cache,
                     )
                     if isinstance(result, ToolException):
                         raise result
@@ -2187,7 +2196,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         try:
             result = parse_file_content(
                 file_path=temp_path, llm=self.llm,
-                is_capture_image=is_capture_image)
+                is_capture_image=is_capture_image,
+                image_cache=self._image_cache)
             if isinstance(result, ToolException):
                 raise result
             return result

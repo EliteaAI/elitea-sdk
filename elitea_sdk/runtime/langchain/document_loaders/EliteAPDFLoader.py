@@ -69,6 +69,7 @@ class EliteAPDFLoader:
         self.extraction_mode = kwargs.get('extraction_mode', "plain")
         self.extraction_kwargs = kwargs.get('extraction_kwargs', None)
         self.max_tokens = kwargs.get('max_tokens', None)
+        self.image_cache = kwargs.get('image_cache')
 
     def get_content(self):
         if hasattr(self, 'file_path'):
@@ -145,11 +146,18 @@ class EliteAPDFLoader:
 
         if self.extract_images:
             images = page.get_images(full=True)
+            source = getattr(self, 'file_path', None) or 'pdf'
             for i, img in enumerate(images):
                 xref = img[0]
                 base_image = report.extract_image(xref)
                 img_bytes = base_image["image"]
-                text_content += "\n**Image Transcript:**\n" + perform_llm_prediction_for_image_bytes(img_bytes, self.llm, self.prompt)  + "\n--------------------\n"
+                image_format = base_image.get("ext", "png")
+                text_content += "\n**Image Transcript:**\n" + perform_llm_prediction_for_image_bytes(
+                    img_bytes, self.llm, self.prompt,
+                    image_format=image_format,
+                    cache=self.image_cache,
+                    image_name=source,
+                )  + "\n--------------------\n"
         return text_content
 
     def load(self):

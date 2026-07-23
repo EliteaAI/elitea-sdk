@@ -118,8 +118,12 @@ class EliteADocxMammothLoader(BaseLoader):
         self.max_tokens = kwargs.get('max_tokens', 512)
         self.extracted_images_names = kwargs.get('extracted_images_names')
         self.read_images_only = kwargs.get('read_images_only', False)
-        # Dedup cache: MD5(image_bytes) → transcript string
-        self._image_cache = {}
+        self.image_cache = kwargs.get('image_cache')
+        # Per-conversion dedup: MD5(image_bytes) → transcript string. Used only
+        # to emit "[already transcribed, see above]" back-references for
+        # duplicate bytes inside a single document — distinct from the shared
+        # cross-invocation ``image_cache`` (ImageDescriptionCache) above.
+        self._per_doc_transcripts = {}
         # Ordered list of image filenames as they appear in the document
         self._image_ref_order = []
         # Counter to track current position during mammoth callbacks
@@ -142,7 +146,7 @@ class EliteADocxMammothLoader(BaseLoader):
         ``_scan_image_references`` on every conversion.)
         """
         self._image_payload_map = {}
-        self._image_cache = {}
+        self._per_doc_transcripts = {}
 
     def __register_image_payload(self, payload_text: str) -> str:
         """Register an image payload and return a unique, paren/space-free token.
@@ -215,8 +219,8 @@ class EliteADocxMammothLoader(BaseLoader):
 
             img_hash = hashlib.md5(image_bytes).hexdigest()
 
-            # Check dedup cache
-            if img_hash in self._image_cache:
+            # Check per-conversion dedup
+            if img_hash in self._per_doc_transcripts:
                 return {"src": self.__register_image_payload(
                     f"Image: {image_name} [already transcribed, see above]"),
                     "alt": image_name}
@@ -225,16 +229,20 @@ class EliteADocxMammothLoader(BaseLoader):
             transcript = None
             if self.llm:
                 try:
+                    source = self.path or self.file_name or "docx"
                     transcript = perform_llm_prediction_for_image_bytes(
                         image_bytes, self.llm,
-                        self.prompt if self.prompt else image_processing_prompt)
+                        self.prompt if self.prompt else image_processing_prompt,
+                        cache=self.image_cache,
+                        image_name=source,
+                    )
                 except Exception:
                     transcript = None
 
             if transcript is None:
                 transcript = "Transcript is not available"
 
-            self._image_cache[img_hash] = transcript
+            self._per_doc_transcripts[img_hash] = transcript
             return {"src": self.__register_image_payload(
                 f"Image: {image_name}, {transcript}"), "alt": image_name}
 
@@ -702,9 +710,13 @@ class EliteADocxMammothLoader(BaseLoader):
             try:
                 image_bytes = file_rels[name].target_part.blob
                 if self.llm:
+                    source = self.path or self.file_name or "docx"
                     transcript = perform_llm_prediction_for_image_bytes(
                         image_bytes, self.llm,
-                        self.prompt if self.prompt else image_processing_prompt)
+                        self.prompt if self.prompt else image_processing_prompt,
+                        cache=self.image_cache,
+                        image_name=source,
+                    )
                 else:
                     transcript = "Transcript is not available"
                 results[name] = transcript

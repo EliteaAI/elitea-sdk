@@ -59,7 +59,7 @@ Be as precise and thorough as possible in your responses. If something is unclea
 
 def parse_file_content(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                        sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False,
-                       prompt=None, extra_params: dict = None) -> str | ToolException:
+                       prompt=None, extra_params: dict = None, image_cache=None) -> str | ToolException:
     """Parse the content of a file based on its type and return the parsed content.
 
     Args:
@@ -89,6 +89,7 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
         excel_by_sheets=excel_by_sheets,
         prompt=prompt,
         extra_params=extra_params,
+        image_cache=image_cache,
     )
 
     if not loader:
@@ -100,7 +101,11 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
             return loader.get_content()
         else:
             extension = Path(file_path if file_path else file_name).suffix
-            loader_kwargs = get_loader_kwargs(loaders_map.get(extension), file_name, file_content, is_capture_image, page_number, sheet_name, llm, file_path, excel_by_sheets, extra_params=extra_params)
+            loader_kwargs = get_loader_kwargs(
+                loaders_map.get(extension), file_name, file_content, is_capture_image,
+                page_number, sheet_name, llm, file_path, excel_by_sheets,
+                extra_params=extra_params, image_cache=image_cache,
+            )
             if file_content:
                 return load_content_from_bytes(file_content=file_content,
                                                extension=extension,
@@ -144,7 +149,7 @@ def load_file_docs(file_name=None, file_content=None, is_capture_image: bool = F
 
 def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                     sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False, prompt=None,
-                    extra_params: dict = None):
+                    extra_params: dict = None, image_cache=None):
     """Build loader kwargs safely without deepcopying non-picklable objects like LLMs.
 
     We avoid copying keys that are going to be overridden by this function anyway
@@ -171,6 +176,7 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
         "prompt",
         "row_content",
         "json_documents",
+        "image_cache",
     }
 
     # Build a safe shallow copy without overridden keys to avoid deepcopy
@@ -188,7 +194,8 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
         "excel_by_sheets": excel_by_sheets,
         "prompt": prompt,
         "row_content": True,
-        "json_documents": False
+        "json_documents": False,
+        "image_cache": image_cache,
     })
     # Merge caller-provided extra_params LAST so they take precedence over
     # defaults from loaders_map. Sheet_name from extra_params overrides the
@@ -201,7 +208,7 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
 
 def prepare_loader(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                        sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False,
-                   prompt=None, extra_params: dict = None):
+                   prompt=None, extra_params: dict = None, image_cache=None):
         if (file_path and (file_name or file_content)) or (not file_path and (not file_name or file_content is None)):
             raise ToolException("Either (file_name and file_content) or file_path must be provided, but not both.")
 
@@ -210,7 +217,9 @@ def prepare_loader(file_name=None, file_content=None, is_capture_image: bool = F
         loader_object = loaders_map.get(extension)
         if not loader_object:
             loader_object = loaders_map.get('.txt')  # Default to text loader if no specific loader found
-        loader_kwargs = get_loader_kwargs(loader_object, file_name, file_content, is_capture_image, page_number, sheet_name, llm, file_path, excel_by_sheets, prompt, extra_params=extra_params)
+        loader_kwargs = get_loader_kwargs(loader_object, file_name, file_content, is_capture_image, page_number,
+                                          sheet_name, llm, file_path, excel_by_sheets, prompt,
+                                          extra_params=extra_params, image_cache=image_cache)
         # Filter loader_kwargs to those accepted by the loader class to avoid
         # TypeError when extra_params contains keys not recognised by that loader.
         try:
@@ -254,6 +263,21 @@ def load_content(file_path: str, extension: str = None, loader_extra_config: dic
         if "file_path" in loader_kwargs:
             del loader_kwargs["file_path"]
 
+        # Filter loader_kwargs to those accepted by loader_cls.__init__ so that
+        # image_cache (or any future strict-signature loader kwarg) doesn't
+        # TypeError when passed to a loader that doesn't declare it. Mirrors
+        # the filter in prepare_loader().
+        try:
+            import inspect
+            sig = inspect.signature(loader_cls.__init__)
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if not accepts_var_kw:
+                allowed = set(sig.parameters.keys())
+                loader_kwargs = {k: v for k, v in loader_kwargs.items() if k in allowed}
+        except (TypeError, ValueError):
+            pass
         loader = loader_cls(file_path=file_path, **loader_kwargs)
         documents = loader.load()
 
@@ -314,11 +338,16 @@ def _load_content_from_bytes_with_prompt(file_content: bytes, extension: str = N
             os.remove(temp_file_path)
 
 
-def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None) \
+def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None, image_cache=None) \
         -> Generator[Document, None, None]:
-    """Process the content of a file based on its type using a configured loader cosidering the origin document."""
+    """Process the content of a file based on its type using a configured loader cosidering the origin document.
+
+    ``image_cache`` is threaded through to :func:`process_content_by_type` so that
+    image-carrying loaders (raster images, PDFs with embedded pictures, etc.) can
+    share a per-toolkit LRU across every document processed in an indexing run.
+    """
     try:
-        chunks = process_content_by_type(content, extension_source, llm, chunking_config)
+        chunks = process_content_by_type(content, extension_source, llm, chunking_config, image_cache=image_cache)
         chunks_counter = 0
         for chunk in chunks:
             chunks_counter += 1
@@ -352,9 +381,17 @@ class UnsupportedExtensionError(Exception):
     pass
 
 
-def process_content_by_type(content, filename: str, llm=None, chunking_config=None, fallback_extensions=None) -> \
-        Generator[Document, None, None]:
-    """Process the content of a file based on its type using a configured loader."""
+def process_content_by_type(content, filename: str, llm=None, chunking_config=None, fallback_extensions=None,
+                            image_cache=None) -> Generator[Document, None, None]:
+    """Process the content of a file based on its type using a configured loader.
+
+    Args:
+        image_cache: Optional per-toolkit ``ImageDescriptionCache`` shared across
+            calls so that repeated images (e.g. same logo in every page of a
+            PDF, or the same screenshot embedded in multiple attachments)
+            skip the LLM roundtrip. Passed through to the loader when its
+            constructor accepts an ``image_cache`` kwarg.
+    """
     temp_file_path = None
     extensions = fallback_extensions if fallback_extensions else []
     match = re.search(r'\.([^.]+)$', filename)
@@ -429,6 +466,26 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                     use_default_prompt = allowed_to_override[use_prompt_key]
                 if use_default_prompt:
                     loader_kwargs[LoaderProperties.PROMPT.value] = image_processing_prompt
+                # Propagate per-toolkit image cache when caller supplied one.
+                # Only inject when the loader actually accepts image_cache — the
+                # signature filter below will drop it otherwise for loaders that
+                # would raise TypeError on unknown kwargs.
+                if image_cache is not None:
+                    loader_kwargs["image_cache"] = image_cache
+                # Filter loader_kwargs to those accepted by loader_cls.__init__
+                # so future strict-signature loaders don't TypeError on kwargs
+                # like image_cache or prompt. Mirrors the filter in prepare_loader().
+                try:
+                    import inspect
+                    sig = inspect.signature(loader_cls.__init__)
+                    accepts_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    )
+                    if not accepts_var_kw:
+                        allowed = set(sig.parameters.keys())
+                        loader_kwargs = {k: v for k, v in loader_kwargs.items() if k in allowed}
+                except (TypeError, ValueError):
+                    pass
                 loader = loader_cls(file_path=temp_file_path, **loader_kwargs)
                 yield from loader.load()
                 break
@@ -556,6 +613,7 @@ def parse_content_from_bytes(
     content_type: str = "",
     is_capture_image: bool = True,
     llm=None,
+    image_cache=None,
 ) -> str:
     """Parse raw bytes into human-readable text — the single canonical entry-point
     for all toolkits (SharePoint, Jira, OneNote, …) that download binary content.
@@ -598,6 +656,7 @@ def parse_content_from_bytes(
                 effective_name,
                 llm=llm,
                 fallback_extensions=None,
+                image_cache=image_cache,
             ))
             parts = []
             for doc in docs:

@@ -100,6 +100,7 @@ class EliteAImageLoader(BaseLoader):
             'prompt') is not None else DEFAULT_MULTIMODAL_PROMPT  # Use provided prompt or default
         self.max_tokens = kwargs.get('max_tokens', 512)
         self.token_overlap = kwargs.get('token_overlap', 10)
+        self.image_cache = kwargs.get('image_cache')
         self._original_dimensions = None
         self._was_scaled = False
 
@@ -176,7 +177,12 @@ class EliteAImageLoader(BaseLoader):
     def __perform_llm_prediction_for_image(self, image: Image, llm, prompt: str) -> str:
         """Performs LLM prediction for image content."""
         byte_array = image_to_byte_array(image)
-        return perform_llm_prediction_for_image_bytes(byte_array, llm, prompt)
+        image_name = str(self.file_path if hasattr(self, 'file_path') else getattr(self, 'file_name', ''))
+        return perform_llm_prediction_for_image_bytes(
+            byte_array, llm, prompt,
+            cache=self.image_cache,
+            image_name=image_name,
+        )
 
     def __process_svg_with_llm(self, svg_content: bytes, llm, prompt: str) -> str:
         """Processes SVG content using LLM with automatic upscaling for small SVGs."""
