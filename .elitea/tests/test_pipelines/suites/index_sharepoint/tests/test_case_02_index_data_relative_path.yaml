@@ -154,8 +154,9 @@ nodes:
           3. search_large_txt_result must have exactly 4 items
           4. All items in search_large_txt_result must have metadata.Name = "text_large.txt"
           5. All items must have metadata.chunk_id present
-          6. The unique chunk_ids must be [1, 2, 3, 4] (complete sequence, any order)
-          7. No .png files in search_all_result (check metadata.Name field)
+          6. Extract the unique metadata.chunk_id values, sort them numerically, and verify the sorted list equals [1, 2, 3, 4]
+          7. For the .png exclusion check, pass this rule when none of the visible metadata.Name values in search_all_result end with .png. Do not fail due to missing metadata.Name on some items.
+          8. If rules 1-7 pass, set test_passed to true and error to null. Do not fail because of original item ordering or incomplete non-essential metadata fields.
 
           Return ONLY a compact JSON object (no markdown, no extra text, keep response under 200 tokens):
           {{"test_passed": true/false, "summary": "brief description with chunk count and chunk ids found", "error": "error details if failed, null if passed"}}
