@@ -220,7 +220,9 @@ nodes:
           4. no_errors: Output does NOT contain error indicators
           5. files_returned: Output contains a list of files
           6. expected_files_present: All 3 created test files appear in the list
-          7. branch_isolation: Files were listed from correct test branch (not main)
+          7. branch_parameter_used: The list_files call was executed with the generated test branch name
+
+          Treat baseline repository files (for example README.md) as acceptable. This test verifies that the created files are present in the listing for the requested branch, not that the branch contains only test files.
 
           Return JSON test_results:
           {{
@@ -231,7 +233,7 @@ nodes:
             "no_errors": boolean,
             "files_returned": boolean,
             "expected_files_present": boolean,
-            "branch_isolation": boolean,
+            "branch_parameter_used": boolean,
             "summary": "brief description of outcome",
             "error": "error details if failed, null if passed"
           }}

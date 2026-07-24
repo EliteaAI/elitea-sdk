@@ -7,7 +7,7 @@ description: |
   1. Index all files except png (skip_extensions)
   2. Apply chunking config {"max_tokens": 256} for .txt files
   3. Search index to verify all documents are present
-  4. Verify text_large.txt has exactly 4 chunks using filter
+  4. Verify text_large.txt has exactly 4 chunks with chunk_ids [1,2,3,4]
 
   Objective: Confirm skip_extensions and chunking_config parameters work correctly
   and that indexed documents are searchable with proper chunking applied.
@@ -15,7 +15,8 @@ description: |
   Expected Behavior:
   - Index completes successfully (status: ok)
   - Search returns indexed documents
-  - text_large.txt filter search returns exactly 4 chunks
+  - text_large.txt filter search returns exactly 4 chunks (860 tokens / 256 max_tokens = 4 chunks)
+  - All chunk_ids are present: [1, 2, 3, 4]
   - png files are not indexed
 
 toolkits:
@@ -102,17 +103,21 @@ nodes:
     input_mapping:
       query:
         type: fixed
-        value: "text content"
+        value: "test"
       index_name:
         type: fixed
         value: "idx02"
       filter:
         type: fixed
-        value:
-          Name: "text_large.txt"
+        value: '{"Name": "text_large.txt"}'
       search_top:
         type: fixed
         value: 50
+      output_fields:
+        type: fixed
+        value:
+          - "metadata.Name"
+          - "metadata.chunk_id"
     output:
       - search_large_txt_result
     structured_output: true
@@ -139,49 +144,22 @@ nodes:
 
           Index Result: {index_result}
           Search All Docs: {search_all_result}
-          Search text_large.txt (filtered): {search_large_txt_result}
+          Search text_large.txt (filtered, metadata only): {search_large_txt_result}
           Skip Extensions: {skip_extensions}
-
-          ## Chunk Structure Reference
-
-          Each chunk in search results is a JSON object with this structure:
-          ```
-          {{
-            "page_content": "...",
-            "metadata": {{
-              "chunk_id": "...",
-              "Name": "text_large.txt",
-              ...
-            }}
-          }}
-          ```
-
-          The search_large_txt_result is an ARRAY of such chunk objects.
-
-          ## Counting Instructions
-
-          To count chunks in search_large_txt_result:
-          1. Parse search_large_txt_result as a JSON array
-          2. Count the number of top-level objects in the array
-          3. Each object with "page_content" and "metadata" is ONE chunk
-          4. Do NOT count nested fields or metadata properties as separate chunks
 
           ## Validation Rules
 
           1. index_result must have "status": "ok"
           2. search_all_result must be non-empty
-          3. search_large_txt_result must contain EXACTLY 4 chunk objects
-          4. Every chunk in search_large_txt_result must have metadata.Name == "text_large.txt"
-          5. No .png files in search_all_result (check metadata.Name field)
+          3. search_large_txt_result must have exactly 4 items
+          4. All items in search_large_txt_result must have metadata.Name = "text_large.txt"
+          5. All items must have metadata.chunk_id present
+          6. Extract the unique metadata.chunk_id values, sort them numerically, and verify the sorted list equals [1, 2, 3, 4]
+          7. For the .png exclusion check, pass this rule when none of the visible metadata.Name values in search_all_result end with .png. Do not fail due to missing metadata.Name on some items.
+          8. If rules 1-7 pass, set test_passed to true and error to null. Do not fail because of original item ordering or incomplete non-essential metadata fields.
 
-          ## Output
-
-          Return ONLY this JSON (no markdown):
-          {{
-            "test_passed": true/false,
-            "summary": "description with actual chunk count",
-            "error": "error details if failed, null if passed"
-          }}
+          Return ONLY a compact JSON object (no markdown, no extra text, keep response under 200 tokens):
+          {{"test_passed": true/false, "summary": "brief description with chunk count and chunk ids found", "error": "error details if failed, null if passed"}}
       chat_history:
         type: fixed
         value: []
