@@ -317,10 +317,16 @@ class LLMNode(BaseTool):
         except GraphBubbleUp:
             raise
         except Exception as exc:
-            if not self._is_structured_transform_rejection(exc):
+            # Fall back on two conditions:
+            #   1. Provider 400-rejected the with_structured_output transform.
+            #   2. Parser failed on the model's response (e.g. Anthropic extended
+            #      thinking disables assistant prefill, so JsonOutputParser sees a
+            #      body-only fragment without its leading '{').
+            if not (isinstance(exc, OutputParserException)
+                    or self._is_structured_transform_rejection(exc)):
                 raise
             logger.warning(
-                "Structured-output transform rejected by provider (%s); "
+                "Structured-output path failed (%s); "
                 "retrying via JSON-prompt parsing", type(exc).__name__
             )
             return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
@@ -486,71 +492,26 @@ class LLMNode(BaseTool):
 
     def _handle_structured_output_fallback(self, llm_client: Any, messages: List, struct_model: Any,
                                           config: RunnableConfig, original_error: Exception) -> Any:
+        """Recover from a failed structured-output primary path.
+
+        Delegates to ``_structured_via_json_prompt``, the provider-agnostic
+        path. It already:
+        - handles list-of-blocks content (Anthropic extended thinking)
+        - handles code-fenced JSON
+        - falls back gracefully via ``_create_fallback_completion`` when the
+          model output genuinely cannot be parsed.
+
+        This supersedes the old ``json_mode -> function_calling -> plain LLM``
+        cascade, which repeated the same failing strategy (all three re-invoke
+        ``with_structured_output`` whose JSON parser had already rejected the
+        response) and crashed on list-content ``.strip()`` in the plain-LLM leg.
         """
-        Handle structured output fallback through multiple strategies.
-
-        Tries fallback methods in order:
-        1. json_mode with explicit instructions
-        2. function_calling method
-        3. Plain text with JSON extraction
-
-        Args:
-            llm_client: LLM client instance
-            messages: Original conversation messages
-            struct_model: Pydantic model for structured output
-            config: Runnable configuration
-            original_error: The original ValueError that triggered fallback
-
-        Returns:
-            Completion with structured output (best effort)
-
-        Raises:
-            Propagates exceptions from LLM invocation
-        """
-        logger.error(f"Error invoking structured output model: {format_exc()}")
-        logger.info("Attempting to fall back to json mode")
-
-        # Build JSON instruction once
-        json_instruction = self._build_json_instruction(struct_model)
-
-        # Add instruction to messages
-        modified_messages = messages.copy()
-        if modified_messages and isinstance(modified_messages[-1], HumanMessage):
-            modified_messages[-1] = HumanMessage(
-                content=modified_messages[-1].content + json_instruction
-            )
-        else:
-            modified_messages.append(HumanMessage(content=json_instruction))
-
-        # Try json_mode (for langchain-anthropic this aliases to json_schema —
-        # which __get_struct_output_model also routes thinking-Anthropic to).
-        try:
-            completion = self.__get_struct_output_model(
-                llm_client, struct_model, method="json_mode"
-            ).invoke(modified_messages, config=config)
-            return completion
-        except Exception as json_mode_error:
-            logger.warning(f"json_mode also failed: {json_mode_error}")
-            logger.info("Falling back to function_calling method")
-            try:
-                completion = self.__get_struct_output_model(
-                    llm_client, struct_model, method="function_calling"
-                ).invoke(modified_messages, config=config)
-                return completion
-            except Exception as function_calling_error:
-                logger.error(f"function_calling also failed: {function_calling_error}")
-                logger.info("Final fallback: using plain LLM response")
-
-                plain_completion = llm_client.invoke(modified_messages, config=config)
-                content = plain_completion.content.strip() if hasattr(plain_completion, 'content') else str(plain_completion)
-
-                try:
-                    parsed = extract_json_content(content)
-                    completion = self._map_parsed_json_to_model(parsed, struct_model)
-                    return completion
-                except (ValueError, ValidationError, KeyError, TypeError) as parse_error:
-                    logger.warning(f"Could not parse extracted JSON: {parse_error}")
-                    return self._create_fallback_completion(content, struct_model)
+        logger.warning(
+            "Structured-output primary path failed (%s); delegating to JSON-prompt fallback",
+            type(original_error).__name__,
+        )
+        logger.info("Original structured-output error: %s", format_exc())
+        return self._structured_via_json_prompt(llm_client, messages, struct_model, config)
 
     def _format_structured_output_result(self, result: dict, messages: List, initial_completion: Any) -> dict:
         """
