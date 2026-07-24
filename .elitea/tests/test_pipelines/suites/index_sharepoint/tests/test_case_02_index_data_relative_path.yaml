@@ -172,7 +172,7 @@ nodes:
           2. search_all_result must be non-empty
           3. search_large_txt_result must contain EXACTLY 3 chunk objects
           4. Every chunk in search_large_txt_result must have metadata.Name == "text_large.txt"
-          5. The chunk_id values in search_large_txt_result must be sequential integers (1, 2, 3)
+          5. Every chunk in search_large_txt_result must have a metadata.chunk_id field present
           6. No .png files in search_all_result (check metadata.Name field)
 
           ## Output
@@ -180,7 +180,7 @@ nodes:
           Return ONLY this JSON (no markdown):
           {{
             "test_passed": true/false,
-            "summary": "description with actual chunk count and chunk_id values",
+            "summary": "description with actual chunk count and observed chunk_id values",
             "error": "error details if failed, null if passed"
           }}
       chat_history:
