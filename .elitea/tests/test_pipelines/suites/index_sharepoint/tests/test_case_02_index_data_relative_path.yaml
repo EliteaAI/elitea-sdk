@@ -175,6 +175,8 @@ nodes:
           5. Every chunk in search_large_txt_result must have a metadata.chunk_id field present
           6. No .png files in search_all_result (check metadata.Name field)
 
+          Note: Search results are ranked by similarity, not by chunk_id order.
+
           ## Output
 
           Return ONLY this JSON (no markdown):
