@@ -1103,6 +1103,7 @@ def get_mcp_config_toolkit_schemas() -> List[BaseModel]:
                         'icon_url': config.get('icon_url'),
                         'categories': categories,
                         'extra_categories': extra_categories,
+                        'group': config.get('group') or 'Other',
                         'description': description,
                         # Section for configuration registration (toolkits page)
                         'section': 'toolkits',
