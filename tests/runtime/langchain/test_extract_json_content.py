@@ -141,6 +141,43 @@ class TestExtractJsonContentEmbedded:
 
 
 # ---------------------------------------------------------------------------
+# extract_json_content: body-only object repair (Anthropic prefill-less)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJsonContentBodyOnly:
+    """Anthropic extended thinking disables assistant prefill, so the model
+    can emit an object *body* — ``"key": val, ...}`` — without the leading
+    ``{``. extract_json_content must prepend the missing brace and parse."""
+
+    def test_body_only_single_field(self):
+        assert extract_json_content('"a": 1}') == {"a": 1}
+
+    def test_body_only_multiple_fields(self):
+        result = extract_json_content('"name": "test", "count": 3}')
+        assert result == {"name": "test", "count": 3}
+
+    def test_body_only_with_leading_whitespace(self):
+        assert extract_json_content('  \n  "x": true}  ') == {"x": True}
+
+    def test_body_only_with_nested_list_value(self):
+        """Exact shape from issue #5682: list-mapping output. Repair must
+        run before _find_json_bounds, otherwise the inner object is grabbed
+        and returned as the whole result — silent corruption."""
+        result = extract_json_content('"question": [{"id": 1}], "ELITEA_RS": null}')
+        assert result == {"question": [{"id": 1}], "ELITEA_RS": None}
+
+    def test_body_only_with_nested_object_value(self):
+        result = extract_json_content('"data": {"inner": "v"}, "n": 1}')
+        assert result == {"data": {"inner": "v"}, "n": 1}
+
+    def test_body_only_repair_skipped_for_embedded_json(self):
+        """Text prefix followed by braced JSON must not be treated as a
+        body-only fragment — the ``startswith('"')`` gate ensures that."""
+        assert extract_json_content('prefix {"a": 1}') == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
 # extract_json_content: error cases
 # ---------------------------------------------------------------------------
 
