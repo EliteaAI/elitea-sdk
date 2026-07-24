@@ -5,7 +5,7 @@
     {
       "_name": "ocr_only",
       "_use_llm": false,
-      "_max_tokens": 2048
+      "max_tokens": 2048
     },
     {
       "_name": "llm_default_prompt",

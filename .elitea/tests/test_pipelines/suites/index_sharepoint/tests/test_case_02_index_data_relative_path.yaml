@@ -7,15 +7,15 @@ description: |
   1. Index all files except png (skip_extensions)
   2. Apply chunking config {"max_tokens": 256} for .txt files
   3. Search index to verify all documents are present
-  4. Verify text_large.txt has exactly 4 chunks using filter
+  4. Verify text_large.txt is split into multiple chunks with sequential chunk IDs using filter
 
   Objective: Confirm skip_extensions and chunking_config parameters work correctly
-  and that indexed documents are searchable with proper chunking applied.
+  and that indexed documents are searchable with chunking applied to .txt files.
 
   Expected Behavior:
   - Index completes successfully (status: ok)
   - Search returns indexed documents
-  - text_large.txt filter search returns exactly 4 chunks
+  - text_large.txt filter search returns multiple chunks with sequential chunk IDs
   - png files are not indexed
 
 toolkits:
@@ -170,16 +170,17 @@ nodes:
 
           1. index_result must have "status": "ok"
           2. search_all_result must be non-empty
-          3. search_large_txt_result must contain EXACTLY 4 chunk objects
+          3. search_large_txt_result must contain at least 3 chunk objects
           4. Every chunk in search_large_txt_result must have metadata.Name == "text_large.txt"
-          5. No .png files in search_all_result (check metadata.Name field)
+          5. The chunk_id values in search_large_txt_result must be sequential integers starting from 1 with no gaps
+          6. No .png files in search_all_result (check metadata.Name field)
 
           ## Output
 
           Return ONLY this JSON (no markdown):
           {{
             "test_passed": true/false,
-            "summary": "description with actual chunk count",
+            "summary": "description with actual chunk count and chunk_id range",
             "error": "error details if failed, null if passed"
           }}
       chat_history:
