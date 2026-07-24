@@ -34,6 +34,7 @@ _LOADER_NAME = "EliteAImageLoader"
 # and baseline regeneration required.
 _SKIP = {
     ("several_in_one_png", 1),  # variable chunk count due to _max_tokens prefix bug
+    ("elitea_screenshot_jpeg", 1),  # same _max_tokens prefix bug: LLM output exceeds 512-token default → 3 chunks vs baseline 2
 }
 
 

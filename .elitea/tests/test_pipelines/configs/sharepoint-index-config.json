@@ -4,7 +4,7 @@
   "selected_tools": [
     "index_data",
     "search_index",
-    "list_collections",
+    "list_indexes",
     "remove_index"
   ]
 }
