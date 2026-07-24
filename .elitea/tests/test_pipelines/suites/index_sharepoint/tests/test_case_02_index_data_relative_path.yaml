@@ -7,7 +7,7 @@ description: |
   1. Index all files except png (skip_extensions)
   2. Apply chunking config {"max_tokens": 256} for .txt files
   3. Search index to verify all documents are present
-  4. Verify text_large.txt has exactly 3 chunks using filter
+  4. Verify text_large.txt has exactly 4 chunks using filter
 
   Objective: Confirm skip_extensions and chunking_config parameters work correctly
   and that indexed documents are searchable with proper chunking applied.
@@ -15,7 +15,7 @@ description: |
   Expected Behavior:
   - Index completes successfully (status: ok)
   - Search returns indexed documents
-  - text_large.txt filter search returns exactly 3 chunks (text_chunker with TokenTextSplitter @ 256 max_tokens)
+  - text_large.txt filter search returns exactly 4 chunks (860 tokens / 256 max_tokens = 4 chunks)
   - png files are not indexed
 
 toolkits:
@@ -104,17 +104,19 @@ nodes:
     input_mapping:
       query:
         type: fixed
-        value: "text content"
+        value: "test"
       index_name:
         type: fixed
         value: "idx02"
       filter:
         type: fixed
-        value:
-          Name: "text_large.txt"
+        value: '{"Name": "text_large.txt"}'
       search_top:
         type: fixed
         value: 50
+      output_fields:
+        type: fixed
+        value: '["metadata"]'
     output:
       - search_large_txt_result
     structured_output: true
@@ -184,9 +186,10 @@ nodes:
           3. search_large_txt_summary.chunk_count must equal 4
           4. search_large_txt_summary.all_text_large must be true
           5. search_large_txt_summary.all_chunk_ids_present must be true
-          6. No .png files in search_all_result (check metadata.Name field)
+          6. search_large_txt_summary.unique_chunk_ids must be [1, 2, 3, 4] (complete sequence)
+          7. No .png files in search_all_result (check metadata.Name field)
 
-          Note: Search results are ranked by similarity, not by chunk_id order.
+          Note: Search results are ranked by similarity, not by chunk_id order, but all chunk_ids must be from the same contiguous sequence starting at 1.
 
           Return ONLY a compact JSON object (no markdown, no extra text, keep response under 200 tokens):
           {{"test_passed": true/false, "summary": "brief description with chunk count and chunk ids", "error": "error details if failed, null if passed"}}
