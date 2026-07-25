@@ -467,7 +467,8 @@ class EliteAClient:
                 # "messages.X.content.Y.thinking.thinking: Field required".
                 _adaptive_only = ("opus-4-7", "opus_4_7", "opus-4.7",
                                   "opus-4-8", "opus_4_8", "opus-4.8",
-                                  "sonnet-5", "sonnet_5")
+                                  "sonnet-5", "sonnet_5",
+                                  "opus-5", "opus_5")
                 if any(p in model_name_lower for p in _adaptive_only):
                     target_kwargs['thinking'] = {"type": "adaptive", "display": "summarized"}
                     target_kwargs['effort'] = effort
