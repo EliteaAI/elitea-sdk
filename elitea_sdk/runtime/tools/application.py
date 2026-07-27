@@ -445,39 +445,39 @@ class Application(BaseTool):
             _inherited_path.append(_path_entry)
             nested_metadata['parent_agent_path'] = _inherited_path
         nested_config = {}
-        if invoke_config and invoke_config.get('configurable'):
-            parent_configurable = dict(invoke_config['configurable'])
-            parent_configurable.pop('selected_tools', None)
-            parent_configurable.pop('selected_toolkits', None)
-            parent_configurable.pop('invoked_skills', None)
-            parent_configurable.pop('attached_skills', None)
-            if self.client and self.args_runnable:
-                # Standalone child runs as a root graph with its own checkpointer.
-                # Strip ALL parent pregel internals so the child doesn't inherit
-                # the parent's checkpoint tree, scratchpad, or task tracking.
-                _pregel_keys = [k for k in parent_configurable
-                                if k.startswith('__pregel_') or k in (
-                                    'checkpoint_id', 'checkpoint_ns', 'checkpoint_map',
-                                )]
-                for k in _pregel_keys:
-                    parent_configurable.pop(k, None)
-            parent_thread_id = parent_configurable.get('thread_id')
-            if parent_thread_id and self.name:
-                # Two parallel calls to the SAME sub-agent in one turn would
-                # collide on f"{parent}:{name}". On the parallel fan-out path
-                # the call id is injected, so suffix with it to isolate the
-                # siblings' checkpoints. Sequential/single path is unchanged.
-                if _hitl_parallel_call_id:
-                    parent_configurable['thread_id'] = (
-                        f"{parent_thread_id}:{self.name}:{_hitl_parallel_call_id}"
-                    )
-                else:
-                    parent_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
-            nested_config['configurable'] = parent_configurable
+        child_configurable = dict((invoke_config or {}).get('configurable') or {})
+        child_configurable.pop('selected_tools', None)
+        child_configurable.pop('selected_toolkits', None)
+        # A sub-agent applies its own version's skills, never its caller's.
+        child_configurable['attached_skills'] = (
+            (self.args_runnable.get('version_details') or {}).get('attached_skills') or []
+        )
+        child_configurable['invoked_skills'] = []
+        if self.client and self.args_runnable:
+            # Standalone child runs as a root graph with its own checkpointer.
+            # Strip ALL parent pregel internals so the child doesn't inherit
+            # the parent's checkpoint tree, scratchpad, or task tracking.
+            _pregel_keys = [k for k in child_configurable
+                            if k.startswith('__pregel_') or k in (
+                                'checkpoint_id', 'checkpoint_ns', 'checkpoint_map',
+                            )]
+            for k in _pregel_keys:
+                child_configurable.pop(k, None)
+        parent_thread_id = child_configurable.get('thread_id')
+        if parent_thread_id and self.name:
+            # Two parallel calls to the SAME sub-agent in one turn would
+            # collide on f"{parent}:{name}". On the parallel fan-out path
+            # the call id is injected, so suffix with it to isolate the
+            # siblings' checkpoints. Sequential/single path is unchanged.
+            if _hitl_parallel_call_id:
+                child_configurable['thread_id'] = (
+                    f"{parent_thread_id}:{self.name}:{_hitl_parallel_call_id}"
+                )
+            else:
+                child_configurable['thread_id'] = f"{parent_thread_id}:{self.name}"
+        nested_config['configurable'] = child_configurable
         if nested_metadata:
             nested_config['metadata'] = nested_metadata
-        if not nested_config:
-            nested_config = None
         if _hitl_parallel_resume is not None:
             # Parallel fan-out resume: this child paused earlier (a deferred
             # sentinel was returned). Resume it directly from its checkpoint with
