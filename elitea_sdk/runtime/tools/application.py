@@ -448,7 +448,8 @@ class Application(BaseTool):
         child_configurable = dict((invoke_config or {}).get('configurable') or {})
         child_configurable.pop('selected_tools', None)
         child_configurable.pop('selected_toolkits', None)
-        # A sub-agent applies its own version's skills, never its caller's.
+        # A sub-agent uses the skills of its own version. It never inherits the
+        # skills of whichever agent called it.
         child_configurable['attached_skills'] = (
             (self.args_runnable.get('version_details') or {}).get('attached_skills') or []
         )
