@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from urllib.parse import urlencode
+from urllib.parse import quote
 from typing import Annotated, Any, Callable, Optional
 import copy
 
@@ -545,6 +545,114 @@ def _guess_python_type(openapi_schema: dict | None) -> type:
     return str
 
 
+# Characters OpenAPI `allowReserved: true` permits to pass through a query VALUE unencoded.
+# This is the RFC 3986 reserved set (gen-delims ":/?#[]@" + sub-delims "!$&'()*+,;=") MINUS two
+# chars we always percent-encode anyway because leaving them raw corrupts the request:
+#   '+'  -> a raw '+' in a query is decoded as a space (form-encoding) — the exact bug we fix.
+#   '#'  -> a raw '#' starts the URL fragment and would truncate the query.
+# Everything else (spaces, '"', and other non-reserved chars) is still percent-encoded by quote().
+# So e.g. $filter=Name eq 'John Doe' -> $filter=Name%20eq%20'John%20Doe' (quotes/'/' stay raw,
+# spaces become %20), matching the OData/Postman wire form.
+_ALLOW_RESERVED_SAFE_CHARS = ":/?[]@!$&'()*,;="
+
+# Safe set for param NAMES under allowReserved: the value set minus the query structural
+# delimiters '&' and '=' (a raw '&'/'=' in a name would corrupt query parsing). This lets
+# '$'-prefixed OData names ($select, $filter, ...) pass through unencoded like Postman does.
+# Applied ONLY when the param's spec sets allowReserved: true; otherwise names stay fully encoded.
+_ALLOW_RESERVED_NAME_SAFE_CHARS = ":/?[]@!$'()*,;"
+
+
+def _stringify_query_value(value: Any) -> str:
+    """Stringify a scalar query value exactly as the previous quote_plus path did (via str())."""
+    return "" if value is None else str(value)
+
+
+def _serialize_query_scalar(value: Any, safe: str) -> str:
+    # quote() (never quote_plus) so a space becomes %20, not '+'.
+    return quote(_stringify_query_value(value), safe=safe)
+
+
+def _get_query_param_specs(
+    op_raw: dict, shared_params: Optional[list] = None
+) -> dict[str, dict[str, Any]]:
+    """Map query param name -> {style, explode, allow_reserved} per OpenAPI 3.0 defaults.
+
+    Merges path-item-level shared params (requests_openapi's `parent_params`) with
+    operation-level params; operation-level wins on name collision (OpenAPI override semantics).
+    """
+    specs: dict[str, dict[str, Any]] = {}
+    for params_list in (shared_params, op_raw.get("parameters") if isinstance(op_raw, dict) else None):
+        if not isinstance(params_list, list):
+            continue
+        for p in params_list:
+            if not isinstance(p, dict) or p.get("in") != "query":
+                continue
+            name = p.get("name")
+            if not isinstance(name, str):
+                continue
+            style = p.get("style") or "form"
+            explode = p.get("explode")
+            if explode is None:
+                explode = style == "form"
+            specs[name] = {
+                "style": style,
+                "explode": bool(explode),
+                "allow_reserved": bool(p.get("allowReserved", False)),
+            }
+    return specs
+
+
+def _serialize_query_param(name: str, value: Any, spec: dict[str, Any]) -> Optional[str]:
+    """RFC 6570 form-style serialization of one query param honoring style/explode/allowReserved.
+
+    Returns None when the param contributes nothing (None / empty list / empty dict).
+    """
+    if value is None:
+        return None
+    allow_reserved = spec.get("allow_reserved")
+    safe = _ALLOW_RESERVED_SAFE_CHARS if allow_reserved else ""
+    # Under allowReserved, let reserved name chars (e.g. the OData '$' prefix) through like
+    # Postman; otherwise fully encode the name.
+    name_safe = _ALLOW_RESERVED_NAME_SAFE_CHARS if allow_reserved else ""
+    enc_name = quote(str(name), safe=name_safe)
+
+    if isinstance(value, (list, tuple)):
+        # Defensive: _guess_python_type never emits list-typed query params today.
+        items = [v for v in value if v is not None]
+        if not items:
+            return None
+        if spec.get("explode"):
+            return "&".join(f"{enc_name}={_serialize_query_scalar(v, safe)}" for v in items)
+        delimiter = {"spaceDelimited": "%20", "pipeDelimited": "|"}.get(spec.get("style"), ",")
+        return f"{enc_name}={delimiter.join(_serialize_query_scalar(v, safe) for v in items)}"
+
+    if isinstance(value, dict):
+        # Defensive: dict-valued query params are not emitted by the current schema builder.
+        if not value:
+            return None
+        if spec.get("explode"):
+            return "&".join(
+                f"{quote(str(k), safe='')}={_serialize_query_scalar(v, safe)}" for k, v in value.items()
+            )
+        flat = ",".join(
+            f"{quote(str(k), safe='')},{_serialize_query_scalar(v, safe)}" for k, v in value.items()
+        )
+        return f"{enc_name}={flat}"
+
+    return f"{enc_name}={_serialize_query_scalar(value, safe)}"
+
+
+def _build_query_string(params: dict[str, Any], specs: dict[str, dict[str, Any]]) -> str:
+    """Serialize the whole query dict ourselves so `requests` never re-encodes it (no '+' for space)."""
+    parts: list[str] = []
+    for name, value in (params or {}).items():
+        spec = specs.get(name) or {"style": "form", "explode": True, "allow_reserved": False}
+        part = _serialize_query_param(name, value, spec)
+        if part:
+            parts.append(part)
+    return "&".join(parts)
+
+
 def _schema_type_hint(openapi_schema: dict | None) -> str:
     if not isinstance(openapi_schema, dict):
         return ""
@@ -816,6 +924,7 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
             for path, path_item in paths.items():
                 if not isinstance(path_item, dict):
                     continue
+                shared_params = path_item.get("parameters") if isinstance(path_item.get("parameters"), list) else []
                 for method, op_raw in path_item.items():
                     if not isinstance(op_raw, dict):
                         continue
@@ -826,6 +935,7 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
                         "method": str(method).upper(),
                         "path": str(path),
                         "raw": op_raw,
+                        "query_specs": _get_query_param_specs(op_raw, shared_params),
                     }
 
         client = Client()
@@ -1097,7 +1207,11 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
             query = {}
 
         if query:
-            url = url + "?" + urlencode(query, doseq=True)
+            # Use the same serializer as the real request so error/debug URLs reflect what is
+            # actually sent (spaces as %20, allowReserved honored) instead of a quote_plus preview.
+            qs = _build_query_string(query, meta.get("query_specs") if isinstance(meta, dict) else {})
+            if qs:
+                url = url + "?" + qs
         return url
 
     def _execute(self, operation_id: str, *args: Any, **kwargs: Any) -> str:
@@ -1235,11 +1349,37 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
                 },
             )
 
+        # requests_openapi hands query params to requests.Session.request as a dict, which
+        # requests encodes with quote_plus (spaces -> '+'). Some servers (e.g. Planisware OData)
+        # reject '+' and require %20, and OpenAPI `allowReserved: true` is ignored entirely.
+        # Serialize the query string ourselves (spaces -> %20, allowReserved honored) and fold it
+        # into the URL so requests never re-encodes it. See _build_query_string.
+        query_specs = meta.get("query_specs") if isinstance(meta, dict) else None
+        query_specs = query_specs or {}
+
         # Apply per-call extra headers (best-effort) without permanently mutating global headers.
         old_headers = dict(getattr(self._client.requestor, "headers", {}) or {})
+        requestor = self._client.requestor
+        orig_request = requestor.request
+
+        def _request_with_manual_query_encoding(method, url, **req_kwargs):
+            params = req_kwargs.pop("params", None)
+            if isinstance(params, dict) and params:
+                qs = _build_query_string(params, query_specs)
+                if qs:
+                    sep = "&" if "?" in url else "?"
+                    url = f"{url}{sep}{qs}"
+                # params intentionally dropped: already folded into `url`.
+            elif params is not None:
+                # Non-dict params never occur from this requests_openapi version's _gen_call;
+                # forward untouched rather than silently drop.
+                req_kwargs["params"] = params
+            return orig_request(method, url, **req_kwargs)
+
         try:
             if extra_headers:
                 self._client.requestor.headers.update({str(k): str(v) for k, v in extra_headers.items()})
+            requestor.request = _request_with_manual_query_encoding
             response = op(*args, **kwargs)
         except Exception as e:
             _raise_openapi_tool_exception(
@@ -1251,6 +1391,7 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
                 details={"exception": repr(e)},
             )
         finally:
+            requestor.request = orig_request
             try:
                 self._client.requestor.headers.clear()
                 self._client.requestor.headers.update(old_headers)
