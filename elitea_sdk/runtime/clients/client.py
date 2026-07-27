@@ -166,7 +166,9 @@ class EliteAClient:
         if version_name:
             url = f"{url}/{version_name}"
 
-        resp = requests.get(url, headers=self.headers, verify=False)
+        resp = requests.get(
+            url, headers=self.headers, params={'runtime': 'true'}, verify=False,
+        )
         if resp.ok:
             data = resp.json()
             logger.info(f"[PUBLIC_APP] Successfully fetched public app {application_id}: {data.get('name')}")

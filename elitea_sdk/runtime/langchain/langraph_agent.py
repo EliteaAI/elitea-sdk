@@ -1704,7 +1704,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if config is None:
             config = RunnableConfig()
         if not config.get("configurable", {}).get("thread_id", ""):
-            config["configurable"] = {"thread_id": str(uuid4())}
+            # Application reads this same dict back for get_state and HITL resume.
+            config.setdefault("configurable", {})["thread_id"] = str(uuid4())
         thread_id = config.get("configurable", {}).get("thread_id")
 
         # Check if checkpoint exists early for chat_history handling
