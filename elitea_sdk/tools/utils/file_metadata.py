@@ -345,6 +345,7 @@ def build_line_range_metadata(file_content, *, file_type_note: str = "file") -> 
     return {
         "unit": "lines",
         "total_lines": total_lines,
+        "read_limits": {"full_read_allowed": content_size <= DEFAULT_MAX_OUTPUT_CHARS},
         "instruction_for_readFile": {
             "first_class_params": {
                 "start_line": (

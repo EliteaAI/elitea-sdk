@@ -126,6 +126,22 @@ class TestTextLoaderMetadata:
         assert meta["read_limits"]["full_read_allowed"] is True
         assert "start_line" in meta["instruction_for_readFile"]["first_class_params"]
 
+    def test_large_multiline_refused(self):
+        """Multi-line file over the cap must also report full_read_allowed=False (#5988).
+
+        Regression test: the multi-line branch of build_line_range_metadata
+        used to omit read_limits entirely, so get_file_metadata's True
+        baseline went unchallenged and multi-line files over the cap were
+        wrongly reported as fully readable.
+        """
+        from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
+        line = b"x" * 100 + b"\n"
+        big = line * ((DEFAULT_MAX_OUTPUT_CHARS + 1000) // len(line) + 1)
+        meta = get_file_metadata("big_multiline.txt", file_content=big, file_size=len(big))
+        assert meta["total_lines"] > 1
+        assert meta["read_limits"]["full_read_allowed"] is False
+        assert "start_line" in meta["instruction_for_readFile"]["first_class_params"]
+
 
 # ---------------------------------------------------------------------------
 # EliteACodeLoader (.py and other code extensions)
