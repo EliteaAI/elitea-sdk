@@ -717,14 +717,16 @@ MAX_SKILLS_PER_INVOCATION = 5
 
 SKILL_REGISTRY_HEADER = """The skills listed below can be activated on demand. Each <skill_option> gives only the skill's name and when to use it — the full instructions are NOT loaded yet.
 
-Before composing each reply, scan this list and decide which skills match. A skill matches when the user's current request falls within its description. You MUST call the `load_skill` tool for EVERY matching skill BEFORE writing your answer — if several match, load all of them, then reconcile their instructions with full information; never skip a matching skill based on its one-line description alone. If you are unsure whether a skill matches, load it: loading an unneeded skill is cheap, missing a needed one is not. Follow each loaded instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. If loaded skills contradict each other, reconcile them silently and output ONLY the final answer: never describe the conflict, name the skills, or show drafts and adjustments in your reply. Only when no skill plausibly matches, answer normally without calling load_skill. Do not mention these skill names or the load_skill mechanism in your reply."""
+Before composing each reply, scan this list and decide which skills match. A skill matches when the user's current request falls within its description. You MUST call the `load_skill` tool for EVERY matching skill BEFORE writing your answer — if several match, load all of them, then reconcile their instructions with full information; never skip a matching skill based on its one-line description alone. If you are unsure whether a skill matches, load it: loading an unneeded skill is cheap, missing a needed one is not. NEVER imitate a skill from its name or description — its actual instructions may differ from what the name suggests; applying a skill you have not loaded this conversation is an error. If your agent instructions refer to a listed skill by name, treat that reference as its trigger: load the skill whenever the situation your instructions specify for it applies, and its rules hold ONLY within that situation. Follow each loaded instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. If loaded skills contradict each other, reconcile them silently and output ONLY the final answer: never describe the conflict, name the skills, or show drafts and adjustments in your reply. Only when no skill plausibly matches, answer normally without calling load_skill. Do not mention these skill names or the load_skill mechanism in your reply."""
 
 SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
 
 SKILL_REMINDER_SUFFIX = (
     "Before answering: check <available_skills> in your instructions and call "
-    "load_skill for every skill matching this request. Earlier replies in this "
-    "conversation do not mean a skill is active now."
+    "load_skill for every skill matching this request. Never apply a skill's "
+    "behavior from its name alone — load it first. Earlier replies in this "
+    "conversation do not mean a skill is active now, and skills loaded earlier "
+    "apply only where their scope matches this request."
 )
 
 LOAD_SKILL_TOOL_DESCRIPTION = (
@@ -734,8 +736,9 @@ LOAD_SKILL_TOOL_DESCRIPTION = (
     "skill's complete instructions. Call this for every skill whose description "
     "matches the user's request — if you are unsure whether a skill matches, load "
     "it — but only once per skill. After the instructions are returned you MUST "
-    "follow them exactly for the applicable part of your response. Only skills listed "
-    "in <available_skills> can be loaded."
+    "follow them exactly for the applicable part of your response. Never apply a "
+    "skill you have not loaded. Only skills listed in <available_skills> can be "
+    "loaded."
 )
 
 LOADED_SKILL_PREFIX = 'Skill "{name}" is now active'
@@ -744,15 +747,22 @@ LOADED_SKILL_PREFIX_RE = re.compile(
     '^' + re.escape(LOADED_SKILL_PREFIX).replace(re.escape('{name}'), '([^"]+)')
 )
 
-LOADED_SKILL_RESULT = LOADED_SKILL_PREFIX + """. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. In later turns, apply them only when the request again falls within this skill's scope. Do not mention this skill by name or that it was loaded.
+LOADED_SKILL_RESULT = LOADED_SKILL_PREFIX + """. Follow these instructions exactly for the part of your response they apply to; if they conflict with a general default, these instructions win. If your agent instructions or the current request scope this skill to a situation, the skill is INACTIVE outside that situation — do not apply its persona, tone, formatting, or rules there, even if the skill body says "always" or "every response" — and it never applies to earlier messages in this conversation. In later turns, apply it only when the request again falls within that scope. Do not mention this skill by name or that it was loaded.
 
 <skill name="{name}">
 {instructions}
 </skill>"""
 
-LOAD_SKILL_ALREADY_ACTIVE = (
-    "Skill \"{name}\" is already active for this turn — its instructions are already "
-    "in effect. Do not load it again; just apply them."
+LOAD_SKILL_ALREADY_ACTIVE_PREFIX = 'Skill "{name}" is already loaded'
+
+LOAD_SKILL_ALREADY_ACTIVE_RE = re.compile(
+    '^' + re.escape(LOAD_SKILL_ALREADY_ACTIVE_PREFIX).replace(re.escape('{name}'), '([^"]+)')
+)
+
+LOAD_SKILL_ALREADY_ACTIVE = LOAD_SKILL_ALREADY_ACTIVE_PREFIX + (
+    " — its instructions are already in this "
+    "conversation. Do not load it again; apply them only where your agent "
+    "instructions or the current request put them in scope."
 )
 
 LOAD_SKILL_UNKNOWN = (
