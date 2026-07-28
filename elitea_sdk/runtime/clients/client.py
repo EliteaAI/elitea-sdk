@@ -710,6 +710,33 @@ class EliteAClient:
         except Exception as e:
             logger.warning(f"Failed to auto-inject SummarizationMiddleware: {e}")
 
+    def _inject_context_editing(
+        self, middleware_list: list, context_settings: Optional[dict], conversation_id: Optional[str] = None
+    ):
+        """
+        Inject LangChain context editing middleware based on context settings.
+
+        Clears older tool-call outputs once a token threshold is crossed, keeping the
+        most recent tool results. Complements summarization without re-summarizing.
+        """
+        if not context_settings or not conversation_id:
+            return
+
+        # Respect the master Context Management switch
+        if not context_settings.get('enabled', True):
+            return
+
+        if not context_settings.get('enable_context_editing', False):
+            return
+
+        try:
+            from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit
+            middleware_list.append(ContextEditingMiddleware(edits=[ClearToolUsesEdit()]))
+
+            logger.info(f'>>> Context editing middleware injected. ')
+        except Exception as e:
+            logger.warning(f"Failed to auto-inject ContextEditingMiddleware: {e}")
+
     def _inject_sensitive_tool_guard(
         self,
         middleware_list: list,
@@ -805,6 +832,9 @@ class EliteAClient:
 
         # Automatically compresses conversation history when threshold is exceeded
         self._inject_summarization(middleware_list, context_settings, conversation_id)
+
+        # Automatically clears stale tool outputs when a token threshold is exceeded
+        self._inject_context_editing(middleware_list, context_settings, conversation_id)
 
         # Inject sensitive tool authorization guard when configured
         self._inject_sensitive_tool_guard(middleware_list, conversation_id, auto_approve_sensitive_actions)
@@ -1262,6 +1292,9 @@ class EliteAClient:
 
         # Automatically compresses conversation history when a threshold is exceeded
         self._inject_summarization(middleware_list, context_settings, conversation_id)
+
+        # Automatically clears stale tool outputs when a token threshold is exceeded
+        self._inject_context_editing(middleware_list, context_settings, conversation_id)
 
         # Inject sensitive tool authorization guard when configured
         self._inject_sensitive_tool_guard(middleware_list, conversation_id, auto_approve_sensitive_actions)
