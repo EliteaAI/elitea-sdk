@@ -806,7 +806,7 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
-def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None) -> list:
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None, auto_approve_sensitive_actions: bool = False) -> list:
     """
     Process tool configurations and return instantiated tools.
 
@@ -982,6 +982,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         memory=memory,
                         fallback_llm=llm,  # Fallback for embedded sub-agents with null llm_settings
                         user_declined_mcp_servers=user_declined_mcp_servers,
+                        auto_approve_sensitive_actions=auto_approve_sensitive_actions,
                     ).get_tools())
                 except McpAuthorizationRequired:
                     # OAuth authorization required by nested agent's toolkit — propagate so the

@@ -593,17 +593,89 @@ def test_application_toolkit_passes_parent_memory_and_subgraph_flag():
         application_version_id=2,
         is_subgraph=True,
         memory=parent_memory,
+        auto_approve_sensitive_actions=True,
     )
 
     assert len(client.application_calls) == 1
     initial_call = client.application_calls[0]['kwargs']
     assert initial_call['memory'] is parent_memory
     assert initial_call['is_subgraph'] is True
+    assert initial_call['auto_approve_sensitive_actions'] is True
 
     tool = toolkit.get_tools()[0]
     assert tool.is_subgraph is True
     assert tool.args_runnable['memory'] is parent_memory
     assert tool.args_runnable['is_subgraph'] is True
+    assert tool.args_runnable['auto_approve_sensitive_actions'] is True
+
+
+def test_client_application_passes_autoapproval_to_nested_tool_loader():
+    from elitea_sdk.runtime.clients import client as client_module
+
+    client = client_module.EliteAClient.__new__(client_module.EliteAClient)
+    client.get_llm = lambda *args, **kwargs: object()
+    client._inject_summarization = lambda *args, **kwargs: None
+    client._inject_sensitive_tool_guard = lambda *args, **kwargs: None
+    captured = {}
+
+    class CapturingAssistant:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    version_details = {
+        'agent_type': 'agent',
+        'instructions': 'test',
+        'tools': [],
+        'variables': [],
+        'meta': {},
+        'llm_settings': {
+            'model_name': 'fake-model',
+            'max_tokens': 1000,
+            'temperature': 0,
+            'reasoning_effort': None,
+        },
+    }
+
+    with patch.object(client_module, 'LangChainAssistant', CapturingAssistant):
+        client.application(
+            application_id=1,
+            application_version_id=2,
+            version_details=version_details,
+            runtime='nonrunnable',
+            auto_approve_sensitive_actions=True,
+        )
+
+    assert captured['auto_approve_sensitive_actions'] is True
+
+
+def test_assistant_passes_autoapproval_to_application_toolkit():
+    app_tool = {
+        'type': 'application',
+        'name': 'child',
+        'project_id': 7,
+        'agent_type': 'agent',
+        'settings': {
+            'application_id': 1,
+            'application_version_id': 2,
+        },
+    }
+
+    with patch.object(ApplicationToolkit, 'get_toolkit') as get_toolkit:
+        get_toolkit.return_value.get_tools.return_value = []
+        Assistant(
+            elitea=DummyEliteARuntime(),
+            data={
+                'instructions': 'parent',
+                'tools': [app_tool],
+                'internal_tools': [],
+                'meta': {},
+            },
+            client=ChildToolCallingLLM(),
+            app_type='predict',
+            auto_approve_sensitive_actions=True,
+        )
+
+    assert get_toolkit.call_args.kwargs['auto_approve_sensitive_actions'] is True
 
 
 
