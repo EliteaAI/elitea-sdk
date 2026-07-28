@@ -84,15 +84,15 @@ ListBranchesInRepoModel = create_model(
 
 ListFilesModel = create_model(
     "ListFilesModel",
-    path=(Optional[str], Field(description="The path to list files from")),
+    path=(Optional[str], Field(default=None, description="The path to list files from. Defaults to the repository root if omitted.")),
     recursive=(bool, Field(description="Whether to list files recursively", default=True)),
-    branch=(Optional[str], Field(description="The branch to list files from")),
+    branch=(Optional[str], Field(default=None, description="The branch to list files from. Defaults to the active branch if omitted.")),
 )
 ListFoldersModel = create_model(
     "ListFoldersModel",
-    path=(Optional[str], Field(description="The path to list folders from")),
+    path=(Optional[str], Field(default=None, description="The path to list folders from. Defaults to the repository root if omitted.")),
     recursive=(bool, Field(description="Whether to list folders recursively", default=True)),
-    branch=(Optional[str], Field(description="The branch to list folders from")),
+    branch=(Optional[str], Field(default=None, description="The branch to list folders from. Defaults to the active branch if omitted.")),
 )
 GetIssuesModel = create_model(
     "GetIssuesModel",
