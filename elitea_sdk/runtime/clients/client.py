@@ -838,7 +838,8 @@ class EliteAClient:
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
                                       child_dispatcher=child_dispatcher,
-                                      user_declined_mcp_servers=user_declined_mcp_servers)
+                                      user_declined_mcp_servers=user_declined_mcp_servers,
+                                      auto_approve_sensitive_actions=auto_approve_sensitive_actions)
         if runtime == 'langchain':
             return LangChainAssistant(self, data, llm,
                                       chat_history, app_type,
@@ -848,7 +849,8 @@ class EliteAClient:
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
                                       child_dispatcher=child_dispatcher,
-                                      user_declined_mcp_servers=user_declined_mcp_servers).runnable()
+                                      user_declined_mcp_servers=user_declined_mcp_servers,
+                                      auto_approve_sensitive_actions=auto_approve_sensitive_actions).runnable()
         elif runtime == 'llama':
             raise NotImplementedError("LLama runtime is not supported")
 
@@ -1283,7 +1285,8 @@ class EliteAClient:
             persona=persona,
             middleware=middleware_list if middleware_list else None,
             lazy_tools_mode=lazy_tools_mode,
-            child_dispatcher=child_dispatcher
+            child_dispatcher=child_dispatcher,
+            auto_approve_sensitive_actions=auto_approve_sensitive_actions,
         ).runnable()
 
     def _validate_toolkit_config(self, toolkit_config: dict) -> dict:

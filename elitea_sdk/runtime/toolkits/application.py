@@ -122,7 +122,8 @@ class ApplicationToolkit(BaseToolkit):
                     conversation_id: Optional[str] = None, agent_type: str = 'agent',
                     memory: Optional[Any] = None,
                     fallback_llm=None,
-                    user_declined_mcp_servers: Optional[list] = None):
+                    user_declined_mcp_servers: Optional[list] = None,
+                    auto_approve_sensitive_actions: bool = False):
         """
         Get toolkit for an application.
 
@@ -214,7 +215,8 @@ class ApplicationToolkit(BaseToolkit):
                                  mcp_tokens=mcp_tokens,
                                  conversation_id=conversation_id,
                                  version_details=version_details,
-                                 user_declined_mcp_servers=user_declined_mcp_servers)  # Pass version_details to avoid re-fetching
+                                 user_declined_mcp_servers=user_declined_mcp_servers,
+                                 auto_approve_sensitive_actions=auto_approve_sensitive_actions)  # Pass version_details to avoid re-fetching
 
         # Extract icon_meta from version_details meta field
         icon_meta = version_details.get('meta', {}).get('icon_meta', {})
@@ -273,8 +275,8 @@ class ApplicationToolkit(BaseToolkit):
                                           "conversation_id": conversation_id,
                                           "version_details": version_details,  # Include to avoid re-fetching (critical for public project apps)
                                           "user_declined_mcp_servers": user_declined_mcp_servers,
+                                          "auto_approve_sensitive_actions": auto_approve_sensitive_actions,
                                       })])
-            
+
     def get_tools(self):
         return self.tools
-    

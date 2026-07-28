@@ -325,7 +325,8 @@ class Assistant:
                  lazy_tools_mode: Optional[bool] = None,
                  middleware: Optional[list[Middleware]] = None,
                  child_dispatcher: Optional[Any] = None,
-                 user_declined_mcp_servers: Optional[list] = None):
+                 user_declined_mcp_servers: Optional[list] = None,
+                 auto_approve_sensitive_actions: bool = False):
 
         self.app_type = app_type
         self.memory = memory
@@ -477,6 +478,7 @@ class Assistant:
                 pipeline_node_toolkit_names=pipeline_node_toolkit_names,
                 skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
             ),
+            auto_approve_sensitive_actions=auto_approve_sensitive_actions,
         )
         if tools:
             # Deduplicate keeping the last occurrence, scoped per (name, toolkit_name) so that
