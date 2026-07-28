@@ -8,6 +8,7 @@ import requests
 from ..elitea_base import filter_missconfigured_index_tools
 from ..utils import parse_list, check_connection_response
 from ...configurations.jira import JiraConfiguration, _hosting_to_cloud
+from ...configurations.utils import _resolve_api_version
 from ...configurations.pgvector import PgVectorConfiguration
 from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOLKIT_TYPE_META, TOOL_NAME_META
@@ -66,7 +67,12 @@ class JiraToolkit(BaseToolkit):
         def check_connection(self):
             jira_config = self.jira_configuration or {}
             base_url = jira_config.get('base_url', '')
-            url = base_url.rstrip('/') + '/rest/api/2/myself'
+            api_version = _resolve_api_version(
+                getattr(self, 'api_version', None),
+                _hosting_to_cloud(jira_config.get('hosting'), base_url),
+                None,
+            )
+            url = base_url.rstrip('/') + f'/rest/api/{api_version}/myself'
             headers = {'Accept': 'application/json'}
             auth = None
             token = jira_config.get('token')

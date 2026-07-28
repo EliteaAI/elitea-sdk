@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from .utils import (
     _hosting_to_cloud,
+    _resolve_jira_version_candidates,
     _validate_atlassian_hosting_selection,
     _ATLASSIAN_HOSTING_TOOLTIP as _HOSTING_TOOLTIP,
 )  # re-exported for back-compat
@@ -58,6 +59,26 @@ _JIRA_USERNAME_TOOLTIP = (
     "• **Server:** use your Jira login username (e.g., john_smith)\n\n"
     "Not required when using Bearer token authentication."
 )
+
+
+def _pick_failure_to_report(responses):
+    """Choose which failed version probe the user should be told about.
+
+    A 403 names a cause; a 404 only says the probed version is absent, so it
+    ranks last. Ties keep probe order.
+
+    Do not collapse this into an ``or`` chain: ``requests.Response`` is falsy for
+    every error status, so each match would be discarded as it was found.
+    """
+    forbidden = [r for r in responses if r.status_code == 403]
+    if forbidden:
+        return forbidden[0]
+
+    informative = [r for r in responses if r.status_code != 404]
+    if informative:
+        return informative[0]
+
+    return responses[0]
 
 
 class JiraConfiguration(BaseModel):
@@ -115,9 +136,13 @@ class JiraConfiguration(BaseModel):
         """
         Check Jira connection using provided settings.
         Returns None if connection is successful, error message otherwise.
-        
-        Tests authentication by calling the /rest/api/latest/myself endpoint,
-        which returns information about the currently authenticated user.
+
+        Tests authentication by calling the /myself endpoint of the REST API
+        version the credential's hosting resolves to, which returns information
+        about the currently authenticated user.
+
+        Callers holding toolkit-level settings may also pass ``api_version`` to
+        pin the version the toolkit will use.
         """
         import requests
         from requests.auth import HTTPBasicAuth
@@ -183,48 +208,83 @@ class JiraConfiguration(BaseModel):
         # actually lives, but we still return an error — we never silently
         # "fix" the URL on the user's behalf.
 
+        candidates = _resolve_jira_version_candidates(
+            settings.get('hosting'), base_url, settings.get('api_version'),
+        )
+        responses = []
+        reported = None
+
         try:
-            api_endpoint = f"{base_url}/rest/api/latest/myself"
-            response = requests.get(
-                api_endpoint,
-                headers=headers,
-                auth=auth,
-                timeout=10,
-            )
+            for api_version in candidates:
+                api_endpoint = f"{base_url}/rest/api/{api_version}/myself"
+                response = requests.get(
+                    api_endpoint,
+                    headers=headers,
+                    auth=auth,
+                    timeout=10,
+                )
+                responses.append(response)
 
-            if response.status_code == 200:
-                content_type = response.headers.get('Content-Type', '')
-                if 'application/json' not in content_type:
-                    return (
-                        "Invalid Jira base URL: server returned a non-JSON response. "
-                        "Please use the base URL (e.g. 'https://yourinstance.atlassian.net') "
-                        "without any extra path."
-                    )
-                return None  # Success — the URL is correct
+                if response.status_code == 200:
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'application/json' not in content_type:
+                        return (
+                            "Invalid Jira base URL: server returned a non-JSON response. "
+                            "Please use the base URL (e.g. 'https://yourinstance.atlassian.net') "
+                            "without any extra path."
+                        )
+                    if api_version != candidates[0]:
+                        # Only the check falls back, so success here would defer the
+                        # failure to the first tool call. Hosting is not the remedy:
+                        # the value matching this result is the one
+                        # _validate_atlassian_hosting_selection refuses.
+                        return (
+                            f"Connected using REST API v{api_version}, but this Base URL "
+                            f"resolves to v{candidates[0]} — the version the toolkit will "
+                            "use, and the one this instance rejected. "
+                            f"Set the toolkit's API Version to {api_version}."
+                        )
+                    return None  # Success — the URL is correct
 
-            if response.status_code == 401:
-                if has_token:
-                    return "Authentication failed: Invalid bearer token"
-                return "Authentication failed: Invalid username or API key"
+                if response.status_code == 401:
+                    if has_token:
+                        return "Authentication failed: Invalid bearer token"
+                    return "Authentication failed: Invalid username or API key"
+
+                # A version mismatch shows up as one of these; anything else is a
+                # real server-side answer that another version would repeat.
+                if response.status_code not in (400, 403, 404):
+                    reported = response
+                    break
+
+            if reported is None:
+                reported = _pick_failure_to_report(responses)
+            response = reported
+
+            tried = ", ".join(f"v{version}" for version in candidates[:len(responses)])
+            versions = "" if len(responses) == 1 else f" (tried API {tried})"
 
             if response.status_code == 403:
-                return "Access forbidden: Your account has insufficient permissions to access Jira API"
+                return (
+                    "Access forbidden: Your account has insufficient permissions "
+                    f"to access Jira API{versions}"
+                )
 
             if response.status_code == 404:
                 # The exact URL didn't work.  Try to discover the correct
                 # base URL so we can give the user a helpful suggestion.
                 suggested = JiraConfiguration._discover_jira_base_url(
-                    parsed, host, path, headers, auth,
+                    parsed, host, path, headers, auth, candidates[0],
                 )
                 if suggested:
                     return (
                         f"Jira API not found at the URL you entered. "
-                        f"Did you mean '{suggested}'?"
+                        f"Did you mean '{suggested}'?{versions}"
                     )
                 return (
                     "Jira API endpoint not found (404): Verify your base URL "
                     "(e.g. 'https://yourinstance.atlassian.net' or "
-                    "'https://company.com/jira')."
+                    f"'https://company.com/jira').{versions}"
                 )
 
             # Any other status code — extract detail and report
@@ -237,7 +297,7 @@ class JiraConfiguration(BaseModel):
                     error_detail = f": {error_json['message']}"
             except Exception:
                 pass
-            return f"Connection failed with status {response.status_code}{error_detail}"
+            return f"Connection failed with status {response.status_code}{error_detail}{versions}"
 
         except requests.exceptions.SSLError:
             return "SSL certificate verification failed: Check your Jira URL or network settings"
@@ -256,7 +316,7 @@ class JiraConfiguration(BaseModel):
     #  Helper: probe shorter URL prefixes to suggest the correct base URL #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _discover_jira_base_url(parsed, host, path, headers, auth):
+    def _discover_jira_base_url(parsed, host, path, headers, auth, api_version='2'):
         """Try progressively shorter path prefixes to find a working Jira
         REST API root.  Returns the discovered base URL string, or *None*
         if nothing works.
@@ -288,7 +348,7 @@ class JiraConfiguration(BaseModel):
         for candidate in candidates:
             try:
                 resp = requests.get(
-                    f"{candidate}/rest/api/latest/myself",
+                    f"{candidate}/rest/api/{api_version}/myself",
                     headers=headers,
                     auth=auth,
                     timeout=10,

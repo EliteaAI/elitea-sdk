@@ -56,9 +56,10 @@ class JiraClient(Jira):
         Raises:
             ToolException: If credentials are invalid or validation fails
         """
+        api_version = str(getattr(self, 'api_version', '2') or '2')
         try:
             response = self.session.get(
-                f"{self.url}/rest/api/2/myself",
+                f"{self.url}/rest/api/{api_version}/myself",
                 headers={'Accept': 'application/json'},
                 timeout=10
             )
@@ -69,6 +70,14 @@ class JiraClient(Jira):
             elif response.status_code == 403:
                 raise ToolException(
                     "Authentication failed: Access forbidden."
+                )
+            elif response.status_code == 404:
+                # Validating against a version this deployment does not serve
+                # would be indistinguishable from a bad URL, so name the cause.
+                raise ToolException(
+                    f"Jira REST API v{api_version} not found at {self.url}. "
+                    "Check the Hosting setting on the linked credential — "
+                    "Cloud uses v3, Server uses v2."
                 )
             elif response.status_code >= 400:
                 raise ToolException(

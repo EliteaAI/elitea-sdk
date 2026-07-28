@@ -2,6 +2,11 @@
 from typing import Optional
 from urllib.parse import urlparse
 
+# Versions a user may pin, as they appear in request paths and in the toolkit
+# schemas' api_version field.
+JIRA_API_VERSIONS = ('2', '3')
+CONFLUENCE_API_VERSIONS = ('1', '2')
+
 
 def url_host_matches_domain(url: Optional[str], domain: str) -> bool:
     """Return True if *url*'s host is exactly *domain* or a subdomain of it.
@@ -109,7 +114,7 @@ def _resolve_api_version(api_version: Optional[str], cloud: Optional[bool], base
        - *base_url* contains ``.atlassian.net`` → ``'3'``
        - Otherwise (Server / Data Center)  → ``'2'``
     """
-    if api_version and api_version in ('2', '3'):
+    if api_version in JIRA_API_VERSIONS:
         return api_version
     # Auto-resolve
     if cloud is True:
@@ -117,6 +122,34 @@ def _resolve_api_version(api_version: Optional[str], cloud: Optional[bool], base
     if url_host_matches_domain(base_url, 'atlassian.net'):
         return '3'
     return '2'
+
+
+def _resolve_jira_version_candidates(
+    hosting: Optional[str],
+    base_url: Optional[str],
+    api_version: Optional[str] = None,
+) -> list[str]:
+    """Return the Jira REST API versions a connection check should try, in order.
+
+    The preferred version comes from :func:`_resolve_api_version` so the version
+    tested tracks the version the toolkit will use. A fallback is offered only
+    when neither hosting nor api_version was stated, since probing the other
+    version would test something the toolkit will never call.
+
+    ``base_url`` is deliberately withheld from the resolver: :func:`_hosting_to_cloud`
+    has already folded it into ``cloud``, and the resolver inspects the URL
+    independently, so passing it twice resolves an explicit ``'Server'`` on an
+    ``*.atlassian.net`` URL to v3.
+    """
+    cloud = _hosting_to_cloud(hosting, base_url)
+    preferred = _resolve_api_version(api_version, cloud, None)
+
+    hosting_specified = (hosting or '').strip().lower() not in {'', 'auto'}
+    if api_version in JIRA_API_VERSIONS or hosting_specified:
+        return [preferred]
+
+    fallback = '2' if preferred == '3' else '3'
+    return [preferred, fallback]
 
 
 def _resolve_confluence_api_version(api_version: Optional[str], cloud: Optional[bool], base_url: Optional[str]) -> str:
@@ -132,7 +165,7 @@ def _resolve_confluence_api_version(api_version: Optional[str], cloud: Optional[
        - *base_url* contains ``.atlassian.net`` → ``'2'``
        - Otherwise (Server / Data Center)  → ``'1'`` (v2 is Cloud-only)
     """
-    if api_version and api_version in ('1', '2'):
+    if api_version in CONFLUENCE_API_VERSIONS:
         return api_version
     # Auto-resolve
     if cloud is True:
