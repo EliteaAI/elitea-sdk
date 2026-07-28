@@ -1165,7 +1165,11 @@ def create_graph(
                     if not matching_tool:
                         # Check if the toolkit was intentionally skipped due to user declining MCP auth.
                         # In that case the pipeline must terminate cleanly instead of raising.
-                        if node_type == 'mcp' and skipped_pipeline_toolkit_names and toolkit_name in skipped_pipeline_toolkit_names:
+                        if (
+                            node_type in ('mcp', 'toolkit')
+                            and skipped_pipeline_toolkit_names
+                            and toolkit_name in skipped_pipeline_toolkit_names
+                        ):
                             _output_vars = node.get('output', [])
                             lg_builder.add_node(
                                 node_id,
@@ -1298,13 +1302,42 @@ def create_graph(
                 # Check if tools should be bound to this LLM node
                 connected_tools = node.get('tool_names', {})
                 tool_names = []
+                connected_toolkit_names = set()
                 if isinstance(connected_tools, dict):
                     for toolkit, selected_tools in connected_tools.items():
+                        connected_toolkit_names.add(str(toolkit).lower())
                         # Add tool names directly (no prefix)
                         tool_names.extend(selected_tools)
                 elif isinstance(connected_tools, list):
                     # Use provided tool names as-is
                     tool_names = connected_tools
+
+                # When an explicitly connected toolkit cannot load before OAuth, its
+                # real tools are replaced by a deferred authorization gateway. Preserve
+                # that gateway (and the preferred auth control tool) on this LLM node;
+                # otherwise exact-name filtering removes the entire toolkit.
+                if connected_toolkit_names:
+                    auth_gateway_names = []
+                    for tool in tools:
+                        if not isinstance(tool, BaseTool) or not tool.name.startswith('mcp_authorize_'):
+                            continue
+                        metadata = getattr(tool, 'metadata', None) or {}
+                        toolkit_aliases = {
+                            str(metadata.get('toolkit_name') or '').lower(),
+                            str(metadata.get('toolkit_type') or '').lower(),
+                            tool.name[len('mcp_authorize_'):].lower(),
+                        }
+                        toolkit_aliases.discard('')
+                        if connected_toolkit_names.intersection(toolkit_aliases):
+                            auth_gateway_names.append(tool.name)
+                    if auth_gateway_names:
+                        tool_names.extend(auth_gateway_names)
+                        if any(
+                            isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
+                            for tool in tools
+                        ):
+                            tool_names.append('mcp_auth_control')
+                        tool_names = list(dict.fromkeys(tool_names))
 
                 # For non-agent LLM nodes (PIPELINE node without toolkits defined) we don't add any hidden tools by default, to avoid confusion and encourage explicit tool selection
                 available_tools = []

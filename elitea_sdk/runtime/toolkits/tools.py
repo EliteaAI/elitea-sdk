@@ -439,6 +439,7 @@ def _make_mcp_auth_control_tool(
     mcp_tokens: Optional[dict] = None,
     user_declined_mcp_servers: Optional[list] = None,
     ignored_mcp_servers: Optional[list] = None,
+    delegated_auth_errors: Optional[Dict[str, McpAuthorizationRequired]] = None,
 ) -> List[StructuredTool]:
     """Create the mcp_auth_control StructuredTool (and its legacy alias) for the predict path.
 
@@ -450,6 +451,9 @@ def _make_mcp_auth_control_tool(
     The richer version created by indexer_agent (with declined_servers context) takes
     precedence via deduplication in LangChainAssistant.__init__.
     """
+    if delegated_auth_errors is None:
+        delegated_auth_errors = {}
+
     # Build declined-server metadata map keyed by canonical URL so re-prompt loop
     # prevention works correctly when the LLM retries mcp_auth_control after Skip.
     declined = user_declined_mcp_servers or []
@@ -482,19 +486,27 @@ def _make_mcp_auth_control_tool(
     ) -> str:
         normalized_action = (action or "authorize").strip().lower()
         normalized_url = canonical_resource(server_url) if _is_http_url(server_url) else (server_url or "")
+        delegated_auth_error = None
 
         # Resolve symbolic server name (e.g. "atlassian3") to an HTTP URL.
         # "atlassian3" is the toolkit's user-facing label, not the MCP config key.
-        # Step 1: find the toolkit in tool_configs by name/toolkit_name, extract server_name from settings.
+        # Step 1: find the toolkit in tool_configs by name/toolkit_name and resolve its server name.
         # Step 2: look up that server_name in the MCP servers config to get the HTTP URL.
         if not _is_http_url(normalized_url) and normalized_url:
-            # Step 1: find matching toolkit config to get the real server_name
+            delegated_auth_error = delegated_auth_errors.get(normalized_url.lower())
+            if delegated_auth_error and _is_http_url(delegated_auth_error.server_url):
+                normalized_url = canonical_resource(delegated_auth_error.server_url)
+
+            # Step 1: find the matching toolkit config and resolve its real server name.
+            # Prebuilt MCP participants may omit settings.server_name because it is
+            # already encoded in their dynamic type (mcp_<server>).
             _lookup_name = normalized_url
             _lower_lookup = normalized_url.lower()
             for _tc in tool_configs:
                 _tc_name = str(_tc.get("toolkit_name") or _tc.get("name") or "")
                 if _tc_name.lower() == _lower_lookup:
-                    _sn = (_tc.get("settings") or {}).get("server_name")
+                    _tc_settings = _tc.get("settings") or {}
+                    _sn = _infer_server_name(_tc, _tc_settings)
                     if _sn:
                         _lookup_name = _sn
                     break
@@ -658,6 +670,9 @@ def _make_mcp_auth_control_tool(
                     break
 
         # Attempt discovery; raises McpAuthorizationRequired if token is missing/invalid
+        if delegated_auth_error is not None:
+            raise delegated_auth_error
+
         try:
             from ..utils.mcp_tools_discovery import discover_mcp_tools  # pylint: disable=C0415
             discover_mcp_tools(
@@ -864,6 +879,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     tools = []
     unhandled_tools = []  # Track tools not handled by main processing
     _mcp_auth_control_added = False  # Ensure mcp_auth_control is injected at most once
+    _delegated_auth_errors: Dict[str, McpAuthorizationRequired] = {}
 
     for tool in deduplicated_tools:
         # Flag to track if this tool was processed by the main loop
@@ -1144,6 +1160,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                     deduplicated_tools, mcp_tokens=mcp_tokens,
                                     user_declined_mcp_servers=user_declined_mcp_servers,
                                     ignored_mcp_servers=ignored_mcp_servers,
+                                    delegated_auth_errors=_delegated_auth_errors,
                                 ))
                                 _mcp_auth_control_added = True
                         continue
@@ -1231,7 +1248,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         len(mcp_tools),
                     )
                     if mcp_tools and not _mcp_auth_control_added:
-                        tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers, ignored_mcp_servers=ignored_mcp_servers))
+                        tools.extend(_make_mcp_auth_control_tool(
+                            deduplicated_tools,
+                            mcp_tokens=mcp_tokens,
+                            user_declined_mcp_servers=user_declined_mcp_servers,
+                            ignored_mcp_servers=ignored_mcp_servers,
+                            delegated_auth_errors=_delegated_auth_errors,
+                        ))
                         _mcp_auth_control_added = True
                         logger.info("[MCP Auth] Injected mcp_auth_control into predict-path toolset (mcp type)")
                     _inject_display_metadata(tool, mcp_tools)
@@ -1318,6 +1341,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                         deduplicated_tools, mcp_tokens=mcp_tokens,
                                         user_declined_mcp_servers=user_declined_mcp_servers,
                                         ignored_mcp_servers=ignored_mcp_servers,
+                                        delegated_auth_errors=_delegated_auth_errors,
                                     ))
                                     _mcp_auth_control_added = True
                             continue
@@ -1350,7 +1374,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     _annotate_mcp_auth_error(auth_err, tool)
                     _is_pipeline_node = (
                         pipeline_node_toolkit_names is not None
-                        and tool.get('toolkit_name', '') in pipeline_node_toolkit_names
+                        and toolkit_name in pipeline_node_toolkit_names
                     )
                     if _is_pipeline_node:
                         logger.info(
@@ -1365,7 +1389,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         len(toolkit_tools),
                     )
                     if toolkit_tools and not _mcp_auth_control_added:
-                        tools.extend(_make_mcp_auth_control_tool(deduplicated_tools, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers, ignored_mcp_servers=ignored_mcp_servers))
+                        tools.extend(_make_mcp_auth_control_tool(
+                            deduplicated_tools,
+                            mcp_tokens=mcp_tokens,
+                            user_declined_mcp_servers=user_declined_mcp_servers,
+                            ignored_mcp_servers=ignored_mcp_servers,
+                            delegated_auth_errors=_delegated_auth_errors,
+                        ))
                         _mcp_auth_control_added = True
                         logger.info("[MCP Auth] Injected mcp_auth_control into predict-path toolset (mcp_config type)")
                     continue
@@ -1404,11 +1434,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 tool['settings'] = {}
             tool['settings']['tokens'] = mcp_tokens
     # Load unhandled (built-in) toolkits one at a time so an OAuth requirement from a
-    # delegated toolkit (e.g. SharePoint) is isolated: it must NOT abort loading of the
-    # remaining tools, and it must be routed through the SAME deferred-proxy mechanism
-    # used for MCP toolkits. Otherwise the eager McpAuthorizationRequired raised at tool
-    # load time propagates out of get_tools() and the agent re-prompts every turn — so
-    # "Skip" never terminates (issue #5638).
+    # delegated toolkit (e.g. SharePoint) is isolated. LLM-driven toolkits use the same
+    # deferred-proxy mechanism as MCP toolkits; direct Pipeline Toolkit nodes instead
+    # re-raise because they have no LLM loop that can invoke a proxy. This distinction
+    # prevents agent re-prompt loops while preserving construction-time auth for direct
+    # nodes (issues #5638 and #5925).
     _elitea_loaded_count = 0
     for _u_tool in unhandled_tools:
         try:
@@ -1421,17 +1451,72 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             # the frontend — proxy tools are meaningless in that context.
             if mcp_context.reraise_on_auth_required:
                 raise
+            if not getattr(auth_err, "toolkit_type", None):
+                auth_err.toolkit_type = _u_tool.get("type")
+
+            # A direct Pipeline Toolkit node has no LLM loop that can invoke a
+            # deferred authorization gateway. Surface its rich auth exception while
+            # building the application, matching the direct mcp/mcp_config contract.
+            # After Skip, retain a declined proxy for any LLM nodes sharing the
+            # toolkit and mark the direct node for create_graph's clean stop path.
+            _toolkit_aliases = {
+                str(_u_tool.get("toolkit_name") or "").lower(),
+                str(_u_tool.get("name") or "").lower(),
+                str(_u_tool.get("type") or "").lower(),
+            }
+            _toolkit_aliases.discard("")
+            _pipeline_toolkit_name = next(
+                (
+                    name for name in (pipeline_node_toolkit_names or set())
+                    if str(name).lower() in _toolkit_aliases
+                ),
+                None,
+            )
+            _direct_pipeline_was_skipped = False
+            if _pipeline_toolkit_name:
+                _auth_server_url = str(auth_err.server_url or "")
+
+                def _matches_auth_server(value: Any) -> bool:
+                    _value = (
+                        value.get("server_url") or ""
+                        if isinstance(value, dict) else str(value or "")
+                    )
+                    if _is_http_url(_value) and _is_http_url(_auth_server_url):
+                        return canonical_resource(_value) == canonical_resource(_auth_server_url)
+                    return _value.lower() in _toolkit_aliases
+
+                _direct_pipeline_was_skipped = any(
+                    _matches_auth_server(value)
+                    for value in (ignored_mcp_servers or [])
+                ) or any(
+                    _matches_auth_server(value)
+                    for value in (user_declined_mcp_servers or [])
+                )
+                if not _direct_pipeline_was_skipped:
+                    logger.info(
+                        "[Toolkit Auth] Direct pipeline toolkit requires authorization — re-raising"
+                    )
+                    raise
+                if skipped_pipeline_toolkit_names is not None:
+                    skipped_pipeline_toolkit_names.add(_pipeline_toolkit_name)
+
             # Built-in delegated-OAuth toolkit needs browser OAuth. Build deferred proxy
             # tools: when the user has already skipped this server, the proxy returns
             # status="declined" (LLM stops asking); otherwise status="authorization_required"
             # (LLM drives the auth flow via mcp_auth_control). The caught exception already
             # carries the fully-resolved server_url, so declined-matching works without any
             # toolkit-specific URL re-derivation.
-            if not getattr(auth_err, "toolkit_type", None):
-                auth_err.toolkit_type = _u_tool.get("type")
+            for _alias in (
+                _u_tool.get("toolkit_name"),
+                _u_tool.get("name"),
+                _u_tool.get("type"),
+            ):
+                if _alias:
+                    _delegated_auth_errors[str(_alias).lower()] = auth_err
             _proxies = _build_deferred_mcp_auth_tools(
                 _u_tool, auth_err, mcp_tokens=mcp_tokens,
                 user_declined_mcp_servers=user_declined_mcp_servers,
+                force_declined=_direct_pipeline_was_skipped,
                 reraise_on_invoke=True,
             )
             if _proxies:
@@ -1443,6 +1528,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         deduplicated_tools, mcp_tokens=mcp_tokens,
                         user_declined_mcp_servers=user_declined_mcp_servers,
                         ignored_mcp_servers=ignored_mcp_servers,
+                        delegated_auth_errors=_delegated_auth_errors,
                     ))
                     _mcp_auth_control_added = True
                 logger.info(
