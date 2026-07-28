@@ -144,6 +144,21 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         offset: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """
+        Read multiple files in batch, capped both per-file and cumulatively.
+
+        Args:
+            file_paths: List of file paths to read
+            branch: Branch name (None for active branch)
+            offset: Starting line number for all files (1-indexed)
+            limit: Number of lines to read from offset for all files
+
+        Returns:
+            Dict mapping each file path to its content: a plain string, a
+            structured content_too_large object if that file alone exceeds the
+            per-file cap, or a short skip notice once the batch's cumulative
+            cap is reached (remaining files are not fetched at all).
+        """
         # Route through the shared capped batch reader so the cumulative-cap
         # loop lives in one place, not one copy per toolkit.
         return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
