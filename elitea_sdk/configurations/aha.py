@@ -66,6 +66,13 @@ class AhaConfiguration(BaseModel):
             return f"Error connecting to Aha!: {exc}"
 
         if response.status_code == 200:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            user = payload.get("user") if isinstance(payload, dict) else None
+            if not isinstance(user, dict) or not user.get("id"):
+                return "Aha! API returned an unexpected response: verify the base URL"
             return None
         if response.status_code == 401:
             return "Authentication failed: invalid Aha! API token"
