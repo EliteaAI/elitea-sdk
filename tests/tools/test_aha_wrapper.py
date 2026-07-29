@@ -315,6 +315,63 @@ class TestOutputFormat:
         assert projected == [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
 
 
+class TestEmptyResults:
+    @pytest.mark.parametrize(
+        ("record_type", "expected"),
+        [
+            (None, "Aha! API returned no records for query 'missing record'."),
+            (
+                "feature",
+                "Aha! API returned no feature records for query 'missing record'.",
+            ),
+        ],
+    )
+    def test_search_returns_detailed_message(self, record_type, expected):
+        w = _wrapper()
+        resp = _rest_stub(
+            {"records": [], "pagination": {"current_page": 1, "total_pages": 1}}
+        )
+
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.search("missing record", type=record_type)
+
+        assert out == expected
+
+    @pytest.mark.parametrize(
+        ("product_id", "query", "expected"),
+        [
+            (None, None, "Aha! API returned no ideas."),
+            (
+                "EL",
+                None,
+                "Aha! API returned no ideas for product 'EL'.",
+            ),
+            (
+                None,
+                "missing idea",
+                "Aha! API returned no ideas matching query 'missing idea'.",
+            ),
+            (
+                "EL",
+                "missing idea",
+                "Aha! API returned no ideas for product 'EL' matching query 'missing idea'.",
+            ),
+        ],
+    )
+    def test_list_ideas_returns_detailed_message(
+        self, product_id, query, expected
+    ):
+        w = _wrapper()
+        resp = _rest_stub(
+            {"ideas": [], "pagination": {"current_page": 1, "total_pages": 1}}
+        )
+
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.list_ideas(product_id=product_id, q=query)
+
+        assert out == expected
+
+
 class TestToolRegistry:
     def test_registry_exposes_all_tools(self):
         w = _wrapper()
@@ -386,6 +443,17 @@ class TestComments:
             out = w.list_comments("feature", "DEVELOP-1", max_records=10)
         assert req.call_args[0][1].endswith("/features/DEVELOP-1/comments")
         assert out == [{"id": 1}, {"id": 2}]
+
+    def test_list_comments_returns_detailed_message(self):
+        w = _wrapper()
+        resp = _rest_stub(
+            {"comments": [], "pagination": {"current_page": 1, "total_pages": 1}}
+        )
+
+        with patch.object(w._session, "request", return_value=resp):
+            out = w.list_comments("epic", "EL-E-1")
+
+        assert out == "Aha! API returned no comments for epic 'EL-E-1'."
 
 
 class TestManageRecord:
