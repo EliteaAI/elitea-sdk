@@ -1511,12 +1511,16 @@ class AhaApiWrapper(BaseToolApiWrapper):
         filepath: str,
         filename: Optional[str] = None,
     ):
-        """Upload an attachment to an Aha record.
+        """Upload an artifact to an Aha record description or to-do.
 
         ``filepath`` must be an artifact-storage path in
-        ``/{bucket}/{filename}`` format.
+        ``/{bucket}/{filename}`` format. For records, the tool first resolves
+        the description note ID required by Aha's attachments API.
         """
-        plural = self._resource_plural(resource_type)
+        rt = (resource_type or "").strip().lower()
+        plural = self._resource_plural(rt)
+        if not (resource_id or "").strip():
+            raise ToolException("attach_file: resource_id is required")
         if not (filepath or "").strip():
             raise ToolException("attach_file: filepath is required")
 
@@ -1540,14 +1544,28 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 "attach_file: filename could not be resolved from the artifact"
             )
 
-        # Aha multipart form: uses the "attachment[file]" field.
-        files = {"attachment[file]": (resolved_name, content)}
+        if rt in {"to_do", "todo"}:
+            attachment_path = f"tasks/{resource_id}/attachments"
+        else:
+            record_payload = self._rest_get(f"{plural}/{resource_id}")
+            record = record_payload.get(rt) or record_payload
+            description = record.get("description") if isinstance(record, dict) else None
+            note_id = description.get("id") if isinstance(description, dict) else None
+            if not note_id:
+                raise ToolException(
+                    f"attach_file: Aha {rt} '{resource_id}' response does not "
+                    "contain description.id required for attachment upload"
+                )
+            attachment_path = f"notes/{note_id}/attachments"
+
+        # Aha's attachments API requires the ``attachment[data]`` form field.
+        files = {"attachment[data]": (resolved_name, content)}
         # ``requests`` will set the correct multipart Content-Type header
         # automatically when ``files`` is provided; strip the JSON default.
         headers = {"Content-Type": None}
         try:
             response = self._session.post(
-                f"{self._rest_url}/{plural}/{resource_id}/attachments",
+                f"{self._rest_url}/{attachment_path}",
                 files=files,
                 headers=headers,
                 timeout=60,

@@ -944,19 +944,33 @@ class TestAttachFile:
         resp.status_code = 201
         resp.content = b'{"attachment": {"id": 5}}'
         resp.json = lambda: {"attachment": {"id": 5}}
+        record_resp = _rest_stub(
+            {"idea": {"description": {"id": "793547626"}}}
+        )
 
-        with patch.object(w._session, "post", return_value=resp) as post:
+        with (
+            patch.object(
+                w._session,
+                "request",
+                return_value=record_resp,
+            ) as request,
+            patch.object(w._session, "post", return_value=resp) as post,
+        ):
             out = w.attach_file(
                 "idea",
                 "PROD-I-1",
                 "/generated/hello.txt",
             )
 
+        assert request.call_args[0][0] == "GET"
+        assert request.call_args[0][1].endswith("/ideas/PROD-I-1")
         url = post.call_args[0][0]
-        assert url.endswith("/ideas/PROD-I-1/attachments")
+        assert url.endswith("/notes/793547626/attachments")
         assert "files" in post.call_args.kwargs
-        assert post.call_args.kwargs["files"]["attachment[file]"][0] == "hello.txt"
-        assert post.call_args.kwargs["files"]["attachment[file]"][1] == b"hi"
+        assert post.call_args.kwargs["files"]["attachment[data]"][0] == "hello.txt"
+        assert post.call_args.kwargs["files"]["attachment[data]"][1] == b"hi"
+        assert post.call_args.kwargs["headers"] == {"Content-Type": None}
+        assert post.call_args.kwargs["timeout"] == 60
         elitea.artifact.assert_called_once_with("__temp__")
         artifact_client.get_raw_content_by_filepath.assert_called_once_with(
             "/generated/hello.txt"
@@ -971,8 +985,18 @@ class TestAttachFile:
         )
         w = _wrapper(elitea=elitea)
         response = _rest_stub({"attachment": {"id": 6}}, status=201)
+        record_response = _rest_stub(
+            {"feature": {"description": {"id": "12345"}}}
+        )
 
-        with patch.object(w._session, "post", return_value=response) as post:
+        with (
+            patch.object(
+                w._session,
+                "request",
+                return_value=record_response,
+            ),
+            patch.object(w._session, "post", return_value=response) as post,
+        ):
             w.attach_file(
                 "feature",
                 "DEVELOP-1",
@@ -981,9 +1005,55 @@ class TestAttachFile:
             )
 
         assert (
-            post.call_args.kwargs["files"]["attachment[file]"][0]
+            post.call_args.kwargs["files"]["attachment[data]"][0]
             == "renamed.txt"
         )
+
+    def test_to_do_upload_uses_task_attachment_endpoint(self):
+        elitea = MagicMock()
+        elitea.artifact.return_value.get_raw_content_by_filepath.return_value = (
+            b"todo",
+            "todo.txt",
+        )
+        w = _wrapper(elitea=elitea)
+        response = _rest_stub({"attachment": {"id": 7}})
+
+        with (
+            patch.object(w._session, "request") as request,
+            patch.object(w._session, "post", return_value=response) as post,
+        ):
+            out = w.attach_file("to_do", "1041191038", "/bucket/todo.txt")
+
+        request.assert_not_called()
+        assert post.call_args[0][0].endswith(
+            "/tasks/1041191038/attachments"
+        )
+        assert out == {"id": 7}
+
+    def test_record_without_description_id_fails_before_upload(self):
+        elitea = MagicMock()
+        elitea.artifact.return_value.get_raw_content_by_filepath.return_value = (
+            b"data",
+            "file.txt",
+        )
+        w = _wrapper(elitea=elitea)
+        record_response = _rest_stub({"idea": {"description": {}}})
+
+        with (
+            patch.object(
+                w._session,
+                "request",
+                return_value=record_response,
+            ),
+            patch.object(w._session, "post") as post,
+            pytest.raises(
+                ToolException,
+                match=r"response does not contain description.id",
+            ),
+        ):
+            w.attach_file("idea", "PROD-I-1", "/bucket/file.txt")
+
+        post.assert_not_called()
 
     def test_missing_elitea_client_raises_detailed_error(self):
         w = _wrapper()
