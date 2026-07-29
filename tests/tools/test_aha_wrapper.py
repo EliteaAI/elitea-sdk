@@ -450,7 +450,7 @@ class TestManageRecord:
     def test_bad_action_rejected(self):
         w = _wrapper()
         with pytest.raises(
-            ToolException, match="action must be 'create', 'update', or 'delete'"
+            ToolException, match="action must be `create`, `update`, or `delete`"
         ):
             w.manage_record(action="patch", record_type="feature")
 

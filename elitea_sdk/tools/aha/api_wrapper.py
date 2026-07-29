@@ -18,7 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 import requests
 from langchain_core.tools import ToolException
@@ -53,10 +53,21 @@ _RESOURCE_PLURAL: Dict[str, str] = {
     "todo": "to_dos",
 }
 
+def _format_allowed_values(values: Iterable[str]) -> str:
+    quoted = [f"`{value}`" for value in values]
+    if len(quoted) == 1:
+        return quoted[0]
+    return f"{', '.join(quoted[:-1])}, or {quoted[-1]}"
+
+
+_COMMENTABLE_RESOURCE_VALUES = _format_allowed_values(
+    ("feature", "requirement", "idea", "release", "epic", "initiative", "goal", "to_do")
+)
+
 # Record types that ``manage_record`` can create/update/delete via REST.
 # Keep the whitelist tight so the tool cannot silently hit unsupported
 # endpoints. Pages are Aha's "notes" resource and expose full CRUD via REST.
-_MANAGEABLE_RECORD_TYPES = {
+_MANAGEABLE_RECORD_TYPES = (
     "feature",
     "requirement",
     "idea",
@@ -64,7 +75,27 @@ _MANAGEABLE_RECORD_TYPES = {
     "initiative",
     "epic",
     "page",
-}
+)
+_MANAGEABLE_RECORD_VALUES = _format_allowed_values(_MANAGEABLE_RECORD_TYPES)
+
+_MANAGE_ACTIONS = ("create", "update", "delete")
+_MANAGE_ACTION_VALUES = _format_allowed_values(_MANAGE_ACTIONS)
+
+_OUTPUT_FORMATS = ("json", "csv", "markdown")
+_OUTPUT_FORMAT_VALUES = _format_allowed_values(_OUTPUT_FORMATS)
+
+_SEARCHABLE_RECORD_TYPES = (
+    "feature",
+    "requirement",
+    "release",
+    "idea",
+    "epic",
+    "initiative",
+    "product",
+)
+_SEARCHABLE_RECORD_VALUES = _format_allowed_values(_SEARCHABLE_RECORD_TYPES)
+
+_READABLE_RECORD_VALUES = _format_allowed_values(_SEARCHABLE_RECORD_TYPES + ("page",))
 
 # GraphQL query strings — copied from aha-mcp v1.1.0.
 _QUERY_GET_PAGE = """
@@ -121,7 +152,7 @@ OUTPUT_FORMAT_FIELD = (
     Optional[str],
     Field(
         default="json",
-        description="Response format: `json` (default), `csv`, or `markdown`.",
+        description=f"Response format: {_OUTPUT_FORMAT_VALUES}. Defaults to `json`.",
     ),
 )
 FIELDS_FIELD = (
@@ -152,6 +183,10 @@ MAX_RECORDS_FIELD = (
         le=2000,
         description="Total record cap across pagination (stops early once reached).",
     ),
+)
+RESOURCE_TYPE_FIELD = (
+    str,
+    Field(description=f"Aha resource type: {_COMMENTABLE_RESOURCE_VALUES}."),
 )
 
 AhaReferenceInput = create_model(
@@ -297,25 +332,14 @@ AhaGetRequirementGqlInput = create_model(
 
 AhaAddCommentInput = create_model(
     "AhaAddCommentInput",
-    resource_type=(
-        str,
-        Field(
-            description=(
-                "Aha resource type: `feature`, `requirement`, `idea`, `release`, "
-                "`epic`, `initiative`, `goal`, or `to_do`."
-            ),
-        ),
-    ),
+    resource_type=RESOURCE_TYPE_FIELD,
     resource_id=(str, Field(description="Aha reference number or numeric ID of the target record.")),
     body=(str, Field(description="Comment body (HTML or plain text).")),
 )
 
 AhaListCommentsInput = create_model(
     "AhaListCommentsInput",
-    resource_type=(
-        str,
-        Field(description="Aha resource type (see `add_comment` for the accepted values)."),
-    ),
+    resource_type=RESOURCE_TYPE_FIELD,
     resource_id=(str, Field(description="Aha reference number or numeric ID of the target record.")),
     per_page=PER_PAGE_FIELD,
     max_records=MAX_RECORDS_FIELD,
@@ -337,10 +361,7 @@ AhaManageRecordInput = create_model(
     record_type=(
         str,
         Field(
-            description=(
-                "Record type. Accepted: `feature`, `requirement`, `idea`, "
-                "`release`, `initiative`, `epic`, `page`."
-            )
+            description=f"Record type. Accepted: {_MANAGEABLE_RECORD_VALUES}."
         ),
     ),
     record_id=(
@@ -424,16 +445,13 @@ AhaFieldOptionsInput = create_model(
 
 AhaAttachFileInput = create_model(
     "AhaAttachFileInput",
-    resource_type=(
-        str,
-        Field(description="Aha resource type (see `add_comment` for the accepted values)."),
-    ),
+    resource_type=RESOURCE_TYPE_FIELD,
     resource_id=(str, Field(description="Aha reference number or numeric ID of the target record.")),
     filepath=(
         str,
         Field(
             description=(
-                "Local file path to upload. Use ``artifact://<bucket>/<name>`` "
+                "Local file path to upload. Use `artifact://<bucket>/<name>` "
                 "for artifacts stored via the SDK artifact interface."
             ),
         ),
@@ -461,10 +479,7 @@ AhaSearchRecordsInput = create_model(
     record_type=(
         str,
         Field(
-            description=(
-                "Record type to search: `feature`, `requirement`, `release`, "
-                "`idea`, `epic`, `initiative`, or `product`."
-            ),
+            description=f"Record type to search: {_SEARCHABLE_RECORD_VALUES}.",
         ),
     ),
     q=(Optional[str], Field(default=None, description="Free-text search filter.")),
@@ -482,10 +497,7 @@ AhaReadRecordsInput = create_model(
     record_type=(
         str,
         Field(
-            description=(
-                "Record type: `feature`, `requirement`, `release`, `idea`, `epic`, "
-                "`initiative`, `product`, or `page`."
-            ),
+            description=f"Record type: {_READABLE_RECORD_VALUES}.",
         ),
     ),
     reference_or_id=(
@@ -707,13 +719,13 @@ class AhaApiWrapper(BaseToolApiWrapper):
           back to JSON when the shape does not match.
         """
         fmt = (output_format or "json").strip().lower()
-        if fmt == "json":
-            return data
-        if fmt not in {"csv", "markdown"}:
+        if fmt not in _OUTPUT_FORMATS:
             raise ToolException(
                 f"Unsupported output_format '{output_format}'. "
-                "Use 'json', 'csv', or 'markdown'."
+                f"Use {_OUTPUT_FORMAT_VALUES}."
             )
+        if fmt == "json":
+            return data
         if not isinstance(data, list) or not data or not all(isinstance(r, dict) for r in data):
             return data
 
@@ -736,7 +748,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         except ImportError as exc:
             raise ToolException(
                 "Rendering markdown requires the `tabulate` package. "
-                "Install it or use output_format='csv'."
+                "Install it or use `output_format='csv'`."
             ) from exc
 
     # ----- Reference validation -----
@@ -1049,7 +1061,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         if not plural:
             raise ToolException(
                 f"Unsupported Aha resource type '{resource_type}'. "
-                f"Accepted: {', '.join(sorted(set(_RESOURCE_PLURAL))) }"
+                f"Accepted: {_COMMENTABLE_RESOURCE_VALUES}"
             )
         return plural
 
@@ -1132,11 +1144,11 @@ class AhaApiWrapper(BaseToolApiWrapper):
         if rt not in _MANAGEABLE_RECORD_TYPES:
             raise ToolException(
                 f"manage_record does not support record_type '{record_type}'. "
-                f"Accepted: {', '.join(sorted(_MANAGEABLE_RECORD_TYPES))}"
+                f"Accepted: {_MANAGEABLE_RECORD_VALUES}"
             )
-        if act not in {"create", "update", "delete"}:
+        if act not in _MANAGE_ACTIONS:
             raise ToolException(
-                "manage_record: action must be 'create', 'update', or 'delete'"
+                f"manage_record: action must be {_MANAGE_ACTION_VALUES}"
             )
 
         plural = _RESOURCE_PLURAL[rt]
@@ -1189,7 +1201,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         if source != "feature":
             raise ToolException(
                 "create_record_link: Aha REST only supports links originating "
-                "from features (from_record_type='feature')"
+                "from features (`from_record_type='feature'`)"
             )
         target = (to_record_type or "").strip().lower()
         if target not in _RESOURCE_PLURAL:
@@ -1393,7 +1405,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             return self.list_products(updated_since=updated_since, **common)
         raise ToolException(
             f"search_records: unsupported record_type '{record_type}'. "
-            "Accepted: feature, requirement, release, idea, epic, initiative, product."
+            f"Accepted: {_SEARCHABLE_RECORD_VALUES}."
         )
 
     def read_records(
@@ -1427,7 +1439,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             return self.get_page(reference_or_id)
         raise ToolException(
             f"read_records: unsupported record_type '{record_type}'. "
-            "Accepted: feature, requirement, release, initiative, epic, idea, product, page."
+            f"Accepted: {_READABLE_RECORD_VALUES}."
         )
 
     # ----- Tool registry -----
