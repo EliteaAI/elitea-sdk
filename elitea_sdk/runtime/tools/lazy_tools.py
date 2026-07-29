@@ -37,6 +37,9 @@ from collections import defaultdict
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langgraph.errors import GraphBubbleUp
+
+from ..exceptions import budget_exceeded_from
+from ..utils.mcp_oauth import McpAuthorizationRequired
 from pydantic import BaseModel, Field
 
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
@@ -761,10 +764,20 @@ class InvokeToolTool(BaseTool):
             return str(result) if result is not None else "Tool executed successfully (no output)"
         except GraphBubbleUp:
             raise
+        except McpAuthorizationRequired:
+            # Must precede the ToolException clause, which this subclasses. Without
+            # it a lazily-invoked MCP tool never shows the Login button.
+            raise
         except ToolException as e:
+            budget_error = budget_exceeded_from(e)
+            if budget_error is not None:
+                raise budget_error from e
             # Even for ToolException, show the expected schema
             return self._format_invocation_error(toolkit, tool, arguments, str(e))
         except Exception as e:
+            budget_error = budget_exceeded_from(e)
+            if budget_error is not None:
+                raise budget_error from e
             error_msg = str(e)
             logger.error(f"Error invoking {toolkit}.{tool}: {e}", exc_info=True)
             return self._format_invocation_error(toolkit, tool, arguments, error_msg)
@@ -894,9 +907,19 @@ class InvokeToolTool(BaseTool):
             return str(result) if result is not None else "Tool executed successfully (no output)"
         except GraphBubbleUp:
             raise
+        except McpAuthorizationRequired:
+            # Must precede the ToolException clause, which this subclasses. Without
+            # it a lazily-invoked MCP tool never shows the Login button.
+            raise
         except ToolException as e:
+            budget_error = budget_exceeded_from(e)
+            if budget_error is not None:
+                raise budget_error from e
             return self._format_invocation_error(toolkit, tool, arguments, str(e))
         except Exception as e:
+            budget_error = budget_exceeded_from(e)
+            if budget_error is not None:
+                raise budget_error from e
             error_msg = str(e)
             logger.error(f"Error invoking {toolkit}.{tool}: {e}", exc_info=True)
             return self._format_invocation_error(toolkit, tool, arguments, error_msg)

@@ -11,6 +11,8 @@ from langchain_core.messages import ToolCall
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
 from langgraph.errors import GraphBubbleUp
+
+from ..exceptions import budget_exceeded_from
 from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -483,8 +485,12 @@ alita_client = elitea_client
             raise ToolException(str(value_error))
         # save the whole error message to the tool's output
         except Exception as e:
+            # A budget rejection is not a tool-input problem and cannot be retried
+            budget_error = budget_exceeded_from(e)
+            if budget_error is not None:
+                raise budget_error from e
             return {"messages": [
-                {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception. 
+                {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
                         \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}"""}]}
 
     def _run(self, *args, **kwargs):

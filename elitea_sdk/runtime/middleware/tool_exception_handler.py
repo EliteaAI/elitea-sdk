@@ -35,6 +35,7 @@ import logging
 from functools import wraps
 from typing import List, Optional, Dict, Any, Callable
 
+from elitea_sdk.runtime.exceptions import budget_exceeded_from
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langchain_core.language_models import BaseChatModel
@@ -264,6 +265,12 @@ When a tool fails with an error:
                 raise
 
             except Exception as e:
+                # Budget rejections bypass the strategies: TransformErrorStrategy would
+                # spend another LLM call rewriting a policy error into tool output
+                budget_error = budget_exceeded_from(e)
+                if budget_error is not None:
+                    raise budget_error from e
+
                 # Create exception context
                 context = ExceptionContext(
                     tool=tool,
