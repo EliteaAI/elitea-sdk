@@ -34,6 +34,7 @@ from pydantic import (
 from pydantic.fields import PrivateAttr
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils import get_file_bytes_from_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -548,8 +549,9 @@ AhaAttachFileInput = create_model(
         str,
         Field(
             description=(
-                "Local file path to upload. Use `artifact://<bucket>/<name>` "
-                "for artifacts stored via the SDK artifact interface."
+                "File path in `/{bucket}/{filename}` format pointing to the "
+                "artifact to attach. Get this from a file/image generation or "
+                "upload tool response."
             ),
         ),
     ),
@@ -622,6 +624,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     base_url: str
     api_key: SecretStr
+    elitea: Any = Field(default=None, exclude=True)
 
     _session: Optional[requests.Session] = PrivateAttr(default=None)
     _rest_url: str = PrivateAttr(default="")
@@ -1508,45 +1511,61 @@ class AhaApiWrapper(BaseToolApiWrapper):
         filepath: str,
         filename: Optional[str] = None,
     ):
-        """Upload an attachment to an Aha record.
+        """Upload an artifact to an Aha record description or to-do.
 
-        ``filepath`` may be a local path or an ``artifact://bucket/name`` URI
-        resolved via the SDK's artifact interface.
+        ``filepath`` must be an artifact-storage path in
+        ``/{bucket}/{filename}`` format. For records, the tool first resolves
+        the description note ID required by Aha's attachments API.
         """
-        import os
-
-        plural = self._resource_plural(resource_type)
+        rt = (resource_type or "").strip().lower()
+        plural = self._resource_plural(rt)
+        if not (resource_id or "").strip():
+            raise ToolException("attach_file: resource_id is required")
         if not (filepath or "").strip():
             raise ToolException("attach_file: filepath is required")
 
-        content: bytes
-        resolved_name: str
-        if filepath.startswith("artifact://"):
-            try:
-                from ...runtime.utils.artifact import read_artifact  # type: ignore
-            except ImportError as exc:
-                raise ToolException(
-                    "attach_file: artifact:// URIs require the SDK runtime "
-                    "artifact helper — provide a local filepath instead."
-                ) from exc
-            content = read_artifact(filepath)  # returns bytes
-            resolved_name = filename or filepath.rsplit("/", 1)[-1]
-        else:
-            try:
-                with open(filepath, "rb") as fh:
-                    content = fh.read()
-            except OSError as exc:
-                raise ToolException(f"attach_file: cannot read '{filepath}': {exc}") from exc
-            resolved_name = filename or os.path.basename(filepath)
+        try:
+            content, artifact_filename = get_file_bytes_from_artifact(
+                self.elitea,
+                filepath,
+            )
+        except Exception as exc:
+            raise ToolException(
+                f"attach_file: failed to retrieve artifact '{filepath}': {exc}"
+            ) from exc
 
-        # Aha multipart form: uses the "attachment[file]" field.
-        files = {"attachment[file]": (resolved_name, content)}
+        if not content:
+            raise ToolException(
+                f"attach_file: artifact '{filepath}' was not found or is empty"
+            )
+        resolved_name = filename or artifact_filename
+        if not resolved_name:
+            raise ToolException(
+                "attach_file: filename could not be resolved from the artifact"
+            )
+
+        if rt in {"to_do", "todo"}:
+            attachment_path = f"tasks/{resource_id}/attachments"
+        else:
+            record_payload = self._rest_get(f"{plural}/{resource_id}")
+            record = record_payload.get(rt) or record_payload
+            description = record.get("description") if isinstance(record, dict) else None
+            note_id = description.get("id") if isinstance(description, dict) else None
+            if not note_id:
+                raise ToolException(
+                    f"attach_file: Aha {rt} '{resource_id}' response does not "
+                    "contain description.id required for attachment upload"
+                )
+            attachment_path = f"notes/{note_id}/attachments"
+
+        # Aha's attachments API requires the ``attachment[data]`` form field.
+        files = {"attachment[data]": (resolved_name, content)}
         # ``requests`` will set the correct multipart Content-Type header
         # automatically when ``files`` is provided; strip the JSON default.
         headers = {"Content-Type": None}
         try:
             response = self._session.post(
-                f"{self._rest_url}/{plural}/{resource_id}/attachments",
+                f"{self._rest_url}/{attachment_path}",
                 files=files,
                 headers=headers,
                 timeout=60,
