@@ -21,7 +21,7 @@ class McpInspectInput(BaseModel):
 
     resource_type: str = Field(
         default="all",
-        description="What to inspect: 'tools', 'prompts', 'resources', or 'all'"
+        description="What to inspect: `tools`, `prompts`, `resources`, or `all`."
     )
 
 
