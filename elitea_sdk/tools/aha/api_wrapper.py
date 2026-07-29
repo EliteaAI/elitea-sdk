@@ -34,6 +34,7 @@ from pydantic import (
 from pydantic.fields import PrivateAttr
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils import get_file_bytes_from_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -548,8 +549,9 @@ AhaAttachFileInput = create_model(
         str,
         Field(
             description=(
-                "Local file path to upload. Use `artifact://<bucket>/<name>` "
-                "for artifacts stored via the SDK artifact interface."
+                "File path in `/{bucket}/{filename}` format pointing to the "
+                "artifact to attach. Get this from a file/image generation or "
+                "upload tool response."
             ),
         ),
     ),
@@ -622,6 +624,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     base_url: str
     api_key: SecretStr
+    elitea: Any = Field(default=None, exclude=True)
 
     _session: Optional[requests.Session] = PrivateAttr(default=None)
     _rest_url: str = PrivateAttr(default="")
@@ -1510,34 +1513,32 @@ class AhaApiWrapper(BaseToolApiWrapper):
     ):
         """Upload an attachment to an Aha record.
 
-        ``filepath`` may be a local path or an ``artifact://bucket/name`` URI
-        resolved via the SDK's artifact interface.
+        ``filepath`` must be an artifact-storage path in
+        ``/{bucket}/{filename}`` format.
         """
-        import os
-
         plural = self._resource_plural(resource_type)
         if not (filepath or "").strip():
             raise ToolException("attach_file: filepath is required")
 
-        content: bytes
-        resolved_name: str
-        if filepath.startswith("artifact://"):
-            try:
-                from ...runtime.utils.artifact import read_artifact  # type: ignore
-            except ImportError as exc:
-                raise ToolException(
-                    "attach_file: artifact:// URIs require the SDK runtime "
-                    "artifact helper — provide a local filepath instead."
-                ) from exc
-            content = read_artifact(filepath)  # returns bytes
-            resolved_name = filename or filepath.rsplit("/", 1)[-1]
-        else:
-            try:
-                with open(filepath, "rb") as fh:
-                    content = fh.read()
-            except OSError as exc:
-                raise ToolException(f"attach_file: cannot read '{filepath}': {exc}") from exc
-            resolved_name = filename or os.path.basename(filepath)
+        try:
+            content, artifact_filename = get_file_bytes_from_artifact(
+                self.elitea,
+                filepath,
+            )
+        except Exception as exc:
+            raise ToolException(
+                f"attach_file: failed to retrieve artifact '{filepath}': {exc}"
+            ) from exc
+
+        if not content:
+            raise ToolException(
+                f"attach_file: artifact '{filepath}' was not found or is empty"
+            )
+        resolved_name = filename or artifact_filename
+        if not resolved_name:
+            raise ToolException(
+                "attach_file: filename could not be resolved from the artifact"
+            )
 
         # Aha multipart form: uses the "attachment[file]" field.
         files = {"attachment[file]": (resolved_name, content)}

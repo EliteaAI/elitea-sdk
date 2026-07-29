@@ -15,9 +15,10 @@ import pytest
 from langchain_core.tools import ToolException
 from pydantic import SecretStr
 
-from elitea_sdk.tools.aha import AhaToolkit
+from elitea_sdk.tools.aha import AhaToolkit, get_tools as get_aha_tools
 from elitea_sdk.tools.aha.api_wrapper import (
     AhaApiWrapper,
+    AhaAttachFileInput,
     AhaCreateRecordInput,
     AhaDeleteRecordInput,
     AhaListRequirementsInput,
@@ -29,8 +30,15 @@ from elitea_sdk.tools.aha.api_wrapper import (
 )
 
 
-def _wrapper(base_url: str = "https://example.aha.io") -> AhaApiWrapper:
-    return AhaApiWrapper(base_url=base_url, api_key=SecretStr("token"))
+def _wrapper(
+    base_url: str = "https://example.aha.io",
+    **kwargs,
+) -> AhaApiWrapper:
+    return AhaApiWrapper(
+        base_url=base_url,
+        api_key=SecretStr("token"),
+        **kwargs,
+    )
 
 
 def _rest_stub(payload: Dict[str, Any], *, ok: bool = True, status: int = 200, text: str = ""):
@@ -436,6 +444,25 @@ class TestToolRegistry:
         )
 
         assert [tool.name for tool in toolkit.get_tools()] == ["delete_record"]
+
+    def test_runtime_elitea_client_is_injected_into_aha_wrapper(self):
+        elitea = MagicMock()
+        tools = get_aha_tools(
+            {
+                "settings": {
+                    "selected_tools": ["attach_file"],
+                    "aha_configuration": {
+                        "base_url": "https://example.aha.io",
+                        "api_key": SecretStr("token"),
+                    },
+                    "elitea": elitea,
+                },
+                "toolkit_name": "Aha",
+            }
+        )
+
+        assert len(tools) == 1
+        assert tools[0].api_wrapper.elitea is elitea
 
 
 class TestComments:
@@ -895,10 +922,22 @@ class TestFieldsMetadata:
 
 
 class TestAttachFile:
-    def test_uploads_multipart(self, tmp_path):
-        w = _wrapper()
-        f = tmp_path / "hello.txt"
-        f.write_bytes(b"hi")
+    def test_schema_advertises_standard_artifact_filepath(self):
+        description = AhaAttachFileInput.model_json_schema()["properties"][
+            "filepath"
+        ]["description"]
+
+        assert "/{bucket}/{filename}" in description
+        assert "artifact://" not in description
+
+    def test_uploads_artifact_as_multipart(self):
+        elitea = MagicMock()
+        artifact_client = elitea.artifact.return_value
+        artifact_client.get_raw_content_by_filepath.return_value = (
+            b"hi",
+            "hello.txt",
+        )
+        w = _wrapper(elitea=elitea)
 
         resp = MagicMock()
         resp.ok = True
@@ -907,18 +946,56 @@ class TestAttachFile:
         resp.json = lambda: {"attachment": {"id": 5}}
 
         with patch.object(w._session, "post", return_value=resp) as post:
-            out = w.attach_file("feature", "DEVELOP-1", str(f))
+            out = w.attach_file(
+                "idea",
+                "PROD-I-1",
+                "/generated/hello.txt",
+            )
 
         url = post.call_args[0][0]
-        assert url.endswith("/features/DEVELOP-1/attachments")
+        assert url.endswith("/ideas/PROD-I-1/attachments")
         assert "files" in post.call_args.kwargs
         assert post.call_args.kwargs["files"]["attachment[file]"][0] == "hello.txt"
+        assert post.call_args.kwargs["files"]["attachment[file]"][1] == b"hi"
+        elitea.artifact.assert_called_once_with("__temp__")
+        artifact_client.get_raw_content_by_filepath.assert_called_once_with(
+            "/generated/hello.txt"
+        )
         assert out == {"id": 5}
 
-    def test_missing_file_raises(self):
+    def test_filename_override_is_used(self):
+        elitea = MagicMock()
+        elitea.artifact.return_value.get_raw_content_by_filepath.return_value = (
+            b"content",
+            "source.txt",
+        )
+        w = _wrapper(elitea=elitea)
+        response = _rest_stub({"attachment": {"id": 6}}, status=201)
+
+        with patch.object(w._session, "post", return_value=response) as post:
+            w.attach_file(
+                "feature",
+                "DEVELOP-1",
+                "/generated/source.txt",
+                filename="renamed.txt",
+            )
+
+        assert (
+            post.call_args.kwargs["files"]["attachment[file]"][0]
+            == "renamed.txt"
+        )
+
+    def test_missing_elitea_client_raises_detailed_error(self):
         w = _wrapper()
-        with pytest.raises(ToolException, match="cannot read"):
-            w.attach_file("feature", "DEVELOP-1", "/no/such/file.txt")
+
+        with pytest.raises(
+            ToolException,
+            match=(
+                r"failed to retrieve artifact '/bucket/file.txt': "
+                r"EliteA client is required"
+            ),
+        ):
+            w.attach_file("feature", "DEVELOP-1", "/bucket/file.txt")
 
 
 class TestDispatchers:

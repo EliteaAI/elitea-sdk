@@ -17,9 +17,11 @@ name = "aha"
 
 
 def get_tools(tool):
+    settings = tool["settings"]
     return AhaToolkit().get_toolkit(
-        selected_tools=tool["settings"].get("selected_tools", []),
-        aha_configuration=tool["settings"]["aha_configuration"],
+        selected_tools=settings.get("selected_tools", []),
+        aha_configuration=settings["aha_configuration"],
+        elitea=settings.get("elitea"),
         toolkit_name=tool.get("toolkit_name"),
     ).get_tools()
 
