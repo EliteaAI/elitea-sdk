@@ -35,6 +35,7 @@ from ..langchain.utils import (
     normalize_null_tool_call_ids,
     propagate_the_input_mapping,
 )
+from ..exceptions import budget_exceeded_from
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from .hitl import (
@@ -996,6 +997,11 @@ class LLMNode(BaseTool):
         except GraphBubbleUp:
             raise
         except Exception as e:
+            # A budget rejection is a policy outcome with no recovery, so it must not
+            # become message content the graph carries on with
+            budget_error = budget_exceeded_from(e)
+            if budget_error is not None:
+                raise budget_error from e
             model_info = getattr(self.client, 'model_name', None) or getattr(self.client, 'model', 'unknown')
             logger.error(f"Error in LLM Node: {format_exc()}")
             logger.error(f"Model being used: {model_info}")
@@ -2494,6 +2500,11 @@ class LLMNode(BaseTool):
             if isinstance(result, GraphBubbleUp):
                 raise result
             if isinstance(result, BaseException):
+                # Never hand a budget rejection back as tool output: the parent model
+                # would reason about it as data and may retry or paraphrase it
+                budget_error = budget_exceeded_from(result)
+                if budget_error is not None:
+                    raise budget_error from result
                 logger.debug("Parallel sub-agent '%s' failed: %s", tool_name, result)
                 new_messages.append(ToolMessage(
                     content=f"Error executing {tool_name}: {result}",
@@ -2894,6 +2905,12 @@ class LLMNode(BaseTool):
                         # and the nested agent silently fails to show the login prompt.
                         raise
                     except Exception as e:
+                        # Same reasoning as the MCP clause above: swallowing a budget
+                        # rejection here hides it from the user entirely
+                        budget_error = budget_exceeded_from(e)
+                        if budget_error is not None:
+                            _PENDING_TOOL_MESSAGES.set([])
+                            raise budget_error from e
                         import traceback
                         error_details = traceback.format_exc()
                         # Use debug level to avoid duplicate output when CLI callbacks are active
@@ -2949,6 +2966,12 @@ class LLMNode(BaseTool):
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
+                # Checked before the string-matching classification below, which has no
+                # budget bucket and would fall through to the generic append-and-break
+                budget_error = budget_exceeded_from(e)
+                if budget_error is not None:
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise budget_error from e
                 error_str = str(e).lower()
                 
                 # Check for thinking model message format errors

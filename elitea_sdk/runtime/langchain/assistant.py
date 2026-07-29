@@ -6,6 +6,8 @@ from typing import Any, Optional
 from jinja2 import DebugUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from langgraph.errors import GraphBubbleUp
+
+from ..exceptions import budget_exceeded_from
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage, ToolMessage
@@ -1226,6 +1228,11 @@ class Assistant:
                 except GraphBubbleUp:
                     raise
                 except Exception as e:
+                    # Otherwise the rejection returns as a handoff message and the main
+                    # agent reasons about it instead of the run stopping
+                    budget_error = budget_exceeded_from(e)
+                    if budget_error is not None:
+                        raise budget_error from e
                     logger.error(f"[SWARM] Direct invocation of '{agent_name}' failed: {e}", exc_info=True)
                     content = f"Execution failed: {e}"
 
