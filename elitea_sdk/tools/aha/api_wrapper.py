@@ -18,11 +18,19 @@ from __future__ import annotations
 import io
 import logging
 import re
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Annotated, Any, Dict, Iterable, Iterator, List, Optional
 
 import requests
 from langchain_core.tools import ToolException
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, create_model, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    SecretStr,
+    create_model,
+    model_validator,
+)
 from pydantic.fields import PrivateAttr
 
 from ..elitea_base import BaseToolApiWrapper
@@ -333,6 +341,18 @@ AhaGetRequirementGqlInput = create_model(
 
 # ----- M3 write / dispatcher schemas -----
 
+def _normalize_properties_input(value: Any) -> Any:
+    """Accept the empty array emitted by older toolkit forms as an empty map."""
+    if isinstance(value, list) and not value:
+        return {}
+    return value
+
+
+AHA_PROPERTIES_TYPE = Annotated[
+    Dict[str, Any],
+    BeforeValidator(_normalize_properties_input),
+]
+
 AhaAddCommentInput = create_model(
     "AhaAddCommentInput",
     resource_type=RESOURCE_TYPE_FIELD,
@@ -390,12 +410,86 @@ AhaManageRecordInput = create_model(
         ),
     ),
     properties=(
-        Dict[str, Any],
+        AHA_PROPERTIES_TYPE,
         Field(
             default_factory=dict,
             description=(
                 "Field/value map to set on the record. See Aha REST docs for the "
                 "specific fields accepted by each record type."
+            ),
+        ),
+    ),
+)
+
+AhaCreateRecordInput = create_model(
+    "AhaCreateRecordInput",
+    record_type=(
+        str,
+        Field(description=f"Record type to create. Accepted: {_MANAGEABLE_RECORD_VALUES}."),
+    ),
+    parent_id=(
+        str,
+        Field(
+            description=(
+                "Parent scope: release ref for features and epics, product ref "
+                "for ideas/releases/initiatives/pages, or feature ref for requirements."
+            ),
+        ),
+    ),
+    properties=(
+        AHA_PROPERTIES_TYPE,
+        Field(
+            description=(
+                "Field/value map for the new record. Include the fields required "
+                "by Aha for the selected record type, usually at least `name`."
+            ),
+        ),
+    ),
+)
+
+AhaUpdateRecordInput = create_model(
+    "AhaUpdateRecordInput",
+    record_type=(
+        str,
+        Field(description=f"Record type to update. Accepted: {_MANAGEABLE_RECORD_VALUES}."),
+    ),
+    record_id=(
+        str,
+        Field(description="Existing record reference or numeric ID."),
+    ),
+    parent_id=(
+        Optional[str],
+        Field(
+            default=None,
+            description=(
+                "Product reference/ID. Required when updating a release or initiative; "
+                "not used for other record types."
+            ),
+        ),
+    ),
+    properties=(
+        AHA_PROPERTIES_TYPE,
+        Field(description="Field/value map containing the Aha fields to update."),
+    ),
+)
+
+AhaDeleteRecordInput = create_model(
+    "AhaDeleteRecordInput",
+    record_type=(
+        str,
+        Field(description=f"Record type to delete. Accepted: {_MANAGEABLE_RECORD_VALUES}."),
+    ),
+    record_id=(
+        str,
+        Field(description="Existing record reference or numeric ID."),
+    ),
+    parent_id=(
+        Optional[str],
+        Field(
+            default=None,
+            description=(
+                "Product reference/ID. Required when deleting a release or initiative; "
+                "not used for other record types."
             ),
         ),
     ),
@@ -1148,7 +1242,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             ),
         )
 
-    # ----- manage_record: create / update dispatcher -----
+    # ----- record create / update / delete -----
 
     # Parent scope for ``manage_record(action='create', ...)``. The path
     # segment before the plural is the parent resource; the value comes from
@@ -1162,6 +1256,71 @@ class AhaApiWrapper(BaseToolApiWrapper):
         "epic": "releases",
         "page": "products",
     }
+    _SCOPED_MUTATION_PATH: Dict[str, str] = {
+        "release": "products",
+        "initiative": "products",
+    }
+
+    def create_record(
+        self,
+        record_type: str,
+        parent_id: str,
+        properties: Dict[str, Any],
+    ):
+        """Create an Aha record under its required parent scope.
+
+        Parent scoping is release for features and epics, feature for
+        requirements, and product for ideas, releases, initiatives, and pages.
+        ``properties`` must contain the fields required by Aha for the selected
+        record type, usually at least ``name``.
+        """
+        return self.manage_record(
+            action="create",
+            record_type=record_type,
+            parent_id=parent_id,
+            properties=properties,
+        )
+
+    def update_record(
+        self,
+        record_type: str,
+        record_id: str,
+        properties: Dict[str, Any],
+        parent_id: Optional[str] = None,
+    ):
+        """Update fields on an existing Aha record.
+
+        ``parent_id`` is the product reference/ID and is required for releases
+        and initiatives because Aha scopes their mutation endpoints by product.
+        It is not used for other record types.
+        """
+        return self.manage_record(
+            action="update",
+            record_type=record_type,
+            record_id=record_id,
+            parent_id=parent_id,
+            properties=properties,
+        )
+
+    def delete_record(
+        self,
+        record_type: str,
+        record_id: str,
+        parent_id: Optional[str] = None,
+    ):
+        """Delete an existing Aha record.
+
+        ``parent_id`` is the product reference/ID and is required for releases
+        and initiatives because Aha scopes their mutation endpoints by product.
+        It is not used for other record types. Returns a confirmation object
+        after Aha accepts the deletion.
+        """
+        return self.manage_record(
+            action="delete",
+            record_type=record_type,
+            record_id=record_id,
+            parent_id=parent_id,
+        )
 
     def manage_record(
         self,
@@ -1171,18 +1330,20 @@ class AhaApiWrapper(BaseToolApiWrapper):
         parent_id: Optional[str] = None,
         properties: Optional[Dict[str, Any]] = None,
     ):
-        """Create, update, or delete an Aha record.
+        """Legacy combined interface to create, update, or delete an Aha record.
+
+        Prefer ``create_record``, ``update_record``, or ``delete_record`` so
+        each operation can be enabled independently and only relevant inputs
+        are exposed.
 
         - ``action='create'`` inserts under a parent scope. Parent scoping:
           feature → release, requirement → feature, idea → product, release →
           product, initiative → product, epic → release, page → product. The
           parent reference may be passed as ``parent_id`` (preferred) or as
           ``record_id`` (legacy alias).
-        - ``action='update'`` requires ``record_id`` (the record reference to
-          modify).
-        - ``action='delete'`` requires ``record_id``. Returns ``{"deleted":
-          True, ...}`` on success — Aha's DELETE endpoints typically respond
-          with an empty body.
+        - ``action='update'`` and ``action='delete'`` require ``record_id``.
+          Releases and initiatives also require their product reference in
+          ``parent_id`` because those Aha endpoints are product-scoped.
 
         ``properties`` is a dict of Aha field values (e.g. ``{"name": "…",
         "description": "…"}``). See Aha REST docs for field names.
@@ -1207,13 +1368,15 @@ class AhaApiWrapper(BaseToolApiWrapper):
         if act == "update":
             if not record_id:
                 raise ToolException("manage_record update: record_id is required")
-            response = self._rest_put(f"{plural}/{record_id}", json={singular: props})
+            path = self._mutation_path(act, rt, record_id, parent_id)
+            response = self._rest_put(path, json={singular: props})
             return response.get(singular) or response
 
         if act == "delete":
             if not record_id:
                 raise ToolException("manage_record delete: record_id is required")
-            response = self._rest_delete(f"{plural}/{record_id}")
+            path = self._mutation_path(act, rt, record_id, parent_id)
+            response = self._rest_delete(path)
             # Aha returns 204/empty on delete; surface a consistent shape.
             return {"deleted": True, "record_type": rt, "record_id": record_id, **(response or {})}
 
@@ -1230,6 +1393,24 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
         response = self._rest_post(path, json={singular: props})
         return response.get(singular) or response
+
+    def _mutation_path(
+        self,
+        action: str,
+        record_type: str,
+        record_id: str,
+        parent_id: Optional[str],
+    ) -> str:
+        parent_plural = self._SCOPED_MUTATION_PATH.get(record_type)
+        plural = _RESOURCE_PLURAL[record_type]
+        if not parent_plural:
+            return f"{plural}/{record_id}"
+        if not parent_id:
+            raise ToolException(
+                f"manage_record {action} {record_type}: parent_id is required "
+                "(product reference/ID) because Aha scopes this endpoint by product"
+            )
+        return f"{parent_plural}/{parent_id}/{plural}/{record_id}"
 
     # ----- Record links -----
 
@@ -1652,6 +1833,24 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 "description": self.manage_record.__doc__,
                 "args_schema": AhaManageRecordInput,
                 "ref": self.manage_record,
+            },
+            {
+                "name": "create_record",
+                "description": self.create_record.__doc__,
+                "args_schema": AhaCreateRecordInput,
+                "ref": self.create_record,
+            },
+            {
+                "name": "update_record",
+                "description": self.update_record.__doc__,
+                "args_schema": AhaUpdateRecordInput,
+                "ref": self.update_record,
+            },
+            {
+                "name": "delete_record",
+                "description": self.delete_record.__doc__,
+                "args_schema": AhaDeleteRecordInput,
+                "ref": self.delete_record,
             },
             {
                 "name": "create_record_link",

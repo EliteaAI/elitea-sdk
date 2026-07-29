@@ -15,9 +15,14 @@ import pytest
 from langchain_core.tools import ToolException
 from pydantic import SecretStr
 
+from elitea_sdk.tools.aha import AhaToolkit
 from elitea_sdk.tools.aha.api_wrapper import (
     AhaApiWrapper,
+    AhaCreateRecordInput,
+    AhaDeleteRecordInput,
     AhaListRequirementsInput,
+    AhaManageRecordInput,
+    AhaUpdateRecordInput,
     _FEATURE_REF_RE,
     _PAGE_REF_RE,
     _REQUIREMENT_REF_RE,
@@ -396,8 +401,8 @@ class TestToolRegistry:
         w = _wrapper()
         tools = w.get_available_tools()
         names = {t["name"] for t in tools}
-        # 19 M2 read tools + 11 M3 write/dispatcher tools = 30
-        assert len(tools) == 30
+        # 19 M2 read tools + 14 M3 write/dispatcher tools = 33
+        assert len(tools) == 33
         # Spot-check every category
         assert {"get_feature", "list_features", "search", "get_page", "get_feature_gql"} <= names
         assert {"find_project", "search_records", "read_records"} <= names
@@ -405,6 +410,9 @@ class TestToolRegistry:
             "add_comment",
             "list_comments",
             "manage_record",
+            "create_record",
+            "update_record",
+            "delete_record",
             "create_record_link",
             "copy_record",
             "fields_metadata",
@@ -417,6 +425,17 @@ class TestToolRegistry:
         for t in w.get_available_tools():
             assert "name" in t and "description" in t and "args_schema" in t and "ref" in t
             assert callable(t["ref"])
+
+    def test_action_specific_tool_can_be_enabled_independently(self):
+        toolkit = AhaToolkit.get_toolkit(
+            selected_tools=["delete_record"],
+            aha_configuration={
+                "base_url": "https://example.aha.io",
+                "api_key": SecretStr("token"),
+            },
+        )
+
+        assert [tool.name for tool in toolkit.get_tools()] == ["delete_record"]
 
 
 class TestComments:
@@ -476,6 +495,88 @@ class TestComments:
 
 
 class TestManageRecord:
+    def test_action_specific_schemas_only_expose_relevant_fields(self):
+        assert set(AhaCreateRecordInput.model_fields) == {
+            "record_type",
+            "parent_id",
+            "properties",
+        }
+        assert set(AhaUpdateRecordInput.model_fields) == {
+            "record_type",
+            "record_id",
+            "parent_id",
+            "properties",
+        }
+        assert set(AhaDeleteRecordInput.model_fields) == {
+            "record_type",
+            "record_id",
+            "parent_id",
+        }
+
+    @pytest.mark.parametrize(
+        "schema",
+        [AhaManageRecordInput, AhaCreateRecordInput, AhaUpdateRecordInput],
+    )
+    def test_properties_schema_normalizes_legacy_empty_array(self, schema):
+        values = {
+            "record_type": "feature",
+            "record_id": "DEVELOP-1",
+            "parent_id": "DEVELOP-R-1",
+            "properties": [],
+        }
+        if schema is AhaManageRecordInput:
+            values["action"] = "delete"
+
+        assert schema.model_validate(values).properties == {}
+
+    def test_properties_schema_still_rejects_nonempty_array(self):
+        with pytest.raises(ValueError, match="valid dictionary"):
+            AhaUpdateRecordInput.model_validate(
+                {
+                    "record_type": "feature",
+                    "record_id": "DEVELOP-1",
+                    "properties": ["name"],
+                }
+            )
+
+    def test_delete_record_does_not_require_properties(self):
+        parsed = AhaDeleteRecordInput.model_validate(
+            {"record_type": "feature", "record_id": "DEVELOP-1"}
+        )
+
+        assert parsed.record_id == "DEVELOP-1"
+
+    def test_dedicated_create_record_uses_create_route(self):
+        w = _wrapper()
+        resp = _rest_stub({"feature": {"id": 9}})
+        with patch.object(w._session, "request", return_value=resp) as req:
+            out = w.create_record(
+                record_type="feature",
+                parent_id="DEVELOP-R-1",
+                properties={"name": "New feature"},
+            )
+
+        assert req.call_args[0][0] == "POST"
+        assert req.call_args[0][1].endswith(
+            "/releases/DEVELOP-R-1/features"
+        )
+        assert out == {"id": 9}
+
+    def test_dedicated_delete_record_uses_delete_route(self):
+        w = _wrapper()
+        with patch.object(
+            w._session, "request", return_value=_rest_stub({})
+        ) as req:
+            out = w.delete_record("feature", "DEVELOP-1")
+
+        assert req.call_args[0][0] == "DELETE"
+        assert req.call_args[0][1].endswith("/features/DEVELOP-1")
+        assert out == {
+            "deleted": True,
+            "record_type": "feature",
+            "record_id": "DEVELOP-1",
+        }
+
     def test_update_feature_puts_to_features_url(self):
         w = _wrapper()
         resp = _rest_stub({"feature": {"id": 1, "name": "new"}})
@@ -638,19 +739,32 @@ class TestManageRecord:
 
     # ----- update: new record types -----
 
-    def test_update_release_puts_to_releases_url(self):
+    def test_update_release_puts_to_product_scoped_url(self):
         w = _wrapper()
         resp = _rest_stub({"release": {"id": 1, "name": "renamed"}})
         with patch.object(w._session, "request", return_value=resp) as req:
-            w.manage_record(
-                action="update",
+            w.update_record(
                 record_type="release",
                 record_id="DEVELOP-R-1",
+                parent_id="DEVELOP",
                 properties={"name": "renamed"},
             )
         method, url = req.call_args[0][:2]
         assert method == "PUT"
-        assert url.endswith("/releases/DEVELOP-R-1")
+        assert url.endswith("/products/DEVELOP/releases/DEVELOP-R-1")
+
+    def test_update_release_requires_product_scope(self):
+        w = _wrapper()
+
+        with pytest.raises(
+            ToolException,
+            match=r"parent_id is required .*Aha scopes this endpoint by product",
+        ):
+            w.update_record(
+                record_type="release",
+                record_id="DEVELOP-R-1",
+                properties={"name": "renamed"},
+            )
 
     def test_update_epic_puts_to_epics_url(self):
         w = _wrapper()
@@ -664,17 +778,35 @@ class TestManageRecord:
             )
         assert req.call_args[0][1].endswith("/epics/DEVELOP-E-1")
 
-    def test_update_initiative_puts_to_initiatives_url(self):
+    def test_update_initiative_puts_to_product_scoped_url(self):
         w = _wrapper()
         resp = _rest_stub({"initiative": {"id": 3}})
         with patch.object(w._session, "request", return_value=resp) as req:
-            w.manage_record(
-                action="update",
+            w.update_record(
                 record_type="initiative",
-                record_id="DEVELOP-I-1",
+                record_id="DEVELOP-S-1",
+                parent_id="DEVELOP",
                 properties={"description": "d"},
             )
-        assert req.call_args[0][1].endswith("/initiatives/DEVELOP-I-1")
+        assert req.call_args[0][1].endswith(
+            "/products/DEVELOP/initiatives/DEVELOP-S-1"
+        )
+
+    def test_delete_initiative_uses_product_scoped_url(self):
+        w = _wrapper()
+        with patch.object(
+            w._session, "request", return_value=_rest_stub({})
+        ) as req:
+            w.delete_record(
+                record_type="initiative",
+                record_id="DEVELOP-S-1",
+                parent_id="DEVELOP",
+            )
+
+        assert req.call_args[0][0] == "DELETE"
+        assert req.call_args[0][1].endswith(
+            "/products/DEVELOP/initiatives/DEVELOP-S-1"
+        )
 
     def test_update_page_puts_to_pages_url(self):
         w = _wrapper()

@@ -20,7 +20,7 @@ Optional (unlock more targeted tests):
 
 Write lifecycle tests
 ---------------------
-The ``manage_record`` lifecycle tests (create → read → update → delete)
+The record lifecycle tests (create → read → update → delete)
 run only when their parent scope is available:
 
   * feature / epic   need AHA_RELEASE_REF
@@ -303,7 +303,7 @@ def test_configuration_check_connection_rejects_bad_token():
 
 
 # -----------------------------------------------------------------------------
-# manage_record write lifecycle (create → read → update → delete)
+# Action-specific write lifecycle (create → read → update → delete)
 # -----------------------------------------------------------------------------
 #
 # Each test creates a uniquely-named artifact, verifies it, updates it, and
@@ -325,12 +325,21 @@ def _record_ref(record: dict) -> str:
     return str(ref)
 
 
-def _try_delete(wrapper: AhaApiWrapper, record_type: str, ref: str) -> None:
+def _try_delete(
+    wrapper: AhaApiWrapper,
+    record_type: str,
+    ref: str,
+    parent_id: str,
+) -> None:
     """Best-effort delete used in test teardown — swallow all errors."""
     if not ref:
         return
     try:
-        wrapper.manage_record(action="delete", record_type=record_type, record_id=ref)
+        wrapper.delete_record(
+            record_type=record_type,
+            record_id=ref,
+            parent_id=parent_id,
+        )
     except Exception:  # noqa: BLE001 — teardown must not mask the real failure
         pass
 
@@ -346,8 +355,7 @@ def _run_lifecycle(
     created_ref: str = ""
     try:
         try:
-            created = wrapper.manage_record(
-                action="create",
+            created = wrapper.create_record(
                 record_type=record_type,
                 parent_id=parent_id,
                 properties=create_props,
@@ -365,10 +373,10 @@ def _run_lifecycle(
 
         # Update — proves the PUT route works and Aha accepts the payload.
         try:
-            updated = wrapper.manage_record(
-                action="update",
+            updated = wrapper.update_record(
                 record_type=record_type,
                 record_id=created_ref,
+                parent_id=parent_id,
                 properties=update_props,
             )
         except ToolException as exc:
@@ -378,8 +386,10 @@ def _run_lifecycle(
 
         # Delete — proves the DELETE route works.
         try:
-            deleted = wrapper.manage_record(
-                action="delete", record_type=record_type, record_id=created_ref
+            deleted = wrapper.delete_record(
+                record_type=record_type,
+                record_id=created_ref,
+                parent_id=parent_id,
             )
         except ToolException as exc:
             _skip_on_permission_denied(exc)
@@ -389,10 +399,10 @@ def _run_lifecycle(
         # Successful delete — nothing left to clean up in ``finally``.
         created_ref = ""
     finally:
-        _try_delete(wrapper, record_type, created_ref)
+        _try_delete(wrapper, record_type, created_ref, parent_id)
 
 
-def test_manage_record_feature_lifecycle(wrapper):
+def test_record_feature_lifecycle(wrapper):
     release_ref = _skip_without("AHA_RELEASE_REF")
     name = _unique_name("feature")
     _run_lifecycle(
@@ -404,7 +414,7 @@ def test_manage_record_feature_lifecycle(wrapper):
     )
 
 
-def test_manage_record_requirement_lifecycle(wrapper):
+def test_record_requirement_lifecycle(wrapper):
     feature_ref = _skip_without("AHA_FEATURE_REF")
     name = _unique_name("req")
     _run_lifecycle(
@@ -416,7 +426,7 @@ def test_manage_record_requirement_lifecycle(wrapper):
     )
 
 
-def test_manage_record_idea_lifecycle(wrapper):
+def test_record_idea_lifecycle(wrapper):
     product_ref = _skip_without("AHA_PRODUCT_ID")
     name = _unique_name("idea")
     _run_lifecycle(
@@ -430,7 +440,7 @@ def test_manage_record_idea_lifecycle(wrapper):
     )
 
 
-def test_manage_record_release_lifecycle(wrapper):
+def test_record_release_lifecycle(wrapper):
     product_ref = _skip_without("AHA_PRODUCT_ID")
     name = _unique_name("release")
     _run_lifecycle(
@@ -442,7 +452,7 @@ def test_manage_record_release_lifecycle(wrapper):
     )
 
 
-def test_manage_record_initiative_lifecycle(wrapper):
+def test_record_initiative_lifecycle(wrapper):
     product_ref = _skip_without("AHA_PRODUCT_ID")
     name = _unique_name("initiative")
     _run_lifecycle(
@@ -454,7 +464,7 @@ def test_manage_record_initiative_lifecycle(wrapper):
     )
 
 
-def test_manage_record_epic_lifecycle(wrapper):
+def test_record_epic_lifecycle(wrapper):
     release_ref = _skip_without("AHA_RELEASE_REF")
     name = _unique_name("epic")
     _run_lifecycle(
@@ -466,7 +476,7 @@ def test_manage_record_epic_lifecycle(wrapper):
     )
 
 
-def test_manage_record_page_lifecycle(wrapper):
+def test_record_page_lifecycle(wrapper):
     product_ref = _skip_without("AHA_PRODUCT_ID")
     name = _unique_name("page")
     _run_lifecycle(
