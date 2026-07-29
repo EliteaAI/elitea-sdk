@@ -217,7 +217,10 @@ AhaListFeaturesInput = create_model(
 
 AhaListRequirementsInput = create_model(
     "AhaListRequirementsInput",
-    feature_id=(Optional[str], Field(default=None, description="Filter by feature reference/ID.")),
+    feature_id=(
+        str,
+        Field(description="Feature reference/ID that owns the requirements."),
+    ),
     q=(Optional[str], Field(default=None, description="Free-text search filter.")),
     per_page=PER_PAGE_FIELD,
     max_records=MAX_RECORDS_FIELD,
@@ -483,6 +486,13 @@ AhaSearchRecordsInput = create_model(
         ),
     ),
     q=(Optional[str], Field(default=None, description="Free-text search filter.")),
+    feature_id=(
+        Optional[str],
+        Field(
+            default=None,
+            description="Feature reference/ID. Required when record_type is `requirement`.",
+        ),
+    ),
     product_id=(Optional[str], Field(default=None, description="Scope search to a product reference/ID.")),
     release_id=(Optional[str], Field(default=None, description="Scope search to a release reference/ID (features/epics).")),
     updated_since=(Optional[str], Field(default=None, description="ISO-8601 timestamp filter.")),
@@ -909,8 +919,11 @@ class AhaApiWrapper(BaseToolApiWrapper):
         output_format: Optional[str] = "json",
         fields: Optional[List[str]] = None,
     ):
-        """List requirements, optionally scoped to a feature by reference/ID."""
-        path = f"features/{feature_id}/requirements" if feature_id else "requirements"
+        """List requirements owned by a feature reference/ID."""
+        feature_ref = (feature_id or "").strip()
+        if not feature_ref:
+            raise ToolException("list_requirements: feature_id is required")
+        path = f"features/{feature_ref}/requirements"
         records = self._collect(
             path,
             per_page=per_page,
@@ -1399,6 +1412,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         self,
         record_type: str,
         q: Optional[str] = None,
+        feature_id: Optional[str] = None,
         product_id: Optional[str] = None,
         release_id: Optional[str] = None,
         updated_since: Optional[str] = None,
@@ -1429,7 +1443,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 **common,
             )
         if rt == "requirement":
-            return self.list_requirements(q=q, **common)
+            return self.list_requirements(feature_id=feature_id, q=q, **common)
         if rt == "release":
             return self.list_releases(product_id=product_id, **common)
         if rt == "idea":

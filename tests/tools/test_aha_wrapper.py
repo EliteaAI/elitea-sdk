@@ -17,6 +17,7 @@ from pydantic import SecretStr
 
 from elitea_sdk.tools.aha.api_wrapper import (
     AhaApiWrapper,
+    AhaListRequirementsInput,
     _FEATURE_REF_RE,
     _PAGE_REF_RE,
     _REQUIREMENT_REF_RE,
@@ -141,6 +142,24 @@ class TestRest:
         url = req.call_args[0][1]
         assert "releases/R/features" in url
         assert "products/P" not in url
+
+    def test_list_requirements_schema_requires_feature_id(self):
+        assert AhaListRequirementsInput.model_fields["feature_id"].is_required()
+
+    @pytest.mark.parametrize("feature_id", [None, "", "   "])
+    def test_list_requirements_rejects_missing_feature_id_before_request(
+        self, feature_id
+    ):
+        w = _wrapper()
+
+        with patch.object(w._session, "request") as req:
+            with pytest.raises(
+                ToolException,
+                match="list_requirements: feature_id is required",
+            ):
+                w.list_requirements(feature_id=feature_id)
+
+        req.assert_not_called()
 
 
 class TestPagination:
@@ -786,6 +805,25 @@ class TestDispatchers:
         with patch.object(w._session, "request", return_value=resp) as req:
             out = w.search_records(record_type="feature", release_id="R-1", q="foo")
         assert "releases/R-1/features" in req.call_args[0][1]
+        assert out == [{"id": 1}]
+
+    def test_search_records_dispatches_requirement_with_feature_id(self):
+        w = _wrapper()
+        resp = _rest_stub(
+            {
+                "requirements": [{"id": 1}],
+                "pagination": {"current_page": 1, "total_pages": 1},
+            }
+        )
+
+        with patch.object(w._session, "request", return_value=resp) as req:
+            out = w.search_records(
+                record_type="requirement",
+                feature_id="DEVELOP-1",
+                q="foo",
+            )
+
+        assert "features/DEVELOP-1/requirements" in req.call_args[0][1]
         assert out == [{"id": 1}]
 
     def test_search_records_rejects_bad_type(self):
