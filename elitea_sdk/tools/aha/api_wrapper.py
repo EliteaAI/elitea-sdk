@@ -710,6 +710,8 @@ class AhaApiWrapper(BaseToolApiWrapper):
     def _format_output(
         data: Any,
         output_format: Optional[str],
+        *,
+        empty_message: Optional[str] = None,
     ) -> Any:
         """Render ``data`` in the requested format.
 
@@ -717,6 +719,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
           tool layer serialises it to JSON.
         - ``csv`` / ``markdown``: only meaningful for a list-of-dicts. Falls
           back to JSON when the shape does not match.
+        - Empty collections return ``empty_message`` when one is supplied.
         """
         fmt = (output_format or "json").strip().lower()
         if fmt not in _OUTPUT_FORMATS:
@@ -724,6 +727,8 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 f"Unsupported output_format '{output_format}'. "
                 f"Use {_OUTPUT_FORMAT_VALUES}."
             )
+        if data == [] and empty_message:
+            return empty_message
         if fmt == "json":
             return data
         if not isinstance(data, list) or not data or not all(isinstance(r, dict) for r in data):
@@ -977,7 +982,23 @@ class AhaApiWrapper(BaseToolApiWrapper):
         """List ideas, optionally scoped to a product or filtered by free-text `q`."""
         path = f"products/{product_id}/ideas" if product_id else "ideas"
         records = self._collect(path, per_page=per_page, max_records=max_records, q=q)
-        return self._format_output(self._project_records(records, fields), output_format)
+        product_detail = (
+            f" for product {product_id.strip()!r}"
+            if product_id and product_id.strip()
+            else ""
+        )
+        query_detail = (
+            f" matching query {q.strip()!r}"
+            if q and q.strip()
+            else ""
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                f"Aha! API returned no ideas{product_detail}{query_detail}."
+            ),
+        )
 
     def search(
         self,
@@ -994,7 +1015,8 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record ``type`` (``feature``, ``requirement``, ``release``, ``idea``,
         ``epic``, etc.).
         """
-        if not (q or "").strip():
+        query = (q or "").strip()
+        if not query:
             raise ToolException("search: query `q` is required")
         records = self._collect(
             "search",
@@ -1003,7 +1025,15 @@ class AhaApiWrapper(BaseToolApiWrapper):
             q=q,
             type=type,
         )
-        return self._format_output(self._project_records(records, fields), output_format)
+        record_type = (type or "").strip()
+        record_label = f"{record_type} records" if record_type else "records"
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                f"Aha! API returned no {record_label} for query {query!r}."
+            ),
+        )
 
     # ----- GraphQL reads -----
 
@@ -1096,7 +1126,14 @@ class AhaApiWrapper(BaseToolApiWrapper):
             per_page=per_page,
             max_records=max_records,
         )
-        return self._format_output(self._project_records(records, fields), output_format)
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                "Aha! API returned no comments for "
+                f"{resource_type.strip().lower()} {resource_id.strip()!r}."
+            ),
+        )
 
     # ----- manage_record: create / update dispatcher -----
 
