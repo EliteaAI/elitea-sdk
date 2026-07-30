@@ -1,4 +1,5 @@
 import html
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -812,7 +813,10 @@ def test_update_test_run_status_happy_path_numeric_id(monkeypatch):
     values = _patch_execution_statuses(monkeypatch)
     _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=_FakeSubmitTestLogResponse(987))
-    fixed_now = datetime(2026, 7, 30, 17, 50, tzinfo=timezone.utc)
+    fixed_now = datetime(
+        2026, 7, 30, 17, 50, 0, 123456, tzinfo=timezone.utc
+    )
+    expected_end = datetime(2026, 7, 30, 17, 50, tzinfo=timezone.utc)
 
     class FixedDateTime:
         @classmethod
@@ -832,12 +836,16 @@ def test_update_test_run_status_happy_path_numeric_id(monkeypatch):
     assert isinstance(body, swagger_client.ManualTestLogResource)
     assert isinstance(body.status, swagger_client.StatusResource)
     assert body.status.id == values['Passed']
-    assert body.status.name == 'Passed'
-    assert body.status.is_default is False
-    assert body.status.color == '#00cda8'
-    assert body.status.active is True
-    assert body.exe_start_date == fixed_now
-    assert body.exe_end_date == fixed_now
+    assert body.status.name is None
+    assert body.status.is_default is None
+    assert body.status.color is None
+    assert body.status.active is None
+    serialized_body = swagger_client.ApiClient().sanitize_for_serialization(body)
+    assert serialized_body['status'] == {'id': values['Passed']}
+    assert body.exe_start_date == datetime(2026, 7, 30, 17, 49, tzinfo=timezone.utc)
+    assert body.exe_end_date == expected_end
+    assert body.exe_end_date.microsecond == 0
+    assert body.exe_start_date < body.exe_end_date
     assert 'new manual execution log' in result
     assert '987' in result
 
@@ -857,7 +865,7 @@ def test_update_test_run_status_resolves_tr_pid(monkeypatch):
     assert calls[0]['test_run_id'] == 999
 
 
-def test_update_test_run_status_includes_note(monkeypatch):
+def test_update_test_run_status_includes_note_without_logging_content(monkeypatch, caplog):
     import swagger_client
     wrapper = _make_wrapper()
     wrapper._client = None
@@ -866,9 +874,13 @@ def test_update_test_run_status_includes_note(monkeypatch):
     _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=None)
 
+    caplog.set_level(logging.INFO)
     wrapper.update_test_run_status('12345', 'Failed', note='some note')
 
     assert calls[0]['body'].note == 'some note'
+    assert 'some note' not in caplog.text
+    assert "'note': '<redacted>'" in caplog.text
+    assert 'note_present=True' in caplog.text
 
 
 def test_update_test_run_status_invalid_test_run_id_raises_tool_exception(monkeypatch):

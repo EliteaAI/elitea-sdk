@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from traceback import format_exc
 from typing import Any, Optional, Generator, Literal
@@ -2275,8 +2275,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         submit_test_log rejects a bare status name with 400; StatusResource.id must
         be an execution-status id. Those ids live in a dedicated project-level list
         (GET /test-runs/execution-statuses), NOT in the test-run property fields
-        (that is a different id space and yields the 400). Preserve the complete
-        project-specific status definition and match its name case-insensitively.
+        (that is a different id space and yields the 400). Match the project-specific
+        status name case-insensitively, then submit only its id as required by qTest.
         """
         headers = {
             "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
@@ -2285,6 +2285,20 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         statuses = response.json() or []
+        status_summary = [
+            {
+                key: item.get(key)
+                for key in ('id', 'name', 'is_default', 'color', 'active')
+            }
+            for item in statuses
+            if isinstance(item, dict)
+        ]
+        logger.info(
+            "qTest execution-status lookup returned %d status(es) for project %s: %s",
+            len(statuses),
+            self.qtest_project_id,
+            status_summary,
+        )
 
         by_name = {
             item.get('name'): item
@@ -2302,12 +2316,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 None,
             )
         if selected_status is not None:
+            # Keep the generated Swagger model, but serialize only the field that
+            # qTest's submit-log contract accepts. StatusResource defaults
+            # is_default and active to False, so they must be explicitly set to
+            # None or the client adds them to the request even when not supplied.
             return swagger_client.StatusResource(
                 id=selected_status['id'],
-                name=selected_status['name'],
-                is_default=selected_status.get('is_default', False),
-                color=selected_status.get('color'),
-                active=selected_status.get('active', False),
+                is_default=None,
+                active=None,
             )
 
         allowed = ', '.join(sorted(by_name.keys()))
@@ -2334,14 +2350,29 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                     f"{self.qtest_project_id}; a new execution log cannot be submitted."
                 )
 
-            # A status update represents a new, instantaneous manual execution
-            # event. qTest requires both timestamps when submitting the test log.
-            now = datetime.now(timezone.utc)
+            # qTest requires a completed execution interval. Use the current UTC
+            # time as the finish and a short preceding interval as the start.
+            # qTest's manual-log endpoint rejects fractional seconds with a
+            # generic 400 even though other qTest responses may include them.
+            execution_end = datetime.now(timezone.utc).replace(microsecond=0)
+            execution_start = execution_end - timedelta(minutes=1)
             body = swagger_client.ManualTestLogResource(
                 status=status_resource,
-                exe_start_date=now,
-                exe_end_date=now,
+                exe_start_date=execution_start,
+                exe_end_date=execution_end,
                 note=note,
+            )
+            serializer = self._client or swagger_client.ApiClient()
+            payload_for_log = serializer.sanitize_for_serialization(body)
+            if 'note' in payload_for_log:
+                payload_for_log['note'] = '<redacted>'
+            logger.info(
+                "Submitting qTest manual execution log: project_id=%s, "
+                "test_run_id=%s, payload=%s, note_present=%s",
+                self.qtest_project_id,
+                qtest_test_run_id,
+                payload_for_log,
+                note is not None,
             )
 
             test_log_api = self.__instantiate_test_log_api_instance()
