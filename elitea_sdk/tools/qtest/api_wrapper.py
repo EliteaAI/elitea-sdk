@@ -2321,9 +2321,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             # event. qTest requires both timestamps when submitting the test log.
             now = datetime.now(timezone.utc)
             body = swagger_client.ManualTestLogResource(
-                # StatusResource injects unrelated false-valued metadata fields
-                # during serialization; qTest's submit contract only needs the id.
-                status={'id': status_id},
+                status=swagger_client.StatusResource(id=status_id),
                 exe_start_date=now,
                 exe_end_date=now,
                 note=note,

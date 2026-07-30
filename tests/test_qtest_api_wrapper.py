@@ -823,7 +823,8 @@ def test_update_test_run_status_happy_path_numeric_id(monkeypatch):
     assert calls[0]['kwargs'].get('_preload_content') is False
     body = calls[0]['body']
     assert isinstance(body, swagger_client.ManualTestLogResource)
-    assert body.status == {'id': values['Passed']}
+    assert isinstance(body.status, swagger_client.StatusResource)
+    assert body.status.id == values['Passed']
     assert body.exe_start_date == fixed_now
     assert body.exe_end_date == fixed_now
     assert 'new manual execution log' in result
@@ -909,7 +910,7 @@ def test_update_test_run_status_resolves_status_name_to_execution_status_id(monk
 
     wrapper.update_test_run_status('12345', 'Failed')
 
-    assert calls[0]['body'].status == {'id': values['Failed']}
+    assert calls[0]['body'].status.id == values['Failed']
 
 
 def test_update_test_run_status_matches_status_case_insensitively(monkeypatch):
@@ -923,7 +924,7 @@ def test_update_test_run_status_matches_status_case_insensitively(monkeypatch):
 
     wrapper.update_test_run_status('12345', 'passed')
 
-    assert calls[0]['body'].status == {'id': values['Passed']}
+    assert calls[0]['body'].status.id == values['Passed']
 
 
 def test_update_test_run_status_invalid_status_raises_with_allowed_values(monkeypatch):
