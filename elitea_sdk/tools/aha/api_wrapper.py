@@ -972,7 +972,16 @@ class AhaApiWrapper(BaseToolApiWrapper):
             max_records=max_records,
             updated_since=updated_since,
         )
-        return self._format_output(self._project_records(records, fields), output_format)
+        updated_detail = (
+            f" updated since {updated_since.strip()!r}"
+            if updated_since and updated_since.strip()
+            else ""
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=f"Aha! API returned no products{updated_detail}.",
+        )
 
     def list_features(
         self,
@@ -1005,7 +1014,29 @@ class AhaApiWrapper(BaseToolApiWrapper):
             q=q,
             updated_since=updated_since,
         )
-        return self._format_output(self._project_records(records, fields), output_format)
+        scope_detail = (
+            f" for release {release_id.strip()!r}"
+            if release_id and release_id.strip()
+            else (
+                f" for product {product_id.strip()!r}"
+                if product_id and product_id.strip()
+                else ""
+            )
+        )
+        query_detail = f" matching query {q.strip()!r}" if q and q.strip() else ""
+        updated_detail = (
+            f" updated since {updated_since.strip()!r}"
+            if updated_since and updated_since.strip()
+            else ""
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                f"Aha! API returned no features{scope_detail}"
+                f"{query_detail}{updated_detail}."
+            ),
+        )
 
     def list_requirements(
         self,
@@ -1027,7 +1058,15 @@ class AhaApiWrapper(BaseToolApiWrapper):
             max_records=max_records,
             q=q,
         )
-        return self._format_output(self._project_records(records, fields), output_format)
+        query_detail = f" matching query {q.strip()!r}" if q and q.strip() else ""
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                "Aha! API returned no requirements for feature "
+                f"{feature_ref!r}{query_detail}."
+            ),
+        )
 
     def list_releases(
         self,
@@ -1046,7 +1085,24 @@ class AhaApiWrapper(BaseToolApiWrapper):
             max_records=max_records,
             parking_lot=parking_lot,
         )
-        return self._format_output(self._project_records(records, fields), output_format)
+        product_detail = (
+            f" for product {product_id.strip()!r}"
+            if product_id and product_id.strip()
+            else ""
+        )
+        parking_lot_detail = (
+            f" with parking_lot={str(parking_lot).lower()}"
+            if parking_lot is not None
+            else ""
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                f"Aha! API returned no releases{product_detail}"
+                f"{parking_lot_detail}."
+            ),
+        )
 
     def list_initiatives(
         self,
@@ -1059,7 +1115,16 @@ class AhaApiWrapper(BaseToolApiWrapper):
         """List initiatives, optionally scoped to a product."""
         path = f"products/{product_id}/initiatives" if product_id else "initiatives"
         records = self._collect(path, per_page=per_page, max_records=max_records)
-        return self._format_output(self._project_records(records, fields), output_format)
+        product_detail = (
+            f" for product {product_id.strip()!r}"
+            if product_id and product_id.strip()
+            else ""
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=f"Aha! API returned no initiatives{product_detail}.",
+        )
 
     def list_epics(
         self,
@@ -1078,7 +1143,20 @@ class AhaApiWrapper(BaseToolApiWrapper):
         else:
             path = "epics"
         records = self._collect(path, per_page=per_page, max_records=max_records)
-        return self._format_output(self._project_records(records, fields), output_format)
+        scope_detail = (
+            f" for release {release_id.strip()!r}"
+            if release_id and release_id.strip()
+            else (
+                f" for product {product_id.strip()!r}"
+                if product_id and product_id.strip()
+                else ""
+            )
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=f"Aha! API returned no epics{scope_detail}.",
+        )
 
     def list_ideas(
         self,

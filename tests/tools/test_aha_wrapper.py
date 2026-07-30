@@ -349,6 +349,79 @@ class TestOutputFormat:
 
 class TestEmptyResults:
     @pytest.mark.parametrize(
+        ("method_name", "kwargs", "expected"),
+        [
+            ("list_products", {}, "Aha! API returned no products."),
+            (
+                "list_products",
+                {"updated_since": "2026-07-01T00:00:00Z"},
+                "Aha! API returned no products updated since "
+                "'2026-07-01T00:00:00Z'.",
+            ),
+            ("list_features", {}, "Aha! API returned no features."),
+            (
+                "list_features",
+                {
+                    "product_id": "EL",
+                    "release_id": "EL-R-1",
+                    "q": "missing feature",
+                    "updated_since": "2026-07-01T00:00:00Z",
+                },
+                "Aha! API returned no features for release 'EL-R-1' "
+                "matching query 'missing feature' updated since "
+                "'2026-07-01T00:00:00Z'.",
+            ),
+            (
+                "list_features",
+                {"product_id": "EL"},
+                "Aha! API returned no features for product 'EL'.",
+            ),
+            (
+                "list_requirements",
+                {"feature_id": "EL-1"},
+                "Aha! API returned no requirements for feature 'EL-1'.",
+            ),
+            (
+                "list_requirements",
+                {"feature_id": "EL-1", "q": "missing requirement"},
+                "Aha! API returned no requirements for feature 'EL-1' "
+                "matching query 'missing requirement'.",
+            ),
+            ("list_releases", {}, "Aha! API returned no releases."),
+            (
+                "list_releases",
+                {"product_id": "EL", "parking_lot": False},
+                "Aha! API returned no releases for product 'EL' "
+                "with parking_lot=false.",
+            ),
+            (
+                "list_initiatives",
+                {"product_id": "EL"},
+                "Aha! API returned no initiatives for product 'EL'.",
+            ),
+            (
+                "list_epics",
+                {"release_id": "EL-R-1"},
+                "Aha! API returned no epics for release 'EL-R-1'.",
+            ),
+            (
+                "list_epics",
+                {"product_id": "EL"},
+                "Aha! API returned no epics for product 'EL'.",
+            ),
+        ],
+    )
+    def test_list_methods_return_detailed_message(
+        self, method_name, kwargs, expected
+    ):
+        w = _wrapper()
+
+        with patch.object(w, "_collect", return_value=[]):
+            out = getattr(w, method_name)(**kwargs)
+
+        assert out == expected
+
+    @pytest.mark.parametrize(
         ("record_type", "expected"),
         [
             (None, "Aha! API returned no records for query 'missing record'."),
