@@ -2293,7 +2293,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             for item in statuses
             if isinstance(item, dict)
         ]
-        logger.info(
+        logger.debug(
             "qTest execution-status lookup returned %d status(es) for project %s: %s",
             len(statuses),
             self.qtest_project_id,
@@ -2366,7 +2366,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             payload_for_log = serializer.sanitize_for_serialization(body)
             if 'note' in payload_for_log:
                 payload_for_log['note'] = '<redacted>'
-            logger.info(
+            logger.debug(
                 "Submitting qTest manual execution log: project_id=%s, "
                 "test_run_id=%s, payload=%s, note_present=%s",
                 self.qtest_project_id,

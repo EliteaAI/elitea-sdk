@@ -874,7 +874,7 @@ def test_update_test_run_status_includes_note_without_logging_content(monkeypatc
     _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=None)
 
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     wrapper.update_test_run_status('12345', 'Failed', note='some note')
 
     assert calls[0]['body'].note == 'some note'
