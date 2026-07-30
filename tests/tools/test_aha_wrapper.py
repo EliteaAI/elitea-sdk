@@ -17,11 +17,13 @@ from pydantic import SecretStr
 
 from elitea_sdk.tools.aha import AhaToolkit, get_tools as get_aha_tools
 from elitea_sdk.tools.aha.api_wrapper import (
+    AhaAddCommentInput,
     AhaApiWrapper,
     AhaAttachFileInput,
     AhaCreateRecordLinkInput,
     AhaCreateRecordInput,
     AhaDeleteRecordInput,
+    AhaListCommentsInput,
     AhaListRequirementsInput,
     AhaManageRecordInput,
     AhaUpdateRecordInput,
@@ -540,6 +542,29 @@ class TestToolRegistry:
 
 
 class TestComments:
+    def test_schemas_expose_canonical_resource_type_dropdown(self):
+        expected = [
+            "feature",
+            "requirement",
+            "idea",
+            "release",
+            "release_phase",
+            "epic",
+            "initiative",
+            "goal",
+            "page",
+            "to_do",
+        ]
+
+        for schema in (AhaAddCommentInput, AhaListCommentsInput):
+            resource_type = schema.model_json_schema()["properties"][
+                "resource_type"
+            ]
+            assert resource_type["enum"] == expected
+            assert "to_do" in resource_type["description"]
+            assert "todo" not in resource_type["enum"]
+            assert "to-do" not in resource_type["enum"]
+
     def test_add_comment_posts_to_correct_url(self):
         w = _wrapper()
         resp = _rest_stub({"comment": {"id": 1, "body": "hi"}})
@@ -553,13 +578,18 @@ class TestComments:
         assert req.call_args.kwargs["json"] == {"comment": {"body": "hi"}}
         assert out == {"id": 1, "body": "hi"}
 
-    def test_add_comment_supports_todo_alias(self):
+    @pytest.mark.parametrize(
+        "resource_type",
+        ["to_do", "todo", "to-do", "to-dos", "to_dos", "task", "tasks"],
+    )
+    def test_add_comment_routes_todo_aliases_to_tasks(self, resource_type):
         w = _wrapper()
         resp = _rest_stub({"comment": {"id": 2}})
 
         with patch.object(w._session, "request", return_value=resp) as req:
-            w.add_comment("todo", "42", "note")
-        assert req.call_args[0][1].endswith("/to_dos/42/comments")
+            w.add_comment(resource_type, "EL-TODO-3", "note")
+
+        assert req.call_args[0][1].endswith("/tasks/EL-TODO-3/comments")
 
     def test_add_comment_rejects_empty_body(self):
         w = _wrapper()
@@ -570,7 +600,10 @@ class TestComments:
 
     def test_add_comment_rejects_unsupported_resource(self):
         w = _wrapper()
-        with pytest.raises(ToolException, match="Unsupported Aha resource type"):
+        with pytest.raises(
+            ToolException,
+            match="Unsupported Aha comment resource type",
+        ):
             w.add_comment("sprint", "S-1", "hi")
 
     def test_list_comments_paginated(self):
@@ -593,6 +626,37 @@ class TestComments:
             out = w.list_comments("epic", "EL-E-1")
 
         assert out == "Aha! API returned no comments for epic 'EL-E-1'."
+
+    def test_list_todo_comments_returns_detailed_empty_message(self):
+        w = _wrapper()
+        resp = _rest_stub(
+            {"comments": [], "pagination": {"current_page": 1, "total_pages": 0}}
+        )
+
+        with patch.object(w._session, "request", return_value=resp) as req:
+            out = w.list_comments("to_do", "EL-TODO-3")
+
+        assert req.call_args[0][1].endswith("/tasks/EL-TODO-3/comments")
+        assert out == "Aha! API returned no comments for to_do 'EL-TODO-3'."
+
+    def test_todo_html_404_is_sanitized(self):
+        w = _wrapper()
+        html_error = (
+            "<!DOCTYPE html><html><head>"
+            "<title>Aha! | Record not found (404)</title>"
+            "<style>.wrapper-500 { color: #666; }</style>"
+            "</head><body>Record not found</body></html>"
+        )
+        resp = _rest_stub({}, ok=False, status=404, text=html_error)
+
+        with patch.object(w._session, "request", return_value=resp):
+            with pytest.raises(ToolException) as exc_info:
+                w.list_comments("to_do", "EL-TODO-404")
+
+        message = str(exc_info.value)
+        assert "Aha! | Record not found (404)" in message
+        assert "<html" not in message
+        assert "<style>" not in message
 
 
 class TestManageRecord:

@@ -15,6 +15,7 @@ under the hood.
 
 from __future__ import annotations
 
+import html
 import io
 import logging
 import re
@@ -59,9 +60,9 @@ _RESOURCE_PLURAL: Dict[str, str] = {
     "product": "products",
     "goal": "goals",
     "page": "pages",
-    "to_do": "to_dos",
-    "todo": "to_dos",
+    "to_do": "tasks",
 }
+
 
 def _format_allowed_values(values: Iterable[str]) -> str:
     quoted = [f"`{value}`" for value in values]
@@ -70,9 +71,39 @@ def _format_allowed_values(values: Iterable[str]) -> str:
     return f"{', '.join(quoted[:-1])}, or {quoted[-1]}"
 
 
-_COMMENTABLE_RESOURCE_VALUES = _format_allowed_values(
-    ("feature", "requirement", "idea", "release", "epic", "initiative", "goal", "to_do")
+_COMMENTABLE_RESOURCE_TYPES = (
+    "feature",
+    "requirement",
+    "idea",
+    "release",
+    "release_phase",
+    "epic",
+    "initiative",
+    "goal",
+    "page",
+    "to_do",
 )
+_COMMENTABLE_RESOURCE_VALUES = _format_allowed_values(_COMMENTABLE_RESOURCE_TYPES)
+_COMMENT_RESOURCE_ALIASES = {
+    "todo": "to_do",
+    "to-do": "to_do",
+    "to-dos": "to_do",
+    "to_dos": "to_do",
+    "task": "to_do",
+    "tasks": "to_do",
+}
+_CommentResourceType = Literal[
+    "feature",
+    "requirement",
+    "idea",
+    "release",
+    "release_phase",
+    "epic",
+    "initiative",
+    "goal",
+    "page",
+    "to_do",
+]
 
 # Record types that ``manage_record`` can create/update/delete via REST.
 # Keep the whitelist tight so the tool cannot silently hit unsupported
@@ -233,6 +264,15 @@ RESOURCE_TYPE_FIELD = (
     str,
     Field(description=f"Aha resource type: {_COMMENTABLE_RESOURCE_VALUES}."),
 )
+COMMENT_RESOURCE_TYPE_FIELD = (
+    _CommentResourceType,
+    Field(
+        description=(
+            f"Canonical Aha comment resource type: {_COMMENTABLE_RESOURCE_VALUES}. "
+            "Use `to_do` for an Aha to-do; the REST API addresses it as a task."
+        )
+    ),
+)
 
 AhaReferenceInput = create_model(
     "AhaReferenceInput",
@@ -392,14 +432,14 @@ AHA_PROPERTIES_TYPE = Annotated[
 
 AhaAddCommentInput = create_model(
     "AhaAddCommentInput",
-    resource_type=RESOURCE_TYPE_FIELD,
+    resource_type=COMMENT_RESOURCE_TYPE_FIELD,
     resource_id=(str, Field(description="Aha reference number or numeric ID of the target record.")),
     body=(str, Field(description="Comment body (HTML or plain text).")),
 )
 
 AhaListCommentsInput = create_model(
     "AhaListCommentsInput",
-    resource_type=RESOURCE_TYPE_FIELD,
+    resource_type=COMMENT_RESOURCE_TYPE_FIELD,
     resource_id=(str, Field(description="Aha reference number or numeric ID of the target record.")),
     per_page=PER_PAGE_FIELD,
     max_records=MAX_RECORDS_FIELD,
@@ -749,7 +789,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             raise ToolException(f"Aha! REST {method} {path} network error: {exc}") from exc
 
         if not response.ok:
-            body = (response.text or "")[:500]
+            body = self._rest_error_excerpt(response.text or "")
             raise ToolException(
                 f"Aha! REST {method} {path} failed ({response.status_code}): {body}"
             )
@@ -762,6 +802,23 @@ class AhaApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Aha! REST {method} {path} returned non-JSON body"
             ) from exc
+
+    @staticmethod
+    def _rest_error_excerpt(body: str) -> str:
+        """Return a concise error detail without exposing an upstream HTML page."""
+        text = (body or "").strip()
+        if not text:
+            return "empty error response"
+        if re.search(r"<!doctype\s+html|<html\b", text, re.IGNORECASE):
+            title = re.search(
+                r"<title[^>]*>(.*?)</title>",
+                text,
+                re.IGNORECASE | re.DOTALL,
+            )
+            text = title.group(1) if title else re.sub(r"<[^>]+>", " ", text)
+            text = html.unescape(text)
+            text = re.sub(r"\s+", " ", text).strip()
+        return text[:500]
 
     def _rest_get(self, path: str, **params: Any) -> Dict[str, Any]:
         # Filter out None params so we don't send `?foo=None` upstream.
@@ -1331,8 +1388,13 @@ class AhaApiWrapper(BaseToolApiWrapper):
     # ----- Resource-type helpers -----
 
     @classmethod
-    def _resource_plural(cls, resource_type: str) -> str:
+    def _normalize_resource_type(cls, resource_type: str) -> str:
         key = (resource_type or "").strip().lower()
+        return _COMMENT_RESOURCE_ALIASES.get(key, key)
+
+    @classmethod
+    def _resource_plural(cls, resource_type: str) -> str:
+        key = cls._normalize_resource_type(resource_type)
         plural = _RESOURCE_PLURAL.get(key)
         if not plural:
             raise ToolException(
@@ -1341,15 +1403,26 @@ class AhaApiWrapper(BaseToolApiWrapper):
             )
         return plural
 
+    @classmethod
+    def _comment_resource(cls, resource_type: str) -> tuple[str, str]:
+        canonical = cls._normalize_resource_type(resource_type)
+        if canonical not in _COMMENTABLE_RESOURCE_TYPES:
+            raise ToolException(
+                f"Unsupported Aha comment resource type '{resource_type}'. "
+                f"Accepted: {_COMMENTABLE_RESOURCE_VALUES}"
+            )
+        return canonical, _RESOURCE_PLURAL[canonical]
+
     # ----- Comments -----
 
     def add_comment(self, resource_type: str, resource_id: str, body: str):
         """Post a comment on an Aha record.
 
         Supports the record types Aha exposes comments for (features,
-        requirements, ideas, releases, epics, initiatives, goals, to-dos).
+        requirements, ideas, releases, release phases, epics, initiatives,
+        goals, pages, and to-dos). Use ``resource_type='to_do'`` for a to-do.
         """
-        plural = self._resource_plural(resource_type)
+        _, plural = self._comment_resource(resource_type)
         if not (body or "").strip():
             raise ToolException("add_comment: comment body is required")
         payload = {"comment": {"body": body}}
@@ -1366,7 +1439,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         fields: Optional[List[str]] = None,
     ):
         """List comments on an Aha record (paginated)."""
-        plural = self._resource_plural(resource_type)
+        canonical, plural = self._comment_resource(resource_type)
         records = self._collect(
             f"{plural}/{resource_id}/comments",
             per_page=per_page,
@@ -1377,7 +1450,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             output_format,
             empty_message=(
                 "Aha! API returned no comments for "
-                f"{resource_type.strip().lower()} {resource_id.strip()!r}."
+                f"{canonical} {resource_id.strip()!r}."
             ),
         )
 
@@ -1728,7 +1801,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         ``/{bucket}/{filename}`` format. For records, the tool first resolves
         the description note ID required by Aha's attachments API.
         """
-        rt = (resource_type or "").strip().lower()
+        rt = self._normalize_resource_type(resource_type)
         plural = self._resource_plural(rt)
         if not (resource_id or "").strip():
             raise ToolException("attach_file: resource_id is required")
@@ -1755,7 +1828,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 "attach_file: filename could not be resolved from the artifact"
             )
 
-        if rt in {"to_do", "todo"}:
+        if rt == "to_do":
             attachment_path = f"tasks/{resource_id}/attachments"
         else:
             record_payload = self._rest_get(f"{plural}/{resource_id}")
