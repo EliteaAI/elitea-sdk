@@ -1112,19 +1112,73 @@ class TestCreateRecordLink:
 
         req.assert_not_called()
 
-    def test_goal_reference_requires_numeric_id(self):
+    def test_resolves_goal_reference_before_link_creation(self):
+        w = _wrapper()
+        responses = [
+            _rest_stub(
+                {
+                    "goals": [
+                        {
+                            "id": "3003",
+                            "reference_num": "PROD-G-2",
+                        }
+                    ],
+                    "pagination": {
+                        "current_page": 1,
+                        "total_pages": 1,
+                    },
+                }
+            ),
+            _rest_stub({"epic": {"id": "2002", "reference_num": "PROD-E-1"}}),
+            _rest_stub({}),
+        ]
+
+        with patch.object(w._session, "request", side_effect=responses) as req:
+            out = w.create_record_link(
+                from_record_type="goal",
+                from_id="PROD-G-2",
+                to_record_type="epic",
+                to_id="PROD-E-1",
+                link_type=10,
+            )
+
+        assert [call.args[0] for call in req.call_args_list] == [
+            "GET",
+            "GET",
+            "POST",
+        ]
+        assert req.call_args_list[0].args[1].endswith("/goals")
+        assert req.call_args_list[0].kwargs["params"] == {
+            "page": 1,
+            "per_page": 100,
+        }
+        assert req.call_args_list[1].args[1].endswith("/epics/PROD-E-1")
+        assert req.call_args_list[2].args[1].endswith(
+            "/goals/3003/record_links"
+        )
+        assert req.call_args_list[2].kwargs["json"] == {
+            "record_link": {
+                "record_type": "epic",
+                "record_id": 2002,
+                "link_type": 10,
+            }
+        }
+        assert out["from_reference_or_id"] == "PROD-G-2"
+        assert out["from_record_id"] == "3003"
+
+    def test_release_phase_reference_requires_numeric_id(self):
         w = _wrapper()
 
         with patch.object(w._session, "request") as req:
             with pytest.raises(
                 ToolException,
-                match="target goal requires a numeric ID",
+                match="target release_phase requires a numeric ID",
             ):
                 w.create_record_link(
                     from_record_type="feature",
                     from_id="1001",
-                    to_record_type="goal",
-                    to_id="GOAL-1",
+                    to_record_type="release_phase",
+                    to_id="PHASE-1",
                     link_type=10,
                 )
 

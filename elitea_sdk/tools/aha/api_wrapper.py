@@ -587,7 +587,8 @@ AhaCreateRecordLinkInput = create_model(
         Field(
             description=(
                 "Source record reference or numeric ID. References are resolved "
-                "to Aha's internal numeric ID before creating the link."
+                "to Aha's internal numeric ID before creating the link. Release "
+                "phases require numeric IDs."
             )
         ),
     ),
@@ -604,7 +605,8 @@ AhaCreateRecordLinkInput = create_model(
         Field(
             description=(
                 "Target record reference or numeric ID. References are resolved "
-                "to Aha's internal numeric ID before creating the link."
+                "to Aha's internal numeric ID before creating the link. Release "
+                "phases require numeric IDs."
             )
         ),
     ),
@@ -1715,7 +1717,20 @@ class AhaApiWrapper(BaseToolApiWrapper):
             )
         if reference_or_id.isdigit():
             return reference_or_id
-        if record_type in {"goal", "release_phase"}:
+        if record_type == "goal":
+            for record in self._paginate("goals", per_page=100):
+                reference_num = str(record.get("reference_num", "")).strip()
+                if reference_num.casefold() != reference_or_id.casefold():
+                    continue
+                resolved_id = str(record.get("id", "")).strip()
+                if resolved_id.isdigit():
+                    return resolved_id
+                break
+            raise ToolException(
+                f"create_record_link: Aha! returned no goal with reference "
+                f"{reference_or_id!r} and an internal numeric ID"
+            )
+        if record_type == "release_phase":
             raise ToolException(
                 f"create_record_link: {role} {record_type} requires a numeric "
                 f"ID; received {reference_or_id!r}"
