@@ -19,6 +19,7 @@ from elitea_sdk.tools.aha import AhaToolkit, get_tools as get_aha_tools
 from elitea_sdk.tools.aha.api_wrapper import (
     AhaApiWrapper,
     AhaAttachFileInput,
+    AhaCreateRecordLinkInput,
     AhaCreateRecordInput,
     AhaDeleteRecordInput,
     AhaListRequirementsInput,
@@ -922,34 +923,148 @@ class TestManageRecord:
 
 
 class TestCreateRecordLink:
-    def test_from_feature_to_feature(self):
-        w = _wrapper()
-        resp = _rest_stub({"record_link": {"id": 1}})
-        with patch.object(w._session, "request", return_value=resp) as req:
-            w.create_record_link(
-                from_record_type="feature",
-                from_id="DEVELOP-1",
-                to_record_type="feature",
-                to_id="DEVELOP-2",
-                link_type="blocks",
-            )
-        method, url = req.call_args[0][:2]
-        assert method == "POST"
-        assert url.endswith("/features/DEVELOP-1/record_links")
-        body = req.call_args.kwargs["json"]
-        assert body["record_link"]["linkable_type"] == "Feature"
-        assert body["record_link"]["linkable_id"] == "DEVELOP-2"
-        assert body["record_link"]["link_type"] == "blocks"
+    def test_schema_exposes_documented_record_and_link_types(self):
+        schema = AhaCreateRecordLinkInput.model_json_schema()
 
-    def test_rejects_non_feature_source(self):
+        assert set(schema["properties"]["from_record_type"]["enum"]) == {
+            "feature",
+            "release",
+            "idea",
+            "epic",
+            "release_phase",
+            "initiative",
+            "page",
+            "goal",
+        }
+        assert schema["properties"]["to_record_type"]["enum"] == schema[
+            "properties"
+        ]["from_record_type"]["enum"]
+        assert schema["properties"]["link_type"]["enum"] == [
+            10,
+            20,
+            30,
+            40,
+            50,
+            60,
+            80,
+        ]
+        assert "link_type" in schema["required"]
+
+    def test_resolves_references_and_posts_documented_payload(self):
         w = _wrapper()
-        with pytest.raises(ToolException, match="from features"):
-            w.create_record_link(
-                from_record_type="idea",
-                from_id="I-1",
-                to_record_type="feature",
-                to_id="F-1",
+        responses = [
+            _rest_stub({"feature": {"id": "1001", "reference_num": "PROD-5"}}),
+            _rest_stub({"epic": {"id": "2002", "reference_num": "PROD-E-1"}}),
+            _rest_stub({}),
+        ]
+
+        with patch.object(w._session, "request", side_effect=responses) as req:
+            out = w.create_record_link(
+                from_record_type="feature",
+                from_id="PROD-5",
+                to_record_type="epic",
+                to_id="PROD-E-1",
+                link_type=10,
             )
+
+        assert [call.args[0] for call in req.call_args_list] == [
+            "GET",
+            "GET",
+            "POST",
+        ]
+        assert req.call_args_list[0].args[1].endswith("/features/PROD-5")
+        assert req.call_args_list[1].args[1].endswith("/epics/PROD-E-1")
+        assert req.call_args_list[2].args[1].endswith(
+            "/features/1001/record_links"
+        )
+        assert req.call_args_list[2].kwargs["json"] == {
+            "record_link": {
+                "record_type": "epic",
+                "record_id": 2002,
+                "link_type": 10,
+            }
+        }
+        assert out == {
+            "created": True,
+            "from_record_type": "feature",
+            "from_reference_or_id": "PROD-5",
+            "from_record_id": "1001",
+            "to_record_type": "epic",
+            "to_reference_or_id": "PROD-E-1",
+            "to_record_id": "2002",
+            "link_type": 10,
+            "link_type_name": "relates to",
+        }
+
+    def test_numeric_ids_post_without_resolution_requests(self):
+        w = _wrapper()
+        resp = _rest_stub({"record_link": {"id": "3003"}})
+
+        with patch.object(w._session, "request", return_value=resp) as req:
+            out = w.create_record_link(
+                from_record_type="page",
+                from_id="1001",
+                to_record_type="feature",
+                to_id="2002",
+                link_type=20,
+            )
+
+        assert req.call_count == 1
+        assert req.call_args.args[0] == "POST"
+        assert req.call_args.args[1].endswith("/pages/1001/record_links")
+        assert req.call_args.kwargs["json"] == {
+            "record_link": {
+                "record_type": "feature",
+                "record_id": 2002,
+                "link_type": 20,
+            }
+        }
+        assert out == {"id": "3003"}
+
+    @pytest.mark.parametrize(
+        ("argument", "value", "message"),
+        [
+            ("from_record_type", "requirement", "unsupported from_record_type"),
+            ("to_record_type", "product", "unsupported to_record_type"),
+            ("link_type", 70, "unsupported link_type"),
+        ],
+    )
+    def test_rejects_unsupported_contract_values(
+        self, argument, value, message
+    ):
+        w = _wrapper()
+        kwargs = {
+            "from_record_type": "feature",
+            "from_id": "1001",
+            "to_record_type": "epic",
+            "to_id": "2002",
+            "link_type": 10,
+        }
+        kwargs[argument] = value
+
+        with patch.object(w._session, "request") as req:
+            with pytest.raises(ToolException, match=message):
+                w.create_record_link(**kwargs)
+
+        req.assert_not_called()
+
+    def test_goal_reference_requires_numeric_id(self):
+        w = _wrapper()
+
+        with patch.object(w._session, "request") as req:
+            with pytest.raises(
+                ToolException,
+                match="target goal requires a numeric ID",
+            ):
+                w.create_record_link(
+                    from_record_type="feature",
+                    from_id="1001",
+                    to_record_type="goal",
+                    to_id="GOAL-1",
+                    link_type=10,
+                )
+
+        req.assert_not_called()
 
 
 class TestCopyRecord:
