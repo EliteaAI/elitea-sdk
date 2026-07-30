@@ -18,7 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import re
-from typing import Annotated, Any, Dict, Iterable, Iterator, List, Optional
+from typing import Annotated, Any, Dict, Iterable, Iterator, List, Literal, Optional
 
 import requests
 from langchain_core.tools import ToolException
@@ -53,6 +53,7 @@ _RESOURCE_PLURAL: Dict[str, str] = {
     "requirement": "requirements",
     "idea": "ideas",
     "release": "releases",
+    "release_phase": "release_phases",
     "epic": "epics",
     "initiative": "initiatives",
     "product": "products",
@@ -105,6 +106,41 @@ _SEARCHABLE_RECORD_TYPES = (
 _SEARCHABLE_RECORD_VALUES = _format_allowed_values(_SEARCHABLE_RECORD_TYPES)
 
 _READABLE_RECORD_VALUES = _format_allowed_values(_SEARCHABLE_RECORD_TYPES + ("page",))
+
+_RECORD_LINK_RECORD_TYPES = (
+    "feature",
+    "release",
+    "idea",
+    "epic",
+    "release_phase",
+    "initiative",
+    "page",
+    "goal",
+)
+_RECORD_LINK_RECORD_VALUES = _format_allowed_values(_RECORD_LINK_RECORD_TYPES)
+_RECORD_LINK_TYPE_LABELS = {
+    10: "relates to",
+    20: "depends on",
+    30: "duplicated by",
+    40: "contained by",
+    50: "impacted by",
+    60: "blocked by",
+    80: "research for",
+}
+_RECORD_LINK_TYPE_VALUES = ", ".join(
+    f"`{code}` ({label})" for code, label in _RECORD_LINK_TYPE_LABELS.items()
+)
+_RecordLinkRecordType = Literal[
+    "feature",
+    "release",
+    "idea",
+    "epic",
+    "release_phase",
+    "initiative",
+    "page",
+    "goal",
+]
+_RecordLinkType = Literal[10, 20, 30, 40, 50, 60, 80]
 
 # GraphQL query strings — copied from aha-mcp v1.1.0.
 _QUERY_GET_PAGE = """
@@ -499,22 +535,44 @@ AhaDeleteRecordInput = create_model(
 AhaCreateRecordLinkInput = create_model(
     "AhaCreateRecordLinkInput",
     from_record_type=(
-        str,
-        Field(description="Source record type — currently only `feature` is supported by Aha."),
-    ),
-    from_id=(str, Field(description="Source record reference or numeric ID.")),
-    to_record_type=(
-        str,
-        Field(description="Target record type: e.g. `feature`, `requirement`, `idea`."),
-    ),
-    to_id=(str, Field(description="Target record reference or numeric ID.")),
-    link_type=(
-        Optional[str],
+        _RecordLinkRecordType,
         Field(
-            default=None,
             description=(
-                "Optional Aha link type — see Aha's record-link vocabulary "
-                "(e.g. `blocks`, `blocked_by`, `duplicate`, `related_to`)."
+                f"Source record type. Accepted: {_RECORD_LINK_RECORD_VALUES}."
+            )
+        ),
+    ),
+    from_id=(
+        str,
+        Field(
+            description=(
+                "Source record reference or numeric ID. References are resolved "
+                "to Aha's internal numeric ID before creating the link."
+            )
+        ),
+    ),
+    to_record_type=(
+        _RecordLinkRecordType,
+        Field(
+            description=(
+                f"Target record type. Accepted: {_RECORD_LINK_RECORD_VALUES}."
+            )
+        ),
+    ),
+    to_id=(
+        str,
+        Field(
+            description=(
+                "Target record reference or numeric ID. References are resolved "
+                "to Aha's internal numeric ID before creating the link."
+            )
+        ),
+    ),
+    link_type=(
+        _RecordLinkType,
+        Field(
+            description=(
+                f"Required Aha relationship code: {_RECORD_LINK_TYPE_VALUES}."
             ),
         ),
     ),
@@ -1501,35 +1559,110 @@ class AhaApiWrapper(BaseToolApiWrapper):
         from_id: str,
         to_record_type: str,
         to_id: str,
-        link_type: Optional[str] = None,
+        link_type: int,
     ):
         """Create a link between two Aha records.
 
-        Aha REST currently exposes record-link creation from features only
-        (``POST /features/{id}/record_links``). ``to_record_type`` is passed
-        through as-is so Aha can resolve it (feature, requirement, idea, …).
+        Resolves reference numbers to Aha's internal numeric IDs, then calls
+        ``POST /{source_type}/{source_id}/record_links`` with Aha's documented
+        ``record_type``, ``record_id``, and numeric ``link_type`` fields.
         """
         source = (from_record_type or "").strip().lower()
-        if source != "feature":
-            raise ToolException(
-                "create_record_link: Aha REST only supports links originating "
-                "from features (`from_record_type='feature'`)"
-            )
         target = (to_record_type or "").strip().lower()
-        if target not in _RESOURCE_PLURAL:
+        if source not in _RECORD_LINK_RECORD_TYPES:
             raise ToolException(
-                f"create_record_link: unsupported to_record_type '{to_record_type}'"
+                f"create_record_link: unsupported from_record_type "
+                f"'{from_record_type}'. Accepted: {_RECORD_LINK_RECORD_VALUES}"
             )
+        if target not in _RECORD_LINK_RECORD_TYPES:
+            raise ToolException(
+                f"create_record_link: unsupported to_record_type "
+                f"'{to_record_type}'. Accepted: {_RECORD_LINK_RECORD_VALUES}"
+            )
+        if isinstance(link_type, bool):
+            link_code = -1
+        else:
+            try:
+                link_code = int(link_type)
+            except (TypeError, ValueError):
+                link_code = -1
+        if link_code not in _RECORD_LINK_TYPE_LABELS:
+            raise ToolException(
+                f"create_record_link: unsupported link_type '{link_type}'. "
+                f"Accepted: {_RECORD_LINK_TYPE_VALUES}"
+            )
+
+        source_input = (from_id or "").strip()
+        target_input = (to_id or "").strip()
+        source_id = self._resolve_record_link_id(
+            source,
+            source_input,
+            role="source",
+        )
+        target_id = self._resolve_record_link_id(
+            target,
+            target_input,
+            role="target",
+        )
         link: Dict[str, Any] = {
             "record_link": {
-                "linkable_type": target.capitalize(),
-                "linkable_id": to_id,
+                "record_type": target,
+                "record_id": int(target_id),
+                "link_type": link_code,
             }
         }
-        if link_type:
-            link["record_link"]["link_type"] = link_type
-        response = self._rest_post(f"features/{from_id}/record_links", json=link)
-        return response.get("record_link") or response
+        response = self._rest_post(
+            f"{_RESOURCE_PLURAL[source]}/{source_id}/record_links",
+            json=link,
+        )
+        return response.get("record_link") or response or {
+            "created": True,
+            "from_record_type": source,
+            "from_reference_or_id": source_input,
+            "from_record_id": source_id,
+            "to_record_type": target,
+            "to_reference_or_id": target_input,
+            "to_record_id": target_id,
+            "link_type": link_code,
+            "link_type_name": _RECORD_LINK_TYPE_LABELS[link_code],
+        }
+
+    def _resolve_record_link_id(
+        self,
+        record_type: str,
+        reference_or_id: str,
+        *,
+        role: str,
+    ) -> str:
+        """Resolve a record-link input to the numeric ID required by Aha."""
+        if not reference_or_id:
+            raise ToolException(
+                f"create_record_link: {role} {record_type} reference or "
+                "numeric ID is required"
+            )
+        if reference_or_id.isdigit():
+            return reference_or_id
+        if record_type in {"goal", "release_phase"}:
+            raise ToolException(
+                f"create_record_link: {role} {record_type} requires a numeric "
+                f"ID; received {reference_or_id!r}"
+            )
+
+        payload = self._rest_get(
+            f"{_RESOURCE_PLURAL[record_type]}/{reference_or_id}"
+        )
+        record = payload.get(record_type)
+        resolved_id = (
+            str(record.get("id", "")).strip()
+            if isinstance(record, dict)
+            else ""
+        )
+        if not resolved_id.isdigit():
+            raise ToolException(
+                f"create_record_link: Aha! returned no internal numeric ID for "
+                f"{role} {record_type} {reference_or_id!r}"
+            )
+        return resolved_id
 
     # ----- Copy / duplicate -----
 
