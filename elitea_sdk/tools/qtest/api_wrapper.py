@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from traceback import format_exc
 from typing import Any, Optional, Generator, Literal
@@ -2269,13 +2269,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error uploading file: \n {stacktrace}")
             raise ToolException(f"Error uploading file to test case {test_case_id}: {str(e)}") from e
 
-    def __resolve_test_run_status_id(self, status: str) -> int:
-        """Resolve a manual-run status name (e.g. 'Passed') to its execution-status id.
+    def __resolve_test_run_status(self, status: str) -> "swagger_client.StatusResource":
+        """Resolve a manual-run status name to its project execution-status object.
 
         submit_test_log rejects a bare status name with 400; StatusResource.id must
         be an execution-status id. Those ids live in a dedicated project-level list
         (GET /test-runs/execution-statuses), NOT in the test-run property fields
-        (that is a different id space and yields the 400). Match is case-insensitive.
+        (that is a different id space and yields the 400). Match the project-specific
+        status name case-insensitively, then submit only its id as required by qTest.
         """
         headers = {
             "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
@@ -2284,14 +2285,46 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         statuses = response.json() or []
+        status_summary = [
+            {
+                key: item.get(key)
+                for key in ('id', 'name', 'is_default', 'color', 'active')
+            }
+            for item in statuses
+            if isinstance(item, dict)
+        ]
+        logger.debug(
+            "qTest execution-status lookup returned %d status(es) for project %s: %s",
+            len(statuses),
+            self.qtest_project_id,
+            status_summary,
+        )
 
-        by_name = {s.get('name'): s.get('id') for s in statuses if s.get('name')}
-        if status in by_name:
-            return by_name[status]
-        # case-insensitive fallback
-        for name, sid in by_name.items():
-            if name.lower() == status.lower():
-                return sid
+        by_name = {
+            item.get('name'): item
+            for item in statuses
+            if item.get('name') and item.get('id') is not None
+        }
+        selected_status = by_name.get(status)
+        if selected_status is None:
+            selected_status = next(
+                (
+                    item
+                    for name, item in by_name.items()
+                    if name.casefold() == status.casefold()
+                ),
+                None,
+            )
+        if selected_status is not None:
+            # Keep the generated Swagger model, but serialize only the field that
+            # qTest's submit-log contract accepts. StatusResource defaults
+            # is_default and active to False, so they must be explicitly set to
+            # None or the client adds them to the request even when not supplied.
+            return swagger_client.StatusResource(
+                id=selected_status['id'],
+                is_default=None,
+                active=None,
+            )
 
         allowed = ', '.join(sorted(by_name.keys()))
         raise ValueError(
@@ -2300,74 +2333,85 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         )
 
     def update_test_run_status(self, test_run_id: str, status: str, note: str = None) -> str:
-        """Update a manual test run's execution result (status) in QTest.
-
-        Modifies the run's existing test log (PUT) rather than creating a new one.
-        """
+        """Record a manual test run's execution result (status) in QTest."""
         try:
-            status_id = self.__resolve_test_run_status_id(status)
+            status_resource = self.__resolve_test_run_status(status)
 
-            # Use the DQL search (same path as find_entity_by_id): it returns the
-            # run with its latest_test_log populated and its internal id. The
-            # direct GET /test-runs/{id} endpoint returns latest_test_log empty on
-            # this qTest instance, so we read everything from the search result.
+            # The submit endpoint requires qTest's internal numeric test-run id.
             test_run = self.__search_entity_by_id('test-runs', test_run_id)
             if not test_run:
                 raise ToolException(
                     f"Test run {test_run_id} not found in project {self.qtest_project_id}."
                 )
             qtest_test_run_id = test_run.get('QTest Id')
-            latest_log = test_run.get('Latest Test Log') or {}
-            test_log_id = latest_log.get('Log Id')
-            if not test_log_id:
+            if not qtest_test_run_id:
                 raise ToolException(
-                    f"Test run {test_run_id} has no test log to update in project "
-                    f"{self.qtest_project_id}."
+                    f"Test run {test_run_id} has no numeric QTest ID in project "
+                    f"{self.qtest_project_id}; a new execution log cannot be submitted."
                 )
 
-            # qTest requires exe_start_date/exe_end_date on the PUT and expects the
-            # run's ORIGINAL execution times (not now()); a fresh timestamp yields a
-            # 400. The search result carries them on the latest test log.
-            now = datetime.now()
-            exe_start = latest_log.get('Execution Start') or now
-            exe_end = latest_log.get('Execution End') or now
-            body = swagger_client.TestLogResource(
-                status=swagger_client.StatusResource(id=status_id, name=status),
-                exe_start_date=exe_start,
-                exe_end_date=exe_end,
+            # qTest requires a completed execution interval. Use the current UTC
+            # time as the finish and a short preceding interval as the start.
+            # qTest's manual-log endpoint rejects fractional seconds with a
+            # generic 400 even though other qTest responses may include them.
+            execution_end = datetime.now(timezone.utc).replace(microsecond=0)
+            execution_start = execution_end - timedelta(minutes=1)
+            body = swagger_client.ManualTestLogResource(
+                status=status_resource,
+                exe_start_date=execution_start,
+                exe_end_date=execution_end,
                 note=note,
             )
-
-            # TEMP DEBUG (remove after diagnosing the qTest 400): dump the resolved
-            # status id, the full parsed test-run (every property + latest log), and
-            # the serialized PUT body for side-by-side comparison. qTest returns
-            # opaque 400s, so we trace the exact request.
-            logger.info("[qtest-debug] resolved status '%s' -> execution-status id %s", status, status_id)
-            logger.info("[qtest-debug] test_run search result: %s", test_run)
-            logger.info(
-                "[qtest-debug] PUT body -> project=%s test_run_id=%s test_log_id=%s body=%s",
-                self.qtest_project_id, qtest_test_run_id, test_log_id, body.to_dict(),
+            serializer = self._client or swagger_client.ApiClient()
+            payload_for_log = serializer.sanitize_for_serialization(body)
+            if 'note' in payload_for_log:
+                payload_for_log['note'] = '<redacted>'
+            logger.debug(
+                "Submitting qTest manual execution log: project_id=%s, "
+                "test_run_id=%s, payload=%s, note_present=%s",
+                self.qtest_project_id,
+                qtest_test_run_id,
+                payload_for_log,
+                note is not None,
             )
 
             test_log_api = self.__instantiate_test_log_api_instance()
             # _preload_content=False returns the raw HTTP response and skips the
             # TestLogResource deserialization, which crashes when the nested
             # test-case has properties=None.
-            test_log_api.modify_test_log(
-                self.qtest_project_id, body, qtest_test_run_id, test_log_id,
+            response = test_log_api.submit_test_log(
+                self.qtest_project_id, body, qtest_test_run_id,
                 _preload_content=False,
             )
 
-            return (
-                f"Successfully updated test run {test_run_id} status to '{status}' "
-                f"in project {self.qtest_project_id}. Test log id: {test_log_id}."
+            test_log_id = getattr(response, 'id', None)
+            raw_response = getattr(response, 'data', None)
+            if test_log_id is None and raw_response:
+                try:
+                    if isinstance(raw_response, bytes):
+                        raw_response = raw_response.decode('utf-8')
+                    test_log_id = json.loads(raw_response).get('id')
+                except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
+                    logger.debug(
+                        "qTest submitted status for test run %s but returned an "
+                        "unrecognized response body.",
+                        test_run_id,
+                    )
+
+            message = (
+                f"Successfully recorded test run {test_run_id} status as '{status}' "
+                f"in project {self.qtest_project_id} by creating a new manual execution log."
             )
+            if test_log_id is not None:
+                message += f" Test log id: {test_log_id}."
+            return message
         except (ApiException, requests.exceptions.RequestException) as e:
             stacktrace = format_exc()
             logger.error(f"Exception when submitting test log for test run {test_run_id}: \n {stacktrace}")
             raise ToolException(
-                f"Unable to update test run {test_run_id} status to '{status}' in project "
-                f"{self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"Unable to record status '{status}' for test run {test_run_id} in "
+                f"project {self.qtest_project_id} by submitting a new manual execution "
+                f"log: {e}"
             ) from e
         except ValueError as e:
             raise ToolException(str(e)) from e
@@ -2554,8 +2598,8 @@ EXAMPLES:
                 "mode": "update_test_run_status",
                 "description": """Update a manual test run's execution result (status) in QTest.
 
-Use this after manually executing a test to record Pass/Fail/etc. It updates the
-test run's existing execution log rather than creating a new run.
+Use this after manually executing a test to record Pass/Fail/etc. It creates a
+new manual execution log so the existing execution history remains unchanged.
 
 Parameters:
 - test_run_id: Test run ID in format TR-123 or QTest numeric ID

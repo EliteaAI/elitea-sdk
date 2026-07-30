@@ -1,4 +1,6 @@
 import html
+import logging
+from datetime import datetime, timezone
 
 import pytest
 import urllib3
@@ -680,7 +682,7 @@ def test_timeout_client_reraises_non_timeout_maxretry(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _patch_test_log_api(monkeypatch, response=None, raise_exc=None):
-    """Patch swagger_client.TestLogApi with a fake recording modify_test_log calls."""
+    """Patch swagger_client.TestLogApi with a fake recording submit_test_log calls."""
     import swagger_client
     calls = []
 
@@ -688,10 +690,10 @@ def _patch_test_log_api(monkeypatch, response=None, raise_exc=None):
         def __init__(self, client):
             pass
 
-        def modify_test_log(self, project_id, body, test_run_id, id, **kwargs):
+        def submit_test_log(self, project_id, body, test_run_id, **kwargs):
             calls.append({
                 'project_id': project_id, 'body': body,
-                'test_run_id': test_run_id, 'id': id, 'kwargs': kwargs,
+                'test_run_id': test_run_id, 'kwargs': kwargs,
             })
             if raise_exc:
                 raise raise_exc
@@ -704,10 +706,9 @@ def _patch_test_log_api(monkeypatch, response=None, raise_exc=None):
 def _patch_search_entity(monkeypatch, test_run=None, raise_exc=None):
     """Patch QtestApiWrapper.__search_entity_by_id to return a parsed test-run dict.
 
-    update_test_run_status / upload_attachment_to_test_run read the run via the DQL
-    search path (same as find_entity_by_id); it returns latest_test_log populated
-    where the direct GET /test-runs/{id} does not on this qTest instance. Returning
-    None models a not-found run.
+    Both tools use the DQL search path (same as find_entity_by_id) to resolve the
+    test run's internal id and attachment targets. Returning None models a
+    not-found run.
     """
     calls = []
 
@@ -734,7 +735,14 @@ def _patch_execution_statuses(monkeypatch, status_values=None):
         status_values = {'Passed': 601, 'Failed': 602, 'Blocked': 603, 'Incomplete': 604}
 
     statuses_payload = [
-        {'id': sid, 'name': name} for name, sid in status_values.items()
+        {
+            'id': sid,
+            'name': name,
+            'is_default': name == 'Incomplete',
+            'color': '#00cda8',
+            'active': True,
+        }
+        for name, sid in status_values.items()
     ]
 
     class _FakeResponse:
@@ -773,7 +781,7 @@ def _test_run_dict(qtest_id=12345, test_case_id=None, latest_test_log_id=None,
 
 class _FakeSubmitTestLogResponse:
     def __init__(self, log_id):
-        self.id = log_id
+        self.data = f'{{"id": {log_id}}}'.encode()
 
 
 class _FakeArtifactClient:
@@ -797,33 +805,48 @@ class _FakeElitea:
 
 def test_update_test_run_status_happy_path_numeric_id(monkeypatch):
     import swagger_client
+    import elitea_sdk.tools.qtest.api_wrapper as api_wrapper_module
+
     wrapper = _make_wrapper()
     wrapper._client = None
 
     values = _patch_execution_statuses(monkeypatch)
-    _patch_search_entity(monkeypatch, test_run=_test_run_dict(
-        latest_test_log_id=987,
-        exe_start='2026-05-11T16:24:53+00:00',
-        exe_end='2026-05-11T16:25:11+00:00',
-    ))
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=_FakeSubmitTestLogResponse(987))
+    fixed_now = datetime(
+        2026, 7, 30, 17, 50, 0, 123456, tzinfo=timezone.utc
+    )
+    expected_end = datetime(2026, 7, 30, 17, 50, tzinfo=timezone.utc)
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return fixed_now
+
+    monkeypatch.setattr(api_wrapper_module, 'datetime', FixedDateTime)
 
     result = wrapper.update_test_run_status('12345', 'Passed')
 
     assert len(calls) == 1
     assert calls[0]['project_id'] == 1
     assert calls[0]['test_run_id'] == 12345
-    # Modifies the existing test log (PUT) by its id, not creating a new one.
-    assert calls[0]['id'] == 987
     assert calls[0]['kwargs'].get('_preload_content') is False
     body = calls[0]['body']
-    # Status must be sent by its resolved value id, not a bare name (else qTest 400).
+    assert isinstance(body, swagger_client.ManualTestLogResource)
+    assert isinstance(body.status, swagger_client.StatusResource)
     assert body.status.id == values['Passed']
-    # qTest requires the run's ORIGINAL execution times, not now() (else 400).
-    assert body.exe_start_date == '2026-05-11T16:24:53+00:00'
-    assert body.exe_end_date == '2026-05-11T16:25:11+00:00'
-    assert body.exe_start_date is not None
-    assert body.exe_end_date is not None
+    assert body.status.name is None
+    assert body.status.is_default is None
+    assert body.status.color is None
+    assert body.status.active is None
+    serialized_body = swagger_client.ApiClient().sanitize_for_serialization(body)
+    assert serialized_body['status'] == {'id': values['Passed']}
+    assert body.exe_start_date == datetime(2026, 7, 30, 17, 49, tzinfo=timezone.utc)
+    assert body.exe_end_date == expected_end
+    assert body.exe_end_date.microsecond == 0
+    assert body.exe_start_date < body.exe_end_date
+    assert 'new manual execution log' in result
     assert '987' in result
 
 
@@ -833,27 +856,31 @@ def test_update_test_run_status_resolves_tr_pid(monkeypatch):
     wrapper._client = None
 
     _patch_execution_statuses(monkeypatch)
-    _patch_search_entity(monkeypatch, test_run=_test_run_dict(qtest_id=999, latest_test_log_id=5))
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(qtest_id=999))
     calls = _patch_test_log_api(monkeypatch, response=None)
 
     wrapper.update_test_run_status('TR-39', 'Passed')
 
-    # The internal run id used for the PUT comes from the search result's QTest Id.
+    # The internal run id used for the POST comes from the search result's QTest Id.
     assert calls[0]['test_run_id'] == 999
 
 
-def test_update_test_run_status_includes_note(monkeypatch):
+def test_update_test_run_status_includes_note_without_logging_content(monkeypatch, caplog):
     import swagger_client
     wrapper = _make_wrapper()
     wrapper._client = None
 
     _patch_execution_statuses(monkeypatch)
-    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=None)
 
+    caplog.set_level(logging.DEBUG)
     wrapper.update_test_run_status('12345', 'Failed', note='some note')
 
     assert calls[0]['body'].note == 'some note'
+    assert 'some note' not in caplog.text
+    assert "'note': '<redacted>'" in caplog.text
+    assert 'note_present=True' in caplog.text
 
 
 def test_update_test_run_status_invalid_test_run_id_raises_tool_exception(monkeypatch):
@@ -877,7 +904,7 @@ def test_update_test_run_status_api_exception_wrapped(monkeypatch):
     wrapper._client = None
 
     _patch_execution_statuses(monkeypatch)
-    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     api_exc = swagger_client.rest.ApiException(status=500, reason='Server Error')
     _patch_test_log_api(monkeypatch, raise_exc=api_exc)
 
@@ -887,9 +914,8 @@ def test_update_test_run_status_api_exception_wrapped(monkeypatch):
     assert exc_info.value.__cause__ is api_exc
 
 
-def test_update_test_run_status_resolves_status_name_to_execution_status_id(monkeypatch):
-    """Status name is resolved to its execution-status id (GET /test-runs/
-    execution-statuses), never sent as a bare name — the root cause of the 400."""
+def test_update_test_run_status_resolves_status_name_to_execution_status_resource(monkeypatch):
+    """Resolve the complete execution-status object from GET execution-statuses."""
     import swagger_client
     wrapper = _make_wrapper()
     wrapper._client = None
@@ -901,7 +927,7 @@ def test_update_test_run_status_resolves_status_name_to_execution_status_id(monk
     monkeypatch.setattr(swagger_client.FieldApi, 'get_fields', boom_get_fields)
 
     values = _patch_execution_statuses(monkeypatch, status_values={'Failed': 902})
-    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=None)
 
     wrapper.update_test_run_status('12345', 'Failed')
@@ -915,7 +941,7 @@ def test_update_test_run_status_matches_status_case_insensitively(monkeypatch):
     wrapper._client = None
 
     values = _patch_execution_statuses(monkeypatch, status_values={'Passed': 601})
-    _patch_search_entity(monkeypatch, test_run=_test_run_dict(latest_test_log_id=5))
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
     calls = _patch_test_log_api(monkeypatch, response=None)
 
     wrapper.update_test_run_status('12345', 'passed')
