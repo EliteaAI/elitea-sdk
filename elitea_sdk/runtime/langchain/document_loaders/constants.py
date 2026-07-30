@@ -163,6 +163,13 @@ document_loaders_map = {
         'kwargs': {},
         'allowed_to_override': DEFAULT_ALLOWED_BASE
     },
+    '.mdx': {
+        'class': EliteAMarkdownLoader,
+        'mime_type': 'text/markdown',
+        'is_multimodal_processing': False,
+        'kwargs': {},
+        'allowed_to_override': DEFAULT_ALLOWED_BASE
+    },
     '.csv': {
         'class': EliteACSVLoader,
         'mime_type': 'text/csv',
