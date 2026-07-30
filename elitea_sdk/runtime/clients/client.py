@@ -732,8 +732,6 @@ class EliteAClient:
         try:
             from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit
             middleware_list.append(ContextEditingMiddleware(edits=[ClearToolUsesEdit()]))
-
-            logger.info(f'>>> Context editing middleware injected. ')
         except Exception as e:
             logger.warning(f"Failed to auto-inject ContextEditingMiddleware: {e}")
 
