@@ -734,7 +734,14 @@ def _patch_execution_statuses(monkeypatch, status_values=None):
         status_values = {'Passed': 601, 'Failed': 602, 'Blocked': 603, 'Incomplete': 604}
 
     statuses_payload = [
-        {'id': sid, 'name': name} for name, sid in status_values.items()
+        {
+            'id': sid,
+            'name': name,
+            'is_default': name == 'Incomplete',
+            'color': '#00cda8',
+            'active': True,
+        }
+        for name, sid in status_values.items()
     ]
 
     class _FakeResponse:
@@ -825,6 +832,10 @@ def test_update_test_run_status_happy_path_numeric_id(monkeypatch):
     assert isinstance(body, swagger_client.ManualTestLogResource)
     assert isinstance(body.status, swagger_client.StatusResource)
     assert body.status.id == values['Passed']
+    assert body.status.name == 'Passed'
+    assert body.status.is_default is False
+    assert body.status.color == '#00cda8'
+    assert body.status.active is True
     assert body.exe_start_date == fixed_now
     assert body.exe_end_date == fixed_now
     assert 'new manual execution log' in result
@@ -891,9 +902,8 @@ def test_update_test_run_status_api_exception_wrapped(monkeypatch):
     assert exc_info.value.__cause__ is api_exc
 
 
-def test_update_test_run_status_resolves_status_name_to_execution_status_id(monkeypatch):
-    """Status name is resolved to its execution-status id (GET /test-runs/
-    execution-statuses), never sent as a bare name — the root cause of the 400."""
+def test_update_test_run_status_resolves_status_name_to_execution_status_resource(monkeypatch):
+    """Resolve the complete execution-status object from GET execution-statuses."""
     import swagger_client
     wrapper = _make_wrapper()
     wrapper._client = None

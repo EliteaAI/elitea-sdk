@@ -2269,13 +2269,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error uploading file: \n {stacktrace}")
             raise ToolException(f"Error uploading file to test case {test_case_id}: {str(e)}") from e
 
-    def __resolve_test_run_status_id(self, status: str) -> int:
-        """Resolve a manual-run status name (e.g. 'Passed') to its execution-status id.
+    def __resolve_test_run_status(self, status: str) -> "swagger_client.StatusResource":
+        """Resolve a manual-run status name to its project execution-status object.
 
         submit_test_log rejects a bare status name with 400; StatusResource.id must
         be an execution-status id. Those ids live in a dedicated project-level list
         (GET /test-runs/execution-statuses), NOT in the test-run property fields
-        (that is a different id space and yields the 400). Match is case-insensitive.
+        (that is a different id space and yields the 400). Preserve the complete
+        project-specific status definition and match its name case-insensitively.
         """
         headers = {
             "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
@@ -2285,13 +2286,29 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         response.raise_for_status()
         statuses = response.json() or []
 
-        by_name = {s.get('name'): s.get('id') for s in statuses if s.get('name')}
-        if status in by_name:
-            return by_name[status]
-        # case-insensitive fallback
-        for name, sid in by_name.items():
-            if name.lower() == status.lower():
-                return sid
+        by_name = {
+            item.get('name'): item
+            for item in statuses
+            if item.get('name') and item.get('id') is not None
+        }
+        selected_status = by_name.get(status)
+        if selected_status is None:
+            selected_status = next(
+                (
+                    item
+                    for name, item in by_name.items()
+                    if name.casefold() == status.casefold()
+                ),
+                None,
+            )
+        if selected_status is not None:
+            return swagger_client.StatusResource(
+                id=selected_status['id'],
+                name=selected_status['name'],
+                is_default=selected_status.get('is_default', False),
+                color=selected_status.get('color'),
+                active=selected_status.get('active', False),
+            )
 
         allowed = ', '.join(sorted(by_name.keys()))
         raise ValueError(
@@ -2302,7 +2319,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     def update_test_run_status(self, test_run_id: str, status: str, note: str = None) -> str:
         """Record a manual test run's execution result (status) in QTest."""
         try:
-            status_id = self.__resolve_test_run_status_id(status)
+            status_resource = self.__resolve_test_run_status(status)
 
             # The submit endpoint requires qTest's internal numeric test-run id.
             test_run = self.__search_entity_by_id('test-runs', test_run_id)
@@ -2321,7 +2338,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             # event. qTest requires both timestamps when submitting the test log.
             now = datetime.now(timezone.utc)
             body = swagger_client.ManualTestLogResource(
-                status=swagger_client.StatusResource(id=status_id),
+                status=status_resource,
                 exe_start_date=now,
                 exe_end_date=now,
                 note=note,
