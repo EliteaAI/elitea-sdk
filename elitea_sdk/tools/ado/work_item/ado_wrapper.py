@@ -1,9 +1,11 @@
 import json
 import logging
 import re
+import threading
 import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List, Generator, Optional
 
 from azure.devops.connection import Connection
@@ -22,10 +24,42 @@ from pydantic.fields import Field
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import get_file_bytes_from_artifact, detect_mime_type
 from ...utils.content_parser import parse_file_content
+from ....runtime.langchain.document_loaders.EliteAImageLoader import EliteAImageLoader, MAX_IMAGE_READ_BYTES
+from ....runtime.langchain.document_loaders.constants import image_loaders_map, image_loaders_map_converted
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ....runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_EXTENSIONS = frozenset(image_loaders_map) | frozenset(image_loaders_map_converted)
+_MARKDOWN_IMAGE_PATTERN = re.compile(r'!\[(.*?)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)')
+_IMAGE_WORKERS = 5
+_MAX_COMMENT_IMAGES_PER_CALL = 20
+# DoS backstop for the legacy work item field pass, NOT a behavior gate: no plausible real
+# work item embeds this many distinct field images, but a hostile one is only bounded by
+# ADO field size limits — without a ceiling one call means an unbounded vision-LLM bill.
+_WORK_ITEM_IMAGE_CEILING = 200
+# The byte cap bounds transfer, not decode: PIL allows 300M-pixel rasters and svglib
+# rasterizes whatever canvas the SVG declares. 36 MP covers an 8K UHD screenshot while
+# capping worst-case RGBA decode at ~145 MB per image.
+_MAX_IMAGE_PIXELS_FOR_LLM = 36_000_000
+# DoS backstop for the legacy work item field pass, NOT an image-size gate: comfortably
+# above the Azure DevOps Services 60 MB attachment maximum, so no real attachment is affected.
+_ATTACHMENT_STREAM_CEILING_BYTES = 100 * 1024 * 1024
+# Cumulative DoS backstop for one gates-off call: per-attachment caps alone compose to
+# many GB against hostile content; a realistic screenshot-heavy item totals tens of MB.
+# The budget is per call, tracked by the serial gates-off loop — concurrent callers
+# (e.g. indexer fetch workers) each get their own, so the aggregate scales with workers.
+_WORK_ITEM_STREAM_BUDGET_BYTES = 512 * 1024 * 1024
+_IMAGE_UNAVAILABLE = "[image unavailable: {reason}]"
+_IMAGE_LIMIT_NOTE = "[image skipped: per-call image limit of {limit} reached]"
+_IMAGE_BUDGET_NOTE = "[image skipped: per-call download budget reached]"
+
+
+class _ImageNote(str):
+    """Failure/skip note from the image-describe pipeline. A distinct type, not text
+    matching, so consumers that must drop notes (the indexer keeps them out of
+    embeddings) cannot silently break when a note's wording changes."""
 
 create_wi_field = """JSON of the work item fields to create in Azure DevOps, i.e.
                     {
@@ -91,7 +125,16 @@ ADOGetComments = create_model(
     limit_total=(Optional[int], Field(description="Max number of total comments to return", default=None)),
     include_deleted=(Optional[bool], Field(description="Specify if the deleted comments should be retrieved", default=False)),
     expand=(Optional[str], Field(description="The expand parameters for comments. Possible options are { all, none, reactions, renderedText, renderedTextOnly }.", default="none")),
-    order=(Optional[str], Field(description="Order in which the comments should be returned. Possible options are { asc, desc }", default=None))
+    order=(Optional[str], Field(description="Order in which the comments should be returned. Possible options are { asc, desc }", default=None)),
+    process_images=(Optional[bool], Field(description="Whether to fetch and analyze images embedded in comment text. When True, each embedded ADO attachment image is described by the configured LLM and the description is inserted next to the image reference in the returned comment content.", default=False)),
+    image_description_prompt=(Optional[str], Field(description="Prompt which is used for image description", default=None)),
+)
+
+ADOGetImageByUrl = create_model(
+    "ADOGetImageByUrl",
+    attachment_url=(str, Field(description="Full Azure DevOps work item attachment URL, e.g. https://dev.azure.com/{org}/{project}/_apis/wit/attachments/{guid}?fileName=screen.png — typically the src of an <img> tag or markdown image found in work item fields or comments. Both dev.azure.com and {org}.visualstudio.com URL forms are accepted.")),
+    file_name=(Optional[str], Field(description="File name with extension (e.g. 'screen.png'). Overrides or supplies the fileName query parameter; required when the URL does not contain one.", default=None)),
+    prompt=(Optional[str], Field(description="Custom instruction for the image analysis. Defaults to the standard detailed image description prompt.", default=None)),
 )
 
 ADOLinkWorkItemsToWikiPage = create_model(
@@ -473,16 +516,172 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error searching work items: {e}")
             return ToolException(f"Error searching work items: {e}")
 
+    def _extract_attachment_ref(self, attachment_url):
+        parsed = urllib.parse.urlparse(attachment_url)
+        segments = [segment for segment in parsed.path.split('/') if segment]
+        if 'attachments' not in segments:
+            return None
+        index = segments.index('attachments')
+        if index + 1 >= len(segments):
+            return None
+        attachment_id = segments[index + 1]
+        if not re.fullmatch(r'[\w-]+', attachment_id):
+            return None
+        file_names = urllib.parse.parse_qs(parsed.query).get('fileName', [])
+        return attachment_id, (urllib.parse.unquote(file_names[0]) if file_names else None)
+
+    def _get_attachment_content_capped(self, attachment_id, limit):
+        content_generator = self._client.get_attachment_content(id=attachment_id, download=True)
+        chunks = []
+        total = 0
+        try:
+            for chunk in content_generator:
+                total += len(chunk)
+                if total > limit:
+                    return None
+                chunks.append(chunk)
+        finally:
+            close = getattr(content_generator, 'close', None)
+            if close:
+                close()
+        return b"".join(chunks)
+
+    def _fetch_validated_image(self, attachment_id, name):
+        """Gated validate-and-fetch ladder shared by the comment pipeline and
+        get_image_by_url; returns (content, None) on success or (None, reason)."""
+        suffix = Path(name).suffix
+        if suffix.lower() not in _IMAGE_EXTENSIONS:
+            return None, f"unsupported image format '{suffix}'; supported: png, jpg, jpeg, gif, webp, bmp, svg"
+        try:
+            content = self._get_attachment_content_capped(attachment_id, limit=MAX_IMAGE_READ_BYTES)
+        except Exception as e:
+            return None, f"could not download the attachment: {e}"
+        if content is None:
+            return None, "image exceeds the 5 MB processing limit"
+        width, height = EliteAImageLoader.read_dimensions(name, content)
+        if not width or not height:
+            return None, "could not read image dimensions"
+        if width * height > _MAX_IMAGE_PIXELS_FOR_LLM:
+            return None, f"image dimensions {width}x{height} exceed the processing limit"
+        return content, None
+
+    def _describe_attachment_safe(self, attachment_url, file_name=None, prompt=None,
+                                  enforce_image_gates=True, stream_budget=None):
+        try:
+            if attachment_url.lower().startswith('data:'):
+                return None
+            ref = self._extract_attachment_ref(attachment_url)
+            if ref is None:
+                return _ImageNote(_IMAGE_UNAVAILABLE.format(reason="not an Azure DevOps attachment URL"))
+            attachment_id, derived_name = ref
+            name = file_name or derived_name
+            if not name:
+                return _ImageNote(_IMAGE_UNAVAILABLE.format(reason="no file name in URL"))
+            if enforce_image_gates:
+                content, error = self._fetch_validated_image(attachment_id, name)
+                if error:
+                    return _ImageNote(_IMAGE_UNAVAILABLE.format(reason=error))
+            else:
+                if stream_budget is not None and stream_budget[0] <= 0:
+                    return _ImageNote(_IMAGE_BUDGET_NOTE)
+                content = self._get_attachment_content_capped(
+                    attachment_id, limit=_ATTACHMENT_STREAM_CEILING_BYTES)
+                if stream_budget is not None:
+                    stream_budget[0] -= len(content) if content is not None else _ATTACHMENT_STREAM_CEILING_BYTES
+                if content is None:
+                    return _ImageNote(_IMAGE_UNAVAILABLE.format(reason="attachment exceeds the download safety limit"))
+            result = parse_file_content(file_content=content, file_name=name, llm=self.llm,
+                                        prompt=prompt, image_cache=self._image_cache)
+            if isinstance(result, ToolException):
+                return _ImageNote(_IMAGE_UNAVAILABLE.format(reason=str(result)))
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to describe attachment '{attachment_url}': {e}")
+            return _ImageNote(_IMAGE_UNAVAILABLE.format(reason=str(e)))
+
+    def _describe_image_urls(self, urls, prompt, enforce_image_gates=True, max_images=None):
+        descriptions = {}
+        fetch_urls = []
+        for url in dict.fromkeys(urls):
+            if url.lower().startswith('data:'):
+                descriptions[url] = None
+            elif max_images is not None and len(fetch_urls) >= max_images:
+                descriptions[url] = _ImageNote(_IMAGE_LIMIT_NOTE.format(limit=max_images))
+            else:
+                fetch_urls.append(url)
+
+        if not fetch_urls:
+            return descriptions
+
+        if not enforce_image_gates:
+            # This path serves the pre-existing work item field pass, whose decode
+            # behaviour is unbounded; keeping it serial preserves today's one-image-at-a-time
+            # memory profile and makes the cumulative download budget a plain running total.
+            budget = [_WORK_ITEM_STREAM_BUDGET_BYTES]
+            results = [self._describe_attachment_safe(url, prompt=prompt, enforce_image_gates=False,
+                                                      stream_budget=budget) for url in fetch_urls]
+        else:
+            def describe(url):
+                return self._describe_attachment_safe(url, prompt=prompt, enforce_image_gates=True)
+
+            # The indexer's work item fetch pool already spends the parallelism budget;
+            # nesting another pool inside one of its workers would multiply concurrent
+            # LLM calls beyond it. Host runtimes routinely dispatch tool calls off the
+            # main thread, so thread identity alone is not a nesting signal.
+            in_fetch_pool = threading.current_thread().name.startswith("ado-wi-fetch")
+            max_workers = min(_IMAGE_WORKERS, len(fetch_urls))
+            if max_workers <= 1 or in_fetch_pool:
+                results = [describe(url) for url in fetch_urls]
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ado-img") as executor:
+                    results = list(executor.map(describe, fetch_urls))
+
+        descriptions.update(zip(fetch_urls, results))
+        return descriptions
+
     def parse_attachment_by_url(self, attachment_url, file_name=None, image_description_prompt=None):
-        match = re.search(r'attachments/([\w-]+)(?:\?fileName=([^&]+))?', attachment_url)
-        if match:
-            attachment_id = match.group(1)
-            if not file_name:
-                file_name = match.group(2)
-            if not file_name:
-                raise ToolException("File name must be provided either in the URL or as a parameter.")
-            return self.parse_attachment_by_id(attachment_id, file_name, image_description_prompt)
-        raise ToolException(f"Attachment '{attachment_url}' was not found.")
+        ref = self._extract_attachment_ref(attachment_url)
+        if ref is None:
+            raise ToolException(f"Attachment '{attachment_url}' was not found.")
+        attachment_id, derived_name = ref
+        file_name = file_name or derived_name
+        if not file_name:
+            raise ToolException("File name must be provided either in the URL or as a parameter.")
+        return self.parse_attachment_by_id(attachment_id, file_name, image_description_prompt)
+
+    def get_image_by_url(self, attachment_url: str, file_name: Optional[str] = None, prompt: Optional[str] = None):
+        """Analyze an image attached to an Azure DevOps work item and return its textual content.
+        Accepts a work item attachment URL (the src of an <img> tag or a markdown image reference
+        found in work item fields or comments), downloads the image by its attachment id through
+        the configured Azure DevOps connection and uses the configured vision model to extract
+        text and describe what the image shows. Supported formats: png, jpg, jpeg, gif, webp,
+        bmp, svg; maximum size 5 MB. Returns the extracted description as plain text, or an
+        error message if the image is inaccessible or the format is unsupported."""
+        try:
+            if not self._client:
+                return ToolException("Azure DevOps client not initialized.")
+            if self.llm is None:
+                return ToolException("Image analysis requires an LLM, but this toolkit is configured without one.")
+            if attachment_url.lower().startswith('data:'):
+                return ToolException("data: URIs are not supported; provide an Azure DevOps attachment URL.")
+            if '/_apis/wit/attachments/' not in urllib.parse.urlparse(attachment_url).path.lower():
+                return ToolException(
+                    "URL must be an Azure DevOps work item attachment URL (containing /_apis/wit/attachments/).")
+            ref = self._extract_attachment_ref(attachment_url)
+            if ref is None:
+                return ToolException("Could not determine the attachment id from the URL.")
+            attachment_id, derived_name = ref
+            name = file_name or derived_name
+            if not name:
+                return ToolException("Provide file_name; the URL has no fileName parameter.")
+            content, error = self._fetch_validated_image(attachment_id, name)
+            if error:
+                return ToolException(error[0].upper() + error[1:])
+            return parse_file_content(file_content=content, file_name=name, llm=self.llm,
+                                      prompt=prompt, image_cache=self._image_cache)
+        except Exception as e:
+            logger.error(f"Error analyzing attachment image: {e}")
+            return ToolException(f"Error analyzing attachment image: {e}")
 
     def parse_attachment_by_id(self, attachment_id, file_name, image_description_prompt):
         file_content = self.get_attachment_content(attachment_id)
@@ -523,16 +722,25 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
             if parse_attachments:
                 # describe images in work item fields if present
+                field_soups = {}
+                image_urls = []
                 for field_name, field_value in fields_data.items():
                     if isinstance(field_value, str):
                         soup = BeautifulSoup(field_value, 'html.parser')
-                        images = soup.find_all('img')
-                        for img in images:
-                            src = img.get('src')
-                            if src and process_images:
-                                description = self.parse_attachment_by_url(src, image_description_prompt=image_description_prompt)
-                                img['image-description'] = description
-                        parsed_item[field_name] = str(soup)
+                        field_soups[field_name] = soup
+                        if process_images:
+                            image_urls += [img.get('src') for img in soup.find_all('img') if img.get('src')]
+                # This pre-existing surface must keep describing every attachment it
+                # describes today, so the image gates that guard the newer surfaces stay off.
+                descriptions = self._describe_image_urls(
+                    image_urls, image_description_prompt, enforce_image_gates=False,
+                    max_images=_WORK_ITEM_IMAGE_CEILING) if image_urls else {}
+                for field_name, soup in field_soups.items():
+                    for img in soup.find_all('img'):
+                        description = descriptions.get(img.get('src'))
+                        if description is not None:
+                            img['image-description'] = description
+                    parsed_item[field_name] = str(soup)
                 # parse attached documents if present
                 for relation in parsed_item.get('relations', []):
                     # Only process actual file attachments
@@ -554,7 +762,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Error getting work item: {e}")
 
 
-    def get_comments(self, work_item_id: int, limit_total: Optional[int] = None, include_deleted: Optional[bool] = None, expand: Optional[str] = None, order: Optional[str] = None):
+    def get_comments(self, work_item_id: int, limit_total: Optional[int] = None, include_deleted: Optional[bool] = None, expand: Optional[str] = None, order: Optional[str] = None, process_images: bool = False, image_description_prompt: Optional[str] = None):
         """Get comments for work item by ID."""
         try:
             # Validate that the Azure DevOps client is initialized
@@ -565,20 +773,93 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             limit_portion = self.limit
             limit_all = limit_total if limit_total else self.limit
 
+            # Markdown-formatted comments carry images in `text`, HTML ones in `renderedText`;
+            # requesting the rendered form gives a uniform surface to scan without overriding
+            # an expand the caller chose deliberately.
+            effective_expand = expand
+            if process_images and expand in (None, "none"):
+                effective_expand = "renderedText"
+
             # Fetch the work item comments
-            comments_portion = self._client.get_comments(project=self.project, work_item_id=work_item_id, top=limit_portion, include_deleted=include_deleted, expand=expand, order=order)
+            comments_portion = self._client.get_comments(project=self.project, work_item_id=work_item_id, top=limit_portion, include_deleted=include_deleted, expand=effective_expand, order=order)
             comments_all = []
 
             while True:
                 comments_all += [comment.as_dict() for comment in comments_portion.comments]
 
                 if not comments_portion.continuation_token or len(comments_all) >= limit_all:
-                    return comments_all[:limit_all]
+                    comments_all = comments_all[:limit_all]
+                    break
                 else:
-                    comments_portion = self._client.get_comments(continuation_token=comments_portion.continuation_token, project=self.project, work_item_id=int(work_item_id), top=3, include_deleted=include_deleted, expand=expand, order=order)
+                    comments_portion = self._client.get_comments(continuation_token=comments_portion.continuation_token, project=self.project, work_item_id=int(work_item_id), top=3, include_deleted=include_deleted, expand=effective_expand, order=order)
+
+            if not process_images:
+                return comments_all
+            if self.llm is None:
+                logger.warning("Image processing requested for work item comments but no LLM is configured; "
+                               "returning raw comments.")
+                return comments_all
+            if not any(self._comment_has_image_markup(comment) for comment in comments_all):
+                return comments_all
+            return self._embed_comment_image_descriptions(comments_all, image_description_prompt)
         except Exception as e:
             logger.error(f"Error getting work item comments: {e}")
             return ToolException(f"Error getting work item comments: {e}")
+
+    _COMMENT_TEXT_FIELDS = ('rendered_text', 'renderedText', 'text')
+
+    def _comment_has_image_markup(self, comment):
+        for field in self._COMMENT_TEXT_FIELDS:
+            value = comment.get(field)
+            if isinstance(value, str) and ('<img' in value or '![' in value):
+                return True
+        return False
+
+    def _embed_comment_image_descriptions(self, comments, prompt):
+        image_urls = []
+        for comment in comments:
+            for field in self._COMMENT_TEXT_FIELDS:
+                value = comment.get(field)
+                if not isinstance(value, str):
+                    continue
+                if '<img' in value:
+                    image_urls += [img.get('src') for img in BeautifulSoup(value, 'html.parser').find_all('img')
+                                   if img.get('src')]
+                if '![' in value:
+                    image_urls += [url for _, url in _MARKDOWN_IMAGE_PATTERN.findall(value) if url]
+
+        descriptions = self._describe_image_urls(image_urls, prompt, enforce_image_gates=True,
+                                                 max_images=_MAX_COMMENT_IMAGES_PER_CALL)
+
+        for comment in comments:
+            for field in self._COMMENT_TEXT_FIELDS:
+                value = comment.get(field)
+                if not isinstance(value, str):
+                    continue
+                try:
+                    comment[field] = self._patch_image_descriptions(value, descriptions)
+                except Exception as e:
+                    logger.warning(f"Failed to embed image descriptions into comment field '{field}': {e}")
+        return comments
+
+    def _patch_image_descriptions(self, value, descriptions):
+        if '<img' in value:
+            soup = BeautifulSoup(value, 'html.parser')
+            for img in soup.find_all('img'):
+                description = descriptions.get(img.get('src'))
+                if description is not None:
+                    img['image-description'] = description
+            value = str(soup)
+        if '![' in value:
+            references = dict.fromkeys(
+                (match.group(0), match.group(2)) for match in _MARKDOWN_IMAGE_PATTERN.finditer(value))
+            for reference, url in references:
+                description = descriptions.get(url)
+                if description is None:
+                    continue
+                # The URL is kept intact so the model can follow up with get_image_by_url.
+                value = value.replace(reference, f"{reference}\n[image-description: {description}]")
+        return value
 
     def _get_wiki_artifact_uri(self, wiki_identified: str, page_name: str) -> str:
         """Helper method to construct the artifact URI for a wiki page."""
@@ -974,25 +1255,43 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         # Describe embedded images before HTML gets sanitized so the image
         # text survives as [image: ...] in the final payload.
         if process_images:
-            for name, value in list(raw_fields.items()):
+            field_soups = {}
+            image_urls = []
+            for name, value in raw_fields.items():
                 if not isinstance(value, str) or '<img' not in value:
                     continue
                 try:
                     soup = BeautifulSoup(value, 'html.parser')
+                    srcs = [img.get('src') for img in soup.find_all('img') if img.get('src')]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "process_images pass failed for field %s on work item %s: %s",
+                        name, wi_id, exc,
+                    )
+                    continue
+                field_soups[name] = soup
+                image_urls += srcs
+            descriptions = self._describe_image_urls(
+                image_urls, image_prompt, enforce_image_gates=False,
+                max_images=_WORK_ITEM_IMAGE_CEILING) if image_urls else {}
+            for name, soup in field_soups.items():
+                try:
                     for img in soup.find_all('img'):
                         src = img.get('src')
                         if not src:
                             continue
-                        try:
-                            description = self.parse_attachment_by_url(
-                                src, image_description_prompt=image_prompt,
-                            )
-                            img['image-description'] = description
-                        except Exception as exc:  # noqa: BLE001
+                        description = descriptions.get(src)
+                        if isinstance(description, _ImageNote) or description is None:
+                            # Notes stay out of the payload — failure text would
+                            # pollute the index embeddings — but the failure must
+                            # still be visible somewhere, and on this unattended
+                            # path the log is the only somewhere.
                             logger.warning(
                                 "image description failed for %s on work item %s: %s",
-                                src, wi_id, exc,
+                                src, wi_id, description or "data: URI skipped",
                             )
+                        elif isinstance(description, str):
+                            img['image-description'] = description
                     raw_fields[name] = str(soup)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1212,6 +1511,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 "description": self.get_comments.__doc__,
                 "args_schema": ADOGetComments,
                 "ref": self.get_comments,
+            },
+            {
+                "name": "get_image_by_url",
+                "description": self.get_image_by_url.__doc__,
+                "args_schema": ADOGetImageByUrl,
+                "ref": self.get_image_by_url,
             },
             {
                 "name": "link_work_items_to_wiki_page",

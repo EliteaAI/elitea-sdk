@@ -31,7 +31,7 @@ class EliteAImageLoader(BaseLoader):
                           file_content=None,
                           file_size=None) -> dict:
         """Report image dimensions/bytes; images are read whole (multimodal), no chunking (PRE-12 #5443)."""
-        width, height = cls._read_dimensions(filename, file_content)
+        width, height = cls.read_dimensions(filename, file_content)
 
         effective_size = file_size if file_size is not None else (
             len(file_content) if file_content else None
@@ -68,7 +68,7 @@ class EliteAImageLoader(BaseLoader):
         return meta
 
     @classmethod
-    def _read_dimensions(cls, filename: str, file_content) -> tuple:
+    def read_dimensions(cls, filename: str, file_content) -> tuple:
         """Return (width, height) in px, or (None, None) on failure/corrupt content."""
         if not file_content:
             return None, None
