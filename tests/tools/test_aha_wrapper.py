@@ -29,6 +29,7 @@ from elitea_sdk.tools.aha.api_wrapper import (
     AhaUpdateRecordInput,
     _FEATURE_REF_RE,
     _PAGE_REF_RE,
+    _QUERY_GET_PAGE,
     _REQUIREMENT_REF_RE,
 )
 
@@ -992,6 +993,7 @@ class TestCreateRecordLink:
 
         assert set(schema["properties"]["from_record_type"]["enum"]) == {
             "feature",
+            "requirement",
             "release",
             "idea",
             "epic",
@@ -1000,9 +1002,16 @@ class TestCreateRecordLink:
             "page",
             "goal",
         }
-        assert schema["properties"]["to_record_type"]["enum"] == schema[
-            "properties"
-        ]["from_record_type"]["enum"]
+        assert set(schema["properties"]["to_record_type"]["enum"]) == {
+            "feature",
+            "release",
+            "idea",
+            "epic",
+            "release_phase",
+            "initiative",
+            "page",
+            "goal",
+        }
         assert schema["properties"]["link_type"]["enum"] == [
             10,
             20,
@@ -1088,8 +1097,8 @@ class TestCreateRecordLink:
     @pytest.mark.parametrize(
         ("argument", "value", "message"),
         [
-            ("from_record_type", "requirement", "unsupported from_record_type"),
-            ("to_record_type", "product", "unsupported to_record_type"),
+            ("from_record_type", "product", "unsupported from_record_type"),
+            ("to_record_type", "requirement", "unsupported to_record_type"),
             ("link_type", 70, "unsupported link_type"),
         ],
     )
@@ -1111,6 +1120,36 @@ class TestCreateRecordLink:
                 w.create_record_link(**kwargs)
 
         req.assert_not_called()
+
+    def test_requirement_is_supported_as_source(self):
+        w = _wrapper()
+        responses = [
+            _rest_stub(
+                {
+                    "requirement": {
+                        "id": "1001",
+                        "reference_num": "PROD-5-1",
+                    }
+                }
+            ),
+            _rest_stub({}),
+        ]
+
+        with patch.object(w._session, "request", side_effect=responses) as req:
+            w.create_record_link(
+                from_record_type="requirement",
+                from_id="PROD-5-1",
+                to_record_type="epic",
+                to_id="2002",
+                link_type=10,
+            )
+
+        assert req.call_args_list[0].args[1].endswith(
+            "/requirements/PROD-5-1"
+        )
+        assert req.call_args_list[1].args[1].endswith(
+            "/requirements/1001/record_links"
+        )
 
     def test_resolves_goal_reference_before_link_creation(self):
         w = _wrapper()
@@ -1165,6 +1204,66 @@ class TestCreateRecordLink:
         }
         assert out["from_reference_or_id"] == "PROD-G-2"
         assert out["from_record_id"] == "3003"
+
+    def test_resolves_initiative_reference_through_collection(self):
+        w = _wrapper()
+        responses = [
+            _rest_stub(
+                {
+                    "initiatives": [
+                        {
+                            "id": "4004",
+                            "reference_num": "PROD-S-2",
+                        }
+                    ],
+                    "pagination": {
+                        "current_page": 1,
+                        "total_pages": 1,
+                    },
+                }
+            ),
+            _rest_stub({}),
+        ]
+
+        with patch.object(w._session, "request", side_effect=responses) as req:
+            w.create_record_link(
+                from_record_type="initiative",
+                from_id="PROD-S-2",
+                to_record_type="epic",
+                to_id="2002",
+                link_type=10,
+            )
+
+        assert req.call_args_list[0].args[1].endswith("/initiatives")
+        assert req.call_args_list[1].args[1].endswith(
+            "/initiatives/4004/record_links"
+        )
+
+    def test_resolves_page_reference_through_graphql(self):
+        w = _wrapper()
+        response = _rest_stub({})
+
+        with (
+            patch.object(
+                w,
+                "_gql",
+                return_value={"page": {"id": "5005"}},
+            ) as gql,
+            patch.object(w._session, "request", return_value=response) as req,
+        ):
+            w.create_record_link(
+                from_record_type="page",
+                from_id="PROD-N-2",
+                to_record_type="epic",
+                to_id="2002",
+                link_type=10,
+            )
+
+        gql.assert_called_once_with(
+            _QUERY_GET_PAGE,
+            {"id": "PROD-N-2", "includeParent": False},
+        )
+        assert req.call_args.args[1].endswith("/pages/5005/record_links")
 
     def test_release_phase_reference_requires_numeric_id(self):
         w = _wrapper()

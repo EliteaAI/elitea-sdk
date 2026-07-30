@@ -138,7 +138,7 @@ _SEARCHABLE_RECORD_VALUES = _format_allowed_values(_SEARCHABLE_RECORD_TYPES)
 
 _READABLE_RECORD_VALUES = _format_allowed_values(_SEARCHABLE_RECORD_TYPES + ("page",))
 
-_RECORD_LINK_RECORD_TYPES = (
+_RECORD_LINK_TARGET_TYPES = (
     "feature",
     "release",
     "idea",
@@ -148,7 +148,9 @@ _RECORD_LINK_RECORD_TYPES = (
     "page",
     "goal",
 )
-_RECORD_LINK_RECORD_VALUES = _format_allowed_values(_RECORD_LINK_RECORD_TYPES)
+_RECORD_LINK_SOURCE_TYPES = _RECORD_LINK_TARGET_TYPES + ("requirement",)
+_RECORD_LINK_SOURCE_VALUES = _format_allowed_values(_RECORD_LINK_SOURCE_TYPES)
+_RECORD_LINK_TARGET_VALUES = _format_allowed_values(_RECORD_LINK_TARGET_TYPES)
 _RECORD_LINK_TYPE_LABELS = {
     10: "relates to",
     20: "depends on",
@@ -161,7 +163,18 @@ _RECORD_LINK_TYPE_LABELS = {
 _RECORD_LINK_TYPE_VALUES = ", ".join(
     f"`{code}` ({label})" for code, label in _RECORD_LINK_TYPE_LABELS.items()
 )
-_RecordLinkRecordType = Literal[
+_RecordLinkSourceType = Literal[
+    "feature",
+    "release",
+    "idea",
+    "epic",
+    "release_phase",
+    "initiative",
+    "page",
+    "goal",
+    "requirement",
+]
+_RecordLinkTargetType = Literal[
     "feature",
     "release",
     "idea",
@@ -575,10 +588,10 @@ AhaDeleteRecordInput = create_model(
 AhaCreateRecordLinkInput = create_model(
     "AhaCreateRecordLinkInput",
     from_record_type=(
-        _RecordLinkRecordType,
+        _RecordLinkSourceType,
         Field(
             description=(
-                f"Source record type. Accepted: {_RECORD_LINK_RECORD_VALUES}."
+                f"Source record type. Accepted: {_RECORD_LINK_SOURCE_VALUES}."
             )
         ),
     ),
@@ -593,10 +606,10 @@ AhaCreateRecordLinkInput = create_model(
         ),
     ),
     to_record_type=(
-        _RecordLinkRecordType,
+        _RecordLinkTargetType,
         Field(
             description=(
-                f"Target record type. Accepted: {_RECORD_LINK_RECORD_VALUES}."
+                f"Target record type. Accepted: {_RECORD_LINK_TARGET_VALUES}."
             )
         ),
     ),
@@ -1644,15 +1657,15 @@ class AhaApiWrapper(BaseToolApiWrapper):
         """
         source = (from_record_type or "").strip().lower()
         target = (to_record_type or "").strip().lower()
-        if source not in _RECORD_LINK_RECORD_TYPES:
+        if source not in _RECORD_LINK_SOURCE_TYPES:
             raise ToolException(
                 f"create_record_link: unsupported from_record_type "
-                f"'{from_record_type}'. Accepted: {_RECORD_LINK_RECORD_VALUES}"
+                f"'{from_record_type}'. Accepted: {_RECORD_LINK_SOURCE_VALUES}"
             )
-        if target not in _RECORD_LINK_RECORD_TYPES:
+        if target not in _RECORD_LINK_TARGET_TYPES:
             raise ToolException(
                 f"create_record_link: unsupported to_record_type "
-                f"'{to_record_type}'. Accepted: {_RECORD_LINK_RECORD_VALUES}"
+                f"'{to_record_type}'. Accepted: {_RECORD_LINK_TARGET_VALUES}"
             )
         if isinstance(link_type, bool):
             link_code = -1
@@ -1717,8 +1730,9 @@ class AhaApiWrapper(BaseToolApiWrapper):
             )
         if reference_or_id.isdigit():
             return reference_or_id
-        if record_type == "goal":
-            for record in self._paginate("goals", per_page=100):
+        if record_type in {"goal", "initiative"}:
+            plural = _RESOURCE_PLURAL[record_type]
+            for record in self._paginate(plural, per_page=100):
                 reference_num = str(record.get("reference_num", "")).strip()
                 if reference_num.casefold() != reference_or_id.casefold():
                     continue
@@ -1727,8 +1741,29 @@ class AhaApiWrapper(BaseToolApiWrapper):
                     return resolved_id
                 break
             raise ToolException(
-                f"create_record_link: Aha! returned no goal with reference "
+                f"create_record_link: Aha! returned no {record_type} with reference "
                 f"{reference_or_id!r} and an internal numeric ID"
+            )
+        if record_type == "page":
+            page_ref = self._validate_reference(
+                reference_or_id,
+                _PAGE_REF_RE,
+                "page",
+            )
+            page = self._gql(
+                _QUERY_GET_PAGE,
+                {"id": page_ref, "includeParent": False},
+            ).get("page")
+            resolved_id = (
+                str(page.get("id", "")).strip()
+                if isinstance(page, dict)
+                else ""
+            )
+            if resolved_id.isdigit():
+                return resolved_id
+            raise ToolException(
+                f"create_record_link: Aha! returned no internal numeric ID for "
+                f"{role} page {reference_or_id!r}"
             )
         if record_type == "release_phase":
             raise ToolException(
