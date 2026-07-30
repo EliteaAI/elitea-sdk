@@ -23,6 +23,8 @@ from elitea_sdk.tools.aha.api_wrapper import (
     AhaCreateRecordLinkInput,
     AhaCreateRecordInput,
     AhaDeleteRecordInput,
+    AhaFieldOptionsInput,
+    AhaFieldsMetadataInput,
     AhaListCommentsInput,
     AhaListRequirementsInput,
     AhaManageRecordInput,
@@ -1302,28 +1304,124 @@ class TestCopyRecord:
 
 
 class TestFieldsMetadata:
-    def test_fields_metadata_hits_custom_fields(self):
+    def test_schemas_match_account_and_definition_contracts(self):
+        fields_schema = AhaFieldsMetadataInput.model_json_schema()
+        options_schema = AhaFieldOptionsInput.model_json_schema()
+
+        assert set(fields_schema["properties"]) == {
+            "output_format",
+            "fields",
+        }
+        assert fields_schema.get("required", []) == []
+        assert options_schema["required"] == ["field_id"]
+        assert "numeric custom-field definition ID" in options_schema[
+            "properties"
+        ]["field_id"]["description"]
+
+    def test_fields_metadata_hits_custom_field_definitions(self):
         w = _wrapper()
         resp = _rest_stub(
-            {"custom_fields": [{"id": 1, "name": "Sprint"}], "pagination": {"current_page": 1, "total_pages": 1}}
+            {
+                "custom_field_definitions": [
+                    {
+                        "id": "581360680",
+                        "name": "Sprint",
+                        "key": "sprint",
+                    }
+                ]
+            }
         )
         with patch.object(w._session, "request", return_value=resp) as req:
             out = w.fields_metadata()
-        assert req.call_args[0][1].endswith("/custom_fields")
-        assert out == [{"id": 1, "name": "Sprint"}]
+        assert req.call_args[0][1].endswith("/custom_field_definitions")
+        assert req.call_args.kwargs["params"] is None
+        assert out == [
+            {
+                "id": "581360680",
+                "name": "Sprint",
+                "key": "sprint",
+            }
+        ]
 
     def test_field_options_metadata(self):
         w = _wrapper()
-        resp = _rest_stub({"options": [{"id": 1, "value": "A"}, {"id": 2, "value": "B"}]})
+        resp = _rest_stub(
+            {
+                "options": [
+                    {
+                        "text": "P1",
+                        "value": "486420793",
+                        "meta": {"color": "#666666"},
+                    }
+                ]
+            }
+        )
         with patch.object(w._session, "request", return_value=resp) as req:
             out = w.field_options_metadata("42")
-        assert req.call_args[0][1].endswith("/custom_fields/42/options")
-        assert out == [{"id": 1, "value": "A"}, {"id": 2, "value": "B"}]
+        assert req.call_args[0][1].endswith(
+            "/custom_field_definitions/42/options"
+        )
+        assert out == [
+            {
+                "text": "P1",
+                "value": "486420793",
+                "meta": {"color": "#666666"},
+            }
+        ]
 
     def test_field_options_requires_id(self):
         w = _wrapper()
         with pytest.raises(ToolException, match="field_id is required"):
             w.field_options_metadata("")
+
+    def test_field_options_rejects_slug_before_request(self):
+        w = _wrapper()
+
+        with patch.object(w._session, "request") as req:
+            with pytest.raises(
+                ToolException,
+                match="field_id must be the numeric custom-field definition ID",
+            ):
+                w.field_options_metadata("priority")
+
+        req.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload", "expected"),
+        [
+            (
+                "fields_metadata",
+                {"custom_field_definitions": []},
+                "Aha! API returned no custom-field definitions.",
+            ),
+            (
+                "field_options_metadata",
+                {"options": []},
+                "Aha! API returned no options for custom-field definition '42'.",
+            ),
+        ],
+    )
+    def test_empty_metadata_results_are_explicit(
+        self,
+        method_name,
+        payload,
+        expected,
+    ):
+        w = _wrapper()
+        kwargs = (
+            {"field_id": "42"}
+            if method_name == "field_options_metadata"
+            else {}
+        )
+
+        with patch.object(
+            w._session,
+            "request",
+            return_value=_rest_stub(payload),
+        ):
+            out = getattr(w, method_name)(**kwargs)
+
+        assert out == expected
 
 
 class TestAttachFile:

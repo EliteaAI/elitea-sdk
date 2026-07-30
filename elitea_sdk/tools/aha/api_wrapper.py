@@ -641,15 +641,21 @@ AhaCopyRecordInput = create_model(
 
 AhaFieldsMetadataInput = create_model(
     "AhaFieldsMetadataInput",
-    per_page=PER_PAGE_FIELD,
-    max_records=MAX_RECORDS_FIELD,
     output_format=OUTPUT_FORMAT_FIELD,
     fields=FIELDS_FIELD,
 )
 
 AhaFieldOptionsInput = create_model(
     "AhaFieldOptionsInput",
-    field_id=(str, Field(description="Custom-field ID (numeric or slug).")),
+    field_id=(
+        str,
+        Field(
+            description=(
+                "Required numeric custom-field definition ID returned by "
+                "`fields_metadata`."
+            )
+        ),
+    ),
     output_format=OUTPUT_FORMAT_FIELD,
     fields=FIELDS_FIELD,
 )
@@ -1810,18 +1816,21 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     def fields_metadata(
         self,
-        per_page: int = 25,
-        max_records: int = 100,
         output_format: Optional[str] = "json",
         fields: Optional[List[str]] = None,
     ):
-        """List custom-field definitions defined in the Aha account."""
-        records = self._collect(
-            "custom_fields",
-            per_page=per_page,
-            max_records=max_records,
+        """List all custom-field definitions in the Aha account.
+
+        Aha exposes this as an account-level collection. No record ID or
+        workspace scope is required.
+        """
+        payload = self._rest_get("custom_field_definitions")
+        records = payload.get("custom_field_definitions") or []
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message="Aha! API returned no custom-field definitions.",
         )
-        return self._format_output(self._project_records(records, fields), output_format)
 
     def field_options_metadata(
         self,
@@ -1829,12 +1838,31 @@ class AhaApiWrapper(BaseToolApiWrapper):
         output_format: Optional[str] = "json",
         fields: Optional[List[str]] = None,
     ):
-        """List the option values defined for an Aha custom field."""
-        if not (field_id or "").strip():
+        """List option metadata for an Aha custom-field definition."""
+        definition_id = str(field_id or "").strip()
+        if not definition_id:
             raise ToolException("field_options_metadata: field_id is required")
-        payload = self._rest_get(f"custom_fields/{field_id}/options")
-        records = payload.get("options") or payload.get("custom_field_options") or []
-        return self._format_output(self._project_records(records, fields), output_format)
+        if not definition_id.isdigit():
+            raise ToolException(
+                "field_options_metadata: field_id must be the numeric custom-field "
+                f"definition ID returned by fields_metadata; received {field_id!r}"
+            )
+        payload = self._rest_get(
+            f"custom_field_definitions/{definition_id}/options"
+        )
+        records = (
+            payload.get("options")
+            or payload.get("custom_field_options")
+            or []
+        )
+        return self._format_output(
+            self._project_records(records, fields),
+            output_format,
+            empty_message=(
+                "Aha! API returned no options for custom-field definition "
+                f"'{definition_id}'."
+            ),
+        )
 
     # ----- Attachments -----
 
