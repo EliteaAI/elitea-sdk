@@ -20,6 +20,7 @@ from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
 from ..middleware import TransformErrorStrategy, LoggingStrategy, SensitiveToolGuardMiddleware
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from ..exceptions import budget_exceeded_from
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools
 from ...tools.exceptions import ToolkitConfigurationError
@@ -1696,6 +1697,13 @@ class EliteAClient:
                     "execution_time_seconds": execution_time
                 }
             except Exception as tool_error:
+                # A budget block is a policy outcome, not a tool failure. Returned as a
+                # dict its type is lost, and the caller can only show the raw provider
+                # payload; raised, it keeps the scope the UI needs to explain the block.
+                budget_error = budget_exceeded_from(tool_error)
+                if budget_error is not None:
+                    raise budget_error from tool_error
+                #
                 # Calculate execution time even for failed executions
                 execution_time = time.time() - start_time
                 logger.error(f"Error executing tool '{tool_name}' after {execution_time:.3f} seconds: {str(tool_error)}")
@@ -1723,6 +1731,11 @@ class EliteAClient:
             # Re-raise McpAuthorizationRequired to allow proper handling upstream
             if isinstance(e, McpAuthorizationRequired):
                 raise
+            #
+            # Same for a budget block, or the scope raised above would be flattened here
+            if budget_exceeded_from(e) is not None:
+                raise
+            #
             logger.error(f"Error in test_toolkit_tool: {str(e)}")
             return {
                 "success": False,
