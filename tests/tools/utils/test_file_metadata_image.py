@@ -7,7 +7,8 @@ Covers:
   * No first_class_params (no line/page/row selectors for images)
   * Oversized image trips the byte-size guard (full_read_allowed=False)
   * Corrupt bytes degrade gracefully (no dimensions, still conformant)
-  * SVG dimensions are reported
+  * SVG is registered in loaders_map for RAG/indexing (EliteADirectoryLoader),
+    but get_file_metadata reports it as text (see test_file_metadata_text.py)
 """
 import io
 
@@ -115,13 +116,27 @@ def test_image_metadata_no_content():
     assert "image_width" not in meta
 
 
-def test_svg_metadata_reports_dimensions():
+def test_svg_metadata_is_text_family_not_image():
+    """get_file_metadata reports SVG as text (matches read_file's decode-first
+    behavior, #5988 follow-up) even though EliteAImageLoader (below) still
+    handles SVG for RAG/indexing via image_loaders_map, unchanged."""
     meta = get_file_metadata("icon.svg", file_content=_SVG, file_size=len(_SVG))
 
     assert meta["extension"] == ".svg"
-    assert meta.get("unit") is None
-    assert meta["image_width"] == 64
-    assert meta["image_height"] == 48
+    assert meta["unit"] == "lines"
+    assert "image_width" not in meta
+    assert "image_height" not in meta
+
+
+def test_svg_loader_classmethod_still_reports_dimensions():
+    """EliteAImageLoader itself (used by EliteADirectoryLoader for indexing)
+    is untouched — it still computes SVG dimensions when called directly."""
+    from elitea_sdk.runtime.langchain.document_loaders.EliteAImageLoader import (
+        EliteAImageLoader,
+    )
+    result = EliteAImageLoader.get_file_metadata(filename="icon.svg", file_content=_SVG)
+    assert result["image_width"] == 64
+    assert result["image_height"] == 48
 
 
 @pytest.mark.parametrize("ext", [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"])

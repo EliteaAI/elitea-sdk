@@ -427,14 +427,24 @@ def get_file_metadata(
         },
     }
 
-    # Look up loader class from loaders_map (single source of truth).
-    try:
-        from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
-        loader_entry = loaders_map.get(extension)
-    except Exception:  # pylint: disable=broad-except
-        loader_entry = None
-
     extra: Dict[str, Any] = {}
+
+    # SVG is registered in loaders_map under EliteAImageLoader for RAG/indexing
+    # (vision-based description is the better embedding), but read_file reads
+    # SVG as text (it decodes as valid UTF-8/XML) — report text-family metadata
+    # here so get_file_metadata matches what read_file actually does, without
+    # touching the shared loaders_map registry that indexing relies on.
+    if extension == ".svg":
+        extra = build_line_range_metadata(file_content, file_type_note="SVG file")
+        loader_entry = None
+    else:
+        # Look up loader class from loaders_map (single source of truth).
+        try:
+            from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map
+            loader_entry = loaders_map.get(extension)
+        except Exception:  # pylint: disable=broad-except
+            loader_entry = None
+
     if loader_entry:
         loader_cls = loader_entry.get("class")
         if loader_cls and hasattr(loader_cls, "get_file_metadata"):

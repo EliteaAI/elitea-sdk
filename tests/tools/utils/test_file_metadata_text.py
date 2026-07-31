@@ -227,3 +227,59 @@ class TestMarkdownLoaderMetadata:
                                  file_size=len(content))
         assert meta["total_lines"] == 20
         assert "1..20" in meta["instruction_for_readFile"]["first_class_params"]["start_line"]
+
+
+# ---------------------------------------------------------------------------
+# SVG classification (#5988 follow-up): get_file_metadata must report
+# text-family metadata for .svg, matching how read_file actually reads it
+# (Artifact.get() decodes SVG as text). image_loaders_map is untouched —
+# EliteADirectoryLoader still indexes .svg via vision for RAG purposes.
+# ---------------------------------------------------------------------------
+
+SVG_SMALL = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>\n'
+
+
+class TestSvgMetadata:
+
+    def test_basic_contract_is_text_family(self):
+        meta = get_file_metadata("icon.svg", file_content=SVG_SMALL,
+                                 file_size=len(SVG_SMALL))
+
+        assert meta["__result_status__"] == "file_metadata"
+        assert meta["extension"] == ".svg"
+        assert meta["unit"] == "lines"
+        assert meta["total_lines"] == 1
+        assert meta["read_limits"]["max_output_chars"] == 200000
+        assert meta["read_limits"]["full_read_allowed"] is True
+        assert "image_width" not in meta
+        assert "image_height" not in meta
+
+    def test_multiline_svg(self):
+        content = b"<svg>\n<rect/>\n<circle/>\n</svg>\n"
+        meta = get_file_metadata("shape.svg", file_content=content,
+                                 file_size=len(content))
+        assert meta["unit"] == "lines"
+        assert meta["total_lines"] == 4
+        instr = meta["instruction_for_readFile"]
+        assert "start_line" in instr["first_class_params"]
+        assert "end_line" in instr["first_class_params"]
+
+    def test_large_svg_refused_matches_read_file_cap(self):
+        """A large SVG must be refused via the 200K-char text cap, not the
+
+        5MB image byte cap — this is the exact divergence reported in #5988's
+        follow-up comment (get_file_metadata said full_read_allowed=True at
+        3.2MB while read_file refused it as content_too_large at 200K chars).
+        """
+        from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
+        line = b"<rect/>\n"
+        big = line * ((DEFAULT_MAX_OUTPUT_CHARS + 1000) // len(line) + 1)
+        big = b"<svg>\n" + big + b"</svg>\n"
+        meta = get_file_metadata("big.svg", file_content=big, file_size=len(big))
+        assert meta["total_lines"] > 1
+        assert meta["read_limits"]["full_read_allowed"] is False
+
+    def test_no_content_degrades(self):
+        meta = get_file_metadata("empty.svg", file_content=None, file_size=0)
+        assert meta["unit"] == "lines"
+        assert meta["total_lines"] == 0
