@@ -97,6 +97,29 @@ class TestRest:
         assert url == "https://example.aha.io/api/v1/features/DEVELOP-1"
         assert result == {"id": 1, "name": "X"}
 
+    @pytest.mark.parametrize("output_format", ["csv", "markdown"])
+    def test_get_requirement_honors_single_record_output_format(self, output_format):
+        w = _wrapper()
+        payload = {
+            "requirement": {
+                "id": 2,
+                "reference_num": "PROD-5-1",
+                "name": "Login",
+            }
+        }
+
+        with patch.object(
+            w._session,
+            "request",
+            return_value=_rest_stub(payload),
+        ):
+            result = w.get_requirement("PROD-5-1", output_format=output_format)
+
+        assert isinstance(result, str)
+        assert "reference_num" in result
+        assert "PROD-5-1" in result
+        assert "Login" in result
+
     def test_rest_http_error_surfaces_status_and_body(self):
         w = _wrapper()
         resp = MagicMock()
@@ -341,9 +364,22 @@ class TestOutputFormat:
         assert "|" in out
         assert "1" in out and "2" in out
 
-    def test_csv_falls_back_to_data_on_non_list(self):
+    @pytest.mark.parametrize("output_format", ["csv", "markdown"])
+    def test_single_record_output(self, output_format):
         w = _wrapper()
-        data = {"single": "record"}
+        out = w._format_output(
+            {"reference_num": "PROD-5-1", "name": "Login"},
+            output_format,
+        )
+
+        assert isinstance(out, str)
+        assert "reference_num" in out
+        assert "PROD-5-1" in out
+        assert "Login" in out
+
+    def test_csv_falls_back_to_data_on_non_tabular_shape(self):
+        w = _wrapper()
+        data = "single record"
         assert w._format_output(data, "csv") == data
 
     def test_projection_only_keeps_allowlist(self):
@@ -512,6 +548,27 @@ class TestToolRegistry:
         for t in w.get_available_tools():
             assert "name" in t and "description" in t and "args_schema" in t and "ref" in t
             assert callable(t["ref"])
+
+    def test_single_record_tools_have_entity_specific_reference_examples(self):
+        tools = {tool["name"]: tool for tool in _wrapper().get_available_tools()}
+        expected_examples = {
+            "get_feature": "DEVELOP-123",
+            "get_requirement": "PROD-5-1",
+            "get_release": "PROD-R-4",
+            "get_initiative": "PROD-I-1",
+            "get_epic": "PROD-E-1",
+            "get_idea": "PROD-I-1",
+            "get_product": "PROD",
+        }
+
+        for tool_name, example in expected_examples.items():
+            description = tools[tool_name]["args_schema"].model_json_schema()[
+                "properties"
+            ]["reference_or_id"]["description"]
+            assert example in description
+
+        schemas = {tools[name]["args_schema"] for name in expected_examples}
+        assert len(schemas) == len(expected_examples)
 
     def test_action_specific_tool_can_be_enabled_independently(self):
         toolkit = AhaToolkit.get_toolkit(
