@@ -287,18 +287,42 @@ COMMENT_RESOURCE_TYPE_FIELD = (
     ),
 )
 
-AhaReferenceInput = create_model(
-    "AhaReferenceInput",
-    reference_or_id=(
-        str,
-        Field(
-            description=(
-                "Aha reference number (e.g. `DEVELOP-123`) or numeric record ID."
+def _create_reference_input(model_name: str, example: str) -> type[BaseModel]:
+    return create_model(
+        model_name,
+        reference_or_id=(
+            str,
+            Field(
+                description=(
+                    f"Aha reference number (e.g. `{example}`) or numeric record ID."
+                ),
             ),
         ),
-    ),
-    output_format=OUTPUT_FORMAT_FIELD,
-    fields=FIELDS_FIELD,
+        output_format=OUTPUT_FORMAT_FIELD,
+        fields=FIELDS_FIELD,
+    )
+
+
+AhaFeatureReferenceInput = _create_reference_input(
+    "AhaFeatureReferenceInput", "DEVELOP-123"
+)
+AhaRequirementReferenceInput = _create_reference_input(
+    "AhaRequirementReferenceInput", "PROD-5-1"
+)
+AhaReleaseReferenceInput = _create_reference_input(
+    "AhaReleaseReferenceInput", "PROD-R-4"
+)
+AhaInitiativeReferenceInput = _create_reference_input(
+    "AhaInitiativeReferenceInput", "PROD-I-1"
+)
+AhaEpicReferenceInput = _create_reference_input(
+    "AhaEpicReferenceInput", "PROD-E-1"
+)
+AhaIdeaReferenceInput = _create_reference_input(
+    "AhaIdeaReferenceInput", "PROD-I-1"
+)
+AhaProductReferenceInput = _create_reference_input(
+    "AhaProductReferenceInput", "PROD"
 )
 
 AhaListFeaturesInput = create_model(
@@ -960,8 +984,9 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
         - ``json`` (default): return the Python object as-is; the LangChain
           tool layer serialises it to JSON.
-        - ``csv`` / ``markdown``: only meaningful for a list-of-dicts. Falls
-          back to JSON when the shape does not match.
+        - ``csv`` / ``markdown``: render a single dict as one row or a
+          list-of-dicts as multiple rows. Falls back to JSON when the shape
+          does not match.
         - Empty collections return ``empty_message`` when one is supplied.
         """
         fmt = (output_format or "json").strip().lower()
@@ -974,7 +999,12 @@ class AhaApiWrapper(BaseToolApiWrapper):
             return empty_message
         if fmt == "json":
             return data
-        if not isinstance(data, list) or not data or not all(isinstance(r, dict) for r in data):
+        records = [data] if isinstance(data, dict) else data
+        if (
+            not isinstance(records, list)
+            or not records
+            or not all(isinstance(record, dict) for record in records)
+        ):
             return data
 
         try:
@@ -985,7 +1015,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
                 "Reinstall elitea-sdk with `pip install '.[tools]'`."
             ) from exc
 
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(records)
         if fmt == "csv":
             buf = io.StringIO()
             df.to_csv(buf, index=False)
@@ -2064,43 +2094,43 @@ class AhaApiWrapper(BaseToolApiWrapper):
             {
                 "name": "get_feature",
                 "description": self.get_feature.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaFeatureReferenceInput,
                 "ref": self.get_feature,
             },
             {
                 "name": "get_requirement",
                 "description": self.get_requirement.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaRequirementReferenceInput,
                 "ref": self.get_requirement,
             },
             {
                 "name": "get_release",
                 "description": self.get_release.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaReleaseReferenceInput,
                 "ref": self.get_release,
             },
             {
                 "name": "get_initiative",
                 "description": self.get_initiative.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaInitiativeReferenceInput,
                 "ref": self.get_initiative,
             },
             {
                 "name": "get_epic",
                 "description": self.get_epic.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaEpicReferenceInput,
                 "ref": self.get_epic,
             },
             {
                 "name": "get_idea",
                 "description": self.get_idea.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaIdeaReferenceInput,
                 "ref": self.get_idea,
             },
             {
                 "name": "get_product",
                 "description": self.get_product.__doc__,
-                "args_schema": AhaReferenceInput,
+                "args_schema": AhaProductReferenceInput,
                 "ref": self.get_product,
             },
             # REST lists
