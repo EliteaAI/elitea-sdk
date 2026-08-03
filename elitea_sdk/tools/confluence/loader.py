@@ -14,7 +14,8 @@ from pdf2image import convert_from_bytes
 # from reportlab.graphics import renderPM
 # from svglib.svglib import svg2rlg
 
-from .utils import image_to_byte_array, bytes_to_base64
+from .utils import bytes_to_base64
+from ...runtime.langchain.tools.utils import encode_image_for_llm
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
@@ -73,7 +74,7 @@ class EliteAConfluenceLoader(ConfluenceLoader):
         self.confluence = confluence_client
 
     def __perform_llm_prediction_for_image(self, image: Image) -> str:
-        byte_array = image_to_byte_array(image)
+        byte_array, image_format = encode_image_for_llm(image)
         base64_string = bytes_to_base64(byte_array)
         result = self.llm.invoke([
             HumanMessage(
@@ -81,7 +82,7 @@ class EliteAConfluenceLoader(ConfluenceLoader):
                     {"type": "text", "text": self.prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{base64_string}"},
+                        "image_url": {"url": f"data:image/{image_format};base64,{base64_string}"},
                     },
                 ]
             )

@@ -7,6 +7,7 @@ from langchain_text_splitters import TokenTextSplitter
 
 from .ImageParser import ImageParser
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
+from ..tools.utils import encode_image_bytes_for_llm
 from langchain_core.tools import ToolException
 
 logger = logging.getLogger(__name__)
@@ -149,15 +150,21 @@ class EliteAPDFLoader:
             source = getattr(self, 'file_path', None) or 'pdf'
             for i, img in enumerate(images):
                 xref = img[0]
-                base_image = report.extract_image(xref)
-                img_bytes = base_image["image"]
-                image_format = base_image.get("ext", "png")
-                text_content += "\n**Image Transcript:**\n" + perform_llm_prediction_for_image_bytes(
-                    img_bytes, self.llm, self.prompt,
-                    image_format=image_format,
-                    cache=self.image_cache,
-                    image_name=source,
-                )  + "\n--------------------\n"
+                try:
+                    base_image = report.extract_image(xref)
+                    img_bytes, image_format = encode_image_bytes_for_llm(base_image["image"])
+                    transcript = perform_llm_prediction_for_image_bytes(
+                        img_bytes, self.llm, self.prompt,
+                        image_format=image_format,
+                        cache=self.image_cache,
+                        image_name=source,
+                    )
+                except Exception as image_error:
+                    logger.warning(
+                        "Skipping image %s on page %s of %s: %s", i, index, source, image_error
+                    )
+                    continue
+                text_content += "\n**Image Transcript:**\n" + transcript + "\n--------------------\n"
         return text_content
 
     def load(self):
