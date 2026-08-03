@@ -46,6 +46,7 @@ INTERNAL_TOOL_DISPLAY_NAMES: dict = {
     'data_analysis':   'Data Analysis',         # DataAnalysisToolkit — chip injected
     'planner':         'Planner',               # deprecated no-op; no chip event
     'pyodide':         'Python sandbox',        # SandboxToolkit — chip injected
+    'ask_user':        'Ask User',              # AskUserTool — clarifying question
     'swarm':           'Swarm Mode',            # mode flag; no chip event
     'lazy_tools_mode': 'Smart Tools Selection', # mode flag; no chip event
 }
@@ -1036,6 +1037,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     else:
                         logger.warning("Data Analysis internal tool requested "
                                        "but no bucket_name provided in settings")
+                elif tool['name'] == 'ask_user':
+                    # Clarifying-question tool. Reuses the HITL pause/resume
+                    # pipeline. auto_skip mirrors auto_approve_sensitive_actions
+                    # so non-interactive / API-only runs never hang on a human.
+                    from ..tools.ask_user import AskUserTool
+                    internal_tools = [AskUserTool(auto_skip=auto_approve_sensitive_actions)]
                 # Inject display metadata so FE chips show human-readable names
                 if internal_tools:
                     internal_display_name = INTERNAL_TOOL_DISPLAY_NAMES.get(
