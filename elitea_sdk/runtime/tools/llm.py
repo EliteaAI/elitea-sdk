@@ -830,6 +830,19 @@ class LLMNode(BaseTool):
         return None
 
     @staticmethod
+    def _dispatch_injection_ack(injection_id: str, config) -> None:
+        """Tell the UI this injection landed. Best-effort; the turn-end list is authoritative."""
+        try:
+            dispatch_custom_event(
+                name="midturn_injection_consumed",
+                data={"injection_id": injection_id},
+                config=config,
+            )
+        except Exception as e:
+            # Non-fatal: the turn-end consumed list is the authoritative signal.
+            logger.debug(f"Failed to dispatch injection ack for {injection_id}: {e}")
+
+    @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
         """Remove AI tool calls that lack matching tool results immediately after.
 
@@ -2945,21 +2958,23 @@ class LLMNode(BaseTool):
             # actually be acted on.
             if _injection_thread_id:
                 try:
-                    from .._injection_registry import drain as _drain_injections
-                    _injected_texts = _drain_injections(_injection_thread_id)
+                    from .. import _injection_registry as _inj_reg
+                    _injected = _inj_reg.drain_items(_injection_thread_id)
                 except Exception:
-                    _injected_texts = []
-                if _injected_texts:
+                    _injected = []
+                if _injected:
                     from langchain_core.messages import HumanMessage
-                    for _text in _injected_texts:
+                    for _inj_id, _text in _injected:
                         new_messages.append(HumanMessage(
                             content=f"[user interjected mid-task]: {_text}"))
                         if effective_limit < _injection_budget_max:
                             effective_limit += 1
+                        _inj_reg.mark_consumed(_injection_thread_id, _inj_id)
+                        self._dispatch_injection_ack(_inj_id, config)
                     logger.info(
                         "[INJECTION] folded %d mid-turn message(s) for thread %s; "
                         "effective_limit now %d",
-                        len(_injected_texts), _injection_thread_id, effective_limit,
+                        len(_injected), _injection_thread_id, effective_limit,
                     )
 
             # Call LLM again with tool results to get next response

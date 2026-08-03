@@ -181,6 +181,64 @@ def test_missing_thread_id_in_config_is_safe_noop():
     assert reg.drain(THREAD_ID) == ['never delivered']
 
 
+def test_consumed_ids_recorded_for_turn_end_report():
+    """Only folded-in injections may appear in the turn-end report (R8 ack).
+
+    The report is what the UI uses to decide whether to roll back and re-send, so
+    an id recorded here that was never actually folded in would suppress a needed
+    retry.
+    """
+    reg.register(THREAD_ID)
+    client = InjectingLLMClient(
+        tool_rounds=2,
+        inject_on_round={1: [('first', 'a')], 2: [('second', 'b')]},
+    )
+    _node(client).invoke({'messages': [HumanMessage(content='go')]}, config=_config())
+
+    assert reg.consumed(THREAD_ID) == ['a', 'b']
+
+
+def test_nothing_consumed_when_no_injection_arrives():
+    reg.register(THREAD_ID)
+    _node(InjectingLLMClient(tool_rounds=2)).invoke(
+        {'messages': [HumanMessage(content='go')]}, config=_config()
+    )
+    assert reg.consumed(THREAD_ID) == []
+
+
+def test_parked_fanout_injection_not_marked_consumed():
+    """A queued-but-undelivered injection must not be reported as consumed."""
+    reg.register(THREAD_ID)
+    reg.push(THREAD_ID, 'pivot during fan-out', injection_id='a')
+
+    node = _node(InjectingLLMClient(tool_rounds=1))
+    node.child_dispatcher = object()
+    parked = {}
+
+    import asyncio
+    completion = AIMessage(
+        content='',
+        tool_calls=[
+            {'name': 'app_a', 'args': {}, 'id': 'c1'},
+            {'name': 'app_b', 'args': {}, 'id': 'c2'},
+        ],
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(type(node), '_collect_parallel_application_specs',
+                   lambda self, *a, **k: [{'name': 'app_a'}, {'name': 'app_b'}])
+        mp.setattr(type(node), '_build_parallel_dispatch_specs',
+                   lambda self, *a, **k: {'c1': {'dispatch_epoch': 1}, 'c2': {}})
+        asyncio.run(
+            node._LLMNode__perform_tool_calling(
+                completion, [HumanMessage(content='go')], node.client,
+                _config(), parked_holder=parked,
+            )
+        )
+
+    assert parked.get('parked') is True
+    assert reg.consumed(THREAD_ID) == []
+
+
 def test_steps_limit_not_mutated_by_injection_budget_bump():
     """R8: the bump must use a local, never the shared Pydantic instance field."""
     reg.register(THREAD_ID)
@@ -195,13 +253,14 @@ def test_steps_limit_not_mutated_by_injection_budget_bump():
 
 
 def test_parked_fanout_returns_before_drain_documents_poc_boundary():
-    """Phase 0 boundary (R7/V-1): the parked sub-agent fan-out path is NOT covered.
+    """R7: the parked sub-agent fan-out path does not drain in-batch.
 
     When child_dispatcher is present, a batch of 2+ Application calls parks and
     RETURNS from __perform_tool_calling before reaching the drain point, so an
-    injection queued during that batch is not folded into this turn. It stays
-    queued (and, in production, is durably persisted), so it is delayed rather
-    than lost. Pinning this so the gap cannot be silently misread as working.
+    injection queued during that batch is not folded in on THIS pass. It stays
+    queued, and _resume_parallel_reconcile re-enters the agent node once children
+    settle — hitting the loop-top drain then. So fan-out injection is delivered
+    late, not lost. Pinning the early return so that contract can't drift.
     """
     reg.register(THREAD_ID)
     reg.push(THREAD_ID, 'pivot during fan-out', injection_id='a')
