@@ -4,6 +4,7 @@ import logging
 from langchain_core.tools import ToolException
 from pptx import Presentation
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
+from ..tools.utils import encode_image_bytes_for_llm
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from langchain_core.documents import Document
 
@@ -279,8 +280,10 @@ class EliteAPowerPointLoader:
                     try:
                         image_blob = self._get_image_blob(shape)
                         if image_blob:
+                            payload, image_format = encode_image_bytes_for_llm(image_blob)
                             caption = perform_llm_prediction_for_image_bytes(
-                                image_blob, self.llm, self.prompt,
+                                payload, self.llm, self.prompt,
+                                image_format=image_format,
                                 cache=self.image_cache,
                                 image_name=source,
                             )
