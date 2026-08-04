@@ -571,8 +571,31 @@ class EliteAClient:
             logger.warning("No low-tier models available matching the specified criteria")
             return None
 
-        # Select the first available low-tier model
-        selected_model = low_tier_models[0]
+        # Prefer the project's configured low-tier default (returned by the models API)
+        # over the first candidate. Falling back to low_tier_models[0] here selects the
+        # alphabetically-first low_tier model, which ignores the configured default.
+        selected_model = None
+        resp = requests.get(self.models_url, headers=self.headers, verify=False)
+        if resp.ok:
+            data = resp.json()
+            default_name = data.get('low_tier_default_model_name')
+            default_project_id = data.get('low_tier_default_model_project_id')
+            if default_name:
+                for model in low_tier_models:
+                    if model.get('name') != default_name:
+                        continue
+                    if default_project_id in (None, '') or model.get('project_id') == default_project_id:
+                        selected_model = model
+                        break
+                if selected_model is None:
+                    logger.warning(
+                        f"Configured low-tier default '{default_name}' not found among available "
+                        f"low-tier models; falling back to first candidate"
+                    )
+
+        # Fall back to the first available low-tier model when no default is configured/found
+        if selected_model is None:
+            selected_model = low_tier_models[0]
         model_name = selected_model['name']
 
         logger.debug(f"Selected low-tier model: {model_name} (display_name: {selected_model.get('display_name', 'N/A')})")
