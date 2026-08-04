@@ -830,12 +830,18 @@ class LLMNode(BaseTool):
         return None
 
     @staticmethod
-    def _dispatch_injection_ack(injection_id: str, config) -> None:
-        """Tell the UI this injection landed. Best-effort; the turn-end list is authoritative."""
+    def _dispatch_injection_ack(injection_id: str, text: str, config) -> None:
+        """Tell the UI this injection landed, and place it in the turn's timeline.
+
+        Carries the text so the indexer can persist a trace-step marker: the
+        injection then renders among the tool-call/thinking pins at the point it
+        was actually consumed, instead of only inside the user's message bubble
+        (which is scrolled away while a turn streams).
+        """
         try:
             dispatch_custom_event(
                 name="midturn_injection_consumed",
-                data={"injection_id": injection_id},
+                data={"injection_id": injection_id, "text": text},
                 config=config,
             )
         except Exception as e:
@@ -2970,7 +2976,7 @@ class LLMNode(BaseTool):
                         if effective_limit < _injection_budget_max:
                             effective_limit += 1
                         _inj_reg.mark_consumed(_injection_thread_id, _inj_id)
-                        self._dispatch_injection_ack(_inj_id, config)
+                        self._dispatch_injection_ack(_inj_id, _text, config)
                     logger.info(
                         "[INJECTION] folded %d mid-turn message(s) for thread %s; "
                         "effective_limit now %d",
