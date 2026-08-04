@@ -445,9 +445,10 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Error processing test data: {e}")
 
     def _dependents_diverged(self, document: Document, idx_data) -> bool:
-        # Attachments are the only dependents Xray emits, and the base loader has
-        # already pre-populated document.metadata['_attachments_data'] by the time
-        # compare_fn runs, so we can diff without an extra API call.
+        if not getattr(self, '_include_attachments', False):
+            return False
+        if '_attachments_data' not in document.metadata:
+            return False
         stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
         attachments_data = document.metadata.get("_attachments_data", []) or []
         current = set()
