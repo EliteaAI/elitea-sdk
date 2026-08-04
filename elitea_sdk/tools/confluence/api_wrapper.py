@@ -1200,6 +1200,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             self._track_processed_item()
             yield document
 
+    def _attachment_passes_extension_filters(self, title: str) -> bool:
+        def matches(patterns):
+            return any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', title, re.IGNORECASE)
+                       for pattern in patterns or [])
+
+        if matches(getattr(self, '_skip_extensions', None)):
+            return False
+        include_extensions = getattr(self, '_include_extensions', None)
+        return not include_extensions or matches(include_extensions)
+
     def _dependents_diverged(self, document: Document, idx_data) -> bool:
         # Attachments are the only dependents Confluence emits, and only when
         # include_attachments is on for this run — strict set-equality on the
@@ -1211,7 +1221,8 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         if '_attachments_data' not in document.metadata:
             return False
         stored = set(idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
-        current = {a['id'] for a in document.metadata['_attachments_data'] if a.get('id')}
+        current = {a['id'] for a in document.metadata['_attachments_data']
+                   if a.get('id') and self._attachment_passes_extension_filters(a.get('title', ''))}
         return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
@@ -1238,23 +1249,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                         logger.warning(f"Failed to fetch history for attachment {attachment.get('title', '')}: {str(e)}")
                         history_map[attachment['id']] = None
 
-                import re
                 for attachment in attachments['results']:
                     title = attachment.get('title', '')
                     file_ext = title.lower().split('.')[-1] if '.' in title else ''
 
-                    # Re-verify extension filters
-                    # Check if file should be skipped based on skip_extensions
-                    if any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', title, re.IGNORECASE)
-                           for pattern in self._skip_extensions):
-                        self._track_skipped_attachment(title, reason="extension")
-                        continue
-
-                    # Check if file should be included based on include_extensions
-                    # If include_extensions is empty, process all files (that weren't skipped)
-                    if self._include_extensions and not (
-                    any(re.match(re.escape(pattern).replace(r'\*', '.*') + '$', title, re.IGNORECASE)
-                        for pattern in self._include_extensions)):
+                    if not self._attachment_passes_extension_filters(title):
                         self._track_skipped_attachment(title, reason="extension")
                         continue
 
