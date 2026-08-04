@@ -622,6 +622,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['embedding'] = self.embeddings
         chunking_config['llm'] = self.llm
 
+        # Dependent documents (attachments) are parsed here rather than by the
+        # toolkit that fetched them, so a prompt the toolkit collected from the
+        # user has to be re-supplied at this point or the loader falls back to
+        # the built-in image-description prompt.
+        image_description_prompt = getattr(self, "_index_image_description_prompt", None)
+
         def _filter_parsing_errors(docs_generator, source_name: str):
             """Filter out documents with parsing errors or empty content and track them as skipped."""
             for doc in docs_generator:
@@ -664,7 +670,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         document=document,
                         content=content,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
-                        image_cache=getattr(self, "_image_cache", None)),
+                        image_cache=getattr(self, "_image_cache", None),
+                        prompt=image_description_prompt),
                     source_name=content_type
                 ))
             if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
@@ -686,7 +693,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         document=document,
                         content=content_in_bytes,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
-                        image_cache=getattr(self, "_image_cache", None)),
+                        image_cache=getattr(self, "_image_cache", None),
+                        prompt=image_description_prompt),
                     source_name=source_name
                 ))
             if chunking_tool:

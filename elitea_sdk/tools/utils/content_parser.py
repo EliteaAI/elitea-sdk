@@ -338,16 +338,21 @@ def _load_content_from_bytes_with_prompt(file_content: bytes, extension: str = N
             os.remove(temp_file_path)
 
 
-def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None, image_cache=None) \
+def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None, image_cache=None, prompt=None) \
         -> Generator[Document, None, None]:
     """Process the content of a file based on its type using a configured loader cosidering the origin document.
 
     ``image_cache`` is threaded through to :func:`process_content_by_type` so that
     image-carrying loaders (raster images, PDFs with embedded pictures, etc.) can
     share a per-toolkit LRU across every document processed in an indexing run.
+
+    ``prompt`` overrides the image-description prompt handed to image-carrying
+    loaders, so a user-supplied prompt survives the hop from the toolkit that
+    collected it to the loader that generates the description.
     """
     try:
-        chunks = process_content_by_type(content, extension_source, llm, chunking_config, image_cache=image_cache)
+        chunks = process_content_by_type(content, extension_source, llm, chunking_config, image_cache=image_cache,
+                                         prompt=prompt)
         chunks_counter = 0
         for chunk in chunks:
             chunks_counter += 1
@@ -382,7 +387,7 @@ class UnsupportedExtensionError(Exception):
 
 
 def process_content_by_type(content, filename: str, llm=None, chunking_config=None, fallback_extensions=None,
-                            image_cache=None) -> Generator[Document, None, None]:
+                            image_cache=None, prompt=None) -> Generator[Document, None, None]:
     """Process the content of a file based on its type using a configured loader.
 
     Args:
@@ -391,6 +396,13 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
             PDF, or the same screenshot embedded in multiple attachments)
             skip the LLM roundtrip. Passed through to the loader when its
             constructor accepts an ``image_cache`` kwarg.
+        prompt: Optional caller-supplied image-description prompt. Takes
+            precedence over the loader's ``use_default_prompt`` default so that
+            a user asking for a specific description style gets it for every
+            image, not just the ones their toolkit describes itself. It also
+            outranks a per-extension ``prompt`` in ``chunking_config``: this one
+            comes from the call that started the run, so it is the more specific
+            statement of intent.
     """
     temp_file_path = None
     extensions = fallback_extensions if fallback_extensions else []
@@ -464,7 +476,9 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                         use_default_prompt = allowed_to_override[use_prompt_key]
                 elif use_prompt_key in allowed_to_override:
                     use_default_prompt = allowed_to_override[use_prompt_key]
-                if use_default_prompt:
+                if prompt:
+                    loader_kwargs[LoaderProperties.PROMPT.value] = prompt
+                elif use_default_prompt:
                     loader_kwargs[LoaderProperties.PROMPT.value] = image_processing_prompt
                 # Propagate per-toolkit image cache when caller supplied one.
                 # Only inject when the loader actually accepts image_cache — the
