@@ -2700,7 +2700,7 @@ class LLMNode(BaseTool):
         _PENDING_TOOL_MESSAGES.set([])
 
         # Local, per-turn step budget. Mid-turn injections may bump it (bounded);
-        # never mutate self.steps_limit (shared across turns). See R8.
+        # never mutate self.steps_limit, which is shared across turns.
         _injection_thread_id = (config or {}).get('configurable', {}).get('thread_id')
         effective_limit = self.steps_limit
         _injection_budget_max = self.steps_limit * 2
@@ -2957,7 +2957,7 @@ class LLMNode(BaseTool):
                     )
                     new_messages.append(tool_message)
 
-            # ── Mid-turn user input injection drain (Phase 0 POC) ──────────
+            # ── Mid-turn user input injection drain ─────────────────────────
             # Fold any messages the user sent while this turn was running into
             # the next invoke, AFTER the tool results so no tool pair is
             # orphaned. Bump the local budget (bounded) so the interjection can

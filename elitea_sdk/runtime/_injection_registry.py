@@ -1,4 +1,4 @@
-"""In-process registry for mid-turn user input injections (Phase 0 POC).
+"""In-process registry for mid-turn user input injections.
 
 Thread-safe, keyed by thread_id. A running agent turn drains pending
 injections at each tool-call loop boundary and folds them into the next

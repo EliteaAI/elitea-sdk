@@ -182,7 +182,7 @@ def test_missing_thread_id_in_config_is_safe_noop():
 
 
 def test_consumed_ids_recorded_for_turn_end_report():
-    """Only folded-in injections may appear in the turn-end report (R8 ack).
+    """Only folded-in injections may appear in the turn-end consumed report.
 
     The report is what the UI uses to decide whether to roll back and re-send, so
     an id recorded here that was never actually folded in would suppress a needed
@@ -240,7 +240,7 @@ def test_parked_fanout_injection_not_marked_consumed():
 
 
 def test_steps_limit_not_mutated_by_injection_budget_bump():
-    """R8: the bump must use a local, never the shared Pydantic instance field."""
+    """The bump must use a local variable, never the shared Pydantic instance field."""
     reg.register(THREAD_ID)
     client = InjectingLLMClient(
         tool_rounds=3,
@@ -252,8 +252,8 @@ def test_steps_limit_not_mutated_by_injection_budget_bump():
     assert node.steps_limit == before
 
 
-def test_parked_fanout_returns_before_drain_documents_poc_boundary():
-    """R7: the parked sub-agent fan-out path does not drain in-batch.
+def test_parked_fanout_returns_before_drain_boundary():
+    """The parked sub-agent fan-out path does not drain in-batch.
 
     When child_dispatcher is present, a batch of 2+ Application calls parks and
     RETURNS from __perform_tool_calling before reaching the drain point, so an

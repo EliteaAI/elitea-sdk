@@ -1,4 +1,4 @@
-"""Unit tests for the mid-turn user input injection registry (Phase 0)."""
+"""Unit tests for the mid-turn user input injection registry."""
 
 import pytest
 
