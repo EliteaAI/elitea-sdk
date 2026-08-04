@@ -345,10 +345,6 @@ def process_document_by_type(content, extension_source: str, document: Document 
     ``image_cache`` is threaded through to :func:`process_content_by_type` so that
     image-carrying loaders (raster images, PDFs with embedded pictures, etc.) can
     share a per-toolkit LRU across every document processed in an indexing run.
-
-    ``prompt`` overrides the image-description prompt handed to image-carrying
-    loaders, so a user-supplied prompt survives the hop from the toolkit that
-    collected it to the loader that generates the description.
     """
     try:
         chunks = process_content_by_type(content, extension_source, llm, chunking_config, image_cache=image_cache,
@@ -396,13 +392,10 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
             PDF, or the same screenshot embedded in multiple attachments)
             skip the LLM roundtrip. Passed through to the loader when its
             constructor accepts an ``image_cache`` kwarg.
-        prompt: Optional caller-supplied image-description prompt. Takes
-            precedence over the loader's ``use_default_prompt`` default so that
-            a user asking for a specific description style gets it for every
-            image, not just the ones their toolkit describes itself. It also
-            outranks a per-extension ``prompt`` in ``chunking_config``: this one
-            comes from the call that started the run, so it is the more specific
-            statement of intent.
+        prompt: Optional image-description prompt. Outranks both
+            ``use_default_prompt`` and a per-extension ``prompt`` in
+            ``chunking_config``: it comes from the call that started the run,
+            so it is the more specific statement of intent.
     """
     temp_file_path = None
     extensions = fallback_extensions if fallback_extensions else []

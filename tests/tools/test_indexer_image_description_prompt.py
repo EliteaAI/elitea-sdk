@@ -23,8 +23,6 @@ from elitea_sdk.tools.utils.content_parser import image_processing_prompt
 
 CUSTOM_PROMPT = "Describe this image like a pirate would. Start with 'Ahoy matey!'"
 
-# Toolkits that never collect a prompt leave the attribute unset, so the reader
-# has to tolerate that shape as well as the None an ADO indexing run leaves.
 ATTRIBUTE_UNSET = object()
 
 
@@ -102,9 +100,8 @@ def test_text_content_is_unaffected_by_the_prompt():
 
 
 class TestToolkitsStashThePromptTheIndexerReads:
-    """The toolkit writes the prompt and the base indexer reads it back by name,
-    across files. Renaming one side has to fail here rather than in production.
-    """
+    """Renaming the attribute on either side of the hop has to fail here rather
+    than silently revert the fix in production."""
 
     def test_ado_wiki(self):
         wrapper = WikiApiWrapper.model_construct()

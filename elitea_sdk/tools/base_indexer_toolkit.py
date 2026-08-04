@@ -622,10 +622,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['embedding'] = self.embeddings
         chunking_config['llm'] = self.llm
 
-        # Dependent documents (attachments) are parsed here rather than by the
-        # toolkit that fetched them, so a prompt the toolkit collected from the
-        # user has to be re-supplied at this point or the loader falls back to
-        # the built-in image-description prompt.
         image_description_prompt = getattr(self, "_index_image_description_prompt", None)
 
         def _filter_parsing_errors(docs_generator, source_name: str):
