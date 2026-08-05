@@ -2005,6 +2005,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             ctx_toolkit_name = hitl_interrupt.get('toolkit_name', '')
                             tool_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args', {})
                         resume_ctx = {
+                            'interrupt_id': hitl_interrupt.get('interrupt_id', ''),
                             'tool_name': ctx_tool_name,
                             'toolkit_name': ctx_toolkit_name,
                             'tool_args': tool_args if isinstance(tool_args, dict) else {},
@@ -2913,6 +2914,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if hitl_interrupt.get('guardrail_type') != 'sensitive_tool':
             return False
 
+        interrupt_id = str(hitl_interrupt.get('interrupt_id') or '').strip()
+        resumed_interrupt_id = str(hitl_resume_ctx.get('interrupt_id') or '').strip()
+        if interrupt_id and resumed_interrupt_id:
+            return interrupt_id == resumed_interrupt_id
+
+        # Legacy checkpoints may predate per-invocation interrupt ids. Retain
+        # the old tool-and-arguments fallback only for those checkpoints.
         interrupt_tool_name = str(hitl_interrupt.get('tool_name') or '').strip()
         resumed_tool_name = str(hitl_resume_ctx.get('tool_name') or '').strip()
         if not interrupt_tool_name or interrupt_tool_name != resumed_tool_name:
