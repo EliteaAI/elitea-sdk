@@ -2104,6 +2104,44 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
+                    elif guardrail_type == 'clarifying_question':
+                        # Ask-user (clarifying question) resume. The ask_user tool
+                        # fired interrupt() from inside the single LLM+tools node,
+                        # so re-executing the node would re-invoke the LLM non-
+                        # deterministically. Inject a resume context (same shape as
+                        # the sensitive-tool path) so the LLM node skips the LLM
+                        # call and re-issues the SAME ask_user tool call; its own
+                        # interrupt() then consumes the resume value (the answer).
+                        resume_ctx = {
+                            'tool_name': 'ask_user',
+                            'toolkit_name': '',
+                            'tool_args': hitl_interrupt.get('tool_args', {}) or {},
+                            'tool_call_id': (
+                                hitl_interrupt.get('tool_call_id')
+                                or f"call_{uuid4().hex[:24]}"
+                            ),
+                            'action': hitl_resume_value.get('action', 'answer'),
+                            'value': hitl_resume_value.get('value', ''),
+                        }
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+
+                        # Restore intermediate tool messages captured before the
+                        # pause so completed sibling tools are not re-executed.
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        if pending_msgs_dicts:
+                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                            if trimmed:
+                                resume_ctx['pending_messages'] = trimmed
+                            original_ai_dict = self._extract_original_ai_message(
+                                pending_msgs_dicts,
+                                tool_name='ask_user',
+                                tool_args=resume_ctx['tool_args']
+                                if isinstance(resume_ctx['tool_args'], dict) else {},
+                            )
+                            if original_ai_dict is not None:
+                                resume_ctx['original_ai_message'] = original_ai_dict
+                        hitl_resume_ctx = resume_ctx
+                        logger.info("[HITL] Prepared clarifying-question resume for ask_user")
                     elif guardrail_type == 'parallel_sensitive_tools':
                         # Parallel sub-agent fan-out resume (issue #4993).
                         # The aggregate interrupt paused N children at once; the
@@ -2910,7 +2948,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if not (hitl_interrupt and hitl_resume_ctx and is_execution_finished):
             return False
 
-        if hitl_interrupt.get('guardrail_type') != 'sensitive_tool':
+        if hitl_interrupt.get('guardrail_type') not in ('sensitive_tool', 'clarifying_question'):
             return False
 
         interrupt_tool_name = str(hitl_interrupt.get('tool_name') or '').strip()
@@ -3073,6 +3111,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # hitl_resume flag) still routes to the resume path.
         return normalized_action in {
             'approve', 'reject', 'edit', 'block_with_comment', 'reject_with_comment',
+            'answer',
         }
 
     @staticmethod
