@@ -3103,10 +3103,34 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
         Returns dict suitable for Command(resume=...).
         """
-        action = input_data.get("hitl_action") or input_data.get("action") or "approve"
+        decisions = input_data.get("hitl_decisions")
+        single_decision = (
+            decisions[0]
+            if isinstance(decisions, list)
+            and len(decisions) == 1
+            and isinstance(decisions[0], dict)
+            else None
+        )
+
+        # The UI uses the routed decision-list shape whenever the backend
+        # exposes ``hitl_interrupts``.  A normal sensitive-tool pause can be
+        # represented there as a one-item list, with no top-level action.  Treat
+        # that unambiguous shape as the scalar resume too; otherwise the missing
+        # action falls through to the historical ``approve`` default and executes
+        # a tool the user explicitly rejected.
+        action = input_data.get("hitl_action") or input_data.get("action")
+        if not action and single_decision is not None:
+            action = single_decision.get("action")
+        action = action or "approve"
+
         value = input_data.get("hitl_value")
         if value is None:
-            value = input_data.get("value", "")
+            if "value" in input_data:
+                value = input_data.get("value")
+            elif single_decision is not None:
+                value = single_decision.get("value", "")
+            else:
+                value = ""
 
         resume = {
             "action": action,
@@ -3116,7 +3140,6 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # Parallel multi-interrupt resume (issue #4993): carry the per-child
         # decision map through so __perform_tool_calling can route each
         # approve/reject back to the correct paused sub-agent.
-        decisions = input_data.get("hitl_decisions")
         if isinstance(decisions, list) and decisions:
             resume["hitl_decisions"] = decisions
 
