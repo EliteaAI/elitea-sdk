@@ -66,11 +66,31 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         list-parsed by the vector adapter)."""
         return False
 
+    def _reduce_duplicates(self, documents, index_name: str, *args, **kwargs):
+        try:
+            yield from super()._reduce_duplicates(documents, index_name, *args, **kwargs)
+        finally:
+            self._dependents_index = (None, None)
+
+    def _dependents_by_parent(self, idx_data) -> dict:
+        cached_for, mapping = getattr(self, '_dependents_index', (None, None))
+        if cached_for is idx_data:
+            return mapping
+        mapping = {}
+        for dep_key, entry in idx_data.items():
+            parent = entry.get(IndexerKeywords.PARENT.value)
+            if parent in (None, -1, ''):
+                continue
+            mapping.setdefault(str(parent), []).append(dep_key)
+        self._dependents_index = (idx_data, mapping)
+        return mapping
+
     def remove_ids_fn(self, idx_data, key: str):
-        return (idx_data[key]['all_chunks'] +
-                [idx_data[dep_id]['id'] for dep_id in idx_data[key][IndexerKeywords.DEPENDENT_DOCS.value]] +
-                [chunk_db_id for dep_id in idx_data[key][IndexerKeywords.DEPENDENT_DOCS.value] for chunk_db_id in
-                 idx_data[dep_id]['all_chunks']])
+        ids = list(idx_data[key]['all_chunks'])
+        for dep_key in self._dependents_by_parent(idx_data).get(str(key), ()):
+            if dep_key != key:
+                ids.extend(idx_data[dep_key]['all_chunks'])
+        return ids
 
     def _init_indexing_stats(self) -> IndexingStats:
         """Initialize or reset indexing stats for this indexing run."""
