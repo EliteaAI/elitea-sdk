@@ -297,6 +297,87 @@ def test_5245_same_tool_prompts_every_call_across_resumes():
     )
 
 
+@pytest.mark.parametrize(
+    ('action', 'value'),
+    [
+        ('reject', ''),
+        ('block_with_comment', 'append more content first'),
+    ],
+)
+def test_single_decision_rejection_reaches_model_without_executing_tool(action, value):
+    """A one-item decision resume must block and reach the follow-up model call."""
+    configure_sensitive_tools({'fs': ['delete_file']})
+
+    class RejectAwareLLM:
+        def __init__(self):
+            self.calls = []
+            self.temperature = 0
+            self.max_tokens = 1000
+
+        @property
+        def _get_model_default_parameters(self):
+            return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def invoke(self, messages, config=None):
+            self.calls.append(list(messages))
+            blocked = []
+            for message in messages:
+                if not isinstance(message, ToolMessage):
+                    continue
+                try:
+                    payload = json.loads(str(message.content))
+                except json.JSONDecodeError:
+                    continue
+                if payload.get('type') == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE:
+                    blocked.append(payload)
+            if blocked:
+                return AIMessage(content=f"blocked: {blocked[-1]['denial_reason']}")
+            return AIMessage(
+                content='',
+                tool_calls=[{
+                    'name': 'delete_file',
+                    'args': {'path': 'temp_artifact_demo.txt'},
+                    'id': 'delete-temp',
+                }],
+            )
+
+    memory = MemorySaver()
+    thread_config = {'configurable': {'thread_id': f'reject-{action}-thread'}}
+    executed = []
+
+    initial_llm = RejectAwareLLM()
+    initial = _build_delete_files_runnable(memory, initial_llm, executed).invoke(
+        {'messages': [HumanMessage(content='Delete the temporary file')]},
+        config=thread_config,
+    )
+    assert initial['execution_finished'] is False
+    assert executed == []
+
+    resumed_llm = RejectAwareLLM()
+    resumed = _build_delete_files_runnable(memory, resumed_llm, executed).invoke(
+        {
+            'hitl_resume': True,
+            'hitl_decisions': [{
+                'interrupt_id': initial['hitl_interrupt']['interrupt_id'],
+                'action': action,
+                'value': value,
+            }],
+        },
+        config=thread_config,
+    )
+
+    assert resumed['execution_finished'] is True
+    assert executed == [], 'A rejected sensitive call must never execute'
+    assert resumed['output'] == f"blocked: {value or SensitiveToolGuardMiddleware.BLOCKED_TOOL_DEFAULT_REASON}"
+    follow_up = resumed_llm.calls[-1]
+    blocked_messages = [message for message in follow_up if isinstance(message, ToolMessage)]
+    assert len(blocked_messages) == 1
+    assert blocked_messages[0].tool_call_id == 'delete-temp'
+
+
 def test_hitl_reject_continues_tool_loop():
     tool = StructuredTool.from_function(
         func=lambda repo: SensitiveToolGuardMiddleware._build_blocked_tool_result(
