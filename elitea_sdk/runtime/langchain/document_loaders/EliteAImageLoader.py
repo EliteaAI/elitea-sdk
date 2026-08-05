@@ -12,7 +12,7 @@ from svglib.svglib import svg2rlg
 from elitea_sdk.tools.chunkers import markdown_chunker
 from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size, scale_svg_drawing, preprocess_svg_for_rendering
 from ..constants import DEFAULT_MULTIMODAL_PROMPT
-from ..tools.utils import image_to_byte_array, bytes_to_base64
+from ..tools.utils import encode_image_for_llm, encode_image_bytes_for_llm
 
 logger = logging.getLogger(__name__)
 
@@ -168,18 +168,37 @@ class EliteAImageLoader(BaseLoader):
         """Processes a raster image with automatic upscaling for small images."""
         image = Image.open(image_source)
         self._original_dimensions = image.size
+        source_format = image.format
         image, self._was_scaled = ensure_min_image_size(image)
         if self.llm:
-            return self.__perform_llm_prediction_for_image(image, self.llm, self.prompt)
+            return self.__perform_llm_prediction_for_image(
+                image, self.llm, self.prompt,
+                source_format=source_format,
+                original_bytes=None if self._was_scaled else self._raster_source_bytes(),
+            )
         else:
             return ""
 
-    def __perform_llm_prediction_for_image(self, image: Image, llm, prompt: str) -> str:
+    def _raster_source_bytes(self):
+        if hasattr(self, 'file_content'):
+            return self.file_content
+        try:
+            return Path(self.file_path).read_bytes()
+        except OSError as exc:
+            logger.warning("Could not re-read %s for passthrough: %s", self.file_path, exc)
+            return None
+
+    def __perform_llm_prediction_for_image(self, image: Image, llm, prompt: str,
+                                           source_format=None, original_bytes=None) -> str:
         """Performs LLM prediction for image content."""
-        byte_array = image_to_byte_array(image)
+        if original_bytes:
+            byte_array, image_format = encode_image_bytes_for_llm(original_bytes)
+        else:
+            byte_array, image_format = encode_image_for_llm(image, source_format=source_format)
         image_name = str(self.file_path if hasattr(self, 'file_path') else getattr(self, 'file_name', ''))
         return perform_llm_prediction_for_image_bytes(
             byte_array, llm, prompt,
+            image_format=image_format,
             cache=self.image_cache,
             image_name=image_name,
         )

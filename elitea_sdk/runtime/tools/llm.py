@@ -830,6 +830,25 @@ class LLMNode(BaseTool):
         return None
 
     @staticmethod
+    def _dispatch_injection_ack(injection_id: str, text: str, config) -> None:
+        """Tell the UI this injection landed, and place it in the turn's timeline.
+
+        Carries the text so the indexer can persist a trace-step marker: the
+        injection then renders among the tool-call/thinking pins at the point it
+        was actually consumed, instead of only inside the user's message bubble
+        (which is scrolled away while a turn streams).
+        """
+        try:
+            dispatch_custom_event(
+                name="midturn_injection_consumed",
+                data={"injection_id": injection_id, "text": text},
+                config=config,
+            )
+        except Exception as e:
+            # Non-fatal: the turn-end consumed list is the authoritative signal.
+            logger.debug(f"Failed to dispatch injection ack for {injection_id}: {e}")
+
+    @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
         """Remove AI tool calls that lack matching tool results immediately after.
 
@@ -2680,14 +2699,20 @@ class LLMNode(BaseTool):
         # Reset the pending-messages contextvar at the start of each execution.
         _PENDING_TOOL_MESSAGES.set([])
 
+        # Local, per-turn step budget. Mid-turn injections may bump it (bounded);
+        # never mutate self.steps_limit, which is shared across turns.
+        _injection_thread_id = (config or {}).get('configurable', {}).get('thread_id')
+        effective_limit = self.steps_limit
+        _injection_budget_max = self.steps_limit * 2
+
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
         while (hasattr(current_completion, 'tool_calls') and
                current_completion.tool_calls and
-               iteration < self.steps_limit):
+               iteration < effective_limit):
 
             iteration += 1
-            logger.info(f"Tool execution iteration {iteration}/{self.steps_limit}")
+            logger.info(f"Tool execution iteration {iteration}/{effective_limit}")
 
             # Execute each tool call in the current completion
             tool_calls = current_completion.tool_calls if hasattr(current_completion.tool_calls,
@@ -2931,6 +2956,32 @@ class LLMNode(BaseTool):
                         tool_call_id=tool_call_id
                     )
                     new_messages.append(tool_message)
+
+            # ── Mid-turn user input injection drain ─────────────────────────
+            # Fold any messages the user sent while this turn was running into
+            # the next invoke, AFTER the tool results so no tool pair is
+            # orphaned. Bump the local budget (bounded) so the interjection can
+            # actually be acted on.
+            if _injection_thread_id:
+                try:
+                    from .. import _injection_registry as _inj_reg
+                    _injected = _inj_reg.drain_items(_injection_thread_id)
+                except Exception:
+                    _injected = []
+                if _injected:
+                    from langchain_core.messages import HumanMessage
+                    for _inj_id, _text in _injected:
+                        new_messages.append(HumanMessage(
+                            content=f"[user interjected mid-task]: {_text}"))
+                        if effective_limit < _injection_budget_max:
+                            effective_limit += 1
+                        _inj_reg.mark_consumed(_injection_thread_id, _inj_id)
+                        self._dispatch_injection_ack(_inj_id, _text, config)
+                    logger.info(
+                        "[INJECTION] folded %d mid-turn message(s) for thread %s; "
+                        "effective_limit now %d",
+                        len(_injected), _injection_thread_id, effective_limit,
+                    )
 
             # Call LLM again with tool results to get next response
             try:
@@ -3183,9 +3234,9 @@ class LLMNode(BaseTool):
                     new_messages.append(AIMessage(content=error_msg))
                     break
 
-        # Handle max iterations
-        if iteration >= self.steps_limit:
-            logger.warning(f"Reached maximum iterations ({self.steps_limit}) for tool execution")
+        # Handle max iterations (against the local budget, which injections may have bumped)
+        if iteration >= effective_limit:
+            logger.warning(f"Reached maximum iterations ({effective_limit}) for tool execution")
             
             # CRITICAL: Check if the last message is an AIMessage with pending tool_calls
             # that were not processed. If so, we need to add placeholder ToolMessages to prevent
@@ -3211,13 +3262,13 @@ class LLMNode(BaseTool):
                         if tool_call_id and tool_call_id not in existing_tool_call_ids:
                             logger.info(f"Adding placeholder ToolMessage for interrupted tool call: {tool_name} ({tool_call_id})")
                             placeholder_msg = ToolMessage(
-                                content=f"[Tool execution interrupted - step limit ({self.steps_limit}) reached before {tool_name} could be executed]",
+                                content=f"[Tool execution interrupted - step limit ({effective_limit}) reached before {tool_name} could be executed]",
                                 tool_call_id=tool_call_id
                             )
                             new_messages.append(placeholder_msg)
             
             # Add warning message - CLI or calling code can detect this and prompt user
-            warning_msg = f"Maximum tool execution iterations ({self.steps_limit}) reached. Stopping tool execution."
+            warning_msg = f"Maximum tool execution iterations ({effective_limit}) reached. Stopping tool execution."
             new_messages.append(AIMessage(content=warning_msg))
         else:
             logger.info(f"Tool execution completed after {iteration} iterations")

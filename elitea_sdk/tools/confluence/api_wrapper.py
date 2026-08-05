@@ -1530,12 +1530,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 return extract_text_from_completion(result)
 
             from PIL import Image, UnidentifiedImageError
-            from .utils import image_to_byte_array
+            from ...runtime.langchain.tools.utils import encode_image_bytes_for_llm
 
             # Validate the input image (raise on unidentifiable bytes) so we
             # return a caller-friendly error instead of failing inside the LLM
-            # payload builder. Normalisation happens in image_to_byte_array,
-            # which always emits PNG bytes.
+            # payload builder.
             try:
                 bio = BytesIO(image_data)
                 bio.seek(0)
@@ -1549,14 +1548,14 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 return f"[Error loading image {image_name}: {str(img_error)}]"
 
             try:
-                byte_array = image_to_byte_array(image)
+                byte_array, image_format = encode_image_bytes_for_llm(image_data)
             except Exception as conv_error:
                 logger.warning(f"Error converting image {image_name}: {str(conv_error)}")
                 return f"[Error converting image {image_name}: {str(conv_error)}]"
 
             return perform_llm_prediction_for_image_bytes(
                 byte_array, llm, prompt,
-                image_format="png",
+                image_format=image_format,
                 cache=self._image_cache,
                 image_name=image_name,
             )

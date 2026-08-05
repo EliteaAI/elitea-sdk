@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_by_headers_chunker
 from .utils import perform_llm_prediction_for_image_bytes
+from ..tools.utils import encode_image_bytes_for_llm
 
 
 class EliteADocxMammothLoader(BaseLoader):
@@ -230,9 +231,11 @@ class EliteADocxMammothLoader(BaseLoader):
             if self.llm:
                 try:
                     source = self.path or self.file_name or "docx"
+                    payload, image_format = encode_image_bytes_for_llm(image_bytes)
                     transcript = perform_llm_prediction_for_image_bytes(
-                        image_bytes, self.llm,
+                        payload, self.llm,
                         self.prompt if self.prompt else image_processing_prompt,
+                        image_format=image_format,
                         cache=self.image_cache,
                         image_name=source,
                     )
@@ -711,9 +714,11 @@ class EliteADocxMammothLoader(BaseLoader):
                 image_bytes = file_rels[name].target_part.blob
                 if self.llm:
                     source = self.path or self.file_name or "docx"
+                    payload, image_format = encode_image_bytes_for_llm(image_bytes)
                     transcript = perform_llm_prediction_for_image_bytes(
-                        image_bytes, self.llm,
+                        payload, self.llm,
                         self.prompt if self.prompt else image_processing_prompt,
+                        image_format=image_format,
                         cache=self.image_cache,
                         image_name=source,
                     )
