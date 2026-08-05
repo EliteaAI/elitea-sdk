@@ -378,6 +378,134 @@ def test_single_decision_rejection_reaches_model_without_executing_tool(action, 
     assert blocked_messages[0].tool_call_id == 'delete-temp'
 
 
+def test_block_then_safe_tool_then_same_sensitive_tool_prompts_again():
+    """A fresh sensitive call after blocked-call recovery must pause again."""
+    configure_sensitive_tools({'fs': ['delete_file']})
+
+    class BlockAppendRetryLLM:
+        def __init__(self):
+            self.temperature = 0
+            self.max_tokens = 1000
+
+        @property
+        def _get_model_default_parameters(self):
+            return {'temperature': self.temperature, 'max_tokens': self.max_tokens}
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def invoke(self, messages, config=None):
+            tool_messages = {
+                message.tool_call_id: str(message.content)
+                for message in messages
+                if isinstance(message, ToolMessage)
+            }
+            if 'delete-2' in tool_messages:
+                return AIMessage(content='FINAL')
+            if 'append-1' in tool_messages:
+                return AIMessage(
+                    content='',
+                    tool_calls=[{
+                        'name': 'delete_file',
+                        'args': {'path': 'bubble_sort.py'},
+                        'id': 'delete-2',
+                    }],
+                )
+            if 'delete-1' in tool_messages:
+                return AIMessage(
+                    content='',
+                    tool_calls=[{
+                        'name': 'append_data',
+                        'args': {'path': 'bubble_sort.py', 'data': 'timsort'},
+                        'id': 'append-1',
+                    }],
+                )
+            return AIMessage(
+                content='',
+                tool_calls=[{
+                    'name': 'delete_file',
+                    'args': {'path': 'bubble_sort.py'},
+                    'id': 'delete-1',
+                }],
+            )
+
+    appended = []
+    deleted = []
+
+    def build_runnable(memory):
+        assistant = Assistant(
+            elitea=DummyEliteARuntime(),
+            data={'instructions': 'Use tools', 'tools': [], 'meta': {}},
+            client=BlockAppendRetryLLM(),
+            tools=[
+                StructuredTool.from_function(
+                    func=lambda path, data: appended.append((path, data)) or 'appended',
+                    name='append_data',
+                    description='append data to a file',
+                    metadata={
+                        'toolkit_type': 'fs', 'toolkit_name': 'fs', 'tool_name': 'append_data',
+                    },
+                ),
+                StructuredTool.from_function(
+                    func=lambda path: deleted.append(path) or 'deleted',
+                    name='delete_file',
+                    description='delete a file',
+                    metadata={
+                        'toolkit_type': 'fs', 'toolkit_name': 'fs', 'tool_name': 'delete_file',
+                    },
+                ),
+            ],
+            memory=memory,
+            app_type='predict',
+            middleware=[SensitiveToolGuardMiddleware()],
+        )
+        return assistant.runnable()
+
+    memory = MemorySaver()
+    config = {'configurable': {'thread_id': 'block-append-retry-thread'}}
+    initial = build_runnable(memory).invoke(
+        {'messages': [HumanMessage(content='Append timsort before deleting bubble_sort.py')]},
+        config=config,
+    )
+    assert initial['execution_finished'] is False
+    assert initial['hitl_interrupt']['tool_name'] == 'delete_file'
+
+    resumed = build_runnable(memory).invoke(
+        {
+            'hitl_resume': True,
+            'hitl_decisions': [{
+                'interrupt_id': initial['hitl_interrupt']['interrupt_id'],
+                'action': 'block_with_comment',
+                'value': 'append timsort first, then delete',
+            }],
+        },
+        config=config,
+    )
+
+    assert resumed['execution_finished'] is False
+    assert resumed['hitl_interrupt']['tool_name'] == 'delete_file'
+    assert resumed['hitl_interrupt']['interrupt_id'] != initial['hitl_interrupt']['interrupt_id']
+    assert appended == [('bubble_sort.py', 'timsort')]
+    assert deleted == []
+
+    completed = build_runnable(memory).invoke(
+        {
+            'hitl_resume': True,
+            'hitl_decisions': [{
+                'interrupt_id': resumed['hitl_interrupt']['interrupt_id'],
+                'action': 'approve',
+                'value': '',
+            }],
+        },
+        config=config,
+    )
+
+    assert completed['execution_finished'] is True
+    assert completed['output'] == 'FINAL'
+    assert appended == [('bubble_sort.py', 'timsort')]
+    assert deleted == ['bubble_sort.py']
+
+
 def test_hitl_reject_continues_tool_loop():
     tool = StructuredTool.from_function(
         func=lambda repo: SensitiveToolGuardMiddleware._build_blocked_tool_result(
