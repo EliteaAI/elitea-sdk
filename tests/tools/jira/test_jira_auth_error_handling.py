@@ -34,6 +34,7 @@ def jira_client(monkeypatch):
     monkeypatch.setattr(Jira, 'session', mock_session, raising=False)
 
     client.url = "https://test.atlassian.net"
+    client.api_version = "2"
 
     return client
 
@@ -50,7 +51,7 @@ class TestJiraClientCredentialValidation:
 
         jira_client.session.get.assert_called_once()
         call_args = jira_client.session.get.call_args
-        assert "/rest/api/2/myself" in call_args[0][0]
+        assert "/rest/api/2/myself" in call_args[0][0]  # fixture pins api_version='2'
         assert call_args[1]['headers'] == {'Accept': 'application/json'}
         assert call_args[1]['timeout'] == 10
 
@@ -63,10 +64,26 @@ class TestJiraClientCredentialValidation:
 
     def test_other_4xx_errors_raise_generic_auth_error(self, jira_client):
         """Other 4xx errors should raise generic auth error with status code."""
+        jira_client.session.get.return_value = create_mock_response(400, "Bad Request")
+
+        with pytest.raises(ToolException, match=r"Authentication failed: Unable to connect to Jira \(HTTP 400\)"):
+            jira_client._validate_credentials()
+
+    def test_404_names_the_api_version_and_hosting_setting(self, jira_client):
+        """A 404 means this deployment does not serve the configured version."""
         jira_client.session.get.return_value = create_mock_response(404, "Not Found")
 
-        with pytest.raises(ToolException, match=r"Authentication failed: Unable to connect to Jira \(HTTP 404\)"):
+        with pytest.raises(ToolException, match=r"Jira REST API v2 not found"):
             jira_client._validate_credentials()
+
+    def test_validates_against_the_configured_api_version(self, jira_client):
+        """Cloud clients resolve to v3, so validation must not probe v2."""
+        jira_client.api_version = "3"
+        jira_client.session.get.return_value = create_mock_response(200, '{"name": "testuser"}')
+
+        jira_client._validate_credentials()
+
+        assert "/rest/api/3/myself" in jira_client.session.get.call_args[0][0]
 
     def test_server_error_5xx_raises_auth_error(self, jira_client):
         """5xx errors should also raise auth error (can't validate)."""

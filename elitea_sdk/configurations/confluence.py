@@ -159,6 +159,15 @@ class ConfluenceConfiguration(BaseModel):
         if hosting_validation_error:
             return hosting_validation_error
 
+        # Server serves the v1 endpoint probed below, so nothing else catches this.
+        if settings.get('api_version') == '2' and not _hosting_to_cloud(
+            settings.get('hosting'), base_url
+        ):
+            return (
+                "API Version 2 is Confluence Cloud only (/wiki/api/v2), but this Base URL "
+                "is a Server/Data Center deployment. Set API Version to 1 or Auto."
+            )
+
         def with_wiki_path(url: str) -> str:
             p = urlparse(url)
             # Keep existing path if it already starts with /wiki
