@@ -347,7 +347,11 @@ def process_document_by_type(content, extension_source: str, document: Document 
     share a per-toolkit LRU across every document processed in an indexing run.
     """
     try:
-        chunks = process_content_by_type(content, extension_source, llm, chunking_config, image_cache=image_cache)
+        # TEMPORARY (EL-TODO): force-bypass the Excel size guard for indexing only —
+        # oversized sheets should be capped/chunked here eventually, not skipped outright.
+        indexing_chunking_config = dict(chunking_config or {})
+        indexing_chunking_config['.xlsx'] = {**indexing_chunking_config.get('.xlsx', {}), 'skip_size_check': True}
+        chunks = process_content_by_type(content, extension_source, llm, indexing_chunking_config, image_cache=image_cache)
         chunks_counter = 0
         for chunk in chunks:
             chunks_counter += 1

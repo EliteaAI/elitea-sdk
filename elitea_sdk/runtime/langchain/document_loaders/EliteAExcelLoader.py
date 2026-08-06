@@ -657,6 +657,9 @@ class EliteAExcelLoader(EliteATableLoader):
         self.include_headers = kwargs.get('include_headers', True)
         self.header_row = kwargs.get('header_row', 1)
         self.evaluate_formulas = bool(kwargs.get('evaluate_formulas', False))
+        # TEMPORARY (EL-TODO): lets indexing bypass the safety guard for oversized
+        # sheets until a chunked/streaming read path exists. Not exposed via read_file.
+        self.skip_size_check = bool(kwargs.get('skip_size_check', False))
         # Set and validate chunking parameters only once
         self.max_tokens = int(kwargs.get('max_tokens', LOADER_MAX_TOKENS_DEFAULT))
         self.add_header_to_chunks = bool(kwargs.get('add_header_to_chunks', False))
@@ -684,14 +687,15 @@ class EliteAExcelLoader(EliteATableLoader):
         """
         # Pass the caller's real start_row/end_row (preserving None) so the guard
         # can distinguish a genuine full read from a bounded range.
-        check_excel_read_limits(
-            self.file_path,
-            file_name=self.file_name,
-            sheet_name=self.sheet_name,
-            start_row=self.start_row,
-            end_row=self.end_row,
-            raise_on_violation=True,
-        )
+        if not self.skip_size_check:
+            check_excel_read_limits(
+                self.file_path,
+                file_name=self.file_name,
+                sheet_name=self.sheet_name,
+                start_row=self.start_row,
+                end_row=self.end_row,
+                raise_on_violation=True,
+            )
 
         if self._is_row_range_mode():
             return read_excel_rows(
