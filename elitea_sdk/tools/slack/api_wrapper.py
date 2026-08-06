@@ -11,8 +11,9 @@ logger = logging.getLogger(__name__)
 
 SendMessageModel = create_model(
                     "SendMessageModel",
-                    channel_id=(Optional[str], Field(default=None,description="Channel ID, user ID, or conversation ID to send the message to. (like C12345678 for public channels, D12345678 for DMs)")),                   
-                    message=(str, Field(description="The message text to send."))
+                    channel_id=(Optional[str], Field(default=None,description="Channel ID, user ID, or conversation ID to send the message to. (like C12345678 for public channels, D12345678 for DMs)")),
+                    message=(str, Field(description="The message text to send.")),
+                    thread_ts=(Optional[str], Field(default=None, description="Timestamp ('ts') of the parent message to reply to, as returned by read_messages. Omit to post a new top-level message to the channel."))
                     )
 
 ReadMessagesModel = create_model(
@@ -71,52 +72,52 @@ class SlackApiWrapper(BaseToolApiWrapper):
             self._client = WebClient(token=self.slack_token.get_secret_value())
         return self._client
     
-    def send_message(self, message: str, channel_id: Optional[str] = None):
+    def send_message(self, message: str, channel_id: Optional[str] = None, thread_ts: Optional[str] = None):
         """
         Sends a message to a specified Slack channel, user, or conversation.
         Uses the provided channel_id if given, otherwise falls back to the instance's channel_id.
-        """
-        
-        try:
+        Pass thread_ts (a message 'ts' from read_messages) to reply inside that message's thread.
 
+        :return: dict: The posted message's 'ts' and 'channel_id', so a later call can thread onto
+                 this message without re-reading the channel to work out which message was its own.
+        """
+        channel = channel_id if channel_id else self.channel_id
+
+        try:
             client = self._get_client()
-            
-            # Use the passed channel_id if provided, else use self.channel_id
-            channel = channel_id if channel_id else self.channel_id
-            response = client.chat_postMessage(channel=channel, text=message)
+            response = client.chat_postMessage(channel=channel, text=message, thread_ts=thread_ts)
             logger.info(f"Message sent to {channel}: {message}")
-            return f"Message sent successfully to {channel}."
-        
+
+            sent = {"success": True, "channel_id": response.get("channel", channel), "ts": response.get("ts")}
+            if thread_ts:
+                sent["thread_ts"] = thread_ts
+            return sent
+
         except SlackApiError as e:
             logger.error(f"Failed to send message to {channel}: {e.response['error']}")
-            return f"Received the error :  {e.response['error']}"
+            return {"success": False, "error": e.response["error"]}
 
     def read_messages(self, limit=10, channel_id: Optional[str] = None):
         """
         Reads the latest messages from a Slack channel or conversation.
-       
-        :param limit: int: The number of messages to fetch (default is 10)
-        :return: list: Returns a list of messages with metadata.
-        """
-        try:
 
+        :param limit: int: The number of messages to fetch (default is 10)
+        :return: list: Returns a list of messages with their 'ts' (Slack timestamp, which also
+                 identifies the message), user, text and app name, plus 'thread_ts' when the
+                 message belongs to a thread. Use 'ts' as send_message's thread_ts to reply in thread.
+        """
+        channel = channel_id if channel_id else self.channel_id
+
+        try:
             client = self._get_client()
             auth_result = client.auth_test()
             logger.debug(f"Slack auth test ok: team={auth_result.get('team')}, user={auth_result.get('user')}")
-            # Use the passed channel_id if provided, else use self.channel_id
-            channel = channel_id if channel_id else self.channel_id
-            # Fetch conversation history
-            response = client.conversations_history(
-                channel=channel,
-                limit=limit )
-            
-            # Extract messages from the response
-            messages = self.extract_slack_messages(response.get('messages', []))
-            
-            return messages
-            
+
+            response = client.conversations_history(channel=channel, limit=limit)
+
+            return self.extract_slack_messages(response.get('messages', []))
+
         except SlackApiError as e:
-            # Handle errors from the Slack API
             logger.error(f"Failed to read message from {channel}: {e.response['error']}")
             return f"Received the error :  {e.response['error']}"
         
@@ -242,16 +243,18 @@ class SlackApiWrapper(BaseToolApiWrapper):
         extracted_info = []
 
         for item in data:
-            # Extract 'user' and 'text'
-            user = item.get("user", "Undefined User")
-            message = item.get("text", "No message")
+            extracted = {
+                "ts": item.get("ts"),
+                "user": item.get("user", "Undefined User"),
+                "message": item.get("text", "No message"),
+                "app_name": (item.get("bot_profile") or {}).get("name", "No App Name"),
+            }
 
-            # Extract 'app name'
-            app_name = item.get("bot_profile", {}).get("name", "No App Name")
-            
-            # Append to result
-            extracted_info.append({"user": user, "message": message, "app_name": app_name})
-        
+            if item.get("thread_ts"):
+                extracted["thread_ts"] = item["thread_ts"]
+
+            extracted_info.append(extracted)
+
         return extracted_info
 
     # Function to extract required user details
