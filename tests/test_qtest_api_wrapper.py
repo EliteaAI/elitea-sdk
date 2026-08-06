@@ -755,7 +755,7 @@ def _patch_execution_statuses(monkeypatch, status_values=None):
         def json(self):
             return self._payload
 
-    def fake_get(url, headers=None, params=None):
+    def fake_get(url, headers=None, params=None, timeout=None):
         return _FakeResponse(statuses_payload)
 
     import elitea_sdk.tools.qtest.api_wrapper as api_wrapper_module
