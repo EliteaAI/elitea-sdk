@@ -1264,16 +1264,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # reindex (it only registers on in_progress), so a stopped reindex stays stuck.
             now = time.time()
             metadata = copy.deepcopy(index_meta.get("metadata", {}))
+            previous_state = metadata.get("state")
             metadata["state"] = IndexerKeywords.INDEX_META_IN_PROGRESS.value
             metadata["created_on"] = now
             metadata["updated_on"] = now
             metadata["error"] = None
-            # Reset run linkage like the fresh-init branch: a previous (e.g. completed)
-            # run may have left task_id stamped, and the platform's reconcile guard skips
-            # rows whose task_id doesn't match the stopping task — leaving a stopped
-            # reindex stuck. Clearing it lets this run's task_id be (re)stamped/matched.
-            metadata["task_id"] = None
-            metadata["conversation_id"] = None
+            # A terminal previous state means task_id is a leftover of a finished run —
+            # keeping it would make the platform's reconcile guard skip the row on Stop.
+            # An in_progress row was pre-created by the platform for THIS run: clearing
+            # it loses the only reliable stamp (the one-shot platform re-stamp races our
+            # full-row writes) and permanently disables the UI Stop button.
+            if previous_state != IndexerKeywords.INDEX_META_IN_PROGRESS.value:
+                metadata["task_id"] = None
+                metadata["conversation_id"] = None
             # Append a new run entry to history (like fresh-init records the run) instead of
             # leaving history[-1] pointing at the previous run's terminal state; also makes
             # is_reindex (len(history) > 1) correct for this run.
