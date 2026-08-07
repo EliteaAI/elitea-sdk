@@ -9,6 +9,11 @@ import pytest
 from langchain_core.tools import ToolException
 from elitea_sdk.tools.sharepoint.graph_wrapper import SharepointGraphWrapper
 from elitea_sdk.tools.sharepoint.api_wrapper import ReadFromSharingLink
+from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
+from elitea_sdk.runtime.langchain.document_loaders.EliteAExcelLoader import (
+    ExcelReadEstimate,
+    ExcelReadLimitExceeded,
+)
 
 
 def _encode_sharing_url(sharing_url: str) -> str:
@@ -1143,3 +1148,350 @@ class TestReadFromSharingLinkSchema:
 
         # Verify description mentions SharePoint (checking schema docs, not URL validation)
         assert 'sharepoint' in description.lower() or 'onedrive' in description.lower()
+
+    def test_schema_exposes_line_range_params(self):
+        """start_line/end_line are advertised so an over-limit read can be retried.
+
+        The over-limit response tells the model to narrow the read; without these
+        params in the schema that guidance would be unactionable.
+        """
+
+        schema = ReadFromSharingLink.model_json_schema()
+
+        for field in ('start_line', 'end_line'):
+            assert field in schema['properties']
+            assert field not in schema.get('required', [])
+
+
+class TestSharingLinkReadCap:
+    """Output-size cap for read_file_from_sharing_link.
+
+    The 20 MB pre-download gate bounds bytes on the drive, not the character
+    count the file parses into — a well-under-limit file can still parse into
+    more text than a model message can carry.
+    """
+
+    OVERSIZED = "\n".join(f"line {i}" for i in range(1, 200_001))
+    SMALL = "\n".join(f"line {i}" for i in range(1, 51))
+
+    def _wrapper(self):
+        return SharepointGraphWrapper(
+            site_url="https://test.sharepoint.com/sites/test",
+            token="test-token",
+            scopes=["Files.Read"],
+        )
+
+    @staticmethod
+    def _metadata_response(file_name):
+        response = MagicMock()
+        response.ok = True
+        response.status_code = 200
+        response.json.return_value = {
+            'name': file_name,
+            'size': 11 * 1024 * 1024,
+            '@microsoft.graph.downloadUrl': 'https://download.url/file',
+        }
+        return response
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_oversized_content_returns_guidance_not_content(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """Over-cap content is replaced by content_too_large guidance."""
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/large.md")
+
+        assert isinstance(result, dict)
+        assert result['__result_status__'] == 'content_too_large'
+        assert result['context']['actual_chars'] == len(self.OVERSIZED)
+        assert result['context']['limit_chars'] == DEFAULT_MAX_OUTPUT_CHARS
+        assert result['context']['requested'] == 'full file read'
+        assert result['read_limits']['full_read_allowed'] is False
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_guidance_reports_the_real_file_name_and_line_total(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """Guidance is built from the Graph file name, not the opaque sharing URL.
+
+        Sharing URLs carry no reliable file name, so the guidance would otherwise
+        report an undetectable type and no chunking unit.
+        """
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/EbC123ABC?e=xyz789")
+
+        assert result['filename'] == 'large.md'
+        assert result['extension'] == '.md'
+        assert result['unit'] == 'lines'
+        assert result['total_lines'] == 200_000
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_line_range_returns_only_the_requested_slice(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """The retry the guidance advertises actually narrows the read."""
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/large.md",
+            start_line=10, end_line=14)
+
+        assert isinstance(result, str)
+        assert result.splitlines() == ['line 10', 'line 11', 'line 12', 'line 13', 'line 14']
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_still_oversized_slice_reports_full_file_line_total(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """A too-wide slice re-guards, and total_lines still describes the whole file.
+
+        Reporting the slice's own length would walk the model into a shrinking
+        window that never converges on a valid range.
+        """
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/large.md",
+            start_line=1, end_line=199_999)
+
+        assert result['__result_status__'] == 'content_too_large'
+        assert result['total_lines'] == 200_000
+        assert result['context']['requested'] == 'start_line=1, end_line=199999'
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_within_cap_content_passes_through_unchanged(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """Normal-sized files are returned verbatim."""
+
+        mock_requests.get.return_value = self._metadata_response('small.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.SMALL
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/small.md")
+
+        assert result == self.SMALL
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_non_text_result_refuses_rather_than_chunking(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """Excel-style dict results have no lines, so a range retry is not offered."""
+
+        mock_requests.get.return_value = self._metadata_response('big.xlsx')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = {'Sheet1': ['row'] * 200_000}
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:x:/s/site/big.xlsx")
+
+        assert result['__result_status__'] == 'content_too_large'
+        assert result['read_limits']['full_read_allowed'] is False
+        assert 'start_line' not in result['instruction_for_readFile']['first_class_params']
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_inverted_range_is_rejected_not_silently_empty(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """end_line < start_line errors instead of returning ''.
+
+        The slice would be empty, and an empty tool result is indistinguishable
+        from an empty file — a dead end on the retry path the over-limit
+        response steers the caller into.
+        """
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/large.md",
+            start_line=10, end_line=5)
+
+        assert isinstance(result, dict)
+        assert result['__result_status__'] == 'error'
+        assert 'end_line (5) is before start_line (10)' in result['message']
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_start_line_past_eof_reports_the_line_total(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """A start_line beyond the file says so and names the valid range."""
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/large.md",
+            start_line=999_999)
+
+        assert result['__result_status__'] == 'error'
+        assert 'this file has 200000 lines' in result['message']
+        assert '1..200000' in result['message']
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_requested_label_omits_an_unset_bound(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """context.requested is LLM-facing, so it must not print 'end_line=None'."""
+
+        mock_requests.get.return_value = self._metadata_response('large.md')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.return_value = self.OVERSIZED
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:t:/s/site/large.md",
+            start_line=1)
+
+        assert result['context']['requested'] == 'start_line=1'
+        assert 'None' not in result['context']['requested']
+
+    @staticmethod
+    def _excel_estimate():
+        return ExcelReadEstimate(
+            sheets=[{"name": "Sheet1", "max_row": 500000, "max_column": 20}],
+            total_rows_workbook=500000, target_sheet="Sheet1",
+            target_sheet_total_rows=500000, requested_start_row=1,
+            requested_end_row=500000, requested_rows=500000, sampled_rows=10,
+            sampled_chars=5000, estimated_output_chars=25_000_000, embedded_images=0,
+            file_size_bytes=18_000_000, is_unbounded_read=True, violations=["too big"],
+        )
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_oversized_workbook_returns_guidance_not_a_bare_raise(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """A workbook too big to parse trips the estimate before the char cap.
+
+        Without an explicit catch it escapes as a bare ValueError subclass —
+        past the guard, on the file type most likely to be oversized.
+        """
+
+        mock_requests.get.return_value = self._metadata_response('huge.xlsx')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.side_effect = ExcelReadLimitExceeded(
+            "too big", estimate=self._excel_estimate())
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:x:/s/site/huge.xlsx")
+
+        assert isinstance(result, dict)
+        assert result['__result_status__'] == 'content_too_large'
+        assert result['filename'] == 'huge.xlsx'
+        assert result['read_limits']['full_read_allowed'] is False
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.utils.http_utils.requests')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_workbook_guidance_names_this_tool_and_offers_no_sheet_name(
+            self, mock_requests, mock_http_requests, mock_parse):
+        """This tool takes no sheet_name, so guidance must not advertise one.
+
+        read_document's variant does suggest sheet_name; suggesting it here
+        would send the caller after a parameter it cannot pass.
+        """
+
+        mock_requests.get.return_value = self._metadata_response('huge.xlsx')
+        mock_http_requests.get.return_value = _create_streaming_response_mock(b'data')
+        mock_parse.side_effect = ExcelReadLimitExceeded(
+            "too big", estimate=self._excel_estimate())
+
+        result = self._wrapper().read_file_from_sharing_link(
+            "https://company.sharepoint.com/:x:/s/site/huge.xlsx")
+
+        instruction = result['instruction_for_readFile']
+        assert instruction['first_class_params'] == {}
+        assert 'read_file_from_sharing_link' in instruction['notes']
+        assert 'read_document' not in instruction['notes']
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_403_fallback_oversized_workbook_is_guarded_too(
+            self, mock_requests, mock_parse):
+        """The cross-tenant fallback parses separately and needs its own catch."""
+
+        mock_403 = MagicMock()
+        mock_403.status_code = 403
+        mock_403.json.return_value = {'error': {'message': 'Access denied'}}
+        mock_requests.get.return_value = mock_403
+        mock_parse.side_effect = ExcelReadLimitExceeded(
+            "too big", estimate=self._excel_estimate())
+
+        wrapper = self._wrapper()
+
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.xlsx', delete=False) as tmp:
+            tmp.write(b'xlsx bytes')
+            temp_path = tmp.name
+
+        try:
+            with patch.object(wrapper, '_download_public_link') as mock_download:
+                mock_download.return_value = ('public.xlsx', temp_path)
+
+                result = wrapper.read_file_from_sharing_link(
+                    "https://other-tenant.sharepoint.com/:x:/g/public/file")
+
+            assert isinstance(result, dict)
+            assert result['__result_status__'] == 'content_too_large'
+            assert result['filename'] == 'public.xlsx'
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.parse_file_content')
+    @patch('elitea_sdk.tools.sharepoint.graph_wrapper.requests')
+    def test_403_public_link_fallback_is_capped_too(self, mock_requests, mock_parse):
+        """The cross-tenant fallback path returns through the same guard."""
+
+        mock_403_response = MagicMock()
+        mock_403_response.status_code = 403
+        mock_403_response.json.return_value = {'error': {'message': 'Access denied'}}
+        mock_requests.get.return_value = mock_403_response
+        mock_parse.return_value = self.OVERSIZED
+
+        wrapper = self._wrapper()
+
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.md', delete=False) as tmp:
+            tmp.write(b'fallback content')
+            temp_path = tmp.name
+
+        try:
+            with patch.object(wrapper, '_download_public_link') as mock_download:
+                mock_download.return_value = ('public.md', temp_path)
+
+                result = wrapper.read_file_from_sharing_link(
+                    "https://other-tenant.sharepoint.com/:t:/g/public/file")
+
+            assert isinstance(result, dict)
+            assert result['__result_status__'] == 'content_too_large'
+            assert result['filename'] == 'public.md'
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)

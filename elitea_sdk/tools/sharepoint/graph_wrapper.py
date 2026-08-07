@@ -18,7 +18,7 @@ import math
 import os
 import re
 import time
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Union
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
 import requests
@@ -27,6 +27,8 @@ from langchain_core.tools import ToolException
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content, parse_content_from_bytes
+from ..utils.file_metadata import bound_read_result, describe_requested_range
+from .read_guidance import build_excel_over_limit_response
 from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ..utils.http_utils import (
@@ -2107,7 +2109,28 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         f"Files with intermediate extensions like '{intermediate_ext}' are not allowed."
                     )
 
-    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False) -> str:
+    @staticmethod
+    def _excel_over_limit(exc: ExcelReadLimitExceeded, file_name: str,
+                          start_line: Optional[int], end_line: Optional[int],
+                          ) -> Dict[str, Any]:
+        """Turn an over-limit workbook into guidance instead of a bare raise.
+
+        A workbook big enough to trip the pre-parse estimate never reaches the
+        output cap — it raises first — so without this catch the largest Excel
+        files escape the sharing-link read guard entirely. Unlike read_document
+        this tool takes no sheet_name, so there is no narrowing lever to offer.
+        """
+        return build_excel_over_limit_response(
+            exc.estimate, filename=file_name,
+            requested=describe_requested_range(start_line, end_line),
+            tool_name="read_file_from_sharing_link",
+            supports_sheet_name=False,
+        )
+
+    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False,
+                                    start_line: Optional[int] = None,
+                                    end_line: Optional[int] = None
+                                    ) -> Union[str, Dict[str, Any]]:
         """Read a file from a SharePoint/OneDrive sharing link.
 
         Supports:
@@ -2124,9 +2147,12 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             sharing_url: Full HTTPS sharing link URL
             is_capture_image: When True and an LLM is configured, embedded images
                 are recognized and transcribed via the vision pipeline.
+            start_line: Starting line number (1-indexed, inclusive) for a partial read
+            end_line: Ending line number (1-indexed, inclusive) for a partial read
 
         Returns:
-            Parsed text content of the file
+            Parsed text content of the file, or content_too_large guidance when the
+            parsed content exceeds the output cap
 
         Raises:
             ToolException: If URL is invalid, file type is unsupported, or file
@@ -2159,7 +2185,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     )
                     if isinstance(result, ToolException):
                         raise result
-                    return result
+                    return bound_read_result(
+                        result, file_name, start_line=start_line, end_line=end_line)
+                except ExcelReadLimitExceeded as e:
+                    return self._excel_over_limit(e, file_name, start_line, end_line)
                 finally:
                     # Always clean up temp file
                     if os.path.exists(temp_path):
@@ -2200,7 +2229,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 image_cache=self._image_cache)
             if isinstance(result, ToolException):
                 raise result
-            return result
+            return bound_read_result(
+                result, file_name, start_line=start_line, end_line=end_line)
+        except ExcelReadLimitExceeded as e:
+            return self._excel_over_limit(e, file_name, start_line, end_line)
         finally:
             # Always clean up temp file
             if temp_path and os.path.exists(temp_path):

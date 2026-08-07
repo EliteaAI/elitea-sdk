@@ -11,7 +11,7 @@ Authentication precedence (evaluated in order):
 import logging
 import os
 import re
-from typing import Optional, Generator, List, Any, Dict
+from typing import Optional, Generator, List, Any
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -22,13 +22,9 @@ from .graph_wrapper import SharepointGraphWrapper
 from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
-from ..utils.file_metadata import (
-    DEFAULT_MAX_OUTPUT_CHARS, build_over_limit_response, guard_nontext_read, guard_text_read,
-)
-from ..utils.text_operations import apply_line_slice
-from ...runtime.langchain.document_loaders.EliteAExcelLoader import (
-    ExcelReadLimitExceeded, build_excel_metadata_from_estimate,
-)
+from ..utils.file_metadata import bound_read_result, describe_requested_range
+from .read_guidance import build_excel_over_limit_response
+from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
 
 # ------------------------------------------------------------------ #
@@ -65,57 +61,6 @@ def _reject_if_executable(path: str) -> None:
     ext = os.path.splitext(path or "")[1].lower()
     if ext in BLOCKED_BINARY_EXTENSIONS:
         raise ToolException(_UNSUPPORTED_FILE_TYPE_MESSAGE)
-
-
-def _sharepoint_excel_over_limit_response(
-    estimate, *, filename: str, sheet_name: Optional[str], requested: str,
-) -> Dict[str, Any]:
-    """Build content_too_large guidance for an ExcelReadLimitExceeded catch.
-
-    read_document has no row-range params (unlike the artifact toolkit's
-    read_file), so the only narrowing lever it exposes is sheet_name. If a
-    sheet_name was already supplied and it's still over limit, there is
-    nothing further to suggest — refuse plainly instead of looping.
-    """
-    sheet_names = [s.get("name", "") for s in estimate.sheets]
-    actual_chars = estimate.estimated_output_chars or estimate.sampled_chars or (DEFAULT_MAX_OUTPUT_CHARS + 1)
-
-    # Reuse the shared builder for the full diagnostic metadata (row/image/byte
-    # limits etc.), then replace only instruction_for_readFile to reflect
-    # read_document's narrower surface (sheet_name, no row range).
-    metadata: Dict[str, Any] = build_excel_metadata_from_estimate(estimate)
-    metadata["filename"] = filename
-
-    if sheet_name is None and sheet_names:
-        metadata["instruction_for_readFile"] = {
-            "first_class_params": {
-                "sheet_name": (
-                    "string — name of a single sheet to read instead of the "
-                    "whole workbook. Available sheets: " + ", ".join(sheet_names)
-                ),
-            },
-            "notes": (
-                f"This workbook exceeds the {DEFAULT_MAX_OUTPUT_CHARS}-character "
-                "read limit. Retry read_document with sheet_name set to one of "
-                "the sheets listed above to read a smaller subset."
-            ),
-        }
-    else:
-        metadata["instruction_for_readFile"] = {
-            "first_class_params": {},
-            "notes": (
-                (f"Sheet '{sheet_name}' " if sheet_name else "This workbook ")
-                + f"still exceeds the {DEFAULT_MAX_OUTPUT_CHARS}-character read "
-                "limit even at the narrowest scope read_document supports. "
-                "Reading it in full is refused; no smaller read is available "
-                "through this tool."
-            ),
-        }
-
-    return build_over_limit_response(
-        metadata, actual_chars=actual_chars, limit_chars=DEFAULT_MAX_OUTPUT_CHARS,
-        requested=requested, include_metadata_directive=False,
-    )
 
 
 # ------------------------------------------------------------------ #
@@ -205,6 +150,12 @@ ReadFromSharingLink = create_model(
         description="Determines is pictures in the document should be recognized.",
         default=False)
     ),
+    start_line=(Optional[int], Field(default=None, ge=1,
+        description="Starting line number (1-indexed, inclusive) for a partial read. "
+                    "Omit to read from the beginning.")),
+    end_line=(Optional[int], Field(default=None, ge=1,
+        description="Ending line number (1-indexed, inclusive) for a partial read. "
+                    "Omit to read to the end.")),
 )
 
 UploadFile = create_model(
@@ -679,33 +630,21 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         _reject_if_executable(path)
         self._sync_backend_context()
 
-        requested = (
-            f"start_line={start_line}, end_line={end_line}"
-            if (start_line is not None or end_line is not None)
-            else "full file read"
-        )
         try:
             result = self._backend.read_file(
                 path, is_capture_image, page_number, sheet_name, excel_by_sheets)
         except ExcelReadLimitExceeded as e:
             # Pre-parse estimate already computed; build read_document-specific
             # guidance rather than the parser's own extra_params-based message.
-            return _sharepoint_excel_over_limit_response(
-                e.estimate, filename=path, sheet_name=sheet_name, requested=requested)
+            return build_excel_over_limit_response(
+                e.estimate, filename=path, sheet_name=sheet_name,
+                requested=describe_requested_range(start_line, end_line))
         # rest_wrapper may return a ToolException instead of raising; pass through
         # as-is rather than feeding an error object into the guard functions.
         if isinstance(result, ToolException):
             return result
-        # Excel etc. parse to a dict with no line structure — not chunkable by line.
-        if not isinstance(result, str):
-            return guard_nontext_read(result, path, requested=requested)
-
-        content = result
-        if start_line is not None or end_line is not None:
-            offset = start_line if start_line is not None else 1
-            limit = (end_line - offset + 1) if end_line is not None else None
-            content = apply_line_slice(content, offset=offset, limit=limit)
-        return guard_text_read(content, path, requested=requested, full_content=result)
+        return bound_read_result(
+            result, path, start_line=start_line, end_line=end_line)
 
     def upload_file(self, folder_path: str, filepath: Optional[str] = None,
                     filedata: Optional[str] = None, filename: Optional[str] = None,
@@ -752,7 +691,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         return self._backend.add_attachment_to_list_item(
             list_title, item_id, filepath, filedata, filename, replace)
 
-    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False):
+    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False,
+                                    start_line: Optional[int] = None,
+                                    end_line: Optional[int] = None):
         """Read a file from a SharePoint/OneDrive sharing link.
 
         Use this tool when you have a sharing link URL to a file (typically from
@@ -770,14 +711,20 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             sharing_url: Complete sharing link URL
             is_capture_image: When True and an LLM is configured, embedded images
                 are recognized and transcribed via the vision pipeline.
+            start_line: Starting line number (1-indexed, inclusive) for a partial read
+            end_line: Ending line number (1-indexed, inclusive) for a partial read
 
         Returns:
-            Parsed text content of the shared file
+            Parsed text content of the shared file. When the content exceeds the
+            read limit, a content_too_large response is returned instead, carrying
+            the total line count and a start_line/end_line range to retry with.
         """
         self._sync_backend_context()
         return self._backend.read_file_from_sharing_link(
             sharing_url=sharing_url,
-            is_capture_image=is_capture_image
+            is_capture_image=is_capture_image,
+            start_line=start_line,
+            end_line=end_line,
         )
 
     # ------------------------------------------------------------------ #

@@ -5,7 +5,7 @@ Two concrete implementations exist:
 - :class:`SharepointGraphWrapper` : Microsoft Graph API (delegated access — requires token + scopes)
 """
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.tools import ToolException
 
@@ -212,15 +212,21 @@ class BaseSharepointWrapper(ABC):
         "Provide token + scopes to enable sharing link support."
     )
 
-    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False) -> str:
+    def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False,
+                                    start_line: Optional[int] = None,
+                                    end_line: Optional[int] = None
+                                    ) -> Union[str, Dict[str, Any]]:
         """Read a file from a SharePoint/OneDrive sharing link.
 
         Args:
             sharing_url: Full sharing URL (e.g., https://company-my.sharepoint.com/:x:/...)
             is_capture_image: When True and an LLM is configured, embedded images are transcribed.
+            start_line: Starting line number (1-indexed, inclusive) for a partial read
+            end_line: Ending line number (1-indexed, inclusive) for a partial read
 
         Returns:
-            Parsed text content of the file
+            Parsed text content of the file, or content_too_large guidance when it
+            exceeds the output cap
 
         Raises:
             ToolException: If sharing links are not supported by this backend
