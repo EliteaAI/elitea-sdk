@@ -1733,15 +1733,58 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error processing page with images: {stacktrace}")
             return f"Error processing page with images: {str(e)}"
     
+    def _get_embedded_file_ids(self, page_id: str) -> Optional[set]:
+        """File ids referenced by the page body, or None when the body can't be inspected.
+
+        Deleting a file from the page in the Confluence editor removes its body
+        reference but keeps the attachment itself (status stays 'current'), so the
+        attachment listing alone can't tell removed files apart. The body is the
+        only source of truth: its media nodes carry the attachment's immutable
+        fileId. atlas_doc_format is used because fileId matching survives renames,
+        which filename matching on the storage format would not.
+        """
+        try:
+            page = self.client.get(f"api/v2/pages/{page_id}", params={'body-format': 'atlas_doc_format'})
+            document = json.loads(page['body']['atlas_doc_format']['value'])
+        except Exception as e:
+            logger.warning(f"Cannot inspect body of page {page_id} for embedded files: {e}")
+            return None
+
+        file_ids = set()
+        nodes = [document]
+        while nodes:
+            node = nodes.pop()
+            if isinstance(node, dict):
+                if str(node.get('type', '')).startswith('media'):
+                    file_id = (node.get('attrs') or {}).get('id')
+                    if file_id:
+                        file_ids.add(file_id)
+                nodes.extend(node.get('content') or [])
+        return file_ids
+
+    @staticmethod
+    def _visible_on_page(attachment: dict, embedded_file_ids: Optional[set]) -> bool:
+        if embedded_file_ids is None:
+            return True
+        file_id = attachment.get('extensions', {}).get('fileId')
+        # Attachments without a fileId (Server/DC responses) can't be matched — keep them.
+        return not file_id or file_id in embedded_file_ids
+
     def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None):
         """
-        Retrieve all attachments for a Confluence page, including core metadata (with creator, created, updated), comments,
-        file content, and LLM-based analysis for supported types.
+        Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
+        file content, and LLM-based analysis for supported types. Files removed from the page content are excluded.
         Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis.
         """
         try:
             attachments = self.client.get_attachments_from_content(page_id)
             if not attachments or not attachments.get('results'):
+                return f"No attachments found for page ID {page_id}."
+
+            embedded_file_ids = self._get_embedded_file_ids(page_id)
+            attachments['results'] = [attachment for attachment in attachments['results']
+                                      if self._visible_on_page(attachment, embedded_file_ids)]
+            if not attachments['results']:
                 return f"No attachments found for page ID {page_id}."
 
             # Get attachment history for created/updated info
