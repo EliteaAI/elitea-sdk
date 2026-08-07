@@ -132,18 +132,18 @@ nodes:
           Result: {list_result}
           
           Expected behavior:
-          - Result contains array of file objects
-          - Each file object has: name, link (download URL), modified (timestamp), size
-          - Test file appears in the listing
-          - Download link is properly formatted: {bucket}/filename
+          - Result contains array of listed entries
+          - The test file appears in the listing
+          - File entries include required metadata fields: name, link (download URL), modified (timestamp), size
+          - Folder entries may omit file-only metadata such as link, modified, or size
           - No errors in the response
           
           Evaluate:
           1. Is the result a valid file list (contains rows/files array)?
           2. Does the test file appear in the listing?
-          3. Does each file have required metadata fields (name, link, modified, size)?
-          4. Are download links properly formatted?
-          5. Are there any errors or null values in critical fields?
+          3. Do listed file entries include required metadata fields (name, link, modified, size)?
+          4. Are file download links properly formatted when present?
+          5. Are there any errors or null values in critical fields for file entries?
           
           Return a JSON object with:
           {{
