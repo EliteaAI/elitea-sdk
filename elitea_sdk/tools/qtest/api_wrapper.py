@@ -266,6 +266,17 @@ UpdateTestRunStatus = create_model(
     test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
     status=(str, Field(description="Manual test run status. Standard values: 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete'. Must match a status name configured in the project's Field Settings.")),
     note=(Optional[str], Field(description="Optional execution note/comment to attach to the test log.", default=None)),
+    testcase_version_id=(Optional[int], Field(
+        description="Optional numeric test case version ID, not the version name. Use get_test_case_versions to resolve a name like '2.0'. If omitted, the test run's current version is used.",
+        default=None)),
+)
+
+GetTestCaseVersions = create_model(
+    "GetTestCaseVersions",
+    test_case_id=(str, Field(description="Test case ID in format TC-123 or QTest numeric ID")),
+    version_name=(Optional[str], Field(
+        description="Optional version name to look up, e.g. '2.0'. If omitted, every version qTest lists is returned.",
+        default=None)),
 )
 
 UploadAttachmentToTestRun = create_model(
@@ -2278,11 +2289,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         (that is a different id space and yields the 400). Match the project-specific
         status name case-insensitively, then submit only its id as required by qTest.
         """
-        headers = {
-            "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
-        }
         url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-runs/execution-statuses"
-        response = requests.get(url, headers=headers)
+        response = requests.get(
+            url, headers=self.__qtest_auth_headers(), timeout=self.qtest_api_timeout
+        )
         response.raise_for_status()
         statuses = response.json() or []
         status_summary = [
@@ -2332,7 +2342,116 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             f"{self.qtest_project_id}. Allowed values: {allowed}."
         )
 
-    def update_test_run_status(self, test_run_id: str, status: str, note: str = None) -> str:
+    def __qtest_auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"}
+
+    def __fetch_test_case_versions(self, qtest_test_case_id: int) -> list[dict]:
+        """List a test case's versions as [{'version_id', 'version', 'name'}].
+
+        Uses plain requests rather than TestCaseApi.get_versions: the generated
+        client deserializes into TestCaseWithCustomFieldResource and crashes on
+        the nested resources qTest returns with properties=None.
+        """
+        url = (
+            f"{self.base_url}/api/v3/projects/{self.qtest_project_id}"
+            f"/test-cases/{qtest_test_case_id}/versions"
+        )
+        response = requests.get(
+            url, headers=self.__qtest_auth_headers(), timeout=self.qtest_api_timeout
+        )
+        response.raise_for_status()
+        return [
+            {
+                'version_id': item.get('test_case_version_id'),
+                'version': item.get('version'),
+                'name': item.get('name'),
+            }
+            for item in (response.json() or [])
+            if isinstance(item, dict)
+        ]
+
+    def __describe_test_case_versions(self, qtest_test_case_id: int) -> str:
+        """Render the test case's versions for an error message, best effort."""
+        try:
+            versions = self.__fetch_test_case_versions(qtest_test_case_id)
+        except (requests.exceptions.RequestException, ValueError):
+            logger.debug(
+                "Could not list versions of test case %s for the error message.",
+                qtest_test_case_id, exc_info=True,
+            )
+            return ""
+        if not versions:
+            return ""
+        rendered = ', '.join(
+            f"{version.get('version')} (id={version.get('version_id')})"
+            for version in versions
+        )
+        return f" Known versions of test case {qtest_test_case_id}: {rendered}."
+
+    def __validate_test_case_version_id(self, qtest_test_case_id: int, testcase_version_id: int) -> None:
+        """Reject a version id that does not belong to this test case.
+
+        submit_test_log answers an unknown test_case_version_id with an opaque
+        400, so the version is checked up-front against the per-version endpoint,
+        which is authoritative for a single version (unlike the list endpoint,
+        which omits intermediate minor versions).
+        """
+        url = (
+            f"{self.base_url}/api/v3/projects/{self.qtest_project_id}"
+            f"/test-cases/{qtest_test_case_id}/versions/{testcase_version_id}"
+        )
+        response = requests.get(
+            url, headers=self.__qtest_auth_headers(), timeout=self.qtest_api_timeout
+        )
+        if response.status_code in (400, 404):
+            raise ToolException(
+                f"Test case version ID {testcase_version_id} does not exist for test case "
+                f"{qtest_test_case_id} in project {self.qtest_project_id}."
+                f"{self.__describe_test_case_versions(qtest_test_case_id)}"
+                " Use the get_test_case_versions tool to resolve a version name to its ID."
+            )
+        response.raise_for_status()
+
+    def get_test_case_versions(self, test_case_id: str, version_name: str = None) -> dict:
+        """List the versions of a QTest test case with their numeric version IDs."""
+        try:
+            qtest_test_case_id = (
+                int(test_case_id) if str(test_case_id).isdigit()
+                else self.__find_qtest_internal_id('test-cases', test_case_id)
+            )
+            versions = self.__fetch_test_case_versions(qtest_test_case_id)
+        except requests.exceptions.RequestException as e:
+            stacktrace = format_exc()
+            logger.error(f"Exception when listing versions of test case {test_case_id}: \n {stacktrace}")
+            raise ToolException(
+                f"Unable to list versions of test case {test_case_id} in project "
+                f"{self.qtest_project_id}: {e}"
+            ) from e
+        except ValueError as e:
+            raise ToolException(str(e)) from e
+
+        if version_name is not None:
+            wanted = version_name.strip()
+            matched = [v for v in versions if str(v.get('version') or '').strip() == wanted]
+            if not matched:
+                available = ', '.join(str(v.get('version')) for v in versions) or 'none'
+                raise ToolException(
+                    f"Version '{version_name}' is not among the versions qTest lists for test "
+                    f"case {test_case_id} in project {self.qtest_project_id}. Listed versions: "
+                    f"{available}. qTest omits intermediate minor versions, so '{version_name}' "
+                    f"may still exist and its ID remain usable if you already know it."
+                )
+            versions = matched
+
+        return {
+            'test_case_id': test_case_id,
+            'qtest_test_case_id': qtest_test_case_id,
+            'total': len(versions),
+            'versions': versions,
+        }
+
+    def update_test_run_status(self, test_run_id: str, status: str, note: str = None,
+                               testcase_version_id: int = None) -> str:
         """Record a manual test run's execution result (status) in QTest."""
         try:
             status_resource = self.__resolve_test_run_status(status)
@@ -2350,6 +2469,17 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                     f"{self.qtest_project_id}; a new execution log cannot be submitted."
                 )
 
+            if testcase_version_id is not None:
+                qtest_test_case_id = test_run.get('Test Case Id')
+                if qtest_test_case_id:
+                    self.__validate_test_case_version_id(qtest_test_case_id, testcase_version_id)
+                else:
+                    logger.debug(
+                        "Test run %s exposes no test case id; submitting "
+                        "test_case_version_id=%s without pre-validation.",
+                        test_run_id, testcase_version_id,
+                    )
+
             # qTest requires a completed execution interval. Use the current UTC
             # time as the finish and a short preceding interval as the start.
             # qTest's manual-log endpoint rejects fractional seconds with a
@@ -2361,6 +2491,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 exe_start_date=execution_start,
                 exe_end_date=execution_end,
                 note=note,
+                test_case_version_id=testcase_version_id,
             )
             serializer = self._client or swagger_client.ApiClient()
             payload_for_log = serializer.sanitize_for_serialization(body)
@@ -2402,6 +2533,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"Successfully recorded test run {test_run_id} status as '{status}' "
                 f"in project {self.qtest_project_id} by creating a new manual execution log."
             )
+            if testcase_version_id is not None:
+                message += f" Test case version id: {testcase_version_id}."
             if test_log_id is not None:
                 message += f" Test log id: {test_log_id}."
             return message
@@ -2605,13 +2738,39 @@ Parameters:
 - test_run_id: Test run ID in format TR-123 or QTest numeric ID
 - status: One of 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete' (must match project's configured status names)
 - note: Optional execution note
+- testcase_version_id: Optional numeric version ID (not the name - resolve it with get_test_case_versions). Omit to keep the run's current version.
 
 Examples:
 - Mark passed: test_run_id='TR-39', status='Passed'
 - Mark failed with note: test_run_id='TR-39', status='Failed', note='Login button unresponsive'
+- With a version: test_run_id='TR-39', status='Passed', testcase_version_id=4626964
 """,
                 "args_schema": UpdateTestRunStatus,
                 "ref": self.update_test_run_status,
+            },
+            {
+                "name": "get_test_case_versions",
+                "mode": "get_test_case_versions",
+                "description": """List the versions of a QTest test case with their numeric version IDs.
+
+Use this to resolve a version name (e.g. '2.0') to the numeric version ID that
+update_test_run_status expects in its testcase_version_id parameter.
+
+Parameters:
+- test_case_id: Test case ID in format TC-123 or QTest numeric ID
+- version_name: Optional version name to look up (e.g. '2.0'). Omit to list every available version.
+
+Returns: test_case_id, qtest_test_case_id, total, and versions with version_id, version and name.
+
+NOTE: QTest returns approved major versions plus the latest unapproved minor
+version, so intermediate minor versions (1.1, 2.1) are not listed.
+
+Examples:
+- List all versions: test_case_id='TC-123'
+- Resolve one version: test_case_id='TC-123', version_name='2.0'
+""",
+                "args_schema": GetTestCaseVersions,
+                "ref": self.get_test_case_versions,
             },
             {
                 "name": "upload_attachment_to_test_run",

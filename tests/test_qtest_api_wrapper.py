@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 import pytest
+import requests
 import urllib3
 from pydantic import SecretStr
 
@@ -755,7 +756,7 @@ def _patch_execution_statuses(monkeypatch, status_values=None):
         def json(self):
             return self._payload
 
-    def fake_get(url, headers=None, params=None):
+    def fake_get(url, headers=None, params=None, timeout=None):
         return _FakeResponse(statuses_payload)
 
     import elitea_sdk.tools.qtest.api_wrapper as api_wrapper_module
@@ -1109,3 +1110,204 @@ def test_upload_attachment_to_test_run_resolves_tr_pid(monkeypatch):
     # The run is looked up by its TR pid via the DQL search path.
     assert run_calls[0]['object_type'] == 'test-runs'
     assert run_calls[0]['entity_id'] == 'TR-39'
+
+
+class _FakeVersionResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} error")
+
+    def json(self):
+        return self._payload
+
+
+def _patch_qtest_get(monkeypatch, statuses=None, versions=None, version_status=200):
+    """Route requests.get by URL: execution-statuses, version list, single version."""
+    if statuses is None:
+        statuses = {'Passed': 601, 'Failed': 602}
+    if versions is None:
+        versions = [
+            {'id': 777, 'name': 'Login', 'version': '1.0', 'test_case_version_id': 111},
+            {'id': 777, 'name': 'Login', 'version': '2.0', 'test_case_version_id': 222},
+        ]
+
+    calls = []
+    statuses_payload = [{'id': sid, 'name': name, 'is_default': False, 'active': True}
+                        for name, sid in statuses.items()]
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append({'url': url, 'timeout': timeout})
+        if url.endswith('/test-runs/execution-statuses'):
+            return _FakeVersionResponse(statuses_payload)
+        if url.endswith('/versions'):
+            return _FakeVersionResponse(versions)
+        if '/versions/' in url:
+            return _FakeVersionResponse(versions[-1], status_code=version_status)
+        raise AssertionError(f"unexpected URL {url}")
+
+    import elitea_sdk.tools.qtest.api_wrapper as api_wrapper_module
+    monkeypatch.setattr(api_wrapper_module.requests, 'get', fake_get)
+    return calls
+
+
+def test_update_test_run_status_forwards_testcase_version_id(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_qtest_get(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=777))
+    calls = _patch_test_log_api(monkeypatch, response=_FakeSubmitTestLogResponse(987))
+
+    result = wrapper.update_test_run_status('TR-39', 'Passed', testcase_version_id=222)
+
+    assert calls[0]['body'].test_case_version_id == 222
+    assert 'Test case version id: 222' in result
+
+
+def test_update_test_run_status_omits_version_by_default(monkeypatch):
+    """Existing calls without the new field stay byte-identical on the wire."""
+    import swagger_client
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_execution_statuses(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=777))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    result = wrapper.update_test_run_status('12345', 'Passed')
+
+    body = calls[0]['body']
+    assert body.test_case_version_id is None
+    serialized = swagger_client.ApiClient().sanitize_for_serialization(body)
+    assert 'test_case_version_id' not in serialized
+    assert 'Test case version id' not in result
+
+
+def test_update_test_run_status_rejects_unknown_version_id(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_qtest_get(monkeypatch, version_status=404)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=777))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.update_test_run_status('TR-39', 'Passed', testcase_version_id=999)
+
+    msg = str(exc_info.value)
+    assert '999' in msg
+    assert '1.0 (id=111)' in msg and '2.0 (id=222)' in msg
+    assert 'get_test_case_versions' in msg
+    # An invalid version must not produce an execution log.
+    assert calls == []
+
+
+def test_update_test_run_status_skips_validation_without_test_case_id(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    get_calls = _patch_qtest_get(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict())
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    wrapper.update_test_run_status('12345', 'Passed', testcase_version_id=222)
+
+    assert calls[0]['body'].test_case_version_id == 222
+    assert not any('/versions' in call['url'] for call in get_calls)
+
+
+def test_get_test_case_versions_lists_all_versions(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    get_calls = _patch_qtest_get(monkeypatch)
+    monkeypatch.setattr(
+        QtestApiWrapper, '_QtestApiWrapper__find_qtest_internal_id',
+        lambda self, object_type, entity_id: 777,
+    )
+
+    result = wrapper.get_test_case_versions('TC-123')
+
+    assert result['qtest_test_case_id'] == 777
+    assert result['total'] == 2
+    assert result['versions'][1] == {'version_id': 222, 'version': '2.0', 'name': 'Login'}
+    assert get_calls[0]['url'].endswith('/test-cases/777/versions')
+    assert get_calls[0]['timeout'] == wrapper.qtest_api_timeout
+
+
+def test_get_test_case_versions_accepts_numeric_id(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    def boom(self, object_type, entity_id):
+        raise AssertionError("a numeric id needs no DQL lookup")
+
+    monkeypatch.setattr(QtestApiWrapper, '_QtestApiWrapper__find_qtest_internal_id', boom)
+    get_calls = _patch_qtest_get(monkeypatch)
+
+    result = wrapper.get_test_case_versions('777')
+
+    assert result['qtest_test_case_id'] == 777
+    assert get_calls[0]['url'].endswith('/test-cases/777/versions')
+
+
+def test_get_test_case_versions_filters_by_version_name(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_qtest_get(monkeypatch)
+
+    result = wrapper.get_test_case_versions('777', version_name='2.0')
+
+    assert result['total'] == 1
+    assert result['versions'][0]['version_id'] == 222
+
+
+def test_get_test_case_versions_unknown_version_name_lists_available(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_qtest_get(monkeypatch)
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.get_test_case_versions('777', version_name='9.9')
+
+    msg = str(exc_info.value)
+    assert '9.9' in msg
+    assert '1.0, 2.0' in msg
+    # qTest hides intermediate minor versions, so absence from the list is not proof
+    # the version does not exist.
+    assert 'does not exist' not in msg
+    assert 'omits intermediate minor versions' in msg
+
+
+def test_get_test_case_versions_missing_test_case_raises(monkeypatch):
+    from langchain_core.tools import ToolException
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    def not_found(self, object_type, entity_id):
+        raise ValueError(f"Test-cases '{entity_id}' not found in project 1.")
+
+    monkeypatch.setattr(QtestApiWrapper, '_QtestApiWrapper__find_qtest_internal_id', not_found)
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.get_test_case_versions('TC-999')
+
+    assert 'TC-999' in str(exc_info.value)
+
+
+def test_get_test_case_versions_is_registered_as_a_tool():
+    wrapper = _make_wrapper()
+    tools = {tool['name']: tool for tool in wrapper.get_available_tools()}
+
+    assert 'get_test_case_versions' in tools
+    assert tools['get_test_case_versions']['ref'] == wrapper.get_test_case_versions
+    version_field = tools['update_test_run_status']['args_schema'].model_fields['testcase_version_id']
+    assert version_field.default is None
