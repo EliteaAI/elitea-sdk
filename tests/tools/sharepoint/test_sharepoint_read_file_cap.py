@@ -191,3 +191,38 @@ def test_sharepoint_excel_over_limit_with_sheet_name_refuses_plainly():
     assert result["read_limits"]["full_read_allowed"] is False
     assert result["instruction_for_readFile"]["first_class_params"] == {}
     assert "Sheet1" in result["instruction_for_readFile"]["notes"]
+
+
+def test_sharepoint_inverted_range_is_rejected_not_silently_empty():
+    """end_line < start_line errors rather than returning ''.
+
+    read_document shares its bounding logic with read_file_from_sharing_link, so
+    the range contract is pinned on both tools, not just the sharing link.
+    """
+    wrapper = _make_wrapper({"file.txt": "\n".join(f"line {i}" for i in range(1, 51))})
+
+    result = wrapper.read_file("file.txt", start_line=10, end_line=5)
+
+    assert isinstance(result, dict)
+    assert result[RESULT_STATUS_KEY] == ResultStatus.ERROR.value
+    assert "end_line (5) is before start_line (10)" in result["message"]
+
+
+def test_sharepoint_start_line_past_eof_reports_the_line_total():
+    wrapper = _make_wrapper({"file.txt": "\n".join(f"line {i}" for i in range(1, 51))})
+
+    result = wrapper.read_file("file.txt", start_line=999999)
+
+    assert isinstance(result, dict)
+    assert result[RESULT_STATUS_KEY] == ResultStatus.ERROR.value
+    assert "this file has 50 lines" in result["message"]
+    assert "1..50" in result["message"]
+
+
+def test_sharepoint_requested_label_omits_an_unset_bound():
+    lines = [f"line {i} " + ("z" * 30) for i in range(1, 6000)]
+    wrapper = _make_wrapper({"big.txt": "\n".join(lines)})
+
+    result = wrapper.read_file("big.txt", start_line=1)
+
+    assert result["context"]["requested"] == "start_line=1"

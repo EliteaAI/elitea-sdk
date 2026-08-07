@@ -50,6 +50,8 @@ from pydantic import (
     model_validator,
 )
 
+from .text_operations import apply_line_slice
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -597,6 +599,79 @@ def guard_nontext_read(
         metadata, actual_chars=actual_chars, limit_chars=max_output_chars,
         requested=requested, include_metadata_directive=False,
     )
+
+
+def describe_requested_range(
+    start_line: Optional[int], end_line: Optional[int],
+) -> str:
+    """Render the ``context.requested`` label for a read.
+
+    Omits an unset bound rather than printing ``end_line=None``, which is
+    LLM-facing text in the over-limit payload.
+    """
+    if start_line is None and end_line is None:
+        return "full file read"
+    bounds = []
+    if start_line is not None:
+        bounds.append(f"start_line={start_line}")
+    if end_line is not None:
+        bounds.append(f"end_line={end_line}")
+    return ", ".join(bounds)
+
+
+def bound_read_result(
+    result: Any,
+    filename: str,
+    *,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+) -> Any:
+    """Slice a read result by line and cap it, or return actionable guidance.
+
+    The single entry point for readers that accept ``start_line``/``end_line``
+    and must not hand oversized content to a model. Ranges are validated before
+    slicing because an out-of-range slice yields an empty string, and an empty
+    tool result is indistinguishable from an empty file — a silent dead end on
+    exactly the path an over-limit response steers the caller into.
+
+    *result* is the reader's own output: a ``str`` for text, or a parsed object
+    (e.g. an Excel dict) which has no line structure and so is only cap-checked.
+    """
+    requested = describe_requested_range(start_line, end_line)
+
+    if not isinstance(result, str):
+        return guard_nontext_read(
+            result, filename, max_output_chars=max_output_chars, requested=requested)
+
+    if start_line is None and end_line is None:
+        return guard_text_read(
+            result, filename, max_output_chars=max_output_chars, requested=requested)
+
+    extension = os.path.splitext(filename or "")[1].lower()
+
+    if start_line is not None and end_line is not None and end_line < start_line:
+        return build_error_response(
+            f"Invalid range: end_line ({end_line}) is before start_line ({start_line}). "
+            f"Pass end_line greater than or equal to start_line.",
+            filename=filename, extension=extension,
+        )
+
+    offset = start_line if start_line is not None else 1
+    limit = (end_line - offset + 1) if end_line is not None else None
+    content = apply_line_slice(result, offset=offset, limit=limit)
+
+    if not content and result:
+        total_lines = _count_lines(result)
+        return build_error_response(
+            f"The requested range is empty: this file has {total_lines} lines, so "
+            f"start_line ({offset}) is past the end. Choose start_line within 1..{total_lines}.",
+            filename=filename, extension=extension,
+        )
+
+    return guard_text_read(
+        content, filename, max_output_chars=max_output_chars,
+        requested=requested, full_content=result)
 
 
 def build_over_limit_response(
