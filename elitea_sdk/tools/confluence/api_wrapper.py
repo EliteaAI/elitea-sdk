@@ -188,6 +188,7 @@ GetPageAttachmentsInput = create_model(
     custom_prompt=(Optional[str], Field(default=None, description="Custom prompt to use for LLM-based analysis of attachments (images, pdfs, etc). If not provided, a default prompt will be used.")),
     allowed_extensions=(Optional[List[str]], Field(default=None, description="List of file extensions to include (e.g. ['pdf', 'docx']). If None, all extensions are included.", examples=[["pdf", "docx"]])),
     name_pattern=(Optional[str], Field(default=None, description="Regex pattern to filter attachment names (e.g. '^report_.*\\.pdf$'). If None, all names are included.", examples=["^report_.*\\.pdf$"])),
+    max_attachments=(int, Field(default=50, description="Maximum number of visible attachments to process and return. A notice entry is appended when more exist. Default is 50.")),
 )
 
 AddFileToPage = create_model(
@@ -1807,12 +1808,12 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         file_ids, filenames = body_references
         return file_id in file_ids or attachment.get('title', '') in filenames
 
-    def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None):
+    def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None, max_attachments: int = 50):
         """
         Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
         file content, and LLM-based analysis for supported types. Files removed from the page content are excluded;
         visibility is judged against the published page body, so files embedded only in an unpublished draft
-        are not yet listed.
+        are not yet listed. At most max_attachments are processed; a notice entry is appended when more exist.
         Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis.
         """
         try:
@@ -1830,6 +1831,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             # that work — notably for Server/DC, which always fails open.
             next_link = (attachments.get('_links') or {}).get('next') if body_references is not None else None
             visited_links = set()
+            listing_truncated = False
             while next_link and next_link not in visited_links:
                 visited_links.add(next_link)
                 try:
@@ -1837,6 +1839,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 except Exception as e:
                     logger.warning(f"Attachment listing pagination failed for page {page_id}: {e}; "
                                    f"continuing with the {len(attachments['results'])} already fetched")
+                    listing_truncated = True
                     break
                 attachments['results'].extend(listing_page.get('results') or [])
                 next_link = (listing_page.get('_links') or {}).get('next')
@@ -1845,8 +1848,20 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             attachments['results'] = [attachment for attachment in attachments['results']
                                       if self._visible_on_page(attachment, body_references)]
             if not attachments['results']:
-                return (f"No attachments are visible on page {page_id}: {total} attachment(s) "
-                        f"exist but are not referenced in the page body.")
+                message = (f"No attachments are visible on page {page_id}: {total} attachment(s) "
+                           f"exist but are not referenced in the page body.")
+                if listing_truncated:
+                    message += " The attachment listing was truncated; further attachments were not checked."
+                return message
+
+            visible_count = len(attachments['results'])
+            attachments['results'] = attachments['results'][:max_attachments]
+            notices = []
+            if visible_count > max_attachments:
+                notices.append(f"Showing {max_attachments} of {visible_count} visible attachments; "
+                               f"narrow with allowed_extensions/name_pattern or raise max_attachments.")
+            if listing_truncated:
+                notices.append("The attachment listing could not be fully fetched; results may be incomplete.")
 
             # Get attachment history for created/updated info
             history_map = {}
@@ -2087,6 +2102,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     'content': content,
                     'llm_analysis': llm_analysis
                 })
+            results.extend({'notice': notice} for notice in notices)
             return results
         except Exception as e:
             logger.error(f"Error retrieving attachments for page {page_id}: {str(e)}")

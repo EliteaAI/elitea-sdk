@@ -338,9 +338,9 @@ def test_server_dc_skips_pagination(wrapper):
     wrapper.client.get.assert_not_called()
 
 
-def test_mid_pagination_failure_keeps_what_was_fetched(wrapper):
+def paginating_failure_client(wrapper, first_page_results):
     wrapper.client.get_attachments_from_content.return_value = {
-        'results': [attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID)],
+        'results': first_page_results,
         '_links': {'next': SECOND_PAGE_LINK},
     }
     body = body_response(adf_page(media_inline(EMBEDDED_FILE_ID)))
@@ -351,4 +351,34 @@ def test_mid_pagination_failure_keeps_what_was_fetched(wrapper):
         raise requests.HTTPError('429 rate limited')
     wrapper.client.get.side_effect = route
 
-    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt']
+
+def test_mid_pagination_failure_keeps_what_was_fetched(wrapper):
+    paginating_failure_client(wrapper, [attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID)])
+
+    result = wrapper.get_page_attachments('1000')
+
+    assert [e['metadata']['name'] for e in result if 'metadata' in e] == ['kept.txt']
+    assert any('may be incomplete' in e.get('notice', '') for e in result)
+
+
+def test_mid_pagination_failure_restores_the_truncation_caveat(wrapper):
+    """An all-filtered claim over a partial listing must say the listing was partial."""
+    paginating_failure_client(wrapper, [attachment('att_a', 'removed.txt', REMOVED_FILE_ID)])
+
+    result = wrapper.get_page_attachments('1000')
+
+    assert 'listing was truncated; further attachments were not checked' in result
+
+
+def test_visible_attachments_beyond_the_cap_are_disclosed(wrapper):
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'a.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'b.txt', EMBEDDED_FILE_ID),
+        attachment('att_c', 'c.txt', EMBEDDED_FILE_ID),
+    ]}
+    set_body(wrapper, media_inline(EMBEDDED_FILE_ID))
+
+    result = wrapper.get_page_attachments('1000', max_attachments=2)
+
+    assert [e['metadata']['name'] for e in result if 'metadata' in e] == ['a.txt', 'b.txt']
+    assert any('Showing 2 of 3 visible attachments' in e.get('notice', '') for e in result)
