@@ -381,4 +381,33 @@ def test_visible_attachments_beyond_the_cap_are_disclosed(wrapper):
     result = wrapper.get_page_attachments('1000', max_attachments=2)
 
     assert [e['metadata']['name'] for e in result if 'metadata' in e] == ['a.txt', 'b.txt']
-    assert any('Showing 2 of 3 visible attachments' in e.get('notice', '') for e in result)
+    assert any('Showing the first 2 matching visible attachments' in e.get('notice', '') for e in result)
+
+
+def test_request_filters_apply_before_the_cap(wrapper):
+    """Narrowing must search past the cap, or the cap notice's advice is a lie."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'a.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'b.pdf', EMBEDDED_FILE_ID),
+    ]}
+    set_body(wrapper, media_inline(EMBEDDED_FILE_ID))
+
+    result = wrapper.get_page_attachments('1000', allowed_extensions=['pdf'], max_attachments=1)
+
+    assert [e['metadata']['name'] for e in result if 'metadata' in e] == ['b.pdf']
+
+
+def test_reaching_the_cap_stops_pagination(wrapper):
+    """Listing requests are bounded by the cap, not just the processing after it."""
+    wrapper.client.get_attachments_from_content.return_value = {
+        'results': [attachment('att_a', 'a.txt', EMBEDDED_FILE_ID),
+                    attachment('att_b', 'b.txt', EMBEDDED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
+    }
+    set_body(wrapper, media_inline(EMBEDDED_FILE_ID))
+
+    result = wrapper.get_page_attachments('1000', max_attachments=1)
+
+    assert [e['metadata']['name'] for e in result if 'metadata' in e] == ['a.txt']
+    wrapper.client.get.assert_called_once_with(
+        'api/v2/pages/1000', params={'body-format': 'atlas_doc_format'}, advanced_mode=True)

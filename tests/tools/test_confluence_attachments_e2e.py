@@ -97,7 +97,9 @@ def embed_file(wrapper, page_id, filename):
 
 def listed_names(wrapper, page_id):
     result = wrapper.get_page_attachments(page_id)
-    return [entry['metadata']['name'] for entry in result] if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+    return [entry['metadata']['name'] for entry in result if 'metadata' in entry]
 
 
 def test_embedded_attachment_is_listed(wrapper, page):

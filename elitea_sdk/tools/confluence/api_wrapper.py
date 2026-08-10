@@ -1813,8 +1813,9 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
         file content, and LLM-based analysis for supported types. Files removed from the page content are excluded;
         visibility is judged against the published page body, so files embedded only in an unpublished draft
-        are not yet listed. At most max_attachments are processed; a notice entry is appended when more exist.
-        Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis.
+        are not yet listed. At most max_attachments matching the filters are processed.
+        Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis; when results were
+        limited or the listing was incomplete, the list ends with an entry whose only key is 'notice'.
         """
         try:
             attachments = self.client.get_attachments_from_content(page_id)
@@ -1822,43 +1823,63 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 return f"No attachments found for page ID {page_id}."
 
             body_references = self._get_body_file_references(page_id)
-            # The client fetches a single page of 50; visibility filtering on a
-            # truncated slice would silently understate the result, so the rest
-            # of the listing is pulled the same way the client's _get_paged does.
-            # Only when the body is inspectable, though: on fail-open every
-            # attachment survives into the per-attachment history/comment/content
-            # fan-out below, and the single-page ceiling is the only bound on
-            # that work — notably for Server/DC, which always fails open.
+
+            def matches_request(entry):
+                title = entry.get('title', '')
+                extension = title.lower().split('.')[-1] if '.' in title else ''
+                if allowed_extensions and extension not in allowed_extensions:
+                    return False
+                return not name_pattern or bool(re.match(name_pattern, title))
+
+            # The client fetches a single page of 50; filtering a truncated slice
+            # would silently understate the result, so further pages are pulled
+            # (as the client's own _get_paged does) — but each page is filtered
+            # as it arrives and the walk stops at max_attachments, so neither the
+            # listing requests nor the per-attachment fan-out below are unbounded.
+            # Fail-open keeps the single-page ceiling: every attachment survives
+            # filtering there, notably on Server/DC.
+            selected = []
+            total = visible_seen = 0
+            more_matching = listing_truncated = False
+            pending = attachments['results']
             next_link = (attachments.get('_links') or {}).get('next') if body_references is not None else None
             visited_links = set()
-            listing_truncated = False
-            while next_link and next_link not in visited_links:
+            while True:
+                for entry in pending:
+                    total += 1
+                    if not self._visible_on_page(entry, body_references):
+                        continue
+                    visible_seen += 1
+                    if not matches_request(entry):
+                        continue
+                    if len(selected) >= max_attachments:
+                        more_matching = True
+                        break
+                    selected.append(entry)
+                if more_matching or not next_link or next_link in visited_links:
+                    break
                 visited_links.add(next_link)
                 try:
                     listing_page = self.client.get(next_link) or {}
                 except Exception as e:
                     logger.warning(f"Attachment listing pagination failed for page {page_id}: {e}; "
-                                   f"continuing with the {len(attachments['results'])} already fetched")
+                                   f"continuing with the {len(selected)} already selected")
                     listing_truncated = True
                     break
-                attachments['results'].extend(listing_page.get('results') or [])
+                pending = listing_page.get('results') or []
                 next_link = (listing_page.get('_links') or {}).get('next')
 
-            total = len(attachments['results'])
-            attachments['results'] = [attachment for attachment in attachments['results']
-                                      if self._visible_on_page(attachment, body_references)]
-            if not attachments['results']:
+            if not visible_seen:
                 message = (f"No attachments are visible on page {page_id}: {total} attachment(s) "
                            f"exist but are not referenced in the page body.")
                 if listing_truncated:
                     message += " The attachment listing was truncated; further attachments were not checked."
                 return message
 
-            visible_count = len(attachments['results'])
-            attachments['results'] = attachments['results'][:max_attachments]
+            attachments['results'] = selected
             notices = []
-            if visible_count > max_attachments:
-                notices.append(f"Showing {max_attachments} of {visible_count} visible attachments; "
+            if more_matching:
+                notices.append(f"Showing the first {max_attachments} matching visible attachments; more exist — "
                                f"narrow with allowed_extensions/name_pattern or raise max_attachments.")
             if listing_truncated:
                 notices.append("The attachment listing could not be fully fetched; results may be incomplete.")
@@ -1873,18 +1894,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     logger.warning(f"Failed to fetch history for attachment {attachment.get('title', '')}: {str(e)}")
                     history_map[attachment['id']] = None
 
-            import re
             results = []
             for attachment in attachments['results']:
                 title = attachment.get('title', '')
                 file_ext = title.lower().split('.')[-1] if '.' in title else ''
-
-                # Filter by allowed_extensions
-                if allowed_extensions and file_ext not in allowed_extensions:
-                    continue
-                # Filter by name_pattern
-                if name_pattern and not re.match(name_pattern, title):
-                    continue
 
                 media_type = attachment.get('metadata', {}).get('mediaType', '')
                 # Core metadata extraction with history
