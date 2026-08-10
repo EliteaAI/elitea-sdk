@@ -1756,8 +1756,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         viewpdf/multimedia survive as extension nodes naming the file only in
         their macro parameters, so those filenames are harvested as well.
         """
-        if not self.cloud:
-            # Server/DC has no v2 page endpoint — don't round-trip into a guaranteed 404.
+        # Server/DC has no v2 page endpoint — don't round-trip into a guaranteed 404.
+        # An unresolved None still attempts inspection: it works on Cloud and the
+        # 404 lands on the fail-open path anyway.
+        if self.cloud is False:
             return None
         try:
             page = self.client.get(f"api/v2/pages/{page_id}", params={'body-format': 'atlas_doc_format'})

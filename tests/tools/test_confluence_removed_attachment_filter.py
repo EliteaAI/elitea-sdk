@@ -164,6 +164,18 @@ def test_server_dc_never_calls_v2_page_endpoint(wrapper):
     wrapper.client.get.assert_not_called()
 
 
+def test_unresolved_cloud_still_inspects_the_body(wrapper):
+    """cloud=None means unknown — attempt inspection; a DC 404 fails open anyway."""
+    wrapper.cloud = None
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt']
+
+
 def test_empty_body_keeps_everything(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
