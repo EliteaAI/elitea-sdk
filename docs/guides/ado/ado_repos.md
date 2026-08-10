@@ -62,3 +62,79 @@ Please add inline comments to PR 2 within this list: [{'invalid_msg': '', 'no_li
 ```
 Results:
 - ![inline_comments_case6_exceptions](./images/ic_case6_exceptions.jpg)
+
+---
+
+### Code search
+
+`search_code` finds code by keyword when the file path is unknown, backed by the Azure
+DevOps Code Search API. Searches are scoped to the toolkit's configured project and
+repository automatically.
+
+**Prompt 1**
+```
+Search the repository for `QueueJobsNow`.
+```
+
+**Prompt 2**
+```
+Find where `parse_response` is defined in Python files only.
+```
+Resolves to `parse_response ext:py`.
+
+**Prompt 3**
+```
+Search for `retry` under src/services and return the next 5 matches after the first 5.
+```
+Resolves to `retry path:src/services` with `top=5`, `skip=5`.
+
+#### Payload limits
+
+The tool is deliberately bounded so results stay safe to feed back into an LLM:
+
+| Control | Value |
+|---|---|
+| Files returned by default | 5 |
+| `top` maximum | 1000 (Azure DevOps service limit) |
+| `skip` maximum | 1000 — total reachable results cap at ~2000, refine the query instead of paging past it |
+| Snippets per file | 3 |
+| Snippet size | 2 lines of context either side, truncated at 400 characters |
+| Files opened to build snippets | first 5 results per call, fetched concurrently |
+
+Full file bodies are never returned — only the leading part of a matched file is read, up
+to the last match offset. Each result carries `project`, `repository`, `path`, `file_name`,
+`branch` and `match_count`; use `read_file` on a path to read a match in full. Set
+`include_snippets=false` for a metadata-only response.
+
+Raising `top` above 5 returns metadata for every result but snippets only for the first 5,
+and the response carries a warning naming how many results were left without them. A
+result whose match is on the file name rather than its content has `match_count: 0` and a
+`matched_on` field instead of snippets.
+
+The response reports `total_count` (all matched files), `returned`, `skip`, a `truncated`
+flag and `next_skip` when more results remain.
+
+#### Recommended usage
+
+- Start broad, then narrow with `path:`, `file:` or `ext:` rather than raising `top`.
+- Code type filters (`class:`, `def:`, `ref:`, `method:`, `comment:`, `strlit:`,
+  `namespace:`) only work for **C#, C, C++, Java and VB.NET** files. Use plain text for
+  Python, JavaScript, Go and everything else.
+- Phrase and wildcard queries cannot be combined with code type filters, and a leading
+  `*` wildcard is not supported. These come back as warnings in the response.
+
+#### When a search returns nothing
+
+- Azure DevOps indexes only the repository **default branch** unless more branches are
+  added under **Project Settings → Repositories → Options → Searchable branches**. Leave
+  `branch` unset unless the branch is known to be indexed.
+- **Forked repositories are never indexed.**
+- A freshly created or reindexing organization returns warnings such as "Branches are
+  still being indexed" — results are incomplete until indexing finishes.
+
+#### Access requirements
+
+At least **Basic** access (Stakeholder access excludes code) and a token with the
+**Code (read)** scope. On Azure DevOps Server the
+[Code Search extension](https://marketplace.visualstudio.com/items?itemName=ms.vss-code-search)
+must also be installed; on Azure DevOps Services code search is built in.

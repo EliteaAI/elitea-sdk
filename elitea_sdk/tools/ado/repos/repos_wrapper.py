@@ -1,10 +1,15 @@
 import logging
 import re
+from bisect import bisect_right
+from codecs import getincrementaldecoder
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import datetime
 from enum import Enum
 from json import dumps
 from typing import ClassVar, List, Union, Optional, Any, Dict
 
+from azure.devops.connection import Connection
 from azure.devops.v7_0.git.git_client import GitClient
 from azure.devops.v7_0.git.models import (
     Comment,
@@ -19,6 +24,7 @@ from azure.devops.v7_0.git.models import (
     GitRefUpdate,
     GitVersionDescriptor, GitQueryCommitsCriteria,
 )
+from azure.devops.v7_1.search.models import CodeSearchRequest
 from langchain_core.tools import ToolException
 from msrest.authentication import BasicAuthentication
 from pydantic import Field, PrivateAttr, create_model, model_validator, SecretStr
@@ -32,6 +38,47 @@ from ...utils.text_operations import apply_line_slice
 from ...utils.file_metadata import guard_text_read
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SEARCH_TOP = 5
+MAX_SEARCH_TOP = 1000
+MAX_SEARCH_SKIP = 1000
+SNIPPET_CONTEXT_LINES = 2
+MAX_SNIPPETS_PER_FILE = 3
+MAX_SNIPPET_CHARS = 400
+MAX_FILES_FETCHED_FOR_SNIPPETS = DEFAULT_SEARCH_TOP
+SNIPPET_READ_TAIL_MARGIN_CHARS = 4000
+SNIPPET_FETCH_WORKERS = 4
+
+SEARCH_INFO_CODES_DOCUMENTED_BY_MICROSOFT = {
+    1: "The organization is being reindexed, so results may be incomplete.",
+    2: "Code indexing has not started for this organization yet.",
+    3: "Azure DevOps rejected the query as invalid.",
+    4: "Prefix wildcard queries (a leading '*') are not supported.",
+    5: "Multi-word queries combined with code type filters are not supported.",
+    6: "The organization is being onboarded, so results may be incomplete.",
+    7: "The organization is being onboarded or reindexed, so results may be incomplete.",
+    8: f"'top' exceeded the service maximum of {MAX_SEARCH_TOP} and was trimmed.",
+    9: "Branches are still being indexed, so results may be incomplete.",
+    10: "Faceting is not enabled for this organization.",
+    19: "Phrase queries are not supported together with code type filters such as 'class:' or 'def:'.",
+    20: "Wildcard queries are not supported together with code type filters such as 'class:' or 'def:'.",
+}
+
+SEARCH_INFO_CODES_OBSERVED_IN_RESPONSES = {
+    15: "A filter value matched nothing in the index, most often a branch that is not listed under Searchable branches.",
+}
+
+SEARCH_INFO_CODES = {
+    **SEARCH_INFO_CODES_DOCUMENTED_BY_MICROSOFT,
+    **SEARCH_INFO_CODES_OBSERVED_IN_RESPONSES,
+}
+
+NO_RESULTS_HINT = (
+    "No matches. Azure DevOps only indexes the repository default branch unless extra "
+    "branches are added under Project Settings > Repositories > Options > Searchable "
+    "branches, and it never indexes forked repositories. Code type filters such as "
+    "'class:' or 'def:' only apply to C#, C, C++, Java and VB.NET files."
+)
 
 
 def _relabel_guidance_offset_limit(result: Any) -> Any:
@@ -303,6 +350,76 @@ class ArgsSchema(Enum):
             ),
         ),
     )
+    SearchCode = create_model(
+        "SearchCode",
+        query=(
+            str,
+            Field(
+                description=(
+                    "Text to search for. Supports Azure DevOps code search syntax: "
+                    "`path:src/**/utils` to scope to a path (`**` spans segments), "
+                    "`file:queueRegister*` by file name, `ext:py` by extension, and "
+                    "code type filters such as `class:`, `def:`, `ref:`, `method:`, "
+                    "`comment:`, `strlit:`, `namespace:`. Code type filters only work "
+                    "for C#, C, C++, Java and VB.NET files - use plain text for any "
+                    "other language. Quote arguments containing spaces."
+                )
+            ),
+        ),
+        branch=(
+            Optional[str],
+            Field(
+                default=None,
+                description=(
+                    "Restrict results to a branch. Only the repository default branch is "
+                    "indexed unless more branches were opted in via Searchable branches, "
+                    "so leave unset unless you know the branch is indexed."
+                ),
+            ),
+        ),
+        path=(
+            Optional[str],
+            Field(
+                default=None,
+                description="Restrict results to a repository path, e.g. `/src/services`.",
+            ),
+        ),
+        top=(
+            Optional[int],
+            Field(
+                default=DEFAULT_SEARCH_TOP,
+                ge=1,
+                le=MAX_SEARCH_TOP,
+                description=(
+                    f"Maximum number of files to return (default {DEFAULT_SEARCH_TOP}, "
+                    f"service maximum {MAX_SEARCH_TOP}). Keep this small - each result "
+                    "carries code snippets."
+                ),
+            ),
+        ),
+        skip=(
+            Optional[int],
+            Field(
+                default=0,
+                ge=0,
+                le=MAX_SEARCH_SKIP,
+                description=(
+                    f"Number of files to skip for paging. Azure DevOps rejects values "
+                    f"above {MAX_SEARCH_SKIP}, which caps total reachable results."
+                ),
+            ),
+        ),
+        include_snippets=(
+            Optional[bool],
+            Field(
+                default=True,
+                description=(
+                    "Include matched code snippets. Set false for a lighter response "
+                    "listing only file paths and match counts."
+                ),
+            ),
+        ),
+    )
 
 
 class ReposApiWrapper(CodeIndexerToolkit):
@@ -313,6 +430,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
     # Repository-specific fields (toolkit level)
     repository_id: Optional[str] = None
+    searchable_repository_name: Optional[str] = None
     base_branch: Optional[str] = None
     active_branch: Optional[str] = None
 
@@ -330,6 +448,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
     # Keyed by (file_path, branch) for branch-based reads and
     # (path, commit_id) for commit-based reads in get_file_content.
     _file_content_cache: Dict[tuple, str] = PrivateAttr(default_factory=dict)
+
+    _search_client_instance: Optional[Any] = PrivateAttr(default=None)
 
     class Config:
         arbitrary_types_allowed = True
@@ -360,10 +480,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
             # Initialize ADO Git client
             ado_client = GitClient(base_url=organization_url, creds=credentials)
             # Verify access to repository
-            ado_client.get_repository(repository_id, project=project)
+            repository = ado_client.get_repository(repository_id, project=project)
 
             # Store client instance
             values["ado_client_instance"] = ado_client
+            values["searchable_repository_name"] = getattr(repository, "name", None) or repository_id
 
             def branch_exists(branch_name):
                 try:
@@ -1374,6 +1495,236 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Unable to retrieve commits due to error:\n{str(e)}")
 
+    @property
+    def _search_client(self):
+        """Access to ADO Search client methods"""
+        if self._search_client_instance is None:
+            token = self.token.get_secret_value() if isinstance(self.token, SecretStr) else self.token
+            connection_resolving_search_host = Connection(
+                base_url=self.organization_url,
+                creds=BasicAuthentication("", token),
+            )
+            self._search_client_instance = connection_resolving_search_host.clients_v7_1.get_search_client()
+        return self._search_client_instance
+
+    def _read_file_prefix(self, commit_id: str, path: str, char_limit: int) -> Optional[str]:
+        chunks = None
+        decoder = getincrementaldecoder("utf-8")(errors="backslashreplace")
+        prefix = ""
+        try:
+            chunks = self._client.get_item_text(
+                repository_id=self.repository_id,
+                project=self.project,
+                path=path,
+                version_descriptor=GitVersionDescriptor(version=commit_id, version_type="commit"),
+            )
+            for chunk in chunks:
+                prefix += decoder.decode(chunk)
+                if len(prefix) >= char_limit:
+                    break
+            return prefix + decoder.decode(b"", final=True)
+        except Exception as e:
+            logger.error(f"Failed to read '{path}' for snippets: {str(e)}")
+            return None
+        finally:
+            close_stream = getattr(chunks, "close", None)
+            if close_stream:
+                with suppress(Exception):
+                    close_stream()
+
+    def _build_snippets(self, content: str, hits: List[Any]) -> List[Dict[str, Any]]:
+        lines_with_endings = content.splitlines(keepends=True)
+        lines = [line.rstrip("\r\n") for line in lines_with_endings]
+        line_starts = []
+        offset = 0
+        for line in lines_with_endings:
+            line_starts.append(offset)
+            offset += len(line)
+
+        snippets = []
+        seen_lines = set()
+        for hit in hits:
+            char_offset = getattr(hit, "char_offset", None)
+            if char_offset is None or char_offset >= len(content):
+                continue
+            line_index = max(bisect_right(line_starts, char_offset) - 1, 0)
+            if line_index in seen_lines:
+                continue
+            seen_lines.add(line_index)
+            start = max(line_index - SNIPPET_CONTEXT_LINES, 0)
+            end = min(line_index + SNIPPET_CONTEXT_LINES + 1, len(lines))
+            snippets.append({
+                "line": line_index + 1,
+                "snippet": "\n".join(lines[start:end])[:MAX_SNIPPET_CHARS],
+            })
+            if len(snippets) >= MAX_SNIPPETS_PER_FILE:
+                break
+        return snippets
+
+    def _fetch_file_and_build_snippets(self, result: Any, hits: List[Any]) -> List[Dict[str, Any]]:
+        versions = result.versions or []
+        change_id = versions[0].change_id if versions else None
+        if not change_id:
+            return []
+
+        offsets = [getattr(hit, "char_offset", None) for hit in hits]
+        offsets = [offset for offset in offsets if offset is not None]
+        if not offsets:
+            return []
+
+        content = self._read_file_prefix(
+            change_id, result.path, max(offsets) + SNIPPET_READ_TAIL_MARGIN_CHARS
+        )
+        if not content:
+            return []
+        return self._build_snippets(content, hits)
+
+    def _fetch_snippets_for_each(self, results_and_hits: List[tuple]) -> List[List[Dict[str, Any]]]:
+        if not results_and_hits:
+            return []
+        if len(results_and_hits) == 1:
+            return [self._fetch_file_and_build_snippets(*results_and_hits[0])]
+
+        with ThreadPoolExecutor(
+            max_workers=min(SNIPPET_FETCH_WORKERS, len(results_and_hits)),
+            thread_name_prefix="ado-snippet",
+        ) as executor:
+            return list(executor.map(
+                lambda result_and_hits: self._fetch_file_and_build_snippets(*result_and_hits),
+                results_and_hits,
+            ))
+
+    def search_code(
+            self,
+            query: str,
+            branch: Optional[str] = None,
+            path: Optional[str] = None,
+            top: int = DEFAULT_SEARCH_TOP,
+            skip: int = 0,
+            include_snippets: bool = True,
+    ) -> str:
+        """
+        Search code in this repository by keyword or phrase using Azure DevOps code search.
+
+        Use this to locate code when the file path is unknown. Returns file metadata and
+        short matched snippets, never full file bodies - follow up with read_file to read
+        a match in full.
+
+        Query syntax supports scope filters (`path:`, `file:`, `ext:`) and code type
+        filters (`class:`, `def:`, `ref:`, `method:`, `comment:`, `strlit:`, `namespace:`).
+        Code type filters only apply to C#, C, C++, Java and VB.NET files.
+
+        Examples: `QueueJobsNow`, `parse_response ext:py`, `retry path:src/**/clients`,
+        `class:PaymentProcessor`.
+
+        Returns:
+            str: JSON with total_count, returned, truncated, next_skip, results and any
+            service warning.
+        """
+        if not query or not query.strip():
+            return ToolException("Search query cannot be empty. Provide text to search for.")
+
+        top = max(1, min(top or DEFAULT_SEARCH_TOP, MAX_SEARCH_TOP))
+        skip = max(0, min(skip or 0, MAX_SEARCH_SKIP))
+
+        filters = {
+            "Project": [self.project],
+            "Repository": [self.searchable_repository_name or self.repository_id],
+        }
+        if branch:
+            filters["Branch"] = [branch]
+        if path:
+            filters["Path"] = [path]
+
+        try:
+            response = self._search_client.fetch_code_search_results(
+                request=CodeSearchRequest(
+                    search_text=query,
+                    filters=filters,
+                    top=top,
+                    skip=skip,
+                    include_snippet=include_snippets,
+                ),
+                project=self.project,
+            )
+        except Exception as e:
+            msg = f"Unable to search code for query '{query}': {str(e)}"
+            logger.error(msg)
+            return ToolException(
+                f"{msg}\nCode search requires at least Basic access and a token with the "
+                "Code (read) scope. On Azure DevOps Server it also requires the Code Search "
+                "extension to be installed."
+            )
+
+        results = response.results or []
+        total_count = response.count or 0
+        payload_results = []
+        entries_awaiting_file_read = []
+        for result in results:
+            matches = result.matches or {}
+            content_hits = matches.get("content") or []
+            entry = {
+                "project": result.project.name if result.project else self.project,
+                "repository": result.repository.name if result.repository else self.searchable_repository_name,
+                "path": result.path,
+                "file_name": result.file_name,
+                "branch": result.versions[0].branch_name if result.versions else None,
+                "match_count": len(content_hits),
+            }
+            if not content_hits:
+                entry["matched_on"] = sorted(field for field, hits in matches.items() if hits) or ["unknown"]
+            payload_results.append(entry)
+
+            if not include_snippets or not content_hits:
+                continue
+            snippets_supplied_by_search = [
+                {"line": hit.line, "snippet": hit.code_snippet[:MAX_SNIPPET_CHARS]}
+                for hit in content_hits[:MAX_SNIPPETS_PER_FILE]
+                if getattr(hit, "code_snippet", None)
+            ]
+            if snippets_supplied_by_search:
+                entry["snippets"] = snippets_supplied_by_search
+            else:
+                entries_awaiting_file_read.append((entry, result, content_hits))
+
+        readable_within_budget = entries_awaiting_file_read[:MAX_FILES_FETCHED_FOR_SNIPPETS]
+        results_denied_snippets_by_budget = len(entries_awaiting_file_read) - len(readable_within_budget)
+        fetched_snippets = self._fetch_snippets_for_each(
+            [(result, hits) for _, result, hits in readable_within_budget]
+        )
+        for (entry, _, _), snippets in zip(readable_within_budget, fetched_snippets):
+            if snippets:
+                entry["snippets"] = snippets
+
+        returned = len(payload_results)
+        payload = {
+            "total_count": total_count,
+            "returned": returned,
+            "skip": skip,
+            "truncated": total_count > skip + returned,
+            "results": payload_results,
+        }
+        if payload["truncated"]:
+            next_skip = skip + returned
+            payload["next_skip"] = next_skip if next_skip <= MAX_SEARCH_SKIP else None
+
+        warnings = []
+        if response.info_code:
+            warnings.append(SEARCH_INFO_CODES.get(
+                response.info_code, f"Azure DevOps returned info code {response.info_code}."
+            ))
+        if not returned:
+            warnings.append(NO_RESULTS_HINT)
+        if results_denied_snippets_by_budget:
+            warnings.append(
+                f"Snippets were resolved for the first {MAX_FILES_FETCHED_FOR_SNIPPETS} files; "
+                f"{results_denied_snippets_by_budget} further result(s) list metadata alone."
+            )
+        if warnings:
+            payload["warnings"] = warnings
+
+        return dumps(payload)
+
     @extend_with_parent_available_tools
     def get_available_tools(self):
         """Return a list of available tools."""
@@ -1467,5 +1818,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 "name": "get_commits",
                 "description": self.get_commits.__doc__,
                 "args_schema": ArgsSchema.GetCommits.value,
+            },
+            {
+                "ref": self.search_code,
+                "name": "search_code",
+                "description": self.search_code.__doc__,
+                "args_schema": ArgsSchema.SearchCode.value,
             },
         ]
