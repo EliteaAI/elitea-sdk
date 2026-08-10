@@ -6,7 +6,7 @@ import traceback
 from io import BytesIO
 from json import JSONDecodeError
 from traceback import format_exc
-from typing import Optional, List, Any, Dict, Callable, Generator, Literal
+from typing import Optional, List, Any, Dict, Callable, Generator, Literal, NamedTuple
 
 import requests
 from atlassian.errors import ApiError
@@ -39,6 +39,14 @@ ATTACHMENT_LISTING_MACROS = frozenset({'attachments', 'gallery', 'space-attachme
 # 'name'). Restricting the harvest to these keeps an unrelated string parameter
 # (a jira jqlQuery, a toc title) from accidentally matching an attachment title.
 FILENAME_MACRO_PARAMS = frozenset({'name', 'filename', 'file'})
+
+
+class _AttachmentSelection(NamedTuple):
+    selected: list
+    total: int
+    visible: int
+    has_more: bool
+    truncated: bool
 
 
 createPage = create_model(
@@ -1757,17 +1765,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         viewpdf/multimedia survive as extension nodes naming the file only in
         their macro parameters, so those filenames are harvested as well.
         """
-        # Server/DC has no v2 page endpoint — don't round-trip into a guaranteed 404.
-        # An unresolved None still attempts inspection: it works on Cloud and the
-        # 404 lands on the fail-open path anyway.
+        # Deliberately `is False`: known Server/DC has no v2 endpoint, but an
+        # unresolved None still attempts inspection — a real DC 404 fails open.
         if self.cloud is False:
             return None
         try:
             response = self.client.get(f"api/v2/pages/{page_id}",
                                        params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
             if response.status_code == 404:
-                # Pages and blogposts share one id space — a pages miss means the id
-                # is a blogpost (or gone), so this is the only case worth a retry.
+                # Pages and blogposts share one id space, so a pages 404 is the
+                # only failure the blogposts endpoint can recover from.
                 response = self.client.get(f"api/v2/blogposts/{page_id}",
                                            params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
             response.raise_for_status()
@@ -1808,6 +1815,50 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         file_ids, filenames = body_references
         return file_id in file_ids or attachment.get('title', '') in filenames
 
+    def _collect_visible_attachments(self, page_id, first_listing, body_references,
+                                     matches_request, limit) -> _AttachmentSelection:
+        """Walk the paginated listing, keeping visible attachments that match the request.
+
+        The client fetches a single listing page of 50; filtering only that
+        slice would silently understate the result, so further pages are
+        pulled. Each page is filtered as it arrives and the walk stops at the
+        limit, bounding the listing requests together with the per-attachment
+        processing that follows. When the body couldn't be inspected every
+        attachment counts as visible, so pagination is skipped to keep the
+        single-page ceiling — notably on Server/DC, which always fails open.
+        """
+        selected = []
+        total = visible = 0
+        has_more = truncated = False
+        pending = first_listing.get('results') or []
+        next_link = (first_listing.get('_links') or {}).get('next') if body_references is not None else None
+        visited_links = set()
+        while True:
+            for entry in pending:
+                total += 1
+                if not self._visible_on_page(entry, body_references):
+                    continue
+                visible += 1
+                if not matches_request(entry):
+                    continue
+                if len(selected) >= limit:
+                    has_more = True
+                    break
+                selected.append(entry)
+            if has_more or not next_link or next_link in visited_links:
+                break
+            visited_links.add(next_link)
+            try:
+                listing_page = self.client.get(next_link) or {}
+            except Exception as e:
+                logger.warning(f"Attachment listing pagination failed for page {page_id}: {e}; "
+                               f"continuing with the {len(selected)} already selected")
+                truncated = True
+                break
+            pending = listing_page.get('results') or []
+            next_link = (listing_page.get('_links') or {}).get('next')
+        return _AttachmentSelection(selected, total, visible, has_more, truncated)
+
     def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None, max_attachments: int = 50):
         """
         Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
@@ -1831,57 +1882,22 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     return False
                 return not name_pattern or bool(re.match(name_pattern, title))
 
-            # The client fetches a single page of 50; filtering a truncated slice
-            # would silently understate the result, so further pages are pulled
-            # (as the client's own _get_paged does) — but each page is filtered
-            # as it arrives and the walk stops at max_attachments, so neither the
-            # listing requests nor the per-attachment fan-out below are unbounded.
-            # Fail-open keeps the single-page ceiling: every attachment survives
-            # filtering there, notably on Server/DC.
-            selected = []
-            total = visible_seen = 0
-            more_matching = listing_truncated = False
-            pending = attachments['results']
-            next_link = (attachments.get('_links') or {}).get('next') if body_references is not None else None
-            visited_links = set()
-            while True:
-                for entry in pending:
-                    total += 1
-                    if not self._visible_on_page(entry, body_references):
-                        continue
-                    visible_seen += 1
-                    if not matches_request(entry):
-                        continue
-                    if len(selected) >= max_attachments:
-                        more_matching = True
-                        break
-                    selected.append(entry)
-                if more_matching or not next_link or next_link in visited_links:
-                    break
-                visited_links.add(next_link)
-                try:
-                    listing_page = self.client.get(next_link) or {}
-                except Exception as e:
-                    logger.warning(f"Attachment listing pagination failed for page {page_id}: {e}; "
-                                   f"continuing with the {len(selected)} already selected")
-                    listing_truncated = True
-                    break
-                pending = listing_page.get('results') or []
-                next_link = (listing_page.get('_links') or {}).get('next')
+            selection = self._collect_visible_attachments(
+                page_id, attachments, body_references, matches_request, max_attachments)
 
-            if not visible_seen:
-                message = (f"No attachments are visible on page {page_id}: {total} attachment(s) "
+            if not selection.visible:
+                message = (f"No attachments are visible on page {page_id}: {selection.total} attachment(s) "
                            f"exist but are not referenced in the page body.")
-                if listing_truncated:
+                if selection.truncated:
                     message += " The attachment listing was truncated; further attachments were not checked."
                 return message
 
-            attachments['results'] = selected
+            attachments['results'] = selection.selected
             notices = []
-            if more_matching:
+            if selection.has_more:
                 notices.append(f"Showing the first {max_attachments} matching visible attachments; more exist — "
                                f"narrow with allowed_extensions/name_pattern or raise max_attachments.")
-            if listing_truncated:
+            if selection.truncated:
                 notices.append("The attachment listing could not be fully fetched; results may be incomplete.")
 
             # Get attachment history for created/updated info
