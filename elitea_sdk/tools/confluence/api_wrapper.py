@@ -33,7 +33,12 @@ logger = logging.getLogger(__name__)
 # Macros that render attachments wholesale, without naming files in their
 # parameters — the body then carries nothing to match against, so visibility
 # filtering must stand down for the whole page.
-ATTACHMENT_LISTING_MACROS = frozenset({'attachments', 'gallery'})
+ATTACHMENT_LISTING_MACROS = frozenset({'attachments', 'gallery', 'space-attachments', 'recently-updated'})
+
+# Macro parameters that name an attached file (viewpdf/multimedia/view-file use
+# 'name'). Restricting the harvest to these keeps an unrelated string parameter
+# (a jira jqlQuery, a toc title) from accidentally matching an attachment title.
+FILENAME_MACRO_PARAMS = frozenset({'name', 'filename', 'file'})
 
 
 createPage = create_model(
@@ -1751,13 +1756,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         viewpdf/multimedia survive as extension nodes naming the file only in
         their macro parameters, so those filenames are harvested as well.
         """
+        if not self.cloud:
+            # Server/DC has no v2 page endpoint — don't round-trip into a guaranteed 404.
+            return None
         try:
             page = self.client.get(f"api/v2/pages/{page_id}", params={'body-format': 'atlas_doc_format'})
             document = json.loads(_AtlasDocFormat.get_content(page))
         except Exception as e:
             logger.warning(f"Cannot inspect body of page {page_id} for embedded files: {e}")
             return None
-        if not document.get('content'):
+        if not isinstance(document, dict) or not document.get('content'):
             # A body with no content at all can't assert its attachments are unreferenced.
             return None
 
@@ -1768,14 +1776,14 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             if not isinstance(node, dict):
                 continue
             attrs = node.get('attrs') or {}
+            if attrs.get('extensionKey') in ATTACHMENT_LISTING_MACROS:
+                return None
             if str(node.get('type', '')).startswith('media') and attrs.get('id'):
                 file_ids.add(attrs['id'])
-            macro_params = (attrs.get('parameters') or {}).get('macroParams')
-            if macro_params is not None:
-                if attrs.get('extensionKey') in ATTACHMENT_LISTING_MACROS:
-                    return None
-                filenames.update(param['value'] for param in macro_params.values()
-                                 if isinstance(param, dict) and isinstance(param.get('value'), str))
+            macro_params = (attrs.get('parameters') or {}).get('macroParams') or {}
+            filenames.update(param['value'] for name, param in macro_params.items()
+                             if name in FILENAME_MACRO_PARAMS
+                             and isinstance(param, dict) and isinstance(param.get('value'), str))
             nodes.extend(node.get('content') or [])
         return file_ids, filenames
 

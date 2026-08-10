@@ -49,12 +49,13 @@ def media_single(file_id):
 
 
 def macro_extension(extension_key, **macro_params):
-    return {'type': 'extension', 'attrs': {
-        'extensionType': 'com.atlassian.confluence.macro.core',
-        'extensionKey': extension_key,
-        'parameters': {'macroParams': {name: {'value': value} for name, value in macro_params.items()},
-                       'macroMetadata': {'schemaVersion': {'value': '1'}}},
-    }}
+    attrs = {'extensionType': 'com.atlassian.confluence.macro.core', 'extensionKey': extension_key}
+    if macro_params:
+        attrs['parameters'] = {
+            'macroParams': {name: {'value': value} for name, value in macro_params.items()},
+            'macroMetadata': {'schemaVersion': {'value': '1'}},
+        }
+    return {'type': 'extension', 'attrs': attrs}
 
 
 @pytest.fixture
@@ -118,9 +119,13 @@ def test_macro_named_file_counts_as_visible(wrapper):
     assert listed_names(wrapper.get_page_attachments('1000')) == ['doc.pdf']
 
 
-@pytest.mark.parametrize('listing_macro', ['attachments', 'gallery'])
+@pytest.mark.parametrize('listing_macro', ['attachments', 'gallery', 'space-attachments', 'recently-updated'])
 def test_attachment_listing_macro_keeps_everything(wrapper, listing_macro):
-    """Listing macros render files without naming them — nothing to match, so don't filter."""
+    """Listing macros render files without naming them — nothing to match, so don't filter.
+
+    The fixture emits no `parameters` key at all, the shape a parameterless
+    macro can serialize with — the bailout must not depend on macroParams.
+    """
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
         attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
@@ -128,6 +133,35 @@ def test_attachment_listing_macro_keeps_everything(wrapper, listing_macro):
     wrapper.client.get.return_value = adf_page(macro_extension(listing_macro))
 
     assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt', 'unreferenced.txt']
+
+
+def test_unrelated_macro_parameter_does_not_rescue(wrapper):
+    """Only filename-shaped parameters count — a jql string equal to a title must not un-filter it."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = adf_page(macro_extension('jira', jqlQuery='removed.txt'))
+
+    assert 'No attachments are visible' in wrapper.get_page_attachments('1000')
+
+
+def test_non_dict_body_document_keeps_everything(wrapper):
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = {'body': {'atlas_doc_format': {'value': 'null'}}}
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
+
+
+def test_server_dc_never_calls_v2_page_endpoint(wrapper):
+    wrapper.cloud = False
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+    ]}
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
+    wrapper.client.get.assert_not_called()
 
 
 def test_empty_body_keeps_everything(wrapper):
