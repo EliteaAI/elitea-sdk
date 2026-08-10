@@ -596,53 +596,18 @@ class UnifiedMcpClient:
         if not self._session:
             await self._connect()
 
-        try:
-            from langchain_mcp_adapters.tools import load_mcp_tools
-        except ImportError:
-            raise ImportError(
-                "langchain-mcp-adapters is required. "
-                "Install with: pip install langchain-mcp-adapters"
-            )
-
-        # Load tools to get the specific tool
-        connection = self._client.connections.get(self._server_name)
-        tools = await load_mcp_tools(
-            self._session,
-            connection=connection,
-            server_name=self._server_name
-        )
-
-        # Find the tool
-        target_tool = None
-        for tool in tools:
-            if tool.name == tool_name:
-                target_tool = tool
-                break
-
-        if not target_tool:
-            raise ValueError(f"Tool '{tool_name}' not found")
-
         # Strip None values from arguments — MCP servers expect optional params
         # to be omitted rather than sent as null (e.g., Go servers reject nil for float64)
         clean_args = {k: v for k, v in (arguments or {}).items() if v is not None}
 
-        # Call the tool
         logger.debug(f"[Unified MCP] Calling tool {tool_name} with args: {clean_args}")
+        result = await self._session.call_tool(tool_name, clean_args)
 
-        # LangChain tools can be invoked with  .a/invoke() or ._run()
-        if hasattr(target_tool, 'ainvoke'):
-            result = await target_tool.ainvoke(clean_args)
-        elif hasattr(target_tool, '_arun'):
-            result = await target_tool._arun(**clean_args)
-        elif hasattr(target_tool, 'invoke'):
-            result = target_tool.invoke(clean_args)
-        else:
-            result = target_tool.run(**clean_args)
-
-        # Format result to match MCP protocol
-        return {
-            'content': [{'type': 'text', 'text': str(result)}]
-        }
+        if isinstance(result, dict):
+            return result
+        if hasattr(result, "model_dump"):
+            return result.model_dump(mode="json", by_alias=True, exclude_none=True)
+        raise TypeError(f"Unsupported MCP tool result type: {type(result).__name__}")
 
     async def send_request(
         self,
