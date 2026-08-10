@@ -313,3 +313,42 @@ def test_extension_and_visibility_filters_compose(wrapper):
     result = wrapper.get_page_attachments('1000', allowed_extensions=['txt'])
 
     assert listed_names(result) == ['kept.txt']
+
+
+def test_fail_open_skips_pagination(wrapper):
+    """On fail-open everything survives into the per-attachment fan-out — keep the single-page ceiling."""
+    wrapper.client.get_attachments_from_content.return_value = {
+        'results': [attachment('att_a', 'first-page.txt', REMOVED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
+    }
+    wrapper.client.get.side_effect = RuntimeError('body unreadable')
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['first-page.txt']
+    assert wrapper.client.get.call_count == 1
+
+
+def test_server_dc_skips_pagination(wrapper):
+    wrapper.cloud = False
+    wrapper.client.get_attachments_from_content.return_value = {
+        'results': [attachment('att_a', 'first-page.txt', REMOVED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
+    }
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['first-page.txt']
+    wrapper.client.get.assert_not_called()
+
+
+def test_mid_pagination_failure_keeps_what_was_fetched(wrapper):
+    wrapper.client.get_attachments_from_content.return_value = {
+        'results': [attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
+    }
+    body = body_response(adf_page(media_inline(EMBEDDED_FILE_ID)))
+
+    def route(url, **kwargs):
+        if url.startswith('api/v2/'):
+            return body
+        raise requests.HTTPError('429 rate limited')
+    wrapper.client.get.side_effect = route
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt']

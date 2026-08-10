@@ -1820,18 +1820,27 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             if not attachments or not attachments.get('results'):
                 return f"No attachments found for page ID {page_id}."
 
+            body_references = self._get_body_file_references(page_id)
             # The client fetches a single page of 50; visibility filtering on a
             # truncated slice would silently understate the result, so the rest
             # of the listing is pulled the same way the client's _get_paged does.
-            next_link = (attachments.get('_links') or {}).get('next')
+            # Only when the body is inspectable, though: on fail-open every
+            # attachment survives into the per-attachment history/comment/content
+            # fan-out below, and the single-page ceiling is the only bound on
+            # that work — notably for Server/DC, which always fails open.
+            next_link = (attachments.get('_links') or {}).get('next') if body_references is not None else None
             visited_links = set()
             while next_link and next_link not in visited_links:
                 visited_links.add(next_link)
-                listing_page = self.client.get(next_link) or {}
+                try:
+                    listing_page = self.client.get(next_link) or {}
+                except Exception as e:
+                    logger.warning(f"Attachment listing pagination failed for page {page_id}: {e}; "
+                                   f"continuing with the {len(attachments['results'])} already fetched")
+                    break
                 attachments['results'].extend(listing_page.get('results') or [])
                 next_link = (listing_page.get('_links') or {}).get('next')
 
-            body_references = self._get_body_file_references(page_id)
             total = len(attachments['results'])
             attachments['results'] = [attachment for attachment in attachments['results']
                                       if self._visible_on_page(attachment, body_references)]
