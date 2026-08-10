@@ -1761,16 +1761,18 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         # 404 lands on the fail-open path anyway.
         if self.cloud is False:
             return None
-        for content_type in ('pages', 'blogposts'):
-            try:
-                content = self.client.get(f"api/v2/{content_type}/{page_id}",
-                                          params={'body-format': 'atlas_doc_format'})
-                document = json.loads(_AtlasDocFormat.get_content(content))
-                break
-            except Exception as e:
-                error = e
-        else:
-            logger.warning(f"Cannot inspect body of content {page_id} for embedded files: {error}")
+        try:
+            response = self.client.get(f"api/v2/pages/{page_id}",
+                                       params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
+            if response.status_code == 404:
+                # Pages and blogposts share one id space — a pages miss means the id
+                # is a blogpost (or gone), so this is the only case worth a retry.
+                response = self.client.get(f"api/v2/blogposts/{page_id}",
+                                           params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
+            response.raise_for_status()
+            document = json.loads(_AtlasDocFormat.get_content(response.json()))
+        except Exception as e:
+            logger.warning(f"Cannot inspect body of content {page_id} for embedded files: {e}")
             return None
         if not isinstance(document, dict) or not document.get('content'):
             # A body with no content at all can't assert its attachments are unreferenced.
@@ -1818,18 +1820,24 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             if not attachments or not attachments.get('results'):
                 return f"No attachments found for page ID {page_id}."
 
+            # The client fetches a single page of 50; visibility filtering on a
+            # truncated slice would silently understate the result, so the rest
+            # of the listing is pulled the same way the client's _get_paged does.
+            next_link = (attachments.get('_links') or {}).get('next')
+            visited_links = set()
+            while next_link and next_link not in visited_links:
+                visited_links.add(next_link)
+                listing_page = self.client.get(next_link) or {}
+                attachments['results'].extend(listing_page.get('results') or [])
+                next_link = (listing_page.get('_links') or {}).get('next')
+
             body_references = self._get_body_file_references(page_id)
-            fetched = len(attachments['results'])
+            total = len(attachments['results'])
             attachments['results'] = [attachment for attachment in attachments['results']
                                       if self._visible_on_page(attachment, body_references)]
             if not attachments['results']:
-                # The listing may be a single page of a larger set, so the claim
-                # is bounded to what was actually fetched.
-                message = (f"No attachments are visible on page {page_id}: none of the {fetched} "
-                           f"attachment(s) returned by Confluence are referenced in the page body.")
-                if (attachments.get('_links') or {}).get('next'):
-                    message += " The attachment listing was truncated; further attachments were not checked."
-                return message
+                return (f"No attachments are visible on page {page_id}: {total} attachment(s) "
+                        f"exist but are not referenced in the page body.")
 
             # Get attachment history for created/updated info
             history_map = {}

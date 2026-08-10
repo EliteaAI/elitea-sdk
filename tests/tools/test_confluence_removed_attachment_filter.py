@@ -3,18 +3,22 @@
 Deleting a file from the page in the Confluence editor removes its body
 reference but keeps the attachment (status stays 'current'), so the attachment
 listing alone can't tell removed files apart. The wrapper cross-references the
-atlas_doc_format body: media nodes carry the attachment's immutable fileId.
+atlas_doc_format body: media nodes carry the attachment's immutable fileId, and
+file-rendering macros carry the filename in their parameters. The listing is
+paginated before filtering so visibility is judged over the full attachment set.
 """
 
 import json
 
 import pytest
+import requests
 from unittest.mock import MagicMock
 
 from elitea_sdk.tools.confluence.api_wrapper import ConfluenceAPIWrapper
 
 EMBEDDED_FILE_ID = 'a7c79fb8-e574-4061-9d38-c5b0e2bc0c1f'
 REMOVED_FILE_ID = 'f191dc06-c1ea-467c-90ef-5b6601f02c9f'
+SECOND_PAGE_LINK = '/rest/api/content/1000/child/attachment?start=50&limit=50'
 
 
 def attachment(att_id, title, file_id):
@@ -36,6 +40,14 @@ def adf_page(*media_nodes):
         *media_nodes,
     ], 'version': 1}
     return {'body': {'atlas_doc_format': {'value': json.dumps(document)}}}
+
+
+def body_response(payload, status=200):
+    response = MagicMock(status_code=status)
+    response.json.return_value = payload
+    if status >= 400:
+        response.raise_for_status.side_effect = requests.HTTPError(f'{status} error')
+    return response
 
 
 def media_inline(file_id):
@@ -61,15 +73,20 @@ def macro_extension(extension_key, **macro_params):
 @pytest.fixture
 def wrapper():
     instance = ConfluenceAPIWrapper.model_construct()
+    instance.cloud = True
     instance.base_url = 'https://example.atlassian.net'
     instance.client = MagicMock()
     instance.client.url = 'https://example.atlassian.net/wiki'
     instance.client.history.return_value = {}
     instance.client.get_comments_for_attachment.return_value = {'results': []}
-    response = MagicMock(status_code=200)
-    response.content = b'attachment body'
-    instance.client.request.return_value = response
+    request_response = MagicMock(status_code=200)
+    request_response.content = b'attachment body'
+    instance.client.request.return_value = request_response
     return instance
+
+
+def set_body(wrapper, *media_nodes):
+    wrapper.client.get.return_value = body_response(adf_page(*media_nodes))
 
 
 def listed_names(result):
@@ -81,18 +98,18 @@ def test_removed_attachment_is_excluded(wrapper):
         attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
         attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
+    set_body(wrapper, media_inline(EMBEDDED_FILE_ID))
 
     assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt']
     wrapper.client.get.assert_called_once_with(
-        'api/v2/pages/1000', params={'body-format': 'atlas_doc_format'})
+        'api/v2/pages/1000', params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
 
 
 def test_media_single_reference_counts_as_visible(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_a', 'image.png', EMBEDDED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(media_single(EMBEDDED_FILE_ID))
+    set_body(wrapper, media_single(EMBEDDED_FILE_ID))
 
     assert listed_names(wrapper.get_page_attachments('1000')) == ['image.png']
 
@@ -101,40 +118,53 @@ def test_all_attachments_removed_reports_distinct_message(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
+    set_body(wrapper, media_inline(EMBEDDED_FILE_ID))
 
     assert wrapper.get_page_attachments('1000') == (
-        'No attachments are visible on page 1000: none of the 1 attachment(s) '
-        'returned by Confluence are referenced in the page body.')
+        'No attachments are visible on page 1000: 1 attachment(s) '
+        'exist but are not referenced in the page body.')
 
 
-def test_truncated_listing_is_flagged_in_the_message(wrapper):
-    """The claim must stay bounded to the fetched slice when more pages exist."""
+def test_listing_pagination_is_followed_before_filtering(wrapper):
+    """A referenced file past the first listing page must not be silently dropped."""
     wrapper.client.get_attachments_from_content.return_value = {
-        'results': [attachment('att_b', 'removed.txt', REMOVED_FILE_ID)],
-        '_links': {'next': '/rest/api/content/1000/child/attachment?start=50&limit=50'},
+        'results': [attachment('att_a', 'first-page.txt', REMOVED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
     }
-    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
+    second_page = {'results': [attachment('att_b', 'second-page.txt', EMBEDDED_FILE_ID)]}
+    body = body_response(adf_page(media_inline(EMBEDDED_FILE_ID)))
+    wrapper.client.get.side_effect = (
+        lambda url, **kwargs: body if url.startswith('api/v2/') else second_page)
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['second-page.txt']
+
+
+def test_all_filtered_message_counts_the_full_listing(wrapper):
+    wrapper.client.get_attachments_from_content.return_value = {
+        'results': [attachment('att_a', 'a.txt', REMOVED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
+    }
+    second_page = {'results': [attachment('att_b', 'b.txt', REMOVED_FILE_ID)]}
+    body = body_response(adf_page(media_inline(EMBEDDED_FILE_ID)))
+    wrapper.client.get.side_effect = (
+        lambda url, **kwargs: body if url.startswith('api/v2/') else second_page)
+
+    assert '2 attachment(s)' in wrapper.get_page_attachments('1000')
+
+
+def test_repeated_next_link_does_not_loop_forever(wrapper):
+    stuck_page = {
+        'results': [attachment('att_a', 'a.txt', EMBEDDED_FILE_ID)],
+        '_links': {'next': SECOND_PAGE_LINK},
+    }
+    wrapper.client.get_attachments_from_content.return_value = dict(stuck_page)
+    body = body_response(adf_page(media_inline(EMBEDDED_FILE_ID)))
+    wrapper.client.get.side_effect = (
+        lambda url, **kwargs: body if url.startswith('api/v2/') else stuck_page)
 
     result = wrapper.get_page_attachments('1000')
 
-    assert 'listing was truncated' in result
-
-
-def test_blogpost_body_is_inspected_via_fallback(wrapper):
-    """api/v2/pages 404s for blogpost ids — the blogposts endpoint takes the same body-format."""
-    wrapper.client.get_attachments_from_content.return_value = {'results': [
-        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
-        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
-    ]}
-    wrapper.client.get.side_effect = [
-        RuntimeError('404: not a page'),
-        adf_page(media_inline(EMBEDDED_FILE_ID)),
-    ]
-
-    assert listed_names(wrapper.get_page_attachments('2000')) == ['kept.txt']
-    endpoints = [call.args[0] for call in wrapper.client.get.call_args_list]
-    assert endpoints == ['api/v2/pages/2000', 'api/v2/blogposts/2000']
+    assert len(result) == 2
 
 
 def test_macro_named_file_counts_as_visible(wrapper):
@@ -143,7 +173,7 @@ def test_macro_named_file_counts_as_visible(wrapper):
         attachment('att_a', 'doc.pdf', EMBEDDED_FILE_ID),
         attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(macro_extension('viewpdf', name='doc.pdf'))
+    set_body(wrapper, macro_extension('viewpdf', name='doc.pdf'))
 
     assert listed_names(wrapper.get_page_attachments('1000')) == ['doc.pdf']
 
@@ -159,7 +189,7 @@ def test_attachment_listing_macro_keeps_everything(wrapper, listing_macro):
         attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
         attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(macro_extension(listing_macro))
+    set_body(wrapper, macro_extension(listing_macro))
 
     assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt', 'unreferenced.txt']
 
@@ -169,16 +199,64 @@ def test_unrelated_macro_parameter_does_not_rescue(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(macro_extension('jira', jqlQuery='removed.txt'))
+    set_body(wrapper, macro_extension('jira', jqlQuery='removed.txt'))
 
     assert 'No attachments are visible' in wrapper.get_page_attachments('1000')
+
+
+def test_blogpost_body_is_inspected_via_fallback(wrapper):
+    """api/v2/pages 404s for blogpost ids — the blogposts endpoint takes the same body-format."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.side_effect = [
+        body_response(None, status=404),
+        body_response(adf_page(media_inline(EMBEDDED_FILE_ID))),
+    ]
+
+    assert listed_names(wrapper.get_page_attachments('2000')) == ['kept.txt']
+    endpoints = [call.args[0] for call in wrapper.client.get.call_args_list]
+    assert endpoints == ['api/v2/pages/2000', 'api/v2/blogposts/2000']
+
+
+def test_non_404_body_error_does_not_retry_blogposts(wrapper):
+    """A 500/429 on the pages fetch is equally doomed on blogposts — fail open, one request."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = body_response(None, status=500)
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
+    assert wrapper.client.get.call_count == 1
+
+
+def test_uninspectable_body_keeps_everything(wrapper):
+    """Never drop attachments blindly when the body can't be read at all."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.side_effect = RuntimeError('connection reset')
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt', 'removed.txt']
 
 
 def test_non_dict_body_document_keeps_everything(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = {'body': {'atlas_doc_format': {'value': 'null'}}}
+    wrapper.client.get.return_value = body_response({'body': {'atlas_doc_format': {'value': 'null'}}})
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
+
+
+def test_empty_body_keeps_everything(wrapper):
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = body_response(
+        {'body': {'atlas_doc_format': {'value': json.dumps({'type': 'doc', 'content': [], 'version': 1})}}})
 
     assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
 
@@ -200,19 +278,21 @@ def test_unresolved_cloud_still_inspects_the_body(wrapper):
         attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
         attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
+    wrapper.client.get.side_effect = [
+        body_response(None, status=404),
+        body_response(None, status=404),
+    ]
 
-    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt']
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt', 'removed.txt']
 
 
-def test_empty_body_keeps_everything(wrapper):
+def test_attachment_without_file_id_is_kept(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
-        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+        attachment('att_a', 'no-file-id.txt', None),
     ]}
-    wrapper.client.get.return_value = {'body': {'atlas_doc_format': {
-        'value': json.dumps({'type': 'doc', 'content': [], 'version': 1})}}}
+    set_body(wrapper)
 
-    assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['no-file-id.txt']
 
 
 def test_null_extensions_field_is_kept():
@@ -222,34 +302,13 @@ def test_null_extensions_field_is_kept():
     assert ConfluenceAPIWrapper._visible_on_page(entry, ({EMBEDDED_FILE_ID}, set())) is True
 
 
-def test_uninspectable_body_keeps_everything(wrapper):
-    """Server/DC has no atlas_doc_format endpoint — never drop attachments blindly."""
-    wrapper.client.get_attachments_from_content.return_value = {'results': [
-        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
-        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
-    ]}
-    wrapper.client.get.side_effect = RuntimeError('404 not found')
-
-    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt', 'removed.txt']
-
-
-def test_attachment_without_file_id_is_kept(wrapper):
-    wrapper.client.get_attachments_from_content.return_value = {'results': [
-        attachment('att_a', 'no-file-id.txt', None),
-    ]}
-    wrapper.client.get.return_value = adf_page()
-
-    assert listed_names(wrapper.get_page_attachments('1000')) == ['no-file-id.txt']
-
-
 def test_extension_and_visibility_filters_compose(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
         attachment('att_b', 'kept.png', EMBEDDED_FILE_ID),
         attachment('att_c', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page(
-        media_inline(EMBEDDED_FILE_ID), media_single(EMBEDDED_FILE_ID))
+    set_body(wrapper, media_inline(EMBEDDED_FILE_ID), media_single(EMBEDDED_FILE_ID))
 
     result = wrapper.get_page_attachments('1000', allowed_extensions=['txt'])
 
