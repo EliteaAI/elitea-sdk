@@ -1761,11 +1761,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         # 404 lands on the fail-open path anyway.
         if self.cloud is False:
             return None
-        try:
-            page = self.client.get(f"api/v2/pages/{page_id}", params={'body-format': 'atlas_doc_format'})
-            document = json.loads(_AtlasDocFormat.get_content(page))
-        except Exception as e:
-            logger.warning(f"Cannot inspect body of page {page_id} for embedded files: {e}")
+        for content_type in ('pages', 'blogposts'):
+            try:
+                content = self.client.get(f"api/v2/{content_type}/{page_id}",
+                                          params={'body-format': 'atlas_doc_format'})
+                document = json.loads(_AtlasDocFormat.get_content(content))
+                break
+            except Exception as e:
+                error = e
+        else:
+            logger.warning(f"Cannot inspect body of content {page_id} for embedded files: {error}")
             return None
         if not isinstance(document, dict) or not document.get('content'):
             # A body with no content at all can't assert its attachments are unreferenced.
@@ -1803,7 +1808,9 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None):
         """
         Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
-        file content, and LLM-based analysis for supported types. Files removed from the page content are excluded.
+        file content, and LLM-based analysis for supported types. Files removed from the page content are excluded;
+        visibility is judged against the published page body, so files embedded only in an unpublished draft
+        are not yet listed.
         Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis.
         """
         try:
@@ -1812,12 +1819,17 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 return f"No attachments found for page ID {page_id}."
 
             body_references = self._get_body_file_references(page_id)
-            total = len(attachments['results'])
+            fetched = len(attachments['results'])
             attachments['results'] = [attachment for attachment in attachments['results']
                                       if self._visible_on_page(attachment, body_references)]
             if not attachments['results']:
-                return (f"No attachments are visible on page {page_id}: {total} attachment(s) "
-                        f"exist but are not referenced in the page body.")
+                # The listing may be a single page of a larger set, so the claim
+                # is bounded to what was actually fetched.
+                message = (f"No attachments are visible on page {page_id}: none of the {fetched} "
+                           f"attachment(s) returned by Confluence are referenced in the page body.")
+                if (attachments.get('_links') or {}).get('next'):
+                    message += " The attachment listing was truncated; further attachments were not checked."
+                return message
 
             # Get attachment history for created/updated info
             history_map = {}

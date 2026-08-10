@@ -104,8 +104,37 @@ def test_all_attachments_removed_reports_distinct_message(wrapper):
     wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
 
     assert wrapper.get_page_attachments('1000') == (
-        'No attachments are visible on page 1000: 1 attachment(s) '
-        'exist but are not referenced in the page body.')
+        'No attachments are visible on page 1000: none of the 1 attachment(s) '
+        'returned by Confluence are referenced in the page body.')
+
+
+def test_truncated_listing_is_flagged_in_the_message(wrapper):
+    """The claim must stay bounded to the fetched slice when more pages exist."""
+    wrapper.client.get_attachments_from_content.return_value = {
+        'results': [attachment('att_b', 'removed.txt', REMOVED_FILE_ID)],
+        '_links': {'next': '/rest/api/content/1000/child/attachment?start=50&limit=50'},
+    }
+    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
+
+    result = wrapper.get_page_attachments('1000')
+
+    assert 'listing was truncated' in result
+
+
+def test_blogpost_body_is_inspected_via_fallback(wrapper):
+    """api/v2/pages 404s for blogpost ids — the blogposts endpoint takes the same body-format."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.side_effect = [
+        RuntimeError('404: not a page'),
+        adf_page(media_inline(EMBEDDED_FILE_ID)),
+    ]
+
+    assert listed_names(wrapper.get_page_attachments('2000')) == ['kept.txt']
+    endpoints = [call.args[0] for call in wrapper.client.get.call_args_list]
+    assert endpoints == ['api/v2/pages/2000', 'api/v2/blogposts/2000']
 
 
 def test_macro_named_file_counts_as_visible(wrapper):
