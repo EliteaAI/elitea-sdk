@@ -48,6 +48,15 @@ def media_single(file_id):
         {'type': 'media', 'attrs': {'id': file_id, 'collection': 'contentId-1000'}}]}
 
 
+def macro_extension(extension_key, **macro_params):
+    return {'type': 'extension', 'attrs': {
+        'extensionType': 'com.atlassian.confluence.macro.core',
+        'extensionKey': extension_key,
+        'parameters': {'macroParams': {name: {'value': value} for name, value in macro_params.items()},
+                       'macroMetadata': {'schemaVersion': {'value': '1'}}},
+    }}
+
+
 @pytest.fixture
 def wrapper():
     instance = ConfluenceAPIWrapper.model_construct()
@@ -87,13 +96,55 @@ def test_media_single_reference_counts_as_visible(wrapper):
     assert listed_names(wrapper.get_page_attachments('1000')) == ['image.png']
 
 
-def test_all_attachments_removed_reports_none(wrapper):
+def test_all_attachments_removed_reports_distinct_message(wrapper):
     wrapper.client.get_attachments_from_content.return_value = {'results': [
         attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
     ]}
-    wrapper.client.get.return_value = adf_page()
+    wrapper.client.get.return_value = adf_page(media_inline(EMBEDDED_FILE_ID))
 
-    assert wrapper.get_page_attachments('1000') == 'No attachments found for page ID 1000.'
+    assert wrapper.get_page_attachments('1000') == (
+        'No attachments are visible on page 1000: 1 attachment(s) '
+        'exist but are not referenced in the page body.')
+
+
+def test_macro_named_file_counts_as_visible(wrapper):
+    """viewpdf/multimedia survive as extension nodes naming the file only in macroParams."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'doc.pdf', EMBEDDED_FILE_ID),
+        attachment('att_b', 'removed.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = adf_page(macro_extension('viewpdf', name='doc.pdf'))
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['doc.pdf']
+
+
+@pytest.mark.parametrize('listing_macro', ['attachments', 'gallery'])
+def test_attachment_listing_macro_keeps_everything(wrapper, listing_macro):
+    """Listing macros render files without naming them — nothing to match, so don't filter."""
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_a', 'kept.txt', EMBEDDED_FILE_ID),
+        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = adf_page(macro_extension(listing_macro))
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['kept.txt', 'unreferenced.txt']
+
+
+def test_empty_body_keeps_everything(wrapper):
+    wrapper.client.get_attachments_from_content.return_value = {'results': [
+        attachment('att_b', 'unreferenced.txt', REMOVED_FILE_ID),
+    ]}
+    wrapper.client.get.return_value = {'body': {'atlas_doc_format': {
+        'value': json.dumps({'type': 'doc', 'content': [], 'version': 1})}}}
+
+    assert listed_names(wrapper.get_page_attachments('1000')) == ['unreferenced.txt']
+
+
+def test_null_extensions_field_is_kept():
+    entry = attachment('att_a', 'no-extensions.txt', None)
+    entry['extensions'] = None
+
+    assert ConfluenceAPIWrapper._visible_on_page(entry, ({EMBEDDED_FILE_ID}, set())) is True
 
 
 def test_uninspectable_body_keeps_everything(wrapper):
