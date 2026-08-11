@@ -6,7 +6,7 @@ import traceback
 from io import BytesIO
 from json import JSONDecodeError
 from traceback import format_exc
-from typing import Optional, List, Any, Dict, Callable, Generator, Literal
+from typing import Optional, List, Any, Dict, Callable, Generator, Literal, NamedTuple
 
 import requests
 from atlassian.errors import ApiError
@@ -29,6 +29,24 @@ from ...configurations.utils import _resolve_confluence_api_version
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
+# Macros that render attachments wholesale, without naming files in their
+# parameters — the body then carries nothing to match against, so visibility
+# filtering must stand down for the whole page.
+ATTACHMENT_LISTING_MACROS = frozenset({'attachments', 'gallery', 'space-attachments', 'recently-updated'})
+
+# Macro parameters that name an attached file (viewpdf/multimedia/view-file use
+# 'name'). Restricting the harvest to these keeps an unrelated string parameter
+# (a jira jqlQuery, a toc title) from accidentally matching an attachment title.
+FILENAME_MACRO_PARAMS = frozenset({'name', 'filename', 'file'})
+
+
+class _AttachmentSelection(NamedTuple):
+    selected: list
+    total: int
+    visible: int
+    has_more: bool
+    truncated: bool
 
 
 createPage = create_model(
@@ -178,6 +196,7 @@ GetPageAttachmentsInput = create_model(
     custom_prompt=(Optional[str], Field(default=None, description="Custom prompt to use for LLM-based analysis of attachments (images, pdfs, etc). If not provided, a default prompt will be used.")),
     allowed_extensions=(Optional[List[str]], Field(default=None, description="List of file extensions to include (e.g. ['pdf', 'docx']). If None, all extensions are included.", examples=[["pdf", "docx"]])),
     name_pattern=(Optional[str], Field(default=None, description="Regex pattern to filter attachment names (e.g. '^report_.*\\.pdf$'). If None, all names are included.", examples=["^report_.*\\.pdf$"])),
+    max_attachments=(int, Field(default=50, description="Maximum number of visible attachments to process and return. A notice entry is appended when more exist. Default is 50.")),
 )
 
 AddFileToPage = create_model(
@@ -1733,16 +1752,153 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error processing page with images: {stacktrace}")
             return f"Error processing page with images: {str(e)}"
     
-    def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None):
+    def _get_body_file_references(self, page_id: str) -> Optional[tuple]:
+        """(file ids, filenames) referenced by the page body, or None when the
+        body can't vouch for what it displays.
+
+        Deleting a file from the page in the Confluence editor removes its body
+        reference but keeps the attachment itself (status stays 'current'), so the
+        attachment listing alone can't tell removed files apart. The body is the
+        only source of truth. Editor file insertions become media nodes whose
+        attrs.id is the attachment's immutable fileId (rename-proof, hence
+        atlas_doc_format rather than the storage format); legacy macros like
+        viewpdf/multimedia survive as extension nodes naming the file only in
+        their macro parameters, so those filenames are harvested as well.
         """
-        Retrieve all attachments for a Confluence page, including core metadata (with creator, created, updated), comments,
-        file content, and LLM-based analysis for supported types.
-        Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis.
+        # Deliberately `is False`: known Server/DC has no v2 endpoint, but an
+        # unresolved None still attempts inspection — a real DC 404 fails open.
+        if self.cloud is False:
+            return None
+        try:
+            response = self.client.get(f"api/v2/pages/{page_id}",
+                                       params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
+            if response.status_code == 404:
+                # Pages and blogposts share one id space, so a pages 404 is the
+                # only failure the blogposts endpoint can recover from.
+                response = self.client.get(f"api/v2/blogposts/{page_id}",
+                                           params={'body-format': 'atlas_doc_format'}, advanced_mode=True)
+            response.raise_for_status()
+            document = json.loads(_AtlasDocFormat.get_content(response.json()))
+        except Exception as e:
+            logger.warning(f"Cannot inspect body of content {page_id} for embedded files: {e}")
+            return None
+        if not isinstance(document, dict) or not document.get('content'):
+            # A body with no content at all can't assert its attachments are unreferenced.
+            return None
+
+        file_ids, filenames = set(), set()
+        nodes = [document]
+        while nodes:
+            node = nodes.pop()
+            if not isinstance(node, dict):
+                continue
+            attrs = node.get('attrs') or {}
+            if attrs.get('extensionKey') in ATTACHMENT_LISTING_MACROS:
+                return None
+            if str(node.get('type', '')).startswith('media') and attrs.get('id'):
+                file_ids.add(attrs['id'])
+            macro_params = (attrs.get('parameters') or {}).get('macroParams') or {}
+            filenames.update(param['value'] for name, param in macro_params.items()
+                             if name in FILENAME_MACRO_PARAMS
+                             and isinstance(param, dict) and isinstance(param.get('value'), str))
+            nodes.extend(node.get('content') or [])
+        return file_ids, filenames
+
+    @staticmethod
+    def _visible_on_page(attachment: dict, body_references: Optional[tuple]) -> bool:
+        if body_references is None:
+            return True
+        file_id = (attachment.get('extensions') or {}).get('fileId')
+        # Attachments without a fileId (Server/DC responses) can't be matched — keep them.
+        if not file_id:
+            return True
+        file_ids, filenames = body_references
+        return file_id in file_ids or attachment.get('title', '') in filenames
+
+    def _collect_visible_attachments(self, page_id, first_listing, body_references,
+                                     matches_request, limit) -> _AttachmentSelection:
+        """Walk the paginated listing, keeping visible attachments that match the request.
+
+        The client fetches a single listing page of 50; filtering only that
+        slice would silently understate the result, so further pages are
+        pulled. Each page is filtered as it arrives and the walk stops at the
+        limit, bounding the listing requests together with the per-attachment
+        processing that follows. When the body couldn't be inspected every
+        attachment counts as visible, so pagination is skipped to keep the
+        single-page ceiling — notably on Server/DC, which always fails open.
+        """
+        selected = []
+        total = visible = 0
+        has_more = truncated = False
+        pending = first_listing.get('results') or []
+        next_link = (first_listing.get('_links') or {}).get('next') if body_references is not None else None
+        visited_links = set()
+        while True:
+            for entry in pending:
+                total += 1
+                if not self._visible_on_page(entry, body_references):
+                    continue
+                visible += 1
+                if not matches_request(entry):
+                    continue
+                if len(selected) >= limit:
+                    has_more = True
+                    break
+                selected.append(entry)
+            if has_more or not next_link or next_link in visited_links:
+                break
+            visited_links.add(next_link)
+            try:
+                listing_page = self.client.get(next_link) or {}
+            except Exception as e:
+                logger.warning(f"Attachment listing pagination failed for page {page_id}: {e}; "
+                               f"continuing with the {len(selected)} already selected")
+                truncated = True
+                break
+            pending = listing_page.get('results') or []
+            next_link = (listing_page.get('_links') or {}).get('next')
+        return _AttachmentSelection(selected, total, visible, has_more, truncated)
+
+    def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None, max_attachments: int = 50):
+        """
+        Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
+        file content, and LLM-based analysis for supported types. Files removed from the page content are excluded;
+        visibility is judged against the published page body, so files embedded only in an unpublished draft
+        are not yet listed. At most max_attachments matching the filters are processed.
+        Returns a list of dicts, each with keys: metadata, comments, content, llm_analysis; when results were
+        limited or the listing was incomplete, the list ends with an entry whose only key is 'notice'.
         """
         try:
             attachments = self.client.get_attachments_from_content(page_id)
             if not attachments or not attachments.get('results'):
                 return f"No attachments found for page ID {page_id}."
+
+            body_references = self._get_body_file_references(page_id)
+
+            def matches_request(entry):
+                title = entry.get('title', '')
+                extension = title.lower().split('.')[-1] if '.' in title else ''
+                if allowed_extensions and extension not in allowed_extensions:
+                    return False
+                return not name_pattern or bool(re.match(name_pattern, title))
+
+            selection = self._collect_visible_attachments(
+                page_id, attachments, body_references, matches_request, max_attachments)
+
+            if not selection.visible:
+                message = (f"No attachments are visible on page {page_id}: {selection.total} attachment(s) "
+                           f"exist but are not referenced in the page body.")
+                if selection.truncated:
+                    message += " The attachment listing was truncated; further attachments were not checked."
+                return message
+
+            attachments['results'] = selection.selected
+            notices = []
+            if selection.has_more:
+                notices.append(f"Showing the first {max_attachments} matching visible attachments; more exist — "
+                               f"narrow with allowed_extensions/name_pattern or raise max_attachments.")
+            if selection.truncated:
+                notices.append("The attachment listing could not be fully fetched; results may be incomplete.")
 
             # Get attachment history for created/updated info
             history_map = {}
@@ -1754,18 +1910,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     logger.warning(f"Failed to fetch history for attachment {attachment.get('title', '')}: {str(e)}")
                     history_map[attachment['id']] = None
 
-            import re
             results = []
             for attachment in attachments['results']:
                 title = attachment.get('title', '')
                 file_ext = title.lower().split('.')[-1] if '.' in title else ''
-
-                # Filter by allowed_extensions
-                if allowed_extensions and file_ext not in allowed_extensions:
-                    continue
-                # Filter by name_pattern
-                if name_pattern and not re.match(name_pattern, title):
-                    continue
 
                 media_type = attachment.get('metadata', {}).get('mediaType', '')
                 # Core metadata extraction with history
@@ -1983,6 +2131,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     'content': content,
                     'llm_analysis': llm_analysis
                 })
+            results.extend({'notice': notice} for notice in notices)
             return results
         except Exception as e:
             logger.error(f"Error retrieving attachments for page {page_id}: {str(e)}")
