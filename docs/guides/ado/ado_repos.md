@@ -112,7 +112,11 @@ result whose match is on the file name rather than its content has `match_count:
 `matched_on` field instead of snippets.
 
 The response reports `total_count` (all matched files), `returned`, `skip`, a `truncated`
-flag and `next_skip` when more results remain.
+flag and `next_skip` when more results remain. `next_skip` is `skip` plus the `top` you
+asked for, so it strictly increases; it is withheld once the next window would pass the
+`skip` ceiling of 1000. A window that comes back empty ends paging - no `next_skip` is
+supplied even when `total_count` is higher, because the remaining matches are not readable
+with this token. Stop as soon as `next_skip` is absent and refine the query instead.
 
 #### Recommended usage
 

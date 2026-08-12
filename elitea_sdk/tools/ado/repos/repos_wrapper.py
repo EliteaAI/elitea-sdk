@@ -9,7 +9,6 @@ from enum import Enum
 from json import dumps
 from typing import ClassVar, List, Union, Optional, Any, Dict
 
-from azure.devops.connection import Connection
 from azure.devops.v7_0.git.git_client import GitClient
 from azure.devops.v7_0.git.models import (
     Comment,
@@ -30,7 +29,14 @@ from msrest.authentication import BasicAuthentication
 from pydantic import Field, PrivateAttr, create_model, model_validator, SecretStr
 
 from ...elitea_base import BaseCodeToolApiWrapper
-from ..utils import generate_diff, get_content_from_generator
+from ..utils import (
+    AdoSearchPaging,
+    SearchIndexHints,
+    create_search_client,
+    describe_search_info_code,
+    generate_diff,
+    get_content_from_generator,
+)
 from ...code_indexer_toolkit import CodeIndexerToolkit
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
@@ -39,46 +45,18 @@ from ...utils.file_metadata import guard_text_read
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SEARCH_TOP = 5
-MAX_SEARCH_TOP = 1000
-MAX_SEARCH_SKIP = 1000
+PAGING = AdoSearchPaging(default_top=5, max_top=1000)
+
+SEARCH_HINTS = SearchIndexHints(
+    filter_not_indexed="Only branches listed under Searchable branches are indexed; check the branch filter.",
+)
+
 SNIPPET_CONTEXT_LINES = 2
 MAX_SNIPPETS_PER_FILE = 3
 MAX_SNIPPET_CHARS = 400
-MAX_FILES_FETCHED_FOR_SNIPPETS = DEFAULT_SEARCH_TOP
+MAX_FILES_FETCHED_FOR_SNIPPETS = PAGING.default_top
 SNIPPET_READ_TAIL_MARGIN_CHARS = 4000
 SNIPPET_FETCH_WORKERS = 4
-
-SEARCH_INFO_CODES_DOCUMENTED_BY_MICROSOFT = {
-    1: "The organization is being reindexed, so results may be incomplete.",
-    2: "Code indexing has not started for this organization yet.",
-    3: "Azure DevOps rejected the query as invalid.",
-    4: "Prefix wildcard queries (a leading '*') are not supported.",
-    5: "Multi-word queries combined with code type filters are not supported.",
-    6: "The organization is being onboarded, so results may be incomplete.",
-    7: "The organization is being onboarded or reindexed, so results may be incomplete.",
-    8: f"'top' exceeded the service maximum of {MAX_SEARCH_TOP} and was trimmed.",
-    9: "Branches are still being indexed, so results may be incomplete.",
-    10: "Faceting is not enabled for this organization.",
-    19: "Phrase queries are not supported together with code type filters such as 'class:' or 'def:'.",
-    20: "Wildcard queries are not supported together with code type filters such as 'class:' or 'def:'.",
-}
-
-SEARCH_INFO_CODES_OBSERVED_IN_RESPONSES = {
-    15: "A filter value matched nothing in the index, most often a branch that is not listed under Searchable branches.",
-}
-
-SEARCH_INFO_CODES = {
-    **SEARCH_INFO_CODES_DOCUMENTED_BY_MICROSOFT,
-    **SEARCH_INFO_CODES_OBSERVED_IN_RESPONSES,
-}
-
-NO_RESULTS_HINT = (
-    "No matches. Azure DevOps only indexes the repository default branch unless extra "
-    "branches are added under Project Settings > Repositories > Options > Searchable "
-    "branches, and it never indexes forked repositories. Code type filters such as "
-    "'class:' or 'def:' only apply to C#, C, C++, Java and VB.NET files."
-)
 
 
 def _relabel_guidance_offset_limit(result: Any) -> Any:
@@ -387,12 +365,12 @@ class ArgsSchema(Enum):
         top=(
             Optional[int],
             Field(
-                default=DEFAULT_SEARCH_TOP,
+                default=PAGING.default_top,
                 ge=1,
-                le=MAX_SEARCH_TOP,
+                le=PAGING.max_top,
                 description=(
-                    f"Maximum number of files to return (default {DEFAULT_SEARCH_TOP}, "
-                    f"service maximum {MAX_SEARCH_TOP}). Keep this small - each result "
+                    f"Maximum number of files to return (default {PAGING.default_top}, "
+                    f"service maximum {PAGING.max_top}). Keep this small - each result "
                     "carries code snippets."
                 ),
             ),
@@ -402,10 +380,10 @@ class ArgsSchema(Enum):
             Field(
                 default=0,
                 ge=0,
-                le=MAX_SEARCH_SKIP,
+                le=PAGING.max_skip,
                 description=(
                     f"Number of files to skip for paging. Azure DevOps rejects values "
-                    f"above {MAX_SEARCH_SKIP}, which caps total reachable results."
+                    f"above {PAGING.max_skip}, which caps total reachable results."
                 ),
             ),
         ),
@@ -1499,12 +1477,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
     def _search_client(self):
         """Access to ADO Search client methods"""
         if self._search_client_instance is None:
-            token = self.token.get_secret_value() if isinstance(self.token, SecretStr) else self.token
-            connection_resolving_search_host = Connection(
-                base_url=self.organization_url,
-                creds=BasicAuthentication("", token),
-            )
-            self._search_client_instance = connection_resolving_search_host.clients_v7_1.get_search_client()
+            self._search_client_instance = create_search_client(self.organization_url, self.token)
         return self._search_client_instance
 
     def _read_file_prefix(self, commit_id: str, path: str, char_limit: int) -> Optional[str]:
@@ -1599,7 +1572,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             query: str,
             branch: Optional[str] = None,
             path: Optional[str] = None,
-            top: int = DEFAULT_SEARCH_TOP,
+            top: int = PAGING.default_top,
             skip: int = 0,
             include_snippets: bool = True,
     ) -> str:
@@ -1624,8 +1597,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
         if not query or not query.strip():
             return ToolException("Search query cannot be empty. Provide text to search for.")
 
-        top = max(1, min(top or DEFAULT_SEARCH_TOP, MAX_SEARCH_TOP))
-        skip = max(0, min(skip or 0, MAX_SEARCH_SKIP))
+        top = max(1, min(top or PAGING.default_top, PAGING.max_top))
+        skip = max(0, min(skip or 0, PAGING.max_skip))
 
         filters = {
             "Project": [self.project],
@@ -1697,24 +1670,35 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 entry["snippets"] = snippets
 
         returned = len(payload_results)
+        matches_beyond_this_window = total_count > skip + top
+        next_skip = skip + top
+        paging_ceiling_reached = next_skip > PAGING.max_skip
         payload = {
             "total_count": total_count,
             "returned": returned,
             "skip": skip,
-            "truncated": total_count > skip + returned,
+            "truncated": matches_beyond_this_window,
             "results": payload_results,
         }
-        if payload["truncated"]:
-            next_skip = skip + returned
-            payload["next_skip"] = next_skip if next_skip <= MAX_SEARCH_SKIP else None
+        if matches_beyond_this_window and returned and not paging_ceiling_reached:
+            payload["next_skip"] = next_skip
 
         warnings = []
         if response.info_code:
-            warnings.append(SEARCH_INFO_CODES.get(
-                response.info_code, f"Azure DevOps returned info code {response.info_code}."
-            ))
+            warnings.append(describe_search_info_code(response.info_code, SEARCH_HINTS))
+        if matches_beyond_this_window and paging_ceiling_reached:
+            warnings.append(
+                f"The paging limit of {PAGING.max_skip} results has been reached; refine the "
+                "query to reach the remaining matches."
+            )
         if not returned:
-            warnings.append(NO_RESULTS_HINT)
+            warnings.append(
+                "No matches. Azure DevOps only indexes the repository default branch unless "
+                "extra branches are added under Project Settings > Repositories > Options > "
+                "Searchable branches, and it never indexes forked repositories. Code type "
+                "filters such as 'class:' or 'def:' only apply to C#, C, C++, Java and VB.NET "
+                "files."
+            )
         if results_denied_snippets_by_budget:
             warnings.append(
                 f"Snippets were resolved for the first {MAX_FILES_FETCHED_FOR_SNIPPETS} files; "
