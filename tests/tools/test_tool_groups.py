@@ -45,8 +45,48 @@ def test_bare_string_declaration_is_rejected():
         class ToolGroups:
             read = "get_thing"
 
-    with pytest.raises(ValueError, match="must be a list of tool names"):
+    with pytest.raises(ValueError, match="must be a collection of tool names"):
         resolve_declared_groups(Producer)
+
+
+def test_non_string_entry_is_rejected():
+    class Producer:
+        class ToolGroups:
+            read = [len]
+
+    with pytest.raises(ValueError, match="entries must be tool-name strings"):
+        resolve_declared_groups(Producer)
+
+
+def test_same_tool_in_two_groups_is_rejected():
+    class Producer:
+        class ToolGroups:
+            read = ["ambiguous_tool"]
+            write = ["ambiguous_tool"]
+
+    with pytest.raises(ValueError, match="'ambiguous_tool' in both"):
+        resolve_declared_groups(Producer)
+
+
+def test_set_declarations_are_accepted():
+    class Producer:
+        class ToolGroups:
+            read = {"get_thing"}
+
+    assert resolve_declared_groups(Producer)["get_thing"] == "read"
+
+
+def test_every_toolkit_schema_builds():
+    from elitea_sdk.tools import AVAILABLE_TOOLKITS
+
+    built = 0
+    for toolkit in AVAILABLE_TOOLKITS.values():
+        if not hasattr(toolkit, "toolkit_config_schema"):
+            continue
+        schema = toolkit.toolkit_config_schema().model_json_schema()
+        assert isinstance(schema, dict)
+        built += 1
+    assert built > 40, f"expected the full static toolkit registry, built only {built}"
 
 
 def get_selected_tools_schema():

@@ -17,6 +17,8 @@ unstamped so the UI can surface it instead of trusting a guess.
 """
 
 import functools
+from collections.abc import Iterable
+from types import MappingProxyType
 
 READ = "read"
 WRITE = "write"
@@ -27,6 +29,7 @@ GROUPS = (READ, WRITE, DELETE, EXECUTE)
 
 
 def _validate_declaration(klass, declaration) -> None:
+    seen = {}
     for attr, value in vars(declaration).items():
         if attr.startswith("__"):
             continue
@@ -34,14 +37,33 @@ def _validate_declaration(klass, declaration) -> None:
             raise ValueError(
                 f"{klass.__qualname__}.ToolGroups.{attr} is not a valid group; expected one of {GROUPS}"
             )
-        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
             raise ValueError(
-                f"{klass.__qualname__}.ToolGroups.{attr} must be a list of tool names, got {type(value).__name__}"
+                f"{klass.__qualname__}.ToolGroups.{attr} must be a collection of tool names, "
+                f"got {type(value).__name__}"
             )
+        for tool_name in value:
+            if not isinstance(tool_name, str):
+                raise ValueError(
+                    f"{klass.__qualname__}.ToolGroups.{attr} entries must be tool-name strings, "
+                    f"got {type(tool_name).__name__}"
+                )
+            if tool_name in seen:
+                raise ValueError(
+                    f"{klass.__qualname__}.ToolGroups lists '{tool_name}' in both "
+                    f"'{seen[tool_name]}' and '{attr}'"
+                )
+            seen[tool_name] = attr
 
 
-def resolve_declared_groups(cls) -> dict:
-    """Collect ToolGroups declarations along the class's MRO, subclass wins."""
+@functools.lru_cache(maxsize=None)
+def resolve_declared_groups(cls) -> MappingProxyType:
+    """Collect ToolGroups declarations along the class's MRO, subclass wins.
+
+    Cached per class — get_available_tools runs on every tool invocation, so
+    validation and the MRO walk happen once. The returned mapping is read-only
+    because it is shared between callers.
+    """
     declared = {}
     for klass in reversed(cls.__mro__):
         declaration = klass.__dict__.get("ToolGroups")
@@ -51,7 +73,7 @@ def resolve_declared_groups(cls) -> dict:
         for group in GROUPS:
             for tool_name in getattr(declaration, group, ()):
                 declared[tool_name] = group
-    return declared
+    return MappingProxyType(declared)
 
 
 def with_tool_groups(method):
