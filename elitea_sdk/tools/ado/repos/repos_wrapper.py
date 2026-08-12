@@ -31,7 +31,6 @@ from pydantic import Field, PrivateAttr, create_model, model_validator, SecretSt
 from ...elitea_base import BaseCodeToolApiWrapper
 from ..utils import (
     AdoSearchPaging,
-    SEARCH_INFO_CODES,
     SearchIndexHints,
     create_search_client,
     describe_search_info_code,
@@ -46,7 +45,7 @@ from ...utils.file_metadata import guard_text_read
 
 logger = logging.getLogger(__name__)
 
-PAGING = AdoSearchPaging(default_top=5, max_top=1000)
+PAGING = AdoSearchPaging(default_top=5, max_top=1000, max_skip=1000)
 
 SEARCH_HINTS = SearchIndexHints(
     filter_not_indexed="Only branches listed under Searchable branches are indexed; check the branch filter.",
@@ -1671,32 +1670,29 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 entry["snippets"] = snippets
 
         returned = len(payload_results)
-        matches_beyond_this_window = total_count > skip + top
-        next_skip = skip + top
-        paging_ceiling_reached = next_skip > PAGING.max_skip
-        reported_code = SEARCH_INFO_CODES.get(response.info_code)
-        matches_withheld_by_permissions = (
-            reported_code is not None and reported_code.matches_hidden_by_permissions
+        window = PAGING.describe_window(
+            skip=skip, top=top, total_count=total_count, returned=returned,
+            info_code=response.info_code,
         )
         payload = {
             "total_count": total_count,
             "returned": returned,
             "skip": skip,
-            "truncated": matches_beyond_this_window,
+            "truncated": window.truncated,
             "results": payload_results,
         }
-        if matches_beyond_this_window and returned and not paging_ceiling_reached:
-            payload["next_skip"] = next_skip
+        if window.next_skip is not None:
+            payload["next_skip"] = window.next_skip
 
         warnings = []
         if response.info_code:
             warnings.append(describe_search_info_code(response.info_code, SEARCH_HINTS))
-        if matches_beyond_this_window and paging_ceiling_reached:
+        if window.truncated and window.paging_ceiling_reached:
             warnings.append(
                 f"The paging limit of {PAGING.max_skip} results has been reached; refine the "
                 "query to reach the remaining matches."
             )
-        if not returned and matches_withheld_by_permissions:
+        if not returned and window.matches_withheld_by_permissions:
             warnings.append(
                 "No readable matches. Azure DevOps grants code read permission per repository "
                 "rather than per file or branch, and this search is scoped to a single "

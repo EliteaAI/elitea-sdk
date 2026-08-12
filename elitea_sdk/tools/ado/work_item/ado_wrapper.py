@@ -26,7 +26,6 @@ from pydantic.fields import Field
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import (
     AdoSearchPaging,
-    SEARCH_INFO_CODES,
     SearchIndexHints,
     create_search_client,
     describe_search_info_code,
@@ -72,7 +71,7 @@ class HighlightBudget:
     max_chars: int = 200
 
 
-PAGING = AdoSearchPaging(default_top=5, max_top=50)
+PAGING = AdoSearchPaging(default_top=5, max_top=50, max_skip=1000, empty_window_stride=50)
 HIGHLIGHTS = HighlightBudget()
 
 SEARCH_HINTS = SearchIndexHints(
@@ -663,27 +662,24 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             payload_results.append(entry)
 
         returned = len(payload_results)
-        matches_beyond_this_window = total_count > skip + top
-        next_skip = skip + (top if returned else max(top, PAGING.empty_window_stride))
-        paging_ceiling_reached = next_skip > PAGING.max_skip
-        reported_code = SEARCH_INFO_CODES.get(response.info_code)
-        window_worth_continuing_from = returned > 0 or (
-            reported_code is not None and reported_code.matches_hidden_by_permissions
+        window = PAGING.describe_window(
+            skip=skip, top=top, total_count=total_count, returned=returned,
+            info_code=response.info_code,
         )
         payload = {
             "total_count": total_count,
             "returned": returned,
             "skip": skip,
-            "truncated": matches_beyond_this_window,
+            "truncated": window.truncated,
             "results": payload_results,
         }
-        if matches_beyond_this_window and window_worth_continuing_from and not paging_ceiling_reached:
-            payload["next_skip"] = next_skip
+        if window.next_skip is not None:
+            payload["next_skip"] = window.next_skip
 
         warnings = []
         if response.info_code:
             warnings.append(describe_search_info_code(response.info_code, SEARCH_HINTS))
-        if matches_beyond_this_window and paging_ceiling_reached:
+        if window.truncated and window.paging_ceiling_reached:
             warnings.append(
                 f"The paging limit of {PAGING.max_skip} results has been reached; refine the "
                 "query to reach the remaining matches."

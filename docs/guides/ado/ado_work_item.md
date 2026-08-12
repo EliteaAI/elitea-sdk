@@ -90,7 +90,7 @@ Resolves to `top=5`, `skip=5`.
 |---|---|
 | Work items returned by default | 5 - independent of the toolkit's **Limit** setting, which applies to `search_work_items` |
 | `top` maximum | 50 - page with `skip` rather than raising it |
-| `skip` maximum | 1000 |
+| `skip` maximum | 1000 - a bound of this tool rather than a documented service limit, so matches ranked below it are unreachable here even if the index would serve them |
 | Matched-field highlights | off by default - set `include_highlights=true`; then the first 5 results that matched a field carry them, whatever `top` is |
 | Highlights per work item | up to 3 matched fields, the first excerpt from each |
 | Highlight size | HTML flattened to plain text, then truncated at 200 characters |
