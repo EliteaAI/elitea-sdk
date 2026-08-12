@@ -475,6 +475,14 @@ class EliteAClient:
                 if any(p in model_name_lower for p in _adaptive_only):
                     target_kwargs['thinking'] = {"type": "adaptive", "display": "summarized"}
                     target_kwargs['effort'] = effort
+                    # Adaptive thinking counts toward max_tokens just like
+                    # "enabled" thinking does. Without padding, a low/default
+                    # max_tokens (e.g. the 4000 auto-default) lets Anthropic
+                    # spend the entire budget on thinking and stop with
+                    # stop_reason="max_tokens" before emitting any text block,
+                    # producing a genuinely empty completion.
+                    budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
+                    target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
                 else:
                     target_kwargs['temperature'] = 1
                     budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
