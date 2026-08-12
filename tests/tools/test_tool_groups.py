@@ -77,15 +77,17 @@ def test_github_composed_sources_all_arrive_stamped():
     assert groups["delete_branch"] == "delete"
     assert groups["list_project_issues"] == "read"
     assert groups["generic_github_api_call"] == "execute"
+    assert groups["get_me"] == "read"
+    assert groups["apply_git_patch_from_file"] == "write"
 
 
-def test_unlisted_tools_stay_unresolved():
+def test_every_github_tool_is_classified():
     selected_tools = get_selected_tools_schema()
     unclassified = set(selected_tools["args_schemas"]) - set(selected_tools["tool_groups"])
-    assert unclassified == {"get_me", "apply_git_patch_from_file"}, (
-        "Every github tool must carry @tool_group on the method that implements it — "
-        "including overrides, which do not inherit the parent method's marker. "
-        "get_me and apply_git_patch_from_file are undecorated on purpose while prototyping."
+    assert not unclassified, (
+        f"Unclassified github tools: {sorted(unclassified)}. Every tool must carry @tool_group "
+        "on the method that implements it — including overrides, which do not inherit the "
+        "parent method's marker."
     )
 
 

@@ -596,6 +596,7 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain text
             return {"error": str(e), "message": f"Unable to retrieve diff between commits due to error: {str(e)}"}
         
+    @tool_group('write')
     def apply_git_patch_from_file(self, bucket_name: str, file_name: str, branch: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None) -> str:
         """Applies a git patch from a file stored in a specified bucket.
 
@@ -2216,6 +2217,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             raise ToolException(str(e))
 
+    @tool_group('read')
     def get_me(self) -> str:
         """
         Get details of the authenticated GitHub user.
