@@ -4,6 +4,7 @@ import re
 import threading
 import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Generator, Optional
@@ -13,6 +14,7 @@ from azure.devops.v7_1.core import CoreClient
 from azure.devops.v7_1.wiki import WikiClient
 from azure.devops.v7_1.work_item_tracking import TeamContext, Wiql, WorkItemTrackingClient
 from azure.devops.v7_1.work_item_tracking.models import CommentCreate
+from azure.devops.v7_1.search.models import WorkItemSearchRequest
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -22,6 +24,12 @@ from pydantic import model_validator
 from pydantic.fields import Field
 
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
+from ..utils import (
+    AdoSearchPaging,
+    SearchIndexHints,
+    create_search_client,
+    describe_search_info_code,
+)
 from ...utils import get_file_bytes_from_artifact, detect_mime_type
 from ...utils.content_parser import parse_file_content
 from ....runtime.langchain.document_loaders.EliteAImageLoader import EliteAImageLoader, MAX_IMAGE_READ_BYTES
@@ -56,6 +64,24 @@ _IMAGE_LIMIT_NOTE = "[image skipped: per-call image limit of {limit} reached]"
 _IMAGE_BUDGET_NOTE = "[image skipped: per-call download budget reached]"
 
 
+@dataclass(frozen=True)
+class HighlightBudget:
+    max_results: int = 5
+    max_per_result: int = 3
+    max_chars: int = 200
+
+
+PAGING = AdoSearchPaging(default_top=5, max_top=50, max_skip=1000, empty_window_stride=50)
+HIGHLIGHTS = HighlightBudget()
+
+SEARCH_HINTS = SearchIndexHints(
+    filter_not_indexed=(
+        "Check that the work item type, state, assignee or area path filtered on exists in "
+        "this project."
+    ),
+)
+
+
 class _ImageNote(str):
     """Failure/skip note from the image-describe pipeline. A distinct type, not text
     matching, so consumers that must drop notes (the indexer keeps them out of
@@ -76,6 +102,18 @@ ADOWorkItemsSearch = create_model(
     query=(str, Field(description="WIQL query for searching Azure DevOps work items")),
     limit=(Optional[int], Field(description="Number of items to return. IMPORTANT: Tool returns all items if limit=-1. If parameter is not provided then the value will be taken from tool configuration.", default=None)),
     fields=(Optional[list[str]], Field(description="Comma-separated list of requested fields", default=None))
+)
+
+ADOWorkItemsTextSearch = create_model(
+    "AzureDevOpsWorkItemsTextSearchModel",
+    query=(str, Field(description="Free text to search for: keywords, a quoted phrase, or a person's name. Matches work item title, description, acceptance criteria, tags, history and comments. This is not WIQL - do not pass a SELECT statement.")),
+    work_item_type=(Optional[List[str]], Field(default=None, description="Restrict to these work item types, exactly as named in Azure DevOps, e.g. ['Bug', 'User Story'].")),
+    state=(Optional[List[str]], Field(default=None, description="Restrict to these states, exactly as named in Azure DevOps, e.g. ['New', 'Active'].")),
+    assigned_to=(Optional[List[str]], Field(default=None, description="Restrict to these assignees, in the display-name-and-email form Azure DevOps stores, e.g. ['John Doe <jodoe@contoso.com>'].")),
+    area_path=(Optional[List[str]], Field(default=None, description="Restrict to these area paths, e.g. ['MyProject\\Backend'].")),
+    top=(Optional[int], Field(default=PAGING.default_top, ge=1, le=PAGING.max_top, description=f"Number of work items to return. Defaults to {PAGING.default_top}; maximum {PAGING.max_top}. Matched-field highlights are only attached to the first {HIGHLIGHTS.max_results} results, so refine the query rather than raising this.")),
+    skip=(Optional[int], Field(default=0, ge=0, le=PAGING.max_skip, description=f"Number of results to skip for paging. Maximum {PAGING.max_skip}. Pass back the next_skip value of a previous response whenever that response supplied one, including when it returned no results - but stop and refine the query once a second window in a row comes back empty, which means the token cannot read these matches.")),
+    include_highlights=(Optional[bool], Field(default=False, description="Return the matched field snippets that explain why each work item matched. Off by default, so a result set is titles and metadata only. Set true whenever relevance matters - free text also matches description, acceptance criteria, tags, history and comments, so a title alone often does not show why an item was returned.")),
 )
 
 ADOCreateWorkItem = create_model(
@@ -179,6 +217,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     _relation_types: Dict = PrivateAttr(default_factory=dict) # track actual relation types for instance
     _work_item_type_fields_cache: Dict[str, Dict] = PrivateAttr(default_factory=dict)  # Cache for work item type field definitions
     _image_cache: ImageDescriptionCache = PrivateAttr(default_factory=ImageDescriptionCache)
+    _search_client_instance: Optional[Any] = PrivateAttr(default=None)
 
     class Config:
         arbitrary_types_allowed = True  # Allow arbitrary types (e.g., WorkItemTrackingClient, WikiClient, CoreClient)
@@ -487,7 +526,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         return f"Work item {source_id} linked to {target_id} with link type {link_type}"
 
     def search_work_items(self, query: str, limit: int = None, fields=None):
-        """Search for work items using a WIQL query and dynamically fetch fields based on the query."""
+        """Search for work items with a WIQL query (SELECT ... FROM WorkItems WHERE ...) and dynamically fetch fields based on the query. Requires a valid WIQL statement, not free text - for keyword or phrase search use search_work_items_by_text."""
         try:
             # Create a Wiql object with the query
             wiql = Wiql(query=query)
@@ -515,6 +554,159 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             logger.error(f"Error searching work items: {e}")
             return ToolException(f"Error searching work items: {e}")
+
+    @property
+    def _search_client(self):
+        if self._search_client_instance is None:
+            self._search_client_instance = create_search_client(self.organization_url, self.token)
+        return self._search_client_instance
+
+    def search_work_items_by_text(
+            self,
+            query: str,
+            work_item_type: Optional[List[str]] = None,
+            state: Optional[List[str]] = None,
+            assigned_to: Optional[List[str]] = None,
+            area_path: Optional[List[str]] = None,
+            top: Optional[int] = PAGING.default_top,
+            skip: Optional[int] = 0,
+            include_highlights: Optional[bool] = False,
+    ) -> str:
+        """
+        Search work items in this project by free text, ranked by relevance.
+
+        Use for keywords, a phrase or a person's name. For a structured query over fields,
+        dates or links use search_work_items, which takes WIQL.
+
+        Returns one summary per work item - never the full body - so follow up with
+        get_work_item to read one. Set include_highlights to see which field matched. Pass
+        next_skip back as skip while a response supplies one, stopping after two empty
+        windows in a row.
+
+        Returns:
+            str: JSON with total_count, returned, skip, truncated, next_skip, results and
+            warnings.
+        """
+        if not query or not query.strip():
+            return ToolException("Search query cannot be empty. Provide text to search for.")
+
+        top = max(1, min(top or PAGING.default_top, PAGING.max_top))
+        skip = max(0, min(skip or 0, PAGING.max_skip))
+        include_highlights = bool(include_highlights)
+
+        filters = {"System.TeamProject": [self.project]}
+        for field_reference_name, requested_values in (
+            ("System.WorkItemType", work_item_type),
+            ("System.State", state),
+            ("System.AssignedTo", assigned_to),
+            ("System.AreaPath", area_path),
+        ):
+            if requested_values:
+                filters[field_reference_name] = (
+                    [requested_values] if isinstance(requested_values, str) else list(requested_values)
+                )
+
+        try:
+            response = self._search_client.fetch_work_item_search_results(
+                request=WorkItemSearchRequest(
+                    search_text=query,
+                    filters=filters,
+                    top=top,
+                    skip=skip,
+                ),
+                project=self.project,
+            )
+        except Exception as e:
+            msg = f"Unable to search work items for query '{query}': {str(e)}"
+            logger.error(msg)
+            return ToolException(
+                f"{msg}\nWork item search requires at least Basic access and a token with the "
+                "Work Items (read) scope. On Azure DevOps Server it also requires the Search "
+                "extension to be installed."
+            )
+
+        results = response.results or []
+        total_count = response.count or 0
+        payload_results = []
+        results_denied_highlights_by_budget = 0
+        results_carrying_highlights = 0
+        for result in results:
+            fields_by_lowercased_name = {key.lower(): value for key, value in (result.fields or {}).items()}
+            work_item_id = fields_by_lowercased_name.get("system.id")
+            entry = {
+                "id": int(work_item_id) if str(work_item_id).isdigit() else work_item_id,
+                "title": fields_by_lowercased_name.get("system.title"),
+                "type": fields_by_lowercased_name.get("system.workitemtype"),
+                "state": fields_by_lowercased_name.get("system.state"),
+                "project": result.project.name if result.project else self.project,
+                "url": f"{self.organization_url}/_workitems/edit/{work_item_id}" if work_item_id else result.url,
+            }
+            assignee = fields_by_lowercased_name.get("system.assignedto")
+            if assignee:
+                entry["assigned_to"] = assignee
+            if include_highlights:
+                hits_carrying_highlights = [hit for hit in (result.hits or []) if hit.highlights]
+                highlights_fit_in_budget = results_carrying_highlights < HIGHLIGHTS.max_results
+                if hits_carrying_highlights and highlights_fit_in_budget:
+                    entry["highlights"] = [
+                        {
+                            "field": hit.field_reference_name,
+                            "text": BeautifulSoup(hit.highlights[0], "html.parser")
+                            .get_text(" ", strip=True)[:HIGHLIGHTS.max_chars],
+                        }
+                        for hit in hits_carrying_highlights[:HIGHLIGHTS.max_per_result]
+                    ]
+                    results_carrying_highlights += 1
+                elif hits_carrying_highlights:
+                    results_denied_highlights_by_budget += 1
+            payload_results.append(entry)
+
+        returned = len(payload_results)
+        window = PAGING.describe_window(
+            skip=skip, top=top, total_count=total_count, returned=returned,
+            info_code=response.info_code,
+        )
+        payload = {
+            "total_count": total_count,
+            "returned": returned,
+            "skip": skip,
+            "truncated": window.truncated,
+            "results": payload_results,
+        }
+        if window.next_skip is not None:
+            payload["next_skip"] = window.next_skip
+
+        warnings = []
+        if response.info_code:
+            warnings.append(describe_search_info_code(response.info_code, SEARCH_HINTS))
+        if window.truncated and window.paging_ceiling_reached:
+            warnings.append(
+                f"The paging limit of {PAGING.max_skip} results has been reached; refine the "
+                "query to reach the remaining matches."
+            )
+        if not returned:
+            warnings.append(
+                "No matches in this window. Work item search covers the configured project and "
+                "indexes title, description, acceptance criteria, tags, history and comments - it "
+                "does not read attachment contents. Filter values must match Azure DevOps exactly, "
+                "for example a work item type of 'User Story' rather than 'story'. If a total_count "
+                "above zero is reported with no results, the matches in this window are either not "
+                "readable with the current token or already past the result set - continue with "
+                "next_skip once, and refine the query when it does not come back or when a second "
+                "window in a row comes back empty, which means the token cannot read these "
+                "matches. Newly created or edited items can take a few minutes to appear in the "
+                "index."
+            )
+        if results_denied_highlights_by_budget:
+            warnings.append(
+                f"Highlights were attached to the first {HIGHLIGHTS.max_results} result(s); "
+                f"{results_denied_highlights_by_budget} further result(s) list metadata alone. "
+                "Lower top or refine the query to see why they matched."
+            )
+        if warnings:
+            payload["warnings"] = warnings
+
+        return json.dumps(payload)
 
     def _extract_attachment_ref(self, attachment_url):
         parsed = urllib.parse.urlparse(attachment_url)
@@ -1469,6 +1661,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 "description": self.search_work_items.__doc__,
                 "args_schema": ADOWorkItemsSearch,
                 "ref": self.search_work_items,
+            },
+            {
+                "name": "search_work_items_by_text",
+                "description": self.search_work_items_by_text.__doc__,
+                "args_schema": ADOWorkItemsTextSearch,
+                "ref": self.search_work_items_by_text,
             },
             {
                 "name": "create_work_item",

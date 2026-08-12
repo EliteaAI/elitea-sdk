@@ -17,10 +17,8 @@ import pytest
 from langchain_core.tools import ToolException
 
 from elitea_sdk.tools.ado.repos.repos_wrapper import (
-    DEFAULT_SEARCH_TOP,
     MAX_FILES_FETCHED_FOR_SNIPPETS,
-    MAX_SEARCH_SKIP,
-    MAX_SEARCH_TOP,
+    PAGING,
     ReposApiWrapper,
 )
 
@@ -141,9 +139,9 @@ def test_branch_and_path_filters_are_opt_in():
 @pytest.mark.parametrize(
     "top,skip,expected_top,expected_skip",
     [
-        (10_000, 5_000, MAX_SEARCH_TOP, MAX_SEARCH_SKIP),
-        (None, -5, DEFAULT_SEARCH_TOP, 0),
-        (0, None, DEFAULT_SEARCH_TOP, 0),
+        (10_000, 5_000, PAGING.max_top, PAGING.max_skip),
+        (None, -5, PAGING.default_top, 0),
+        (0, None, PAGING.default_top, 0),
     ],
 )
 def test_top_and_skip_are_clamped_to_service_limits(top, skip, expected_top, expected_skip):
@@ -178,14 +176,36 @@ def test_last_page_is_not_marked_truncated():
     assert "next_skip" not in payload
 
 
-def test_next_skip_is_null_past_the_paging_ceiling():
+def test_next_skip_is_withheld_past_the_paging_ceiling():
     results = [FakeResult(path=f"/f{i}.py") for i in range(5)]
     wrapper = _make_ado(FakeResponse(results=results, count=100_000))
 
-    payload = json.loads(wrapper.search_code("q", skip=MAX_SEARCH_SKIP, include_snippets=False))
+    payload = json.loads(wrapper.search_code("q", skip=PAGING.max_skip, include_snippets=False))
 
     assert payload["truncated"] is True
-    assert payload["next_skip"] is None
+    assert "next_skip" not in payload
+    assert any("paging limit" in warning for warning in payload["warnings"])
+
+
+def test_an_empty_window_ends_paging():
+    wrapper = _make_ado(FakeResponse(results=[], count=500))
+
+    payload = json.loads(wrapper.search_code("q", top=10, skip=100, include_snippets=False))
+
+    assert payload["returned"] == 0
+    assert payload["truncated"] is True
+    assert "next_skip" not in payload
+
+
+def test_a_partial_final_page_reports_no_further_window():
+    results = [FakeResult(path=f"/f{i}.py") for i in range(3)]
+    wrapper = _make_ado(FakeResponse(results=results, count=13))
+
+    payload = json.loads(wrapper.search_code("q", top=5, skip=10, include_snippets=False))
+
+    assert payload["returned"] == 3
+    assert payload["truncated"] is False
+    assert "next_skip" not in payload
 
 
 def test_results_carry_metadata_and_never_full_bodies():
@@ -214,10 +234,12 @@ def test_info_code_surfaces_as_warning():
     assert any("Branches are still being indexed" in w for w in payload["warnings"])
 
 
-def test_unindexed_branch_filter_info_code_is_explained():
-    wrapper = _make_ado(FakeResponse(results=[], count=0, info_code=15))
+def test_unindexed_filter_info_code_is_explained():
+    wrapper = _make_ado(FakeResponse(results=[FakeResult()], count=1, info_code=15))
 
-    payload = json.loads(wrapper.search_code("q", branch="feature/never-indexed"))
+    payload = json.loads(
+        wrapper.search_code("q", branch="feature/never-indexed", include_snippets=False)
+    )
 
     assert any("Searchable branches" in w for w in payload["warnings"])
     assert not any("info code 15" in w for w in payload["warnings"])
@@ -238,6 +260,16 @@ def test_empty_results_explain_indexing_coverage():
 
     assert payload["results"] == []
     assert any("Searchable branches" in w for w in payload["warnings"])
+
+
+def test_permission_trimmed_window_is_not_blamed_on_branch_indexing():
+    wrapper = _make_ado(FakeResponse(results=[], count=500, info_code=11))
+
+    payload = json.loads(wrapper.search_code("q", include_snippets=False))
+
+    assert payload["returned"] == 0
+    assert not any("Searchable branches" in w for w in payload["warnings"])
+    assert any("read permission per repository" in w for w in payload["warnings"])
 
 
 def test_snippets_reconstructed_from_char_offsets():
