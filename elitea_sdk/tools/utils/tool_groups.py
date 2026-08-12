@@ -18,7 +18,6 @@ unstamped so the UI can surface it instead of trusting a guess.
 
 import functools
 from collections.abc import Collection
-from types import MappingProxyType
 
 READ = "read"
 WRITE = "write"
@@ -59,14 +58,8 @@ def _validate_declaration(klass, declaration) -> None:
             seen[tool_name] = attr
 
 
-@functools.lru_cache(maxsize=None)
-def resolve_declared_groups(cls) -> MappingProxyType:
-    """Collect ToolGroups declarations along the class's MRO, subclass wins.
-
-    Cached per class — get_available_tools runs on every tool invocation, so
-    validation and the MRO walk happen once. The returned mapping is read-only
-    because it is shared between callers.
-    """
+def resolve_declared_groups(cls) -> dict:
+    """Collect ToolGroups declarations along the class's MRO, subclass wins."""
     declared = {}
     for klass in reversed(cls.__mro__):
         declaration = klass.__dict__.get("ToolGroups")
@@ -76,7 +69,7 @@ def resolve_declared_groups(cls) -> MappingProxyType:
         for group in GROUPS:
             for tool_name in getattr(declaration, group, ()):
                 declared[tool_name] = group
-    return MappingProxyType(declared)
+    return declared
 
 
 def with_tool_groups(method):
