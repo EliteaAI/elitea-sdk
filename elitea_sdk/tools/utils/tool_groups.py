@@ -16,12 +16,28 @@ Groups follow the safety rollup: `read` is read-only; `write`, `delete` and
 unstamped so the UI can surface it instead of trusting a guess.
 """
 
+import functools
+
 READ = "read"
 WRITE = "write"
 DELETE = "delete"
 EXECUTE = "execute"
 
 GROUPS = (READ, WRITE, DELETE, EXECUTE)
+
+
+def _validate_declaration(klass, declaration) -> None:
+    for attr, value in vars(declaration).items():
+        if attr.startswith("__"):
+            continue
+        if attr not in GROUPS:
+            raise ValueError(
+                f"{klass.__qualname__}.ToolGroups.{attr} is not a valid group; expected one of {GROUPS}"
+            )
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"{klass.__qualname__}.ToolGroups.{attr} must be a list of tool names, got {type(value).__name__}"
+            )
 
 
 def resolve_declared_groups(cls) -> dict:
@@ -31,6 +47,7 @@ def resolve_declared_groups(cls) -> dict:
         declaration = klass.__dict__.get("ToolGroups")
         if declaration is None:
             continue
+        _validate_declaration(klass, declaration)
         for group in GROUPS:
             for tool_name in getattr(declaration, group, ()):
                 declared[tool_name] = group
@@ -45,6 +62,7 @@ def with_tool_groups(method):
     aggregation point needs to know how the list was assembled. An already
     stamped dict is never overwritten.
     """
+    @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         tools = method(self, *args, **kwargs)
         declared = resolve_declared_groups(type(self))

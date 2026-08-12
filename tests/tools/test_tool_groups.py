@@ -1,5 +1,7 @@
+import pytest
+
 from elitea_sdk.tools.github import EliteAGitHubToolkit
-from elitea_sdk.tools.utils.tool_groups import GROUPS, with_tool_groups
+from elitea_sdk.tools.utils.tool_groups import GROUPS, resolve_declared_groups, with_tool_groups
 
 
 class FakeProducer:
@@ -29,6 +31,24 @@ def test_stamping_never_guesses_and_never_overwrites():
     assert tools["delete_thing"]["group"] == "read"
 
 
+def test_misspelled_group_attribute_is_rejected():
+    class Producer:
+        class ToolGroups:
+            reed = ["get_thing"]
+
+    with pytest.raises(ValueError, match="reed is not a valid group"):
+        resolve_declared_groups(Producer)
+
+
+def test_bare_string_declaration_is_rejected():
+    class Producer:
+        class ToolGroups:
+            read = "get_thing"
+
+    with pytest.raises(ValueError, match="must be a list of tool names"):
+        resolve_declared_groups(Producer)
+
+
 def get_selected_tools_schema():
     schema = EliteAGitHubToolkit.toolkit_config_schema().model_json_schema()
     return schema["properties"]["selected_tools"]
@@ -54,4 +74,8 @@ def test_github_composed_sources_all_arrive_stamped():
 def test_unlisted_tools_stay_unresolved():
     selected_tools = get_selected_tools_schema()
     unclassified = set(selected_tools["args_schemas"]) - set(selected_tools["tool_groups"])
-    assert unclassified == {"get_me", "apply_git_patch_from_file"}
+    assert unclassified == {"get_me", "apply_git_patch_from_file"}, (
+        "Every github tool must be classified in the ToolGroups declaration of the class "
+        "that declares it (GitHubClient / GraphQLClientWrapper / the indexer base). "
+        "get_me and apply_git_patch_from_file are unlisted on purpose while prototyping."
+    )
