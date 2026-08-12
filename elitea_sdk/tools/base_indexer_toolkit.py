@@ -20,6 +20,7 @@ from .index_params import (
     build_base_stepback_search_params,
 )
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
+from .utils.tool_groups import with_tool_groups
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
 from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
@@ -254,6 +255,11 @@ BaseStepbackSearchParams = build_base_stepback_search_params(cut_off_default=DEF
 
 class BaseIndexerToolkit(VectorStoreWrapperBase):
     """Base class for tool API wrappers that support vector store functionality."""
+
+    class ToolGroups:
+        read = ["list_indexes", "search_index", "stepback_search_index", "stepback_summary_index"]
+        write = ["index_data"]
+        delete = ["remove_index"]
 
     doctype: str = "document"
 
@@ -1504,6 +1510,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         except Exception as e:
             logger.warning(f"Failed to emit index_data_removed event: {e}")
 
+    @with_tool_groups
     def get_available_tools(self, filter_by_collections: bool = False):
         """
         Returns the standardized vector search tools.

@@ -15,6 +15,7 @@ from github.Consts import DEFAULT_BASE_URL
 from langchain_core.tools import ToolException
 
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
+from ..utils.tool_groups import with_tool_groups
 from ..utils import normalize_pem_key
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
@@ -84,6 +85,24 @@ from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION
 
 class GitHubClient(BaseModel):
     """Client for interacting with the GitHub REST API."""
+
+    # get_me and apply_git_patch_from_file are intentionally unlisted while
+    # prototyping, to exercise the unclassified-tool path end to end
+    class ToolGroups:
+        read = [
+            "get_issues", "get_issue", "list_open_pull_requests", "get_pull_request",
+            "list_pull_request_diffs", "read_file", "list_files_in_main_branch",
+            "list_files_in_bot_branch", "list_branches_in_repo", "get_files_from_directory",
+            "search_issues", "get_commits", "get_commit_changes", "get_commits_diff",
+            "get_workflow_status", "get_workflow_logs", "search_code",
+        ]
+        write = [
+            "comment_on_issue", "create_pull_request", "create_file", "update_file",
+            "set_active_branch", "create_branch", "create_issue", "update_issue",
+            "apply_git_patch",
+        ]
+        delete = ["delete_file", "delete_branch"]
+        execute = ["trigger_workflow", "generic_github_api_call"]
 
     # Config for Pydantic model
     class Config:
@@ -2386,6 +2405,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             raise ToolException(f"Failed to search code: {str(e)}")
 
+    @with_tool_groups
     @extend_with_file_operations
     def get_available_tools(self) -> List[Dict[str, Any]]:
         return [

@@ -5,6 +5,8 @@ from dateutil import parser
 from langchain_core.tools import ToolException
 from pydantic import BaseModel, Field, model_validator
 
+from ..utils.tool_groups import with_tool_groups
+
 # Remove the import of GraphQLClient
 # from .graphql_github import GraphQLClient
 
@@ -34,6 +36,10 @@ class GraphQLClientWrapper(BaseModel):
     """
     Wrapper for interacting with GitHub's GraphQL API.
     """
+    class ToolGroups:
+        read = ["list_project_issues", "search_project_issues"]
+        write = ["create_issue_on_project", "update_issue_on_project"]
+
     # Config for Pydantic model
     class Config:
         arbitrary_types_allowed = True
@@ -1782,6 +1788,7 @@ class GraphQLClientWrapper(BaseModel):
         
         return formatted_items
     
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

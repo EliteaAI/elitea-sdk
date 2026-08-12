@@ -1073,21 +1073,24 @@ def extend_with_file_operations(method):
                     "mode": "read_multiple_files",
                     "ref": self.read_multiple_files,
                     "description": self.read_multiple_files.__doc__,
-                    "args_schema": custom_schemas.get("read_multiple_files", elitea_base.ReadMultipleFilesInput)
+                    "args_schema": custom_schemas.get("read_multiple_files", elitea_base.ReadMultipleFilesInput),
+                    "group": "read"
                 },
                 {
                     "name": "grep_file",
                     "mode": "grep_file",
                     "ref": self.search_file,  # internal method name unchanged for compatibility
                     "description": "Search for text/pattern WITHIN a specific file's content (like grep/ripgrep). Use this to find function definitions, imports, TODOs, or any text pattern inside a file you've already identified. NOT for finding files by name - use list_files_in_main_branch for that.",
-                    "args_schema": custom_schemas.get("grep_file", elitea_base.GrepFileInput)
+                    "args_schema": custom_schemas.get("grep_file", elitea_base.GrepFileInput),
+                    "group": "read"
                 },
                 {
                     "name": "edit_file",
                     "mode": "edit_file",
                     "ref": self.edit_file,
                     "description": self.edit_file.__doc__,
-                    "args_schema": custom_schemas.get("edit_file", elitea_base.EditFileInput)
+                    "args_schema": custom_schemas.get("edit_file", elitea_base.EditFileInput),
+                    "group": "write"
                 },
             ]
 
