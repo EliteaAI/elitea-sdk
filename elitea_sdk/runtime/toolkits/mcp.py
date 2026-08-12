@@ -435,7 +435,21 @@ class McpToolkit(BaseToolkit):
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(_run_in_new_loop)
-                    all_tools, server_session_id = future.result()
+                    # Backstop: the async layer bounds itself (session read timeout +
+                    # wait_for on connect), so the worker thread should finish within
+                    # `timeout`. Give the sync caller a slightly larger bound so it can
+                    # never block forever if the async bounds are somehow bypassed.
+                    try:
+                        all_tools, server_session_id = future.result(timeout=timeout + 30)
+                    except concurrent.futures.TimeoutError as e:
+                        logger.error(
+                            f"[MCP] Discovery for '{toolkit_name}' exceeded "
+                            f"{timeout + 30}s hard limit - abandoning worker thread"
+                        )
+                        raise TimeoutError(
+                            f"MCP tool discovery for '{toolkit_name}' timed out after "
+                            f"{timeout + 30}s."
+                        ) from e
             else:
                 all_tools, server_session_id = asyncio.run(
                     cls._discover_tools_async(
