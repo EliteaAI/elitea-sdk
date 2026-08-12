@@ -262,6 +262,16 @@ def test_empty_results_explain_indexing_coverage():
     assert any("Searchable branches" in w for w in payload["warnings"])
 
 
+def test_permission_trimmed_window_is_not_blamed_on_branch_indexing():
+    wrapper = _make_ado(FakeResponse(results=[], count=500, info_code=11))
+
+    payload = json.loads(wrapper.search_code("q", include_snippets=False))
+
+    assert payload["returned"] == 0
+    assert not any("Searchable branches" in w for w in payload["warnings"])
+    assert any("read permission per repository" in w for w in payload["warnings"])
+
+
 def test_snippets_reconstructed_from_char_offsets():
     content = "\n".join(f"line{i}" for i in range(1, 11))
     offset_of_line_5 = sum(len(f"line{i}\n") for i in range(1, 5))

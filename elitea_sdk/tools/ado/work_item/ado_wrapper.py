@@ -82,6 +82,7 @@ SEARCH_HINTS = SearchIndexHints(
     ),
 )
 
+
 class _ImageNote(str):
     """Failure/skip note from the image-describe pipeline. A distinct type, not text
     matching, so consumers that must drop notes (the indexer keeps them out of

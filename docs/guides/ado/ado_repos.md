@@ -114,9 +114,17 @@ result whose match is on the file name rather than its content has `match_count:
 The response reports `total_count` (all matched files), `returned`, `skip`, a `truncated`
 flag and `next_skip` when more results remain. `next_skip` is `skip` plus the `top` you
 asked for, so it strictly increases; it is withheld once the next window would pass the
-`skip` ceiling of 1000. A window that comes back empty ends paging - no `next_skip` is
-supplied even when `total_count` is higher, because the remaining matches are not readable
-with this token. Stop as soon as `next_skip` is absent and refine the query instead.
+`skip` ceiling of 1000. Stop as soon as `next_skip` is absent and refine the query instead.
+
+A window that comes back empty ends paging - no `next_skip` is supplied even when
+`total_count` is higher. Azure DevOps counts every match and then removes the ones the
+token cannot read, reporting info code 11 in `warnings` when it does. For code search that
+removal is all-or-nothing: read permission on code is granted per repository, not per file
+or branch, and this search is scoped to a single repository, so a token that cannot read
+one match cannot read any of them. Paging further would only walk to the `skip` ceiling
+for nothing. `search_work_items_by_text` behaves differently and keeps paging on the same
+info code, because work item permissions are per area path and leave readable matches
+further down the ranking.
 
 #### Recommended usage
 

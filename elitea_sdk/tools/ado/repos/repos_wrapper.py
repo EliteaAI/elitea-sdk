@@ -31,6 +31,7 @@ from pydantic import Field, PrivateAttr, create_model, model_validator, SecretSt
 from ...elitea_base import BaseCodeToolApiWrapper
 from ..utils import (
     AdoSearchPaging,
+    SEARCH_INFO_CODES,
     SearchIndexHints,
     create_search_client,
     describe_search_info_code,
@@ -1673,6 +1674,10 @@ class ReposApiWrapper(CodeIndexerToolkit):
         matches_beyond_this_window = total_count > skip + top
         next_skip = skip + top
         paging_ceiling_reached = next_skip > PAGING.max_skip
+        reported_code = SEARCH_INFO_CODES.get(response.info_code)
+        matches_withheld_by_permissions = (
+            reported_code is not None and reported_code.matches_hidden_by_permissions
+        )
         payload = {
             "total_count": total_count,
             "returned": returned,
@@ -1691,7 +1696,14 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 f"The paging limit of {PAGING.max_skip} results has been reached; refine the "
                 "query to reach the remaining matches."
             )
-        if not returned:
+        if not returned and matches_withheld_by_permissions:
+            warnings.append(
+                "No readable matches. Azure DevOps grants code read permission per repository "
+                "rather than per file or branch, and this search is scoped to a single "
+                "repository, so the current token can reach none of the counted matches. Paging "
+                "further will not surface them; use a token that can read this repository."
+            )
+        elif not returned:
             warnings.append(
                 "No matches. Azure DevOps only indexes the repository default branch unless "
                 "extra branches are added under Project Settings > Repositories > Options > "
