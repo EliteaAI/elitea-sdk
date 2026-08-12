@@ -17,6 +17,7 @@ from .index_params import (
     build_base_search_params,
     build_base_stepback_search_params,
 )
+from .utils.tool_groups import tool_group
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.utils.utils import IndexerKeywords
 
@@ -649,6 +650,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         # (toolkit's _read_file will return full content if it ignores offset/limit)
         return apply_line_slice(content, offset=offset, limit=limit)
     
+    @tool_group('read')
     def read_multiple_files(
         self,
         file_paths: List[str],
@@ -685,6 +687,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         return results
     
+    @tool_group('read')
     def search_file(
         self,
         file_path: str,
@@ -741,6 +744,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         return "\n".join(result_lines)
 
+    @tool_group('write')
     def edit_file(
         self,
         file_path: str,
@@ -1073,24 +1077,21 @@ def extend_with_file_operations(method):
                     "mode": "read_multiple_files",
                     "ref": self.read_multiple_files,
                     "description": self.read_multiple_files.__doc__,
-                    "args_schema": custom_schemas.get("read_multiple_files", elitea_base.ReadMultipleFilesInput),
-                    "group": "read"
+                    "args_schema": custom_schemas.get("read_multiple_files", elitea_base.ReadMultipleFilesInput)
                 },
                 {
                     "name": "grep_file",
                     "mode": "grep_file",
                     "ref": self.search_file,  # internal method name unchanged for compatibility
                     "description": "Search for text/pattern WITHIN a specific file's content (like grep/ripgrep). Use this to find function definitions, imports, TODOs, or any text pattern inside a file you've already identified. NOT for finding files by name - use list_files_in_main_branch for that.",
-                    "args_schema": custom_schemas.get("grep_file", elitea_base.GrepFileInput),
-                    "group": "read"
+                    "args_schema": custom_schemas.get("grep_file", elitea_base.GrepFileInput)
                 },
                 {
                     "name": "edit_file",
                     "mode": "edit_file",
                     "ref": self.edit_file,
                     "description": self.edit_file.__doc__,
-                    "args_schema": custom_schemas.get("edit_file", elitea_base.EditFileInput),
-                    "group": "write"
+                    "args_schema": custom_schemas.get("edit_file", elitea_base.EditFileInput)
                 },
             ]
 

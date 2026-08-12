@@ -20,7 +20,7 @@ from .index_params import (
     build_base_stepback_search_params,
 )
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
-from .utils.tool_groups import with_tool_groups
+from .utils.tool_groups import tool_group, with_tool_groups
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
 from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
@@ -256,11 +256,6 @@ BaseStepbackSearchParams = build_base_stepback_search_params(cut_off_default=DEF
 class BaseIndexerToolkit(VectorStoreWrapperBase):
     """Base class for tool API wrappers that support vector store functionality."""
 
-    class ToolGroups:
-        read = ["list_indexes", "search_index", "stepback_search_index", "stepback_summary_index"]
-        write = ["index_data"]
-        delete = ["remove_index"]
-
     doctype: str = "document"
 
     connection_string: Optional[SecretStr] = None
@@ -324,6 +319,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             Document: The processed document with metadata."""
         yield from ()
 
+    @tool_group('write')
     def index_data(self, **kwargs):
         index_name = kwargs.get("index_name")
         # Reject empty/None index_name early — otherwise it gets formatted into the
@@ -967,10 +963,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def remove_ids_fn(self, idx_data, key: str):
         raise NotImplementedError("Subclasses must implement this method")
 
+    @tool_group('read')
     def list_indexes(self):
         """Lists all indexes in the vector store."""
         return super().list_collections()
 
+    @tool_group('delete')
     def remove_index(self, index_name: str = ""):
         """Cleans the indexed data in the collection."""
         deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
@@ -1010,6 +1008,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             ]}
         return filter
 
+    @tool_group('read')
     def search_index(self,
                      query: str,
                      index_name: str = "",
@@ -1144,6 +1143,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         return filtered_docs
 
+    @tool_group('read')
     def stepback_search_index(self,
                      query: str,
                      messages: List[Dict[str, Any]] = [],
@@ -1169,6 +1169,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         )
         return f"Found {len(found_docs)} documents matching the query\n{json.dumps(found_docs, indent=4)}" if found_docs else "No documents found matching the query."
 
+    @tool_group('read')
     def stepback_summary_index(self,
                      query: str,
                      messages: List[Dict[str, Any]] = [],

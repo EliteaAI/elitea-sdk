@@ -15,7 +15,7 @@ from github.Consts import DEFAULT_BASE_URL
 from langchain_core.tools import ToolException
 
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
-from ..utils.tool_groups import with_tool_groups
+from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils import normalize_pem_key
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
@@ -88,22 +88,6 @@ class GitHubClient(BaseModel):
 
     # get_me and apply_git_patch_from_file are intentionally unlisted while
     # prototyping, to exercise the unclassified-tool path end to end
-    class ToolGroups:
-        read = [
-            "get_issues", "get_issue", "list_open_pull_requests", "get_pull_request",
-            "list_pull_request_diffs", "read_file", "list_files_in_main_branch",
-            "list_files_in_bot_branch", "list_branches_in_repo", "get_files_from_directory",
-            "search_issues", "get_commits", "get_commit_changes", "get_commits_diff",
-            "get_workflow_status", "get_workflow_logs", "search_code",
-        ]
-        write = [
-            "comment_on_issue", "create_pull_request", "create_file", "update_file",
-            "set_active_branch", "create_branch", "create_issue", "update_issue",
-            "apply_git_patch",
-        ]
-        delete = ["delete_file", "delete_branch"]
-        execute = ["trigger_workflow", "generic_github_api_call"]
-
     # Config for Pydantic model
     class Config:
         arbitrary_types_allowed = True
@@ -308,6 +292,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Error fetching files: {str(e)}"
 
+    @tool_group('read')
     def get_files_from_directory(self, directory_path: str, repo_name: Optional[str] = None) -> str:
         """
         Recursively fetches files from a directory in the repo.
@@ -321,6 +306,7 @@ class GitHubClient(BaseModel):
         """
         return self._get_files(directory_path, self.active_branch, repo_name)
 
+    @tool_group('read')
     def get_issue(self, issue_number: int, repo_name: Optional[str] = None) -> str:
         """
         Fetches information about a specific issue.
@@ -351,6 +337,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to get issue: {str(e)}"
 
+    @tool_group('read')
     def list_files_in_main_branch(self, repo_name: Optional[str] = None) -> str:
         """
         Fetches all files in the main branch of the repo.
@@ -363,6 +350,7 @@ class GitHubClient(BaseModel):
         """
         return self._get_files("", self.github_base_branch, repo_name)
 
+    @tool_group('read')
     def list_files_in_bot_branch(self, repo_name: Optional[str] = None) -> str:
         """
         Fetches all files in the current working branch.
@@ -375,6 +363,7 @@ class GitHubClient(BaseModel):
         """
         return self._get_files("", self.active_branch, repo_name)
 
+    @tool_group('read')
     def get_commits(
             self,
             sha: Optional[str] = None,
@@ -438,6 +427,7 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain text
             return {"error": str(e), "message": f"Unable to retrieve commits due to error: {str(e)}"}
 
+    @tool_group('read')
     def get_commit_changes(self, sha: str, repo_name: Optional[str] = None) -> str:
         """
         Retrieves the files changed in a specific commit.
@@ -493,6 +483,7 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain text
             return {"error": str(e), "message": f"Unable to retrieve commit changes due to error: {str(e)}"}
         
+    @tool_group('read')
     def get_commits_diff(self, base_sha: str, head_sha: str, repo_name: Optional[str] = None) -> str:
         """
         Retrieves the diff between two commits.
@@ -635,6 +626,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return {"error": str(e), "message": f"Unable to download patch file: {str(e)}"}
 
+    @tool_group('write')
     def apply_git_patch(self, patch_content: str, branch: str, commit_message: Optional[str] = "Apply git patch", repo_name: Optional[str] = None) -> str:
         """
         Applies a git patch to the repository by parsing the unified diff format and updating files accordingly.
@@ -1020,6 +1012,7 @@ class GitHubClient(BaseModel):
             
         return '\n'.join(result_lines)
 
+    @tool_group('read')
     def get_pull_request(self, pr_number: str, repo_name: Optional[str] = None) -> str:
         """
         Fetches information about a specific pull request.
@@ -1091,6 +1084,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to get pull request: {str(e)}"
 
+    @tool_group('read')
     def list_pull_request_diffs(self, pr_number: int, repo_name: Optional[str] = None) -> str:
         """
         Fetches the files included in a pull request.
@@ -1127,6 +1121,7 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain string
             return {"error": str(e), "message": f"Failed to get pull request diffs: {str(e)}"}
 
+    @tool_group('write')
     def create_branch(self, proposed_branch_name: str, repo_name: Optional[str] = None) -> str:
         """
         Create a new branch, and set it as the active bot branch.
@@ -1183,6 +1178,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to create branch: {str(e)}"
 
+    @tool_group('delete')
     def delete_branch(self, branch_name: str, force: bool = False) -> str:
         """
         Delete a branch from the GitHub repository.
@@ -1250,6 +1246,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to delete branch '{branch_name}': {str(e)}"
 
+    @tool_group('write')
     def create_file(self, file_path: str, branch: str, repo_name: Optional[str] = None, file_contents: str = None, filepath: str = None) -> str:
         """
         Creates a new file on the GitHub repo from new content or by copying an existing artifact.
@@ -1319,6 +1316,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             raise ToolException(f"Unable to create file due to error:\n{str(e)}")
 
+    @tool_group('write')
     def update_file(self, file_query: str, branch: str, repo_name: Optional[str] = None, commit_message: Optional[str] = None) -> str:
         """Updates a file with new content using OLD/NEW markers and edit_file.
 
@@ -1379,6 +1377,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Unable to update file due to error:\n{str(e)}"
 
+    @tool_group('delete')
     def delete_file(self, file_path: str, branch: str, repo_name: Optional[str] = None) -> str:
         """
         Deletes a file from the repository.
@@ -1439,6 +1438,7 @@ class GitHubClient(BaseModel):
         ]
         return not any(re.search(pattern, query, re.IGNORECASE) for pattern in dangerous_patterns)
 
+    @tool_group('read')
     def search_issues(self, search_query: str, repo_name: Optional[str] = None, max_count: int = 30) -> str:
         """
         Searches for issues in a specific repository or a default initialized repository
@@ -1492,6 +1492,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"An error occurred while searching issues:\n{str(e)}"
 
+    @tool_group('write')
     def create_issue(self, title: str, body: Optional[str] = None, repo_name: Optional[str] = None,
                      labels: Optional[List[str]] = None, assignees: Optional[List[str]] = None) -> str:
         """
@@ -1524,6 +1525,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"An error occurred while creating the issue: {str(e)}"
 
+    @tool_group('write')
     def update_issue(self, issue_id: int, title: Optional[str] = None,
                      body: Optional[str] = None, labels: Optional[List[str]] = None,
                      assignees: Optional[List[str]] = None, state: Optional[str] = None,
@@ -1644,6 +1646,7 @@ class GitHubClient(BaseModel):
         # All retries exhausted
         raise ToolException(f"File not found `{file_path}` on branch `{branch}` after {max_retries} attempts. Error: {str(last_exception)}")
 
+    @tool_group('read')
     def read_file(self, file_path: str, branch: Optional[str] = None, repo_name: Optional[str] = None,
                   start_line: Optional[int] = None, end_line: Optional[int] = None):
         """
@@ -1674,6 +1677,7 @@ class GitHubClient(BaseModel):
         )
         return guard_text_read(content, file_path, requested=requested, full_content=full_content)
 
+    @tool_group('read')
     def read_multiple_files(
         self,
         file_paths: List[str],
@@ -1806,6 +1810,7 @@ class GitHubClient(BaseModel):
         except ImportError as e:
             return f"Error processing code files: {str(e)}"
 
+    @tool_group('read')
     def list_branches_in_repo(self, repo_name: Optional[str] = None, max_count: Optional[int] = 100) -> str:
         """
         Lists branches in the repository.
@@ -1834,6 +1839,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to list branches: {str(e)}"
 
+    @tool_group('write')
     def set_active_branch(self, branch_name: str, repo_name: Optional[str] = None) -> str:
         """
         Sets the active branch for future operations.
@@ -1864,6 +1870,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to set active branch: {str(e)}"
 
+    @tool_group('execute')
     def trigger_workflow(self, workflow_id: str, ref: str, inputs: Optional[Dict[str, Any]] = None, repo_name: Optional[str] = None) -> str:
         """
         Triggers a GitHub Actions workflow run manually.
@@ -1909,6 +1916,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"An error occurred while triggering workflow: {str(e)}"
 
+    @tool_group('read')
     def get_workflow_status(self, run_id: str, repo_name: Optional[str] = None) -> str:
         """
         Gets the status and details of a specific GitHub Actions workflow run.
@@ -1965,6 +1973,7 @@ class GitHubClient(BaseModel):
                 "message": f"An error occurred while getting workflow status: {str(e)}"
             }
 
+    @tool_group('read')
     def get_workflow_logs(self, run_id: str, repo_name: Optional[str] = None) -> str:
         """
         Gets the logs from a GitHub Actions workflow run.
@@ -2038,6 +2047,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"An error occurred while getting workflow logs: {str(e)}"
 
+    @tool_group('write')
     def comment_on_issue(self, issue_number: str, comment: str, repo_name: Optional[str] = None) -> str:
         """
         Adds a comment to an issue or pull request
@@ -2059,6 +2069,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to add comment: {str(e)}"
 
+    @tool_group('write')
     def create_pull_request(self, title: str, body: str, head: str,
                            base: Optional[str] = None, repo_name: Optional[str] = None) -> str:
         """
@@ -2089,6 +2100,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to create pull request: {str(e)}"
 
+    @tool_group('read')
     def get_issues(self, state: str = "open", repo_name: Optional[str] = None) -> str:
         """
         Get a list of issues from the repository
@@ -2122,6 +2134,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to get issues: {str(e)}"
 
+    @tool_group('read')
     def list_open_pull_requests(self, repo_name: Optional[str] = None, max_count: Optional[int] = 100) -> str:
         """
         Lists open pull requests for a repository.
@@ -2161,6 +2174,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             return f"Failed to list open pull requests: {str(e)}"
 
+    @tool_group('execute')
     def generic_github_api_call(self, method: str, method_kwargs: Optional[Dict[str, Any]] = None) -> str:
         """
         Generic method to make API calls to GitHub.
@@ -2261,6 +2275,7 @@ class GitHubClient(BaseModel):
         except Exception as e:
             raise ToolException(f"Failed to get authenticated user: {str(e)}")
 
+    @tool_group('read')
     def search_code(
         self,
         query: str,
