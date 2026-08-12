@@ -17,7 +17,7 @@ unstamped so the UI can surface it instead of trusting a guess.
 """
 
 import functools
-from collections.abc import Iterable
+from collections.abc import Collection
 from types import MappingProxyType
 
 READ = "read"
@@ -37,7 +37,9 @@ def _validate_declaration(klass, declaration) -> None:
             raise ValueError(
                 f"{klass.__qualname__}.ToolGroups.{attr} is not a valid group; expected one of {GROUPS}"
             )
-        if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        # Collection (not Iterable) so single-pass generators — which validation
+        # would exhaust before resolution reads them — are rejected outright
+        if isinstance(value, (str, bytes)) or not isinstance(value, Collection):
             raise ValueError(
                 f"{klass.__qualname__}.ToolGroups.{attr} must be a collection of tool names, "
                 f"got {type(value).__name__}"
@@ -51,7 +53,8 @@ def _validate_declaration(klass, declaration) -> None:
             if tool_name in seen:
                 raise ValueError(
                     f"{klass.__qualname__}.ToolGroups lists '{tool_name}' in both "
-                    f"'{seen[tool_name]}' and '{attr}'"
+                    f"'{seen[tool_name]}' and '{attr}' — a tool belongs to one group per "
+                    f"declaration; to change an inherited group, re-declare it in the subclass"
                 )
             seen[tool_name] = attr
 

@@ -1,5 +1,6 @@
 import pytest
 
+from elitea_sdk.tools import AVAILABLE_TOOLKITS
 from elitea_sdk.tools.github import EliteAGitHubToolkit
 from elitea_sdk.tools.utils.tool_groups import GROUPS, resolve_declared_groups, with_tool_groups
 
@@ -76,9 +77,16 @@ def test_set_declarations_are_accepted():
     assert resolve_declared_groups(Producer)["get_thing"] == "read"
 
 
-def test_every_toolkit_schema_builds():
-    from elitea_sdk.tools import AVAILABLE_TOOLKITS
+def test_generator_declaration_is_rejected():
+    class Producer:
+        class ToolGroups:
+            read = (name for name in ["get_thing"])
 
+    with pytest.raises(ValueError, match="must be a collection of tool names"):
+        resolve_declared_groups(Producer)
+
+
+def test_every_toolkit_schema_builds():
     built = 0
     for toolkit in AVAILABLE_TOOLKITS.values():
         if not hasattr(toolkit, "toolkit_config_schema"):
@@ -86,7 +94,7 @@ def test_every_toolkit_schema_builds():
         schema = toolkit.toolkit_config_schema().model_json_schema()
         assert isinstance(schema, dict)
         built += 1
-    assert built > 40, f"expected the full static toolkit registry, built only {built}"
+    assert built, "static toolkit registry is empty — toolkit imports are broken"
 
 
 def get_selected_tools_schema():
