@@ -2040,7 +2040,13 @@ class LLMNode(BaseTool):
                         thinking_blocks.append(getattr(block, 'thinking', ''))
                     elif block.type == 'text':
                         text_blocks.append(getattr(block, 'text', ''))
-            
+                elif isinstance(block, str) and block:
+                    # Some providers/thinking modes (e.g. Anthropic adaptive
+                    # thinking) emit the final answer as a bare string list
+                    # item instead of a {'type': 'text', ...} dict. Without
+                    # this branch that text is silently dropped.
+                    text_blocks.append(block)
+
             if thinking_blocks:
                 result['thinking'] = '\n\n'.join(thinking_blocks)
             if text_blocks:
