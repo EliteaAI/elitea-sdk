@@ -42,6 +42,33 @@ def safe_int(value, default):
         logger.warning(f"Invalid integer value '{value}', using default {default}")
         return default
 
+
+def _drain_and_close_loop(loop):
+    """Cancel pending tasks and finalize async generators, then close the loop.
+
+    Closing an event loop that still has pending tasks or un-finalized async
+    generators is what produced the "Task was destroyed but it is pending" and
+    "async_generator_athrow" fallout observed in the MCP discovery hang incident.
+    This drains the loop before closing so an abandoned/cancelled worker leaves
+    no dangling tasks or task-growth warnings behind.
+    """
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+    except Exception:  # pylint: disable=W0718
+        logger.debug("Error while cancelling pending tasks during loop drain", exc_info=True)
+    try:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:  # pylint: disable=W0718
+        logger.debug("Error while shutting down async generators during loop drain", exc_info=True)
+    finally:
+        loop.close()
+
 class McpToolkit(BaseToolkit):
     """
     MCP Toolkit for connecting to a single remote MCP server and exposing its tools.
@@ -409,10 +436,17 @@ class McpToolkit(BaseToolkit):
         # When called from within a running event loop (e.g. nested agent execution),
         # asyncio.run() raises "cannot be called from a running event loop".
         # In that case, run the coroutine in a dedicated thread that owns its own loop.
+        #
+        # `holder` lets the timeout path (in the calling thread) reach into the worker
+        # thread's loop and task so it can signal cancellation across the thread
+        # boundary via `loop.call_soon_threadsafe`.
+        holder = {"loop": None, "task": None}
+
         def _run_in_new_loop():
             loop = asyncio.new_event_loop()
+            holder["loop"] = loop
             try:
-                return loop.run_until_complete(
+                task = loop.create_task(
                     cls._discover_tools_async(
                         toolkit_name=toolkit_name,
                         toolkit_type=toolkit_type,
@@ -422,8 +456,16 @@ class McpToolkit(BaseToolkit):
                         oauth_token_injected=oauth_token_injected,
                     )
                 )
+                holder["task"] = task
+                return loop.run_until_complete(task)
             finally:
-                loop.close()
+                # Cancel any tasks still pending (e.g. after the driving task was
+                # cancelled from the caller) and let async generators finalize
+                # BEFORE closing the loop. Closing a loop with pending tasks or
+                # un-finalized async generators is what produced the
+                # "Task was destroyed but it is pending" / "async_generator_athrow"
+                # fallout in the incident.
+                _drain_and_close_loop(loop)
 
         try:
             try:
@@ -433,23 +475,55 @@ class McpToolkit(BaseToolkit):
 
             if running_loop is not None:
                 import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                # NOTE: do NOT use `with ThreadPoolExecutor(...)`. The context
+                # manager's __exit__ calls shutdown(wait=True), which re-blocks the
+                # caller on a genuinely stuck worker thread and defeats the whole
+                # point of the hard timeout. Manage the executor manually so the
+                # timeout path can abandon the worker without waiting on it.
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                hard_limit = timeout + 30
+                try:
                     future = executor.submit(_run_in_new_loop)
                     # Backstop: the async layer bounds itself (session read timeout +
                     # wait_for on connect), so the worker thread should finish within
                     # `timeout`. Give the sync caller a slightly larger bound so it can
                     # never block forever if the async bounds are somehow bypassed.
                     try:
-                        all_tools, server_session_id = future.result(timeout=timeout + 30)
+                        all_tools, server_session_id = future.result(timeout=hard_limit)
                     except concurrent.futures.TimeoutError as e:
                         logger.error(
                             f"[MCP] Discovery for '{toolkit_name}' exceeded "
-                            f"{timeout + 30}s hard limit - abandoning worker thread"
+                            f"{hard_limit}s hard limit - signalling cancellation "
+                            f"and abandoning worker thread"
                         )
+                        # Signal cancellation into the worker loop from this thread.
+                        # This unwinds the pending task, runs `finally`/`__aexit__`
+                        # cleanup, and lets `_drain_and_close_loop` finalize async
+                        # generators so we don't leak pending tasks.
+                        wloop = holder.get("loop")
+                        wtask = holder.get("task")
+                        if wloop is not None and wtask is not None:
+                            try:
+                                wloop.call_soon_threadsafe(wtask.cancel)
+                            except RuntimeError:
+                                # Loop already closed/stopped - nothing to cancel.
+                                pass
+                            # Bounded join: give the worker a short grace period to
+                            # observe the cancellation and clean up. If it doesn't,
+                            # we still abandon it rather than block the caller.
+                            # future.result may surface CancelledError, which is a
+                            # BaseException, so catch BaseException here.
+                            try:
+                                future.result(timeout=5)
+                            except BaseException:  # pylint: disable=W0718
+                                pass
                         raise TimeoutError(
                             f"MCP tool discovery for '{toolkit_name}' timed out after "
-                            f"{timeout + 30}s."
+                            f"{hard_limit}s."
                         ) from e
+                finally:
+                    # Never block the caller on the abandoned worker thread.
+                    executor.shutdown(wait=False)
             else:
                 all_tools, server_session_id = asyncio.run(
                     cls._discover_tools_async(
