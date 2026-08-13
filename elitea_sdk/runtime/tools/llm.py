@@ -37,7 +37,10 @@ from ..langchain.utils import (
 )
 from ..exceptions import budget_exceeded_from
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
-from ..utils.mcp_oauth import McpAuthorizationRequired
+from ..utils.mcp_oauth import (
+    McpAuthorizationRequired,
+    build_mcp_auth_decision_result,
+)
 from .hitl import (
     HITL_INTERRUPT_ID_KEY,
     HITL_NESTED_INTERRUPT_ID_KEY,
@@ -1352,7 +1355,49 @@ class LLMNode(BaseTool):
         # __perform_tool_calling loop can execute it. The guard will then
         # resolve the resume action consistently: approve executes the tool,
         # reject returns a blocked-tool result and gives the LLM another turn.
-        if hitl_ctx and hitl_ctx.get('parallel_calls'):
+        if hitl_ctx and hitl_ctx.get('mcp_auth_payload'):
+            # ---- Delegated toolkit authorization resume (#6072) ----
+            # The tool already reached the exact authorization boundary before
+            # the checkpoint was written.  Do not ask the LLM to recreate that
+            # call (which can select a different tool or, for a nested agent,
+            # create a different child invocation).  Consume the Command resume
+            # here and close the original leaf tool_call with a structured
+            # ToolMessage, then let the same LLM node continue from its restored
+            # intermediate history.
+            auth_payload = dict(hitl_ctx['mcp_auth_payload'])
+            scratchpad = configurable.get(_SCRATCHPAD_KEY)
+            n_prior = (
+                len(scratchpad.resume)
+                if scratchpad
+                and hasattr(scratchpad, 'resume')
+                and scratchpad.resume
+                else 0
+            )
+            for _i in range(n_prior):
+                try:
+                    _langgraph_interrupt({'__replay_consumer__': True})
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "[MCP_AUTH] Replay consumer #%d raised %s — stopping "
+                        "before authorization resume",
+                        _i, exc,
+                    )
+                    break
+
+            resume_value = _langgraph_interrupt(auth_payload)
+            action = (
+                str((resume_value or {}).get('action') or 'skip').strip().lower()
+                if isinstance(resume_value, dict)
+                else 'skip'
+            )
+            if action not in {'authorize', 'skip'}:
+                action = 'skip'
+            messages = list(messages) + [ToolMessage(
+                content=self._mcp_auth_decision_message(auth_payload, action),
+                tool_call_id=auth_payload.get('tool_call_id') or 'mcp_auth_resume_call',
+            )]
+            completion = llm_client.invoke(messages, config=config)
+        elif hitl_ctx and hitl_ctx.get('parallel_calls'):
             # ---- Parallel sub-agent resume (issue #4993) ----
             # The original turn fanned out 2+ Application calls and the parent
             # paused on ONE aggregated interrupt (not the single-tool guard).
@@ -2386,6 +2431,102 @@ class LLMNode(BaseTool):
         route = f"{container_call_id}\x1f{leaf_call_id}"
         return f"hitl_{uuid5(NAMESPACE_URL, route).hex}"
 
+    def _build_mcp_auth_interrupt(
+        self,
+        exc: McpAuthorizationRequired,
+        tool_to_execute: BaseTool,
+        tool_name: str,
+        tool_args: dict,
+        tool_call_id: str,
+        config: Optional[RunnableConfig],
+    ) -> dict:
+        """Build the checkpoint-safe delegated-authorization interrupt payload."""
+        from langchain_core.messages import message_to_dict
+
+        auth_metadata = exc.to_dict()
+        identity = self._get_tool_identity(tool_to_execute)
+        resolved_tool_name = (
+            auth_metadata.get('tool_name')
+            or identity.get('tool_name')
+            or tool_name
+        )
+        toolkit_name = (
+            auth_metadata.get('toolkit_name')
+            or identity.get('toolkit_name')
+            or ''
+        )
+        toolkit_type = (
+            auth_metadata.get('toolkit_type')
+            or identity.get('toolkit_type')
+            or ''
+        )
+        configurable = (
+            config.get('configurable', {})
+            if isinstance(config, dict)
+            else {}
+        )
+
+        serialized_pending = []
+        for message in _PENDING_TOOL_MESSAGES.get([]):
+            try:
+                serialized_pending.append(message_to_dict(message))
+            except Exception:  # pragma: no cover - defensive serialization seam
+                continue
+
+        payload = {
+            'type': 'hitl',
+            'interrupt_id': f'mcp_auth_{uuid4().hex}',
+            'guardrail_type': 'mcp_auth',
+            'node_name': 'mcp_auth_guard',
+            'message': str(exc),
+            'available_actions': ['authorize', 'skip'],
+            'tool_name': resolved_tool_name,
+            'toolkit_name': toolkit_name,
+            'toolkit_type': toolkit_type,
+            'tool_call_id': tool_call_id,
+            # Arguments are checkpoint-private. Authorization cards never need
+            # request bodies, which may contain credentials or user content.
+            'tool_args': {},
+            'tool_args_raw': dict(tool_args or {}),
+            'server_url': auth_metadata.get('server_url'),
+            'resource_metadata_url': auth_metadata.get('resource_metadata_url'),
+            'www_authenticate': auth_metadata.get('www_authenticate'),
+            'resource_metadata': auth_metadata.get('resource_metadata'),
+            'authorization_servers': auth_metadata.get('authorization_servers'),
+            'status': auth_metadata.get('status'),
+            'thread_id': configurable.get('thread_id'),
+            'checkpoint_ns': configurable.get('checkpoint_ns') or '',
+        }
+        if serialized_pending:
+            payload['_pending_messages'] = serialized_pending
+        return payload
+
+    @staticmethod
+    def _mcp_auth_decision_message(interrupt_payload: dict, action: str) -> str:
+        authorized = action == 'authorize'
+        return build_mcp_auth_decision_result(
+            status='authorized' if authorized else 'declined',
+            server_url=interrupt_payload.get('server_url') or '',
+            tool_name=interrupt_payload.get('tool_name') or '',
+            toolkit_type=interrupt_payload.get('toolkit_type') or '',
+            message=(
+                'Authorization completed. Retry the requested operation with the '
+                'newly available toolkit.'
+                if authorized else
+                'The user skipped authorization for this run. Continue without '
+                'the unavailable toolkit or explain the limitation.'
+            ),
+            next_step=(
+                'Retry the requested operation using the authorized toolkit.'
+                if authorized else
+                'Do not request this toolkit again during the current run.'
+            ),
+            denial_reason=None if authorized else 'User skipped authorization for this run.',
+            resource_metadata_url=interrupt_payload.get('resource_metadata_url'),
+            www_authenticate=interrupt_payload.get('www_authenticate'),
+            resource_metadata=interrupt_payload.get('resource_metadata'),
+        )
+
     async def _run_parallel_application_calls(
         self, app_specs, new_messages, config, hitl_decisions=None,
         pending_capture_start=0,
@@ -2456,6 +2597,7 @@ class LLMNode(BaseTool):
                 child_config['configurable']['__hitl_parallel_resume__'] = {
                     'action': decision.get('action', 'approve'),
                     'value': decision.get('value', decision.get('user_feedback', '')),
+                    'guardrail_type': decision.get('guardrail_type'),
                 }
             elif grandchild_decisions:
                 # This child is itself a container: its OWN prior pause was a
@@ -2646,9 +2788,19 @@ class LLMNode(BaseTool):
             except Exception:  # pragma: no cover - defensive
                 pass
 
+        guardrail_types = {
+            item.get('guardrail_type') for item in pending_payload
+            if item.get('guardrail_type')
+        }
+        if guardrail_types == {'mcp_auth'}:
+            aggregate_guardrail = 'parallel_mcp_auth'
+        elif guardrail_types == {'sensitive_tool'}:
+            aggregate_guardrail = 'parallel_sensitive_tools'
+        else:
+            aggregate_guardrail = 'parallel_guardrails'
         aggregate = {
             'type': 'hitl',
-            'guardrail_type': 'parallel_sensitive_tools',
+            'guardrail_type': aggregate_guardrail,
             'message': pending_payload[0].get(
                 'message', 'Multiple actions require your review before continuing.',
             ),
@@ -2663,6 +2815,11 @@ class LLMNode(BaseTool):
 
     async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
                                      pending_capture_base=None, parked_holder=None):
+        # Several historical branches import ToolMessage locally.  Bind it
+        # before any awaited tool invocation so an exception raised before one
+        # of those imports can still be converted into a guardrail result.
+        from langchain_core.messages import ToolMessage
+
         # Handle iterative tool-calling and execution
         logger.info(f"__perform_tool_calling called with {len(completion.tool_calls) if hasattr(completion, 'tool_calls') else 0} tool calls")
         normalize_null_tool_call_ids(completion)
@@ -2928,13 +3085,35 @@ class LLMNode(BaseTool):
                         # signals must propagate to the graph executor.
                         _PENDING_TOOL_MESSAGES.set([])
                         raise
-                    except McpAuthorizationRequired:
-                        # Re-raise so the parent agent's on_tool_error callback
-                        # can emit the mcp_authorization_required socket event,
-                        # which triggers the Login button in the Chat UI.
-                        # Without this, the exception is swallowed into a ToolMessage
-                        # and the nested agent silently fails to show the login prompt.
-                        raise
+                    except McpAuthorizationRequired as exc:
+                        # Delegated toolkit authorization is a durable guardrail,
+                        # not an ordinary tool failure. Interrupt at the exact LLM
+                        # tool-call boundary while the leaf call id, pending
+                        # messages and child checkpoint are still available.
+                        auth_interrupt = self._build_mcp_auth_interrupt(
+                            exc,
+                            tool_to_execute,
+                            tool_name,
+                            tool_args,
+                            tool_call_id,
+                            config,
+                        )
+                        resume_value = _langgraph_interrupt(auth_interrupt)
+                        action = (
+                            str((resume_value or {}).get('action') or 'skip')
+                            .strip().lower()
+                            if isinstance(resume_value, dict)
+                            else 'skip'
+                        )
+                        if action not in {'authorize', 'skip'}:
+                            action = 'skip'
+                        new_messages.append(ToolMessage(
+                            content=self._mcp_auth_decision_message(
+                                auth_interrupt, action,
+                            ),
+                            tool_call_id=tool_call_id,
+                        ))
+                        continue
                     except Exception as e:
                         # Same reasoning as the MCP clause above: swallowing a budget
                         # rejection here hides it from the user entirely

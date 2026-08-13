@@ -1016,6 +1016,24 @@ def find_tool_by_name_or_metadata(tools: list, tool_name: str, toolkit_name: Opt
     return None
 
 
+def find_mcp_auth_proxy(tools: list, toolkit_name: Optional[str]) -> Optional[BaseTool]:
+    """Find a deferred auth gateway for an unavailable direct Toolkit node."""
+    if not toolkit_name:
+        return None
+    normalized = str(toolkit_name).strip().lower()
+    for tool in tools:
+        metadata = getattr(tool, 'metadata', None) or {}
+        candidate_names = {
+            str(metadata.get(TOOLKIT_NAME_META) or '').strip().lower(),
+            str(metadata.get('toolkit_type') or '').strip().lower(),
+        }
+        if normalized in candidate_names and str(getattr(tool, 'name', '')).startswith(
+            'mcp_authorize_'
+        ):
+            return tool
+    return None
+
+
 def create_graph(
         client: Any,
         yaml_schema: str,
@@ -1178,6 +1196,18 @@ def create_graph(
                             # matching_tool stays None → if matching_tool: block below is skipped.
                             # Fall through to edge-adding code so TransitionalEdge is registered;
                             # it will detect _pipeline_blocked and route to END automatically.
+                        elif node_type in ('mcp', 'toolkit'):
+                            # The real toolkit could not be discovered before
+                            # OAuth.  Compile its deferred gateway into the
+                            # exact direct node so authorization happens as a
+                            # durable FunctionTool interrupt at runtime.
+                            matching_tool = find_mcp_auth_proxy(tools, toolkit_name)
+                            if not matching_tool:
+                                error_msg = f"Node `{node_id}` with type `{node_type}` has tool '{tool_name}'"
+                                if toolkit_name:
+                                    error_msg += f" (toolkit: '{toolkit_name}')"
+                                error_msg += f" which is not found in the provided tools. Make sure it is connected properly. Available tools: {format_tools(tools)}"
+                                raise ToolException(error_msg)
                         else:
                             # tool is not found in the provided tools
                             error_msg = f"Node `{node_id}` with type `{node_type}` has tool '{tool_name}'"
@@ -1196,6 +1226,11 @@ def create_graph(
                         if node_type in ['function', 'toolkit', 'mcp']:
                             lg_builder.add_node(node_id, FunctionTool(
                                 tool=matching_tool, name=node_id, return_type='dict',
+                                auth_tool_name=tool_name,
+                                auth_toolkit_name=toolkit_name,
+                                auth_toolkit_type=(
+                                    (getattr(matching_tool, 'metadata', None) or {}).get('toolkit_type')
+                                ),
                                 output_variables=node.get('output', []),
                                 input_mapping=node.get('input_mapping',
                                                        {'messages': {'type': 'variable', 'value': 'messages'}}),
@@ -1991,7 +2026,30 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # (or rejected) tool call.  This avoids the fundamental issue
                     # where re-executing the LLM produces a different response.
                     guardrail_type = hitl_interrupt.get('guardrail_type')
-                    if guardrail_type == 'sensitive_tool':
+                    if guardrail_type == 'mcp_auth':
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        if hitl_interrupt.get('_parent_tool_name'):
+                            resume_ctx = {
+                                'tool_name': hitl_interrupt['_parent_tool_name'],
+                                'toolkit_name': '',
+                                'tool_args': hitl_interrupt.get('_parent_tool_args', {}),
+                                'tool_call_id': (
+                                    hitl_interrupt.get('_parent_tool_call_id')
+                                    or f"call_{uuid4().hex[:24]}"
+                                ),
+                                'mcp_auth_bridge': True,
+                            }
+                        else:
+                            resume_ctx = {
+                                'mcp_auth_payload': dict(hitl_interrupt),
+                            }
+                        if pending_msgs_dicts:
+                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                            if trimmed:
+                                resume_ctx['pending_messages'] = trimmed
+                        hitl_resume_ctx = resume_ctx
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+                    elif guardrail_type == 'sensitive_tool':
                         # When the interrupt bubbled up from a child Application
                         # tool, reference the PARENT tool so the LLMNode builds
                         # a synthetic AIMessage calling the Application wrapper
@@ -2143,7 +2201,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 resume_ctx['original_ai_message'] = original_ai_dict
                         hitl_resume_ctx = resume_ctx
                         logger.info("[HITL] Prepared clarifying-question resume for ask_user")
-                    elif guardrail_type == 'parallel_sensitive_tools':
+                    elif guardrail_type in {
+                        'parallel_sensitive_tools',
+                        'parallel_mcp_auth',
+                        'parallel_guardrails',
+                    }:
                         # Parallel sub-agent fan-out resume (issue #4993).
                         # The aggregate interrupt paused N children at once; the
                         # caller returns a decision per child as hitl_decisions.
@@ -2198,6 +2260,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         persisted = []
                         for d in decisions:
                             if not isinstance(d, dict):
+                                continue
+                            if d.get('guardrail_type') == 'mcp_auth':
                                 continue
                             entry = {
                                 'tool_name': d.get('tool_name', ''),
@@ -2798,7 +2862,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         interrupt_value = cls._get_hitl_interrupt(state_snapshot)
         if not interrupt_value:
             return []
-        if interrupt_value.get('guardrail_type') == 'parallel_sensitive_tools':
+        if isinstance(interrupt_value.get('pending'), list):
             pending = interrupt_value.get('pending') or []
             return [p for p in pending if isinstance(p, dict)]
         return [interrupt_value]
@@ -2888,6 +2952,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         decision[key] = match[key]
                     else:
                         decision.pop(key, None)
+                if match.get('guardrail_type'):
+                    decision['guardrail_type'] = match['guardrail_type']
             hydrated.append(decision)
         return hydrated
 
@@ -3104,8 +3170,14 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if input_data.get('hitl_resume') is True:
             return True
 
+        if input_data.get('mcp_auth_resume') is True:
+            return True
+
         # Parallel multi-interrupt resume: a list of per-child decisions.
         if isinstance(input_data.get('hitl_decisions'), list) and input_data['hitl_decisions']:
+            return True
+
+        if isinstance(input_data.get('mcp_auth_decisions'), list) and input_data['mcp_auth_decisions']:
             return True
 
         action = input_data.get('hitl_action') or input_data.get('action')
@@ -3150,7 +3222,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
         Returns dict suitable for Command(resume=...).
         """
-        decisions = input_data.get("hitl_decisions")
+        decisions = input_data.get("hitl_decisions") or input_data.get("mcp_auth_decisions")
         single_decision = (
             decisions[0]
             if isinstance(decisions, list)
@@ -3165,7 +3237,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # that unambiguous shape as the scalar resume too; otherwise the missing
         # action falls through to the historical ``approve`` default and executes
         # a tool the user explicitly rejected.
-        action = input_data.get("hitl_action") or input_data.get("action")
+        action = (
+            input_data.get("hitl_action")
+            or input_data.get("mcp_auth_action")
+            or input_data.get("action")
+        )
         if not action and single_decision is not None:
             action = single_decision.get("action")
         action = action or "approve"

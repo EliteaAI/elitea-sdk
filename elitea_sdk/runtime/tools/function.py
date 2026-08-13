@@ -5,14 +5,17 @@ import textwrap
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.messages import ToolCall
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
 from langgraph.errors import GraphBubbleUp
+from langgraph.types import interrupt
 
 from ..exceptions import budget_exceeded_from
+from ..utils.mcp_oauth import McpAuthorizationRequired
 from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -46,6 +49,9 @@ class FunctionTool(BaseTool):
     structured_output: Optional[bool] = False
     elitea_client: Optional[Any] = None
     debug: bool = False
+    auth_tool_name: Optional[str] = None
+    auth_toolkit_name: Optional[str] = None
+    auth_toolkit_type: Optional[str] = None
 
     def _prepare_pyodide_input(self, state: Union[str, dict, ToolCall], input_variables: Optional[list[str]] = None) -> str:
         """Prepare input for PyodideSandboxTool by injecting state into the code block.
@@ -309,6 +315,94 @@ alita_client = elitea_client
         )
         return result
 
+    def _build_mcp_auth_skipped_termination(self, payload: dict) -> dict:
+        """Stop a direct Pipeline Toolkit node cleanly after Skip."""
+        tool_name = payload.get('tool_name') or self.auth_tool_name or self.tool.name
+        toolkit_name = payload.get('toolkit_name') or self.auth_toolkit_name or 'Toolkit'
+        message = (
+            f"**Pipeline stopped** — authorization for **{toolkit_name}** "
+            f"(tool: `{tool_name}`, node: *{self.name}*) was skipped.\n\n"
+            f"Downstream nodes that depend on `{self.name}` output were not "
+            "executed because the required toolkit is unavailable.\n\n"
+            "> **Tip:** Authorize the toolkit and run the pipeline again."
+        )
+        result: dict[str, Any] = {
+            "messages": [{"role": "assistant", "content": message}],
+            PIPELINE_BLOCKED_KEY: message,
+        }
+        for var in self.output_variables or []:
+            if var != 'messages':
+                result[var] = None
+        return result
+
+    def _build_mcp_auth_refresh_termination(self, payload: dict) -> dict:
+        """Fail closed if an authorized Toolkit was not loaded on rebuild."""
+        tool_name = payload.get('tool_name') or self.auth_tool_name or self.tool.name
+        toolkit_name = payload.get('toolkit_name') or self.auth_toolkit_name or 'Toolkit'
+        message = (
+            f"**Pipeline stopped** — authorization for **{toolkit_name}** "
+            f"(tool: `{tool_name}`, node: *{self.name}*) completed, but the "
+            "authorized Toolkit was not available in this pipeline instance.\n\n"
+            "Downstream nodes were not executed with an unavailable tool.\n\n"
+            "> **Tip:** Run the pipeline again to load the authorized Toolkit."
+        )
+        result: dict[str, Any] = {
+            "messages": [{"role": "assistant", "content": message}],
+            PIPELINE_BLOCKED_KEY: message,
+        }
+        for var in self.output_variables or []:
+            if var != 'messages':
+                result[var] = None
+        return result
+
+    def _build_mcp_auth_interrupt(
+        self,
+        exc: McpAuthorizationRequired,
+        config: Optional[RunnableConfig],
+    ) -> dict:
+        """Create the durable guardrail payload for a direct Pipeline node."""
+        metadata = exc.to_dict()
+        tool_metadata = getattr(self.tool, 'metadata', None) or {}
+        configurable = config.get('configurable', {}) if isinstance(config, dict) else {}
+        return {
+            'type': 'hitl',
+            'interrupt_id': f'mcp_auth_{uuid4().hex}',
+            'guardrail_type': 'mcp_auth',
+            'node_name': self.name,
+            'message': str(exc),
+            'available_actions': ['authorize', 'skip'],
+            'tool_name': (
+                self.auth_tool_name
+                or metadata.get('tool_name')
+                or tool_metadata.get('tool_name')
+                or self.tool.name
+            ),
+            'toolkit_name': (
+                self.auth_toolkit_name
+                or metadata.get('toolkit_name')
+                or tool_metadata.get('toolkit_name')
+                or ''
+            ),
+            'toolkit_type': (
+                self.auth_toolkit_type
+                or metadata.get('toolkit_type')
+                or tool_metadata.get('toolkit_type')
+                or ''
+            ),
+            # Direct graph nodes have no LLM tool-call id.  The node id is the
+            # stable leaf invocation identity in this checkpointed pipeline.
+            'tool_call_id': f'pipeline:{self.name}',
+            'tool_args': {},
+            'server_url': metadata.get('server_url'),
+            'resource_metadata_url': metadata.get('resource_metadata_url'),
+            'www_authenticate': metadata.get('www_authenticate'),
+            'resource_metadata': metadata.get('resource_metadata'),
+            'authorization_servers': metadata.get('authorization_servers'),
+            'status': metadata.get('status'),
+            'thread_id': configurable.get('thread_id'),
+            'checkpoint_ns': configurable.get('checkpoint_ns') or '',
+        }
+
     def invoke(
             self,
             state: Union[str, dict, ToolCall],
@@ -479,6 +573,25 @@ alita_client = elitea_client
                     return { self.output_variables[0]: object_to_dict(tool_result) }
         except GraphBubbleUp:
             raise
+        except McpAuthorizationRequired as auth_error:
+            # Direct Toolkit/MCP pipeline nodes bypass the LLM tool loop, so
+            # this checkpointed FunctionTool node owns their dynamic auth
+            # guard.  A rebuilt continuation supplies the authorized real tool
+            # at this same node; Skip terminates with the established polite
+            # pipeline-stop contract.
+            auth_payload = self._build_mcp_auth_interrupt(auth_error, config)
+            resume_value = interrupt(auth_payload)
+            action = (
+                str((resume_value or {}).get('action') or 'skip').strip().lower()
+                if isinstance(resume_value, dict)
+                else 'skip'
+            )
+            if action != 'authorize':
+                return self._build_mcp_auth_skipped_termination(auth_payload)
+            # This branch is a defensive same-runnable fallback.  Production
+            # continuations rebuild the application with the new OAuth token,
+            # so the real tool executes before reaching this catch.
+            return self._build_mcp_auth_refresh_termination(auth_payload)
         except ValueError as value_error:
             # re-raise the error as ToolException since it is related to toolkit configuration:
             # example: incorrect input mappings etc.

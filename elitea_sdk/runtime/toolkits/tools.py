@@ -1243,14 +1243,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         pipeline_node_toolkit_names is not None
                         and (resolved_toolkit_name in pipeline_node_toolkit_names)
                     )
-                    if _is_pipeline_node:
-                        # Pipeline nodes call tools directly — deferred stubs are useless.
-                        # Re-raise so the caller can trigger the OAuth flow for the user.
-                        logger.info(
-                            "[MCP Auth] Pipeline node toolkit requires authorization — re-raising"
-                        )
-                        raise
-                    mcp_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers)
+                    mcp_tools = _build_deferred_mcp_auth_tools(
+                        tool,
+                        auth_err,
+                        mcp_tokens=mcp_tokens,
+                        user_declined_mcp_servers=user_declined_mcp_servers,
+                        reraise_on_invoke=_is_pipeline_node,
+                    )
                     logger.info(
                         "[MCP Auth] Deferred authorization for toolkit with %d proxy tool(s)",
                         len(mcp_tools),
@@ -1384,12 +1383,13 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         pipeline_node_toolkit_names is not None
                         and toolkit_name in pipeline_node_toolkit_names
                     )
-                    if _is_pipeline_node:
-                        logger.info(
-                            "[MCP Auth] Pipeline node toolkit requires authorization — re-raising"
-                        )
-                        raise
-                    toolkit_tools = _build_deferred_mcp_auth_tools(tool, auth_err, mcp_tokens=mcp_tokens, user_declined_mcp_servers=user_declined_mcp_servers)
+                    toolkit_tools = _build_deferred_mcp_auth_tools(
+                        tool,
+                        auth_err,
+                        mcp_tokens=mcp_tokens,
+                        user_declined_mcp_servers=user_declined_mcp_servers,
+                        reraise_on_invoke=_is_pipeline_node,
+                    )
                     _inject_display_metadata(tool, toolkit_tools)
                     tools.extend(toolkit_tools)
                     logger.info(
@@ -1500,12 +1500,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     _matches_auth_server(value)
                     for value in (user_declined_mcp_servers or [])
                 )
-                if not _direct_pipeline_was_skipped:
-                    logger.info(
-                        "[Toolkit Auth] Direct pipeline toolkit requires authorization — re-raising"
-                    )
-                    raise
-                if skipped_pipeline_toolkit_names is not None:
+                if _direct_pipeline_was_skipped and skipped_pipeline_toolkit_names is not None:
                     skipped_pipeline_toolkit_names.add(_pipeline_toolkit_name)
 
             # Built-in delegated-OAuth toolkit needs browser OAuth. Build deferred proxy
