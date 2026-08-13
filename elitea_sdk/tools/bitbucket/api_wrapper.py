@@ -373,6 +373,34 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"File was not created due to error: {str(e)}")
 
+    def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
+        """
+        Deletes a file from the bitbucket repo
+        Parameters:
+            file_path(str): a string which contains the file path (example: "hello_world.md").
+            branch(str): branch name (by default: active_branch)
+            commit_message(str, optional): commit message for deleting the file
+        Returns:
+            str: A success or failure message
+        """
+        branch = branch or self._active_branch
+        try:
+            self._read_file(file_path, branch)
+        except Exception as e:
+            raise ToolException(f"File '{file_path}' not found on branch '{branch}': {str(e)}")
+
+        try:
+            self._bitbucket.delete_file(
+                file_path=file_path,
+                branch=branch,
+                commit_message=commit_message or f"Delete {file_path}",
+            )
+            return f"File has been deleted: {file_path}."
+        except ToolException:
+            raise
+        except Exception as e:
+            raise ToolException(f"File was not deleted due to error: {str(e)}")
+
     def update_file(self, file_path: str, update_query: str, branch: str) -> ToolException | str:
         """
         Updates file on the bitbucket repo
@@ -662,6 +690,12 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                 "ref": self.create_file,
                 "description": self.create_file.__doc__ or "Create a new file in the repository.",
                 "args_schema": CreateFileModel,
+            },
+            {
+                "name": "delete_file",
+                "ref": self.delete_file,
+                "description": self.delete_file.__doc__ or "Delete a file from the repository.",
+                "args_schema": DeleteFileModel,
             },
             {
                 "name": "read_file",

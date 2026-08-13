@@ -5,13 +5,44 @@
 ```
 tests/tools/bitbucket/
 ├── __init__.py
-├── test_bitbucket_rate_limit.py   # Rate limit handling & retry logic tests
-└── tests_overview.md              # This file
+├── test_bitbucket_delete_file.py     # delete_file tool tests (wrapper + Cloud/Server backends)
+├── test_bitbucket_rate_limit.py      # Rate limit handling & retry logic tests
+├── test_bitbucket_read_file_cap.py   # read_file/read_multiple_files output-cap tests
+└── tests_overview.md                 # This file
 ```
 
 ---
 
 ## Coverage Matrix
+
+### `test_bitbucket_delete_file.py`
+
+**Scope:** New `delete_file` tool — wrapper orchestration in `api_wrapper.py`, Cloud backend's `files`-field deletion via the `src` endpoint, and Server backend's explicit unsupported-operation error in `cloud_api_wrapper.py`
+**Related Issue:** [#3401] Add Delete File Tool to BitBucket Toolkit (parity with GitHub/GitLab/ADO Repos)
+
+#### Class: `TestBitbucketAPIWrapperDeleteFile` — `BitbucketAPIWrapper.delete_file` orchestration
+
+| Test Method | Scenario | Expected Outcome |
+|-------------|----------|-----------------|
+| `test_deletes_existing_file` | File exists on branch | Delegates to backend with a default `Delete {path}` commit message ✅ |
+| `test_uses_provided_commit_message` | Caller supplies `commit_message` | Backend receives the caller-supplied message ✅ |
+| `test_falls_back_to_active_branch_when_branch_empty` | `branch=None` | Uses `self._active_branch` ✅ |
+| `test_raises_when_file_does_not_exist` | File missing on branch | Raises `ToolException` before calling the backend delete ❌ |
+| `test_wraps_backend_error_from_delete` | Backend raises a generic `Exception` | Wrapped into a descriptive `ToolException` ❌ |
+| `test_propagates_tool_exception_from_backend_unchanged` | Backend raises `ToolException` (e.g. Server limitation) | Re-raised unchanged, message preserved ❌ |
+
+#### Class: `TestBitbucketCloudApiDeleteFile` — `BitbucketCloudApi.delete_file`
+
+| Test Method | Scenario | Expected Outcome |
+|-------------|----------|-----------------|
+| `test_posts_files_field_without_content_to_mark_deletion` | Delete a file, no commit message | POSTs to `src` with `{"branch", "files"}` and no content field for that path (Bitbucket Cloud's documented deletion convention) ✅ |
+| `test_includes_commit_message_when_provided` | Delete with a `commit_message` | Adds a `message` field to the form data ✅ |
+
+#### Class: `TestBitbucketServerApiDeleteFile` — `BitbucketServerApi.delete_file`
+
+| Test Method | Scenario | Expected Outcome |
+|-------------|----------|-----------------|
+| `test_raises_tool_exception_explaining_platform_limitation` | Any delete attempt | Raises `ToolException` explaining Bitbucket Server's REST API has no file-deletion endpoint ❌ |
 
 ### `test_bitbucket_rate_limit.py`
 
@@ -105,5 +136,5 @@ retry_on_rate_limit decorated call
 
 ---
 
-*Last updated: 2026-04-27*
+*Last updated: 2026-08-13*
 
