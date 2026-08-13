@@ -28,11 +28,12 @@ def decode_text(data: bytes) -> str:
     if encoding is not None and confidence >= _CHARDET_MIN_CONFIDENCE:
         try:
             return data.decode(encoding)
-        except Exception as e:  # pylint: disable=broad-except
-            raise ValueError(
-                f"Could not decode bytes with detected encoding '{encoding}' "
-                f"(confidence {confidence:.2f}): {e}"
-            ) from e
+        except Exception:  # pylint: disable=broad-except
+            # The sample (first _CHARDET_SAMPLE_SIZE bytes) can be pure-ASCII
+            # while non-ASCII content appears later in the file, so a
+            # confident-but-wrong detection (e.g. 'ascii') is expected, not
+            # exceptional — fall through to UTF-8 like the low-confidence path.
+            pass
     try:
         return data.decode('utf-8')
     except UnicodeDecodeError as e:

@@ -593,7 +593,10 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 raise
             return self._excel_over_limit_response(e.estimate, filename=full_key, requested=requested)
 
-        # Apply line range slicing if requested (for text content only)
+        # Apply line range slicing if requested (for text content only).
+        # full_content keeps the pre-slice string so over-limit guidance can
+        # still report the whole file's total_lines, not just the slice's.
+        full_content = content if isinstance(content, str) else None
         if isinstance(content, str) and (start_line is not None or end_line is not None):
             offset = start_line if start_line is not None else 1
             limit = (end_line - offset + 1) if end_line is not None else None
@@ -615,8 +618,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         actual_chars = self._measure_content_chars(content)
         if actual_chars > self.max_single_read_size:
             return self._over_limit_response(
-                content, full_key, actual_chars=actual_chars, requested=requested,
-                had_range=(start_line is not None or end_line is not None),
+                full_key, actual_chars=actual_chars, requested=requested,
+                full_content=full_content,
             )
 
         return content
@@ -633,17 +636,22 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         except (TypeError, ValueError):
             return len(str(content))
 
-    def _over_limit_response(self, content, full_key: str, *, actual_chars: int,
-                             requested: str, had_range: bool) -> dict:
+    def _over_limit_response(self, full_key: str, *, actual_chars: int,
+                             requested: str,
+                             full_content: Optional[str] = None) -> dict:
         """Build the structured content_too_large guidance object."""
-        metadata = get_file_metadata_dict(full_key, file_content=None)
+        # Pass the whole (pre-slice) file so total_lines/read_limits reflect
+        # the real file rather than defaulting to 0/empty when None is passed.
+        metadata_content = full_content.encode('utf-8') if full_content is not None else None
+        metadata = get_file_metadata_dict(full_key, file_content=metadata_content)
         if metadata.get(RESULT_STATUS_KEY) == ResultStatus.ERROR.value:
             return metadata
 
-        # Skip for page/row-oriented units (PDF/PPTX/Excel) — a line count
-        # there would be meaningless next to unit="pages"/"rows".
-        if isinstance(content, str) and not had_range and metadata.get("unit") in (None, "lines"):
-            total_lines = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
+        # Only recompute if the loader's own get_file_metadata didn't already
+        # count lines from this same full_content (avoids a redundant O(n) scan).
+        if (full_content is not None and "total_lines" not in metadata
+                and metadata.get("unit") in (None, "lines")):
+            total_lines = full_content.count('\n') + (1 if full_content and not full_content.endswith('\n') else 0)
             metadata["total_lines"] = total_lines
             metadata["unit"] = "lines"
 
