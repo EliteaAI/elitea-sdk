@@ -1210,7 +1210,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     failed_names.append(file_name)
                     continue
                 if not attachment_bytes:
-                    self._track_dependent_item_skipped(file_name)
+                    self._track_skipped_attachment(file_name, reason="empty")
                     failed_names.append(file_name)
                     continue
                 logger.debug(

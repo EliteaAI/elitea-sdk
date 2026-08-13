@@ -39,6 +39,7 @@ class TestAttachmentTracking:
             ("filtered", "dependent_items_filtered"),
             ("unsupported", "dependent_items_unsupported"),
             ("extension", "dependent_items_unsupported"),
+            ("empty", "dependent_items_empty"),
             ("error", "dependent_items_skipped"),
         ],
     )
@@ -51,6 +52,7 @@ class TestAttachmentTracking:
         toolkit._track_skipped_attachment("a.png", reason="filtered")
         toolkit._track_skipped_attachment("b.ai", reason="unsupported")
         toolkit._track_skipped_attachment("c.zip", reason="error")
+        toolkit._track_skipped_attachment("d.txt", reason="empty")
 
         assert toolkit.get_indexing_stats().to_dict()["total_skipped"] == 0
 

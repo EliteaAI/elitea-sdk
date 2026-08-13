@@ -1202,30 +1202,25 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         # Phase 2: Batch fetch image URLs by scale (parallel for multiple scale groups)
         all_image_urls: Dict[str, str] = {}
 
+        def fetch_for_scale(scale_str: str, node_ids: List[str]) -> Dict[str, str]:
+            scale = float(scale_str)
+            try:
+                return self._get_file_images_with_scale(
+                    file_key, node_ids, scale=scale, debug_logger=log
+                )
+            except Exception as e:
+                log.warning(f"Failed to fetch images at scale {scale_str}: {e}")
+                for node_id in node_ids:
+                    self._track_dependent_item_skipped(node_id)
+                return {}
+
         if len(scale_groups) <= 1:
             # Zero or one scale group - no need for threading overhead
             for scale_str, node_ids in scale_groups.items():
-                scale = float(scale_str)
-                try:
-                    images = self._get_file_images_with_scale(
-                        file_key, node_ids, scale=scale, debug_logger=log
-                    )
-                    all_image_urls.update(images)
-                except Exception as e:
-                    log.warning(f"Failed to fetch images at scale {scale_str}: {e}")
+                all_image_urls.update(fetch_for_scale(scale_str, node_ids))
         else:
             # Multiple scale groups - fetch in parallel
             from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            def fetch_for_scale(scale_str: str, node_ids: List[str]) -> Dict[str, str]:
-                scale = float(scale_str)
-                try:
-                    return self._get_file_images_with_scale(
-                        file_key, node_ids, scale=scale, debug_logger=log
-                    )
-                except Exception as e:
-                    log.warning(f"Failed to fetch images at scale {scale_str}: {e}")
-                    return {}
 
             with ThreadPoolExecutor(max_workers=len(scale_groups)) as executor:
                 futures = {
@@ -1234,8 +1229,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 }
                 for future in as_completed(futures):
                     try:
-                        images = future.result()
-                        all_image_urls.update(images)
+                        all_image_urls.update(future.result())
                     except Exception as e:
                         log.warning(f"Image fetch future failed: {e}")
                         for node_id in scale_groups[futures[future]]:

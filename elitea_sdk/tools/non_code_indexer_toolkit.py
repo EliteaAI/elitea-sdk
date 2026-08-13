@@ -128,6 +128,7 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
             attachment_name: Name shown in the report.
             reason: 'filtered' when a configured include/skip pattern excluded it,
                     'unsupported' when its format cannot be indexed at all,
+                    'empty' when it held no indexable content,
                     anything else for a genuine failure.
         """
         if not hasattr(self, '_indexing_stats'):
@@ -136,6 +137,8 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
             self._indexing_stats.dependent_items_filtered.add(attachment_name)
         elif reason in ("unsupported", "extension"):
             self._indexing_stats.dependent_items_unsupported.add(attachment_name)
+        elif reason == "empty":
+            self._indexing_stats.dependent_items_empty.add(attachment_name)
         else:
             self._indexing_stats.dependent_items_skipped.add(attachment_name)
 

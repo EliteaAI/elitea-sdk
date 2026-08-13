@@ -25,7 +25,6 @@ from elitea_sdk.tools.base_indexer_toolkit import (
     REPORT_ITEMS_SAMPLE_SIZE,
     REPORT_VERSION,
     BaseIndexerToolkit,
-    IndexingOperation,
     IndexingStats,
     IndexingStatus,
     ReportKind,
@@ -60,7 +59,6 @@ def build_stats(**overrides) -> IndexingStats:
 def make_report(stats: IndexingStats, indexed_count: int = 0, **overrides):
     kwargs = dict(
         status=IndexingStatus.OK,
-        operation=IndexingOperation.INDEX,
         indexed_count=indexed_count,
         item_labels=PAGE_LABELS,
         dependent_labels=ATTACHMENT_LABELS,
@@ -81,12 +79,11 @@ def group(report, kind: ReportKind, reason: str, dependent: bool = False):
 
 
 class TestReportStructure:
-    def test_envelope_carries_version_status_operation_and_labels(self):
-        report = make_report(build_stats(), indexed_count=3, operation=IndexingOperation.SCHEDULED_REINDEX)
+    def test_envelope_carries_version_status_and_labels(self):
+        report = make_report(build_stats(), indexed_count=3)
 
         assert report["version"] == REPORT_VERSION
         assert report["status"] == "ok"
-        assert report["operation"] == "scheduled_reindex"
         assert report["item_labels"] == {"singular": "page", "plural": "pages"}
         assert report["dependent_labels"] == {"singular": "attachment", "plural": "attachments"}
 
@@ -118,14 +115,16 @@ class TestStatsMapping:
         assert group(report, ReportKind.SKIPPED, "blacklisted")["count"] == 1
         assert group(report, ReportKind.SKIPPED, "empty")["count"] == 1
 
-    def test_unchanged_documents_are_a_skipped_group_and_their_own_total(self):
+    def test_unchanged_documents_are_listed_but_never_counted_as_skipped(self):
+        """They are in the store, so no consumer should have to subtract them back out."""
         stats = build_stats(documents_already_indexed={"one", "two"})
 
         report = make_report(stats, indexed_count=5)
 
         assert group(report, ReportKind.SKIPPED, "unchanged")["count"] == 2
         assert report["totals"]["unchanged"] == 2
-        assert report["totals"]["skipped"] == 2
+        assert report["totals"]["skipped"] == 0
+        assert report["totals"]["total"] == 7
 
     def test_unsupported_extensions_from_both_sets_merge_into_one_group(self):
         stats = build_stats(
@@ -244,8 +243,11 @@ class TestTotals:
 
         totals = make_report(stats, indexed_count=20)["totals"]
 
-        assert totals["total"] == totals["indexed"] + totals["skipped"] + totals["not_indexed"] + totals["failed"]
-        assert totals["total"] == 20 + 3 + 1 + 1
+        assert totals["total"] == (
+            totals["indexed"] + totals["skipped"] + totals["not_indexed"]
+            + totals["failed"] + totals["unchanged"]
+        )
+        assert totals["total"] == 20 + 1 + 1 + 1 + 2
 
     def test_total_equals_total_fetched_from_the_same_stats(self):
         stats = build_stats(
@@ -493,13 +495,11 @@ class TestErrorReport:
     def test_error_report_carries_the_exception_and_zero_totals(self):
         report = build_error_report(
             "connection refused",
-            operation=IndexingOperation.REINDEX,
             item_labels=PAGE_LABELS,
             dependent_labels=ATTACHMENT_LABELS,
         )
 
         assert report["status"] == IndexingStatus.ERROR.value
-        assert report["operation"] == "reindex"
         assert report["errors"] == ["connection refused"]
         assert report["totals"]["total"] == 0
 
@@ -507,7 +507,7 @@ class TestErrorReport:
         stats = build_stats(documents_skipped_filtered={"a.tmp"})
 
         report = build_error_report(
-            "boom", operation=IndexingOperation.INDEX,
+            "boom",
             item_labels=PAGE_LABELS, dependent_labels=ATTACHMENT_LABELS, stats=stats,
         )
 
@@ -614,7 +614,7 @@ class TestIndexMetaPersistence:
     def test_error_report_preserves_the_previous_runs_total(self, toolkit):
         seed_completed_run(toolkit)
         error_report = build_error_report(
-            "auth failed", operation=IndexingOperation.REINDEX,
+            "auth failed",
             item_labels=PAGE_LABELS, dependent_labels=ATTACHMENT_LABELS,
         )
 
@@ -821,16 +821,16 @@ class TestIndexDataResult:
         assert stored["errors"] == ["auth failed"]
 
 
-class TestOperationResolution:
-    """The run count is recorded by index_meta_init, so these go through it rather
-    than reading the row a second time."""
+class TestPreviousRunDetection:
+    """Drives the reindex flag on the status event and the scheduled_reindex promotion.
+    index_meta_init records the count, so these go through it."""
 
-    def test_first_run_is_an_index(self, toolkit):
+    def test_a_first_run_has_no_previous_one(self, toolkit):
         toolkit.index_meta_init("x", {"index_name": "x"})
 
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.INDEX
+        assert toolkit._has_previous_index_run() is False
 
-    def test_a_platform_pre_created_row_is_still_a_first_index(self, toolkit):
+    def test_a_platform_pre_created_row_is_still_a_first_run(self, toolkit):
         """The platform creates the row with an in-progress entry before the run starts.
         Counting that as a run announced every first index as a reindex."""
         seed_completed_run(
@@ -841,7 +841,6 @@ class TestOperationResolution:
 
         toolkit.index_meta_init("x", {"index_name": "x"})
 
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.INDEX
         assert toolkit._has_previous_index_run() is False
 
     @pytest.mark.parametrize(
@@ -852,34 +851,19 @@ class TestOperationResolution:
             IndexerKeywords.INDEX_META_SCHEDULED_REINDEX.value,
         ],
     )
-    def test_any_run_that_built_an_index_makes_the_next_one_a_reindex(self, toolkit, previous_state):
+    def test_any_run_that_built_an_index_counts(self, toolkit, previous_state):
         seed_completed_run(toolkit, history=json.dumps([{"state": previous_state}]))
 
         toolkit.index_meta_init("x", {"index_name": "x"})
 
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.REINDEX
+        assert toolkit._has_previous_index_run() is True
 
-    def test_second_run_is_a_reindex(self, toolkit):
-        seed_completed_run(toolkit)
-
-        toolkit.index_meta_init("x", {"index_name": "x"})
-
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.REINDEX
-
-    def test_scheduled_reindex_is_detected(self, toolkit, monkeypatch):
-        seed_completed_run(toolkit)
-        monkeypatch.setattr(RecordingToolkit, "_is_scheduled_run", lambda self: True)
-
-        toolkit.index_meta_init("x", {"index_name": "x"})
-
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.SCHEDULED_REINDEX
-
-    def test_unreadable_history_falls_back_to_index(self, toolkit):
+    def test_unreadable_history_reads_as_no_previous_run(self, toolkit):
         seed_completed_run(toolkit, history="not json")
 
         toolkit.index_meta_init("x", {"index_name": "x"})
 
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.INDEX
+        assert toolkit._has_previous_index_run() is False
 
-    def test_resolving_without_an_init_does_not_read_the_row(self, toolkit):
-        assert toolkit._resolve_indexing_operation("x") is IndexingOperation.INDEX
+    def test_no_init_means_no_previous_run(self, toolkit):
+        assert toolkit._has_previous_index_run() is False
