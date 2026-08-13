@@ -152,6 +152,10 @@ class BitbucketApiAbstract(ABC):
         pass
 
     @abstractmethod
+    def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
+        pass
+
+    @abstractmethod
     def get_pull_request_commits(self, pr_id: str) -> List[Dict[str, Any]]:
         pass
 
@@ -304,6 +308,20 @@ class BitbucketServerApi(BitbucketApiAbstract):
             message=f"Create {file_path}",
             branch=branch,
             filename=file_path
+        )
+
+    def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
+        """Delete a file from Bitbucket Server.
+
+        Bitbucket Server's REST API (`browse/{path}` PUT, operation `editFile`) only
+        supports creating/updating file content and has no native file-deletion
+        endpoint, unlike Bitbucket Cloud's `src` endpoint. This applies to both the
+        legacy v1.0 API and the Data Center v3 API.
+        """
+        raise ToolException(
+            "Deleting a file is not supported by the Bitbucket Server REST API. "
+            "This is a platform limitation: the file-editing endpoint only supports "
+            "creating or updating file content, not removing files."
         )
 
     @retry_on_rate_limit()
@@ -650,6 +668,22 @@ class BitbucketCloudApi(BitbucketApiAbstract):
             'branch': f'{branch}',
             f'{file_path}': f'{file_contents}',
         }
+        return self.repository.post(path='src', data=form_data, files={},
+                                    headers={'Content-Type': 'application/x-www-form-urlencoded'})
+
+    @retry_on_rate_limit()
+    def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
+        """Delete a file from Bitbucket Cloud.
+
+        The `src` endpoint interprets a `files` field with no matching file-content
+        field as a request to delete that path, creating a new commit on `branch`.
+        """
+        form_data = {
+            'branch': f'{branch}',
+            'files': f'{file_path}',
+        }
+        if commit_message:
+            form_data['message'] = commit_message
         return self.repository.post(path='src', data=form_data, files={},
                                     headers={'Content-Type': 'application/x-www-form-urlencoded'})
 
