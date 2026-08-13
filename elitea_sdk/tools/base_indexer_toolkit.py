@@ -300,6 +300,11 @@ class IndexingStats:
 
         `indexed_count` is documents newly indexed THIS run; unchanged documents are
         reported separately so the breakdown never double-counts them.
+
+        Where a category has groups, its `count` is the sum of those carrying
+        `counted: true`; groups marked `counted: false` (unchanged items, and dependent
+        items belonging to a parent that is itself counted) are listed for context only.
+        The `indexed` category carries its count directly and has no groups.
         """
         categories = {
             kind: {"kind": kind.value, "count": 0, "groups": []}
@@ -324,7 +329,9 @@ class IndexingStats:
                 continue
             dependent_total += len(items)
             categories[kind]["groups"].append(
-                _build_report_group(reason, label, items, labels=dependent_labels, dependent=True)
+                _build_report_group(
+                    reason, label, items, labels=dependent_labels, dependent=True, counted=False
+                )
             )
 
         # Unchanged items are reported beside the categories, never inside `skipped`:
@@ -337,6 +344,7 @@ class IndexingStats:
                     "unchanged",
                     "Already indexed (unchanged)",
                     sorted(self.documents_already_indexed),
+                    counted=False,
                 )
             )
 
@@ -407,6 +415,7 @@ def _build_report_group(
     items: List[str],
     labels: Optional[Tuple[str, str]] = None,
     dependent: bool = False,
+    counted: bool = True,
 ) -> Dict[str, Any]:
     group = {
         "reason": reason,
@@ -416,6 +425,8 @@ def _build_report_group(
     }
     if len(items) > REPORT_ITEMS_SAMPLE_SIZE:
         group["more"] = len(items) - REPORT_ITEMS_SAMPLE_SIZE
+    if not counted:
+        group["counted"] = False
     if dependent:
         group["dependent"] = True
     if labels:

@@ -172,6 +172,59 @@ class TestStatsMapping:
         assert "more" not in group(make_report(stats), ReportKind.SKIPPED, "filtered")
 
 
+class TestCountingInvariant:
+    """Where a category has groups, its count is the sum of the counted ones — the rule
+    a consumer would otherwise have to infer from `dependent` plus a hardcoded reason.
+    `indexed` carries its count directly and has no breakdown."""
+
+    def test_every_category_count_equals_its_counted_groups(self):
+        stats = build_stats(
+            documents_skipped_filtered={"a.tmp", "b.tmp"},
+            files_skipped_empty={"c.md"},
+            documents_already_indexed={"d", "e", "f"},
+            files_unsupported_extension={"g.ai"},
+            documents_skipped_error={"h.pdf"},
+            dependent_items_filtered={"i.png"},
+            dependent_items_unsupported={"j.raw"},
+            dependent_items_empty={"k.txt"},
+            dependent_items_skipped={"l.zip"},
+        )
+
+        report = make_report(stats, indexed_count=9)
+
+        for item in report["categories"]:
+            if not item["groups"]:
+                continue
+            counted = [group for group in item["groups"] if group.get("counted", True)]
+            assert item["count"] == sum(group["count"] for group in counted), item["kind"]
+
+    @pytest.mark.parametrize(
+        "attribute,reason",
+        [
+            ("documents_already_indexed", "unchanged"),
+            ("dependent_items_filtered", "filtered"),
+            ("dependent_items_unsupported", "unsupported_format"),
+            ("dependent_items_empty", "empty"),
+            ("dependent_items_skipped", "processing_error"),
+        ],
+    )
+    def test_uncounted_groups_say_so(self, attribute, reason):
+        report = make_report(build_stats(**{attribute: {"x"}}), indexed_count=1)
+
+        marked = [
+            group
+            for item in report["categories"]
+            for group in item["groups"]
+            if group["reason"] == reason and group.get("counted") is False
+        ]
+        assert marked, f"{attribute} should be reported as uncounted"
+
+    def test_counted_groups_carry_no_flag(self):
+        report = make_report(build_stats(documents_skipped_filtered={"a.tmp"}))
+
+        assert "counted" not in group(report, ReportKind.SKIPPED, "filtered")
+
+
 class TestDependentItems:
     def test_dependent_group_is_uncounted_and_carries_its_own_labels(self):
         stats = build_stats(dependent_items_skipped={"a.raw", "b.raw", "c.raw", "d.raw"})
