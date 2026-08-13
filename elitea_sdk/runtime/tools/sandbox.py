@@ -330,6 +330,20 @@ class PyodideSandboxTool(BaseTool):
     def _initialize_sandbox(self) -> None:
         """Initialize the PyodideSandbox instance with optimized settings"""
         try:
+            sandbox_url = os.environ.get("SANDBOX_SERVICE_URL")
+            if sandbox_url:
+                from ..langchain.remote_sandbox import RemoteSandbox
+                tenant_id = "unknown"
+                if self.elitea_client and hasattr(self.elitea_client, "project_id"):
+                    tenant_id = str(self.elitea_client.project_id)
+                self._sandbox = RemoteSandbox(
+                    url=sandbox_url,
+                    auth_token=os.environ.get("SANDBOX_AUTH_TOKEN", ""),
+                    tenant_id=tenant_id,
+                )
+                logger.info("RemoteSandbox initialized (url=%s)", sandbox_url)
+                return
+
             # Check if Deno is available
             if not _is_deno_available():
                 error_msg = (
@@ -409,38 +423,44 @@ class PyodideSandboxTool(BaseTool):
                 limits = _read_sandbox_limits_from_env()
 
             # --- Admission gate (burst protection) -------------------------------
-            # Reject (soft, retriable) rather than spawn another sandbox when the
-            # box is already at capacity. Both checks read shared OS/cgroup state,
-            # are self-healing (no counter to leak), and fail OPEN on probe error.
-            max_concurrent = limits["max_concurrent"]
-            if max_concurrent and max_concurrent > 0:
-                n_deno = _count_deno_processes()
-                if n_deno >= max_concurrent:
-                    logger.warning(
-                        "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
-                        n_deno, max_concurrent,
-                    )
-                    return {
-                        "error": f"Sandbox busy: {n_deno} concurrent executions at limit "
-                                 f"{max_concurrent}. Retry shortly.",
-                        "status": "Execution failed",
-                        "execution_info": "Execution time: 0.00s",
-                    }
+            # Skip local gates when using the remote sandbox service — it handles
+            # its own concurrency and memory pressure checks.
+            from ..langchain.remote_sandbox import RemoteSandbox
+            _using_remote = isinstance(self._sandbox, RemoteSandbox)
 
-            pressure_pct = limits["memory_pressure_pct"]
-            if pressure_pct and pressure_pct > 0:
-                current_pressure = _cgroup_memory_pressure_pct()
-                if current_pressure is not None and current_pressure >= pressure_pct:
-                    logger.warning(
-                        "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
-                        current_pressure, pressure_pct,
-                    )
-                    return {
-                        "error": f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
-                                 f"{pressure_pct}%. Retry shortly.",
-                        "status": "Execution failed",
-                        "execution_info": "Execution time: 0.00s",
-                    }
+            if not _using_remote:
+                # Reject (soft, retriable) rather than spawn another sandbox when the
+                # box is already at capacity. Both checks read shared OS/cgroup state,
+                # are self-healing (no counter to leak), and fail OPEN on probe error.
+                max_concurrent = limits["max_concurrent"]
+                if max_concurrent and max_concurrent > 0:
+                    n_deno = _count_deno_processes()
+                    if n_deno >= max_concurrent:
+                        logger.warning(
+                            "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
+                            n_deno, max_concurrent,
+                        )
+                        return {
+                            "error": f"Sandbox busy: {n_deno} concurrent executions at limit "
+                                     f"{max_concurrent}. Retry shortly.",
+                            "status": "Execution failed",
+                            "execution_info": "Execution time: 0.00s",
+                        }
+
+                pressure_pct = limits["memory_pressure_pct"]
+                if pressure_pct and pressure_pct > 0:
+                    current_pressure = _cgroup_memory_pressure_pct()
+                    if current_pressure is not None and current_pressure >= pressure_pct:
+                        logger.warning(
+                            "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
+                            current_pressure, pressure_pct,
+                        )
+                        return {
+                            "error": f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
+                                     f"{pressure_pct}%. Retry shortly.",
+                            "status": "Execution failed",
+                            "execution_info": "Execution time: 0.00s",
+                        }
             # --- End admission gate ----------------------------------------------
 
             if self._sandbox is None:
