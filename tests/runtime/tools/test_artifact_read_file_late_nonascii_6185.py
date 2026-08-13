@@ -14,13 +14,17 @@ together:
      the real total_lines instead of 0.
 """
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from elitea_sdk.runtime.clients.artifact import Artifact
 from elitea_sdk.runtime.tools.artifact import ArtifactWrapper
-from elitea_sdk.tools.utils.file_metadata import RESULT_STATUS_KEY, ResultStatus
+from elitea_sdk.tools.utils.file_metadata import (
+    RESULT_STATUS_KEY,
+    ResultStatus,
+    get_file_metadata,
+)
 
 MAX = 200_000
 
@@ -120,3 +124,34 @@ def test_over_limit_guidance_with_start_line_still_reports_full_file_total_lines
 
     assert result[RESULT_STATUS_KEY] == ResultStatus.CONTENT_TOO_LARGE.value
     assert result["total_lines"] == 200
+
+
+def test_over_limit_response_does_not_recount_lines_already_supplied_by_loader():
+    # Perf: EliteAJSONLoader.get_file_metadata already counts total_lines from
+    # this same full_content via build_line_range_metadata. _over_limit_response
+    # must not redo that O(n) scan itself and overwrite the loader's value -
+    # only fill it in when the loader metadata has no total_lines key at all
+    # (e.g. unrecognized extensions).
+    small_max = 1_000
+    lines = ["line " + str(i) + ": " + "y" * 50 for i in range(100)]
+    text = "\n".join(lines)
+    file_bytes = text.encode("utf-8")
+
+    wrapper = make_real_artifact_wrapper(file_bytes)
+    wrapper.max_single_read_size = small_max
+
+    real_get_metadata = get_file_metadata
+
+    def spy_get_metadata(*args, **kwargs):
+        metadata = real_get_metadata(*args, **kwargs)
+        if metadata.get("total_lines") is not None:
+            # Sentinel: deliberately wrong so a passing test proves the value
+            # was taken verbatim from the loader, not recomputed from scratch.
+            metadata["total_lines"] = 999999
+        return metadata
+
+    with patch("elitea_sdk.runtime.tools.artifact.get_file_metadata_dict", spy_get_metadata):
+        result = wrapper.read_file(filename="work_item.json")
+
+    assert result[RESULT_STATUS_KEY] == ResultStatus.CONTENT_TOO_LARGE.value
+    assert result["total_lines"] == 999999

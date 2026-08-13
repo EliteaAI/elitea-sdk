@@ -619,7 +619,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         if actual_chars > self.max_single_read_size:
             return self._over_limit_response(
                 full_key, actual_chars=actual_chars, requested=requested,
-                had_range=(start_line is not None or end_line is not None),
                 full_content=full_content,
             )
 
@@ -638,7 +637,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             return len(str(content))
 
     def _over_limit_response(self, full_key: str, *, actual_chars: int,
-                             requested: str, had_range: bool,
+                             requested: str,
                              full_content: Optional[str] = None) -> dict:
         """Build the structured content_too_large guidance object."""
         # Pass the whole (pre-slice) file so total_lines/read_limits reflect
@@ -648,9 +647,10 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         if metadata.get(RESULT_STATUS_KEY) == ResultStatus.ERROR.value:
             return metadata
 
-        # Skip for page/row-oriented units (PDF/PPTX/Excel) — a line count
-        # there would be meaningless next to unit="pages"/"rows".
-        if full_content is not None and not had_range and metadata.get("unit") in (None, "lines"):
+        # Only recompute if the loader's own get_file_metadata didn't already
+        # count lines from this same full_content (avoids a redundant O(n) scan).
+        if (full_content is not None and "total_lines" not in metadata
+                and metadata.get("unit") in (None, "lines")):
             total_lines = full_content.count('\n') + (1 if full_content and not full_content.endswith('\n') else 0)
             metadata["total_lines"] = total_lines
             metadata["unit"] = "lines"
