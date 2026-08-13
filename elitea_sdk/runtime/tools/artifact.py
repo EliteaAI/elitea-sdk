@@ -4,7 +4,7 @@ import json
 import logging
 import mimetypes
 import re
-from typing import Any, Optional, Generator, List
+from typing import Any, Callable, Optional, Generator, List
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
@@ -72,6 +72,7 @@ SKIP_SIZE_CHECK_DEPRECATION_MSG = (
 
 
 class ArtifactWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('file', 'files')
     bucket: str
     max_single_read_size: int = DEFAULT_MAX_OUTPUT_CHARS
     artifact: Optional[Any] = None
@@ -303,7 +304,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         return fnmatch.fnmatch(filename.lower(), pattern.lower())
 
     def list_files(self, bucket_name=None, folder: str = None, recursive: bool = False,
-                   include: List[str] = None, skip: List[str] = None, return_as_string=True):
+                   include: List[str] = None, skip: List[str] = None, return_as_string=True,
+                   on_file_skipped: Optional[Callable[[str], None]] = None):
         """List files in the artifact bucket with S3 download links.
 
         Args:
@@ -320,6 +322,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             skip: Glob patterns to exclude. Same syntax as include.
                   Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
             return_as_string: If True, returns str(result), else returns dict
+            on_file_skipped: Called with the key of every file excluded by the
+                  patterns, so indexing can report what it left out.
         
         Returns:
             Dict with 'total' and 'rows', or empty list if folder doesn't exist.
@@ -355,6 +359,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 tool_name="list_files"
             )
 
+        report_skipped = on_file_skipped or (lambda file_key: None)
         filtered_files = []
         skipped_by_skip = 0
         skipped_by_include = 0
@@ -367,11 +372,13 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 # Check skip patterns first (case-insensitive)
                 if skip and any(self._fnmatch_nocase(full_key, pattern) for pattern in skip):
                     skipped_by_skip += 1
+                    report_skipped(full_key)
                     continue
 
                 # Check include patterns (case-insensitive, if specified must match)
                 if include and not any(self._fnmatch_nocase(full_key, pattern) for pattern in include):
                     skipped_by_include += 1
+                    report_skipped(full_key)
                     continue
 
                 # Add S3 download link
@@ -863,7 +870,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         }
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
-        self._init_indexing_stats()
         self._log_tool_event(message=f"Loading the files from artifact's bucket. {kwargs=}", tool_name="loader")
 
         # Extract filtering params
@@ -883,7 +889,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 recursive=True,
                 include=include_extensions,
                 skip=skip_extensions,
-                return_as_string=False
+                return_as_string=False,
+                on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered")
             )['rows']
         except Exception as e:
             raise ToolException(f"Unable to extract files: {e}")
@@ -891,7 +898,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         self._log_tool_event(message=f"Found {len(all_files)} files after filtering", tool_name="loader")
 
         for file in all_files:
-            self._track_processed_item()
             metadata = {
                 ("updated_on" if k == "modified" else k): str(v)
                 for k, v in file.items()

@@ -5,7 +5,7 @@ Two concrete implementations exist:
 - :class:`SharepointGraphWrapper` : Microsoft Graph API (delegated access — requires token + scopes)
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from langchain_core.tools import ToolException
 
@@ -65,6 +65,7 @@ class BaseSharepointWrapper(ABC):
         form_name: Optional[str] = None,
         include_extensions: Optional[List[str]] = None,
         skip_extensions: Optional[List[str]] = None,
+        on_file_skipped: Optional[Callable[[str], None]] = None,
     ):
         """Return a list of file metadata dicts from document libraries,
         including files from subfolders.
@@ -80,6 +81,8 @@ class BaseSharepointWrapper(ABC):
             skip_extensions: If provided, files whose name matches any of these
                 extension, filename, or glob-style patterns are excluded. Same
                 format as *include_extensions*.
+            on_file_skipped: Called with the name of every file excluded by the
+                filters, so indexing can report what it left out.
 
         Returns:
             list[dict] on success, :class:`ToolException` on failure.

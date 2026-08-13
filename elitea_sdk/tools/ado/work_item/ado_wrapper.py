@@ -206,6 +206,7 @@ ADOAttachFileToWorkItem = create_model(
 )
 
 class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('work item', 'work items')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str
     project: str
@@ -1331,7 +1332,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         sanitize: Optional[bool] = True,
         **kwargs,
     ) -> Generator[Document, None, None]:
-        self._init_indexing_stats()
         # Expose worker count to _save_index_generator (base-doc executor) and
         # any downstream per-doc work. Defaults to _DEFAULT_WORKERS so the tool
         # works out of the box; pass workers=1 to force serial.
@@ -1377,7 +1377,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         max_workers = max(1, self._index_workers)
         if max_workers <= 1 or len(work_item_ids) <= 1:
             for wi_id in work_item_ids:
-                self._track_processed_item()
                 yield self._fetch_work_item_document(wi_id)
             return
 
@@ -1406,7 +1405,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             while pending or ready:
                 # Drain any contiguous ready items first (in-order yield).
                 while next_yield_idx in ready:
-                    self._track_processed_item()
                     yield ready.pop(next_yield_idx)
                     next_yield_idx += 1
                 if not pending:
@@ -1418,7 +1416,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     _submit_next()
             # Drain any tail
             while next_yield_idx in ready:
-                self._track_processed_item()
                 yield ready.pop(next_yield_idx)
                 next_yield_idx += 1
         finally:

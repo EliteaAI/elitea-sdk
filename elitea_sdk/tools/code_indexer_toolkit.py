@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 class CodeIndexerToolkit(BaseIndexerToolkit):
+    index_item_labels = ('file', 'files')
+    loader_yields_chunks = True
+
     def _get_indexed_data(self, index_name: str):
         self._ensure_vectorstore_initialized()
         if not self.vector_adapter:
@@ -52,15 +55,6 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
     def _extend_data(self, documents: Generator[Document, None, None]):
         yield from documents
-
-    def get_indexing_stats(self) -> Optional[IndexingStats]:
-        """Get the indexing statistics from the last loader run."""
-        return getattr(self, '_indexing_stats', None)
-
-    def get_indexing_stats_summary(self) -> str:
-        """Get a human-readable summary of skipped files."""
-        stats = self.get_indexing_stats()
-        return stats.get_summary() if stats else ""
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""

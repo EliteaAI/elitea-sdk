@@ -337,6 +337,8 @@ class ArgsSchema(Enum):
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('file', 'files')
+    index_dependent_labels = ('image', 'images')
     # Threshold for subframe extraction: frames larger than this will have their
     # children extracted for better image quality instead of rendering the whole frame
     SUBFRAME_EXTRACT_THRESHOLD: ClassVar[int] = 15000
@@ -475,7 +477,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             frame_spatial_order: When True, processes frames in spatial order (top-to-bottom,
                 left-to-right). Default: True.
         """
-        self._init_indexing_stats()
 
         # Log model name used for indexing
         model_name = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None) or 'unknown'
@@ -544,7 +545,6 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             if metadata_threads_override is not None:
                 metadata['number_of_threads_override'] = metadata_threads_override
 
-            self._track_processed_item()
             yield Document(page_content=json.dumps(metadata), metadata=metadata)
 
     def has_image_representation(self, node):
@@ -709,9 +709,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             response = requests.get(image_url, timeout=60)
         except Exception as exc:
             log.warning(f"Download failed for node {node_id}: {exc}")
+            self._track_dependent_item_skipped(node_id or image_url)
             return None
 
         if response.status_code != 200:
+            self._track_dependent_item_skipped(node_id or image_url)
             return None
 
         content_type = response.headers.get('Content-Type', '')
@@ -731,6 +733,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             return description
         except Exception as exc:
             log.warning(f"LLM processing failed for node {node_id}: {exc}")
+            self._track_dependent_item_skipped(node_id or image_url)
             return None
 
     def _calculate_optimal_scale(
@@ -1235,6 +1238,8 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                         all_image_urls.update(images)
                     except Exception as e:
                         log.warning(f"Image fetch future failed: {e}")
+                        for node_id in scale_groups[futures[future]]:
+                            self._track_dependent_item_skipped(node_id)
 
         return all_frames, all_image_urls
 

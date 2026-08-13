@@ -256,6 +256,7 @@ def _format_wiki_response(wiki_response):
 
 
 class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('page', 'pages')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str
     project: str
@@ -846,7 +847,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                      skip_extensions: Optional[List[str]] = None,
                      workers: Optional[int] = None,
                      **kwargs) -> Generator[Document, None, None]:
-        self._init_indexing_stats()
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
 
         # Stash indexing-time flags on the instance so _process_document (called
@@ -928,7 +928,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 _submit_next()
                 self._indexing_stats.total_fetched += 1
                 logger.debug(f"[ADO wiki index] Loading page #{page_idx}: '{page_path}' (id={page_id})")
-                self._track_processed_item()
                 try:
                     page, raw_content = fut.result()
                 except Exception as e:
@@ -1159,7 +1158,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 logger.debug(
                     f"[ADO wiki index] Attachment {att_idx}/{total_attachments} skipped by extension filter for page '{parent_path}': '{file_name}'"
                 )
-                self._track_runtime_skipped(file_name, reason="extension")
+                self._track_skipped_attachment(file_name, reason="filtered")
                 continue
             eligible.append((att_idx, att_url, file_path, file_name))
 
@@ -1211,7 +1210,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     failed_names.append(file_name)
                     continue
                 if not attachment_bytes:
-                    self._track_skipped_file_empty(file_name)
+                    self._track_dependent_item_skipped(file_name)
                     failed_names.append(file_name)
                     continue
                 logger.debug(

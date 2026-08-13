@@ -506,6 +506,7 @@ def process_search_response(jira_url, response, payload_params: Dict[str, Any] =
 
 
 class JiraApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('issue', 'issues')
     base_url: str
     api_version: Optional[str] = "auto"
     api_key: Optional[SecretStr] = None,
@@ -1961,8 +1962,6 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         Uses the existing Jira client instance to fetch and process issues.
         """
         client = self._get_client()
-        # Initialize indexing stats for this run
-        self._init_indexing_stats()
 
         # Extract parameters from kwargs
         jql = kwargs.get('jql')
@@ -2015,7 +2014,6 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                             fields_to_index
                         )
                         if issue_doc:
-                            self._track_processed_item()
                             yield issue_doc
                     except Exception as e:
                         issue_key = issue.get('key', 'unknown')
@@ -2093,7 +2091,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 ext = f".{attachment['filename'].split('.')[-1].lower()}"
                 if ext in self._skipped_attachment_extensions:
                     # Track skipped attachment due to extension filter
-                    self._track_skipped_attachment(attachment['filename'], reason="extension")
+                    self._track_skipped_attachment(attachment['filename'], reason="filtered")
                     continue
 
                 attachment_id = f"attach_{attachment['id']}"

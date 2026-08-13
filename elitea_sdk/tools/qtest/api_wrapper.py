@@ -376,6 +376,7 @@ class _TimeoutApiClient(swagger_client.ApiClient):
 
 
 class QtestApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('test case', 'test cases')
     base_url: str
     qtest_project_id: int
     qtest_api_token: SecretStr
@@ -3034,7 +3035,6 @@ Examples:
         - module: Index specific module/folder by name (most deterministic)
         - full: Full project traversal with pagination
         """
-        self._init_indexing_stats()
         self._chunking_tool = kwargs.get('chunking_tool', 'markdown')
         self._extract_images = kwargs.get('extract_images', False)
         self._image_prompt = kwargs.get('image_prompt', None)
@@ -3101,7 +3101,6 @@ Examples:
                     break
                     
                 for item in items:
-                    self._track_processed_item()
                     yield self._create_test_case_document(item)
 
                 # Check for next page
@@ -3142,7 +3141,6 @@ Examples:
                     break
                     
                 for item in items:
-                    self._track_processed_item()
                     yield self._create_test_case_document(item)
 
                 if len(items) < self.no_of_items_per_page:
@@ -3179,7 +3177,6 @@ Examples:
                     break
                     
                 for item in items:
-                    self._track_processed_item()
                     yield self._create_test_case_document(item)
 
                 if len(items) < self.no_of_items_per_page:
