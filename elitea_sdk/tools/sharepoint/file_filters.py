@@ -1,7 +1,12 @@
 """Filename filter helpers for SharePoint file listing."""
 
 import re
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
+
+
+def skip_reporter(on_file_skipped: Optional[Callable[[str], None]]) -> Callable[[str], None]:
+    """Callback for names the filters excluded, usable without a None check."""
+    return on_file_skipped or (lambda file_name: None)
 
 
 def normalize_extension_filters(extensions: Optional[Sequence[str]]) -> list[str]:

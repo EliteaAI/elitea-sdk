@@ -245,6 +245,7 @@ class _StyledView:
 
 
 class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('page', 'pages')
     # Changed from PrivateAttr to Optional field with exclude=True
     client: Optional[Any] = Field(default=None, exclude=True)
     base_url: str
@@ -1167,9 +1168,6 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         from .loader import EliteAConfluenceLoader
         from copy import copy
 
-        # Initialize indexing stats for this run
-        self._init_indexing_stats()
-
         content_format = kwargs.get('content_format', 'view').lower()
 
         self._index_include_attachments = kwargs.get('include_attachments', False)
@@ -1216,7 +1214,6 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                         logger.warning(
                             f"Failed to fetch attachments for page {page_id}: {e}."
                         )
-            self._track_processed_item()
             yield document
 
     def _attachment_passes_extension_filters(self, title: str) -> bool:
@@ -1273,7 +1270,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     file_ext = title.lower().split('.')[-1] if '.' in title else ''
 
                     if not self._attachment_passes_extension_filters(title):
-                        self._track_skipped_attachment(title, reason="extension")
+                        self._track_skipped_attachment(title, reason="filtered")
                         continue
 
                     media_type = attachment.get('metadata', {}).get('mediaType', '')
