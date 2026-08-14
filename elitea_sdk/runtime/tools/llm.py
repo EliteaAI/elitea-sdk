@@ -1621,6 +1621,11 @@ class LLMNode(BaseTool):
                 self.__perform_tool_calling(
                     completion, messages, llm_client, config,
                     hitl_decisions=hitl_decisions,
+                    pending_hitl_entries=(
+                        hitl_ctx.get('parallel_pending')
+                        if hitl_ctx and isinstance(hitl_ctx.get('parallel_pending'), list)
+                        else None
+                    ),
                     pending_capture_base=_durable_base_count,
                     parked_holder=parked_holder,
                 )
@@ -2326,9 +2331,10 @@ class LLMNode(BaseTool):
         if not tool_calls or len(tool_calls) < 2:
             return None
         decision_ids = {
-            d.get('tool_call_id')
+            d.get(HITL_VIA_CALL_ID_KEY) or d.get(HITL_TOOL_CALL_ID_KEY)
             for d in (hitl_decisions or [])
-            if isinstance(d, dict) and d.get('tool_call_id')
+            if isinstance(d, dict)
+            and (d.get(HITL_VIA_CALL_ID_KEY) or d.get(HITL_TOOL_CALL_ID_KEY))
         }
         specs = []
         for tool_call in tool_calls:
@@ -2564,7 +2570,7 @@ class LLMNode(BaseTool):
 
     async def _run_parallel_application_calls(
         self, app_specs, new_messages, config, hitl_decisions=None,
-        pending_capture_start=0,
+        pending_capture_start=0, pending_hitl_entries=None,
     ):
         """Execute multiple Application (sub-agent) tool calls concurrently.
 
@@ -2615,6 +2621,59 @@ class LLMNode(BaseTool):
             elif tcid:
                 decisions_by_id[tcid] = decision
 
+        # A partial root resume replays the complete gather node. Do not invoke
+        # children that are still paused and did not receive this decision: a
+        # normal Application invocation against their interrupted checkpoint
+        # starts/replans the child and can generate fresh nested tool-call ids.
+        # Reconstruct their prior deferred sentinels from the root checkpoint
+        # instead. Selected children still resume normally below.
+        prior_direct_by_id: Dict[str, list] = {}
+        prior_nested_by_via_id: Dict[str, list] = {}
+        for raw_entry in (pending_hitl_entries or []):
+            if not isinstance(raw_entry, dict):
+                continue
+            via_id = raw_entry.get(HITL_VIA_CALL_ID_KEY)
+            tool_call_id = raw_entry.get(HITL_TOOL_CALL_ID_KEY)
+            if via_id:
+                prior_nested_by_via_id.setdefault(via_id, []).append(raw_entry)
+            elif tool_call_id:
+                prior_direct_by_id.setdefault(tool_call_id, []).append(raw_entry)
+
+        def _restore_child_entry(raw_entry: dict) -> dict:
+            entry = dict(raw_entry)
+            entry.pop(HITL_VIA_CALL_ID_KEY, None)
+            nested_interrupt_id = entry.pop(HITL_NESTED_INTERRUPT_ID_KEY, None)
+            if nested_interrupt_id:
+                entry[HITL_INTERRUPT_ID_KEY] = nested_interrupt_id
+            return entry
+
+        def _prior_deferred_interrupt(tool_call_id: str):
+            nested_entries = prior_nested_by_via_id.get(tool_call_id) or []
+            if nested_entries:
+                pending = [_restore_child_entry(entry) for entry in nested_entries]
+                guardrail_types = {
+                    entry.get('guardrail_type') for entry in pending
+                    if entry.get('guardrail_type')
+                }
+                if guardrail_types == {'mcp_auth'}:
+                    guardrail_type = 'parallel_mcp_auth'
+                elif guardrail_types == {'sensitive_tool'}:
+                    guardrail_type = 'parallel_sensitive_tools'
+                else:
+                    guardrail_type = 'parallel_guardrails'
+                return {
+                    'type': 'hitl',
+                    'guardrail_type': guardrail_type,
+                    'message': pending[0].get(
+                        'message', 'Multiple actions require your review before continuing.',
+                    ),
+                    'pending': pending,
+                }
+            direct_entries = prior_direct_by_id.get(tool_call_id) or []
+            if direct_entries:
+                return _restore_child_entry(direct_entries[0])
+            return None
+
         loop = asyncio.get_running_loop()
 
         async def _run_one(sibling_ordinal, spec):
@@ -2626,6 +2685,18 @@ class LLMNode(BaseTool):
             child_config['metadata']['sibling_ordinal'] = sibling_ordinal
             decision = decisions_by_id.get(tool_call_id)
             grandchild_decisions = grandchild_decisions_by_via_id.get(tool_call_id)
+            prior_interrupt = _prior_deferred_interrupt(tool_call_id)
+            if decision is None and not grandchild_decisions and prior_interrupt:
+                logger.info(
+                    "[HITL] Carrying forward untouched paused child '%s' "
+                    "(tool_call_id=%s) without re-invocation",
+                    tool_name, tool_call_id,
+                )
+                return {
+                    '__hitl_deferred__': True,
+                    'hitl_interrupt': prior_interrupt,
+                    'tool_call_id': tool_call_id,
+                }
             if decision is not None:
                 # Resume this child from its checkpoint with the user's decision
                 # (the derived child thread_id is keyed by this tool_call_id).
@@ -2780,16 +2851,22 @@ class LLMNode(BaseTool):
             entry = cast(PendingHITLEntry, dict(nested_aggregate))
             entry[HITL_TOOL_CALL_ID_KEY] = tool_call_id
             nested_interrupt_id = nested_aggregate.get(HITL_INTERRUPT_ID_KEY)
+            interrupt_route_seed = str(
+                nested_interrupt_id
+                or ':'.join(filter(None, (
+                    tool_call_id,
+                    nested_aggregate.get('tool_name'),
+                    nested_aggregate.get('message'),
+                )))
+            )
+            # Persist the exact derivation seed even for legacy/dict-bridge
+            # children that supplied no interrupt_id. A later partial replay
+            # can then derive the SAME public id instead of hashing the already
+            # derived public id and making an untouched card look new.
+            entry[HITL_NESTED_INTERRUPT_ID_KEY] = interrupt_route_seed
             entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
                 tool_call_id,
-                str(
-                    nested_interrupt_id
-                    or ':'.join(filter(None, (
-                        tool_call_id,
-                        nested_aggregate.get('tool_name'),
-                        nested_aggregate.get('message'),
-                    )))
-                ),
+                interrupt_route_seed,
                 None if nested_interrupt_id else len(pending_payload),
             )
             # Label the paused card with the sub-agent it originated from so the
@@ -2848,8 +2925,10 @@ class LLMNode(BaseTool):
         )
         _langgraph_interrupt(aggregate)  # raises GraphInterrupt → parent pregel
 
-    async def __perform_tool_calling(self, completion, messages, llm_client, config, hitl_decisions=None,
-                                     pending_capture_base=None, parked_holder=None):
+    async def __perform_tool_calling(
+        self, completion, messages, llm_client, config, hitl_decisions=None,
+        pending_hitl_entries=None, pending_capture_base=None, parked_holder=None,
+    ):
         # Several historical branches import ToolMessage locally.  Bind it
         # before any awaited tool invocation so an exception raised before one
         # of those imports can still be converted into a guardrail result.
@@ -2958,6 +3037,7 @@ class LLMNode(BaseTool):
                         app_specs, new_messages, config,
                         hitl_decisions=hitl_decisions,
                         pending_capture_start=_pending_capture_start,
+                        pending_hitl_entries=pending_hitl_entries,
                     )
                 except GraphBubbleUp:
                     # The aggregated parallel interrupt() raised — mirror the

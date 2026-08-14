@@ -2246,6 +2246,15 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             'content': (original_ai_dict or {}).get('content', '')
                                 if isinstance(original_ai_dict, dict) else '',
                             'hitl_decisions': list(decisions),
+                            # The node replays every Application call in the
+                            # original fan-out. Keep the checkpoint-authoritative
+                            # pending set so untouched children can be carried
+                            # forward without invoking them again.
+                            'parallel_pending': [
+                                dict(entry)
+                                for entry in (hitl_interrupt.get('pending') or [])
+                                if isinstance(entry, dict)
+                            ],
                             # Application._run stamps bubbled child aggregates.
                             # In that sequential bridge the wrapper's own
                             # interrupt() must consume the current Command value;

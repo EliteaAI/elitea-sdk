@@ -3503,6 +3503,126 @@ def test_real_parallel_containers_route_duplicate_leaf_ids_through_nested_interr
     assert len(x_executions) == 1 and len(y_executions) == 1
 
 
+def test_partial_nested_parallel_resume_does_not_reinvoke_paused_siblings():
+    """A -> (B1, B2) -> (C1, C2) resumes one leaf without replaying 3 peers.
+
+    The root aggregate is one LangGraph interrupt, so its node is replayed for
+    every partial decision.  Paused applications that did not receive that
+    decision must be carried forward from the checkpoint payload rather than
+    invoked again inside the replayed ``asyncio.gather`` batch.
+    """
+    def _two_pausing_leaf_container(label):
+        first_executions = []
+        second_executions = []
+        first = _RecordingDictBridgeApplication(
+            'leaf-done-result', f'{label}_first_op', first_executions,
+        )
+        second = _RecordingDictBridgeApplication(
+            'leaf-pause-result', f'{label}_second_op', second_executions,
+        )
+        runnable, _, _, _ = _build_real_container_runnable(
+            second_executions,
+            leaf_done_app=first,
+            leaf_pause_app=second,
+        )
+        return runnable, first, second, first_executions, second_executions
+
+    x = _two_pausing_leaf_container('x')
+    y = _two_pausing_leaf_container('y')
+
+    def _container_tool(name, runnable):
+        return Application(
+            name=name,
+            description=f'{name} real compiled container',
+            application=runnable,
+            return_type='str',
+            client=FakeApplicationClient(runnable),
+            is_subgraph=True,
+            args_runnable={
+                'application_id': name,
+                'application_version_id': 1,
+                'is_subgraph': True,
+            },
+        )
+
+    tools = [
+        _container_tool('container_x', x[0]),
+        _container_tool('container_y', y[0]),
+    ]
+    memory = MemorySaver()
+    config = {'configurable': {'thread_id': 'partial-nested-parallel'}}
+    initial = _build_parent_runnable(
+        memory,
+        MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y'),
+        tools,
+    ).invoke(
+        {'messages': [HumanMessage(content='Delegate both containers')]},
+        config=config,
+    )
+
+    assert initial['execution_finished'] is False
+    assert len(initial['hitl_interrupts']) == 4
+    selected = initial['hitl_interrupts'][0]
+    original_ids = {entry['interrupt_id'] for entry in initial['hitl_interrupts']}
+
+    after_one = _build_parent_runnable(
+        memory,
+        MultiAppParentLLM('container_x', 'container_y', 'call-X', 'call-Y'),
+        tools,
+    ).invoke(
+        {'hitl_decisions': [{
+            'interrupt_id': selected['interrupt_id'],
+            'tool_call_id': selected['tool_call_id'],
+            'action': 'approve',
+            'value': '',
+        }]},
+        config=config,
+    )
+
+    assert after_one['execution_finished'] is False
+    assert len(after_one['hitl_interrupts']) == 3
+    assert {entry['interrupt_id'] for entry in after_one['hitl_interrupts']} == (
+        original_ids - {selected['interrupt_id']}
+    )
+    assert len(x[1].calls) == 2  # initial pause + selected resume
+    assert len(x[2].calls) == 1
+    assert len(y[1].calls) == 1
+    assert len(y[2].calls) == 1
+    assert len(x[3]) == 1
+    assert x[4] == [] and y[3] == [] and y[4] == []
+
+    current = after_one
+    while current.get('hitl_interrupts'):
+        next_entry = current['hitl_interrupts'][0]
+        previous_ids = {
+            entry['interrupt_id'] for entry in current['hitl_interrupts']
+        }
+        current = _build_parent_runnable(
+            memory,
+            MultiAppParentLLM(
+                'container_x', 'container_y', 'call-X', 'call-Y',
+            ),
+            tools,
+        ).invoke(
+            {'hitl_decisions': [{
+                'interrupt_id': next_entry['interrupt_id'],
+                'tool_call_id': next_entry['tool_call_id'],
+                'action': 'approve',
+                'value': '',
+            }]},
+            config=config,
+        )
+        remaining = current.get('hitl_interrupts') or []
+        assert {entry['interrupt_id'] for entry in remaining} == (
+            previous_ids - {next_entry['interrupt_id']}
+        )
+
+    assert current['execution_finished'] is True
+    assert current['output'] == 'parent-done'
+    assert all(len(app.calls) == 2 for app in (x[1], x[2], y[1], y[2]))
+    assert all(len(executions) == 1 for executions in (x[3], x[4], y[3], y[4]))
+
+
 class _TwoRoundDictBridgeApplication:
     """A leaf that pauses on a FIRST sensitive tool, and after that decision
     diverges to a SECOND distinct sensitive tool (pauses again), then completes.
