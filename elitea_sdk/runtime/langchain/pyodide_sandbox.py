@@ -124,7 +124,6 @@ class BasePyodideSandbox:
 
     def _build_command(
         self,
-        code: str,
         *,
         session_bytes: bytes | None = None,
         session_metadata: dict | None = None,
@@ -178,8 +177,9 @@ class BasePyodideSandbox:
                 f"--unsafely-ignore-certificate-errors={','.join(insecure_tls_domains)}"
             )
 
-        # Add the package and code
-        cmd.extend([self.pkg_name, "-c", code])
+        # Add the package and stdin flag (code will be passed via stdin to avoid
+        # Linux kernel's MAX_ARG_STRLEN 128KB limit on individual CLI arguments)
+        cmd.extend([self.pkg_name, "--stdin"])
 
         # Add stateful flag
         if self.stateful:
@@ -218,7 +218,6 @@ class PyodideSandbox(BasePyodideSandbox):
         status: Literal["success", "error"] = "success"
 
         cmd = self._build_command(
-            code,
             session_bytes=session_bytes,
             session_metadata=session_metadata,
             memory_limit_mb=memory_limit_mb,
@@ -226,15 +225,25 @@ class PyodideSandbox(BasePyodideSandbox):
             insecure_tls_domains=insecure_tls_domains,
         )
 
+        try:
+            code_bytes = code.encode('utf-8')
+        except UnicodeEncodeError as e:
+            return CodeExecutionResult(
+                status="error",
+                execution_time=time.time() - start_time,
+                stderr=f"Failed to encode code as UTF-8: {e}",
+            )
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
+                process.communicate(input=code_bytes),
                 timeout=timeout_seconds,
             )
             stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -296,7 +305,6 @@ class SyncPyodideSandbox(BasePyodideSandbox):
         status: Literal["success", "error"]
 
         cmd = self._build_command(
-            code,
             session_bytes=session_bytes,
             session_metadata=session_metadata,
             memory_limit_mb=memory_limit_mb,
@@ -305,8 +313,18 @@ class SyncPyodideSandbox(BasePyodideSandbox):
         )
 
         try:
+            code_bytes = code.encode('utf-8')
+        except UnicodeEncodeError as e:
+            return CodeExecutionResult(
+                status="error",
+                execution_time=time.time() - start_time,
+                stderr=f"Failed to encode code as UTF-8: {e}",
+            )
+
+        try:
             process = subprocess.run(
                 cmd,
+                input=code_bytes,
                 capture_output=True,
                 text=False,
                 timeout=timeout_seconds,
