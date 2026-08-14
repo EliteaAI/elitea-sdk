@@ -22,6 +22,7 @@ Usage:
 import asyncio
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -149,10 +150,32 @@ class UnifiedMcpClient:
         # Create MultiServerMCPClient with single server
         self._client = MultiServerMCPClient({self._server_name: server_config})
 
-        # Create persistent session
+        # Create persistent session.
+        # session() auto-initializes the MCP session inside __aenter__ (it calls
+        # ClientSession.initialize()). Wrap it in wait_for as a hard outer bound so a
+        # stalled TCP connect or an initialize() that never resolves cannot hang the
+        # worker thread indefinitely. The per-request session read timeout set in
+        # _build_server_config bounds each MCP request; this additionally bounds the
+        # transport connect + full handshake.
         self._session_context = self._client.session(self._server_name)
         try:
-            self._session = await self._session_context.__aenter__()
+            self._session = await asyncio.wait_for(
+                self._session_context.__aenter__(),
+                timeout=self.timeout,
+            )
+        except asyncio.TimeoutError as e:
+            # Tear down the half-opened session context so we don't leak the
+            # transport/task group.
+            try:
+                await self._session_context.__aexit__(type(e), e, e.__traceback__)
+            except BaseException:
+                pass
+            self._session_context = None
+            raise TimeoutError(
+                f"Timed out after {self.timeout}s connecting to MCP server "
+                f"'{self._server_name}' at {self.url}. The server may be unreachable "
+                "or behind a login proxy that never completes the MCP handshake."
+            ) from e
         except BaseException as e:
             # langchain-mcp-adapters uses asyncio.TaskGroup internally, which wraps
             # exceptions in ExceptionGroup. Unwrap it so callers see the real error.
@@ -218,6 +241,24 @@ class UnifiedMcpClient:
             config['url'] = self.url
             if self.headers:
                 config['headers'] = self.headers
+            # Bound the MCP session's request/response wait. mcp's ClientSession
+            # defaults read_timeout_seconds=None, so send_request() uses
+            # anyio.fail_after(None) and initialize()/list_tools() can wait forever
+            # if the server accepts the connection but never returns a valid MCP
+            # response (e.g. an SSO proxy answers with a 200 HTML login page whose
+            # unexpected-content-type error is dropped instead of routed to the
+            # pending request). This makes every MCP request time-bounded.
+            config['session_kwargs'] = {
+                'read_timeout_seconds': timedelta(seconds=self.timeout)
+            }
+            # Bound transport-level HTTP/idle-stream reads too. SSEConnection takes
+            # plain floats; StreamableHttpConnection (and the 'http' alias) take timedelta.
+            if transport == 'sse':
+                config['timeout'] = float(self.timeout)
+                config['sse_read_timeout'] = float(self.timeout)
+            else:
+                config['timeout'] = timedelta(seconds=self.timeout)
+                config['sse_read_timeout'] = timedelta(seconds=self.timeout)
             # Use httpx_client_factory to disable SSL verification
             # This is the proper way to configure SSL in langchain-mcp-adapters
             if not self.ssl_verify:
@@ -296,7 +337,26 @@ class UnifiedMcpClient:
                     }
                 }
 
-                async with session.post(self.url, json=init_request, headers=headers) as response:
+                # allow_redirects=False: an OIDC/forward-auth proxy answers an
+                # unauthenticated MCP POST with a 3xx redirect to a login page
+                # instead of a proper 401 challenge. If we follow it we land on a
+                # 200 HTML login page, which the real MCP client cannot parse and
+                # which makes initialize() hang. Surface the redirect as an error.
+                async with session.post(
+                    self.url, json=init_request, headers=headers, allow_redirects=False
+                ) as response:
+                    if 300 <= response.status < 400:
+                        location = response.headers.get('Location', '')
+                        logger.warning(
+                            f"[Unified MCP] Server returned redirect ({response.status}) "
+                            f"to {location!r}: {self.url}"
+                        )
+                        raise ValueError(
+                            f"The MCP server redirected the request ({response.status}). "
+                            "This usually means the endpoint is behind an SSO/login proxy "
+                            "that is not returning a proper 401 authentication challenge. "
+                            "Please verify the server URL and authentication in the toolkit settings."
+                        )
                     if response.status == 401:
                         # Extract OAuth metadata and raise McpAuthorizationRequired
                         try:
@@ -352,6 +412,23 @@ class UnifiedMcpClient:
                             f"The MCP server returned an error ({response.status}). "
                             "Please verify the server URL and try again."
                         )
+                    else:
+                        # 2xx but not a valid MCP response. A login proxy may serve an
+                        # HTML page with 200 OK; the real MCP client would treat this as
+                        # an "unexpected content type", drop the error, and hang. Detect
+                        # the HTML content-type here and fail fast instead.
+                        content_type = response.headers.get('Content-Type', '').lower()
+                        if 'text/html' in content_type:
+                            logger.warning(
+                                f"[Unified MCP] Server returned HTML ({content_type}) with "
+                                f"status {response.status} instead of an MCP response: {self.url}"
+                            )
+                            raise ValueError(
+                                "The MCP server returned an HTML page instead of an MCP/JSON "
+                                "response. This usually means the endpoint is behind an SSO/login "
+                                "proxy. Please verify the server URL and authentication in the "
+                                "toolkit settings."
+                            )
                     # Not a 401/400 auth error, auth check passed (or server will handle auth differently)
 
         except (McpAuthorizationRequired, ValueError):

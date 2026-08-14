@@ -18,7 +18,7 @@ import math
 import os
 import re
 import time
-from typing import Any, Dict, Optional, List, Tuple, Union
+from typing import Any, Callable, Dict, Optional, List, Tuple, Union
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
 import requests
@@ -619,7 +619,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                        limit_files: int = 100,
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
-                       skip_extensions: Optional[List[str]] = None):
+                       skip_extensions: Optional[List[str]] = None,
+                       on_file_skipped: Optional[Callable[[str], None]] = None):
         """
         Lists all files including files from subfolders across **all document
         libraries** on the site.
@@ -650,6 +651,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """
         from .file_filters import (
             matches_extension_filter,
+            skip_reporter,
             normalize_extension_filters,
         )
         from urllib.parse import unquote as _unquote
@@ -662,6 +664,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
 
             norm_include = normalize_extension_filters(include_extensions)
             norm_skip = normalize_extension_filters(skip_extensions)
+            _report_skipped = skip_reporter(on_file_skipped)
 
             params = {
                 "$top": 999,
@@ -752,8 +755,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                             continue
                         file_name = item.get('name', '')
                         if norm_skip and matches_extension_filter(file_name, norm_skip):
+                            _report_skipped(file_name)
                             continue
                         if norm_include and not matches_extension_filter(file_name, norm_include):
+                            _report_skipped(file_name)
                             continue
                         parent_path = item.get('parentReference', {}).get('path', '')
                         result.append({

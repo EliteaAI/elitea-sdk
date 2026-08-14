@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from io import BytesIO
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from langchain_core.tools import ToolException
 
@@ -303,7 +303,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                        limit_files: int = 100,
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
-                       skip_extensions: Optional[List[str]] = None):
+                       skip_extensions: Optional[List[str]] = None,
+                       on_file_skipped: Optional[Callable[[str], None]] = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder; otherwise lists
@@ -324,6 +325,7 @@ class SharepointRestWrapper(BaseSharepointWrapper):
         """
         from .file_filters import (
             matches_extension_filter,
+            skip_reporter,
             normalize_extension_filters,
         )
         try:
@@ -337,7 +339,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         self.site_url, folder_name, limit_files,
                         include_extensions=include_extensions,
                         skip_extensions=skip_extensions,
-                        form_name=form_name)
+                        form_name=form_name,
+                        on_file_skipped=on_file_skipped)
                     logging.info(
                         "[SP-REST][get_files_list] Graph fast path — files=%d time=%.3fs",
                         len(graph_result), time.perf_counter() - _t_graph)
@@ -360,6 +363,7 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             limit_files = limit_files or 100
             norm_include = normalize_extension_filters(include_extensions)
             norm_skip = normalize_extension_filters(skip_extensions)
+            _report_skipped = skip_reporter(on_file_skipped)
 
             site_segments = [s for s in self.site_url.strip('/').split('/') if s][-2:]
             full_path_prefix = '/'.join(site_segments)
@@ -414,8 +418,10 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         break
                     file_name = file.properties['Name']
                     if norm_skip and matches_extension_filter(file_name, norm_skip):
+                        _report_skipped(file_name)
                         continue
                     if norm_include and not matches_extension_filter(file_name, norm_include):
+                        _report_skipped(file_name)
                         continue
                     # Convert datetime to ISO string for JSON serialization
                     created = file.properties['TimeCreated']
@@ -439,7 +445,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         self.site_url, folder_name, limit_files,
                         include_extensions=include_extensions,
                         skip_extensions=skip_extensions,
-                        form_name=form_name)
+                        form_name=form_name,
+                        on_file_skipped=on_file_skipped)
                     logging.info(
                         "[SP-REST][get_files_list] Graph fallback — files=%d time=%.3fs",
                         len(graph_result), time.perf_counter() - _t_graph)

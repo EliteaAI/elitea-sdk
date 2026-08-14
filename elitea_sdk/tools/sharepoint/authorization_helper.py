@@ -11,6 +11,7 @@ from botocore.response import get_response
 from .file_filters import (
     matches_extension_filter,
     normalize_extension_filters,
+    skip_reporter,
 )
 
 
@@ -141,7 +142,8 @@ class SharepointAuthorizationHelper:
             raise RuntimeError(f"Error while obtaining access_token and site_id: {e}")
 
     def get_files_list(self, site_url: str, folder_name: str = None, limit_files: int = 100,
-                       include_extensions=None, skip_extensions=None, form_name: str = None):
+                       include_extensions=None, skip_extensions=None, form_name: str = None,
+                       on_file_skipped=None):
         if not site_url or not site_url.startswith("https://"):
             raise ValueError(f"Invalid site_url format: {site_url}")
         if limit_files is not None and (not isinstance(limit_files, int) or limit_files <= 0):
@@ -149,6 +151,7 @@ class SharepointAuthorizationHelper:
 
         norm_include = normalize_extension_filters(include_extensions)
         norm_skip = normalize_extension_filters(skip_extensions)
+        _report_skipped = skip_reporter(on_file_skipped)
         try:
             access_token, site_id = self.generate_token_and_site_id(site_url)
             headers = {"Authorization": f"Bearer {access_token}"}
@@ -198,8 +201,10 @@ class SharepointAuthorizationHelper:
                         else:
                             # Apply extension, filename, and glob-style filters.
                             if norm_skip and matches_extension_filter(file_name, norm_skip):
+                                _report_skipped(file_name)
                                 continue
                             if norm_include and not matches_extension_filter(file_name, norm_include):
+                                _report_skipped(file_name)
                                 continue
                             files.append(temp_props)
                         if limit_files is not None and len(result) + len(files) >= limit_files:

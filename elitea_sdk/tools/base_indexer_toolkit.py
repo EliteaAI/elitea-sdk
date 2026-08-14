@@ -1,12 +1,13 @@
 import copy
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, List, Dict, Generator, Set
+from typing import Any, ClassVar, Optional, List, Dict, Generator, Set, Tuple
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
@@ -27,6 +28,42 @@ from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from ..runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
+
+REPORT_VERSION = 1
+REPORT_ITEMS_SAMPLE_SIZE = 5
+REPORT_ERRORS_SAMPLE_SIZE = 5
+REPORT_ERROR_MAX_LENGTH = 500
+
+# SQLAlchemy embeds the failing statement and its bound parameters into every
+# exception message. One failing batch of 20 chunks therefore yields a distinct
+# multi-KB string per batch, which would otherwise be copied into index_meta, every
+# history snapshot, the socket event and the tool result.
+_ERROR_DETAIL_TAIL = re.compile(r"\s*(\[SQL:|\[parameters:|\(Background on this error).*", re.DOTALL)
+
+
+class IndexingStatus(str, Enum):
+    """Outcome of an indexing run. Shared by the tool result and the report it carries
+    so the two can never disagree about the same run."""
+    OK = "ok"
+    PARTLY_INDEXED = "partly_indexed"
+    ERROR = "error"
+
+
+# Kept in step with the UI's RUNNABLE_INDEX_STATUSES.
+COMPLETED_INDEX_STATES = frozenset({
+    IndexerKeywords.INDEX_META_COMPLETED.value,
+    IndexerKeywords.INDEX_META_PARTLY_OK.value,
+    IndexerKeywords.INDEX_META_SCHEDULED_REINDEX.value,
+})
+
+
+class ReportKind(str, Enum):
+    """Closed set of report categories. Drives icon and color in every renderer,
+    so new tracking reasons must map onto one of these rather than extend the set."""
+    INDEXED = "indexed"
+    SKIPPED = "skipped"
+    NOT_INDEXED = "not_indexed"
+    FAILED = "failed"
 
 
 @dataclass
@@ -70,6 +107,11 @@ class IndexingStats:
     # Dependent/child items that failed within successful parent documents
     # These are tracked separately since the parent document was still indexed
     dependent_items_skipped: Set[str] = field(default_factory=set)
+
+    # Never enter total_skipped: the parent document is what the run counts.
+    dependent_items_filtered: Set[str] = field(default_factory=set)
+    dependent_items_unsupported: Set[str] = field(default_factory=set)
+    dependent_items_empty: Set[str] = field(default_factory=set)
 
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
@@ -127,6 +169,18 @@ class IndexingStats:
             "dependent_items_skipped": {
                 "count": dependent_items_count,
                 "items": sorted(self.dependent_items_skipped),
+            },
+            "dependent_items_filtered": {
+                "count": len(self.dependent_items_filtered),
+                "items": sorted(self.dependent_items_filtered),
+            },
+            "dependent_items_unsupported": {
+                "count": len(self.dependent_items_unsupported),
+                "items": sorted(self.dependent_items_unsupported),
+            },
+            "dependent_items_empty": {
+                "count": len(self.dependent_items_empty),
+                "items": sorted(self.dependent_items_empty),
             },
             "documents_already_indexed": {
                 "count": len(self.documents_already_indexed),
@@ -235,6 +289,310 @@ class IndexingStats:
 
         return "\n".join(lines)
 
+    def build_report(
+        self,
+        status: "IndexingStatus",
+        indexed_count: int,
+        item_labels: Tuple[str, str],
+        dependent_labels: Tuple[str, str],
+        errors: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Build the canonical indexing report for this run.
+
+        `indexed_count` is documents newly indexed THIS run; unchanged documents are
+        reported separately so the breakdown never double-counts them.
+
+        Where a category has groups, its `count` is the sum of those carrying
+        `counted: true`; groups marked `counted: false` (unchanged items, and dependent
+        items belonging to a parent that is itself counted) are listed for context only.
+        The `indexed` category carries its count directly and has no groups.
+        """
+        categories = {
+            kind: {"kind": kind.value, "count": 0, "groups": []}
+            for kind in ReportKind
+        }
+        categories[ReportKind.INDEXED]["count"] = indexed_count
+
+        for kind, reason, label, attributes in _REPORT_GROUP_SPECS:
+            items = sorted(set().union(*(getattr(self, attribute) for attribute in attributes)))
+            if not items:
+                continue
+            categories[kind]["groups"].append(_build_report_group(reason, label, items))
+            categories[kind]["count"] += len(items)
+
+        # Dependent items belong to a parent that is itself counted, so they carry their
+        # own noun and contribute nothing to the category count or to the totals —
+        # counting them would make `totals.total` a documents+attachments hybrid.
+        dependent_total = 0
+        for kind, reason, label, attribute in _DEPENDENT_GROUP_SPECS:
+            items = sorted(getattr(self, attribute))
+            if not items:
+                continue
+            dependent_total += len(items)
+            categories[kind]["groups"].append(
+                _build_report_group(
+                    reason, label, items, labels=dependent_labels, dependent=True, counted=False
+                )
+            )
+
+        # Unchanged items are reported beside the categories, never inside `skipped`:
+        # they were not left out of the index, and folding them in would make every
+        # consumer subtract them back out.
+        unchanged_count = len(self.documents_already_indexed)
+        if unchanged_count:
+            categories[ReportKind.SKIPPED]["groups"].append(
+                _build_report_group(
+                    "unchanged",
+                    "Already indexed (unchanged)",
+                    sorted(self.documents_already_indexed),
+                    counted=False,
+                )
+            )
+
+        totals = {
+            "indexed": indexed_count,
+            "skipped": categories[ReportKind.SKIPPED]["count"],
+            "not_indexed": categories[ReportKind.NOT_INDEXED]["count"],
+            "failed": categories[ReportKind.FAILED]["count"],
+            "unchanged": unchanged_count,
+            "dependent_not_indexed": dependent_total,
+        }
+        totals["total"] = (
+            sum(categories[kind]["count"] for kind in ReportKind) + unchanged_count
+        )
+
+        sampled_errors, errors_total = normalize_report_errors(errors)
+        return {
+            "version": REPORT_VERSION,
+            "status": status.value,
+            "item_labels": {"singular": item_labels[0], "plural": item_labels[1]},
+            "dependent_labels": {"singular": dependent_labels[0], "plural": dependent_labels[1]},
+            "totals": totals,
+            "categories": [categories[kind] for kind in ReportKind],
+            "errors": sampled_errors,
+            "errors_total": errors_total,
+        }
+
+
+_REPORT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, Tuple[str, ...]], ...] = (
+    (ReportKind.SKIPPED, "filtered", "Excluded by configured filters",
+     ("documents_skipped_filtered",)),
+    (ReportKind.SKIPPED, "not_in_whitelist", "Not matching the configured include patterns",
+     ("files_skipped_whitelist",)),
+    (ReportKind.SKIPPED, "blacklisted", "Matching the configured exclude patterns",
+     ("files_skipped_blacklist",)),
+    (ReportKind.SKIPPED, "empty", "Contained no indexable content",
+     ("files_skipped_empty",)),
+    (ReportKind.NOT_INDEXED, "unsupported_format", "Unsupported format",
+     ("files_unsupported_extension", "runtime_skipped_extension")),
+    (ReportKind.FAILED, "read_error", "Could not be read",
+     ("files_skipped_read_error",)),
+    (ReportKind.FAILED, "processing_error", "Could not be processed",
+     ("documents_skipped_error", "runtime_skipped_error")),
+)
+
+_DEPENDENT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, str], ...] = (
+    (ReportKind.SKIPPED, "filtered", "Excluded by configured filters",
+     "dependent_items_filtered"),
+    (ReportKind.NOT_INDEXED, "unsupported_format", "Unsupported format",
+     "dependent_items_unsupported"),
+    (ReportKind.SKIPPED, "empty", "Contained no indexable content",
+     "dependent_items_empty"),
+    (ReportKind.FAILED, "processing_error", "Could not be processed",
+     "dependent_items_skipped"),
+)
+
+_CATEGORY_RENDERING = {
+    ReportKind.INDEXED: ("✓", "indexed"),
+    ReportKind.SKIPPED: ("⚠", "skipped"),
+    ReportKind.NOT_INDEXED: ("⚠", "not indexed"),
+    ReportKind.FAILED: ("✕", "failed"),
+}
+
+
+def _build_report_group(
+    reason: str,
+    label: str,
+    items: List[str],
+    labels: Optional[Tuple[str, str]] = None,
+    dependent: bool = False,
+    counted: bool = True,
+) -> Dict[str, Any]:
+    group = {
+        "reason": reason,
+        "label": label,
+        "count": len(items),
+        "items": items[:REPORT_ITEMS_SAMPLE_SIZE],
+    }
+    if len(items) > REPORT_ITEMS_SAMPLE_SIZE:
+        group["more"] = len(items) - REPORT_ITEMS_SAMPLE_SIZE
+    if not counted:
+        group["counted"] = False
+    if dependent:
+        group["dependent"] = True
+    if labels:
+        group["item_labels"] = {"singular": labels[0], "plural": labels[1]}
+    return group
+
+
+def normalize_report_errors(errors: Optional[List[str]]) -> Tuple[List[str], int]:
+    """Strip driver-level detail, deduplicate and cap indexing error messages.
+
+    Returns the sample to carry in the report plus the full distinct count, so every
+    downstream copy of the report inherits the same bound.
+    """
+    distinct: List[str] = []
+    for raw in errors or []:
+        if not raw:
+            continue
+        message = _ERROR_DETAIL_TAIL.sub("", str(raw)).strip()
+        if not message:
+            continue
+        if len(message) > REPORT_ERROR_MAX_LENGTH:
+            message = message[:REPORT_ERROR_MAX_LENGTH].rstrip() + "…"
+        if message not in distinct:
+            distinct.append(message)
+    return distinct[:REPORT_ERRORS_SAMPLE_SIZE], len(distinct)
+
+
+def _sample_skipped_payload(skipped: Any, sample_size: int = REPORT_ITEMS_SAMPLE_SIZE) -> Any:
+    """Cut every name list in an IndexingStats.to_dict() payload down to a sample.
+
+    The `*_count` fields beside each list stay exact, which is all the totals heuristic
+    and the legacy renderers ever read.
+    """
+    if isinstance(skipped, dict):
+        return {key: _sample_skipped_payload(value, sample_size) for key, value in skipped.items()}
+    if isinstance(skipped, list):
+        return skipped[:sample_size]
+    return skipped
+
+
+def build_error_report(
+    error_message: str,
+    item_labels: Tuple[str, str],
+    dependent_labels: Tuple[str, str],
+    stats: Optional[IndexingStats] = None,
+    indexed_count: int = 0,
+) -> Dict[str, Any]:
+    """Report for a run that aborted before producing a result.
+
+    Its totals are meaningless (an early failure never fetched anything) and must not
+    drive persisted counts — it exists so the history entry renders this run's failure
+    instead of silently repeating the previous run's summary.
+    """
+    report = (stats or IndexingStats()).build_report(
+        status=IndexingStatus.ERROR,
+        indexed_count=indexed_count,
+        item_labels=item_labels,
+        dependent_labels=dependent_labels,
+        errors=[error_message],
+    )
+    return report
+
+
+def _pick_noun(count: int, labels: Dict[str, str]) -> str:
+    return labels["singular"] if count == 1 else labels["plural"]
+
+
+def _group_labels(group: Dict[str, Any], default: Dict[str, str]) -> Dict[str, str]:
+    return group.get("item_labels") or default
+
+
+def render_report_text(report: Dict[str, Any]) -> str:
+    """Render the report as plain text for the LLM-facing tool message.
+
+    Every line except the headline is deliberately shaped so that it does NOT end in
+    `<number> <word>`: an older UI still parses this message with a regex that reformats
+    such lines, and only the headline is meant to be reformatted by it.
+    """
+    totals = report.get("totals", {})
+    item_labels = report.get("item_labels") or {"singular": "document", "plural": "documents"}
+    status = report.get("status")
+    indexed = totals.get("indexed", 0)
+    unchanged = totals.get("unchanged", 0)
+
+    up_to_date = is_up_to_date_run(totals)
+    if status == IndexingStatus.ERROR.value and indexed == 0:
+        lines = [f"Failed to index {item_labels['plural']}."]
+    elif status == IndexingStatus.PARTLY_INDEXED.value:
+        lines = [f"Partially indexed {indexed} {_pick_noun(indexed, item_labels)}."]
+    elif indexed > 0:
+        lines = [f"Successfully indexed {indexed} {_pick_noun(indexed, item_labels)}."]
+    elif up_to_date:
+        lines = [f"Up to date — {unchanged} {_pick_noun(unchanged, item_labels)} unchanged."]
+    else:
+        lines = ["No new documents to index."]
+
+    for category in report.get("categories", []):
+        lines.extend(_render_category_lines(category, item_labels))
+
+    # Unchanged items are in the store, not left out of it. Reporting them as "skipped"
+    # beside a chip that counts them as indexed reads as a contradiction.
+    if unchanged and not up_to_date:
+        lines.append(
+            f"ℹ {unchanged} {_pick_noun(unchanged, item_labels)} already indexed (unchanged)"
+        )
+
+    errors = report.get("errors") or []
+    if errors:
+        lines.append("Errors:")
+        lines.extend(f"    - {message}" for message in errors)
+        hidden_errors = report.get("errors_total", len(errors)) - len(errors)
+        if hidden_errors > 0:
+            lines.append(f"    ... and {hidden_errors} more distinct errors")
+
+    return "\n".join(lines)
+
+
+def is_up_to_date_run(totals: Dict[str, int]) -> bool:
+    """A run where nothing changed — the common outcome of a scheduled reindex.
+
+    Such a run must never be described by its zero indexed count; the unchanged count
+    is the whole story and every surface says so.
+    """
+    return (
+        totals.get("indexed", 0) == 0
+        and totals.get("failed", 0) == 0
+        and totals.get("unchanged", 0) > 0
+    )
+
+
+def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]) -> List[str]:
+    kind = ReportKind(category["kind"])
+    icon, verb = _CATEGORY_RENDERING[kind]
+    # The unchanged group is reported on its own line, not under "skipped".
+    groups = [group for group in category.get("groups", []) if group.get("reason") != "unchanged"]
+    count = category.get("count", 0)
+
+    if count:
+        headline_count, headline_labels = count, item_labels
+    else:
+        dependent_count = sum(group.get("count", 0) for group in groups if group.get("dependent"))
+        if not dependent_count:
+            return []
+        headline_count = dependent_count
+        headline_labels = next(
+            _group_labels(group, item_labels) for group in groups if group.get("dependent")
+        )
+
+    lines = [f"{icon} {headline_count} {_pick_noun(headline_count, headline_labels)} {verb}"]
+    for group in groups:
+        labels = _group_labels(group, item_labels)
+        group_count = group.get("count", 0)
+        items = group.get("items") or []
+        suffix = f": {', '.join(items)}" if items else ""
+        # Named so its count cannot be read as part of the category total.
+        counted = (
+            f"{group_count} {_pick_noun(group_count, labels)}"
+            if group.get("dependent") else str(group_count)
+        )
+        lines.append(f"    - {group['label']} ({counted}){suffix}")
+        if group.get("more"):
+            lines.append(f"      ... and {group['more']} more {labels['plural']}")
+    return lines
+
+
 DEFAULT_CUT_OFF = 0.1
 INDEX_META_UPDATE_INTERVAL = 600.0
 
@@ -257,6 +615,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     """Base class for tool API wrappers that support vector store functionality."""
 
     doctype: str = "document"
+
+    # Travel inside the report so no consumer holds a toolkit-to-noun mapping.
+    index_item_labels: ClassVar[Tuple[str, str]] = ("document", "documents")
+    index_dependent_labels: ClassVar[Tuple[str, str]] = ("attachment", "attachments")
+
+    # When true the document count comes from the stats, not from the chunk count.
+    loader_yields_chunks: ClassVar[bool] = False
 
     connection_string: Optional[SecretStr] = None
     collection_name: Optional[str] = None
@@ -306,6 +671,34 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """ Loads documents from a source, processes them,
         and returns a list of Document objects with base metadata: id and created_on."""
         yield from ()
+
+    def get_indexing_stats(self) -> Optional[IndexingStats]:
+        """Get the indexing statistics from the current or last indexing run."""
+        return getattr(self, '_indexing_stats', None)
+
+    def get_indexing_stats_summary(self) -> str:
+        """Get a human-readable summary of skipped items."""
+        stats = self.get_indexing_stats()
+        return stats.get_summary() if stats else ""
+
+    def _stamp_loader_stats(self, documents_count: int):
+        """Record what the loader produced, for toolkits that don't track it themselves.
+
+        Called once the loader generator has been exhausted, so every skip it recorded is
+        already in the stats. Loaders that count differently — the code indexer yields
+        chunks, some non-code loaders emit several documents per source item — have
+        already stamped their own numbers, and those win.
+        """
+        stats = self.get_indexing_stats()
+        if stats is None:
+            return
+        stats.items_processed = stats.items_processed or documents_count
+        # Counting only yielded documents would break the documented invariant as soon as
+        # a loader skips items before yielding: the chip would read "179 / 179" next to a
+        # report listing twelve skips.
+        stats.total_fetched = stats.total_fetched or (
+            stats.items_processed + stats.to_dict()["total_skipped"]
+        )
 
     def _process_document(self, base_document: Document) -> Generator[Document, None, None]:
         """ Process an existing base document to extract relevant metadata for full document preparation.
@@ -359,9 +752,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             #
             self._log_tool_event(f"Indexing data into collection with suffix '{index_name}'. It can take some time...")
             self._log_tool_event(f"Loading the documents to index...{kwargs}")
+            # A second index_data call on the same wrapper would otherwise accumulate
+            # the previous run's counts into this run's report.
+            self._indexing_stats = IndexingStats()
             documents = self._base_loader(**kwargs)
             documents = list(documents) # consume/exhaust generator to count items
             documents_count = len(documents)
+            self._stamp_loader_stats(documents_count)
             documents = (doc for doc in documents)
             self._log_tool_event(f"Base documents were pre-loaded. "
                                  f"Search for possible document duplicates and remove them from the indexing list...")
@@ -375,25 +772,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             succeeded_chunks_count = chunks_count - failed_chunks_count
             docs_count = result.get("docs_count", 0)
             errors = result.get("errors", [])
-            issues_detail = ("\nIssues: " + "; ".join(errors)) if errors else ""
 
-            # Get skipped files summary and data if available
-            skipped_summary = ""
-            skipped_data = None
-            if hasattr(self, 'get_indexing_stats_summary') and callable(self.get_indexing_stats_summary):
-                skipped_summary = self.get_indexing_stats_summary()
-            if hasattr(self, 'get_indexing_stats') and callable(self.get_indexing_stats):
-                stats = self.get_indexing_stats()
-                if stats:
-                    skipped_data = stats.to_dict()
+            stats = self.get_indexing_stats()
+            skipped_data = stats.to_dict() if stats else None
 
-            # For code indexer: chunking happens inside _base_loader via universal_chunker,
-            # so docs_count counts chunks instead of files. Use items_processed from stats
-            # which tracks actual file count.
-            # Detection: if docs_count equals chunks and items_processed differs, it's code indexer.
-            # Subtract already-indexed (unchanged, dedup-matched) docs from items_processed so
-            # that a non-code indexer with all-unchanged docs (docs_count=0, chunks=0,
-            # items_processed=N) doesn't get its docs_count inflated back to N.
+            # Unchanged docs are yielded but never re-indexed, so they come off the
+            # processed count.
             unchanged_count = (
                 skipped_data.get("documents_already_indexed", {}).get("count", 0)
                 if skipped_data else 0
@@ -402,59 +786,53 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 (skipped_data.get("items_processed", 0) - unchanged_count)
                 if skipped_data else 0
             )
-            if (skipped_data and effective_processed > 0
-                    and docs_count == succeeded_chunks_count
-                    and docs_count != effective_processed):
+            if self.loader_yields_chunks and effective_processed > 0:
                 docs_count = effective_processed
 
-            unchanged_detail = (
-                f" {unchanged_count} document(s) already indexed (unchanged)."
-                if unchanged_count > 0 else ""
-            )
-
-            # Use docs_count for user-facing messages (number of documents)
-            # Use succeeded_chunks_count for internal tracking (number of chunks in vector store)
+            # Chunk counts drive the state only — never the user-facing summary.
             if failed_chunks_count > 0 and succeeded_chunks_count > 0:
                 final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
-                status = "partly_indexed"
-                message = (f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks)."
-                           f"{unchanged_detail} "
-                           f"Failed to index {failed_chunks_count} chunks.{issues_detail}{skipped_summary}")
+                status = IndexingStatus.PARTLY_INDEXED
             elif failed_chunks_count > 0 >= succeeded_chunks_count:
                 final_state = IndexerKeywords.INDEX_META_FAILED.value
-                status = "error"
-                message = f"Failed to index documents ({failed_chunks_count} chunks failed).{issues_detail}{skipped_summary}"
-            elif docs_count > 0:
-                final_state = IndexerKeywords.INDEX_META_COMPLETED.value
-                status = "ok"
-                message = (f"Successfully indexed {docs_count} documents ({succeeded_chunks_count} chunks)."
-                           f"{unchanged_detail}{skipped_summary}")
-            elif unchanged_count > 0:
-                final_state = IndexerKeywords.INDEX_META_COMPLETED.value
-                status = "ok"
-                message = (f"No new documents to index; {unchanged_count} document(s) already indexed "
-                           f"(unchanged).{skipped_summary}")
+                status = IndexingStatus.ERROR
             else:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
-                status = "ok"
-                message = f"No new documents to index.{skipped_summary}"
+                status = IndexingStatus.OK
+
+            report = (stats or IndexingStats()).build_report(
+                status=status,
+                indexed_count=docs_count,
+                item_labels=self.index_item_labels,
+                dependent_labels=self.index_dependent_labels,
+                errors=errors,
+            )
+            message = render_report_text(report)
 
             # Final update should always be forced (pass chunks count for indexed_chunks field).
             # Include unchanged docs in the indexed count so the UI reflects total items
             # currently in the vector store, not just newly indexed ones.
             indexed_total = docs_count + unchanged_count
             self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
-                                   error=message if status != "ok" else None, skipped=skipped_data,
-                                   docs_count=indexed_total)
+                                   error=message if status is not IndexingStatus.OK else None,
+                                   skipped=skipped_data, docs_count=indexed_total, report=report)
             self._emit_index_event(index_name)
             #
-            return {"status": status, "message": message}
+            return {"status": status.value, "message": message, "report": report}
         except Exception as e:
             # Do maximum effort at least send custom event for supposed changed status
             msg = str(e)
             try:
-                # Error update should also be forced and include the error message
-                self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"], update_force=True, error=msg)
+                # Without an error report the history entry would keep rendering the
+                # previous run's summary.
+                error_report = build_error_report(
+                    msg,
+                    item_labels=self.index_item_labels,
+                    dependent_labels=self.index_dependent_labels,
+                    stats=self.get_indexing_stats(),
+                )
+                self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
+                                       update_force=True, error=msg, report=error_report)
             except Exception as ie:
                 logger.error(f"Failed to update index meta status to FAILED for index '{index_name}': {ie}")
                 msg = f"{msg}; additionally failed to update index meta status to FAILED: {ie}"
@@ -1234,6 +1612,29 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return False
         return str(candidate).strip().lower() == "schedule"
 
+    def _has_previous_index_run(self) -> bool:
+        """True when this index was already built before the current run started."""
+        return getattr(self, "_index_meta_config", {}).get("previous_runs", 0) > 0
+
+    def _count_completed_runs(self, metadata: Dict[str, Any]) -> int:
+        """Number of runs that finished with a usable index.
+
+        Counting every non-'created' entry would also count in-progress markers, and the
+        platform pre-creates one before the first run ever starts — which made a first
+        indexing look like a reindex on every surface that asks.
+        """
+        history_raw = metadata.get("history", "[]")
+        try:
+            history = json.loads(history_raw) if history_raw and history_raw.strip() else []
+        except (json.JSONDecodeError, TypeError):
+            return 0
+        if not isinstance(history, list):
+            return 0
+        return len([
+            entry for entry in history
+            if isinstance(entry, dict) and entry.get("state") in COMPLETED_INDEX_STATES
+        ])
+
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         self._ensure_vectorstore_initialized()
@@ -1276,6 +1677,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata["created_on"] = now
             metadata["updated_on"] = now
             metadata["error"] = None
+            # Both describe the PREVIOUS run. Carrying them over would make a failed or
+            # stopped reindex render last run's successful summary verbatim.
+            metadata["report"] = None
+            metadata["skipped"] = None
             # A terminal previous state means task_id is a leftover of a finished run —
             # keeping it would make the platform's reconcile guard skip the row on Stop.
             # An in_progress row was pre-created by the platform for THIS run: clearing
@@ -1301,8 +1706,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 metadata=metadata,
             )
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta.get("id")])
+        # The history already holds this run's in-progress entry, so this counts
+        # strictly the runs before it. Captured here to avoid a second read later.
+        if not hasattr(self, "_index_meta_config"):
+            self._index_meta_config: Dict[str, Any] = {}
+        self._index_meta_config["previous_runs"] = self._count_completed_runs(metadata)
 
-    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None, docs_count: Optional[int] = None):
+    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None, docs_count: Optional[int] = None, report: Optional[Dict] = None):
         """Update `index_meta` document with optional time-based throttling.
 
         Args:
@@ -1316,6 +1726,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                       if present, otherwise uses `INDEX_META_UPDATE_INTERVAL`.
             error: Optional error message to record when the state represents a failed index.
             skipped: Optional dictionary containing skipped items data from indexing stats.
+            report: Optional canonical indexing report for this run. When present and not an
+                    error report it also derives the persisted totals, so the numbers can
+                    never contradict the breakdown rendered next to them.
         """
         self._ensure_vectorstore_initialized()
         if not hasattr(self, "_index_meta_last_update_time"):
@@ -1354,24 +1767,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata["indexed_chunks"] = self.get_indexed_count(index_name)
             metadata["updated"] = result
             # Promote a successful completion to 'scheduled_reindex' when the run was
-            # triggered by the platform scheduler AND at least one prior run already
-            # completed. History at this point always contains the current run's
-            # 'in_progress' entry (appended by index_meta_init on both fresh and reindex
-            # paths). So after filtering the permanent 'created' marker:
-            #   - first indexing:      previous_runs = [in_progress]        len=1 → keep 'completed'
-            #   - Nth reindex (N>=2):  previous_runs = [..., in_progress]   len>1 → promote
-            if state == IndexerKeywords.INDEX_META_COMPLETED.value and self._is_scheduled_run():
-                previous_history_raw = metadata.get("history", "[]")
-                try:
-                    previous_history = json.loads(previous_history_raw) if previous_history_raw and previous_history_raw.strip() else []
-                except (json.JSONDecodeError, TypeError):
-                    previous_history = []
-                previous_runs = [
-                    h for h in previous_history
-                    if isinstance(h, dict) and h.get("state") != IndexerKeywords.INDEX_META_CREATED.value
-                ]
-                if len(previous_runs) > 1:
-                    state = IndexerKeywords.INDEX_META_SCHEDULED_REINDEX.value
+            # triggered by the platform scheduler AND the index had already been built
+            # before. At this point the history still carries the current run as
+            # in-progress, so what is counted is strictly the earlier runs.
+            if (state == IndexerKeywords.INDEX_META_COMPLETED.value
+                    and self._is_scheduled_run()
+                    and self._count_completed_runs(metadata) > 0):
+                state = IndexerKeywords.INDEX_META_SCHEDULED_REINDEX.value
             metadata["state"] = state
             metadata["updated_on"] = time.time()
             # Attach error if provided, else clear on success
@@ -1380,9 +1782,28 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             elif state == IndexerKeywords.INDEX_META_COMPLETED.value:
                 # Clear previous error on successful completion
                 metadata["error"] = None
-            # Attach skipped items data if provided
+            if report is not None:
+                metadata["report"] = json.dumps(report)
+            # Only a sample of each name list is persisted: this blob is copied into
+            # every history entry and re-shipped by every indexes-list read. The counts
+            # beside it stay exact.
             if skipped is not None:
-                metadata["skipped"] = json.dumps(skipped)
+                metadata["skipped"] = json.dumps(_sample_skipped_payload(skipped))
+
+            successful_report_totals = (
+                report.get("totals")
+                if report is not None and report.get("status") != IndexingStatus.ERROR.value
+                else None
+            )
+            if successful_report_totals is not None:
+                # `indexed` stays unchanged-inclusive: it answers "items currently in
+                # the store", not "items indexed this run".
+                metadata["total"] = successful_report_totals.get("total", 0)
+                metadata["indexed"] = (
+                    successful_report_totals.get("indexed", 0)
+                    + successful_report_totals.get("unchanged", 0)
+                )
+            elif report is None and skipped is not None:
                 items_processed = skipped.get("items_processed", 0)
                 total_skipped = skipped.get("total_skipped", 0)
                 total_fetched = skipped.get("total_fetched", 0)
@@ -1406,9 +1827,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     # Non-code indexer: items_processed is all fetched, skipped is subset
                     metadata["total"] = items_processed
                     metadata["indexed"] = docs_count if docs_count is not None else items_processed - total_skipped
-            else:
-                # Fallback: if no skipped data, use chunks count for backward compatibility
+            elif report is None:
                 metadata["indexed"] = metadata["indexed_chunks"]
+            else:
+                # A failed run leaves both counts alone: the store still holds and
+                # serves the previous run's documents, so those remain the true counts.
+                pass
             #
             history_raw = metadata.pop("history", "[]")
             try:
@@ -1445,17 +1869,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         
         metadata = index_meta.get("metadata", {})
         
-        # Determine if this is a reindex operation.
-        # The 'created' marker is a permanent history[0] entry from the initial index_meta_init,
-        # so it must be excluded when counting actual run entries.
-        history_raw = metadata.get("history", "[]")
-        try:
-            history = json.loads(history_raw) if history_raw.strip() else []
-            run_entries = [h for h in history if h.get("state") != IndexerKeywords.INDEX_META_CREATED.value]
-            is_reindex = len(run_entries) > 1
-        except (json.JSONDecodeError, TypeError):
-            is_reindex = False
-        
+        # Taken from the count captured at init rather than the current history, which
+        # differs between the start and end events of the same run.
+        is_reindex = self._has_previous_index_run()
+
         # Build event message
         event_data = {
             "id": index_meta.get("id"),
@@ -1464,6 +1881,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "error": error,
             "reindex": is_reindex,
             "indexed": metadata.get("indexed", 0),
+            "total": metadata.get("total", 0),
+            "report": metadata.get("report"),
             "updated": metadata.get("updated", 0),
             "toolkit_id": metadata.get("toolkit_id"),
             "created_at": metadata.get("created_on"),

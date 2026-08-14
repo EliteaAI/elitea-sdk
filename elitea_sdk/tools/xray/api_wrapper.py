@@ -135,6 +135,7 @@ def _parse_tests(test_results) -> List[Any]:
 
 
 class XrayApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('test case', 'test cases')
     _default_base_url: str = 'https://xray.cloud.getxray.app'
     base_url: str = ""
     client_id: str = None
@@ -318,7 +319,6 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
             # Using GraphQL
             graphql = 'query { getTests(jql: "project = \\"CALC\\"") { results { issueId jira(fields: ["key"]) steps { action result } } } }'
         """
-        self._init_indexing_stats()
         self._skipped_attachment_extensions = skip_attachment_extensions if skip_attachment_extensions else []
         self._include_attachments = include_attachments
 
@@ -354,7 +354,6 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
                     raise ToolException("No test data found in GraphQL response")
 
             for test in tests_data:
-                self._track_processed_item()
                 page_content = ""
                 content_structure = {}
                 test_type_name = test.get("testType", {}).get("name", "").lower()
@@ -489,7 +488,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
 
                 if hasattr(self, '_skipped_attachment_extensions') and ext in self._skipped_attachment_extensions:
                     logger.debug(f"Skipping attachment {filename} due to extension filter: {ext}")
-                    self._track_skipped_attachment(filename, reason="extension")
+                    self._track_skipped_attachment(filename, reason="filtered")
                     continue
                 
                 attachment_id = f"attach_{attachment['id']}"

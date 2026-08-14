@@ -26,6 +26,7 @@ zql_description = """
                     """
 
 class ZephyrApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('test case', 'test cases')
     base_url: str
     token: SecretStr
     _client: Optional[ZephyrClient] = PrivateAttr()
@@ -161,11 +162,9 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         }
 
     def _base_loader(self, zql: str, **kwargs) -> Generator[Document, None, None]:
-        self._init_indexing_stats()
         self._chunking_tool = kwargs.get('chunking_tool', None)
         test_cases = self.get_testcases_by_zql(zql=zql, return_as_list=True)
         for test_case in test_cases:
-            self._track_processed_item()
             metadata = {
                 "updated_on": str(test_case.get("lastModifiedOn")),
                 "id": str(test_case.get("id")),
