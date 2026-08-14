@@ -11,7 +11,7 @@ Authentication precedence (evaluated in order):
 import logging
 import os
 import re
-from typing import Optional, Generator, List, Any
+from typing import Callable, Optional, Generator, List, Any
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -427,6 +427,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
        (REST token without Graph scopes — legacy behaviour)
     """
 
+    index_item_labels = ('file', 'files')
+
     site_url: str
     client_id: Optional[str] = None
     client_secret: Optional[SecretStr] = None
@@ -598,7 +600,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        limit_files: int = 100,
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
-                       skip_extensions: Optional[List[str]] = None):
+                       skip_extensions: Optional[List[str]] = None,
+                       on_file_skipped: Optional[Callable[[str], None]] = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder path; otherwise lists
@@ -617,7 +620,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         """
         self._sync_backend_context()
         return self._backend.get_files_list(
-            folder_name, limit_files, form_name, include_extensions, skip_extensions)
+            folder_name, limit_files, form_name, include_extensions, skip_extensions,
+            on_file_skipped=on_file_skipped)
 
     def read_file(self, path: str,
                   is_capture_image: bool = False,
@@ -1022,9 +1026,6 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._sync_backend_context()
 
-        # Initialize indexing stats for this run
-        self._init_indexing_stats()
-
         # Normalise onenote_filter (already a dict or None) and inject top-level
         # extension filters so include_extensions / skip_extensions apply uniformly
         # to both SharePoint files and OneNote attachments.
@@ -1050,7 +1051,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     kwargs.get('path'), limit_files,
                     form_name=form_name,
                     include_extensions=include_extensions,
-                    skip_extensions=skip_extensions)
+                    skip_extensions=skip_extensions,
+                    on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered"))
                 if isinstance(all_files, ToolException):
                     raise all_files
                 self._log_tool_event(
@@ -1064,7 +1066,6 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     ("updated_on" if k == "Modified" else k): str(v)
                     for k, v in file.items()
                 }
-                self._track_processed_item()
                 yield Document(page_content="", metadata=metadata)
 
         # ── OneNote pages ─────────────────────────────────────────────

@@ -680,11 +680,7 @@ class TestCodeIndexerDBPersistence:
             # Verify index_data succeeded
             assert result['status'] == 'ok', f"index_data failed: {result}"
             
-            # Extract indexed count from message
-            import re
-            match = re.search(r'Successfully indexed (\d+) documents', result['message'])
-            assert match, f"Could not parse indexed count from message: {result['message']}"
-            indexed_count = int(match.group(1))
+            indexed_count = result['report']['totals']['indexed']
             
             # Query database directly
             records = _get_db_records(code_indexer_toolkit, index_name=TEST_INDEX_NAME)
@@ -857,11 +853,7 @@ class TestNonCodeIndexerDBPersistence:
             # Verify index_data succeeded
             assert result['status'] == 'ok', f"index_data failed: {result}"
             
-            # Extract indexed count from message
-            import re
-            match = re.search(r'Successfully indexed (\d+) documents', result['message'])
-            assert match, f"Could not parse indexed count from message: {result['message']}"
-            indexed_count = int(match.group(1))
+            indexed_count = result['report']['totals']['indexed']
             
             # Query database directly
             records = _get_db_records(non_code_indexer_toolkit, index_name=TEST_INDEX_NAME)
@@ -1925,9 +1917,7 @@ class TestWritePathChunkCount:
             )
             assert result["status"] == "ok"
 
-            match = _re.search(r"Successfully indexed (\d+) documents", result["message"])
-            assert match, f"Cannot parse indexed count from: {result['message']}"
-            reported = int(match.group(1))
+            reported = result["report"]["totals"]["indexed"]
 
         actual = _get_db_records(non_code_indexer_toolkit, index_name=TEST_INDEX_NAME)
         assert len(actual) == reported, (

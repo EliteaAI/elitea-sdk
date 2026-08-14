@@ -172,6 +172,7 @@ GetAllTestCaseFieldsModel = create_model(
 )
 
 class TestPlanApiWrapper(NonCodeIndexerToolkit):
+    index_item_labels = ('test case', 'test cases')
     # TODO use ado_configuration instead of organization_url, project and token
     __test__ = False
     organization_url: str
@@ -533,7 +534,6 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Error getting test suites: {e}")
 
     def _base_loader(self, plan_id: int, suite_ids: Optional[List[int]] = [], chunking_tool: str = None, **kwargs) -> Generator[Document, None, None]:
-        self._init_indexing_stats()
         cases = []
         if not suite_ids:
             suites = self.get_suites_in_plan(plan_id)
@@ -542,7 +542,6 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             cases.extend(self.get_test_cases(plan_id, sid))
         #
         for case in cases:
-            self._track_processed_item()
             field_dicts = case.get('work_item', {}).get('work_item_fields', [])
             data = {k: v for d in field_dicts for k, v in d.items()}
             if chunking_tool:
