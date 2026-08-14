@@ -2044,9 +2044,16 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 'mcp_auth_payload': dict(hitl_interrupt),
                             }
                         if pending_msgs_dicts:
-                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
-                            if trimmed:
-                                resume_ctx['pending_messages'] = trimmed
+                            if resume_ctx.get('mcp_auth_payload'):
+                                # The MCP resume path closes the interrupted call
+                                # with a ToolMessage directly. Keep the original
+                                # AIMessage that owns that tool_call_id so provider
+                                # ordering remains AI(tool_calls) -> ToolMessage.
+                                resume_ctx['pending_messages'] = list(pending_msgs_dicts)
+                            else:
+                                trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                                if trimmed:
+                                    resume_ctx['pending_messages'] = trimmed
                         hitl_resume_ctx = resume_ctx
                         config['configurable']['_hitl_resume_context'] = resume_ctx
                     elif guardrail_type == 'sensitive_tool':

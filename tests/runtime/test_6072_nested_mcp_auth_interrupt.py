@@ -12,6 +12,21 @@ from elitea_sdk.runtime.tools.application import Application
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 
 
+def _assert_tool_messages_have_owning_calls(messages):
+    """Enforce the provider-neutral assistant-call -> tool-result contract."""
+    for index, message in enumerate(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        owner = index - 1
+        while owner >= 0 and isinstance(messages[owner], ToolMessage):
+            owner -= 1
+        assert owner >= 0
+        assert isinstance(messages[owner], AIMessage)
+        assert message.tool_call_id in {
+            call.get("id") for call in messages[owner].tool_calls
+        }
+
+
 class _Runtime:
     def get_mcp_toolkits(self):
         return []
@@ -61,6 +76,7 @@ class _BoundChildLLM:
 
     def invoke(self, messages, config=None):
         self.root.invocations.append(list(messages))
+        _assert_tool_messages_have_owning_calls(messages)
         for message in messages:
             if not isinstance(message, ToolMessage):
                 continue
@@ -130,6 +146,53 @@ def _assistant(llm, tools, memory):
         memory=memory,
         app_type="predict",
     ).runnable()
+
+
+def test_direct_agent_skip_restores_tool_call_before_structured_result():
+    counter = _AuthToolCounter()
+    auth_tool = StructuredTool.from_function(
+        func=counter.raise_auth,
+        name="sharepoint_search",
+        description="Search SharePoint",
+        metadata={
+            "tool_name": "search",
+            "toolkit_name": "SharePoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6072-direct-skip"}}
+
+    paused = _assistant(_ChildLLM(), [auth_tool], memory).invoke(
+        {"messages": [HumanMessage(content="Search SharePoint")]},
+        config=config,
+    )
+    assert paused["execution_finished"] is False
+    assert counter.calls == 1
+
+    resumed_llm = _ChildLLM()
+    resumed = _assistant(resumed_llm, [auth_tool], memory).invoke(
+        {"mcp_auth_resume": True, "mcp_auth_action": "skip"},
+        config=config,
+    )
+
+    assert resumed["execution_finished"] is True
+    assert resumed["output"] == "child-finished:declined"
+    assert counter.calls == 1
+    assert len(resumed_llm.invocations) == 1
+
+    tool_result = next(
+        message
+        for message in resumed_llm.invocations[0]
+        if isinstance(message, ToolMessage)
+    )
+    payload = json.loads(str(tool_result.content))
+    assert payload["type"] == "mcp_auth_decision"
+    assert payload["status"] == "declined"
+    assert payload["next_step"] == (
+        "Do not request this toolkit again during the current run."
+    )
+    assert payload["denial_reason"] == "User skipped authorization for this run."
 
 
 def test_nested_mcp_auth_uses_durable_interrupt_and_resumes_same_child_call():

@@ -1275,7 +1275,12 @@ class LLMNode(BaseTool):
             try:
                 restored_messages = messages_from_dict(hitl_ctx['pending_messages'])
                 messages = list(messages) + list(restored_messages)
-                messages = self._filter_orphaned_tool_calls(messages)
+                # A delegated-auth checkpoint is restored immediately before
+                # its structured ToolMessage is appended below. Filtering here
+                # would delete the temporarily-unmatched AI tool call and leave
+                # an orphan ToolMessage, rejected by Anthropic and OpenAI alike.
+                if not hitl_ctx.get('mcp_auth_payload'):
+                    messages = self._filter_orphaned_tool_calls(messages)
                 logger.info(
                     "[HITL] Restored %d intermediate messages into LLM node history",
                     len(restored_messages),
@@ -1392,11 +1397,38 @@ class LLMNode(BaseTool):
             )
             if action not in {'authorize', 'skip'}:
                 action = 'skip'
+            tool_call_id = (
+                auth_payload.get('tool_call_id') or 'mcp_auth_resume_call'
+            )
+            completion = next(
+                (
+                    message for message in reversed(messages)
+                    if isinstance(message, AIMessage)
+                    and any(
+                        str(call.get('id') or '') == tool_call_id
+                        for call in (message.tool_calls or [])
+                        if isinstance(call, dict)
+                    )
+                ),
+                None,
+            )
+            if completion is None:
+                # Defensive fallback for an old/incomplete checkpoint. New
+                # checkpoints always carry the original AIMessage in
+                # _pending_messages, preserving provider-specific content.
+                completion = AIMessage(
+                    content='',
+                    tool_calls=[{
+                        'name': auth_payload.get('_tool_call_name') or 'mcp_auth_control',
+                        'args': auth_payload.get('tool_args_raw') or {},
+                        'id': tool_call_id,
+                    }],
+                )
+                messages = list(messages) + [completion]
             messages = list(messages) + [ToolMessage(
                 content=self._mcp_auth_decision_message(auth_payload, action),
-                tool_call_id=auth_payload.get('tool_call_id') or 'mcp_auth_resume_call',
+                tool_call_id=tool_call_id,
             )]
-            completion = llm_client.invoke(messages, config=config)
         elif hitl_ctx and hitl_ctx.get('parallel_calls'):
             # ---- Parallel sub-agent resume (issue #4993) ----
             # The original turn fanned out 2+ Application calls and the parent
@@ -2484,6 +2516,9 @@ class LLMNode(BaseTool):
             'toolkit_name': toolkit_name,
             'toolkit_type': toolkit_type,
             'tool_call_id': tool_call_id,
+            # Checkpoint-private invoked name. The public tool_name may be the
+            # resource operation exposed by the authorization exception.
+            '_tool_call_name': tool_name,
             # Arguments are checkpoint-private. Authorization cards never need
             # request bodies, which may contain credentials or user content.
             'tool_args': {},
