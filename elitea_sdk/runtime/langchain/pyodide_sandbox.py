@@ -225,6 +225,15 @@ class PyodideSandbox(BasePyodideSandbox):
             insecure_tls_domains=insecure_tls_domains,
         )
 
+        try:
+            code_bytes = code.encode('utf-8')
+        except UnicodeEncodeError as e:
+            return CodeExecutionResult(
+                status="error",
+                execution_time=time.time() - start_time,
+                stderr=f"Failed to encode code as UTF-8: {e}",
+            )
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -234,7 +243,7 @@ class PyodideSandbox(BasePyodideSandbox):
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(input=code.encode('utf-8')),
+                process.communicate(input=code_bytes),
                 timeout=timeout_seconds,
             )
             stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -304,9 +313,18 @@ class SyncPyodideSandbox(BasePyodideSandbox):
         )
 
         try:
+            code_bytes = code.encode('utf-8')
+        except UnicodeEncodeError as e:
+            return CodeExecutionResult(
+                status="error",
+                execution_time=time.time() - start_time,
+                stderr=f"Failed to encode code as UTF-8: {e}",
+            )
+
+        try:
             process = subprocess.run(
                 cmd,
-                input=code.encode('utf-8'),
+                input=code_bytes,
                 capture_output=True,
                 text=False,
                 timeout=timeout_seconds,
