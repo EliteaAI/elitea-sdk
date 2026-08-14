@@ -955,11 +955,11 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
     """
     def _node(state):
         message = (
-            f"**Pipeline stopped** — MCP toolkit **{toolkit_name}** "
+            f"**Pipeline stopped** — toolkit **{toolkit_name}** "
             f"(node: *{node_id}*) authentication was skipped.\n\n"
             f"Downstream nodes that depend on `{node_id}` output were not executed "
             f"because the required data is unavailable without authentication.\n\n"
-            f"> **Tip:** Authorize the MCP server and try again."
+            f"> **Tip:** Authorize the toolkit and try again."
         )
         result = {
             "messages": [{"role": "assistant", "content": message}],
