@@ -239,7 +239,11 @@ def _annotate_mcp_auth_error(auth_err: Any, tool: dict) -> None:
         auth_err.toolkit_type = resolved_toolkit_type
 
     current_toolkit_name = str(getattr(auth_err, 'toolkit_name', '') or '').strip()
-    if toolkit_label and (not current_toolkit_name or _is_http_url(current_toolkit_name)):
+    if toolkit_label and (
+        not current_toolkit_name
+        or current_toolkit_name in {'mcp', 'mcp_config'}
+        or _is_http_url(current_toolkit_name)
+    ):
         auth_err.toolkit_name = toolkit_label
 
     if toolkit_label:
@@ -1459,8 +1463,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
             # the frontend — proxy tools are meaningless in that context.
             if mcp_context.reraise_on_auth_required:
                 raise
-            if not getattr(auth_err, "toolkit_type", None):
-                auth_err.toolkit_type = _u_tool.get("type")
+            _annotate_mcp_auth_error(auth_err, _u_tool)
 
             # A direct Pipeline Toolkit node has no LLM loop that can invoke a
             # deferred authorization gateway. Surface its rich auth exception while

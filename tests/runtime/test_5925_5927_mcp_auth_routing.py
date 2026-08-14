@@ -128,6 +128,8 @@ def test_auth_control_uses_delegated_toolkit_auth_url(monkeypatch):
         auth_control.func(action="authorize", server_url="sharepoint")
 
     assert exc_info.value.server_url == SHAREPOINT_URL
+    assert exc_info.value.toolkit_name == "sharepoint"
+    assert exc_info.value.toolkit_type == "sharepoint"
     assert (exc_info.value.resource_metadata or {}).get("resource_name") == "SharePoint"
 
 
