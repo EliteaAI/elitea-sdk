@@ -121,7 +121,7 @@ def _read_sandbox_limits_from_env() -> Dict[str, Any]:
             return hi
         return val
 
-    timeout_seconds = _num("SANDBOX_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS, float, lo=0.0001)
+    timeout_seconds = _num("SANDBOX_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS, float, lo=0.0001, hi=55.0)
     wasm_max_mem_mb = _num("SANDBOX_WASM_MAX_MEM_MB", _DEFAULT_WASM_MAX_MEM_MB, int, lo=_MIN_WASM_MEM_MB)
     # 0 is a valid "off" value for the gates, so allow it explicitly (lo=0).
     max_concurrent = _num("SANDBOX_MAX_CONCURRENT", _DEFAULT_MAX_CONCURRENT, int, lo=0)

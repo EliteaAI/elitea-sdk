@@ -1,6 +1,7 @@
 """Remote sandbox backend that delegates execution to the pylon_sandbox service."""
 
 import base64
+import json
 import logging
 import time
 
@@ -9,6 +10,18 @@ import aiohttp
 from .sandbox_types import CodeExecutionResult
 
 logger = logging.getLogger(__name__)
+
+_MAX_TIMEOUT_SECONDS = 55.0
+_HTTP_TIMEOUT_HEADROOM = 15
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB cap on stdout/result/session_bytes
+
+
+def _truncate(value: str | None, max_bytes: int = _MAX_RESPONSE_BYTES) -> str | None:
+    if value is None:
+        return None
+    if len(value) > max_bytes:
+        return value[:max_bytes] + "\n…[truncated]"
+    return value
 
 
 class RemoteSandbox:
@@ -22,6 +35,17 @@ class RemoteSandbox:
         self.url = url.rstrip("/")
         self.auth_token = auth_token
         self.tenant_id = tenant_id
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self, timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def execute(
         self,
@@ -34,8 +58,8 @@ class RemoteSandbox:
         root_ca_path: str | None = None,
         insecure_tls_domains: list[str] | None = None,
     ) -> CodeExecutionResult:
-        timeout = timeout_seconds or 55
-        http_timeout = aiohttp.ClientTimeout(total=timeout + 15)
+        timeout = min(timeout_seconds or _MAX_TIMEOUT_SECONDS, _MAX_TIMEOUT_SECONDS)
+        http_timeout = aiohttp.ClientTimeout(total=timeout + _HTTP_TIMEOUT_HEADROOM)
 
         body = {
             "code": code,
@@ -52,30 +76,34 @@ class RemoteSandbox:
 
         start = time.monotonic()
         try:
-            async with aiohttp.ClientSession(timeout=http_timeout) as session:
-                async with session.post(self.url, json=body, headers=headers) as resp:
-                    elapsed = time.monotonic() - start
+            session = await self._get_session(http_timeout)
+            async with session.post(self.url, json=body, headers=headers) as resp:
+                elapsed = time.monotonic() - start
 
-                    if resp.status == 401:
-                        raise ValueError("Sandbox auth token invalid")
+                if resp.status == 401:
+                    raise ValueError("Sandbox auth token invalid")
 
-                    if resp.status == 503:
+                if resp.status == 503:
+                    try:
                         data = await resp.json()
-                        return CodeExecutionResult(
-                            status="error",
-                            stderr=data.get("stderr") or data.get("detail", "Service unavailable, retry shortly"),
-                            execution_time=elapsed,
-                        )
+                        detail = data.get("stderr") or data.get("detail", "")
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                        detail = ""
+                    return CodeExecutionResult(
+                        status="error",
+                        stderr=detail or "Sandbox service unavailable, retry shortly",
+                        execution_time=elapsed,
+                    )
 
-                    if resp.status != 200:
-                        text = await resp.text()
-                        return CodeExecutionResult(
-                            status="error",
-                            stderr=f"Sandbox service returned HTTP {resp.status}: {text[:200]}",
-                            execution_time=elapsed,
-                        )
+                if resp.status != 200:
+                    text = await resp.text()
+                    return CodeExecutionResult(
+                        status="error",
+                        stderr=f"Sandbox service returned HTTP {resp.status}: {text[:200]}",
+                        execution_time=elapsed,
+                    )
 
-                    data = await resp.json()
+                data = await resp.json()
 
         except aiohttp.ClientError as exc:
             elapsed = time.monotonic() - start
@@ -94,13 +122,18 @@ class RemoteSandbox:
             )
 
         response_session_bytes = None
-        if data.get("session_bytes"):
-            response_session_bytes = base64.b64decode(data["session_bytes"])
+        raw_session = data.get("session_bytes")
+        if raw_session:
+            decoded = base64.b64decode(raw_session)
+            if len(decoded) <= _MAX_RESPONSE_BYTES:
+                response_session_bytes = decoded
+            else:
+                logger.warning("session_bytes response truncated (%d bytes)", len(decoded))
 
         return CodeExecutionResult(
-            result=data.get("result"),
-            stdout=data.get("stdout"),
-            stderr=data.get("stderr"),
+            result=_truncate(str(data.get("result"))) if data.get("result") is not None else None,
+            stdout=_truncate(data.get("stdout")),
+            stderr=_truncate(data.get("stderr")),
             status="success" if data.get("success") else "error",
             execution_time=elapsed,
             session_metadata=data.get("session_metadata"),
