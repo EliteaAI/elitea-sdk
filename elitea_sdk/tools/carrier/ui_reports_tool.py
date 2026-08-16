@@ -17,7 +17,10 @@ class GetUIReportsTool(BaseTool):
     args_schema: Type[BaseModel] = create_model(
         "GetUIReportsInput",
         report_id=(str, Field(description="UI Report id to retrieve")),
-        current_date=(str, Field(default=datetime.datetime.now().strftime("%Y-%m-%d"), description="Current date in YYYY-MM-DD format (auto-filled)")),
+        # Use default_factory. A plain default runs the call one time, when
+        # Python imports this module. The value then stays at the date of the
+        # import for all of the life of the process.
+        current_date=(str, Field(default_factory=lambda: datetime.datetime.now().strftime("%Y-%m-%d"), description="Current date in YYYY-MM-DD format (auto-filled)")),
         **{
             "name": (Optional[str], Field(default=None, description="Optional. Filter reports by name (case-insensitive, partial match)")),
             "start_time": (Optional[str], Field(default=None, description="Start date/time for filtering reports (YYYY-MM-DD or ISO format)")),
