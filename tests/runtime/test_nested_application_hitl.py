@@ -2020,6 +2020,17 @@ class DictBridgeInterruptingApplication:
         }
 
 
+def _resume_action(payload, default='approve'):
+    if not isinstance(payload, dict):
+        return default
+    if payload.get('hitl_action'):
+        return payload['hitl_action']
+    decisions = payload.get('hitl_decisions')
+    if isinstance(decisions, list) and decisions and isinstance(decisions[0], dict):
+        return decisions[0].get('action', default)
+    return default
+
+
 def _subagent(name, application):
     return Application(
         name=name, description=f'{name} worker', application=application,
@@ -2092,8 +2103,8 @@ def test_parallel_resume_routes_decisions_to_correct_children():
     )
 
     # Each child got resumed with ITS decision.
-    assert child_a.calls[-1]['payload'].get('hitl_action') == 'approve'
-    assert child_b.calls[-1]['payload'].get('hitl_action') == 'reject'
+    assert _resume_action(child_a.calls[-1]['payload']) == 'approve'
+    assert _resume_action(child_b.calls[-1]['payload']) == 'reject'
 
     # Both ToolMessages reached the parent's final LLM turn, and it completed.
     assert resume_result['execution_finished'] is True
@@ -2518,7 +2529,7 @@ class MultiRoundDivergingApplication:
         is_resume = isinstance(payload, dict) and payload.get('hitl_resume')
         if not is_resume:
             return self._pause(self.first_tool)
-        action = payload.get('hitl_action', 'approve') if isinstance(payload, dict) else 'approve'
+        action = _resume_action(payload)
         if action == 'reject' and not self._diverged:
             self._diverged = True
             return self._pause(self.second_tool)

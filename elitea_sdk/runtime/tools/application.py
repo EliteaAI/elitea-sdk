@@ -517,6 +517,22 @@ class Application(BaseTool):
                     },
                     config=nested_config,
                 )
+            elif _hitl_parallel_resume.get('interrupt_id'):
+                # Preserve the checkpoint-owned leaf interrupt identity across
+                # the Application boundary. A scalar action has no identity and
+                # could otherwise be consumed by whichever guardrail currently
+                # occupies this child thread after a stale/concurrent resume.
+                response = application_runnable.invoke(
+                    {
+                        "hitl_resume": True,
+                        "hitl_decisions": [{
+                            "interrupt_id": _hitl_parallel_resume['interrupt_id'],
+                            "action": _hitl_parallel_resume.get("action", "approve"),
+                            "value": _hitl_parallel_resume.get("value", ""),
+                        }],
+                    },
+                    config=nested_config,
+                )
             elif _hitl_parallel_resume.get('guardrail_type') == 'mcp_auth':
                 response = application_runnable.invoke(
                     {

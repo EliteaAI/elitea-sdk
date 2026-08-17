@@ -2016,6 +2016,40 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # below, not the stale parked one.
                     config.get('configurable', {}).pop('checkpoint_id', None)
                 elif hitl_interrupt and self._is_hitl_resume(input):
+                    if not self._hitl_resume_targets_checkpoint(
+                        input, hitl_interrupt,
+                    ):
+                        hitl_interrupts_for_ui = self._strip_hitl_ui_keys(
+                            self._get_hitl_interrupts(checkpoint_state)
+                        )
+                        hitl_for_ui = (
+                            hitl_interrupts_for_ui[0]
+                            if hitl_interrupts_for_ui else {}
+                        )
+                        logger.warning(
+                            "[HITL] Resume decision does not match the current "
+                            "checkpoint interrupt; re-surfacing the pending "
+                            "guardrail without applying the action",
+                        )
+                        result_with_state = {
+                            "output": hitl_interrupt.get(
+                                "message",
+                                "A pending action requires your review before continuing.",
+                            ),
+                            "thread_id": thread_id,
+                            "execution_finished": False,
+                            "hitl_interrupt": hitl_for_ui,
+                            "hitl_interrupts": hitl_interrupts_for_ui,
+                        }
+                        if (
+                            hasattr(checkpoint_state, 'values')
+                            and checkpoint_state.values
+                        ):
+                            for key, value in checkpoint_state.values.items():
+                                if key != 'output':
+                                    result_with_state[key] = value
+                        return result_with_state
+
                     # Resuming from an HITL dynamic interrupt - use Command(resume=...)
                     hitl_resume_value = self._extract_hitl_resume(input)
                     logger.info(f"[HITL] Resuming HITL interrupt with: {hitl_resume_value}")
@@ -2972,6 +3006,31 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     decision['guardrail_type'] = match['guardrail_type']
             hydrated.append(decision)
         return hydrated
+
+    @classmethod
+    def _hitl_resume_targets_checkpoint(
+        cls, input_data: dict, interrupt_value: dict,
+    ) -> bool:
+        """Validate identity-bearing resumes against the paused checkpoint.
+
+        Historical scalar resume payloads carry no invocation identity and
+        remain supported. Once a caller supplies ``hitl_decisions``, however,
+        at least one decision must match the checkpoint's public interrupt id
+        (or an unambiguous legacy tool-call id). This prevents a stale action
+        from being consumed by a newer guardrail on the same child thread.
+        """
+        decisions = (
+            input_data.get('hitl_decisions')
+            or input_data.get('mcp_auth_decisions')
+        )
+        if not isinstance(decisions, list) or not decisions:
+            return True
+        checkpoint_interrupt = interrupt_value
+        if not isinstance(interrupt_value.get('pending'), list):
+            checkpoint_interrupt = {'pending': [interrupt_value]}
+        return bool(cls._hydrate_parallel_hitl_decisions(
+            decisions, checkpoint_interrupt,
+        ))
 
     # Internal payload keys that must never leak to the UI/transport layer.
     _HITL_INTERNAL_KEYS = (

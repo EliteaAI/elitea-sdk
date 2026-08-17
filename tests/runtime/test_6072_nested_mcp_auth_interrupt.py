@@ -256,6 +256,54 @@ def test_nested_mcp_auth_uses_durable_interrupt_and_resumes_same_child_call():
     assert len(second_parent_llm.invocations) == 1
 
 
+def test_nested_mcp_auth_rejects_stale_interrupt_identity():
+    counter = _AuthToolCounter()
+    auth_tool = StructuredTool.from_function(
+        func=counter.raise_auth,
+        name="sharepoint_search",
+        description="Search SharePoint",
+        metadata={
+            "tool_name": "search",
+            "toolkit_name": "SharePoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    child_memory = MemorySaver()
+    child_runnable = _assistant(_ChildLLM(), [auth_tool], child_memory)
+    child_tool = Application(
+        name="Research Agent",
+        description="Delegated research agent",
+        application=child_runnable,
+        return_type="str",
+        client=None,
+        metadata={"original_name": "Research Agent", "agent_type": "agent"},
+    )
+    parent_memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6072-stale-id"}}
+    paused = _assistant(_ParentLLM(), [child_tool], parent_memory).invoke(
+        {"messages": [HumanMessage(content="Delegate the SharePoint search")]},
+        config=config,
+    )
+
+    stale = _assistant(_ParentLLM(), [child_tool], parent_memory).invoke(
+        {
+            "hitl_resume": True,
+            "hitl_decisions": [{
+                "interrupt_id": "mcp_auth_stale",
+                "action": "skip",
+                "value": "",
+            }],
+        },
+        config=config,
+    )
+
+    assert stale["execution_finished"] is False
+    assert stale["hitl_interrupt"]["interrupt_id"] == (
+        paused["hitl_interrupt"]["interrupt_id"]
+    )
+    assert counter.calls == 1
+
+
 def _direct_toolkit_schema():
     return yaml.safe_dump({
         "name": "direct-toolkit-auth",

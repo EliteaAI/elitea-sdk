@@ -2704,6 +2704,14 @@ class LLMNode(BaseTool):
                     'action': decision.get('action', 'approve'),
                     'value': decision.get('value', decision.get('user_feedback', '')),
                     'guardrail_type': decision.get('guardrail_type'),
+                    # The root aggregate owns a public interrupt id, while the
+                    # child checkpoint owns the nested id. Forward the latter
+                    # so checkpoint drift cannot apply an MCP decision to a
+                    # newer sensitive-tool pause (or vice versa).
+                    'interrupt_id': (
+                        decision.get(HITL_NESTED_INTERRUPT_ID_KEY)
+                        or decision.get(HITL_INTERRUPT_ID_KEY)
+                    ),
                 }
             elif grandchild_decisions:
                 # This child is itself a container: its OWN prior pause was a
