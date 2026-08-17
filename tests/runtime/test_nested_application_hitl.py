@@ -1,5 +1,8 @@
+import time
 from unittest.mock import patch
+from uuid import uuid4
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
@@ -12,6 +15,7 @@ from elitea_sdk.runtime.tools.application import Application
 from elitea_sdk.runtime.tools.llm import LLMNode
 from elitea_sdk.runtime.toolkits.application import ApplicationToolkit
 from elitea_sdk.runtime.toolkits.security import configure_sensitive_tools, reset_sensitive_tools
+from elitea_sdk.runtime import _parallel_hitl_registry
 
 
 class DummyEliteARuntime:
@@ -433,6 +437,20 @@ def _build_parent_runnable(memory, llm, tools):
     return assistant.runnable()
 
 
+def _build_supervised_parent_runnable(memory, llm, tools):
+    assistant = Assistant(
+        elitea=DummyEliteARuntime(),
+        data={'instructions': 'Use tools', 'tools': [], 'meta': {}},
+        client=llm,
+        tools=tools,
+        memory=memory,
+        app_type='predict',
+        independent_parallel_hitl=True,
+        parallel_hitl_max_concurrency=2,
+    )
+    return assistant.runnable()
+
+
 
 def test_multiple_application_tools_use_toolnode_runtime_and_resume_hitl():
     parent_memory = MemorySaver()
@@ -508,6 +526,7 @@ def test_application_run_forwards_parent_checkpoint_context():
             'metadata': {'origin': 'parent'},
             'configurable': {
                 'thread_id': 'parent-thread',
+                '__parallel_hitl_root_thread_id__': 'root-thread',
                 'checkpoint_ns': 'parent-ns',
                 'checkpoint_id': 'parent-cp',
                 'selected_tools': ['should-be-removed'],
@@ -523,9 +542,38 @@ def test_application_run_forwards_parent_checkpoint_context():
     # stable across parent turns (multi-turn child history works), isolated
     # from parent (no stale-mixing — #4949). See test_application_task_toolkit.
     assert nested_config['configurable']['thread_id'] == 'parent-thread:child_agent'
+    assert nested_config['configurable']['__parallel_hitl_root_thread_id__'] == 'root-thread'
     assert nested_config['configurable']['checkpoint_ns'] == 'parent-ns'
     assert nested_config['configurable']['checkpoint_id'] == 'parent-cp'
     assert 'selected_tools' not in nested_config['configurable']
+
+
+def test_supervisor_contract_crosses_single_container_application_boundary():
+    """A root with one container must enable independent HITL in its leaves."""
+    nested = StaticApplication(output='container-complete')
+    container = Application(
+        name='container_agent',
+        description='Container agent',
+        application=nested,
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+        metadata={'display_name': 'container_agent'},
+    )
+    runnable = _build_supervised_parent_runnable(
+        MemorySaver(), ParentResultAwareLLM(target_tool_name='container_agent'),
+        [container],
+    )
+
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate through the container')]},
+        config={'configurable': {'thread_id': 'single-container-supervisor'}},
+    )
+
+    assert result['execution_finished'] is True
+    configurable = nested.calls[0]['config']['configurable']
+    assert configurable['__independent_parallel_hitl__'] is True
+    assert configurable['__parallel_hitl_max_concurrency__'] == 2
 
 
 
@@ -2020,6 +2068,140 @@ class DictBridgeInterruptingApplication:
         }
 
 
+def test_supervised_parallel_hitl_resumes_first_child_before_slow_sibling_settles():
+    """The first pause is actionable without the old gather settlement barrier."""
+    root_thread_id = 'supervised-staggered-root'
+    nested_thread_id = f'{root_thread_id}:container'
+    first = DictBridgeInterruptingApplication('first-done', 'delete_file')
+    slow_finished_at = []
+
+    class SlowApplication:
+        def invoke(self, payload, config=None):
+            del payload, config
+            time.sleep(0.25)
+            slow_finished_at.append(time.monotonic())
+            return {'output': 'slow-done', 'execution_finished': True}
+
+    event_times = []
+
+    class DecisionCallback(BaseCallbackHandler):
+        def on_custom_event(self, name, data, **kwargs):
+            del kwargs
+            if name != 'parallel_hitl_interrupt':
+                return
+            event_times.append(time.monotonic())
+            assert data['root_thread_id'] == root_thread_id
+            interrupt_payload = data['hitl_interrupt']
+            decision = {
+                'decision_id': str(uuid4()),
+                'interrupt_id': interrupt_payload['interrupt_id'],
+                'action': 'approve',
+                'value': '',
+            }
+            assert _parallel_hitl_registry.offer(root_thread_id, decision)
+            assert _parallel_hitl_registry.commit(root_thread_id, decision)
+
+    tools = [
+        _subagent('first_child', first),
+        _subagent('slow_child', SlowApplication()),
+    ]
+    runnable = _build_supervised_parent_runnable(
+        MemorySaver(),
+        MultiAppParentLLM(
+            'first_child', 'slow_child', 'call-first', 'call-slow',
+        ),
+        tools,
+    )
+    _parallel_hitl_registry.register(root_thread_id)
+    try:
+        result = runnable.invoke(
+            {'messages': [HumanMessage(content='Run both children')]},
+            config={
+                'configurable': {
+                    'thread_id': nested_thread_id,
+                    '__parallel_hitl_root_thread_id__': root_thread_id,
+                },
+                'callbacks': [DecisionCallback()],
+            },
+        )
+    finally:
+        _parallel_hitl_registry.unregister(root_thread_id)
+
+    assert result['execution_finished'] is True
+    assert result['output'] == 'parent-done'
+    assert len(first.calls) == 2
+    assert event_times and slow_finished_at
+    assert event_times[0] < slow_finished_at[0]
+
+
+def test_supervised_parallel_hitl_stays_live_when_every_child_is_paused():
+    """One coroutine owns all paused leaves; no root replay is required."""
+    root_thread_id = 'supervised-all-paused-root'
+    first = DictBridgeInterruptingApplication('first-done', 'first_delete')
+    second = DictBridgeInterruptingApplication('second-done', 'second_delete')
+    published = {}
+    lifecycle = []
+
+    class SequentialDecisionCallback(BaseCallbackHandler):
+        @staticmethod
+        def _commit(entry):
+            lifecycle.append(f"committed:{entry['tool_name']}")
+            decision = {
+                'decision_id': str(uuid4()),
+                'interrupt_id': entry['interrupt_id'],
+                'action': 'approve',
+                'value': '',
+            }
+            assert _parallel_hitl_registry.offer(root_thread_id, decision)
+            assert _parallel_hitl_registry.commit(root_thread_id, decision)
+
+        def on_custom_event(self, name, data, **kwargs):
+            del kwargs
+            if name == 'parallel_hitl_interrupt':
+                entry = data['hitl_interrupt']
+                published[entry['tool_name']] = entry
+                lifecycle.append(f"paused:{entry['tool_name']}")
+                if len(published) == 2:
+                    self._commit(published['first_delete'])
+            elif (
+                name == 'parallel_hitl_state'
+                and data.get('state') == 'completed'
+                and data.get('tool_call_id') == 'call-first'
+            ):
+                lifecycle.append('completed:first_delete')
+                self._commit(published['second_delete'])
+
+    runnable = _build_supervised_parent_runnable(
+        MemorySaver(),
+        MultiAppParentLLM(
+            'first_child', 'second_child', 'call-first', 'call-second',
+        ),
+        [_subagent('first_child', first), _subagent('second_child', second)],
+    )
+    _parallel_hitl_registry.register(root_thread_id)
+    try:
+        result = runnable.invoke(
+            {'messages': [HumanMessage(content='Run both children')]},
+            config={
+                'configurable': {
+                    'thread_id': f'{root_thread_id}:container',
+                    '__parallel_hitl_root_thread_id__': root_thread_id,
+                },
+                'callbacks': [SequentialDecisionCallback()],
+            },
+        )
+    finally:
+        _parallel_hitl_registry.unregister(root_thread_id)
+
+    assert result['execution_finished'] is True
+    assert result['output'] == 'parent-done'
+    assert len(first.calls) == 2
+    assert len(second.calls) == 2
+    assert lifecycle.index('committed:first_delete') < lifecycle.index(
+        'completed:first_delete'
+    ) < lifecycle.index('committed:second_delete')
+
+
 def _resume_action(payload, default='approve'):
     if not isinstance(payload, dict):
         return default
@@ -3115,7 +3297,7 @@ class RootToContainerLLM:
 
 def _build_real_container_runnable(
     leaf_pause_executions, *, memory=None, leaf_done_app=None,
-    leaf_pause_app=None,
+    leaf_pause_app=None, independent_parallel_hitl=False,
 ):
     """Build a REAL tier-2 container Assistant().runnable() whose LLM fans out
     two leaf Applications, using the SAME leaf doubles the working depth-2 tests
@@ -3146,6 +3328,8 @@ def _build_real_container_runnable(
         client=ContainerFanoutLLM(), tools=[leaf_done_tool, leaf_pause_tool],
         memory=memory or MemorySaver(), app_type='predict', is_subgraph=False,
         middleware=[SensitiveToolGuardMiddleware()],
+        independent_parallel_hitl=independent_parallel_hitl,
+        parallel_hitl_max_concurrency=2,
     )
     return (
         container_assistant.runnable(), leaf_done_app, leaf_pause_app,
@@ -3178,6 +3362,121 @@ class _RecordingDictBridgeApplication:
                 'tool_name': self.tool_name,
             },
         }
+
+
+def test_supervised_nested_fanout_durable_fallback_resumes_exact_leaf():
+    """When every live leaf is paused, root replay must enter the container.
+
+    The worker mailbox is gone at that point, so the canonical root checkpoint
+    is the only durable continuation path.  A selected leaf decision must not
+    reconstruct the root runnable against the container's checkpoint (which
+    would make NameResolver/SurnameResolver unavailable at the orchestrator).
+    """
+    published_interrupt_ids = []
+
+    class CapturePublishedInterrupts(BaseCallbackHandler):
+        def on_custom_event(self, name, data, **kwargs):
+            del kwargs
+            if name != 'parallel_hitl_interrupt':
+                return
+            published_interrupt_ids.extend(
+                entry.get('interrupt_id')
+                for entry in (data.get('hitl_interrupts') or [])
+                if entry.get('interrupt_id')
+            )
+
+    first_executions = []
+    second_executions = []
+    first = _RecordingDictBridgeApplication(
+        'leaf-done-result', 'name_delete', first_executions,
+    )
+    second = _RecordingDictBridgeApplication(
+        'leaf-pause-result', 'surname_delete', second_executions,
+    )
+    container_runnable, _, _, _ = _build_real_container_runnable(
+        second_executions,
+        leaf_done_app=first,
+        leaf_pause_app=second,
+        independent_parallel_hitl=True,
+    )
+    container_tool = Application(
+        name='full_name_resolver',
+        description='Resolves a full name',
+        application=container_runnable,
+        return_type='str',
+        client=FakeApplicationClient(container_runnable),
+        is_subgraph=True,
+        args_runnable={
+            'application_id': 42,
+            'application_version_id': 1,
+            'is_subgraph': True,
+        },
+    )
+    parent_memory = MemorySaver()
+    config = {
+        'configurable': {
+            'thread_id': 'supervised-durable-root',
+            '__parallel_hitl_root_thread_id__': 'supervised-durable-root',
+        },
+        'callbacks': [CapturePublishedInterrupts()],
+    }
+
+    initial = _build_supervised_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool],
+    ).invoke(
+        {'messages': [HumanMessage(content='Resolve full name')]},
+        config=config,
+    )
+
+    assert initial['execution_finished'] is False
+    assert len(initial['hitl_interrupts']) == 2
+    durable_interrupt_ids = {
+        entry['interrupt_id'] for entry in initial['hitl_interrupts']
+    }
+    assert set(published_interrupt_ids) == durable_interrupt_ids
+    by_tool = {
+        entry['tool_name']: entry for entry in initial['hitl_interrupts']
+    }
+
+    after_first = _build_supervised_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool],
+    ).invoke(
+        {'hitl_decisions': [{
+            'interrupt_id': by_tool['name_delete']['interrupt_id'],
+            'tool_call_id': by_tool['name_delete']['tool_call_id'],
+            'action': 'reject',
+            'value': '',
+        }]},
+        config=config,
+    )
+
+    assert after_first['execution_finished'] is False
+    assert len(after_first['hitl_interrupts']) == 1
+    assert after_first['hitl_interrupts'][0]['interrupt_id'] == (
+        by_tool['surname_delete']['interrupt_id']
+    )
+    assert len(first.calls) == 2
+    assert len(first_executions) == 1
+    assert len(second.calls) == 1
+    assert second_executions == []
+
+    finished = _build_supervised_parent_runnable(
+        parent_memory, RootToContainerLLM(), [container_tool],
+    ).invoke(
+        {'hitl_decisions': [{
+            'interrupt_id': by_tool['surname_delete']['interrupt_id'],
+            'tool_call_id': by_tool['surname_delete']['tool_call_id'],
+            'action': 'approve',
+            'value': '',
+        }]},
+        config=config,
+    )
+
+    assert finished['execution_finished'] is True
+    assert finished['output'] == 'root-complete'
+    assert len(first.calls) == 2
+    assert len(second.calls) == 2
+    assert len(second_executions) == 1
 
 
 def test_rebuilt_container_restores_pending_messages_from_raw_checkpoint_interrupt():

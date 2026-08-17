@@ -802,6 +802,8 @@ class EliteAClient:
                     auto_approve_sensitive_actions: bool = False,
                     openai_compatible: Optional[bool] = None,
                     child_dispatcher: Optional[Any] = None,
+                    independent_parallel_hitl: bool = True,
+                    parallel_hitl_max_concurrency: int = 8,
                     user_declined_mcp_servers: Optional[list] = None):
         if tools is None:
             tools = []
@@ -898,6 +900,8 @@ class EliteAClient:
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
                                       child_dispatcher=child_dispatcher,
+                                      independent_parallel_hitl=independent_parallel_hitl,
+                                      parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
                                       user_declined_mcp_servers=user_declined_mcp_servers,
                                       auto_approve_sensitive_actions=auto_approve_sensitive_actions)
         if runtime == 'langchain':
@@ -909,6 +913,8 @@ class EliteAClient:
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
                                       child_dispatcher=child_dispatcher,
+                                      independent_parallel_hitl=independent_parallel_hitl,
+                                      parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
                                       user_declined_mcp_servers=user_declined_mcp_servers,
                                       auto_approve_sensitive_actions=auto_approve_sensitive_actions).runnable()
         elif runtime == 'llama':
@@ -1243,6 +1249,8 @@ class EliteAClient:
                       exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
                       step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
                       child_dispatcher: Optional[Any] = None,
+                      independent_parallel_hitl: bool = True,
+                      parallel_hitl_max_concurrency: int = 8,
                       user_declined_mcp_servers: Optional[list] = None):
         """
         Create a predict-type agent with minimal configuration.
@@ -1349,6 +1357,8 @@ class EliteAClient:
             middleware=middleware_list if middleware_list else None,
             lazy_tools_mode=lazy_tools_mode,
             child_dispatcher=child_dispatcher,
+            independent_parallel_hitl=independent_parallel_hitl,
+            parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
             auto_approve_sensitive_actions=auto_approve_sensitive_actions,
         ).runnable()
 

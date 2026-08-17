@@ -36,9 +36,11 @@ HITL_INTERRUPT_ID_KEY = "interrupt_id"
 HITL_TOOL_CALL_ID_KEY = "tool_call_id"
 HITL_VIA_CALL_ID_KEY = "_via_call_id"
 HITL_NESTED_INTERRUPT_ID_KEY = "_nested_interrupt_id"
+HITL_CANONICAL_INTERRUPT_ID_KEY = "_canonical_interrupt_id"
 HITL_PRIVATE_ROUTING_KEYS = (
     HITL_VIA_CALL_ID_KEY,
     HITL_NESTED_INTERRUPT_ID_KEY,
+    HITL_CANONICAL_INTERRUPT_ID_KEY,
 )
 
 
@@ -63,6 +65,7 @@ class PendingHITLEntry(TypedDict, total=False):
     tool_call_id: str
     _via_call_id: str
     _nested_interrupt_id: str
+    _canonical_interrupt_id: bool
 
 
 class HITLNode(Runnable):

@@ -872,7 +872,8 @@ class StateModifierNode(Runnable):
 def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_before=None, interrupt_after=None,
                           interrupt_after_successors=None, state_class=None, output_variables=None,
                           tool_registry=None, middleware_manager=None, terminal_output_variables=None,
-                          child_dispatcher=None):
+                          child_dispatcher=None, independent_parallel_hitl=True,
+                          parallel_hitl_max_concurrency=8):
     # prepare output channels
     if interrupt_after is None:
         interrupt_after = []
@@ -926,6 +927,8 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
         middleware_manager=middleware_manager,
         terminal_output_variables=terminal_output_variables,
         child_dispatcher=child_dispatcher,
+        independent_parallel_hitl=independent_parallel_hitl,
+        parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
     )
 
     compiled.attach_node(START, None)
@@ -1047,6 +1050,8 @@ def create_graph(
         always_bind_tools: Optional[list[BaseTool]] = None,
         middleware_manager: Optional[Any] = None,
         child_dispatcher: Optional[Any] = None,
+        independent_parallel_hitl: bool = True,
+        parallel_hitl_max_concurrency: int = 8,
         skipped_pipeline_toolkit_names: Optional[set] = None,
         **kwargs
 ):
@@ -1430,6 +1435,8 @@ def create_graph(
                     # Parallel sub-agent dispatch seam (Track 2, #4993). None → in-process
                     # gather fan-out (Track 1); present → park-by-returning dispatch.
                     child_dispatcher=child_dispatcher,
+                    independent_parallel_hitl=independent_parallel_hitl,
+                    parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
                 ))
             elif node_type in ['router', 'decision']:
                 if node_type == 'router':
@@ -1632,6 +1639,8 @@ def create_graph(
         middleware_manager=middleware_manager,
         terminal_output_variables=collect_terminal_output_variables(schema),
         child_dispatcher=child_dispatcher,
+        independent_parallel_hitl=independent_parallel_hitl,
+        parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
     )
     return compiled.validate()
 
@@ -1703,7 +1712,9 @@ def convert_dict_to_message(msg_dict):
 class LangGraphAgentRunnable(CompiledStateGraph):
     def __init__(self, *args, output_variables=None, tool_registry=None,
                  interrupt_after_successors=None, middleware_manager=None,
-                 terminal_output_variables=None, child_dispatcher=None, **kwargs):
+                 terminal_output_variables=None, child_dispatcher=None,
+                 independent_parallel_hitl=True,
+                 parallel_hitl_max_concurrency=8, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_variables = output_variables
         self.tool_registry = tool_registry
@@ -1711,6 +1722,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         self._middleware_manager = middleware_manager
         self._terminal_output_variables = terminal_output_variables or []
         self._child_dispatcher = child_dispatcher
+        self._independent_parallel_hitl = independent_parallel_hitl
+        self._parallel_hitl_max_concurrency = parallel_hitl_max_concurrency
 
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,

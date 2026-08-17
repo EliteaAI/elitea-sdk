@@ -381,6 +381,16 @@ class Application(BaseTool):
                 **self.args_runnable,
                 'is_subgraph': False,
                 'child_dispatcher': None,
+                'independent_parallel_hitl': bool(
+                    ((invoke_config or {}).get('configurable') or {}).get(
+                        '__independent_parallel_hitl__', True,
+                    )
+                ),
+                'parallel_hitl_max_concurrency': int(
+                    ((invoke_config or {}).get('configurable') or {}).get(
+                        '__parallel_hitl_max_concurrency__', 8,
+                    )
+                ),
             }
             application_runnable = self.client.application(
                 **runnable_args, application_variables=application_variables,
