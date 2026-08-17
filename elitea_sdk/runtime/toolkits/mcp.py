@@ -7,6 +7,7 @@ Following MCP specification: https://modelcontextprotocol.io/specification/2025-
 import logging
 import re
 import asyncio
+import time
 from typing import List, Optional, Any, Dict, Literal, ClassVar, Union
 
 from langchain_core.tools import BaseToolkit, BaseTool
@@ -562,6 +563,7 @@ class McpToolkit(BaseToolkit):
         Returns:
             Tuple of (tool_list, server_session_id)
         """
+        _discovery_start = time.perf_counter()
         all_tools = []
         session_id = connection_config.session_id
 
@@ -603,21 +605,32 @@ class McpToolkit(BaseToolkit):
         server_session_id = None
         async with client:
             # Initialize MCP session
+            _init_start = time.perf_counter()
             await client.initialize()
+            logger.debug(
+                f"[MCP][Timing] initialize() for '{toolkit_name}' took "
+                f"{(time.perf_counter() - _init_start) * 1000:.1f}ms"
+            )
             logger.info(f"[MCP] Session initialized for '{toolkit_name}' (transport={client.detected_transport})")
-            
+
             # Capture server-provided session_id (from mcp-session-id header)
             server_session_id = client.server_session_id
             if server_session_id:
                 logger.info(f"[MCP] Server provided session_id: {server_session_id}")
-            
+
             # Discover tools
+            _list_tools_start = time.perf_counter()
             tools = await client.list_tools()
+            logger.debug(
+                f"[MCP][Timing] list_tools() for '{toolkit_name}' took "
+                f"{(time.perf_counter() - _list_tools_start) * 1000:.1f}ms ({len(tools)} tools)"
+            )
             all_tools.extend(tools)
             logger.info(f"[MCP] Discovered {len(tools)} tools from '{toolkit_name}'")
-            
+
             # Discover prompts
             try:
+                _list_prompts_start = time.perf_counter()
                 prompts = await client.list_prompts()
                 # Convert prompts to tool format
                 for prompt in prompts:
@@ -645,11 +658,24 @@ class McpToolkit(BaseToolkit):
                         "_mcp_prompt_name": prompt.get('name')
                     }
                     all_tools.append(prompt_tool)
+                logger.debug(
+                    f"[MCP][Timing] list_prompts() for '{toolkit_name}' took "
+                    f"{(time.perf_counter() - _list_prompts_start) * 1000:.1f}ms ({len(prompts)} prompts)"
+                )
                 logger.info(f"[MCP] Discovered {len(prompts)} prompts from '{toolkit_name}'")
             except Exception as e:
+                logger.debug(
+                    f"[MCP][Timing] list_prompts() for '{toolkit_name}' failed after "
+                    f"{(time.perf_counter() - _list_prompts_start) * 1000:.1f}ms"
+                )
                 logger.warning(f"[MCP] Failed to discover prompts: {e}")
-        
+
         logger.info(f"[MCP] Total discovered {len(all_tools)} items from '{toolkit_name}'")
+        logger.debug(
+            f"[MCP][Timing] Full discovery for '{toolkit_name}' took "
+            f"{(time.perf_counter() - _discovery_start) * 1000:.1f}ms "
+            f"({len(all_tools)} items)"
+        )
         # Return tools and server-provided session_id (use server's if available, else the one we sent)
         final_session_id = server_session_id or session_id
         return all_tools, final_session_id
