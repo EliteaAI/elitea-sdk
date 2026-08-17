@@ -42,8 +42,6 @@ import os
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from ...runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS
-
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -52,6 +50,7 @@ from pydantic import (
     model_validator,
 )
 
+from ...runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS
 from .text_operations import apply_line_slice
 
 logger = logging.getLogger(__name__)
@@ -65,7 +64,6 @@ SCHEMA_VERSION = "1.0"
 #: JSON key carrying the single machine-detectable discriminator. Namespaced
 #: with dunders so it never collides with a content dict's own keys.
 RESULT_STATUS_KEY = "__result_status__"
-
 
 
 class ResultStatus(str, Enum):

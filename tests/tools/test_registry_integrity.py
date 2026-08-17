@@ -21,8 +21,8 @@ def test_registry_has_no_unexpected_failed_imports():
 def module_scope_tools_imports(source, module_package):
     """Module-scope imports resolving under elitea_sdk.tools, absolute or relative.
 
-    Module scope includes bodies of top-level try/if/with blocks — they execute at
-    import time just the same — but not function or class bodies.
+    Module scope is everything that executes at import time: top-level statements,
+    try/if/with bodies, and class bodies — but not function bodies.
     """
     offenders = []
     tree = ast.parse(source)
@@ -36,7 +36,7 @@ def module_scope_tools_imports(source, module_package):
 
     def visit(node):
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 continue
             if isinstance(child, ast.ImportFrom):
                 target = resolve_relative(child.level, child.module) if child.level else (child.module or "")
@@ -80,7 +80,7 @@ def test_loaders_imported_first_leave_registry_intact():
         f"{imports}; "
         "from elitea_sdk.tools import FAILED_IMPORTS; "
         f"bad = sorted(set(FAILED_IMPORTS) - {PREEXISTING_TOOLS_INTERNAL_CYCLES!r}); "
-        "print('|'.join(bad))"
+        "print('REGISTRY_RESULT:' + '|'.join(bad))"
     )
     repo_root = str(Path(loaders_pkg.__file__).parents[4])
     result = subprocess.run(
@@ -91,5 +91,6 @@ def test_loaders_imported_first_leave_registry_intact():
         timeout=180,
     )
     assert result.returncode == 0, f"loader-first interpreter crashed: {result.stderr[-500:]}"
-    bad = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    marker = next(line for line in result.stdout.splitlines() if line.startswith("REGISTRY_RESULT:"))
+    bad = marker.removeprefix("REGISTRY_RESULT:")
     assert not bad, f"Importing loaders before elitea_sdk.tools dropped toolkits: {bad.split('|')}"
