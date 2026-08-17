@@ -29,6 +29,12 @@ PRINTER_COMPLETED_STATE = "PRINTER_COMPLETED"
 
 LOADER_MAX_TOKENS_DEFAULT = 512
 
+#: The single universal bounded-read limit (chars of text returned to context).
+#: Lives here rather than in tools.utils.file_metadata because both the tools
+#: package and the document loaders need it, and loaders must not import the
+#: tools package at module level (circular — see EliteAImageLoader).
+DEFAULT_MAX_OUTPUT_CHARS = 200000
+
 FILE_HANDLING_INSTRUCTIONS = """
 ## Handling files
 

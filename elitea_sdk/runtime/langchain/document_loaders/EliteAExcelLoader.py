@@ -24,7 +24,7 @@ from openpyxl import load_workbook
 from xlrd import open_workbook
 from langchain_core.documents import Document
 from .EliteATableLoader import EliteATableLoader
-from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
+from elitea_sdk.runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS, LOADER_MAX_TOKENS_DEFAULT
 
 logger = logging.getLogger(__name__)
 
@@ -219,13 +219,9 @@ def check_excel_read_limits(source: Union[str, bytes, io.BytesIO],
                             sheet_name: Optional[str] = None,
                             start_row: Optional[int] = None,
                             end_row: Optional[int] = None,
-                            max_output_chars: Optional[int] = None,
+                            max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
                             raise_on_violation: bool = False) -> ExcelReadEstimate:
     """Estimate an Excel request and optionally reject unsafe reads."""
-    # Imported lazily: module-level tools imports from a document loader are circular (see EliteAImageLoader)
-    from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
-    if max_output_chars is None:
-        max_output_chars = DEFAULT_MAX_OUTPUT_CHARS
     extension, openable = _open_source(file_name, source)
     # A full workbook read materializes every sheet (see _read_xlsx), so for that
     # case list and sample leading rows in a single open — reopening per sheet is
@@ -541,16 +537,11 @@ def _read_xls_rows(openable, sheet_name, start_row, end_row,
         "content": "\n".join(lines),
     }
 
-def _default_max_output_chars() -> int:
-    from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
-    return DEFAULT_MAX_OUTPUT_CHARS
-
-
 def build_excel_metadata_from_estimate(estimate: ExcelReadEstimate) -> dict:
     """Build the get_file_metadata-shaped dict directly from an estimate."""
     sheets = estimate.sheets
     read_limits = {
-        "max_output_chars": _default_max_output_chars(),
+        "max_output_chars": DEFAULT_MAX_OUTPUT_CHARS,
         "full_read_allowed": estimate.is_unbounded_read and not estimate.violations,
         "excel_max_request_rows": EXCEL_MAX_REQUEST_ROWS,
         "excel_max_embedded_images": EXCEL_MAX_IMAGE_COUNT,

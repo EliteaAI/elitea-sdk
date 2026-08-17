@@ -42,6 +42,8 @@ import os
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from ...runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS
+
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -64,12 +66,6 @@ SCHEMA_VERSION = "1.0"
 #: with dunders so it never collides with a content dict's own keys.
 RESULT_STATUS_KEY = "__result_status__"
 
-#: The single universal bounded-read limit (chars of text returned to context).
-#: Injected as the ``read_limits`` baseline for every file type so the
-#: documented-required field is genuinely always present, even for loaders that
-#: supply no ``read_limits`` of their own. Phase 4 (#5446) wires the configurable
-#: per-tool value through; PRE-1 only needs a single source of truth.
-DEFAULT_MAX_OUTPUT_CHARS = 200000
 
 
 class ResultStatus(str, Enum):

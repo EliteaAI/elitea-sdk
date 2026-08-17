@@ -9,7 +9,6 @@ from langchain_core.tools import ToolException
 from langchain_text_splitters import RecursiveJsonSplitter
 
 
-
 class EliteAJSONLoader(BaseLoader):
 
     @classmethod
