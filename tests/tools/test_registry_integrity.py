@@ -5,17 +5,50 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+import elitea_sdk.configurations as configurations_pkg
 import elitea_sdk.runtime.langchain.document_loaders as loaders_pkg
-from elitea_sdk.tools import FAILED_IMPORTS
 
 PREEXISTING_TOOLS_INTERNAL_CYCLES = {"inventory"}
 
-def test_registry_has_no_unexpected_failed_imports():
-    unexpected = set(FAILED_IMPORTS) - PREEXISTING_TOOLS_INTERNAL_CYCLES
-    assert not unexpected, (
-        f"Toolkits silently dropped from the registry: "
-        f"{ {k: v[:120] for k, v in FAILED_IMPORTS.items() if k in unexpected} }"
+REPO_ROOT = str(Path(loaders_pkg.__file__).parents[4])
+
+CYCLE_PRONE_PACKAGES = [loaders_pkg, configurations_pkg]
+
+
+def run_registry_check(first_imports):
+    script = (
+        "import logging, warnings; logging.disable(logging.CRITICAL); warnings.filterwarnings('ignore'); "
+        f"{first_imports}; "
+        "from elitea_sdk.tools import FAILED_IMPORTS; "
+        f"bad = sorted(set(FAILED_IMPORTS) - {PREEXISTING_TOOLS_INTERNAL_CYCLES!r}); "
+        "print('REGISTRY_RESULT:' + '|'.join(bad))"
     )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=180,
+    )
+    assert result.returncode == 0, f"registry-check interpreter crashed: {result.stderr[-500:]}"
+    marker = next(line for line in result.stdout.splitlines() if line.startswith("REGISTRY_RESULT:"))
+    return marker.removeprefix("REGISTRY_RESULT:")
+
+
+def test_tools_import_alone_leaves_registry_intact():
+    bad = run_registry_check("pass")
+    assert not bad, f"Toolkits silently dropped from the registry on a clean import: {bad.split('|')}"
+
+
+@pytest.mark.parametrize("package", CYCLE_PRONE_PACKAGES, ids=lambda p: p.__name__)
+def test_package_imported_first_leaves_registry_intact(package):
+    module_names = [m.name for m in pkgutil.iter_modules(package.__path__)]
+    assert module_names, f"no modules found in {package.__name__}"
+    imports = "; ".join(f"import {package.__name__}.{name}" for name in module_names)
+    bad = run_registry_check(imports)
+    assert not bad, f"Importing {package.__name__} before elitea_sdk.tools dropped toolkits: {bad.split('|')}"
 
 
 def module_scope_tools_imports(source, module_package):
@@ -52,45 +85,19 @@ def module_scope_tools_imports(source, module_package):
     return offenders
 
 
-def test_no_loader_imports_tools_at_module_level():
+@pytest.mark.parametrize("package", CYCLE_PRONE_PACKAGES, ids=lambda p: p.__name__)
+def test_no_module_scope_tools_imports(package):
     offenders = []
-    for module_info in pkgutil.iter_modules(loaders_pkg.__path__):
-        module_name = f"{loaders_pkg.__name__}.{module_info.name}"
-        module = importlib.import_module(module_name)
+    for module_info in pkgutil.iter_modules(package.__path__):
+        module = importlib.import_module(f"{package.__name__}.{module_info.name}")
         source_file = getattr(module, "__file__", None)
         if not source_file:
             continue
         with open(source_file) as fh:
             source = fh.read()
-        for lineno, stmt in module_scope_tools_imports(source, loaders_pkg.__name__):
+        for lineno, stmt in module_scope_tools_imports(source, package.__name__):
             offenders.append(f"{module_info.name}:{lineno}: {stmt}")
     assert not offenders, (
-        f"Module-scope elitea_sdk.tools imports in document loaders (circular — import "
+        f"Module-scope elitea_sdk.tools imports in {package.__name__} (circular — import "
         f"lazily at the call site instead): {offenders}"
     )
-
-
-def test_loaders_imported_first_leave_registry_intact():
-    """Deterministically force the dangerous import order in a clean interpreter."""
-    loader_names = [m.name for m in pkgutil.iter_modules(loaders_pkg.__path__)]
-    assert loader_names, "no document loaders found"
-    imports = "; ".join(f"import {loaders_pkg.__name__}.{name}" for name in loader_names)
-    script = (
-        "import logging, warnings; logging.disable(logging.CRITICAL); warnings.filterwarnings('ignore'); "
-        f"{imports}; "
-        "from elitea_sdk.tools import FAILED_IMPORTS; "
-        f"bad = sorted(set(FAILED_IMPORTS) - {PREEXISTING_TOOLS_INTERNAL_CYCLES!r}); "
-        "print('REGISTRY_RESULT:' + '|'.join(bad))"
-    )
-    repo_root = str(Path(loaders_pkg.__file__).parents[4])
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        cwd=repo_root,
-        timeout=180,
-    )
-    assert result.returncode == 0, f"loader-first interpreter crashed: {result.stderr[-500:]}"
-    marker = next(line for line in result.stdout.splitlines() if line.startswith("REGISTRY_RESULT:"))
-    bad = marker.removeprefix("REGISTRY_RESULT:")
-    assert not bad, f"Importing loaders before elitea_sdk.tools dropped toolkits: {bad.split('|')}"
