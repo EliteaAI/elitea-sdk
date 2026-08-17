@@ -41,6 +41,7 @@ from ...runtime.langchain.document_loaders.EliteAExcelLoader import (
     ExcelReadLimitExceeded,
     build_excel_metadata_from_estimate,
 )
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 BASIC_CREATE_FILE_DESCRIPTION = """Create a new file OR overwrite/replace an existing file entirely in the artifact bucket. Supports two modes:
 1. Create from content: Use 'filedata' parameter to create or fully overwrite files with text or rich formats
@@ -77,6 +78,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
     max_single_read_size: int = DEFAULT_MAX_OUTPUT_CHARS
     artifact: Optional[Any] = None
 
+    @tool_group('read')
     def read_multiple_files(
         self,
         file_paths: List[str],
@@ -116,6 +118,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         # the whole batch at one 200K-char budget, not per file × N.
         return capped_read_multiple_files(_read_one, file_paths, offset=offset, limit=limit)
 
+    @tool_group('read')
     def search_file(
         self,
         file_path: str,
@@ -155,6 +158,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
 
         return "\n".join(results)
 
+    @tool_group('write')
     def edit_file(
         self,
         file_path: str,
@@ -303,6 +307,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         """
         return fnmatch.fnmatch(filename.lower(), pattern.lower())
 
+    @tool_group('read')
     def list_files(self, bucket_name=None, folder: str = None, recursive: bool = False,
                    include: List[str] = None, skip: List[str] = None, return_as_string=True,
                    on_file_skipped: Optional[Callable[[str], None]] = None):
@@ -406,6 +411,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
 
         return str(result) if return_as_string else result
 
+    @tool_group('write')
     def create_file(self, filename: str, bucket_name = None, filedata: str = None, filepath: str = None):
         """Create a file in the artifact bucket from new content or by copying an existing file.
 
@@ -495,6 +501,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             "message": f"File '{filename}' {'copied' if operation_type == 'copy' else 'created'} successfully"
         })
 
+    @tool_group('read')
     def read_file(self,
                   filename: str = None,
                   bucket_name = None,
@@ -750,6 +757,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Unable to write file {file_path}: {str(e)}")
 
+    @tool_group('delete')
     def delete_file(self, filename: str, bucket_name = None):
         """Delete a file from the artifact bucket."""
         target_bucket = bucket_name or self.bucket
@@ -763,6 +771,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         
         return f'File "{filename}" deleted successfully.'
 
+    @tool_group('write')
     def append_data(self, filename: str, filedata: str, bucket_name=None, create_if_missing: bool = True):
         """Append data to an existing file or create new if missing."""
         target_bucket = bucket_name or self.bucket
@@ -798,6 +807,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             "message": "Data appended successfully"
         })
 
+    @tool_group('read')
     def get_file_metadata(self, filepath: str = None, filename: str = None,
                           bucket_name: str = None) -> str:
         """Return type metadata + per-type ``read_file`` hints for an artifact.
@@ -847,6 +857,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 filename=filename, filepath=filepath,
             ))
 
+    @tool_group('write')
     def create_new_bucket(self, bucket_name: str, expiration_measure = "weeks", expiration_value = 1):
         sanitized_name = bucket_name.replace('_', '-').lower()
         if sanitized_name != bucket_name:
@@ -956,6 +967,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             return base_desc
         return base_desc + "".join(format_blocks)
 
+    @with_tool_groups
     @extend_with_file_operations
     def get_available_tools(self):
         """Get available tools. Returns all tools for schema; filtering happens at toolkit level."""

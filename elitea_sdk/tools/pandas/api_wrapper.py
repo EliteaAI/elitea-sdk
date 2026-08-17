@@ -20,6 +20,7 @@ from .dataframe.generator.base import CodeGenerator
 from .dataframe.executor.code_executor import CodeExecutor
 from langchain_core.callbacks import dispatch_custom_event
 from traceback import format_exc
+from ..utils.tool_groups import with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,7 @@ class PandasWrapper(BaseToolApiWrapper):
         
         return f"Successfully saved dataframe to {target_file} in {self.bucket_name} with response: {response}"
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

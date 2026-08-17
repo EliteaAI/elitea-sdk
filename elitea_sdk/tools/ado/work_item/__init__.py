@@ -36,13 +36,15 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in AzureDevOpsApiWrapper.model_construct().get_available_tools()}
+        available_tools = AzureDevOpsApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         m = create_model(
             name,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), json_schema_extra={'configuration_types': ['ado']})),
             project=(str, Field(description="ADO project name")),
             limit=(Optional[int], Field(description="Default ADO boards result limit (can be overridden by agent instructions)", default=5, gt=0)),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default = None,
                                                                            description=PGVECTOR_CONFIGURATION_TOOLTIP,

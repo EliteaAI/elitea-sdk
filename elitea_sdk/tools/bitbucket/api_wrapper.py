@@ -17,6 +17,7 @@ from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         cls._active_branch = values.get('branch')
         return super().validate_toolkit(values)
 
+    @tool_group('write')
     def set_active_branch(self, branch_name: str) -> str:
         """
         Switches the active branch to the specified branch.
@@ -233,6 +235,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             # Handle unexpected errors during branch fetching
             return ToolException(f"Failed to validate branch '{branch_name}': {str(e)}")
 
+    @tool_group('read')
     def list_branches_in_repo(self, limit: Optional[int] = 20, branch_wildcard: Optional[str] = None) -> List[str]:
         """
         Lists branches in the repository with optional limit and wildcard filtering.
@@ -257,6 +260,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Failed to list branches: {str(e)}")
 
+    @tool_group('write')
     def create_branch(self, branch_name: str) -> None:
         """Create a new branch in the repository."""
         try:
@@ -271,6 +275,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         self._active_branch = branch_name
         return f"Branch {branch_name} created successfully and set as active"
 
+    @tool_group('delete')
     def delete_branch(self, branch_name: str) -> str:
         """
         Delete a branch from the repository.
@@ -321,6 +326,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Failed to delete branch '{branch_name}': {str(e)}")
 
+    @tool_group('write')
     def create_pull_request(self, pr_json_data: str) -> str:
         """
         Makes a pull request from the bot's branch to the base branch
@@ -338,6 +344,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                 raise ToolException(f"Make sure your pr_json matches to data json format {create_pr_data}.\nOrigin exception: {e}")
             raise ToolException(e)
 
+    @tool_group('write')
     def create_file(self, file_path: str, file_contents: str, branch: str) -> str:
         """
         Creates a new file on the bitbucket repo
@@ -373,6 +380,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"File was not created due to error: {str(e)}")
 
+    @tool_group('delete')
     def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
         """
         Deletes a file from the bitbucket repo
@@ -401,6 +409,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"File was not deleted due to error: {str(e)}")
 
+    @tool_group('write')
     def update_file(self, file_path: str, update_query: str, branch: str) -> ToolException | str:
         """
         Updates file on the bitbucket repo
@@ -437,6 +446,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"File was not updated due to error: {str(e)}")
 
+    @tool_group('read')
     def get_pull_requests_commits(self, pr_id: str) -> List[Dict[str, Any]]:
         """
         Get commits from a pull request
@@ -459,6 +469,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         """
         return self._bitbucket.get_pull_requests()
 
+    @tool_group('read')
     def get_pull_request(self, pr_id: str) -> Dict[str, Any]:
         """
         Get details of a pull request
@@ -472,6 +483,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Can't get pull request `{pr_id}` due to error:\n{str(e)}")
 
+    @tool_group('read')
     def get_pull_requests_changes(self, pr_id: str) -> Dict[str, Any]:
         """
         Get changes of a pull request
@@ -485,6 +497,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Can't get changes from pull request `{pr_id}` due to error:\n{str(e)}")
 
+    @tool_group('write')
     def add_pull_request_comment(self, pr_id: str, content, inline=None) -> str:
         """
         Add a comment to a pull request. Supports multiple content types and inline comments.
@@ -500,6 +513,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Can't add comment to pull request `{pr_id}` due to error:\n{str(e)}")
 
+    @tool_group('write')
     def close_pull_request(self, pr_id: str, message: str = None) -> str:
         """
         Close (decline) a pull request without merging it.
@@ -560,6 +574,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Can't extract file content (`{file_path}`) due to error:\n{str(e)}")
 
+    @tool_group('read')
     def list_files(self, path: str = None, recursive: bool = True, branch: str = None) -> List[str]:
         """List files in the repository with optional path, recursive search, and branch."""
         branch = branch if branch else self._active_branch
@@ -579,6 +594,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Failed to list files: {str(e)}")
 
+    @tool_group('read')
     def read_file(self, file_path: str, branch: str,
                   start_line: Optional[int] = None, end_line: Optional[int] = None) -> Any:
         """Read the contents of a file in the repository.
@@ -611,6 +627,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         )
         return guard_text_read(content, file_path, requested=requested, full_content=full_content)
 
+    @tool_group('read')
     def read_multiple_files(self, file_paths: List[str], branch: str = None,
                             offset: Optional[int] = None, limit: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -651,6 +668,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Unable to write file {file_path} on branch {branch}: {str(e)}")
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     @extend_with_file_operations
     def get_available_tools(self):

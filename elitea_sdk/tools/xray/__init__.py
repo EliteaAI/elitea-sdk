@@ -39,7 +39,9 @@ class XrayToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in XrayApiWrapper.model_construct().get_available_tools()}
+        available_tools = XrayApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         return create_model(
             name,
             limit=(Optional[int], Field(description="Limit", default=100, gt=0)),
@@ -51,7 +53,7 @@ class XrayToolkit(BaseToolkit):
             # embedder settings
             embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
 
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__={'json_schema_extra':
                             {
                                 'metadata': {

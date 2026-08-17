@@ -4,6 +4,7 @@ from pydantic import model_validator, BaseModel, SecretStr
 from pydantic import create_model
 from pydantic import Field
 import yagmail
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class YagmailWrapper(BaseModel):
         cls.client = yagmail.SMTP(user=username, password=password, host=host)
         return values
 
+    @tool_group('write')
     def send_gmail_message(self, receiver: str, message: str, subject: str, cc=None):
         """ Send email """
         response = self.client.send(
@@ -47,6 +49,7 @@ class YagmailWrapper(BaseModel):
         return response
 
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

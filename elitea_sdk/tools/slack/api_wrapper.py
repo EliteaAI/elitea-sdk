@@ -5,6 +5,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from elitea_sdk.tools.elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             self._client = WebClient(token=self.slack_token.get_secret_value())
         return self._client
     
+    @tool_group('write')
     def send_message(self, message: str, channel_id: Optional[str] = None, thread_ts: Optional[str] = None):
         """
         Sends a message to a specified Slack channel, user, or conversation.
@@ -97,6 +99,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             logger.error(f"Failed to send message to {channel}: {e.response['error']}")
             return {"success": False, "error": e.response["error"]}
 
+    @tool_group('read')
     def read_messages(self, limit=10, channel_id: Optional[str] = None):
         """
         Reads the latest messages from a Slack channel or conversation.
@@ -121,6 +124,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             logger.error(f"Failed to read message from {channel}: {e.response['error']}")
             return f"Received the error :  {e.response['error']}"
         
+    @tool_group('write')
     def create_slack_channel(self,  channel_name: str, is_private=False):
         """
         Creates a new Slack channel.
@@ -146,6 +150,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
     
 
 
+    @tool_group('read')
     def list_channel_users(self, channel_id: Optional[str] = None):
         """
         Lists all users in the specified Slack channel.
@@ -179,6 +184,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             logger.error(f"Failed to list users in channel {channel}: {e.response['error']}")
             return f"Received the error :  {e.response['error']}"
 
+    @tool_group('read')
     def list_workspace_users(self):
         """
         Fetches and returns a list of all users in the Slack workspace with selected user details.
@@ -195,6 +201,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             print(f"Error fetching users: {e.response['error']}")
             return []
     
+    @tool_group('read')
     def list_workspace_conversations(self):
         """
         Retrieves and returns a list of all conversations (channels, groups, and direct messages) in the Slack workspace.
@@ -221,6 +228,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             print(f"Error fetching conversations: {e.response['error']}")
             return [] 
 
+    @tool_group('write')
     def invite_to_conversation(self, user_ids: list, channel_id: Optional[str] = None ):
         """
         Invite one or more users to a Slack channel.
@@ -271,6 +279,7 @@ class SlackApiWrapper(BaseToolApiWrapper):
             extracted_user_data.append(extracted_entry)
         return extracted_user_data   
     
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

@@ -36,6 +36,7 @@ from pydantic.fields import PrivateAttr
 
 from ..elitea_base import BaseToolApiWrapper
 from ..utils import get_file_bytes_from_artifact
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -1045,6 +1046,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- REST reads -----
 
+    @tool_group('read')
     def get_feature(
         self,
         reference_or_id: str,
@@ -1058,6 +1060,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record = self._rest_get(f"features/{reference_or_id}").get("feature", {})
         return self._format_output(self._project_record(record, fields), output_format)
 
+    @tool_group('read')
     def get_requirement(
         self,
         reference_or_id: str,
@@ -1071,6 +1074,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record = self._rest_get(f"requirements/{reference_or_id}").get("requirement", {})
         return self._format_output(self._project_record(record, fields), output_format)
 
+    @tool_group('read')
     def get_release(
         self,
         reference_or_id: str,
@@ -1081,6 +1085,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record = self._rest_get(f"releases/{reference_or_id}").get("release", {})
         return self._format_output(self._project_record(record, fields), output_format)
 
+    @tool_group('read')
     def get_initiative(
         self,
         reference_or_id: str,
@@ -1091,6 +1096,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record = self._rest_get(f"initiatives/{reference_or_id}").get("initiative", {})
         return self._format_output(self._project_record(record, fields), output_format)
 
+    @tool_group('read')
     def get_epic(
         self,
         reference_or_id: str,
@@ -1101,6 +1107,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record = self._rest_get(f"epics/{reference_or_id}").get("epic", {})
         return self._format_output(self._project_record(record, fields), output_format)
 
+    @tool_group('read')
     def get_idea(
         self,
         reference_or_id: str,
@@ -1111,6 +1118,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         record = self._rest_get(f"ideas/{reference_or_id}").get("idea", {})
         return self._format_output(self._project_record(record, fields), output_format)
 
+    @tool_group('read')
     def get_product(
         self,
         reference_or_id: str,
@@ -1123,6 +1131,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- REST lists -----
 
+    @tool_group('read')
     def list_products(
         self,
         updated_since: Optional[str] = None,
@@ -1149,6 +1158,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             empty_message=f"Aha! API returned no products{updated_detail}.",
         )
 
+    @tool_group('read')
     def list_features(
         self,
         product_id: Optional[str] = None,
@@ -1204,6 +1214,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             ),
         )
 
+    @tool_group('read')
     def list_requirements(
         self,
         feature_id: Optional[str] = None,
@@ -1234,6 +1245,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             ),
         )
 
+    @tool_group('read')
     def list_releases(
         self,
         product_id: Optional[str] = None,
@@ -1270,6 +1282,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             ),
         )
 
+    @tool_group('read')
     def list_initiatives(
         self,
         product_id: Optional[str] = None,
@@ -1292,6 +1305,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             empty_message=f"Aha! API returned no initiatives{product_detail}.",
         )
 
+    @tool_group('read')
     def list_epics(
         self,
         product_id: Optional[str] = None,
@@ -1324,6 +1338,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             empty_message=f"Aha! API returned no epics{scope_detail}.",
         )
 
+    @tool_group('read')
     def list_ideas(
         self,
         product_id: Optional[str] = None,
@@ -1354,6 +1369,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             ),
         )
 
+    @tool_group('read')
     def search(
         self,
         q: str,
@@ -1391,6 +1407,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- GraphQL reads -----
 
+    @tool_group('read')
     def get_page(self, reference: str, include_parent: bool = False):
         """Fetch an Aha! page (note) by its reference number.
 
@@ -1403,6 +1420,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         )
         return data.get("page") or {}
 
+    @tool_group('read')
     def search_documents(self, query: str, searchable_type: Optional[str] = "Page"):
         """Search Aha! documents (default type: `Page`) via GraphQL.
 
@@ -1416,6 +1434,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         )
         return (data.get("searchDocuments") or {}).get("nodes") or []
 
+    @tool_group('read')
     def get_feature_gql(self, reference: str):
         """Fetch a feature via GraphQL — description is returned as markdown.
 
@@ -1427,6 +1446,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         data = self._gql(_QUERY_GET_FEATURE, {"id": ref})
         return data.get("feature") or {}
 
+    @tool_group('read')
     def get_requirement_gql(self, reference: str):
         """Fetch a requirement via GraphQL — description is returned as markdown.
 
@@ -1466,6 +1486,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Comments -----
 
+    @tool_group('write')
     def add_comment(self, resource_type: str, resource_id: str, body: str):
         """Post a comment on an Aha record.
 
@@ -1480,6 +1501,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         response = self._rest_post(f"{plural}/{resource_id}/comments", json=payload)
         return response.get("comment") or response
 
+    @tool_group('read')
     def list_comments(
         self,
         resource_type: str,
@@ -1524,6 +1546,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         "initiative": "products",
     }
 
+    @tool_group('write')
     def create_record(
         self,
         record_type: str,
@@ -1544,6 +1567,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             properties=properties,
         )
 
+    @tool_group('write')
     def update_record(
         self,
         record_type: str,
@@ -1565,6 +1589,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             properties=properties,
         )
 
+    @tool_group('delete')
     def delete_record(
         self,
         record_type: str,
@@ -1585,6 +1610,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             parent_id=parent_id,
         )
 
+    @tool_group('execute')
     def manage_record(
         self,
         action: str,
@@ -1677,6 +1703,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Record links -----
 
+    @tool_group('write')
     def create_record_link(
         self,
         from_record_type: str,
@@ -1825,6 +1852,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Copy / duplicate -----
 
+    @tool_group('write')
     def copy_record(self, record_type: str, record_id: str):
         """Duplicate an Aha record.
 
@@ -1844,6 +1872,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Custom fields metadata -----
 
+    @tool_group('read')
     def fields_metadata(
         self,
         output_format: Optional[str] = "json",
@@ -1862,6 +1891,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             empty_message="Aha! API returned no custom-field definitions.",
         )
 
+    @tool_group('read')
     def field_options_metadata(
         self,
         field_id: str,
@@ -1896,6 +1926,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Attachments -----
 
+    @tool_group('write')
     def attach_file(
         self,
         resource_type: str,
@@ -1978,6 +2009,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Dispatchers matching Aha remote MCP tool names -----
 
+    @tool_group('read')
     def find_project(
         self,
         q: Optional[str] = None,
@@ -2000,6 +2032,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
         )
         return self._format_output(self._project_records(records, fields), output_format)
 
+    @tool_group('read')
     def search_records(
         self,
         record_type: str,
@@ -2051,6 +2084,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
             f"Accepted: {_SEARCHABLE_RECORD_VALUES}."
         )
 
+    @tool_group('read')
     def read_records(
         self,
         record_type: str,
@@ -2087,6 +2121,7 @@ class AhaApiWrapper(BaseToolApiWrapper):
 
     # ----- Tool registry -----
 
+    @with_tool_groups
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Return the list of tools this wrapper exposes."""
         return [

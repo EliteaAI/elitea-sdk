@@ -7,6 +7,7 @@ from pydantic.fields import PrivateAttr
 
 from .Zephyr import Zephyr
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class ZephyrV1ApiWrapper(BaseToolApiWrapper):
             parsed.append(parsed_step)
         return parsed
 
+    @tool_group('read')
     def get_test_case_steps(self, issue_id: int, project_id: int):
         """ Get test case steps by issue_id."""
         parsed = self._parse_test_steps(self._client.get_test_case_steps(issue_id, project_id).json())
@@ -82,17 +84,20 @@ class ZephyrV1ApiWrapper(BaseToolApiWrapper):
             return "No Zephyr test steps found"
         return "Found " + str(len(parsed)) + " test steps:\n" + str(parsed)
 
+    @tool_group('write')
     def add_new_test_case_step(self, issue_id: int, project_id: int, step: str, data: str, result: str):
         """ Adds new test case step by issue_id."""
         return "New test step created: " + self._client.add_new_test_case_step(issue_id, project_id, step, data,
                                                                               result).text
 
+    @tool_group('write')
     def add_test_case(self, issue_id: int, project_id: int, steps_data: str):
         """ Adds test case's steps to corresponding jira ticket"""
         logger.info(f"Issue id: {issue_id}, project_id: {project_id}, Steps: {steps_data}")
         steps = json.loads(steps_data)
         return self.add_steps(issue_id, project_id, steps["steps"])
 
+    @tool_group('write')
     def add_test_cases(self, create_test_cases_data: str):
         """ Adds test case's steps to corresponding jira tickets"""
         test_cases = json.loads(create_test_cases_data)
@@ -105,6 +110,7 @@ class ZephyrV1ApiWrapper(BaseToolApiWrapper):
                                         data=step["data"], result=step["result"])
         return f"Done. Test issue was update with steps: {steps}"
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

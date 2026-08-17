@@ -25,13 +25,15 @@ class ZephyrSquadToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in ZephyrSquadApiWrapper.model_construct().get_available_tools()}
+        available_tools = ZephyrSquadApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         return create_model(
             name,
             account_id=(str, Field(description="AccountID for the user that is going to be authenticating")),
             access_key=(SecretStr, Field(description="Generated access key", json_schema_extra={'secret': True})),
             secret_key=(SecretStr, Field(description="Generated secret key", json_schema_extra={'secret': True})),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__={'json_schema_extra': {'metadata': {"label": "Zephyr Squad", "icon_url": "zephyr.svg",
                             "categories": ["test management"],
                             "extra_categories": ["test automation", "test case management", "test planning"]

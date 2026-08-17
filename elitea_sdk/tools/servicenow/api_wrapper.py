@@ -9,6 +9,7 @@ from pysnc.record import GlideElement, GlideRecord
 
 from langchain_core.tools import ToolException
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
         cls.client = ServiceNowClient(instance=base_url, auth=(username, password.get_secret_value()))
         return values
 
+    @tool_group('read')
     def get_incidents(self, data: Optional[Dict[str, Any]] = None) -> ToolException | str:
         """Retrieves incidents from the ServiceNow database based on the provided filters."""
 
@@ -89,6 +91,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
             parsed.append(parsed_item)
         return parsed
 
+    @tool_group('write')
     def create_incident(self, data: Optional[Dict[str, str]] = {}) -> ToolException | str:
         """Creates a new incident on the ServiceNow database."""
         try:
@@ -102,6 +105,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(f"ServiceNow tool exception. {e}")
 
+    @tool_group('write')
     def update_incident(self, sys_id: str, update_fields: str) -> ToolException | str:
         """Updates an existing incident on the ServiceNow database per the provided sys_id and
          data describing the fields to update.
@@ -130,6 +134,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
                 except AttributeError as e:
                     raise ToolException(f"Warning: Cannot set field '{field}': {e}")
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

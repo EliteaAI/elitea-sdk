@@ -14,6 +14,7 @@ from .model import (
     SalesforceInput
 )
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 
 class SalesforceApiWrapper(BaseToolApiWrapper):
@@ -95,6 +96,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
             "Content-Type": "application/json"
         }
 
+    @tool_group('write')
     def create_case(self, subject: str, description: str, origin: str, status: str):
         """
         Create a new Salesforce Case.
@@ -116,6 +118,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
         return response.json()
 
 
+    @tool_group('write')
     def create_lead(self, last_name: str, company: str, email: str, phone: str):
         """
         Create a new Salesforce Lead.
@@ -138,6 +141,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
 
 
 
+    @tool_group('read')
     def search_salesforce(self, object_type: str, query: str):
         """
         Perform a SOQL search in Salesforce.
@@ -159,6 +163,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
 
         return response.json()
 
+    @tool_group('write')
     def update_case(self, case_id: str, status: str, description: str = ""):
         """
         Update an existing Salesforce Case.
@@ -177,6 +182,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
         raise ToolException(f"Failed to update Case {case_id}. Error: {error_message}")
 
 
+    @tool_group('write')
     def update_lead(self, lead_id: str, email: Optional[str] = None, phone: Optional[str] = None):
         """
         Update an existing Salesforce Lead.
@@ -197,6 +203,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
         return ToolException(f"Failed to update Lead {lead_id}. Error: {error_message}")
 
 
+    @tool_group('execute')
     def execute_generic_rq(self, method: str, relative_url: str, params: Optional[str] = "{}"):
         """
         Execute a generic API request to Salesforce.
@@ -236,6 +243,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
 
 
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {"name": "create_case", "description": "Create a new Case", "args_schema": SalesforceCreateCase, "ref": self.create_case},

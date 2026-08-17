@@ -18,6 +18,7 @@ from ..work_item import AzureDevOpsApiWrapper
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ....runtime.utils.utils import IndexerKeywords
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                 raise ValueError(f"Azure DevOps connection failed: {e}")
         return super().validate_toolkit(values)
 
+    @tool_group('read')
     def get_all_test_case_fields_for_project(self, force_refresh: bool = False) -> str:
         """
         Get formatted information about available Test Case fields and their metadata.
@@ -241,6 +243,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         # Use the class-level work_item wrapper instance
         return self._work_item_wrapper.get_work_item_type_fields(work_item_type="Test Case", force_refresh=force_refresh)
 
+    @tool_group('write')
     def create_test_plan(self, test_plan_create_params: str):
         """Create a test plan in Azure DevOps."""
         try:
@@ -252,6 +255,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error creating test plan: {e}")
             return ToolException(f"Error creating test plan: {e}")
 
+    @tool_group('delete')
     def delete_test_plan(self, plan_id: int):
         """Delete a test plan in Azure DevOps."""
         try:
@@ -261,6 +265,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error deleting test plan: {e}")
             return ToolException(f"Error deleting test plan: {e}")
 
+    @tool_group('read')
     def get_test_plan(self, plan_id: Optional[int] = None):
         """Get a test plan or list of test plans in Azure DevOps."""
         try:
@@ -274,6 +279,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error getting test plan(s): {e}")
             return ToolException(f"Error getting test plan(s): {e}")
 
+    @tool_group('write')
     def create_test_suite(self, test_suite_create_params: str, plan_id: int):
         """Create a test suite in Azure DevOps."""
         try:
@@ -285,6 +291,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error creating test suite: {e}")
             return ToolException(f"Error creating test suite: {e}")
 
+    @tool_group('delete')
     def delete_test_suite(self, plan_id: int, suite_id: int):
         """Delete a test suite in Azure DevOps."""
         try:
@@ -294,6 +301,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error deleting test suite: {e}")
             return ToolException(f"Error deleting test suite: {e}")
 
+    @tool_group('read')
     def get_test_suite(self, plan_id: int, suite_id: Optional[int] = None):
         """Get a test suite or list of test suites in Azure DevOps."""
         try:
@@ -307,6 +315,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error getting test suite(s): {e}")
             return ToolException(f"Error getting test suite(s): {e}")
 
+    @tool_group('write')
     def add_test_case(self, suite_test_case_create_update_parameters, plan_id: int, suite_id: int):
         """Add a test case to a suite in Azure DevOps."""
         try:
@@ -321,6 +330,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error adding test case: {e}")
             return ToolException(f"Error adding test case: {e}")
 
+    @tool_group('write')
     def create_test_cases(self, create_test_cases_parameters):
         """Creates new test cases in specified suite in Azure DevOps."""
         test_cases = json.loads(create_test_cases_parameters)
@@ -333,6 +343,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             test_steps_format=test_case['test_steps_format'],
             additional_fields=test_case.get('additional_fields', None)) for test_case in test_cases]
 
+    @tool_group('write')
     def create_test_case(self, plan_id: int, suite_id: int, title: str, description: str, test_steps: str,
                          test_steps_format: str = 'json', additional_fields: Optional[str] = None):
         """Creates a new test case in specified suite in Azure DevOps."""
@@ -440,6 +451,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         expected_elem.text = expected_result or ""
         return step_elem
 
+    @tool_group('read')
     def get_test_case(self, plan_id: int, suite_id: int, test_case_id: str, fields: Optional[List[str]] = None):
         """Get a test case from a suite in Azure DevOps with all custom fields."""
         try:
@@ -481,6 +493,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error getting test case: {e}")
             return ToolException(f"Error getting test case: {e}")
 
+    @tool_group('read')
     def get_test_cases(self, plan_id: int, suite_id: int, fields: Optional[List[str]] = None):
         """Get test cases from a suite in Azure DevOps with all custom fields."""
         try:
@@ -583,6 +596,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                                                                  'Example: [2, 23]', default=[])),
         }
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         """Return a list of available tools."""

@@ -15,6 +15,7 @@ from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, guard_nontext_read, capped_read_multiple_files
 from .utils import get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 AppendFileModel = create_model(
     "AppendFileModel",
@@ -137,6 +138,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
 
+    @tool_group('read')
     def read_multiple_files(
         self,
         file_paths: List[str],
@@ -207,11 +209,13 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
                 raise ToolException(e)
         return self._repo_instance
 
+    @tool_group('write')
     def set_active_branch(self, branch_name: str) -> str:
         self._active_branch = branch_name
         self.repo_instance.default_branch = branch_name
         return f"Active branch set to {branch_name}"
 
+    @tool_group('read')
     def list_branches_in_repo(self, limit: Optional[int] = 20, branch_wildcard: Optional[str] = None) -> List[str]:
         """
         Lists branches in the repository with optional limit and wildcard filtering.
@@ -237,12 +241,14 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return f"Failed to list branches: {str(e)}"
 
+    @tool_group('read')
     def list_files(self, path: str = None, recursive: bool = True, branch: str = None) -> List[str]:
         branch = branch if branch else self._active_branch
         files = self._get_all_files(path, recursive, branch)
         paths = [file['path'] for file in files if file['type'] == 'blob']
         return paths
 
+    @tool_group('read')
     def list_folders(self, path: str = None, recursive: bool = True, branch: str = None) -> List[str]:
         branch = branch if branch else self._active_branch
         files = self._get_all_files(path, recursive, branch)
@@ -292,6 +298,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
                                       llm=self.llm,
                                       image_cache=self._image_cache))
 
+    @tool_group('write')
     def create_branch(self, branch_name: str) -> str:
         try:
             self.repo_instance.branches.create(
@@ -308,6 +315,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         self._active_branch = branch_name
         return f"Branch {branch_name} created successfully and set as active"
 
+    @tool_group('delete')
     def delete_branch(self, branch_name: str, force: bool = False) -> str:
         """
         Delete a branch from the GitLab repository.
@@ -358,6 +366,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             parsed.append({"title": title, "number": number})
         return parsed
 
+    @tool_group('read')
     def get_issues(self) -> str:
         issues = self.repo_instance.issues.list(state="opened")
         if len(issues) > 0:
@@ -369,6 +378,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         else:
             return "No open issues available"
 
+    @tool_group('read')
     def get_issue(self, issue_number: int) -> Dict[str, Any]:
         """Fetch details of a specific issue including its comments.
 
@@ -394,6 +404,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             "comments": comments,
         }
 
+    @tool_group('write')
     def create_pull_request(self, pr_title: str, pr_body: str, branch: str) -> str:
         if self.branch == branch:
             return f"""Cannot make a pull request because 
@@ -413,6 +424,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             except Exception as e:
                 return "Unable to make pull request due to error:\n" + str(e)
 
+    @tool_group('write')
     def comment_on_issue(self, comment_query: str) -> str:
         issue_number = int(comment_query.split("\n\n")[0])
         comment = comment_query[len(str(issue_number)) + 2 :]
@@ -423,6 +435,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return "Unable to make comment due to error:\n" + str(e)
 
+    @tool_group('write')
     def comment_on_pr(self, pr_number: int, comment: str) -> str:
         """
         Add a comment to a pull request (merge request) in GitLab.
@@ -444,6 +457,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return "Unable to make comment due to error:\n" + str(e)
 
+    @tool_group('write')
     def create_file(self, file_path: str, file_contents: str, branch: str) -> str:
         # Default to active branch if branch is None
         branch = branch if branch else self._active_branch
@@ -462,6 +476,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
 
             return "Created file " + file_path
 
+    @tool_group('read')
     def read_file(self, file_path: str, branch: str,
                   start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
         """
@@ -565,6 +580,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Unable to write file {file_path}: {str(e)}")
 
+    @tool_group('write')
     def update_file(self, file_query: str, branch: str) -> str:
         """
         Update file using edit_file functionality.
@@ -620,6 +636,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return "Unable to update file due to error:\n" + str(e)
 
+    @tool_group('write')
     def append_file(self, file_path: str, content: str, branch: str) -> str:
         if branch == self.branch:
             return (
@@ -652,6 +669,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return "Unable to update file due to error:\n" + str(e)
 
+    @tool_group('delete')
     def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
         try:
             self.set_active_branch(branch)
@@ -662,6 +680,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             return f"Unable to delete file due to error:\n{e}"
 
+    @tool_group('read')
     def get_pr_changes(self, pr_number: int) -> str:
         mr = self.repo_instance.mergerequests.get(pr_number)
         res = f"title: {mr.title}\ndescription: {mr.description}\n\n"
@@ -669,6 +688,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             res += f"diff --git a/{change['old_path']} b/{change['new_path']}\n{change['diff']}\n"
         return res
 
+    @tool_group('write')
     def create_pr_change_comment(self, pr_number: int, file_path: str, line_number: int, comment: str) -> str:
         """
         Create a comment on a specific line in a pull request (merge request) change in GitLab.
@@ -706,6 +726,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Failed to create comment on MR #{pr_number}: {e}")
 
+    @tool_group('read')
     def get_commits(self, sha: Optional[str] = None, path: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None, author: Optional[str] = None):
         params = {}
         if sha:
@@ -730,6 +751,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             for commit in commits
         ]
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     @extend_with_file_operations
     def get_available_tools(self):

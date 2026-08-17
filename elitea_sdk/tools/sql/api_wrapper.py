@@ -1,3 +1,4 @@
+import functools
 import logging
 from typing import Optional
 from urllib.parse import quote_plus
@@ -10,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from .models import SQLConfig, SQLDialect
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,7 @@ class SQLApiWrapper(BaseToolApiWrapper):
     def _handle_database_errors(func):
         """Decorator to catch exceptions and mask passwords in error messages."""
 
+        @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             try:
                 return func(self, *args, **kwargs)
@@ -104,6 +107,7 @@ class SQLApiWrapper(BaseToolApiWrapper):
 
         return wrapper
 
+    @tool_group('execute')
     @_handle_database_errors
     def execute_sql(self, sql_query: str):
         """Executes the provided SQL query on the configured database."""
@@ -128,6 +132,7 @@ class SQLApiWrapper(BaseToolApiWrapper):
         finally:
             session.close()
 
+    @tool_group('read')
     @_handle_database_errors
     def list_tables_and_columns(self):
         """Lists all tables and their columns in the configured database."""
@@ -148,6 +153,7 @@ class SQLApiWrapper(BaseToolApiWrapper):
             }
         return data
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

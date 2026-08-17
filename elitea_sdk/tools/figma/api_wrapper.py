@@ -75,6 +75,7 @@ from ..utils.retry import (
     retry_on_server_error,
     retry_on_volume_error,
 )
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 GLOBAL_LIMIT = 1000000
 GLOBAL_RETAIN = ['id', 'name', 'type', 'document', 'children']
@@ -2028,6 +2029,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
 
         return wrapper
 
+    @tool_group('read')
     @process_output
     def get_file_nodes(self, file_key: str, ids: str, **kwargs):
         """Reads a specified file nodes by field key from Figma."""
@@ -2041,6 +2043,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             f"files/{file_key}/nodes?ids={str(ids)}", method="get"
         )
 
+    @tool_group('read')
     @process_output
     def get_file(
         self,
@@ -2052,16 +2055,19 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         """Reads a specified file by field key from Figma."""
         return self._client.get_file(file_key, geometry, version)
 
+    @tool_group('read')
     @process_output
     def get_file_versions(self, file_key: str, **kwargs):
         """Retrieves the version history of a specified file from Figma."""
         return self._client.get_file_versions(file_key)
 
+    @tool_group('read')
     @process_output
     def get_file_comments(self, file_key: str, **kwargs):
         """Retrieves comments on a specified file from Figma."""
         return self._client.get_comments(file_key)
 
+    @tool_group('write')
     @process_output
     def post_file_comment(
         self, file_key: str, message: str, client_meta: Optional[dict] = None, **kwargs
@@ -2069,6 +2075,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         """Posts a comment to a specific file in Figma."""
         return self._client.post_comment(file_key, message, client_meta)
 
+    @tool_group('read')
     @process_output
     def get_file_images(
         self,
@@ -2085,11 +2092,13 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             file_key=file_key, ids=ids_list, scale=scale, format=format, version=version
         )
 
+    @tool_group('read')
     @process_output
     def get_team_projects(self, team_id: str, **kwargs):
         """Retrieves all projects for a specified team ID from Figma."""
         return self._client.get_team_projects(team_id)
 
+    @tool_group('read')
     @process_output
     def get_project_files(self, project_id: str, **kwargs):
         """Retrieves all files for a specified project ID from Figma."""
@@ -2377,6 +2386,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         self._log_tool_event("Frame details extracted")
         return '\n'.join(lines)
 
+    @tool_group('read')
     def analyze_file(
         self,
         url: Optional[str] = None,
@@ -2897,6 +2907,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                     seen[sig] = {**eff, "source_path": entry["path"]}
         return list(seen.values())
 
+    @tool_group('read')
     def extract_design_tokens(
         self,
         file_key: str,
@@ -2993,6 +3004,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         }
         return json.dumps(result)
 
+    @tool_group('read')
     def extract_design_tokens_batch(
         self,
         entries: List[Dict],
@@ -3426,6 +3438,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         )
         return json.dumps(result, indent=2)
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

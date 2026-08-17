@@ -100,3 +100,37 @@ def test_every_toolkit_schema_builds():
         assert isinstance(schema, dict)
         built += 1
     assert built, "static toolkit registry is empty — toolkit imports are broken"
+
+
+def test_every_toolkit_tool_is_classified():
+    unclassified = {}
+    empty = []
+    checked = 0
+    for name, toolkit in sorted(AVAILABLE_TOOLKITS.items()):
+        if not hasattr(toolkit, "toolkit_config_schema"):
+            continue
+        schema = toolkit.toolkit_config_schema().model_json_schema()
+        selected_tools = (schema.get("properties") or {}).get("selected_tools") or {}
+        tool_names = set(selected_tools.get("args_schemas") or {}) or set(
+            (selected_tools.get("items") or {}).get("enum") or []
+        )
+        if not tool_names:
+            empty.append(name)
+            continue
+        checked += 1
+        groups = selected_tools.get("tool_groups") or {}
+        assert set(groups.values()) <= set(GROUPS), f"{name}: invalid group values {set(groups.values()) - set(GROUPS)}"
+        missing = tool_names - set(groups)
+        if missing:
+            unclassified[name] = sorted(missing)
+    assert not unclassified, (
+        f"Unclassified tools per toolkit: {unclassified}. Every tool must carry @tool_group "
+        "on the method that implements it (overrides do not inherit the marker), and the "
+        "toolkit's schema builder must emit tool_groups next to args_schemas."
+    )
+    from elitea_sdk.tools import FAILED_IMPORTS
+
+    assert checked > 30, (
+        f"expected the full static registry, checked only {checked}; registry size {len(AVAILABLE_TOOLKITS)}; "
+        f"toolkits with no enumerable tools: {empty}; failed imports: {dict(FAILED_IMPORTS)}"
+    )

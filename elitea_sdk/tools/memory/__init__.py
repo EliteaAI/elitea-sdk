@@ -175,6 +175,12 @@ class MemoryToolkit(BaseToolkit):
             "get_memory": GetMemoryInput.model_json_schema(),
             "delete_memory": DeleteMemoryInput.model_json_schema(),
         }
+        tool_groups = {
+            "manage_memory": "write",
+            "search_memory": "read",
+            "get_memory": "read",
+            "delete_memory": "delete",
+        }
 
         return create_model(
             'memory',
@@ -185,7 +191,7 @@ class MemoryToolkit(BaseToolkit):
             )),
             selected_tools=(
                 List[Literal["manage_memory", "search_memory", "get_memory", "delete_memory"]],
-                Field(default=["manage_memory", "search_memory"], json_schema_extra={'args_schemas': available_tools})
+                Field(default=["manage_memory", "search_memory"], json_schema_extra={'args_schemas': available_tools, 'tool_groups': tool_groups})
             ),
             __config__=ConfigDict(json_schema_extra={
                 'metadata': {

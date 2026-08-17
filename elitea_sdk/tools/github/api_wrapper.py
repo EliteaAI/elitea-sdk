@@ -11,6 +11,7 @@ from .schemas import (
 )
 from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
+from ..utils.tool_groups import with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
         """Access to GitHub GraphQL client methods"""
         return self.graphql_client_instance
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         # this is horrible, I need to think on something better

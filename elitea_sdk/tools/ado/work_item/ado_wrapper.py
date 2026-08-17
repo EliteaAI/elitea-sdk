@@ -36,6 +36,7 @@ from ....runtime.langchain.document_loaders.EliteAImageLoader import EliteAImage
 from ....runtime.langchain.document_loaders.constants import image_loaders_map, image_loaders_map_converted
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ....runtime.utils.utils import IndexerKeywords
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         ]
         return patch_document
 
+    @tool_group('write')
     def create_work_item(self, work_item_json, wi_type="Task"):
         """Create a work item in Azure DevOps."""
         try:
@@ -339,6 +341,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error creating work item: {e}")
             return ToolException(f"Error creating work item: {e}")
 
+    @tool_group('write')
     def update_work_item(self, id: str, work_item_json: str):
         """Updates existing work item per defined data"""
 
@@ -349,6 +352,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Issues during attempt to parse work_item_json: {str(e)}")
         return f"Work item ({work_item.id}) was updated."
 
+    @tool_group('delete')
     def delete_work_item(self, id: int):
         """Delete a work item from Azure DevOps by ID."""
         try:
@@ -358,6 +362,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error deleting work item {id}: {e}")
             return ToolException(f"Error deleting work item {id}: {e}")
 
+    @tool_group('read')
     def get_relation_types(self) -> dict:
         """Returns dict of possible relation types per syntax: 'relation name': 'relation reference name'.
         NOTE: reference name is used for adding links to the work item"""
@@ -471,6 +476,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         return '\n'.join(output)
 
+    @tool_group('read')
     def get_work_item_type_fields(self, work_item_type: str = "Task", force_refresh: bool = False) -> str:
         """
         Get formatted information about available fields for a specific work item type.
@@ -492,6 +498,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         return self._format_work_item_type_fields_for_display(work_item_type, self._work_item_type_fields_cache[cache_key])
 
+    @tool_group('write')
     def link_work_items(self, source_id, target_id, link_type, attributes: dict = None):
         """Add the relation to the source work item with an appropriate attributes if any. User may pass attributes like name, etc."""
 
@@ -526,6 +533,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         return f"Work item {source_id} linked to {target_id} with link type {link_type}"
 
+    @tool_group('read')
     def search_work_items(self, query: str, limit: int = None, fields=None):
         """Search for work items with a WIQL query (SELECT ... FROM WorkItems WHERE ...) and dynamically fetch fields based on the query. Requires a valid WIQL statement, not free text - for keyword or phrase search use search_work_items_by_text."""
         try:
@@ -562,6 +570,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             self._search_client_instance = create_search_client(self.organization_url, self.token)
         return self._search_client_instance
 
+    @tool_group('read')
     def search_work_items_by_text(
             self,
             query: str,
@@ -842,6 +851,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             raise ToolException("File name must be provided either in the URL or as a parameter.")
         return self.parse_attachment_by_id(attachment_id, file_name, image_description_prompt)
 
+    @tool_group('read')
     def get_image_by_url(self, attachment_url: str, file_name: Optional[str] = None, prompt: Optional[str] = None):
         """Analyze an image attached to an Azure DevOps work item and return its textual content.
         Accepts a work item attachment URL (the src of an <img> tag or a markdown image reference
@@ -882,6 +892,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                                             llm=self.llm, prompt=image_description_prompt,
                                             image_cache=self._image_cache)
 
+    @tool_group('read')
     def get_work_item(self, id: int, fields: Optional[list[str]] = None, as_of: Optional[str] = None, expand: Optional[str] = None, parse_attachments=False, image_description_prompt=None, process_images: bool = True):
         """Get a single work item by ID."""
         try:
@@ -955,6 +966,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Error getting work item: {e}")
 
 
+    @tool_group('read')
     def get_comments(self, work_item_id: int, limit_total: Optional[int] = None, include_deleted: Optional[bool] = None, expand: Optional[str] = None, order: Optional[str] = None, process_images: bool = False, image_description_prompt: Optional[str] = None):
         """Get comments for work item by ID."""
         try:
@@ -1085,6 +1097,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         # logger.info(f"Constructed Artifact URI: {artifact_uri}")
         return artifact_uri
 
+    @tool_group('write')
     def link_work_items_to_wiki_page(self, work_item_ids: List[int], wiki_identified: str, page_name: str):
         """Links one or more work items to a specific wiki page using an ArtifactLink."""
         if not work_item_ids:
@@ -1141,6 +1154,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error linking work items to wiki page '{page_name}': {str(e)}")
             return ToolException(f"An unexpected error occurred while linking work items to wiki page '{page_name}': {str(e)}")
 
+    @tool_group('delete')
     def unlink_work_items_from_wiki_page(self, work_item_ids: List[int], wiki_identified: str, page_name: str):
         """Unlinks one or more work items from a specific wiki page by removing the ArtifactLink."""
         if not work_item_ids:
@@ -1215,6 +1229,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error unlinking work items from wiki page '{page_name}': {str(e)}")
             return ToolException(f"An unexpected error occurred while unlinking work items from wiki page '{page_name}': {str(e)}")
 
+    @tool_group('write')
     def attach_file_to_work_item(
         self,
         work_item_id: int,
@@ -1650,6 +1665,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )),
         }
 
+    @with_tool_groups
     def get_available_tools(self):
         """Return a list of available tools."""
         return super().get_available_tools() + [

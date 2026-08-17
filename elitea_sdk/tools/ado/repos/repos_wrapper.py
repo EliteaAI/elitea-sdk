@@ -42,6 +42,7 @@ from ...utils.available_tools_decorator import extend_with_parent_available_tool
 from ...utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
 from ...utils.text_operations import apply_line_slice
 from ...utils.file_metadata import guard_text_read
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -579,6 +580,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 files.append(item.path)
         return files # Changed to return list directly instead of str
 
+    @tool_group('write')
     def set_active_branch(self, branch_name: str) -> str:
         """
         Equivalent to `git checkout branch_name` for this Agent.
@@ -605,6 +607,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
             return ToolException(msg)
 
+    @tool_group('read')
     def list_branches_in_repo(self) -> str:
         """
         Fetches a list of all branches in the repository.
@@ -632,6 +635,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             return ToolException(msg)
 
+    @tool_group('read')
     def list_files(self, directory_path: str = "", branch_name: str = None) -> List[str]:
         """
         Recursively fetches files from a directory in the repo.
@@ -679,6 +683,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 )
         return parsed_comments
 
+    @tool_group('read')
     def list_open_pull_requests(self) -> str:
         """
         Fetches all open pull requests from the Azure DevOps repository.
@@ -712,6 +717,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         else:
             return "No open pull requests available"
 
+    @tool_group('read')
     def get_pull_request(self, pull_request_id: str) -> str:
         """
         Fetches particular pull request from the Azure DevOps repository.
@@ -787,6 +793,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
         return parsed
 
+    @tool_group('read')
     def list_pull_request_diffs(self, pull_request_id: str) -> str:
         """
         Fetches the files and their diffs included in a pull request.
@@ -889,6 +896,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         self._file_content_cache[cache_key] = content
         return content
 
+    @tool_group('write')
     def create_branch(self, branch_name: str) -> str:
         """
         Create a new branch in Azure DevOps, and set it as the active bot branch.
@@ -952,6 +960,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             raise ToolException(msg)
 
+    @tool_group('write')
     def create_file(self, file_path: str, file_contents: str, branch_name: str = None) -> str:
         """
         Creates a new file on the Azure DevOps repo
@@ -1089,6 +1098,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             return ToolException(msg)
 
+    @tool_group('read')
     def read_file(self, file_path: str, branch: str,
                   offset: Optional[int] = None, limit: Optional[int] = None) -> Any:
         """
@@ -1166,6 +1176,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(f"Unable to write file {file_path}: {e}")
             raise ToolException(f"Unable to write file {file_path}: {str(e)}")
 
+    @tool_group('write')
     def update_file(self, branch_name: str, file_path: str, update_query: str) -> str:
         """Updates a file with new content in Azure DevOps using OLD/NEW markers.
 
@@ -1202,6 +1213,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             return ToolException(msg)
 
+    @tool_group('delete')
     def delete_file(self, branch_name: str, file_path: str) -> str:
         """
         Deletes a file from the repository in Azure DevOps.
@@ -1242,6 +1254,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             return ToolException(msg)
 
+    @tool_group('read')
     def get_work_items(self, pull_request_id: int):
         """
         Fetches a specific work item and its first 10 comments from Azure DevOps.
@@ -1265,6 +1278,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             return ToolException(msg)
         return work_item_ids
 
+    @tool_group('write')
     def comment_on_pull_request(self, comment_query: Optional[str] = None, pull_request_id: Optional[int] = None,
                                 inline_comments: Optional[list] = None):
         """
@@ -1383,6 +1397,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             return ToolException(msg)
 
+    @tool_group('write')
     def create_pr(
             self, pull_request_title: str, pull_request_body: str, target_branch: str, source_branch: str
     ) -> str:
@@ -1422,6 +1437,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             raise ToolException(msg)
 
+    @tool_group('read')
     def get_commits(
             self,
             sha: Optional[str] = None,
@@ -1567,6 +1583,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 results_and_hits,
             ))
 
+    @tool_group('read')
     def search_code(
             self,
             query: str,
@@ -1717,6 +1734,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
         return dumps(payload)
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         """Return a list of available tools."""

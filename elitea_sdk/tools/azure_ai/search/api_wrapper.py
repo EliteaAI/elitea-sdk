@@ -6,6 +6,7 @@ from azure.search.documents import SearchClient
 from langchain_openai import AzureOpenAIEmbeddings
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class AzureSearchApiWrapper(BaseToolApiWrapper):
             )
         return values
 
+    @tool_group('read')
     def text_search(self, search_text: str, limit: Optional[int] = -1, order_by: Optional[List[str]] = None, selected_fields: Optional[list] = []) -> List[Dict]:
         """
         Perform a search query on the Azure Search index.
@@ -88,6 +90,7 @@ class AzureSearchApiWrapper(BaseToolApiWrapper):
         results = self._client.search(search_text=search_text, top=limit, order_by=order_by, select=selected_fields)
         return list(results)
 
+    @tool_group('read')
     def get_document(self, document_id: str, selected_fields: Optional[list] = None) -> Dict[str, Any]:
         """
         Get a specific document from the Azure Search index.
@@ -132,6 +135,7 @@ class AzureSearchApiWrapper(BaseToolApiWrapper):
         else:
             return res[:limit]
 
+    @with_tool_groups
     def get_available_tools(self):
         """
         Get the available tools for the Azure Search API.

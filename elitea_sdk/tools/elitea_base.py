@@ -17,7 +17,7 @@ from .index_params import (
     build_base_search_params,
     build_base_stepback_search_params,
 )
-from .utils.tool_groups import tool_group
+from .utils.tool_groups import tool_group, with_tool_groups
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.utils.utils import IndexerKeywords
 
@@ -141,6 +141,7 @@ class BaseToolApiWrapper(BaseModel):
     _runnable_config: Optional[Dict[str, Any]] = None
     # toolkit id propagated from backend
     toolkit_id: int = 0
+    @with_tool_groups
     def get_available_tools(self):
         raise NotImplementedError("Subclasses should implement this method")
 
@@ -687,6 +688,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         return results
     
+    @tool_group('read')
     @tool_group('read')
     def search_file(
         self,

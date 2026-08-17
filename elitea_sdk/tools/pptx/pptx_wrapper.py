@@ -13,6 +13,7 @@ import traceback
 from langchain_core.messages import HumanMessage
 import pptx
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from ..utils.tool_groups import tool_group, with_tool_groups
 logger = getLogger(__name__)
 
 
@@ -471,6 +472,7 @@ IMPORTANT:
         else:
             p.text = new_content
 
+    @tool_group('write')
     def fill_template(self, file_name: str, output_file_name: str, content_description: str, pdf_file_name: str = None, batch_size: int = 20) -> Dict[str, Any]:
         """
         Fill a PPTX template with content based on the provided description.
@@ -930,6 +932,7 @@ Texts to translate:
         presentation = pptx.Presentation(temp_output_path)
         return temp_output_path
 
+    @tool_group('write')
     def translate_presentation(self, file_name: str, output_file_name: str, target_language: str) -> Dict[str, Any]:
         """
         Translate text in a PowerPoint presentation to another language.
@@ -1071,6 +1074,7 @@ Texts to translate:
             }
     
     
+    @with_tool_groups
     def get_available_tools(self):
         """
         Return list of available tools.

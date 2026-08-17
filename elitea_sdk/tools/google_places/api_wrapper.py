@@ -5,6 +5,7 @@ import googlemaps
 from pydantic import create_model, Field, field_validator, PrivateAttr, SecretStr
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class GooglePlacesAPIWrapper(BaseToolApiWrapper):
             cls._client = googlemaps.Client(key=api_key)
         return api_key
 
+    @tool_group('read')
     def places(self, query: str) -> str:
         """Retrieve places based on a query using Google Places API."""
         client_places = self._client.places(query) if self._client else {}
@@ -41,6 +43,7 @@ class GooglePlacesAPIWrapper(BaseToolApiWrapper):
 
         return "\n".join([f"{i + 1}. {place}" for i, place in enumerate(places)])
 
+    @tool_group('read')
     def find_near(self, current_location_query: str, target: str, radius: Optional[int] = 3000) -> str:
         """Find places near a specific location using Google Places API."""
         logger.info(f"Google Places API query: {current_location_query}, target: {target}, radius: {radius}")
@@ -85,6 +88,7 @@ class GooglePlacesAPIWrapper(BaseToolApiWrapper):
         )
         return formatted_details
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

@@ -27,6 +27,7 @@ from ...runtime.langchain.document_loaders.utils import perform_llm_prediction_f
 from ...runtime.langchain.utils import extract_text_from_completion
 from ...configurations.utils import _resolve_confluence_api_version
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +352,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 unquoted_space = f'"{unquoted_space}"'
         return unquoted_space
 
+    @tool_group('write')
     def create_page(self, title: str, body: str, status: str = 'current', space: str = None, parent_id: str = None,
                     representation: str = 'storage', label: str = None):
         """ Creates a page in the Confluence space. Represents content in html (storage) or wiki (wiki) formats
@@ -411,6 +413,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         parent_display = f"parent page '{parent_id_filled}'" if parent_id_filled else "space root level"
         return f"The page '{title}' was created under {parent_display}: '{page_details['link']}'. \nDetails: {str(page_details)}"
 
+    @tool_group('write')
     def create_pages(self, pages_info: str, status: str = 'current', space: str = None, parent_id: str = None):
         """ Creates a batch of pages in the Confluence space."""
         created_pages = []
@@ -542,6 +545,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             "_v2_raw": response,
         }
 
+    @tool_group('delete')
     def delete_page(self, page_id: str = None, page_title: str = None):
         """ Deletes a page by its defined page_id or page_title """
         if not page_id and not page_title:
@@ -555,6 +559,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             message = f"Page instance could not be resolved with id '{page_id}' and/or title '{page_title}'"
         return message
 
+    @tool_group('write')
     def update_page_by_id(self, page_id: str, representation: str = 'storage', new_title: str = None,
                           new_body: str = None, new_labels: list = None):
         """ Updates an existing Confluence page (using id or title) by replacing its content, title, labels """
@@ -603,6 +608,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
         return f"The page '{page_id}' was updated successfully: '{webui_link}'. \nDetails: {str(update_details)}"
 
+    @tool_group('write')
     def update_page_by_title(self, page_title: str, representation: str = 'storage', new_title: str = None,
                              new_body: str = None, new_labels: list = None):
         """ Updates an existing Confluence page (using id or title) by replacing its content, title, labels """
@@ -613,6 +619,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return self.update_page_by_id(page_id=current_page['id'], representation=representation, new_title=new_title,
                                       new_body=new_body, new_labels=new_labels)
 
+    @tool_group('write')
     def update_pages(self, page_ids: list = None, new_contents: list = None, new_labels: list = None):
         """ Update a batch of pages in the Confluence space. """
         statuses = []
@@ -637,6 +644,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             for label in self.labels:
                 self.client.set_page_label(page_id, label)
 
+    @tool_group('write')
     def update_labels(self, page_ids: list = None, new_labels: list = None):
         """ Update a batch of pages in the Confluence space. """
         statuses = []
@@ -648,6 +656,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         else:
             return "Either list of page_ids should be provided."
 
+    @tool_group('read')
     def get_page_tree(self, page_id: str):
         """ Gets page tree for the Confluence space """
         descendant_pages = self.get_all_descendants(page_id)  # Pass None as the parent for the root
@@ -679,10 +688,12 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         status = self.client.page_exists(space=self.space, title=title)
         return status
 
+    @tool_group('read')
     def get_pages_with_label(self, label: str):
         """ Gets pages with specific label in the Confluence space."""
         return str(self._get_labeled_page(label))
 
+    @tool_group('read')
     def list_pages_with_label(self, label: str):
         """ Lists the pages with specific label in the Confluence space."""
         return [{'id': page['page_id'], 'title': page['page_title']} for page in self._get_labeled_page(label)]
@@ -841,6 +852,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         }
         return mapping.get(content_format.lower())
 
+    @tool_group('read')
     def read_page_by_id(self, page_id: str, skip_images: bool = False,
                         content_format: Optional[Literal['view', 'storage', 'export_view', 'editor', 'anonymous', 'styled_view', 'atlas_doc_format']] = None):
         """Reads a page by its id in the Confluence space. If id is not available, but there is a title - use get_page_id first.
@@ -862,6 +874,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return result[0].page_content
         # return self._strip_base64_images(result[0].page_content) if skip_images else result[0].page_content
 
+    @tool_group('read')
     def get_page_id_by_title(self, title: str, type: str = "page"):
         """
         Provide page id from search result by title.
@@ -906,6 +919,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             start += self.limit
         return str(pages_info) if pages_info else f"Unable to find anything using query {cql}. Check space or query."
 
+    @tool_group('read')
     def search_pages(self, query: str, skip_images: bool = False):
         """Search pages in Confluence by query text in title or page content."""
 
@@ -918,6 +932,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             cql = f'(type=page and space={self.__sanitize_confluence_space()}) and (title~"{query}" or text~"{query}")'
         return self._process_search(cql, skip_images)
 
+    @tool_group('read')
     def search_by_title(self, query: str, skip_images: bool = False):
         """Search pages in Confluence by query text in title."""
 
@@ -940,6 +955,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         """
         return query.replace('\\', '\\\\').replace('"', '\\"')
 
+    @tool_group('read')
     def site_search(self, query: str):
         """Search for pages in Confluence using site search by query text."""
         content = []
@@ -1080,6 +1096,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
         return texts
 
+    @tool_group('execute')
     def execute_generic_confluence(self, method: str, relative_url: str, params: Optional[str] = "") -> str:
         """Generic Confluence Tool for Official Atlassian Confluence REST API to call, searching, creating, updating pages, etc."""
         payload_params = parse_payload_params(params)
@@ -1578,6 +1595,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error processing image with LLM: {str(e)}")
             return f"[Image processing error: {str(e)}]"
 
+    @tool_group('read')
     def get_page_with_image_descriptions(self, page_id: str, prompt: Optional[str] = None, context_radius: int = 500):
         """
         Get a Confluence page and augment any images in it with textual descriptions that include
@@ -1856,6 +1874,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             next_link = (listing_page.get('_links') or {}).get('next')
         return _AttachmentSelection(selected, total, visible, has_more, truncated)
 
+    @tool_group('read')
     def get_page_attachments(self, page_id: str, max_content_length: int = 10000, custom_prompt: str = None, allowed_extensions: Optional[List[str]] = None, name_pattern: Optional[str] = None, max_attachments: int = 50):
         """
         Retrieve attachments visible on a Confluence page, including core metadata (with creator, created, updated), comments,
@@ -2262,6 +2281,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         """Generate Confluence storage format for file attachment link."""
         return f'<ac:link><ri:attachment ri:filename="{filename}"/></ac:link>'
 
+    @tool_group('write')
     def add_file_to_page(
         self,
         page_id: str,
@@ -2400,6 +2420,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             f"`relative_url` MUST start with this base path (e.g. {example_path})."
         )
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

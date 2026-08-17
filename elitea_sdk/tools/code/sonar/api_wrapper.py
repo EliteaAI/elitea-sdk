@@ -8,6 +8,7 @@ from langchain_core.tools import ToolException
 from pydantic import create_model, Field, PrivateAttr, model_validator, SecretStr
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 
 class SonarApiWrapper(BaseToolApiWrapper):
@@ -28,6 +29,7 @@ class SonarApiWrapper(BaseToolApiWrapper):
         cls._client.auth = (sonar_token, '')
         return values
 
+    @tool_group('read')
     def get_sonar_data(self, relative_url: str, params: str = None) -> str:
         """
         SonarQube Tool for interacting with the SonarQube REST API.
@@ -54,6 +56,7 @@ class SonarApiWrapper(BaseToolApiWrapper):
                 raise ToolException(f"Sonar tool exception. Passed params are not valid JSON. {stacktrace}")
         return {}
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

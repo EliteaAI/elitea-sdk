@@ -29,7 +29,9 @@ class ArtifactToolkit(BaseToolkit):
     
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in ArtifactWrapper.model_construct().get_available_tools()}
+        available_tools = ArtifactWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         ArtifactToolkit.toolkit_max_length = get_max_toolkit_length(selected_tools)
         return create_model(
             "artifact",
@@ -37,7 +39,7 @@ class ArtifactToolkit(BaseToolkit):
                 description=BUCKET_TOOLTIP,
                 pattern=r'^[a-z][a-z0-9-]*$'
             )),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(
                 default=None,

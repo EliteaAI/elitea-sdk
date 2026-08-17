@@ -35,7 +35,9 @@ class AzureSearchToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in AzureSearchApiWrapper.model_construct().get_available_tools()}
+        available_tools = AzureSearchApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         m = create_model(
             name,
             index_name=(str, Field(description="Azure Search index name")),
@@ -46,7 +48,7 @@ class AzureSearchToolkit(BaseToolkit):
             api_version=(Optional[str], Field(description="API version", default=None)),
             openai_api_key=(Optional[str], Field(description="Azure OpenAI API Key", default=None, json_schema_extra={'secret': True})),
             model_name=(Optional[str], Field(description="Model name for Embeddings model", default=None)),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra={
                 'metadata': {
                     "label": "Azure Search", "icon_url": None, "hidden": True,

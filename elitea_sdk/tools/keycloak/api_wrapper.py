@@ -5,6 +5,7 @@ import requests
 import json
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 
 class KeycloakApiWrapper(BaseToolApiWrapper):
@@ -41,6 +42,7 @@ class KeycloakApiWrapper(BaseToolApiWrapper):
         response.raise_for_status()
         return response.json()['access_token']
 
+    @tool_group('execute')
     def execute(self, method: str, relative_url: str, params: Optional[str] = ""):
         """Execute a request to the Keycloak Admin API."""
         if not relative_url.startswith('/'):
@@ -63,6 +65,7 @@ class KeycloakApiWrapper(BaseToolApiWrapper):
             return json.loads(json_acceptable_string)
         return {}
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

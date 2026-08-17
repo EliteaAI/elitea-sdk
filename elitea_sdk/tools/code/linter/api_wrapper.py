@@ -5,6 +5,7 @@ from typing import Tuple, Dict, List, Optional, Any
 from pydantic import model_validator, create_model, Field, PrivateAttr
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ class PythonLinter(BaseToolApiWrapper):
 
         return changed_lines
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

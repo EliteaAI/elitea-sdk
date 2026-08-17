@@ -13,6 +13,7 @@ from ..gitlab.utils import get_diff_w_position, get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -228,11 +229,13 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             else:
                 raise e
 
+    @tool_group('write')
     def set_active_branch(self, branch: str) -> str:
         """Set the active branch for the bot."""
         self._active_branch = branch
         return f"Active branch set to {branch}"
 
+    @tool_group('read')
     def list_branches_in_repo(self, repository: Optional[str] = None, limit: Optional[int] = 20, branch_wildcard: Optional[str] = None) -> List[str]:
         """
         Lists branches in the repository with optional limit and wildcard filtering.
@@ -260,6 +263,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return f"Failed to list branches: {str(e)}"
 
+    @tool_group('write')
     def create_branch(self, branch_name: str, repository: Optional[str] = None) -> str:
         """Create a new branch in the repository."""
         try:
@@ -281,6 +285,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         self._active_branch = branch_name
         return f"Branch {branch_name} created successfully and set as active"
 
+    @tool_group('read')
     def get_issues(self, repository: Optional[str] = None) -> str:
         """Fetches all open issues from the repo."""
 
@@ -295,6 +300,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(e)
 
+    @tool_group('read')
     def get_issue(self, issue_number: int, repository: Optional[str] = None) -> Dict[str, Any]:
         """Fetches a specific issue and its first 10 comments."""
 
@@ -306,6 +312,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(e)
 
+    @tool_group('write')
     def create_pull_request(self, pr_title: str, pr_body: str, branch: str, repository: Optional[str] = None) -> str:
         """Makes a pull request from the bot's branch to the base branch."""
 
@@ -328,6 +335,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(f"Unable to make pull request due to error:\n{e}")
 
+    @tool_group('read')
     def get_pr_changes(self, pr_number:str, repository: Optional[str] = None):
         """Get pull request changes from the specified pr number and repository."""
 
@@ -348,6 +356,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(e)
 
+    @tool_group('write')
     def comment_on_issue(self, comment_query: str, repository: Optional[str] = None) -> str:
         """Adds a comment to a gitlab issue."""
         try:
@@ -363,6 +372,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(e)
 
+    @tool_group('write')
     def create_file(self, file_path: str, file_contents: str, branch: str, repository: Optional[str] = None) -> str:
         """Creates a new file on the gitlab repo."""
         try:
@@ -382,6 +392,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(e)
 
+    @tool_group('read')
     def read_file(self, file_path: str, branch: str, repository: Optional[str] = None,
                   start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
         """Reads a file from the gitlab repo.
@@ -462,6 +473,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(f"Unable to write file due to error: {str(e)}")
 
+    @tool_group('write')
     def update_file(self, file_path: str, update_query: str, branch: str, repository: Optional[str] = None) -> str:
         """Updates a file with new content using OLD/NEW markers by delegating to `edit_file`.
 
@@ -484,6 +496,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             except Exception:
                 self._tmp_repository_for_edit = None
 
+    @tool_group('delete')
     def delete_file(self, file_path: str, branch: str, repository: Optional[str] = None) -> str:
         """Deletes a file from the repo."""
         try:
@@ -496,6 +509,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             return ToolException(f"Unable to delete file due to error: {str(e)}")
 
 
+    @tool_group('write')
     def append_file(self, file_path: str, content: str, branch: str, repository: Optional[str] = None) -> str:
         """
         Appends new content to the end of file.
@@ -532,6 +546,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return "Unable to update file due to error:\n" + str(e)
 
+    @tool_group('write')
     def create_pr_change_comment(self, pr_number: str, file_path: str, line_number: int, comment: str, repository: Optional[str] = None):
         """Create a comment on a pull request change in GitLab."""
 
@@ -549,6 +564,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(f"An error occurred: {e}")
 
+    @tool_group('read')
     def list_files(self, path: str = None, recursive: bool = True, branch: str = None, repository: str = None) -> List[str]:
         """List files by defined path."""
 
@@ -556,6 +572,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         paths = [file['path'] for file in files if file['type'] == 'blob']
         return f"Files: {paths}"
 
+    @tool_group('read')
     def list_folders(self, path: str = None, recursive: bool = True, branch: str = None, repository: str = None) -> List[str]:
         """List folders by defined path."""
 
@@ -567,6 +584,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         return self._get_repo(repository).repository_tree(path=path, ref=branch if branch else self._active_branch,
                                                     recursive=recursive, all=True)
 
+    @tool_group('read')
     def get_commits(
             self,
             repository: Optional[str] = None,
@@ -621,6 +639,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except Exception as e:
             return ToolException(f"Unable to retrieve commits due to error:\n{str(e)}")
 
+    @with_tool_groups
     def get_available_tools(self):
         """Return a list of available tools."""
         return [

@@ -53,10 +53,9 @@ class FigmaToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {
-            x["name"]: x["args_schema"].schema()
-            for x in FigmaApiWrapper.model_construct().get_available_tools()
-        }
+        available_tools = FigmaApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x["name"]: x["args_schema"].schema() for x in available_tools}
+        tool_groups = {x["name"]: x["group"] for x in available_tools if x.get("group")}
         return create_model(
             name,
             # TODO disabled until new requirements
@@ -96,7 +95,7 @@ class FigmaToolkit(BaseToolkit):
             global_regexp=(Optional[str], Field(description="Global regex pattern", default=None)),
             selected_tools=(
                 List[Literal[tuple(selected_tools)]],
-                Field(default=[], json_schema_extra={"args_schemas": selected_tools}),
+                Field(default=[], json_schema_extra={"args_schemas": selected_tools, "tool_groups": tool_groups}),
             ),
             # Figma configuration
             figma_configuration=(FigmaConfiguration, Field(description=get_credentials_tooltip("Figma"), json_schema_extra={'configuration_types': ['figma']})),
