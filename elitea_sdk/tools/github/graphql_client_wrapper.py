@@ -5,6 +5,8 @@ from dateutil import parser
 from langchain_core.tools import ToolException
 from pydantic import BaseModel, Field, model_validator
 
+from ..utils.tool_groups import tool_group, with_tool_groups
+
 # Remove the import of GraphQLClient
 # from .graphql_github import GraphQLClient
 
@@ -572,6 +574,7 @@ class GraphQLClientWrapper(BaseModel):
 
         return date_iso8601
     
+    @tool_group('read')
     def list_project_issues(self, board_repo: str, project_number: int = 1, items_count: int = 100) -> str:
         """
         Lists all issues in a GitHub project with their details including status, assignees, and custom fields.
@@ -683,6 +686,7 @@ class GraphQLClientWrapper(BaseModel):
         
         return formatted_result
     
+    @tool_group('read')
     def search_project_issues(self, board_repo: str, search_query: str, project_number: int = 1, items_count: int = 100) -> str:
         
         try:
@@ -1405,6 +1409,7 @@ class GraphQLClientWrapper(BaseModel):
 
         return repository_id, labels, assignable_users
     
+    @tool_group('write')
     def create_issue_on_project(self, board_repo: str, project_title: str, title: str, 
                                body: str, fields: Optional[Dict[str, str]] = None,
                                issue_repo: Optional[str] = None) -> str:
@@ -1558,6 +1563,7 @@ class GraphQLClientWrapper(BaseModel):
         # Issue not found after checking all pages
         raise ToolException(f"Issue number {issue_number} not found in project.")
 
+    @tool_group('write')
     def update_issue_on_project(self, board_repo: str, issue_number: str, project_title: str,
                                title: str, body: str, fields: Optional[Dict[str, str]] = None,
                                issue_repo: Optional[str] = None) -> str:
@@ -1782,6 +1788,7 @@ class GraphQLClientWrapper(BaseModel):
         
         return formatted_items
     
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

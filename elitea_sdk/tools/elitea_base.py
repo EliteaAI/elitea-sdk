@@ -17,6 +17,7 @@ from .index_params import (
     build_base_search_params,
     build_base_stepback_search_params,
 )
+from .utils.tool_groups import tool_group
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.utils.utils import IndexerKeywords
 
@@ -649,6 +650,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         # (toolkit's _read_file will return full content if it ignores offset/limit)
         return apply_line_slice(content, offset=offset, limit=limit)
     
+    @tool_group('read')
     def read_multiple_files(
         self,
         file_paths: List[str],
@@ -685,6 +687,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         return results
     
+    @tool_group('read')
     def search_file(
         self,
         file_path: str,
@@ -741,6 +744,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         return "\n".join(result_lines)
 
+    @tool_group('write')
     def edit_file(
         self,
         file_path: str,
