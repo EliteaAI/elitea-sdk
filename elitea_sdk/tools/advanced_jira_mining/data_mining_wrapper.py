@@ -24,7 +24,6 @@ from atlassian import Jira
 from logging import getLogger
 
 from ..llm.llm_utils import get_model, summarize
-from ..utils.tool_groups import with_tool_groups
 
 logger = getLogger(__name__)
 
@@ -921,7 +920,6 @@ class AdvancedJiraMiningWrapper(BaseModel):
         else:
             return "No gap analysis prompt has been provided. Please provide the gap analysis prompt in toolkit configuration. You should provide it under gaps_analysis_prompt value as a string."
 
-    @with_tool_groups
     def get_available_tools(self):
         return [
             {

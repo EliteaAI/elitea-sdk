@@ -4,7 +4,6 @@ from typing import Any, Optional, List
 from pydantic import BaseModel, Field, PrivateAttr, model_validator, create_model
 
 import urllib3
-from ..utils.tool_groups import with_tool_groups
 
 
 class OpenApiConfig(BaseModel):
@@ -49,7 +48,6 @@ class OpenApiWrapper(BaseModel):
         """
         return self.spec
 
-    @with_tool_groups
     def get_available_tools(self):
         return [
             {

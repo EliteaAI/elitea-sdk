@@ -8,7 +8,6 @@ from langchain_community.document_loaders.helpers import detect_file_encodings
 from langchain_core.tools import ToolException
 from langchain_text_splitters import RecursiveJsonSplitter
 
-from elitea_sdk.tools.utils.text_operations import decode_text
 
 
 class EliteAJSONLoader(BaseLoader):
@@ -78,6 +77,7 @@ class EliteAJSONLoader(BaseLoader):
                         except UnicodeDecodeError:
                             continue
                 elif hasattr(self, 'file_content') and self.file_content:
+                    from elitea_sdk.tools.utils.text_operations import decode_text
                     return decode_text(self.file_content)
                 else:
                     raise ValueError("Neither file_path nor file_content is provided for encoding detection.")

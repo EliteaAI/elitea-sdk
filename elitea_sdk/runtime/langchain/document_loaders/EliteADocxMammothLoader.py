@@ -13,7 +13,6 @@ from docx import Document as DocxDocument
 from docx.oxml.ns import qn
 from bs4 import BeautifulSoup
 
-from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_by_headers_chunker
 from .utils import perform_llm_prediction_for_image_bytes
 from ..tools.utils import encode_image_bytes_for_llm
 
@@ -654,6 +653,8 @@ class EliteADocxMammothLoader(BaseLoader):
                           and metadata including the source file path.
         """
         result_content = self.get_content()
+        # Imported lazily: module-level tools imports from a document loader are circular (see EliteAImageLoader)
+        from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_by_headers_chunker
         return list(markdown_by_headers_chunker(iter([Document(page_content=result_content, metadata={'source': str(self.path)})]), config={'max_tokens':self.max_tokens}))
 
     def get_content(self):

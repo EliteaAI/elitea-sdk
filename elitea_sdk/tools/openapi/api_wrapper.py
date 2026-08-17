@@ -12,7 +12,6 @@ from requests_openapi import Client, Operation
 
 from ..elitea_base import BaseToolApiWrapper
 from ..utils import clean_string
-from ..utils.tool_groups import with_tool_groups
 
 
 def _coerce_empty_string_to_none(v: Any) -> Any:
@@ -1124,7 +1123,6 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
             **fields,
         )
 
-    @with_tool_groups
     def get_available_tools(self, selected_tools: Optional[list[str]] = None) -> list[dict[str, Any]]:
         if not selected_tools:
             return list(self._tool_defs)

@@ -6,8 +6,6 @@ from langchain_community.document_loaders.base import BaseLoader
 from langchain_community.document_loaders.helpers import detect_file_encodings
 from langchain_core.tools import ToolException
 
-from elitea_sdk.tools.chunkers import text_chunker
-from elitea_sdk.tools.utils.text_operations import decode_text
 
 class EliteATextLoader(BaseLoader):
 
@@ -56,6 +54,7 @@ class EliteATextLoader(BaseLoader):
                         except UnicodeDecodeError:
                             continue
                 elif hasattr(self, 'file_content') and self.file_content:
+                    from elitea_sdk.tools.utils.text_operations import decode_text
                     text = decode_text(self.file_content)
                 else:
                     raise ValueError("Neither file_path nor file_content is provided for encoding detection.")
@@ -76,6 +75,8 @@ class EliteATextLoader(BaseLoader):
         """Load from file path."""
         text = self.get_content()
         metadata = {"source": str(self.file_path) if hasattr(self, 'file_path') else self.file_name}
+        # Imported lazily: module-level tools imports from a document loader are circular (see EliteAImageLoader)
+        from elitea_sdk.tools.chunkers import text_chunker
         chunks = text_chunker(file_content_generator=self.generate_document(text, metadata),
                               config={
                                   "max_tokens": self.max_tokens,
