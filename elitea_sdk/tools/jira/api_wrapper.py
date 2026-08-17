@@ -24,6 +24,7 @@ from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker, process_content_by_type
 from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -748,6 +749,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """)
 
 
+    @tool_group('read')
     def search_using_jql(self, jql: str, limit: Optional[int] = None):
         """ Search for Jira issues using JQL.
 
@@ -768,6 +770,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             return "No Jira issues found"
         return "Found " + str(len(parsed)) + " Jira issues:\n" + str(parsed)
 
+    @tool_group('write')
     def link_issues(self, inward_issue_key: str, outward_issue_key: str, linktype:str ):
         """ Link issues functionality for Jira issues. To link test to another issue ( test 'test' story, story 'is tested by test').
         Use the appropriate issue link type (e.g., "Test", "Relates", "Blocks").
@@ -787,6 +790,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """ Get the remote links from the specified jira issue key"""
         return f"Link created using following data: {link_data}."
 
+    @tool_group('read')
     def get_specific_field_info(self, jira_issue_key: str, field_name: str):
         """ Get the specific field information from Jira by jira issue key and field name """
         client = self._get_client()
@@ -798,6 +802,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Unable to find field '{field_name}'. All available fields are '{existing_fields_str}'")
         return f"Got the data from following Jira issue - {jira_issue_key} and field - {field_name}. The data is:\n{field_info}"
 
+    @tool_group('read')
     def get_remote_links(self, jira_issue_key: str):
         """ Get the remote links from the specified jira issue key"""
         client = self._get_client()
@@ -810,6 +815,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.info(f'Add pre-defined labels to the issue: {self.labels}')
             self.modify_labels(issue_key=issue_key, add_labels=self.labels)
 
+    @tool_group('write')
     def create_issue(self, issue_json: str):
         """ Create an issue in Jira."""
         client = self._get_client()
@@ -830,6 +836,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error creating Jira issue: {stacktrace}")
             return ToolException(f"Error creating Jira issue: {stacktrace}")
 
+    @tool_group('write')
     def set_issue_status(self, issue_key: str, status_name: str, mandatory_fields_json: str):
         """Set new status for the issue in Jira. Used to move ticket through the defined workflow."""
         client = self._get_client()
@@ -875,6 +882,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error updating Jira issue: {stacktrace}")
             return f"Error updating Jira issue: {stacktrace}"
 
+    @tool_group('write')
     def update_issue(self, issue_json: str):
         """ Update an issue in Jira."""
         client = self._get_client()
@@ -884,6 +892,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         self._add_default_labels(issue_key=key)
         return result
 
+    @tool_group('write')
     def modify_labels(self, issue_key: str, add_labels: list[str] = None, remove_labels: list[str] = None):
         """Updates labels of an issue in Jira."""
         client = self._get_client()
@@ -901,6 +910,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 update_issue_json["update"]["labels"].append({"remove": label})
         return self._update_issue(client, json.dumps(update_issue_json))
 
+    @tool_group('read')
     def list_comments(self, issue_key: str):
         """ Extract the comments related to specified Jira issue """
         client = self._get_client()
@@ -919,6 +929,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Unable to extract any comments from the issue: {stacktrace}")
             return f"Error during the attempt to extract available comments: {stacktrace}"
 
+    @tool_group('write')
     def add_comments(self, issue_key: str, comment: str):
         """ Add a comment to a Jira issue."""
         client = self._get_client()
@@ -1020,6 +1031,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             'content_url': content_url
         }
 
+    @tool_group('write')
     def add_file_to_issue_description(
         self,
         issue_key: str,
@@ -1114,6 +1126,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error adding file to issue description: {stacktrace}")
             raise ToolException(f"Failed to add file to issue description: {str(e)}")
 
+    @tool_group('write')
     def update_comment_with_file(
         self,
         issue_key: str,
@@ -1204,6 +1217,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error updating comment with file: {stacktrace}")
             raise ToolException(f"Failed to update comment with file: {str(e)}")
 
+    @tool_group('read')
     def list_projects(self):
         """ List all projects in Jira. """
         client = self._get_client()
@@ -1220,6 +1234,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error listing Jira projects: {stacktrace}")
             return ToolException(f"Error listing Jira projects: {stacktrace}")
 
+    @tool_group('read')
     def get_attachments_content(self, jira_issue_key: str, attachment_pattern: Optional[str] = None):
         """ Extract the content of all attachments related to a specified Jira issue key.
          NOTE: only parsable attachments will be considered
@@ -1251,6 +1266,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
         return "\n\n".join(attachment_data)
 
+    @tool_group('execute')
     def execute_generic_rq(self, method: str, relative_url: str, params: Optional[str] = "", *args):
         """Executes a generic JIRA tool request."""
         client = self._get_client()
@@ -1706,6 +1722,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
         return ''
 
+    @tool_group('read')
     def get_field_with_image_descriptions(self, jira_issue_key: str, field_name: str, prompt: Optional[str] = None,
                                           context_radius: int = 500, process_images: bool = True):
         """
@@ -1908,6 +1925,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         
         return processed_comments
 
+    @tool_group('read')
     def get_comments_with_image_descriptions(self, jira_issue_key: str, prompt: Optional[str] = None, context_radius: int = 500, process_images: bool = True):
         """
         Get all comments from Jira issue and augment any images in them with textual descriptions.
@@ -2367,6 +2385,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
     #         logger.error(f"Error indexing Jira issues: {str(e)}")
     #         raise ToolException(f"Error indexing Jira issues: {str(e)}")
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

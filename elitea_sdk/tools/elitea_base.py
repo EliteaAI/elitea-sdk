@@ -141,6 +141,7 @@ class BaseToolApiWrapper(BaseModel):
     _runnable_config: Optional[Dict[str, Any]] = None
     # toolkit id propagated from backend
     toolkit_id: int = 0
+
     def get_available_tools(self):
         raise NotImplementedError("Subclasses should implement this method")
 

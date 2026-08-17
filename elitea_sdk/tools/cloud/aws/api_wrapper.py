@@ -5,6 +5,7 @@ from botocore.config import Config
 from pydantic import Field, PrivateAttr, create_model, model_validator, SecretStr
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 
 class AWSToolConfig(BaseToolApiWrapper):
@@ -28,6 +29,7 @@ class AWSToolConfig(BaseToolApiWrapper):
         )
         return values
 
+    @tool_group('execute')
     def execute_aws(self, query: Union[str, Dict[str, Any]]):
         """Execute AWS service method based on the provided query"""
         loaded = self.json_query_load(query)
@@ -42,6 +44,7 @@ class AWSToolConfig(BaseToolApiWrapper):
             return json.loads(query)
         return query
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

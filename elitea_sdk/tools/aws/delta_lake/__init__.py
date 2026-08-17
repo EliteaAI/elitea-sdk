@@ -22,6 +22,12 @@ def get_available_tools() -> dict[str, dict]:
     }
     return available_tools
 
+
+@lru_cache(maxsize=1)
+def get_tool_groups() -> dict[str, str]:
+    api_wrapper = DeltaLakeApiWrapper.model_construct()
+    return {x["name"]: x["group"] for x in api_wrapper.get_available_tools() if x.get("group")}
+
 class DeltaLakeToolkitConfig(BaseModel):
     class Config:
         title = name
@@ -52,7 +58,7 @@ class DeltaLakeToolkitConfig(BaseModel):
         }
 
     delta_lake_configuration: DeltaLakeConfiguration = Field(description="Delta Lake Configuration", json_schema_extra={"configuration_types": ["delta_lake"]})
-    selected_tools: List[str] = Field(default=[], description="Selected tools", json_schema_extra={"args_schemas": get_available_tools()})
+    selected_tools: List[str] = Field(default=[], description="Selected tools", json_schema_extra={"args_schemas": get_available_tools(), "tool_groups": get_tool_groups()})
 
     @field_validator("selected_tools", mode="before", check_fields=False)
     @classmethod

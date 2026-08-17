@@ -47,8 +47,9 @@ class PostmanToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema(
-        ) for x in PostmanApiWrapper.model_construct().get_available_tools()}
+        available_tools = PostmanApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         m = create_model(
             name,
             postman_configuration=(Optional[PostmanConfiguration], Field(description="Postman Configuration",
@@ -58,7 +59,7 @@ class PostmanToolkit(BaseToolkit):
                 description="JSON configuration for request execution (auth headers, project IDs, base URLs, etc.)",
                 default={})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(
-                default=[], json_schema_extra={'args_schemas': selected_tools})),
+                default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra={'metadata': {
                                   "label": "Postman", "icon_url": "postman.svg"}})
         )

@@ -4,6 +4,7 @@ from pydantic import model_validator, create_model, Field, SecretStr, BaseModel,
 
 from .zephyr_squad_cloud_client import ZephyrSquadCloud
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 
 class ZephyrSquadApiWrapper(BaseToolApiWrapper):
@@ -31,66 +32,82 @@ class ZephyrSquadApiWrapper(BaseToolApiWrapper):
         )
         return values
 
+    @tool_group('read')
     def get_test_step(self, issue_id, step_id, project_id):
         """Retrieve details for a specific test step in a Jira test case."""
         return self._client.get_test_step(issue_id, step_id, project_id)
 
+    @tool_group('write')
     def update_test_step(self, issue_id, step_id, project_id, json):
         """Update the content or a specific test step in a Jira test case."""
         return self._client.update_test_step(issue_id, step_id, project_id, json)
 
+    @tool_group('delete')
     def delete_test_step(self, issue_id, step_id, project_id):
         """Remove a specific test step from a Jira test case."""
         return self._client.delete_test_step(issue_id, step_id, project_id)
 
+    @tool_group('write')
     def create_new_test_step(self, issue_id, project_id, json):
         """Add a new test step to a Jira test case."""
         return self._client.create_new_test_step(issue_id, project_id, json)
 
+    @tool_group('read')
     def get_all_test_steps(self, issue_id, project_id):
         """List all test steps associated with a Jira test case."""
         return self._client.get_all_test_steps(issue_id, project_id)
 
+    @tool_group('read')
     def get_all_test_step_statuses(self):
         """Retrieve all possible statuses for test steps in Jira."""
         return self._client.get_all_test_step_statuses()
 
+    @tool_group('read')
     def get_bdd_content(self, issue_id):
         """Retrieve BDD (Gherkin) content of an issue (feature or scenario)."""
         return self._client.get_bdd_content(issue_id)
 
+    @tool_group('write')
     def update_bdd_content(self, issue_id, new_content):
         """Replace BDD (Gherkin) content of an issue (feature or scenario)."""
         return self._client.update_bdd_content(issue_id, new_content)
 
+    @tool_group('delete')
     def delete_bdd_content(self, issue_id):
         """Remove BDD (Gherkin) content of an issue (feature or scenario)."""
         return self._client.delete_bdd_content(issue_id)
 
+    @tool_group('write')
     def create_new_cycle(self, json):
         """Creates a Cycle from a JSON representation. If no VersionId is passed in the request, it will be defaulted to an unscheduled version"""
         return self._client.create_new_cycle(json)
 
+    @tool_group('write')
     def create_folder(self, json):
         """Creates a Folder from a JSON representation. Folder names within a cycle needs to be unique."""
         return self._client.create_folder(json)
 
+    @tool_group('write')
     def add_test_to_cycle(self, cycle_id, json):
         """Adds Tests(s) to a Cycle."""
         return self._client.add_test_to_cycle(cycle_id, json)
 
+    @tool_group('write')
     def add_test_to_folder(self, folder_id, json):
         """Adds Tests(s) to a Folder."""
         return self._client.add_test_to_folder(folder_id, json)
 
+    @tool_group('write')
     def create_execution(self, json):
         """Creates an execution from a JSON representation."""
         return self._client.create_execution(json)
 
+    @tool_group('read')
     def get_execution(self, execution_id, issue_id, project_id):
         """Retrieves Execution and ExecutionStatus by ExecutionId"""
         return self._client.get_execution(execution_id, issue_id, project_id)
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

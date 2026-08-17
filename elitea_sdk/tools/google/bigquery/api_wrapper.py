@@ -17,6 +17,7 @@ from pydantic_core.core_schema import ValidationInfo
 
 from ...elitea_base import BaseToolApiWrapper
 from .schemas import ArgsSchema
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 
 def process_output(func):
@@ -136,9 +137,11 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
                 return filter
         return "TRUE"
 
+    @tool_group('read')
     def job_stats(self, job_id: str) -> Dict:
         return self.bigquery_client.get_job(job_id)._properties.get("statistics", {})
 
+    @tool_group('write')
     def create_vector_index(self):
         table_id = self._get_table_id()
         index_name = f"{self.table}_langchain_index"
@@ -156,6 +159,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
             logging.error(f"Vector index creation failed: {ex}")
             return ToolException(f"Vector index creation failed: {ex}")
 
+    @tool_group('read')
     @process_output
     def get_documents(
         self,
@@ -175,6 +179,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
         job = self.bigquery_client.query(query, job_config=job_config)
         return [dict(row) for row in job]
 
+    @tool_group('read')
     @process_output
     def similarity_search(
         self,
@@ -214,6 +219,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
         job = self.bigquery_client.query(sql, job_config=job_config)
         return [dict(row) for row in job]
 
+    @tool_group('read')
     @process_output
     def batch_search(
         self,
@@ -258,6 +264,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
             results.append([dict(row) for row in job])
         return results
 
+    @tool_group('read')
     def similarity_search_by_vector(
         self, embedding: List[float], k: int = 5, **kwargs
     ) -> List[Dict]:
@@ -277,6 +284,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
         job = self.bigquery_client.query(sql, job_config=job_config)
         return [self._row_to_document(row) for row in job]
 
+    @tool_group('read')
     def similarity_search_by_vector_with_score(
         self,
         embedding: List[float],
@@ -302,6 +310,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
         job = self.bigquery_client.query(sql, job_config=job_config)
         return [self._row_to_document(row) for row in job]
 
+    @tool_group('read')
     def similarity_search_with_score(
         self,
         query: str,
@@ -315,6 +324,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
             embedding, filter=filter, k=k, **kwargs
         )
 
+    @tool_group('read')
     def similarity_search_by_vectors(
         self,
         embeddings: List[List[float]],
@@ -339,6 +349,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
             results.append(docs)
         return results
 
+    @tool_group('execute')
     def execute(self, method: str, *args, **kwargs):
         """
         Universal method to call any method from google.cloud.bigquery.Client.
@@ -363,6 +374,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
             logging.error(f"Error executing '{method}': {e}")
             raise ToolException(f"Error executing '{method}': {e}")
 
+    @tool_group('write')
     @process_output
     def create_delta_lake_table(
         self,
@@ -406,6 +418,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
         except Exception as e:
             raise ToolException(f"Failed to create Delta Lake table: {e}")
 
+    @with_tool_groups
     def get_available_tools(self) -> List[Dict[str, Any]]:
         return [
             {

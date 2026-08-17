@@ -8,6 +8,7 @@ from pydantic.fields import PrivateAttr
 from langchain_core.tools import ToolException
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
         return values
 
     # Tool declaration
+    @tool_group('read')
     def get_types(self):
         """Get available entity types from Rally."""
         try:
@@ -125,6 +127,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error getting stories: {e}")
             return ToolException(f"Error getting stories: {e}")
 
+    @tool_group('read')
     def get_entities(self, entity_type: str = "UserStory", query=None, fetch=True, limit=10):
         """Get user stories from Rally."""
         try:
@@ -135,6 +138,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error getting stories: {e}")
             return ToolException(f"Error getting stories: {e}")
 
+    @tool_group('read')
     def get_project(self, project_name=None):
         """Get a project from Rally by name."""
         try:
@@ -147,6 +151,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error getting project: {e}")
             return ToolException(f"Error getting project: {e}")
 
+    @tool_group('read')
     def get_workspace(self, workspace_name=None):
         """Get a workspace from Rally by name."""
         try:
@@ -159,6 +164,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error getting workspace: {e}")
             return ToolException(f"Error getting workspace: {e}")
 
+    @tool_group('read')
     def get_user(self, user_name=None):
         """Get a user from Rally by username."""
         try:
@@ -178,6 +184,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error getting user: {e}")
             return ToolException(f"Error getting user: {e}")
 
+    @tool_group('read')
     def get_context(self):
         """Get a user from Rally by username."""
         try:
@@ -186,6 +193,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error getting user: {e}")
             return ToolException(f"Error getting user: {e}")
 
+    @tool_group('write')
     def create_entity(self, entity_json: str, entity_type="HierarchicalRequirement"):
         """Create an artifact in Rally."""
         try:
@@ -206,6 +214,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             logger.error(f"Error creating artifact: {e}")
             return ToolException(f"Error creating artifact: {e}")
 
+    @tool_group('write')
     def update_entity(self, entity_json: str, entity_type: str = None):
         """Update an artifact in Rally."""
         try:
@@ -231,6 +240,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             return ToolException(f"Error updating artifact: {e}")
 
     # list of available tools for a toolkit
+    @with_tool_groups
     def get_available_tools(self):
         """Return a list of available tools."""
         return [

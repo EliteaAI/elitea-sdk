@@ -11,6 +11,7 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         cls._client = ZephyrClient(base_url=base_url, token=token)
         return super().validate_toolkit(values)
 
+    @tool_group('read')
     def get_test_case(self, testcase_id: str):
 
         """Retrieve test case data by id."""
@@ -47,6 +49,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Unable to retrieve test cases: {e}")
 
+    @tool_group('read')
     def search_zql(self, zql_json: str):
 
         """Retrieve Zephyr entities by zql."""
@@ -56,6 +59,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
 
+    @tool_group('read')
     def get_testcases_by_zql(self, zql: str, return_as_list: bool = False):
 
         """
@@ -79,6 +83,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             return ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
+    @tool_group('write')
     def create_testcase(self, create_testcase_json: str):
 
         """
@@ -104,6 +109,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
     def get_test_case_steps_by_version(self, test_case_version_id: str):
         return self._client.get_testcase_steps(test_case_version_id)
 
+    @tool_group('write')
     def add_steps(self, testcase_tree_id: str, steps: Optional[List[dict]] = []):
 
         """
@@ -187,6 +193,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
                 logging.error(f"Failed to process document: {e}")
             yield document
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

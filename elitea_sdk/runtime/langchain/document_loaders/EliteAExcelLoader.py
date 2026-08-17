@@ -24,8 +24,7 @@ from openpyxl import load_workbook
 from xlrd import open_workbook
 from langchain_core.documents import Document
 from .EliteATableLoader import EliteATableLoader
-from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
-from elitea_sdk.tools.utils.file_metadata import DEFAULT_MAX_OUTPUT_CHARS
+from elitea_sdk.runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS, LOADER_MAX_TOKENS_DEFAULT
 
 logger = logging.getLogger(__name__)
 

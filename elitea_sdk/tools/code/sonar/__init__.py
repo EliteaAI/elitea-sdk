@@ -25,12 +25,14 @@ class SonarToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in SonarApiWrapper.model_construct().get_available_tools()}
+        available_tools = SonarApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         return create_model(
             name,
             sonar_project_name=(str, Field(description="Project name of the desired repository")),
             sonar_configuration=(SonarConfiguration, Field(description="Sonar Configuration", json_schema_extra={'configuration_types': ['sonar']})),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra=
                                   {
                                       'metadata':

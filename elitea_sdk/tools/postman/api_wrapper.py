@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator, create_
 
 from ..elitea_base import BaseToolApiWrapper
 from .postman_analysis import PostmanAnalyzer
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +470,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
                         headers['Cookie'] = new_cookies
 
 
+    @with_tool_groups
     def get_available_tools(self):
         """Return list of available tools with their configurations."""
         return [
@@ -748,6 +750,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
                 "Please verify the workspace ID in your toolkit configuration."
             )
 
+    @tool_group('read')
     def get_collections(self, **kwargs) -> str:
         """Get all Postman collections accessible to the user."""
         try:
@@ -773,6 +776,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
                     raise
             raise ToolException(f"Unable to get collections: {str(e)}")
 
+    @tool_group('execute')
     def execute_request(self, request_path: str, override_variables: str = "{}", **kwargs) -> str:
         """Execute a Postman request with environment variables and custom configuration."""
         try:
@@ -1025,6 +1029,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to get collection {self.collection_id}: {str(e)}")
 
+    @tool_group('read')
     def get_collection_flat(self, collection_id: Optional[str] = None, **kwargs) -> str:
         """Get a specific collection by ID in flattened format."""
         try:
@@ -1055,6 +1060,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to get folder {folder_path} from collection {self.collection_id}: {str(e)}")
 
+    @tool_group('read')
     def get_folder_flat(self, folder_path: str, **kwargs) -> str:
         """Get a specific folder in flattened format with path-based structure."""
         try:
@@ -1101,6 +1107,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to get requests from folder {folder_path}: {str(e)}")
 
+    @tool_group('read')
     def search_requests(self, query: str, search_in: str = "all", method: str = None, **kwargs) -> str:
         """Search for requests across the collection and return results in flattened structure."""
         try:
@@ -1160,6 +1167,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to search requests in collection {self.collection_id}: {str(e)}")
 
+    @tool_group('read')
     def analyze(self, scope: str = "collection", target_path: str = None, include_improvements: bool = False, **kwargs) -> str:
         """Unified analysis method for collection, folder, or request analysis.
         
@@ -1295,6 +1303,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update collection {self.collection_id} name: {str(e)}")
 
+    @tool_group('write')
     def update_collection_description(self, description: str, collection_id: Optional[str] = None, **kwargs) -> str:
         """Update collection description."""
         coll_id = collection_id or self.collection_id
@@ -1321,6 +1330,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update collection {coll_id} description: {str(e)}")
 
+    @tool_group('write')
     def update_collection_variables(self, variables: List[Dict[str, Any]], **kwargs) -> str:
         """Update collection variables."""
         try:
@@ -1346,6 +1356,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update collection {self.collection_id} variables: {str(e)}")
 
+    @tool_group('write')
     def update_collection_auth(self, auth: Dict[str, Any] = None, **kwargs) -> str:
         """Update or clear collection authentication settings.
 
@@ -1374,6 +1385,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update collection {self.collection_id} auth: {str(e)}")
 
+    @tool_group('delete')
     def delete_collection(self, collection_id: Optional[str] = None, **kwargs) -> str:
         """Delete a collection permanently."""
         try:
@@ -1388,6 +1400,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to delete collection {coll_id}: {str(e)}")
 
+    @tool_group('write')
     def duplicate_collection(self, new_name: str, **kwargs) -> str:
         """Create a copy of an existing collection."""
         try:
@@ -1424,6 +1437,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
     # FOLDER MANAGEMENT METHODS
     # =================================================================
 
+    @tool_group('write')
     def create_folder(self, name: str, description: str = None,
                       parent_path: str = None, auth: Dict = None, **kwargs) -> str:
         """Create a new folder in a collection."""
@@ -1489,6 +1503,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
 
         return folder_id
 
+    @tool_group('write')
     def update_folder(self, folder_path: str, name: str = None,
                       description: str = None, auth: Dict = None, **kwargs) -> str:
         """Update folder properties using the direct folder endpoint."""
@@ -1524,6 +1539,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update folder '{folder_path}': {str(e)}")
 
+    @tool_group('delete')
     def delete_folder(self, folder_path: str, **kwargs) -> str:
         """Delete a folder and all its contents permanently."""
         try:
@@ -1546,6 +1562,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to delete folder '{folder_path}': {str(e)}")
 
+    @tool_group('write')
     def move_folder(self, source_path: str, target_path: str = None, **kwargs) -> str:
         """Move a folder to a different location within the collection."""
         try:
@@ -1590,6 +1607,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
     # REQUEST MANAGEMENT METHODS
     # =================================================================
 
+    @tool_group('write')
     def create_request(self, name: str, method: str, url: str,
                        folder_path: str = None, description: str = None, headers: List[Dict] = None,
                        body: Dict = None, auth: Dict = None, tests: str = None,
@@ -1689,6 +1707,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             logger.error(f"Exception when creating request: {stacktrace}")
             raise ToolException(f"Unable to create request '{name}': {str(e)}")
 
+    @tool_group('write')
     def update_request_name(self, request_path: str, name: str, **kwargs) -> str:
         """Update request name."""
         try:
@@ -1710,6 +1729,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' name: {str(e)}")
 
+    @tool_group('write')
     def update_request_method(self, request_path: str, method: str, **kwargs) -> str:
         """Update request HTTP method."""
         try:
@@ -1731,6 +1751,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' method: {str(e)}")
 
+    @tool_group('write')
     def update_request_url(self, request_path: str, url: str, **kwargs) -> str:
         """Update request URL."""
         try:
@@ -1775,6 +1796,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
 
         return request_item, request_id, collection_data
         
+    @tool_group('write')
     def update_request_description(self, request_path: str, description: str, **kwargs) -> str:
         """Update request description."""
         try:
@@ -1797,6 +1819,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' description: {str(e)}")
 
+    @tool_group('write')
     def update_request_headers(self, request_path: str, headers: str, **kwargs) -> str:
         """Update request headers."""
         try:
@@ -1818,6 +1841,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' headers: {str(e)}")
 
+    @tool_group('write')
     def update_request_body(self, request_path: str, body: Union[str, Dict[str, Any]], **kwargs) -> str:
         """Update request body."""
         try:
@@ -1866,6 +1890,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' body: {str(e)}")
 
+    @tool_group('write')
     def update_request_auth(self, request_path: str, auth: Dict[str, Any] = None, **kwargs) -> str:
         """Update or clear request authentication.
 
@@ -1890,6 +1915,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' auth: {str(e)}")
 
+    @tool_group('write')
     def update_request_tests(self, request_path: str, tests: str, **kwargs) -> str:
         """Update request test scripts."""
         try:
@@ -1924,6 +1950,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' tests: {str(e)}")
 
+    @tool_group('write')
     def update_request_pre_script(self, request_path: str, pre_request_script: str, **kwargs) -> str:
         """Update request pre-request scripts."""
         try:
@@ -1958,6 +1985,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to update request '{request_path}' pre-script: {str(e)}")
 
+    @tool_group('delete')
     def delete_request(self, request_path: str, **kwargs) -> str:
         """Delete an API request permanently."""
         try:
@@ -1980,6 +2008,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to delete request '{request_path}': {str(e)}")
 
+    @tool_group('write')
     def duplicate_request(self, source_path: str, new_name: str,
                           target_path: str = None, **kwargs) -> str:
         """Create a copy of an existing API request."""
@@ -2032,6 +2061,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to duplicate request '{source_path}': {str(e)}")
 
+    @tool_group('write')
     def move_request(self, source_path: str, target_path: str = None, **kwargs) -> str:
         """Move an API request to a different folder."""
         try:
@@ -2077,6 +2107,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
     # HELPER METHODS
     # =================================================================
 
+    @tool_group('read')
     def get_request_by_path(self, request_path: str, **kwargs) -> str:
         """Get a specific request by path.
         
@@ -2099,6 +2130,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to get request '{request_path}': {str(e)}")
 
+    @tool_group('read')
     def get_request_by_id(self, request_id: str, **kwargs) -> str:
         """Get a specific request by ID.
         
@@ -2117,6 +2149,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             raise ToolException(
                 f"Unable to get request with ID '{request_id}': {str(e)}")
 
+    @tool_group('read')
     def get_request_script(self, request_path: str, script_type: str = "prerequest", **kwargs) -> str:
         """
         Get the script (pre-request or test) for a request by path.

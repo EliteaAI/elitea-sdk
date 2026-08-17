@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, PrivateAttr, create_model, model_validato
 
 from .report_portal_client import RPClient
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         cls._client = RPClient(endpoint=endpoint, api_key=api_key, project=project)
         return values
 
+    @tool_group('read')
     def get_extended_launch_data_as_raw(self, launch_id: str, format: str = 'html') -> str | None:
         """
         Get Launch details as a raw
@@ -78,6 +80,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
             return None
         return response.content
 
+    @tool_group('read')
     def get_extended_launch_data(self, launch_id: str) -> str | None:
         """
         Use the exported data from a specific launch to generate a comprehensive test report for management.
@@ -104,6 +107,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
             logger.warning(f"Exported data for launch {launch_id} is in an unsupported format.")
             return None
 
+    @tool_group('read')
     def get_launch_details(self, launch_id: str) -> dict:
         """
         Retrieve detailed information about a launch to perform a root cause analysis of failures.
@@ -112,6 +116,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.get_launch_details(launch_id)
 
+    @tool_group('read')
     def get_all_launches(self, page_number: int = 1) -> dict:
         """
         Analyze the data from all launches to track the progress of testing activities over time.
@@ -121,6 +126,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.get_all_launches(page_number)
 
+    @tool_group('read')
     def find_test_item_by_id(self, item_id: str) -> dict:
         """
         Fetch specific test items to perform detailed analysis on individual test cases. It can evaluate
@@ -129,6 +135,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.find_test_item_by_id(item_id)
 
+    @tool_group('read')
     def get_test_items_for_launch(self, launch_id: str, page_number: int = 1) -> dict:
         """
         Compile all test items from a launch to create a test execution summary.
@@ -138,6 +145,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.get_test_items_for_launch(launch_id, page_number)
 
+    @tool_group('read')
     def get_logs_for_test_items(self, item_id: str, page_number: int = 1) -> dict:
         """
         Process the logs for test items to assist in automated debugging.
@@ -147,6 +155,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.get_logs_for_test_items(item_id, page_number)
 
+    @tool_group('read')
     def get_user_information(self, username: str) -> dict:
         """
         Use user information to personalize dashboards and reports. It can also analyze user activity to optimize
@@ -154,6 +163,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.get_user_information(username)
 
+    @tool_group('read')
     def get_dashboard_data(self, dashboard_id: str) -> dict:
         """
         Analyze dashboard data to create executive summaries that highlight key performance indicators (KPIs),
@@ -162,6 +172,7 @@ class ReportPortalApiWrapper(BaseToolApiWrapper):
         """
         return self._client.get_dashboard_data(dashboard_id)
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

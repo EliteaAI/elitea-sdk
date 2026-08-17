@@ -26,6 +26,7 @@ from ..utils.file_metadata import bound_read_result, describe_requested_range
 from .read_guidance import build_excel_over_limit_response
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files (read_document only)  #
@@ -537,16 +538,19 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     #  Lists — delegates to backend                                       #
     # ------------------------------------------------------------------ #
 
+    @tool_group('read')
     def read_list(self, list_title: str, limit: int = 1000):
         """ Reads a specified List in sharepoint site. Number of list items is limited by limit (default is 1000). """
         self._sync_backend_context()
         return self._backend.read_list(list_title, limit)
 
+    @tool_group('read')
     def get_lists(self):
         """Returns all SharePoint lists available on the site with their titles, IDs, and descriptions."""
         self._sync_backend_context()
         return self._backend.get_lists()
 
+    @tool_group('read')
     def get_list_columns(self, list_title: str):
         """Get all columns (fields) in a SharePoint list with their metadata.
 
@@ -563,6 +567,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.get_list_columns(list_title)
 
+    @tool_group('write')
     def create_list_item(self, list_title: str, fields: dict):
         """Create a new item in a SharePoint list.
 
@@ -596,6 +601,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     #  Files — delegates to backend                                       #
     # ------------------------------------------------------------------ #
 
+    @tool_group('read')
     def get_files_list(self, folder_name: Optional[str] = None,
                        limit_files: int = 100,
                        form_name: Optional[str] = None,
@@ -623,6 +629,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             folder_name, limit_files, form_name, include_extensions, skip_extensions,
             on_file_skipped=on_file_skipped)
 
+    @tool_group('read')
     def read_file(self, path: str,
                   is_capture_image: bool = False,
                   page_number: Optional[int] = None,
@@ -650,6 +657,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         return bound_read_result(
             result, path, start_line=start_line, end_line=end_line)
 
+    @tool_group('write')
     def upload_file(self, folder_path: str, filepath: Optional[str] = None,
                     filedata: Optional[str] = None, filename: Optional[str] = None,
                     replace: bool = True):
@@ -695,6 +703,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         return self._backend.add_attachment_to_list_item(
             list_title, item_id, filepath, filedata, filename, replace)
 
+    @tool_group('read')
     def read_file_from_sharing_link(self, sharing_url: str, is_capture_image: bool = False,
                                     start_line: Optional[int] = None,
                                     end_line: Optional[int] = None):
@@ -735,6 +744,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     #  OneNote — delegates to backend                                     #
     # ------------------------------------------------------------------ #
 
+    @tool_group('read')
     def onenote_get_notebooks(self, select: Optional[List[str]] = None) -> list:
         """List all OneNote notebooks in this SharePoint site.
 
@@ -747,6 +757,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_get_notebooks(select=select)
 
+    @tool_group('read')
     def onenote_get_sections(self, notebook_id: str, select: Optional[List[str]] = None) -> list:
         """List all sections in a specific OneNote notebook on this site.
 
@@ -759,6 +770,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_get_sections(notebook_id, select=select)
 
+    @tool_group('read')
     def onenote_get_pages(self, section_id: str, limit: int = 100, select: Optional[List[str]] = None) -> list:
         """List pages in a OneNote section on this site.
 
@@ -772,6 +784,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_get_pages(section_id, limit, select=select)
 
+    @tool_group('read')
     def onenote_get_page_content(self, page_id: str) -> str:
         """Retrieve the raw HTML content of a OneNote page on this site.
 
@@ -783,6 +796,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_get_page_content(page_id)
 
+    @tool_group('read')
     def onenote_read_page(
         self,
         page_id: str,
@@ -810,6 +824,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             page_id, capture_images, include_attachments, read_attachment_content
         )
 
+    @tool_group('write')
     def onenote_create_notebook(self, display_name: str) -> dict:
         """Create a new OneNote notebook in this SharePoint site.
 
@@ -820,6 +835,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_create_notebook(display_name)
 
+    @tool_group('write')
     def onenote_create_section(self, notebook_id: str, display_name: str) -> dict:
         """Create a new section in a OneNote notebook on this site.
 
@@ -830,6 +846,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_create_section(notebook_id, display_name)
 
+    @tool_group('write')
     def onenote_create_page(self, section_id: str, html_content: str) -> dict:
         """Create a new OneNote page in a section on this site from raw HTML.
 
@@ -844,6 +861,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_create_page(section_id, html_content)
 
+    @tool_group('write')
     def onenote_update_page(self, page_id: str, patch_commands: list) -> str:
         """Update a OneNote page using Graph API PATCH commands.
 
@@ -859,6 +877,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_update_page(page_id, patch_commands)
 
+    @tool_group('write')
     def onenote_replace_page_content(self, page_id: str, html_content: str) -> str:
         """Replace the entire body of a OneNote page with new HTML content.
 
@@ -872,6 +891,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_replace_page_content(page_id, html_content)
 
+    @tool_group('delete')
     def onenote_delete_page(self, page_id: str) -> str:
         """Permanently delete a OneNote page on this site.
 
@@ -883,6 +903,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         return self._backend.onenote_delete_page(page_id)
 
 
+    @tool_group('read')
     def onenote_list_attachments(self, page_id: str) -> list:
         """List all file attachments on a OneNote page.
 
@@ -902,6 +923,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_list_attachments(page_id)
 
+    @tool_group('read')
     def onenote_read_attachment(
         self,
         page_id: str,
@@ -925,6 +947,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.onenote_read_attachment(page_id, attachment_name, capture_images)
 
+    @tool_group('read')
     def onenote_read_page_items(
         self,
         page_id: str,
@@ -1425,6 +1448,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     #  Tool registry                                                       #
     # ------------------------------------------------------------------ #
 
+    @with_tool_groups
     def get_available_tools(self):
         return super().get_available_tools() + [
             {

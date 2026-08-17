@@ -28,14 +28,16 @@ class SQLToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in SQLApiWrapper.model_construct().get_available_tools()}
+        available_tools = SQLApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         supported_dialects = (d.value for d in SQLDialect)
         return create_model(
             name,
             dialect=(Literal[tuple(supported_dialects)], Field(default=SQLDialect.POSTGRES.value, description="Database dialect (mysql or postgres)")),
             database_name=(str, Field(description="Database name")),
             sql_configuration=(SqlConfiguration, Field(description="SQL Configuration", json_schema_extra={'configuration_types': ['sql']})),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra=
                                   {
                                       'metadata':

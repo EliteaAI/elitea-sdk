@@ -12,6 +12,7 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 
 class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
@@ -32,152 +33,185 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
         )
         return super().validate_toolkit(values)
 
+    @tool_group('read')
     def list_test_cases(self, project_key: Optional[str] = None, folder_id: Optional[str] = None, max_results: int = None, start_at: int = None):
         """List test cases with optional filters."""
         return self._client.list_test_cases(project_key=project_key, folder_id=folder_id, max_results=max_results, start_at=start_at)['values']
 
+    @tool_group('write')
     def create_test_case(self, json: str):
         """Create a new test case."""
         test_case_data = self._parse_json(json)
         return self._client.create_test_case(test_case_data)
 
+    @tool_group('read')
     def get_test_case(self, test_case_key: str):
         """Retrieve details of a specific test case."""
         return self._client.get_test_case(test_case_key)
 
+    @tool_group('write')
     def update_test_case(self, test_case_key: str, json: str):
         """Update an existing test case."""
         test_case_data = self._parse_json(json)
         return self._client.update_test_case(test_case_key, test_case_data)
 
+    @tool_group('read')
     def get_test_case_links(self, test_case_key: str):
         """Retrieve links associated with a test case."""
         return self._client.get_test_case_links(test_case_key)
 
+    @tool_group('write')
     def create_test_case_issue_link(self, test_case_key: str, json: str):
         """Create an issue link for a test case."""
         issue_link_data = self._parse_json(json)
         self._validate_issue_link_data(issue_link_data, "test case")
         return self._client.create_test_case_issue_link(test_case_key, issue_link_data)
 
+    @tool_group('write')
     def create_test_case_web_link(self, test_case_key: str, json: str):
         """Create a web link for a test case."""
         web_link_data = self._parse_json(json)
         return self._client.create_test_case_web_link(test_case_key, web_link_data)
 
+    @tool_group('read')
     def list_test_case_versions(self, test_case_key: str, max_results: int = None, start_at: int = None):
         """List versions of a test case."""
         return self._client.list_test_case_versions(test_case_key, max_results=max_results, start_at=start_at)
 
+    @tool_group('read')
     def get_test_case_version(self, test_case_key: str, version: int):
         """Retrieve a specific version of a test case."""
         return self._client.get_test_case_version(test_case_key, version)
 
+    @tool_group('read')
     def get_test_case_test_script(self, test_case_key: str):
         """Retrieve the test script of a test case."""
         return self._client.get_test_case_test_script(test_case_key)
 
+    @tool_group('write')
     def create_test_case_test_script(self, test_case_key: str, json: str):
         """Create a test script for a test case."""
         test_script_data = self._parse_json(json)
         return self._client.create_test_case_test_script(test_case_key, test_script_data)
 
+    @tool_group('read')
     def get_test_case_test_steps(self, test_case_key: str, max_results: int = None, start_at: int = None):
         """List test steps of a test case."""
         result = self._client.get_test_case_test_steps(test_case_key, max_results=max_results, start_at=start_at)
         return result["values"]
 
+    @tool_group('write')
     def create_test_case_test_steps(self, test_case_key: str, json: str):
         """Create test steps for a test case."""
         test_steps_data = self._parse_json(json)
         return self._client.create_test_case_test_steps(test_case_key, test_steps_data)
 
+    @tool_group('read')
     def list_test_cycles(self, project_key: Optional[str] = None, folder_id: Optional[str] = None, jira_project_version_id: Optional[str] = None, max_results: int = None, start_at: int = None):
         """List test cycles with optional filters."""
         return self._client.list_test_cycles(project_key=project_key, folder_id=folder_id, jira_project_version_id=jira_project_version_id, max_results=max_results, start_at=start_at)
 
+    @tool_group('write')
     def create_test_cycle(self, json: str):
         """Create a new test cycle."""
         test_cycle_data = self._parse_json(json)
         return self._client.create_test_cycle(test_cycle_data)
 
+    @tool_group('read')
     def get_test_cycle(self, test_cycle_id_or_key: str):
         """Retrieve details of a specific test cycle."""
         return self._client.get_test_cycle(test_cycle_id_or_key)
 
+    @tool_group('write')
     def update_test_cycle(self, test_cycle_id_or_key: str, json: str):
         """Update an existing test cycle."""
         test_cycle_data = self._parse_json(json)
         return self._client.update_test_cycle(test_cycle_id_or_key, test_cycle_data)
 
+    @tool_group('read')
     def get_test_cycle_links(self, test_cycle_id_or_key: str):
         """Retrieve links associated with a test cycle."""
         return self._client.get_test_cycle_links(test_cycle_id_or_key)
 
+    @tool_group('write')
     def create_test_cycle_issue_link(self, test_cycle_id_or_key: str, json: str):
         """Create an issue link for a test cycle."""
         issue_link_data = self._parse_json(json)
         self._validate_issue_link_data(issue_link_data, "test cycle")
         return self._client.create_test_cycle_issue_link(test_cycle_id_or_key, issue_link_data)
 
+    @tool_group('write')
     def create_test_cycle_web_link(self, test_cycle_id_or_key: str, json: str):
         """Create a web link for a test cycle."""
         web_link_data = self._parse_json(json)
         return self._client.create_test_cycle_web_link(test_cycle_id_or_key, web_link_data)
 
+    @tool_group('read')
     def list_test_executions(self, project_key: Optional[str] = None, test_cycle: Optional[str] = None, test_case: Optional[str] = None, max_results: int = None, start_at: int = None):
         """List test executions with optional filters."""
         return self._client.list_test_executions(project_key=project_key, test_cycle=test_cycle, test_case=test_case, max_results=max_results, start_at=start_at)
 
+    @tool_group('write')
     def create_test_execution(self, json: str):
         """Create a new test execution."""
         test_execution_data = self._parse_json(json)
         return self._client.create_test_execution(test_execution_data)
 
+    @tool_group('read')
     def get_test_execution(self, test_execution_id_or_key: str):
         """Retrieve details of a specific test execution."""
         return self._client.get_test_execution(test_execution_id_or_key)
 
+    @tool_group('write')
     def update_test_execution(self, test_execution_id_or_key: str, json: str):
         """Update an existing test execution."""
         test_execution_data = self._parse_json(json)
         return self._client.update_test_execution(test_execution_id_or_key, test_execution_data)
 
+    @tool_group('read')
     def get_test_execution_test_steps(self, test_execution_id_or_key: str, max_results: int = None, start_at: int = None):
         """List test steps of a test execution."""
         return self._client.get_test_execution_test_steps(test_execution_id_or_key, max_results=max_results, start_at=start_at)
 
+    @tool_group('write')
     def update_test_execution_test_steps(self, test_execution_id_or_key: str, json: str):
         """Update test steps of a test execution."""
         test_steps_data = self._parse_json(json)
         return self._client.update_test_execution_test_steps(test_execution_id_or_key, test_steps_data)
 
+    @tool_group('write')
     def sync_test_execution_script(self, test_execution_id_or_key: str):
         """Sync the test execution script."""
         return self._client.sync_test_execution_script(test_execution_id_or_key)
 
+    @tool_group('read')
     def list_test_execution_links(self, test_execution_id_or_key: str):
         """List links associated with a test execution."""
         return self._client.list_test_execution_links(test_execution_id_or_key)
 
+    @tool_group('write')
     def create_test_execution_issue_link(self, test_execution_id_or_key: str, json: str):
         """Create an issue link for a test execution."""
         issue_link_data = self._parse_json(json)
         self._validate_issue_link_data(issue_link_data, "test execution")
         return self._client.create_test_execution_issue_link(test_execution_id_or_key, issue_link_data)
 
+    @tool_group('read')
     def list_projects(self, max_results: int = None, start_at: int = None):
         """List all projects."""
         return self._client.list_projects(max_results=max_results, start_at=start_at)
 
+    @tool_group('read')
     def get_project(self, project_id_or_key: str):
         """Retrieve details of a specific project."""
         return self._client.get_project(project_id_or_key)
 
+    @tool_group('read')
     def list_folders(self, project_key: Optional[str] = None, folder_type: Optional[str] = None, max_results: int = None, start_at: int = None):
         """List folders with optional filters."""
         return self._client.list_folders(project_key=project_key, folder_type=folder_type, max_results=max_results, start_at=start_at)
 
+    @tool_group('write')
     def create_folder(self, json: str):
         """Create a new folder."""
         folder_data = self._parse_json(json)
@@ -192,10 +226,12 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
 
         return self._client.create_folder(folder_data)
 
+    @tool_group('read')
     def get_folder(self, folder_id: str):
         """Retrieve details of a specific folder."""
         return self._client.get_folder(folder_id)
 
+    @tool_group('read')
     def find_folder_by_name(self, name: str, project_key: Optional[str] = None, folder_type: Optional[str] = None):
         """
         Find a folder by its name, ignoring case.
@@ -214,42 +250,52 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
                 return folder
         return None
 
+    @tool_group('delete')
     def delete_link(self, link_id: str):
         """Delete a specific link."""
         return self._client.delete_link(link_id)
 
+    @tool_group('read')
     def get_issue_link_test_cases(self, issue_key: str):
         """Retrieve test cases linked to an issue."""
         return self._client.get_issue_link_test_cases(issue_key)
 
+    @tool_group('read')
     def get_issue_link_test_cycles(self, issue_key: str):
         """Retrieve test cycles linked to an issue."""
         return self._client.get_issue_link_test_cycles(issue_key)
 
+    @tool_group('read')
     def get_issue_link_test_plans(self, issue_key: str):
         """Retrieve test plans linked to an issue."""
         return self._client.get_issue_link_test_plans(issue_key)
 
+    @tool_group('read')
     def get_issue_link_test_executions(self, issue_key: str):
         """Retrieve test executions linked to an issue."""
         return self._client.get_issue_link_test_executions(issue_key)
 
+    @tool_group('write')
     def create_custom_executions(self, project_key: str, files: str, auto_create_test_cases: bool = False):
         """Create custom executions."""
         return self._client.create_custom_executions(project_key, files, auto_create_test_cases)
 
+    @tool_group('write')
     def create_cucumber_executions(self, project_key: str, files: str, auto_create_test_cases: bool = False):
         """Create cucumber executions."""
         return self._client.create_cucumber_executions(project_key, files, auto_create_test_cases)
 
+    @tool_group('write')
     def create_junit_executions(self, project_key: str, files: str, auto_create_test_cases: bool = False):
         """Create JUnit executions."""
         return self._client.create_junit_executions(project_key, files, auto_create_test_cases)
 
+    @tool_group('read')
     def retrieve_bdd_test_cases(self, project_key: str):
         """Retrieve BDD test cases."""
         return self._client.retrieve_bdd_test_cases(project_key)
 
+    @tool_group('read')
     def healthcheck(self):
         """Perform a health check on the API."""
         return self._client.healthcheck()
@@ -319,6 +365,7 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
             return {"script": script}
         return {"empty": ""}
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

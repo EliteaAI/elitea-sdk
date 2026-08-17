@@ -7,6 +7,7 @@ from pydantic import model_validator, create_model, Field, SecretStr
 from ..elitea_base import BaseToolApiWrapper
 
 from logging import getLogger
+from ..utils.tool_groups import tool_group, with_tool_groups
 logger = getLogger(__name__)
 
 
@@ -73,6 +74,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             raise ValueError("Not Found: The requested resource does not exist")
         response.raise_for_status()
 
+    @tool_group('read')
     def get_test_cases_for_test(
         self,
         product_id: int,
@@ -88,6 +90,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
         return data
 
 
+    @tool_group('read')
     def get_test_cases_statuses_for_test(
         self,
         product_id: int,
@@ -102,6 +105,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def list_bugs_for_test_with_filter(
         self,
         filter_product_ids: Optional[str] = None,
@@ -121,6 +125,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def list_products(
         self,
         filter_product_ids: Optional[List[int]] = None,
@@ -136,6 +141,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def get_product(
         self,
         product_id: int,
@@ -149,6 +155,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def list_features(
         self,
         product_id: int,
@@ -166,6 +173,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def get_feature(
         self,
         product_id: int,
@@ -181,6 +189,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def list_user_stories(
         self,
         product_id: Optional[int] = None,
@@ -198,6 +207,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def get_user_story(
         self,
         product_id: int,
@@ -209,6 +219,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def list_exploratory_tests(
         self,
         product_id: Optional[int] = None,
@@ -223,6 +234,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def get_exploratory_test(
         self,
         product_id: int,
@@ -235,6 +247,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('write')
     def create_exploratory_test(
         self,
         product_id: int,
@@ -267,6 +280,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
         self._handle_response(response)
         return response.json()
 
+    @tool_group('read')
     def list_test_cases(
         self,
         product_id: int,
@@ -285,6 +299,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('read')
     def get_test_case(
         self,
         product_id: int,
@@ -299,6 +314,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return self.filter_fields(data, client_fields)
         return data
 
+    @tool_group('write')
     def confirm_bug_fix(
         self,
         bug_id: int,
@@ -334,6 +350,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
             return _filter(data)
         return data
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

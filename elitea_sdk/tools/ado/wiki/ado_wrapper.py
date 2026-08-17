@@ -28,6 +28,7 @@ from ...utils.available_tools_decorator import extend_with_parent_available_tool
 from ...utils.content_parser import parse_file_content
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ....runtime.utils.utils import IndexerKeywords
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             "Please either pass 'wiki_identified' parameter or configure 'default_wiki_identifier' in the toolkit."
         )
 
+    @tool_group('read')
     def get_wiki(self, wiki_identified: Optional[str] = None):
         """Extract ADO wiki information."""
         try:
@@ -342,6 +344,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error during the attempt to extract wiki: {str(e)}")
             return ToolException(f"Error during the attempt to extract wiki: {str(e)}")
 
+    @tool_group('read')
     def get_wiki_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None, image_description_prompt=None, process_images: bool = True):
         """Extract ADO wiki page content."""
         try:
@@ -355,6 +358,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error during the attempt to extract wiki page: {str(e)}")
             return ToolException(f"Error during the attempt to extract wiki page: {str(e)}")
 
+    @tool_group('read')
     def get_wiki_page_by_id(self, wiki_identified: Optional[str] = None, page_id: int = None, image_description_prompt=None, process_images: bool = True):
         """Extract ADO wiki page content."""
         try:
@@ -368,6 +372,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error during the attempt to extract wiki page: {str(e)}")
             return ToolException(f"Error during the attempt to extract wiki page: {str(e)}")
 
+    @tool_group('read')
     def get_wiki_page(self, wiki_identified: Optional[str] = None, page_path: Optional[str] = None, page_id: Optional[int] = None,
                       include_content: bool = False, image_description_prompt: Optional[str] = None,
                       process_images: bool = True, recursion_level: Literal['none', 'oneLevel', 'oneLevelPlusNestedEmptyFolders', 'full'] = "oneLevel"):
@@ -669,6 +674,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             image_cache=self._image_cache,
         )
 
+    @tool_group('delete')
     def delete_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None):
         """Delete ADO wiki page by path."""
         try:
@@ -679,6 +685,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Unable to delete wiki page: {str(e)}")
             return ToolException(f"Unable to delete wiki page: {str(e)}")
 
+    @tool_group('delete')
     def delete_page_by_id(self, wiki_identified: Optional[str] = None, page_id: int = None):
         """Delete ADO wiki page by ID."""
         try:
@@ -689,6 +696,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Unable to delete wiki page: {str(e)}")
             return ToolException(f"Unable to delete wiki page: {str(e)}")
 
+    @tool_group('write')
     def rename_wiki_page(self, wiki_identified: Optional[str] = None, old_page_name: str = None, new_page_name: str = None, version_identifier: str = None,
                          version_type: str = "branch"):
         """Rename page
@@ -726,6 +734,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Unable to rename wiki page: {str(e)}")
             return ToolException(f"Unable to rename wiki page: {str(e)}")
 
+    @tool_group('write')
     def modify_wiki_page(self, wiki_identified: Optional[str] = None, page_name: str = None, page_content: str = None, version_identifier: str = None, version_type: str = "branch", expanded: Optional[bool] = False):
         """Create or Update ADO wiki page content."""
         try:
@@ -1320,6 +1329,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )),
         }
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         """Return a list of available tools."""

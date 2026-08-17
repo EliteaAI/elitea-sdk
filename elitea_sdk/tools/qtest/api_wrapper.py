@@ -26,6 +26,7 @@ from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import parse_file_content, file_extension_by_chunker
 from ...runtime.utils.utils import IndexerKeywords
 from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 QTEST_ID = "QTest Id"
 
@@ -977,6 +978,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         output.append("\nMulti-select: Provide value as array [\"val1\", \"val2\"]. Use null to clear.")
         return '\n'.join(output)
 
+    @tool_group('read')
     def get_all_test_cases_fields_for_project(self, force_refresh: bool = False) -> str:
         """
         Get formatted information about available test case fields and their values.
@@ -1434,6 +1436,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return response['items'][0]['id']
 
 
+    @tool_group('write')
     def link_tests_to_jira_requirement(self, requirement_external_id: str, json_list_of_test_case_ids: str) -> str:
         """Link test cases to external Jira requirement.
         
@@ -1473,6 +1476,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('write')
     def link_tests_to_qtest_requirement(self, requirement_id: str, json_list_of_test_case_ids: str) -> str:
         """Link test cases to internal QTest requirement.
         
@@ -1520,6 +1524,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('read')
     def find_test_cases_by_requirement_id(self, requirement_id: str, include_details: bool = False) -> dict:
         """Find all test cases linked to a QTest requirement.
         
@@ -1634,6 +1639,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('read')
     def find_requirements_by_test_case_id(self, test_case_id: str) -> dict:
         """Find all requirements linked to a test case.
         
@@ -1716,6 +1722,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('read')
     def find_test_runs_by_test_case_id(self, test_case_id: str) -> dict:
         """Find all test runs associated with a test case.
         
@@ -1806,6 +1813,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('read')
     def find_defects_by_test_run_id(self, test_run_id: str) -> dict:
         """Find all defects associated with a test run.
         
@@ -1910,6 +1918,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('read')
     def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
                       append_test_steps: bool=False, include_external_properties: bool=False):
         """Search for the test cases in qTest using Data Query Language.
@@ -1935,6 +1944,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return "Found " + str(
             len(parsed_data)) + f" Qtest test cases:\n" + str(parsed_data[:self.no_of_tests_shown_in_dql_search])
 
+    @tool_group('read')
     def search_entities_by_dql(self, object_type: str, dql: str) -> dict:
         """Generic DQL search for any entity type (test-cases, requirements, defects, test-runs, etc.).
         
@@ -1990,6 +2000,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
             ) from e
 
+    @tool_group('read')
     def find_entity_by_id(self, entity_id: str) -> dict:
         """Find any QTest entity by its ID (TC-xxx, RQ-xxx, DF-xxx, TR-xxx).
         
@@ -2109,6 +2120,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         
         return result
 
+    @tool_group('write')
     def create_test_cases(self, test_case_content: str, folder_to_place_test_cases_to: str) -> dict:
         """ Create the test case based on the incoming content. The input should be in json format. """
         test_cases_api_instance: TestCaseApi = self.__instantiate_test_api_instance()
@@ -2129,6 +2141,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 result['test_cases'].append(test_result)
             return result
 
+    @tool_group('write')
     def update_test_case(self, test_id: str, test_case_content: str) -> str:
         """ Update the test case base on the incoming content. The input should be in json format. Also test id should be passed in following format TC-786. """
         input_obj = json.loads(test_case_content)
@@ -2154,11 +2167,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(
                 f"""Unable to update test case in project with id - {self.qtest_project_id} and test id - {test_id}.\n Exception: \n {stacktrace}""") from e
 
+    @tool_group('read')
     def find_test_case_by_id(self, test_id: str, extract_images=False, prompt=None) -> str:
         """ Find the test case by its id. Id should be in format TC-123. """
         dql: str = f"Id = '{test_id}'"
         return f"{self.search_by_dql(dql=dql, extract_images=extract_images, prompt=prompt)}"
 
+    @tool_group('delete')
     def delete_test_case(self, qtest_id: int) -> str:
         """ Delete the test case by its id. Id should be in format 3534653120. """
         test_cases_api_instance: TestCaseApi = self.__instantiate_test_api_instance()
@@ -2209,6 +2224,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         
         return attachment_id
 
+    @tool_group('write')
     def add_file_to_test_case(self, test_case_id: str, filepath: str, filename: str = None, 
                                test_step_number: Optional[int] = None) -> str:
         """Upload file from artifact and attach to QTest test case or test step."""
@@ -2413,6 +2429,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             )
         response.raise_for_status()
 
+    @tool_group('read')
     def get_test_case_versions(self, test_case_id: str, version_name: str = None) -> dict:
         """List the versions of a QTest test case with their numeric version IDs."""
         try:
@@ -2451,6 +2468,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             'versions': versions,
         }
 
+    @tool_group('write')
     def update_test_run_status(self, test_run_id: str, status: str, note: str = None,
                                testcase_version_id: int = None) -> str:
         """Record a manual test run's execution result (status) in QTest."""
@@ -2550,6 +2568,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         except ValueError as e:
             raise ToolException(str(e)) from e
 
+    @tool_group('write')
     def upload_attachment_to_test_run(self, test_run_id: str, attachment_type: str,
                                        filepath: str, filename: str = None) -> str:
         """Upload a file from artifact storage and attach it to a test run's test case or latest test log."""
@@ -2610,6 +2629,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         except ValueError as e:
             raise ToolException(str(e)) from e
 
+    @tool_group('read')
     def get_modules(self, parent_id: int = None, search: str = None):
         """
         :param int project_id: ID of the project (required)
@@ -2666,6 +2686,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         
         return f"Found {len(formatted)} module(s):\n{str(formatted)}"
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

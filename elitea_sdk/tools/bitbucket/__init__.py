@@ -47,8 +47,9 @@ class EliteABitbucketToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in
-                          BitbucketAPIWrapper.model_construct().get_available_tools()}
+        available_tools = BitbucketAPIWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         m = create_model(
             name,
             project=(str, Field(description="Project/Workspace")),
@@ -59,7 +60,7 @@ class EliteABitbucketToolkit(BaseToolkit):
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None, description=PGVECTOR_CONFIGURATION_TOOLTIP, json_schema_extra={'configuration_types': ['pgvector']})),
             # embedder settings
             embedding_model=(Optional[str], Field(default=None, description=EMBEDDING_MODEL_TOOLTIP, json_schema_extra={'configuration_model': 'embedding'})),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra=
             {
                 'metadata':

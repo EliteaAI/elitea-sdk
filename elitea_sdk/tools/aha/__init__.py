@@ -31,10 +31,9 @@ class AhaToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {
-            x["name"]: x["args_schema"].schema()
-            for x in AhaApiWrapper.model_construct().get_available_tools()
-        }
+        available_tools = AhaApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x["name"]: x["args_schema"].schema() for x in available_tools}
+        tool_groups = {x["name"]: x["group"] for x in available_tools if x.get("group")}
         return create_model(
             name,
             aha_configuration=(
@@ -46,7 +45,7 @@ class AhaToolkit(BaseToolkit):
             ),
             selected_tools=(
                 List[Literal[tuple(selected_tools)]] if selected_tools else List[str],
-                Field(default=[], json_schema_extra={"args_schemas": selected_tools}),
+                Field(default=[], json_schema_extra={"args_schemas": selected_tools, "tool_groups": tool_groups}),
             ),
             __config__=ConfigDict(
                 json_schema_extra={

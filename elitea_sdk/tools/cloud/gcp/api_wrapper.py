@@ -7,6 +7,7 @@ from pydantic import Field, PrivateAttr, model_validator, create_model, SecretSt
 from requests import Session
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 
 class GCPApiWrapper(BaseToolApiWrapper):
@@ -35,6 +36,7 @@ class GCPApiWrapper(BaseToolApiWrapper):
 
         return values
 
+    @tool_group('execute')
     def execute_request(self, method: str, scopes: List[str], url: str, optional_args: Optional[Dict[str, Any]] = None) -> str:
         """Execute a request to the Google Cloud REST API."""
         if not url:
@@ -57,6 +59,7 @@ class GCPApiWrapper(BaseToolApiWrapper):
         except Exception as e:
             return f"Error: {str(e)}"
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

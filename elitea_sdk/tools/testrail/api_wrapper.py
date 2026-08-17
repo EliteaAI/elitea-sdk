@@ -18,6 +18,7 @@ from ..chunkers.code.constants import get_file_extension, image_extensions
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 try:
     from elitea_sdk.runtime.langchain.interfaces.llm_processor import get_embeddings
@@ -632,6 +633,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
         return all_cases
 
+    @tool_group('write')
     def add_cases(self, add_test_cases_data: str):
         """Adds new test cases into Testrail per defined parameters.
                 add_test_cases_data: str - JSON string which includes list of objects with following parameters:
@@ -663,6 +665,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             )
         return results
 
+    @tool_group('write')
     def add_case(self, section_id: str, title: str, case_properties: str = "{}"):
         """Adds new test case into Testrail per defined parameters.
         Parameters:
@@ -697,6 +700,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Unable to add new testcase {e}")
         return f"New test case has been created: id - {created_case['id']} at '{created_case['created_on']}'"
 
+    @tool_group('read')
     def get_case(self, testcase_id: str):
         """Extracts information about single test case from Testrail"""
         try:
@@ -705,6 +709,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Unable to extract testcase {e}")
         return f"Extracted test case:\n{str(extracted_case)}"
 
+    @tool_group('read')
     def get_cases(
         self, project_id: str, output_format: str = "json", keys: Optional[List[str]] = None,
             suite_id: Optional[str] = None
@@ -744,6 +749,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except StatusCodeError as e:
             return ToolException(self._format_status_error(e))
 
+    @tool_group('read')
     def get_cases_by_filter(
         self,
         project_id: str,
@@ -815,6 +821,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except (ValueError, json.JSONDecodeError) as e:
             return ToolException(f"Invalid parameter for json_case_arguments: {e}")
 
+    @tool_group('write')
     def update_case(self, case_id: str, case_properties: str = "{}"):
         """Updates an existing test case. Partial updates are supported.
         Pass case_properties as a JSON string with the fields to update.
@@ -832,6 +839,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             return ToolException(f"Unable to update testcase #{case_id} due to {e}")
         return f"Test case #{case_id} has been updated at '{updated_case['updated_on']}'" 
 
+    @tool_group('delete')
     def delete_case(self, case_id: str, soft_delete: bool = True) -> str:
         """Deletes an existing test case.
         
@@ -872,6 +880,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Error deleting test case #{case_id}: {str(e)}")
 
+    @tool_group('write')
     def add_file_to_case(self, case_id: str, filepath: str, filename: str = None,
                          embed_in_field: str = None, embed_text_before: str = "",
                          embed_text_after: str = "") -> str:
@@ -962,6 +971,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         else:
             return suites_response if isinstance(suites_response, list) else []
     
+    @tool_group('read')
     def get_suites(self, project_id: str, output_format: str = "json",) -> Union[str, ToolException]:
         """Extracts a list of test suites for a given project from Testrail"""
         try:
@@ -1029,6 +1039,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
         return all_sections
 
+    @tool_group('read')
     def get_sections(
         self, project_id: str, suite_id: Optional[str] = None, output_format: str = "json"
     ) -> Union[str, ToolException]:
@@ -1053,6 +1064,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except StatusCodeError as e:
             return ToolException(self._format_status_error(e))
 
+    @tool_group('write')
     def add_section(self, project_id: str, name: str, section_properties: Union[str, dict] = "{}"):
         """Adds a new section into Testrail per defined parameters.
 
@@ -1085,6 +1097,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Unable to add new section {e}")
         return f"New section has been created: id - {created_section['id']} - '{created_section['name']}'"
 
+    @tool_group('delete')
     def delete_section(self, section_id: str, soft_delete: bool = False) -> str:
         """Deletes an existing section.
 
@@ -1148,6 +1161,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         ]
         return _project_records(runs, run_fields, "run", ("created_on", "completed_on"))
 
+    @tool_group('read')
     def get_run(self, run_id: str, output_format: str = "json") -> Union[str, ToolException]:
         """Extracts a single test run from Testrail.
 
@@ -1163,6 +1177,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             return ToolException(self._format_status_error(e))
         return self._to_markup(self._to_run_dicts([run]), output_format)
 
+    @tool_group('read')
     def get_runs(
         self, project_id: str, run_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
     ) -> Union[str, ToolException]:
@@ -1256,6 +1271,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         )
         return self._to_markup(self._to_result_dicts(results), output_format)
 
+    @tool_group('read')
     def get_results_for_run(
         self, run_id: str, result_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
     ) -> Union[str, ToolException]:
@@ -1274,6 +1290,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             result_filter, output_format,
         )
 
+    @tool_group('read')
     def get_results_for_case(
         self, run_id: str, case_id: str, result_filter: Optional[Union[str, dict]] = None,
         output_format: str = "json",
@@ -1293,6 +1310,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             result_filter, output_format,
         )
 
+    @tool_group('read')
     def get_results(
         self, test_id: str, result_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
     ) -> Union[str, ToolException]:
@@ -1532,6 +1550,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         if output_format == "markdown":
             return df.to_markdown(index=False)
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         tools = [

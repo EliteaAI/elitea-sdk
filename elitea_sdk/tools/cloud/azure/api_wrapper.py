@@ -6,6 +6,7 @@ from azure.mgmt.resource import ResourceManagementClient
 from pydantic import model_validator, create_model, Field, PrivateAttr, SecretStr
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 ERROR_PREFIX = 'Error:'
 
@@ -28,6 +29,7 @@ class AzureApiWrapper(BaseToolApiWrapper):
         cls._client = ResourceManagementClient(cls._credentials, subscription_id)
         return values
 
+    @tool_group('execute')
     def execute(self, method: str, url: str, optional_args: Optional[Union[str, Dict[str, Any]]] = None):
         """ Executes an HTTP request to the Azure Resource Management REST API """
         request_args = self.json_query_load(optional_args)
@@ -55,6 +57,7 @@ class AzureApiWrapper(BaseToolApiWrapper):
         except Exception:
             return f"{ERROR_PREFIX} request failed"
 
+    @tool_group('read')
     def azure_integration_healthcheck(self):
         """ Tests the integration with Azure by trying to access the resource groups with the provided credentials """
         try:
@@ -66,6 +69,7 @@ class AzureApiWrapper(BaseToolApiWrapper):
             return False, str(e)
         return True, ''
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

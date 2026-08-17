@@ -5,6 +5,7 @@ from kubernetes import client, config as k8s_config
 from pydantic import BaseModel, Field, PrivateAttr, ConfigDict, model_validator, create_model, SecretStr
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 
 class KubernetesApiWrapper(BaseToolApiWrapper):
@@ -29,6 +30,7 @@ class KubernetesApiWrapper(BaseToolApiWrapper):
             cls._client = client.CoreV1Api()
         return values
 
+    @tool_group('execute')
     def execute_kubernetes(self, method: str, suburl: str, body: Optional[Union[str, Dict[str, Any]]] = None, headers: Optional[Union[str, Dict[str, Any]]] = None) -> str:
         """
         Execute a Kubernetes API request with the specified method, suburl, body, and headers.
@@ -59,6 +61,7 @@ class KubernetesApiWrapper(BaseToolApiWrapper):
         except Exception:
             return "Tool output parsing error"
 
+    @tool_group('read')
     def kubernetes_integration_healthcheck(self) -> Tuple[bool, str]:
         """
         Tests the integration with a Kubernetes cluster by performing a GET request to a predefined URL.
@@ -87,6 +90,7 @@ class KubernetesApiWrapper(BaseToolApiWrapper):
             return False, response
         return True, ""
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

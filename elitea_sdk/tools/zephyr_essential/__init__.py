@@ -34,11 +34,13 @@ class ZephyrEssentialToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in ZephyrEssentialApiWrapper.model_construct().get_available_tools()}
+        available_tools = ZephyrEssentialApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         return create_model(
             name,
             zephyr_essential_configuration=(ZephyrEssentialConfiguration, Field(description=get_credentials_tooltip("Zephyr Essential"), json_schema_extra={'configuration_types': ['zephyr_essential']})),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None,
                                                                            description=PGVECTOR_CONFIGURATION_TOOLTIP,
                                                                            json_schema_extra={

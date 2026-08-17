@@ -15,6 +15,7 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import get_file_bytes_from_artifact, detect_mime_type
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 try:
     from elitea_sdk.runtime.langchain.interfaces.llm_processor import get_embeddings
@@ -244,6 +245,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         
         return self._auth_token
 
+    @tool_group('read')
     def get_tests(self, jql: str):
         """get all tests"""
 
@@ -278,6 +280,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
             start_at += self.limit
         return f"Extracted tests ({len(all_tests)}):\n{all_tests}"
 
+    @tool_group('write')
     def create_test(self, graphql_mutation: str) -> str:
         """Create new test in XRAY per defined XRAY graphql mutation"""
 
@@ -288,10 +291,12 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Unable to create new test due to error:\n{str(e)}")
         return f"Created test case:\n{create_test_response}"
 
+    @tool_group('write')
     def create_tests(self, graphql_mutations: list[str]) -> list[str]:
         """Create new tests in XRAY per defined XRAY graphql mutations"""
         return [self.create_test(mutation) for mutation in graphql_mutations]
 
+    @tool_group('execute')
     def execute_graphql(self, graphql: str) -> str:
         """Executes custom graphql query or mutation"""
 
@@ -604,6 +609,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         attachment_metadata[IndexerKeywords.CONTENT_FILE_NAME.value] = file_name
         yield Document(page_content='', metadata=attachment_metadata)
 
+    @tool_group('write')
     def add_attachment_to_test_step(self, step_id: str, filepath: Optional[str] = None, 
                                     filedata: Optional[str] = None, filename: Optional[str] = None) -> str:
         """
@@ -770,6 +776,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         # Already a numeric ID
         return issue_id
 
+    @tool_group('read')
     def get_test_step_attachments(self, issue_id: str, step_id: Optional[str] = None) -> str:
         """
         Get attachments for a test or specific test step.
@@ -942,6 +949,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Unable to execute GraphQL due to error: {str(e)}")
 
+    @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
         return [

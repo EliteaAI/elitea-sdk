@@ -25,13 +25,14 @@ class EliteACarrierToolkit(BaseToolkit):
         for t in __all__:
             default = t['tool'].__pydantic_fields__['args_schema'].default
             selected_tools[t['name']] = default.schema() if default else default
+        tool_groups = {t['name']: t['group'] for t in __all__ if t.get('group')}
         return create_model(
             name,
             project_id=(Optional[str], Field(None, description="Optional project ID for scoped operations")),
             carrier_configuration=(CarrierConfiguration, Field(description="Carrier Configuration", json_schema_extra={'configuration_types': ['carrier']})),
             selected_tools=(
                 List[Literal[tuple(selected_tools)]],
-                Field(default=[], json_schema_extra={"args_schemas": selected_tools}),
+                Field(default=[], json_schema_extra={"args_schemas": selected_tools, "tool_groups": tool_groups}),
             ),
             __config__=ConfigDict(json_schema_extra={
                 'metadata': {

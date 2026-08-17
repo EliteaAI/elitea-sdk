@@ -16,6 +16,7 @@ from pydantic import (
 from pydantic_core.core_schema import ValidationInfo
 from ...elitea_base import BaseToolApiWrapper
 from .schemas import ArgsSchema
+from ...utils.tool_groups import tool_group, with_tool_groups
 
 
 def process_output(func):
@@ -108,6 +109,7 @@ class DeltaLakeApiWrapper(BaseToolApiWrapper):
                 raise ToolException(f"Error initializing DeltaTable: {e}")
         return self._delta_table
 
+    @tool_group('read')
     @process_output
     def query_table(self, query: Optional[str] = None, columns: Optional[List[str]] = None, filters: Optional[dict] = None) -> List[dict]:
         """
@@ -133,6 +135,7 @@ class DeltaLakeApiWrapper(BaseToolApiWrapper):
             df = df[columns]
         return df.to_dict(orient="records")
 
+    @tool_group('read')
     @process_output
     def vector_search(self, embedding: List[float], k: int = 5, embedding_column: str = "embedding") -> List[dict]:
         """
@@ -169,11 +172,13 @@ class DeltaLakeApiWrapper(BaseToolApiWrapper):
         top_rows = df.iloc[top_k_idx]
         return top_rows.to_dict(orient="records")
 
+    @tool_group('read')
     @process_output
     def get_table_schema(self) -> str:
         dt = self.delta_table
         return dt.schema().to_pyarrow().to_string()
 
+    @with_tool_groups
     def get_available_tools(self) -> List[dict]:
         return [
             {

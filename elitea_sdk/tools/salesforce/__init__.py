@@ -22,12 +22,14 @@ class SalesforceToolkit(BaseToolkit):
     tools: List[BaseTool] = []
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        available_tools = {x['name']: x['args_schema'].schema() for x in SalesforceApiWrapper.model_construct().get_available_tools()}
+        tools = SalesforceApiWrapper.model_construct().get_available_tools()
+        available_tools = {x['name']: x['args_schema'].schema() for x in tools}
+        tool_groups = {x['name']: x['group'] for x in tools if x.get('group')}
         return create_model(
             name,
             api_version=(str, Field(description="Salesforce API Version", default='v59.0')),
             salesforce_configuration=(SalesforceConfiguration, Field(description="Salesforce Configuration", json_schema_extra={'configuration_types': ['salesforce']})),
-            selected_tools=(List[Literal[tuple(available_tools)]], Field(default=[], json_schema_extra={'args_schemas': available_tools})),
+            selected_tools=(List[Literal[tuple(available_tools)]], Field(default=[], json_schema_extra={'args_schemas': available_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra={'metadata': {
                 "label": "Salesforce", "icon_url": "salesforce-icon.svg",
                 "categories": ["other"],

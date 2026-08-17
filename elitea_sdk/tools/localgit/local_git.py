@@ -13,6 +13,7 @@ from typing import List
 from ..elitea_base import BaseToolApiWrapper, extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.text_operations import parse_old_new_markers, apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
+from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 CREATE_FILE_PROMPT = """Create new file in your local repository."""
@@ -180,6 +181,7 @@ class LocalGit(BaseToolApiWrapper):
             repo.head.reset(commit=commit_sha, working_tree=True)
         return values
 
+    @tool_group('write')
     def checkout_commit(self, commit_sha: str) -> str:
         """ Checkout specific commit from repository """
         try:
@@ -191,10 +193,12 @@ class LocalGit(BaseToolApiWrapper):
                 f"Error checking out the commit from repo - {self.repo_path} using following commit hash - {commit_sha}: {stacktrace}")
             return 'Unable to checkout commit - {}'.format(commit_sha)
 
+    @tool_group('read')
     def get_diff(self) -> str:
         """ Show difference of the file for which changes have been made"""
         return self.repo.git.diff(None)
 
+    @tool_group('delete')
     def delete_file(self, file_path: str) -> str:
         """ Delete file from the repository by its path """
         file_path = os.path.normpath(os.path.join(self.repo.working_dir, file_path))
@@ -204,6 +208,7 @@ class LocalGit(BaseToolApiWrapper):
         else:
             return f"File '{file_path}' cannot be deleted because it does not exist"
 
+    @tool_group('write')
     def create_file(self, file_path: str, file_content: str) -> str:
         """ Create file in repository by specific path and content """
         file_path = os.path.normpath(os.path.join(self.repo.working_dir, file_path))
@@ -215,16 +220,19 @@ class LocalGit(BaseToolApiWrapper):
             self.repo.index.add([file_path])
         return 'Successfully created file {} with content - {}'.format(file_path, file_content)
 
+    @tool_group('write')
     def commit_changes(self, commit_message: str) -> str:
         """ Commit changes to the repo """
         self.repo.index.commit(commit_message)
         return f'Successfully committed changes with the commit message - {commit_message}'
 
+    @tool_group('write')
     def checkout_branch(self, branch_name: str) -> str:
         """ Checkout specific branch of repository """
         self.repo.git.checkout(branch_name)
         return 'Successfully checked out branch {}'.format(branch_name)
 
+    @tool_group('read')
     def read_file(self, file_path: str,
                   start_line: Optional[int] = None, end_line: Optional[int] = None) -> Any:
         """ Read file from repository """
@@ -256,6 +264,7 @@ class LocalGit(BaseToolApiWrapper):
                 return f.read()
         return "File '{}' cannot be read because it is not existed".format(full_path)
 
+    @tool_group('read')
     def read_multiple_files(self, file_paths,
                             offset: Optional[int] = None, limit: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -309,6 +318,7 @@ class LocalGit(BaseToolApiWrapper):
         except Exception as e:
             raise ToolException(f"Unable to write file {file_path}: {str(e)}")
 
+    @tool_group('write')
     def update_file_content_by_lines(self, file_path: str, start_line_index: int, end_line_index: int,
                                      new_content: str) -> str:
         """ Update file content by lines """
@@ -361,6 +371,7 @@ class LocalGit(BaseToolApiWrapper):
                 result.append(self.__dict_to_indented_string(value, indent + 1))
         return '\n'.join(result)
 
+    @tool_group('read')
     def list_files(self) -> str:
         """ List all files in the repository and return an YAML like object representing the directory structure """
         file_tree = {}
@@ -377,11 +388,13 @@ class LocalGit(BaseToolApiWrapper):
 
         return self.__dict_to_indented_string(file_tree)
     
+    @tool_group('read')
     def get_files_in_folder(self, folder_path: str) -> str:
         """ List all files in the repository """
         folder_path = os.path.join(self.repo.working_dir, folder_path)
         return "\n".join([file for file in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, file))])
 
+    @tool_group('write')
     def update_file(self, file_query: str) -> str:
         """ Updates a file with new content. """
         try:
@@ -409,6 +422,7 @@ class LocalGit(BaseToolApiWrapper):
         except Exception as e:
             return "Unable to update file due to error:\n" + str(e)
 
+    @with_tool_groups
     @extend_with_file_operations
     def get_available_tools(self):
         return [

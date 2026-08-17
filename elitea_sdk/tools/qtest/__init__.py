@@ -40,7 +40,9 @@ class QtestToolkit(BaseToolkit):
 
     @staticmethod
     def toolkit_config_schema() -> BaseModel:
-        selected_tools = {x['name']: x['args_schema'].schema() for x in QtestApiWrapper.model_construct().get_available_tools()}
+        available_tools = QtestApiWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         m = create_model(
             name,
             qtest_configuration=(QtestConfiguration, Field(description=get_credentials_tooltip("QTest"), json_schema_extra={
@@ -59,7 +61,7 @@ class QtestToolkit(BaseToolkit):
                 json_schema_extra={'configuration_model': 'embedding'})),
 
         selected_tools=(List[Literal[tuple(selected_tools)]],
-                            Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+                            Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra={'metadata': {"label": "QTest", "icon_url": "qtest.svg",
                                                                   "categories": ["test management"],
                                                                   "extra_categories": ["quality assurance",

@@ -40,12 +40,14 @@ class PPTXToolkit(BaseToolkit):
         """
         Define the configuration schema for the toolkit.
         """
-        selected_tools = {x['name']: x['args_schema'].schema() for x in PPTXWrapper.model_construct().get_available_tools()}
+        available_tools = PPTXWrapper.model_construct().get_available_tools()
+        selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         
         return create_model(
             name,
             bucket_name=(str, Field(description="Bucket name where PPTX files are stored")),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra={
                 'metadata': {
                     "label": "PPTX",

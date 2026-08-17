@@ -9,7 +9,6 @@ from langchain_core.documents import Document
 from reportlab.graphics import renderPM
 from svglib.svglib import svg2rlg
 
-from elitea_sdk.tools.chunkers import markdown_chunker
 from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size, scale_svg_drawing, preprocess_svg_for_rendering
 from ..constants import DEFAULT_MULTIMODAL_PROMPT
 from ..tools.utils import encode_image_for_llm, encode_image_bytes_for_llm
@@ -235,6 +234,10 @@ class EliteAImageLoader(BaseLoader):
         base_doc = Document(page_content=text_content, metadata=metadata)
         if not self.max_tokens or self.max_tokens <= 0:
             return [base_doc]
+        # Imported lazily: a module-level import of the tools package from inside
+        # the document-loaders chain is circular — any process importing a loader
+        # before elitea_sdk.tools silently loses most of the toolkit registry
+        from elitea_sdk.tools.chunkers import markdown_chunker
         chunks = list(markdown_chunker(
             iter([base_doc]),
             config={"max_tokens": self.max_tokens, "token_overlap": self.token_overlap},

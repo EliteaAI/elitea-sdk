@@ -2,7 +2,6 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-from elitea_sdk.tools.utils import normalize_pem_key
 
 
 class GithubConfiguration(BaseModel):
@@ -136,6 +135,8 @@ class GithubConfiguration(BaseModel):
                 auth = HTTPBasicAuth(username, password)
                 response = requests.get(f'{base_url}/user', headers=headers, auth=auth, timeout=10)
             elif app_id and app_private_key:
+                from elitea_sdk.tools.utils import normalize_pem_key
+
                 app_private_key = normalize_pem_key(app_private_key)
 
                 # Generate JWT for GitHub App authentication
