@@ -955,11 +955,11 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
     """
     def _node(state):
         message = (
-            f"**Pipeline stopped** — MCP toolkit **{toolkit_name}** "
+            f"**Pipeline stopped** — toolkit **{toolkit_name}** "
             f"(node: *{node_id}*) authentication was skipped.\n\n"
             f"Downstream nodes that depend on `{node_id}` output were not executed "
             f"because the required data is unavailable without authentication.\n\n"
-            f"> **Tip:** Authorize the MCP server and try again."
+            f"> **Tip:** Authorize the toolkit and try again."
         )
         result = {
             "messages": [{"role": "assistant", "content": message}],
@@ -1013,6 +1013,24 @@ def find_tool_by_name_or_metadata(tools: list, tool_name: str, toolkit_name: Opt
             if tool.name == tool_name:
                 return tool
 
+    return None
+
+
+def find_mcp_auth_proxy(tools: list, toolkit_name: Optional[str]) -> Optional[BaseTool]:
+    """Find a deferred auth gateway for an unavailable direct Toolkit node."""
+    if not toolkit_name:
+        return None
+    normalized = str(toolkit_name).strip().lower()
+    for tool in tools:
+        metadata = getattr(tool, 'metadata', None) or {}
+        candidate_names = {
+            str(metadata.get(TOOLKIT_NAME_META) or '').strip().lower(),
+            str(metadata.get('toolkit_type') or '').strip().lower(),
+        }
+        if normalized in candidate_names and str(getattr(tool, 'name', '')).startswith(
+            'mcp_authorize_'
+        ):
+            return tool
     return None
 
 
@@ -1178,6 +1196,18 @@ def create_graph(
                             # matching_tool stays None → if matching_tool: block below is skipped.
                             # Fall through to edge-adding code so TransitionalEdge is registered;
                             # it will detect _pipeline_blocked and route to END automatically.
+                        elif node_type in ('mcp', 'toolkit'):
+                            # The real toolkit could not be discovered before
+                            # OAuth.  Compile its deferred gateway into the
+                            # exact direct node so authorization happens as a
+                            # durable FunctionTool interrupt at runtime.
+                            matching_tool = find_mcp_auth_proxy(tools, toolkit_name)
+                            if not matching_tool:
+                                error_msg = f"Node `{node_id}` with type `{node_type}` has tool '{tool_name}'"
+                                if toolkit_name:
+                                    error_msg += f" (toolkit: '{toolkit_name}')"
+                                error_msg += f" which is not found in the provided tools. Make sure it is connected properly. Available tools: {format_tools(tools)}"
+                                raise ToolException(error_msg)
                         else:
                             # tool is not found in the provided tools
                             error_msg = f"Node `{node_id}` with type `{node_type}` has tool '{tool_name}'"
@@ -1196,6 +1226,11 @@ def create_graph(
                         if node_type in ['function', 'toolkit', 'mcp']:
                             lg_builder.add_node(node_id, FunctionTool(
                                 tool=matching_tool, name=node_id, return_type='dict',
+                                auth_tool_name=tool_name,
+                                auth_toolkit_name=toolkit_name,
+                                auth_toolkit_type=(
+                                    (getattr(matching_tool, 'metadata', None) or {}).get('toolkit_type')
+                                ),
                                 output_variables=node.get('output', []),
                                 input_mapping=node.get('input_mapping',
                                                        {'messages': {'type': 'variable', 'value': 'messages'}}),
@@ -1981,6 +2016,40 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # below, not the stale parked one.
                     config.get('configurable', {}).pop('checkpoint_id', None)
                 elif hitl_interrupt and self._is_hitl_resume(input):
+                    if not self._hitl_resume_targets_checkpoint(
+                        input, hitl_interrupt,
+                    ):
+                        hitl_interrupts_for_ui = self._strip_hitl_ui_keys(
+                            self._get_hitl_interrupts(checkpoint_state)
+                        )
+                        hitl_for_ui = (
+                            hitl_interrupts_for_ui[0]
+                            if hitl_interrupts_for_ui else {}
+                        )
+                        logger.warning(
+                            "[HITL] Resume decision does not match the current "
+                            "checkpoint interrupt; re-surfacing the pending "
+                            "guardrail without applying the action",
+                        )
+                        result_with_state = {
+                            "output": hitl_interrupt.get(
+                                "message",
+                                "A pending action requires your review before continuing.",
+                            ),
+                            "thread_id": thread_id,
+                            "execution_finished": False,
+                            "hitl_interrupt": hitl_for_ui,
+                            "hitl_interrupts": hitl_interrupts_for_ui,
+                        }
+                        if (
+                            hasattr(checkpoint_state, 'values')
+                            and checkpoint_state.values
+                        ):
+                            for key, value in checkpoint_state.values.items():
+                                if key != 'output':
+                                    result_with_state[key] = value
+                        return result_with_state
+
                     # Resuming from an HITL dynamic interrupt - use Command(resume=...)
                     hitl_resume_value = self._extract_hitl_resume(input)
                     logger.info(f"[HITL] Resuming HITL interrupt with: {hitl_resume_value}")
@@ -1991,7 +2060,37 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # (or rejected) tool call.  This avoids the fundamental issue
                     # where re-executing the LLM produces a different response.
                     guardrail_type = hitl_interrupt.get('guardrail_type')
-                    if guardrail_type == 'sensitive_tool':
+                    if guardrail_type == 'mcp_auth':
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        if hitl_interrupt.get('_parent_tool_name'):
+                            resume_ctx = {
+                                'tool_name': hitl_interrupt['_parent_tool_name'],
+                                'toolkit_name': '',
+                                'tool_args': hitl_interrupt.get('_parent_tool_args', {}),
+                                'tool_call_id': (
+                                    hitl_interrupt.get('_parent_tool_call_id')
+                                    or f"call_{uuid4().hex[:24]}"
+                                ),
+                                'mcp_auth_bridge': True,
+                            }
+                        else:
+                            resume_ctx = {
+                                'mcp_auth_payload': dict(hitl_interrupt),
+                            }
+                        if pending_msgs_dicts:
+                            if resume_ctx.get('mcp_auth_payload'):
+                                # The MCP resume path closes the interrupted call
+                                # with a ToolMessage directly. Keep the original
+                                # AIMessage that owns that tool_call_id so provider
+                                # ordering remains AI(tool_calls) -> ToolMessage.
+                                resume_ctx['pending_messages'] = list(pending_msgs_dicts)
+                            else:
+                                trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                                if trimmed:
+                                    resume_ctx['pending_messages'] = trimmed
+                        hitl_resume_ctx = resume_ctx
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+                    elif guardrail_type == 'sensitive_tool':
                         # When the interrupt bubbled up from a child Application
                         # tool, reference the PARENT tool so the LLMNode builds
                         # a synthetic AIMessage calling the Application wrapper
@@ -2143,7 +2242,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 resume_ctx['original_ai_message'] = original_ai_dict
                         hitl_resume_ctx = resume_ctx
                         logger.info("[HITL] Prepared clarifying-question resume for ask_user")
-                    elif guardrail_type == 'parallel_sensitive_tools':
+                    elif guardrail_type in {
+                        'parallel_sensitive_tools',
+                        'parallel_mcp_auth',
+                        'parallel_guardrails',
+                    }:
                         # Parallel sub-agent fan-out resume (issue #4993).
                         # The aggregate interrupt paused N children at once; the
                         # caller returns a decision per child as hitl_decisions.
@@ -2177,6 +2280,15 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             'content': (original_ai_dict or {}).get('content', '')
                                 if isinstance(original_ai_dict, dict) else '',
                             'hitl_decisions': list(decisions),
+                            # The node replays every Application call in the
+                            # original fan-out. Keep the checkpoint-authoritative
+                            # pending set so untouched children can be carried
+                            # forward without invoking them again.
+                            'parallel_pending': [
+                                dict(entry)
+                                for entry in (hitl_interrupt.get('pending') or [])
+                                if isinstance(entry, dict)
+                            ],
                             # Application._run stamps bubbled child aggregates.
                             # In that sequential bridge the wrapper's own
                             # interrupt() must consume the current Command value;
@@ -2198,6 +2310,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         persisted = []
                         for d in decisions:
                             if not isinstance(d, dict):
+                                continue
+                            if d.get('guardrail_type') == 'mcp_auth':
                                 continue
                             entry = {
                                 'tool_name': d.get('tool_name', ''),
@@ -2798,7 +2912,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         interrupt_value = cls._get_hitl_interrupt(state_snapshot)
         if not interrupt_value:
             return []
-        if interrupt_value.get('guardrail_type') == 'parallel_sensitive_tools':
+        if isinstance(interrupt_value.get('pending'), list):
             pending = interrupt_value.get('pending') or []
             return [p for p in pending if isinstance(p, dict)]
         return [interrupt_value]
@@ -2888,8 +3002,35 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         decision[key] = match[key]
                     else:
                         decision.pop(key, None)
+                if match.get('guardrail_type'):
+                    decision['guardrail_type'] = match['guardrail_type']
             hydrated.append(decision)
         return hydrated
+
+    @classmethod
+    def _hitl_resume_targets_checkpoint(
+        cls, input_data: dict, interrupt_value: dict,
+    ) -> bool:
+        """Validate identity-bearing resumes against the paused checkpoint.
+
+        Historical scalar resume payloads carry no invocation identity and
+        remain supported. Once a caller supplies ``hitl_decisions``, however,
+        at least one decision must match the checkpoint's public interrupt id
+        (or an unambiguous legacy tool-call id). This prevents a stale action
+        from being consumed by a newer guardrail on the same child thread.
+        """
+        decisions = (
+            input_data.get('hitl_decisions')
+            or input_data.get('mcp_auth_decisions')
+        )
+        if not isinstance(decisions, list) or not decisions:
+            return True
+        checkpoint_interrupt = interrupt_value
+        if not isinstance(interrupt_value.get('pending'), list):
+            checkpoint_interrupt = {'pending': [interrupt_value]}
+        return bool(cls._hydrate_parallel_hitl_decisions(
+            decisions, checkpoint_interrupt,
+        ))
 
     # Internal payload keys that must never leak to the UI/transport layer.
     _HITL_INTERNAL_KEYS = (
@@ -3104,8 +3245,14 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if input_data.get('hitl_resume') is True:
             return True
 
+        if input_data.get('mcp_auth_resume') is True:
+            return True
+
         # Parallel multi-interrupt resume: a list of per-child decisions.
         if isinstance(input_data.get('hitl_decisions'), list) and input_data['hitl_decisions']:
+            return True
+
+        if isinstance(input_data.get('mcp_auth_decisions'), list) and input_data['mcp_auth_decisions']:
             return True
 
         action = input_data.get('hitl_action') or input_data.get('action')
@@ -3150,7 +3297,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
         Returns dict suitable for Command(resume=...).
         """
-        decisions = input_data.get("hitl_decisions")
+        decisions = input_data.get("hitl_decisions") or input_data.get("mcp_auth_decisions")
         single_decision = (
             decisions[0]
             if isinstance(decisions, list)
@@ -3165,7 +3312,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # that unambiguous shape as the scalar resume too; otherwise the missing
         # action falls through to the historical ``approve`` default and executes
         # a tool the user explicitly rejected.
-        action = input_data.get("hitl_action") or input_data.get("action")
+        action = (
+            input_data.get("hitl_action")
+            or input_data.get("mcp_auth_action")
+            or input_data.get("action")
+        )
         if not action and single_decision is not None:
             action = single_decision.get("action")
         action = action or "approve"

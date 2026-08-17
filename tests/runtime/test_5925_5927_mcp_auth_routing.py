@@ -58,8 +58,8 @@ def _patch_sharepoint_auth_loader(monkeypatch) -> None:
     monkeypatch.setitem(elitea_tools_mod.AVAILABLE_TOOLS, "sharepoint", sharepoint_entry)
 
 
-def test_pipeline_mcp_config_uses_server_name_to_reraise_auth(monkeypatch):
-    """A direct pipeline node must surface auth instead of receiving proxy tools."""
+def test_pipeline_mcp_config_defers_auth_to_checkpointed_node(monkeypatch):
+    """A direct pipeline node receives a gateway that raises only when invoked."""
 
     def get_toolkit(**_kwargs):
         return SimpleNamespace(get_tools=lambda: (_ for _ in ()).throw(_auth_error()))
@@ -72,8 +72,11 @@ def test_pipeline_mcp_config_uses_server_name_to_reraise_auth(monkeypatch):
     }
     context = McpContext(pipeline_node_toolkit_names={SERVER_NAME})
 
+    tools = runtime_tools.get_tools([toolkit_config], mcp_context=context)
+    proxy = next(tool for tool in tools if tool.name.startswith("mcp_authorize_"))
+
     with pytest.raises(McpAuthorizationRequired):
-        runtime_tools.get_tools([toolkit_config], mcp_context=context)
+        proxy.invoke({})
 
 
 def test_auth_control_resolves_participant_name_through_dynamic_mcp_type(monkeypatch):
@@ -125,17 +128,22 @@ def test_auth_control_uses_delegated_toolkit_auth_url(monkeypatch):
         auth_control.func(action="authorize", server_url="sharepoint")
 
     assert exc_info.value.server_url == SHAREPOINT_URL
+    assert exc_info.value.toolkit_name == "sharepoint"
+    assert exc_info.value.toolkit_type == "sharepoint"
     assert (exc_info.value.resource_metadata or {}).get("resource_name") == "SharePoint"
 
 
-def test_direct_sharepoint_toolkit_node_reraises_auth_before_graph_creation(monkeypatch):
-    """A no-LLM Toolkit node must surface auth instead of receiving proxy tools."""
+def test_direct_sharepoint_toolkit_node_defers_auth_until_execution(monkeypatch):
+    """A no-LLM Toolkit node must compile a runtime authorization gateway."""
 
     _patch_sharepoint_auth_loader(monkeypatch)
     context = McpContext(pipeline_node_toolkit_names={"sharepoint"})
 
+    tools = runtime_tools.get_tools([_sharepoint_tool_config()], mcp_context=context)
+    proxy = next(tool for tool in tools if tool.name.startswith("mcp_authorize_"))
+
     with pytest.raises(McpAuthorizationRequired) as exc_info:
-        runtime_tools.get_tools([_sharepoint_tool_config()], mcp_context=context)
+        proxy.invoke({})
 
     assert exc_info.value.server_url == SHAREPOINT_URL
 
@@ -191,8 +199,8 @@ def test_declined_direct_sharepoint_toolkit_marks_clean_pipeline_stop(monkeypatc
     assert result["sharepoint_result"] is None
 
 
-def test_multiple_direct_toolkits_request_auth_sequentially(monkeypatch):
-    """Only one direct-toolkit auth request is emitted per application rebuild."""
+def test_multiple_direct_toolkits_are_all_available_as_runtime_auth_gateways(monkeypatch):
+    """Every direct Toolkit can reach its own checkpointed auth boundary."""
 
     _patch_sharepoint_auth_loader(monkeypatch)
     first_url = "https://tenant.sharepoint.com/sites/first"
@@ -203,25 +211,19 @@ def test_multiple_direct_toolkits_request_auth_sequentially(monkeypatch):
     ]
     pipeline_toolkits = {"sharepoint-first", "sharepoint-second"}
 
-    with pytest.raises(McpAuthorizationRequired) as first_request:
-        runtime_tools.get_tools(
-            tool_configs,
-            mcp_context=McpContext(pipeline_node_toolkit_names=pipeline_toolkits),
-        )
-    assert first_request.value.server_url == first_url
+    tools = runtime_tools.get_tools(
+        tool_configs,
+        mcp_context=McpContext(pipeline_node_toolkit_names=pipeline_toolkits),
+    )
+    proxies = [tool for tool in tools if tool.name.startswith("mcp_authorize_")]
+    assert len(proxies) == 2
 
-    skipped_toolkits = set()
+    with pytest.raises(McpAuthorizationRequired) as first_request:
+        proxies[0].invoke({})
     with pytest.raises(McpAuthorizationRequired) as second_request:
-        runtime_tools.get_tools(
-            tool_configs,
-            mcp_context=McpContext(
-                user_declined_servers=[{"server_url": first_url}],
-                pipeline_node_toolkit_names=pipeline_toolkits,
-                skipped_pipeline_toolkit_names=skipped_toolkits,
-            ),
-        )
+        proxies[1].invoke({})
+    assert first_request.value.server_url == first_url
     assert second_request.value.server_url == second_url
-    assert skipped_toolkits == {"sharepoint-first"}
 
 
 def test_multiple_agent_toolkits_keep_distinct_auth_urls(monkeypatch):

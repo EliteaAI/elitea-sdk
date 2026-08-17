@@ -696,6 +696,35 @@ def test_deferred_resume_invokes_child_with_resume_payload():
     assert result['output'] == 'approved-result'
 
 
+def test_deferred_resume_forwards_checkpoint_interrupt_identity():
+    child = DictBridgeInterruptingApplication(output='declined-result', tool_name='create_file')
+    app = _app('worker', child)
+
+    result = app._run(
+        task='do work',
+        config={'configurable': {
+            'thread_id': 'parent-identity',
+            '__hitl_parallel_call_id__': 'call-X',
+            '__hitl_parallel_resume__': {
+                'action': 'skip',
+                'value': '',
+                'guardrail_type': 'mcp_auth',
+                'interrupt_id': 'mcp_auth_expected',
+            },
+        }},
+    )
+
+    assert child.calls[-1]['payload'] == {
+        'hitl_resume': True,
+        'hitl_decisions': [{
+            'interrupt_id': 'mcp_auth_expected',
+            'action': 'skip',
+            'value': '',
+        }],
+    }
+    assert result['output'] == 'declined-result'
+
+
 def test_parallel_call_id_isolates_same_name_sibling_thread_ids():
     """Two parallel calls to the SAME sub-agent must get distinct child
     thread_ids — the parallel path suffixes with tool_call_id so the two

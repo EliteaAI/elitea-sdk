@@ -517,6 +517,32 @@ class Application(BaseTool):
                     },
                     config=nested_config,
                 )
+            elif _hitl_parallel_resume.get('interrupt_id'):
+                # Preserve the checkpoint-owned leaf interrupt identity across
+                # the Application boundary. A scalar action has no identity and
+                # could otherwise be consumed by whichever guardrail currently
+                # occupies this child thread after a stale/concurrent resume.
+                response = application_runnable.invoke(
+                    {
+                        "hitl_resume": True,
+                        "hitl_decisions": [{
+                            "interrupt_id": _hitl_parallel_resume['interrupt_id'],
+                            "action": _hitl_parallel_resume.get("action", "approve"),
+                            "value": _hitl_parallel_resume.get("value", ""),
+                        }],
+                    },
+                    config=nested_config,
+                )
+            elif _hitl_parallel_resume.get('guardrail_type') == 'mcp_auth':
+                response = application_runnable.invoke(
+                    {
+                        "mcp_auth_resume": True,
+                        "mcp_auth_action": _hitl_parallel_resume.get(
+                            "action", "skip",
+                        ),
+                    },
+                    config=nested_config,
+                )
             else:
                 response = application_runnable.invoke(
                     {
@@ -553,7 +579,9 @@ class Application(BaseTool):
                             value = getattr(it, 'value', None)
                             if not isinstance(value, dict):
                                 continue
-                            if value.get('guardrail_type') != 'sensitive_tool':
+                            if value.get('guardrail_type') not in {
+                                'sensitive_tool', 'mcp_auth',
+                            }:
                                 continue
                             value.setdefault('_parent_tool_name', self.name)
                             value.setdefault('_parent_tool_args', {'task': kwargs.get('task', '')})
@@ -569,6 +597,13 @@ class Application(BaseTool):
                                     'parent_agent_call_id',
                                     nested_metadata['parent_agent_call_id'],
                                 )
+                            child_thread_id = child_configurable.get('thread_id')
+                            if child_thread_id:
+                                value.setdefault('thread_id', child_thread_id)
+                                value.setdefault('child_thread_id', child_thread_id)
+                            checkpoint_ns = child_configurable.get('checkpoint_ns')
+                            if checkpoint_ns:
+                                value.setdefault('checkpoint_ns', checkpoint_ns)
                             # Always drop the CHILD's pending messages so they can
                             # never leak into the parent checkpoint and pollute the
                             # parent LLM's resume history; attach the parent's
@@ -658,6 +693,13 @@ class Application(BaseTool):
                 child_hitl_for_parent.setdefault(
                     'parent_agent_call_id', nested_metadata['parent_agent_call_id'],
                 )
+            child_thread_id = child_configurable.get('thread_id')
+            if child_thread_id:
+                child_hitl_for_parent.setdefault('thread_id', child_thread_id)
+                child_hitl_for_parent.setdefault('child_thread_id', child_thread_id)
+            checkpoint_ns = child_configurable.get('checkpoint_ns')
+            if checkpoint_ns:
+                child_hitl_for_parent.setdefault('checkpoint_ns', checkpoint_ns)
             # The dict(child_hitl) copy carries the CHILD's own _pending_messages.
             # Always drop them so they can't leak into the parent checkpoint;
             # only the parent's pending is meaningful when restored into the
@@ -710,11 +752,19 @@ class Application(BaseTool):
             # the child's `parallel_sensitive_tools` resume branch routes each
             # decision to the correct leaf. Fall back to the scalar shape for a
             # plain single-tool child pause.
-            _resume_decisions = resume_value.get("hitl_decisions")
+            _resume_decisions = (
+                resume_value.get("hitl_decisions")
+                or resume_value.get("mcp_auth_decisions")
+            )
             if isinstance(_resume_decisions, list) and _resume_decisions:
                 _resume_payload = {
                     "hitl_resume": True,
                     "hitl_decisions": _resume_decisions,
+                }
+            elif child_hitl.get('guardrail_type') == 'mcp_auth':
+                _resume_payload = {
+                    "mcp_auth_resume": True,
+                    "mcp_auth_action": resume_value.get("action", "skip"),
                 }
             else:
                 _resume_payload = {
