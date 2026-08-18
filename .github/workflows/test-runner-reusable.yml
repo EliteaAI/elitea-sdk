@@ -85,7 +85,7 @@ jobs:
       env:
         SANDBOX_BASE: ${{ github.workspace }}/.elitea/tests/test_pipelines
         DENO_DIR: ${{ github.workspace }}/.elitea/tests/test_pipelines/node_modules
-        PYODIDE_SANDBOX_PKG: /app/data/sandbox/main.ts
+        PYODIDE_SANDBOX_PKG: ${{ github.workspace }}/infra/data/sandbox/main.ts
         PYTHONPATH: /app
         PYTHONDONTWRITEBYTECODE: "1"
         PYTHONUNBUFFERED: "1"
