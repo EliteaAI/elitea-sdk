@@ -43,6 +43,7 @@ from ..utils.mcp_oauth import (
     build_mcp_auth_decision_result,
 )
 from .hitl import (
+    HITL_CANONICAL_INTERRUPT_ID_KEY,
     HITL_INTERRUPT_ID_KEY,
     HITL_NESTED_INTERRUPT_ID_KEY,
     HITL_TOOL_CALL_ID_KEY,
@@ -177,6 +178,19 @@ class LLMNode(BaseTool):
                     'the node PARKS by writing child specs to the parallel_tasks state channel '
                     'and returning instead of running children in-process. When None, the '
                     'node falls back to the in-process asyncio.gather fan-out (Track 1).'
+    )
+    independent_parallel_hitl: bool = Field(
+        default=True,
+        description='Single-process parallel HITL supervisor. '
+                    'When enabled, paused Application children publish immediately '
+                    'and accept exact live decisions while siblings keep running.'
+    )
+    parallel_hitl_max_concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description='Maximum concurrently executing in-process Application children '
+                    'when the independent parallel HITL supervisor is enabled.'
     )
     _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
 
@@ -1436,10 +1450,35 @@ class LLMNode(BaseTool):
                     }],
                 )
                 messages = list(messages) + [completion]
+            decision_result = self._mcp_auth_decision_message(
+                auth_payload, action,
+            )
             messages = list(messages) + [ToolMessage(
-                content=self._mcp_auth_decision_message(auth_payload, action),
+                content=decision_result,
                 tool_call_id=tool_call_id,
             )]
+            # The authorization boundary is completed synthetically on resume:
+            # the original tool call must not execute again, but its structured
+            # result is still a real step in the leaf's history.  Emit an
+            # explicit completion event so the worker persists the same
+            # LLM -> tool -> LLM timeline that ordinary tools produce.  Without
+            # this, resolved auth cards disappear and the child accordion looks
+            # as though the guarded call never happened.
+            dispatch_custom_event(
+                name="mcp_auth_decision",
+                data={
+                    "tool_name": (
+                        auth_payload.get("_tool_call_name")
+                        or "mcp_auth_control"
+                    ),
+                    "tool_call_id": tool_call_id,
+                    "toolkit_name": auth_payload.get("toolkit_name") or "",
+                    "toolkit_type": auth_payload.get("toolkit_type") or "",
+                    "tool_output": decision_result,
+                    "action": action,
+                },
+                config=config,
+            )
         elif hitl_ctx and hitl_ctx.get('parallel_calls'):
             # ---- Parallel sub-agent resume (issue #4993) ----
             # The original turn fanned out 2+ Application calls and the parent
@@ -2567,16 +2606,21 @@ class LLMNode(BaseTool):
             tool_name=interrupt_payload.get('tool_name') or '',
             toolkit_type=interrupt_payload.get('toolkit_type') or '',
             message=(
-                'Authorization completed. Retry the requested operation with the '
-                'newly available toolkit.'
+                'Authorization completed for this toolkit call only. Continue '
+                'the original task from its next unfinished step.'
                 if authorized else
-                'The user skipped authorization for this run. Continue without '
-                'the unavailable toolkit or explain the limitation.'
+                'The user skipped authorization for this toolkit call only. '
+                'Continue the original task from its next unfinished step.'
             ),
             next_step=(
-                'Retry the requested operation using the authorized toolkit.'
+                'Retry the guarded operation using the authorized toolkit, then '
+                'execute every remaining step required by the original task. Do '
+                'not repeat work already completed before authorization.'
                 if authorized else
-                'Do not request this toolkit again during the current run.'
+                'Do not request this toolkit again during the current run. '
+                'Execute every remaining step that does not require it, including '
+                'all other required tool calls. Do not finish early solely because '
+                'authorization was skipped, and do not repeat completed work.'
             ),
             denial_reason=None if authorized else 'User skipped authorization for this run.',
             resource_metadata_url=interrupt_payload.get('resource_metadata_url'),
@@ -2590,8 +2634,12 @@ class LLMNode(BaseTool):
     ):
         """Execute multiple Application (sub-agent) tool calls concurrently.
 
-        Children run in worker threads under ``asyncio.gather`` so their
-        (blocking) sub-graph invocations overlap (elapsed ≈ max, not sum).
+        Children run in worker threads so their blocking sub-graph invocations
+        overlap (elapsed ≈ max, not sum).  The default supervised path uses
+        bounded tasks plus ``asyncio.wait(FIRST_COMPLETED)`` so a paused child
+        can be decided and resumed while runnable siblings continue. The
+        aggregate ``asyncio.gather`` path remains available as a compatibility
+        opt-out.
         ``contextvars.copy_context()`` is captured per child so each runs in an
         isolated context (its own ``_PENDING_TOOL_MESSAGES`` slot). Per #5245
         there is no shared approval set — every sensitive call interrupts on its
@@ -2607,11 +2655,9 @@ class LLMNode(BaseTool):
         Completed children's ``ToolMessage``s are appended to ``new_messages`` in
         tool_call order regardless of whether siblings paused. See issue #4993.
 
-        All children are awaited to settlement before the aggregate interrupt is
-        raised: ``interrupt()`` checkpoints and replays the WHOLE node on resume,
-        so a sibling cannot be left running across a human pause on a stateless
-        server — abandoning + re-running it desynchronises the resume-value
-        replay cadence and re-fires the same interrupt in a loop.
+        When no runnable child remains, both modes raise the same durable root
+        aggregate interrupt.  That checkpoint is the fallback for process exit,
+        reload, Stop, and lost live ownership.
         """
         from langchain_core.messages import ToolMessage, message_to_dict
 
@@ -2661,6 +2707,12 @@ class LLMNode(BaseTool):
             nested_interrupt_id = entry.pop(HITL_NESTED_INTERRUPT_ID_KEY, None)
             if nested_interrupt_id:
                 entry[HITL_INTERRUPT_ID_KEY] = nested_interrupt_id
+                # The canonical marker applies to the public id at THIS
+                # supervisor tier. Once we descend to the child-owned id, the
+                # child must deterministically project it again. Retaining the
+                # marker here would incorrectly expose the private nested id as
+                # a new public card after any sibling resumes.
+                entry.pop(HITL_CANONICAL_INTERRUPT_ID_KEY, None)
             return entry
 
         def _prior_deferred_interrupt(tool_call_id: str):
@@ -2697,6 +2749,12 @@ class LLMNode(BaseTool):
             envelope = {"type": "tool_call", "id": tool_call_id, "args": tool_args, "name": tool_name}
             child_config = dict(config)
             child_config['configurable'] = dict(config.get('configurable', {}))
+            child_config['configurable']['__independent_parallel_hitl__'] = (
+                self.independent_parallel_hitl
+            )
+            child_config['configurable']['__parallel_hitl_max_concurrency__'] = (
+                self.parallel_hitl_max_concurrency
+            )
             child_config['metadata'] = dict(config.get('metadata', {}))
             child_config['metadata']['sibling_ordinal'] = sibling_ordinal
             decision = decisions_by_id.get(tool_call_id)
@@ -2779,17 +2837,389 @@ class LLMNode(BaseTool):
                 None, lambda c=ctx, t=tool, e=envelope, cc=child_config: c.run(t.invoke, e, config=cc),
             )
 
-        # Run every child concurrently and wait for ALL to settle. A child that
-        # pauses for sensitive-tool approval returns a deferred sentinel (it must
-        # NOT call interrupt() inside the executor thread — gather would capture
-        # the GraphInterrupt and lose the pause). Completed siblings produce
-        # ToolMessages; paused siblings are aggregated into ONE parent interrupt
-        # below. return_exceptions keeps one child's failure from cancelling the
-        # rest (per-child isolation, issue #4993).
-        results = await asyncio.gather(
-            *[_run_one(index + 1, spec) for index, spec in enumerate(app_specs)],
-            return_exceptions=True,
-        )
+        def _build_pending_payload(deferred_items):
+            """Project deferred child pauses into stable root-scoped cards."""
+            payload: list[PendingHITLEntry] = []
+            for spec, sentinel in deferred_items:
+                _tn, _ta, tool_call_id, _tool = spec
+                nested_aggregate = sentinel.get('hitl_interrupt') or {}
+                nested_pending = nested_aggregate.get('pending')
+                if isinstance(nested_pending, list) and nested_pending:
+                    for leaf_index, leaf_entry in enumerate(nested_pending):
+                        if not isinstance(leaf_entry, dict):
+                            continue
+                        flat_entry = cast(PendingHITLEntry, dict(leaf_entry))
+                        flat_entry[HITL_VIA_CALL_ID_KEY] = tool_call_id
+                        canonical_id = (
+                            self.independent_parallel_hitl
+                            and bool(flat_entry.get(
+                                HITL_CANONICAL_INTERRUPT_ID_KEY
+                            ))
+                        )
+                        if flat_entry.get(HITL_INTERRUPT_ID_KEY):
+                            flat_entry[HITL_NESTED_INTERRUPT_ID_KEY] = flat_entry[
+                                HITL_INTERRUPT_ID_KEY
+                            ]
+                        nested_interrupt_id = flat_entry.get(
+                            HITL_NESTED_INTERRUPT_ID_KEY
+                        )
+                        if not canonical_id:
+                            flat_entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
+                                tool_call_id,
+                                str(
+                                    nested_interrupt_id
+                                    or flat_entry.get(HITL_TOOL_CALL_ID_KEY)
+                                    or flat_entry.get('tool_name')
+                                    or ''
+                                ),
+                                None if nested_interrupt_id else leaf_index,
+                            )
+                        # Once an interrupt has been projected by the innermost
+                        # active supervisor, every outer supervisor must reuse
+                        # that public id. Re-scoping it at each Application
+                        # boundary renders duplicate cards for the same leaf and
+                        # makes the earlier card impossible for the outer
+                        # checkpoint to hydrate.
+                        if self.independent_parallel_hitl:
+                            flat_entry[HITL_CANONICAL_INTERRUPT_ID_KEY] = True
+                        flat_entry.pop('_pending_messages', None)
+                        payload.append(flat_entry)
+                    continue
+
+                entry = cast(PendingHITLEntry, dict(nested_aggregate))
+                entry[HITL_TOOL_CALL_ID_KEY] = tool_call_id
+                nested_interrupt_id = nested_aggregate.get(HITL_INTERRUPT_ID_KEY)
+                interrupt_route_seed = str(
+                    nested_interrupt_id
+                    or ':'.join(filter(None, (
+                        tool_call_id,
+                        nested_aggregate.get('tool_name'),
+                        nested_aggregate.get('message'),
+                    )))
+                )
+                entry[HITL_NESTED_INTERRUPT_ID_KEY] = interrupt_route_seed
+                canonical_id = (
+                    self.independent_parallel_hitl
+                    and bool(nested_aggregate.get(
+                        HITL_CANONICAL_INTERRUPT_ID_KEY
+                    ))
+                )
+                if not canonical_id:
+                    entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
+                        tool_call_id,
+                        interrupt_route_seed,
+                        None if nested_interrupt_id else len(payload),
+                    )
+                if self.independent_parallel_hitl:
+                    entry[HITL_CANONICAL_INTERRUPT_ID_KEY] = True
+                app_meta = getattr(_tool, 'metadata', None) or {}
+                sub_agent_name = (
+                    app_meta.get('original_name')
+                    or app_meta.get('display_name')
+                    or getattr(_tool, 'name', '')
+                    or _tn
+                )
+                if sub_agent_name:
+                    entry['parent_agent_name'] = sub_agent_name
+                entry.pop('_pending_messages', None)
+                payload.append(entry)
+            return payload
+
+        async def _run_supervised():
+            """Settle/resume children independently while retaining one process."""
+            from .. import _parallel_hitl_registry as decision_registry
+
+            configurable = (config or {}).get('configurable', {})
+            # ``thread_id`` is rewritten at every Application boundary so each
+            # nested graph owns a distinct checkpoint.  It is therefore not
+            # the worker mailbox address.  The worker stamps its canonical
+            # root id separately and every nested supervisor routes through it.
+            # Otherwise a durable fallback can reconstruct the root runnable
+            # against a child checkpoint and resume the orchestrator instead
+            # of the interrupted caller (#6264).
+            root_thread_id = str(
+                configurable.get('__parallel_hitl_root_thread_id__')
+                or configurable.get('thread_id')
+                or ''
+            )
+            if not root_thread_id:
+                return await asyncio.gather(
+                    *[
+                        _run_one(index + 1, spec)
+                        for index, spec in enumerate(app_specs)
+                    ],
+                    return_exceptions=True,
+                )
+
+            semaphore = asyncio.Semaphore(self.parallel_hitl_max_concurrency)
+
+            async def _bounded(index):
+                async with semaphore:
+                    try:
+                        return await _run_one(index + 1, app_specs[index])
+                    except BaseException as exc:  # preserve gather return_exceptions parity
+                        return exc
+
+            results = [None] * len(app_specs)
+            running = {
+                asyncio.create_task(_bounded(index)): index
+                for index in range(len(app_specs))
+            }
+            paused_entries: Dict[int, list] = {}
+            supervisor_id = decision_registry.attach(root_thread_id, loop)
+            decision_waiter = None
+            for spec in app_specs:
+                dispatch_custom_event(
+                    'parallel_hitl_state',
+                    {
+                        'state': 'running',
+                        'root_thread_id': root_thread_id,
+                        'tool_call_id': spec[2],
+                    },
+                    config=config,
+                )
+
+            def _public_entry(entry):
+                public = dict(entry)
+                for key in (
+                    HITL_CANONICAL_INTERRUPT_ID_KEY,
+                    HITL_NESTED_INTERRUPT_ID_KEY,
+                    HITL_VIA_CALL_ID_KEY,
+                    'tool_args_raw',
+                    '_pending_messages',
+                ):
+                    public.pop(key, None)
+                public['root_thread_id'] = root_thread_id
+                public['resume_strategy'] = 'supervised_child'
+                return public
+
+            def _publish_pause(index, result):
+                entries = _build_pending_payload([(app_specs[index], result)])
+                paused_entries[index] = entries
+                decision_registry.advertise(
+                    root_thread_id,
+                    supervisor_id,
+                    [
+                        str(entry.get(HITL_INTERRUPT_ID_KEY) or '')
+                        for entry in entries
+                    ],
+                )
+                public_entries = [_public_entry(entry) for entry in entries]
+                if not public_entries:
+                    return
+                dispatch_custom_event(
+                    'parallel_hitl_state',
+                    {
+                        'state': 'paused',
+                        'root_thread_id': root_thread_id,
+                        'interrupt_id': public_entries[0].get(
+                            HITL_INTERRUPT_ID_KEY
+                        ),
+                        'tool_call_id': app_specs[index][2],
+                    },
+                    config=config,
+                )
+                dispatch_custom_event(
+                    'parallel_hitl_interrupt',
+                    {
+                        'root_thread_id': root_thread_id,
+                        'thread_id': root_thread_id,
+                        'resume_strategy': 'supervised_child',
+                        'hitl_interrupt': public_entries[0],
+                        'hitl_interrupts': public_entries,
+                        'message': public_entries[0].get(
+                            'message', 'Awaiting human review...',
+                        ),
+                    },
+                    config=config,
+                )
+
+            def _route_decisions(decisions):
+                routed: Dict[int, list] = {}
+                for raw_decision in decisions:
+                    if not isinstance(raw_decision, dict):
+                        continue
+                    interrupt_id = raw_decision.get(HITL_INTERRUPT_ID_KEY)
+                    target = None
+                    target_entry = None
+                    for index, entries in paused_entries.items():
+                        target_entry = next(
+                            (
+                                entry for entry in entries
+                                if entry.get(HITL_INTERRUPT_ID_KEY) == interrupt_id
+                            ),
+                            None,
+                        )
+                        if target_entry is not None:
+                            target = index
+                            break
+                    if target is None or target_entry is None:
+                        logger.info(
+                            '[HITL] Ignoring stale supervised decision interrupt_id=%s',
+                            interrupt_id,
+                        )
+                        continue
+
+                    routed.setdefault(target, []).append(
+                        (dict(raw_decision), target_entry)
+                    )
+
+                for target, target_decisions in routed.items():
+                    routed_by_via: Dict[str, list] = {}
+                    direct_decision = None
+                    for raw_decision, target_entry in target_decisions:
+                        decision = dict(raw_decision)
+                        decision[HITL_TOOL_CALL_ID_KEY] = target_entry.get(
+                            HITL_TOOL_CALL_ID_KEY
+                        )
+                        nested_id = target_entry.get(HITL_NESTED_INTERRUPT_ID_KEY)
+                        if nested_id:
+                            decision[HITL_NESTED_INTERRUPT_ID_KEY] = nested_id
+                        via_id = target_entry.get(HITL_VIA_CALL_ID_KEY)
+                        if via_id:
+                            decision[HITL_VIA_CALL_ID_KEY] = via_id
+                            routed_by_via.setdefault(via_id, []).append(decision)
+                        else:
+                            direct_decision = decision
+
+                    for via_id, via_decisions in routed_by_via.items():
+                        grandchild_decisions_by_via_id[via_id] = via_decisions
+                    if direct_decision is not None:
+                        decisions_by_id[str(
+                            direct_decision.get(HITL_TOOL_CALL_ID_KEY) or ''
+                        )] = direct_decision
+
+                    # One paused container can expose multiple nested leaf
+                    # cards. Reconstruct it once with every decision that was
+                    # committed in this drain; launching once per card would
+                    # discard later decisions and replay the same container.
+                    owned_entries = paused_entries.get(target) or []
+                    decision_registry.withdraw(
+                        root_thread_id,
+                        supervisor_id,
+                        [
+                            str(entry.get(HITL_INTERRUPT_ID_KEY) or '')
+                            for entry in owned_entries
+                        ],
+                    )
+                    paused_entries.pop(target, None)
+                    results[target] = None
+                    task = asyncio.create_task(_bounded(target))
+                    running[task] = target
+                    for raw_decision, target_entry in target_decisions:
+                        dispatch_custom_event(
+                            'parallel_hitl_state',
+                            {
+                                'state': 'resuming',
+                                'root_thread_id': root_thread_id,
+                                'interrupt_id': raw_decision.get(
+                                    HITL_INTERRUPT_ID_KEY
+                                ),
+                                'tool_call_id': target_entry.get(
+                                    HITL_TOOL_CALL_ID_KEY
+                                ),
+                            },
+                            config=config,
+                        )
+
+                return bool(routed)
+
+            try:
+                while running or paused_entries:
+                    # Worker teardown removes the live mailbox and wakes this
+                    # coroutine.  Return the still-paused entries through the
+                    # normal durable aggregate below so a later worker can
+                    # reconstruct the exact leaves from their checkpoints.
+                    if paused_entries and not decision_registry.is_active(
+                        root_thread_id
+                    ):
+                        break
+                    queued = decision_registry.drain(
+                        root_thread_id, supervisor_id,
+                    )
+                    if queued and _route_decisions(queued):
+                        continue
+
+                    wait_set = set(running)
+                    if paused_entries:
+                        # A supervisor is a coroutine inside the worker's existing
+                        # process, not a parked process per child.  Keep it alive
+                        # even when EVERY child is paused so a later decision can
+                        # resume the exact owning leaf without replaying the root
+                        # tool call.  Detaching here used to make every click miss
+                        # live ownership and fall back through the durable root
+                        # checkpoint, which rebuilt the outer hierarchy and lost
+                        # the independent-child UX.  The durable aggregate below
+                        # is still the crash/restart fallback: if this coroutine is
+                        # cancelled, the persisted child checkpoints and roster
+                        # reconstruct the same pending leaves.
+                        decision_waiter = asyncio.create_task(
+                            decision_registry.wait(root_thread_id, supervisor_id)
+                        )
+                        wait_set.add(decision_waiter)
+                    done, _ = await asyncio.wait(
+                        wait_set, return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if decision_waiter is not None and decision_waiter in done:
+                        decisions = decision_waiter.result()
+                        decision_waiter = None
+                        _route_decisions(decisions)
+
+                    for task in done:
+                        if task not in running:
+                            continue
+                        index = running.pop(task)
+                        result = task.result()
+                        results[index] = result
+                        if isinstance(result, dict) and result.get('__hitl_deferred__'):
+                            _publish_pause(index, result)
+                        else:
+                            paused_entries.pop(index, None)
+                            dispatch_custom_event(
+                                'parallel_hitl_state',
+                                {
+                                    'state': (
+                                        'failed'
+                                        if isinstance(result, BaseException)
+                                        else 'completed'
+                                    ),
+                                    'root_thread_id': root_thread_id,
+                                    'tool_call_id': app_specs[index][2],
+                                },
+                                config=config,
+                            )
+
+                    if decision_waiter is not None:
+                        decision_waiter.cancel()
+                        await asyncio.gather(decision_waiter, return_exceptions=True)
+                        decision_waiter = None
+            finally:
+                if decision_waiter is not None:
+                    decision_waiter.cancel()
+                decision_registry.detach(root_thread_id, supervisor_id)
+
+            for index in paused_entries:
+                # ``results`` already contains the latest deferred sentinel.
+                if results[index] is None:
+                    logger.error(
+                        '[HITL] Supervised child %s lost its deferred state', index,
+                    )
+            return results
+
+        # The supervisor removes only the all-child settlement barrier; both
+        # modes build the same durable root interrupt below. The legacy
+        # aggregate path remains available as an explicit compatibility opt-out.
+        if self.independent_parallel_hitl:
+            results = await _run_supervised()
+        else:
+            results = await asyncio.gather(
+                *[
+                    _run_one(index + 1, spec)
+                    for index, spec in enumerate(app_specs)
+                ],
+                return_exceptions=True,
+            )
 
         pending_deferred = []
         for spec, result in zip(app_specs, results):
@@ -2837,79 +3267,7 @@ class LLMNode(BaseTool):
         # preserving its original tool_call_id and stamping `_via_call_id` with
         # THIS level's container id so a later resume can be regrouped and
         # routed back down (see the grandchild_decisions_by_via_id map above).
-        pending_payload: list[PendingHITLEntry] = []
-        for spec, sentinel in pending_deferred:
-            _tn, _ta, tool_call_id, _tool = spec
-            nested_aggregate = sentinel.get('hitl_interrupt') or {}
-            nested_pending = nested_aggregate.get('pending')
-            if isinstance(nested_pending, list) and nested_pending:
-                # The paused child is itself a container: unpack its leaves.
-                for leaf_index, leaf_entry in enumerate(nested_pending):
-                    if not isinstance(leaf_entry, dict):
-                        continue
-                    flat_entry = cast(PendingHITLEntry, dict(leaf_entry))
-                    # Leaf's own tool_call_id is preserved as-is (NOT
-                    # overwritten with the container's id) — the UI card and
-                    # the eventual resume decision both key off the leaf id.
-                    flat_entry[HITL_VIA_CALL_ID_KEY] = tool_call_id
-                    if flat_entry.get(HITL_INTERRUPT_ID_KEY):
-                        flat_entry[HITL_NESTED_INTERRUPT_ID_KEY] = flat_entry[
-                            HITL_INTERRUPT_ID_KEY
-                        ]
-                    nested_interrupt_id = flat_entry.get(
-                        HITL_NESTED_INTERRUPT_ID_KEY
-                    )
-                    flat_entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
-                        tool_call_id,
-                        str(
-                            nested_interrupt_id
-                            or flat_entry.get(HITL_TOOL_CALL_ID_KEY)
-                            or flat_entry.get('tool_name')
-                            or ''
-                        ),
-                        None if nested_interrupt_id else leaf_index,
-                    )
-                    flat_entry.pop('_pending_messages', None)
-                    pending_payload.append(flat_entry)
-                continue
-            entry = cast(PendingHITLEntry, dict(nested_aggregate))
-            entry[HITL_TOOL_CALL_ID_KEY] = tool_call_id
-            nested_interrupt_id = nested_aggregate.get(HITL_INTERRUPT_ID_KEY)
-            interrupt_route_seed = str(
-                nested_interrupt_id
-                or ':'.join(filter(None, (
-                    tool_call_id,
-                    nested_aggregate.get('tool_name'),
-                    nested_aggregate.get('message'),
-                )))
-            )
-            # Persist the exact derivation seed even for legacy/dict-bridge
-            # children that supplied no interrupt_id. A later partial replay
-            # can then derive the SAME public id instead of hashing the already
-            # derived public id and making an untouched card look new.
-            entry[HITL_NESTED_INTERRUPT_ID_KEY] = interrupt_route_seed
-            entry[HITL_INTERRUPT_ID_KEY] = self._parallel_interrupt_id(
-                tool_call_id,
-                interrupt_route_seed,
-                None if nested_interrupt_id else len(pending_payload),
-            )
-            # Label the paused card with the sub-agent it originated from so the
-            # UI can group N stacked approvals by sub-agent name (issue #4993).
-            # Falls back to the call name when metadata is absent.
-            sub_agent_name = ''
-            _app_meta = getattr(_tool, 'metadata', None) or {}
-            sub_agent_name = (
-                _app_meta.get('original_name')
-                or _app_meta.get('display_name')
-                or getattr(_tool, 'name', '')
-                or _tn
-            )
-            if sub_agent_name:
-                entry['parent_agent_name'] = sub_agent_name
-            # Per-entry pending messages would duplicate the parent-level set
-            # carried on the aggregate; drop them to keep the payload lean.
-            entry.pop('_pending_messages', None)
-            pending_payload.append(entry)
+        pending_payload = _build_pending_payload(pending_deferred)
 
         # Expose + embed the parent's intermediate messages (completed siblings
         # and the AIMessage that owns all N tool_calls) so the resume restores
@@ -3138,7 +3496,25 @@ class LLMNode(BaseTool):
                                 "args": tool_args,
                                 "name": tool_name,
                             }
-                            tool_result = tool_to_execute.invoke(tool_call_envelope, config=config)
+                            # A single container Application may itself fan out
+                            # into parallel leaves.  Stamp the supervisor contract
+                            # on every Application boundary, not only on a 2+
+                            # sibling batch at this level, so orchestrator ->
+                            # container -> leaf hierarchies do not silently fall
+                            # back to the legacy gather barrier.
+                            application_config = dict(config or {})
+                            application_config['configurable'] = dict(
+                                application_config.get('configurable') or {}
+                            )
+                            application_config['configurable'][
+                                '__independent_parallel_hitl__'
+                            ] = self.independent_parallel_hitl
+                            application_config['configurable'][
+                                '__parallel_hitl_max_concurrency__'
+                            ] = self.parallel_hitl_max_concurrency
+                            tool_result = tool_to_execute.invoke(
+                                tool_call_envelope, config=application_config,
+                            )
                         elif hasattr(tool_to_execute, 'ainvoke'):
                             try:
                                 tool_result = await tool_to_execute.ainvoke(tool_args, config=config)

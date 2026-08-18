@@ -2,6 +2,7 @@ import json
 
 import pytest
 import yaml
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
@@ -30,6 +31,14 @@ def _assert_tool_messages_have_owning_calls(messages):
 class _Runtime:
     def get_mcp_toolkits(self):
         return []
+
+
+class _CustomEventCapture(BaseCallbackHandler):
+    def __init__(self):
+        self.events = []
+
+    def on_custom_event(self, name, data, **kwargs):
+        self.events.append((name, data, kwargs))
 
 
 class _AuthToolCounter:
@@ -161,7 +170,11 @@ def test_direct_agent_skip_restores_tool_call_before_structured_result():
         },
     )
     memory = MemorySaver()
-    config = {"configurable": {"thread_id": "issue-6072-direct-skip"}}
+    capture = _CustomEventCapture()
+    config = {
+        "configurable": {"thread_id": "issue-6072-direct-skip"},
+        "callbacks": [capture],
+    }
 
     paused = _assistant(_ChildLLM(), [auth_tool], memory).invoke(
         {"messages": [HumanMessage(content="Search SharePoint")]},
@@ -190,9 +203,98 @@ def test_direct_agent_skip_restores_tool_call_before_structured_result():
     assert payload["type"] == "mcp_auth_decision"
     assert payload["status"] == "declined"
     assert payload["next_step"] == (
-        "Do not request this toolkit again during the current run."
+        "Do not request this toolkit again during the current run. Execute every "
+        "remaining step that does not require it, including all other required "
+        "tool calls. Do not finish early solely because authorization was skipped, "
+        "and do not repeat completed work."
     )
     assert payload["denial_reason"] == "User skipped authorization for this run."
+    auth_events = [
+        data for name, data, _kwargs in capture.events
+        if name == "mcp_auth_decision"
+    ]
+    assert len(auth_events) == 1
+    assert auth_events[0]["tool_name"] == "sharepoint_search"
+    assert auth_events[0]["tool_call_id"] == "call-sharepoint-auth"
+    assert json.loads(auth_events[0]["tool_output"])["status"] == "declined"
+
+
+class _ContinueAfterAuthLLM(_ChildLLM):
+    def bind_tools(self, tools, **kwargs):
+        return _ContinueAfterAuthBound(self, tools)
+
+    def invoke(self, messages, config=None):
+        return _ContinueAfterAuthBound(self, []).invoke(messages, config=config)
+
+
+class _ContinueAfterAuthBound(_BoundChildLLM):
+    def invoke(self, messages, config=None):
+        self.root.invocations.append(list(messages))
+        _assert_tool_messages_have_owning_calls(messages)
+        results = [str(message.content) for message in messages if isinstance(message, ToolMessage)]
+        if "follow-up-complete" in results:
+            return AIMessage(content="child-finished-after-follow-up")
+        for result in results:
+            try:
+                payload = json.loads(result)
+            except (TypeError, ValueError):
+                continue
+            if payload.get("type") == "mcp_auth_decision":
+                return AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "follow_up_tool",
+                        "args": {},
+                        "id": "call-follow-up",
+                        "type": "tool_call",
+                    }],
+                )
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "sharepoint_search",
+                "args": {"query": "quarterly results"},
+                "id": "call-sharepoint-auth",
+                "type": "tool_call",
+            }],
+        )
+
+
+def test_direct_agent_auth_decision_continues_same_leaf_tool_loop():
+    counter = _AuthToolCounter()
+    auth_tool = StructuredTool.from_function(
+        func=counter.raise_auth,
+        name="sharepoint_search",
+        description="Search SharePoint",
+    )
+    follow_up_calls = []
+    follow_up_tool = StructuredTool.from_function(
+        func=lambda: follow_up_calls.append(True) or "follow-up-complete",
+        name="follow_up_tool",
+        description="Perform remaining child work",
+    )
+    memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6072-continue-loop"}}
+
+    paused = _assistant(
+        _ContinueAfterAuthLLM(), [auth_tool, follow_up_tool], memory,
+    ).invoke(
+        {"messages": [HumanMessage(content="Authorize, then continue work")]},
+        config=config,
+    )
+    assert paused["execution_finished"] is False
+
+    resumed = _assistant(
+        _ContinueAfterAuthLLM(), [auth_tool, follow_up_tool], memory,
+    ).invoke(
+        {"mcp_auth_resume": True, "mcp_auth_action": "skip"},
+        config=config,
+    )
+
+    assert resumed["execution_finished"] is True
+    assert resumed["output"] == "child-finished-after-follow-up"
+    assert follow_up_calls == [True]
+    assert counter.calls == 1
 
 
 def test_nested_mcp_auth_uses_durable_interrupt_and_resumes_same_child_call():

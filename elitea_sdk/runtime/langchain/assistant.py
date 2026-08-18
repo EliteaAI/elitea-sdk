@@ -327,6 +327,8 @@ class Assistant:
                  lazy_tools_mode: Optional[bool] = None,
                  middleware: Optional[list[Middleware]] = None,
                  child_dispatcher: Optional[Any] = None,
+                 independent_parallel_hitl: bool = True,
+                 parallel_hitl_max_concurrency: int = 8,
                  user_declined_mcp_servers: Optional[list] = None,
                  auto_approve_sensitive_actions: bool = False):
 
@@ -337,6 +339,8 @@ class Assistant:
         # None → in-process gather fan-out (Track 1, CLI/tests). pylon_indexer
         # supplies a real dispatcher to enable park-by-returning durable children.
         self.child_dispatcher = child_dispatcher
+        self.independent_parallel_hitl = independent_parallel_hitl
+        self.parallel_hitl_max_concurrency = parallel_hitl_max_concurrency
         self.persona = persona
         self.max_iterations = data.get('meta', {}).get('step_limit', 25)
         self.is_subgraph = is_subgraph  # Store is_subgraph flag
@@ -879,6 +883,8 @@ class Assistant:
             always_bind_tools=self._always_bind_tools,  # Middleware tools always bound directly
             middleware_manager=self.middleware_manager,  # Pass middleware for before_model hooks
             child_dispatcher=self.child_dispatcher,  # Parallel sub-agent dispatch seam (#4993 Track 2)
+            independent_parallel_hitl=self.independent_parallel_hitl,
+            parallel_hitl_max_concurrency=self.parallel_hitl_max_concurrency,
         )
 
         return agent
@@ -900,6 +906,8 @@ class Assistant:
             always_bind_tools=self._always_bind_tools,
             middleware_manager=self.middleware_manager,
             child_dispatcher=self.child_dispatcher,  # Parallel sub-agent dispatch seam (#4993 Track 2)
+            independent_parallel_hitl=self.independent_parallel_hitl,
+            parallel_hitl_max_concurrency=self.parallel_hitl_max_concurrency,
             skipped_pipeline_toolkit_names=self._skipped_pipeline_toolkit_names,
         )
         return agent
