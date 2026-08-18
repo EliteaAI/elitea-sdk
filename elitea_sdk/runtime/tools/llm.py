@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import time
 from traceback import format_exc
 from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -1306,13 +1307,23 @@ class LLMNode(BaseTool):
         )
 
         if should_bind_tools:
+            _filter_start = time.perf_counter()
             filtered_tools = (
                 prebuilt_filtered_tools if prebuilt_filtered_tools is not None
                 else self.get_filtered_tools(config=config)
             )
+            logger.debug(
+                f"[Timing] get_filtered_tools took {(time.perf_counter() - _filter_start) * 1000:.1f}ms "
+                f"({len(filtered_tools)} tools, lazy_mode={self.lazy_tools_mode})"
+            )
             if filtered_tools:
                 logger.info(f"Binding {len(filtered_tools)} tools to LLM: {[t.name for t in filtered_tools]}")
+                _bind_start = time.perf_counter()
                 llm_client = self.client.bind_tools(filtered_tools)
+                logger.debug(
+                    f"[Timing] bind_tools took {(time.perf_counter() - _bind_start) * 1000:.1f}ms "
+                    f"({len(filtered_tools)} tools)"
+                )
             else:
                 logger.warning("No tools to bind to LLM")
 
@@ -1591,7 +1602,12 @@ class LLMNode(BaseTool):
                     }],
                 )
         else:
+            _llm_call_start = time.perf_counter()
             completion = llm_client.invoke(messages, config=config)
+            logger.debug(
+                f"[Timing] LLM invoke took {(time.perf_counter() - _llm_call_start) * 1000:.1f}ms "
+                f"(messages={len(messages)}, lazy_mode={self.lazy_tools_mode})"
+            )
         logger.info(f"Initial completion: {completion}")
 
         # Handle both tool-calling and regular responses
