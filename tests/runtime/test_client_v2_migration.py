@@ -59,16 +59,17 @@ class TestEliteAClientV2Urls:
         assert "elitea_core/tools_call" in self.client.mcp_tools_call
 
     def test_toolkit_url(self):
-        with patch("requests.get") as mock_get:
+        with patch("requests.Session.request") as mock_request:
             mock_resp = MagicMock()
             mock_resp.ok = False
             mock_resp.text = "not found"
-            mock_get.return_value = mock_resp
+            mock_request.return_value = mock_resp
             try:
                 self.client.toolkit(7)
             except ValueError:
                 pass  # expected — mock returns not-ok
-        called_url = mock_get.call_args[0][0]
+        method, called_url = mock_request.call_args[0][:2]
+        assert method == 'get'
         assert "/api/v2/" in called_url, f"toolkit() used wrong URL: {called_url}"
         assert "elitea_core/tool/prompt_lib" in called_url
 
@@ -93,26 +94,27 @@ class TestEliteAClientGetAppVersionDetails:
         self.client = make_elitea_client()
 
     def test_patches_v2_url(self):
-        with patch("requests.patch") as mock_patch:
-            mock_patch.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
             self.client.get_app_version_details(1, 2)
-        url = mock_patch.call_args[0][0]
+        method, url = mock_request.call_args[0][:2]
+        assert method == 'patch'
         assert "/api/v2/" in url, f"Expected v2 URL, got: {url}"
         assert "elitea_core/version/prompt_lib" in url
 
     def test_uses_application_versions_attr(self):
-        with patch("requests.patch") as mock_patch:
-            mock_patch.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
             self.client.get_app_version_details(10, 20)
-        url = mock_patch.call_args[0][0]
+        url = mock_request.call_args[0][1]
         assert url.startswith(self.client.application_versions)
 
     def test_no_json_body_sent(self):
-        with patch("requests.patch") as mock_patch:
-            mock_patch.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
             self.client.get_app_version_details(1, 2)
         # no json= kwarg should be passed
-        kwargs = mock_patch.call_args[1]
+        kwargs = mock_request.call_args[1]
         assert "json" not in kwargs
 
 
@@ -205,20 +207,22 @@ class TestSandboxClientMcpV2:
         self.client = make_sandbox_client()
 
     def test_get_mcp_toolkits_calls_v2_url_directly(self):
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = MagicMock(json=lambda: [{"name": "tool1"}])
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(json=lambda: [{"name": "tool1"}])
             result = self.client.get_mcp_toolkits()
-        mock_get.assert_called_once()
-        called_url = mock_get.call_args[0][0]
+        mock_request.assert_called_once()
+        method, called_url = mock_request.call_args[0][:2]
+        assert method == 'get'
         assert called_url == self.client.mcp_tools_list
         assert "/api/v2/" in called_url
 
     def test_mcp_tool_call_posts_to_v2_url_directly(self):
         params = {"params": {"arguments": {}}}
-        with patch("requests.post") as mock_post:
-            mock_post.return_value = MagicMock(json=lambda: {"result": "ok"})
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(json=lambda: {"result": "ok"})
             self.client.mcp_tool_call(params)
-        called_url = mock_post.call_args[0][0]
+        method, called_url = mock_request.call_args[0][:2]
+        assert method == 'post'
         assert called_url == self.client.mcp_tools_call
         assert "/api/v2/" in called_url
 
@@ -228,16 +232,17 @@ class TestSandboxClientGetAppVersionDetails:
         self.client = make_sandbox_client()
 
     def test_patches_v2_url(self):
-        with patch("requests.patch") as mock_patch:
-            mock_patch.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
             self.client.get_app_version_details(3, 4)
-        url = mock_patch.call_args[0][0]
+        method, url = mock_request.call_args[0][:2]
+        assert method == 'patch'
         assert "/api/v2/" in url
         assert "elitea_core/version/prompt_lib" in url
 
     def test_no_json_body_sent(self):
-        with patch("requests.patch") as mock_patch:
-            mock_patch.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
+        with patch("requests.Session.request") as mock_request:
+            mock_request.return_value = MagicMock(ok=True, json=lambda: {"llm_settings": {}})
             self.client.get_app_version_details(3, 4)
-        kwargs = mock_patch.call_args[1]
+        kwargs = mock_request.call_args[1]
         assert "json" not in kwargs
