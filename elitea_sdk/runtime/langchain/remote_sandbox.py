@@ -7,21 +7,14 @@ import time
 
 import aiohttp
 
+from ..utils.trace_limits import cap_trace_json, cap_trace_text
 from .sandbox_types import CodeExecutionResult
 
 logger = logging.getLogger(__name__)
 
 _MAX_TIMEOUT_SECONDS = 55.0
 _HTTP_TIMEOUT_HEADROOM = 15
-_MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB cap on stdout/result/session_bytes
-
-
-def _truncate(value: str | None, max_bytes: int = _MAX_RESPONSE_BYTES) -> str | None:
-    if value is None:
-        return None
-    if len(value) > max_bytes:
-        return value[:max_bytes] + "\n…[truncated]"
-    return value
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB cap on session_bytes (binary, not trace-capped)
 
 
 class RemoteSandbox:
@@ -131,9 +124,9 @@ class RemoteSandbox:
                 logger.warning("session_bytes response truncated (%d bytes)", len(decoded))
 
         return CodeExecutionResult(
-            result=_truncate(str(data.get("result"))) if data.get("result") is not None else None,
-            stdout=_truncate(data.get("stdout")),
-            stderr=_truncate(data.get("stderr")),
+            result=cap_trace_json(data.get("result")),
+            stdout=cap_trace_text(data.get("stdout")),
+            stderr=cap_trace_text(data.get("stderr")),
             status="success" if data.get("success") else "error",
             execution_time=elapsed,
             session_metadata=data.get("session_metadata"),

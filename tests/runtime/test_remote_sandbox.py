@@ -9,7 +9,6 @@ import pytest
 
 from elitea_sdk.runtime.langchain.remote_sandbox import (
     RemoteSandbox,
-    _MAX_RESPONSE_BYTES,
     _MAX_TIMEOUT_SECONDS,
 )
 
@@ -85,7 +84,7 @@ async def test_successful_execution(sandbox):
 
     assert result.status == "success"
     assert result.stdout == "hello\n"
-    assert "42" in str(result.result)
+    assert result.result == 42
     assert result.execution_time > 0
 
 
