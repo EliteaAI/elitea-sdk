@@ -155,3 +155,38 @@ def test_unregister_wakes_fully_paused_supervisor_for_durable_fallback():
         assert await asyncio.wait_for(waiter, timeout=1) == []
 
     asyncio.run(scenario())
+
+
+def test_drain_clears_delayed_notification_after_commit_was_consumed():
+    async def scenario():
+        thread_id = 'registry-delayed-wakeup-root'
+        decision = {
+            'decision_id': 'decision-delayed',
+            'interrupt_id': 'interrupt-delayed',
+        }
+        registry.register(thread_id)
+        try:
+            supervisor_id = registry.attach(
+                thread_id, asyncio.get_running_loop(),
+            )
+            assert registry.advertise(
+                thread_id, supervisor_id, [decision['interrupt_id']],
+            )
+            assert registry.offer(thread_id, decision)
+            assert registry.commit(thread_id, decision)
+
+            # Consume synchronously before call_soon_threadsafe(wakeup.set)
+            # executes, then let that now-stale callback run.
+            assert registry.drain(thread_id, supervisor_id) == [decision]
+            await asyncio.sleep(0)
+
+            supervisor = registry._mailboxes[thread_id].supervisors[
+                supervisor_id
+            ]
+            assert supervisor.wakeup.is_set()
+            assert registry.drain(thread_id, supervisor_id) == []
+            assert not supervisor.wakeup.is_set()
+        finally:
+            registry.unregister(thread_id)
+
+    asyncio.run(scenario())

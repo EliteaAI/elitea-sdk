@@ -262,11 +262,17 @@ def drain(thread_id: str, supervisor_id: Optional[str] = None) -> List[dict]:
     with _lock:
         mailbox = _mailboxes.get(thread_id)
         supervisor = _resolve_supervisor(mailbox, supervisor_id)
-        if supervisor is None or not supervisor.commits:
+        if supervisor is None:
+            return []
+        # commit() wakes through call_soon_threadsafe().  A same-loop consumer
+        # can drain the commit before that callback runs, leaving a stale set
+        # event that makes wait() spin without yielding.  Clear every observed
+        # notification, including notifications whose commit was already read.
+        supervisor.wakeup.clear()
+        if not supervisor.commits:
             return []
         values = list(supervisor.commits.values())
         supervisor.commits.clear()
-        supervisor.wakeup.clear()
         return values
 
 
