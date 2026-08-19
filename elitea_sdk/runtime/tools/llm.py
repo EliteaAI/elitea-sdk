@@ -3127,12 +3127,13 @@ class LLMNode(BaseTool):
             try:
                 while running or paused_entries:
                     # Worker teardown removes the live mailbox and wakes this
-                    # coroutine.  Return the still-paused entries through the
-                    # normal durable aggregate below so a later worker can
-                    # reconstruct the exact leaves from their checkpoints.
-                    if paused_entries and not decision_registry.is_active(
-                        root_thread_id
-                    ):
+                    # coroutine.  Let siblings that are still running settle
+                    # before building the durable aggregate; breaking on the
+                    # first paused child made the visible card set depend on
+                    # asyncio scheduling.  With no live mailbox, wait only for
+                    # running children, never for an unreachable decision.
+                    mailbox_active = decision_registry.is_active(root_thread_id)
+                    if paused_entries and not mailbox_active and not running:
                         break
                     queued = decision_registry.drain(
                         root_thread_id, supervisor_id,
@@ -3141,7 +3142,7 @@ class LLMNode(BaseTool):
                         continue
 
                     wait_set = set(running)
-                    if paused_entries:
+                    if paused_entries and mailbox_active:
                         # A supervisor is a coroutine inside the worker's existing
                         # process, not a parked process per child.  Keep it alive
                         # even when EVERY child is paused so a later decision can

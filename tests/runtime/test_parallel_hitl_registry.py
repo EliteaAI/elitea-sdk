@@ -157,7 +157,20 @@ def test_unregister_wakes_fully_paused_supervisor_for_durable_fallback():
     asyncio.run(scenario())
 
 
-def test_drain_clears_delayed_notification_after_commit_was_consumed():
+def test_wait_clears_delayed_notification_after_commit_was_consumed():
+    class WaitSettled(Exception):
+        pass
+
+    class ObservableEvent(asyncio.Event):
+        calls = 0
+
+        async def wait(self):
+            self.calls += 1
+            if self.calls == 2:
+                assert not self.is_set()
+                raise WaitSettled
+            return await super().wait()
+
     async def scenario():
         thread_id = 'registry-delayed-wakeup-root'
         decision = {
@@ -169,6 +182,10 @@ def test_drain_clears_delayed_notification_after_commit_was_consumed():
             supervisor_id = registry.attach(
                 thread_id, asyncio.get_running_loop(),
             )
+            supervisor = registry._mailboxes[thread_id].supervisors[
+                supervisor_id
+            ]
+            supervisor.wakeup = ObservableEvent()
             assert registry.advertise(
                 thread_id, supervisor_id, [decision['interrupt_id']],
             )
@@ -180,12 +197,13 @@ def test_drain_clears_delayed_notification_after_commit_was_consumed():
             assert registry.drain(thread_id, supervisor_id) == [decision]
             await asyncio.sleep(0)
 
-            supervisor = registry._mailboxes[thread_id].supervisors[
-                supervisor_id
-            ]
             assert supervisor.wakeup.is_set()
-            assert registry.drain(thread_id, supervisor_id) == []
-            assert not supervisor.wakeup.is_set()
+            try:
+                await registry.wait(thread_id, supervisor_id)
+            except WaitSettled:
+                pass
+            else:
+                raise AssertionError('wait did not re-enter the parked state')
         finally:
             registry.unregister(thread_id)
 
