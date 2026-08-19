@@ -115,9 +115,17 @@ class EliteAClient:
         self.s3_url = f"{self.base_url}/artifacts/s3"
         self.model_timeout = kwargs.get('model_timeout', 120)
         self.model_image_generation = kwargs.get('model_image_generation')
+        # (connect, read) — bounds every outbound call below so a stalled
+        # endpoint raises instead of parking the worker forever (#6246).
+        self.timeout = kwargs.get('timeout', (5, 30))
+        self._session = requests.Session()
+
+    def _request(self, method: str, url: str, **kwargs):
+        kwargs.setdefault('timeout', self.timeout)
+        return self._session.request(method, url, **kwargs)
 
     def get_mcp_toolkits(self):
-        data = requests.get(self.mcp_tools_list, headers=self.headers, verify=False).json()
+        data = self._request('get', self.mcp_tools_list, headers=self.headers, verify=False).json()
         return data
 
     def mcp_tool_call(self, params: dict[str, Any]):
@@ -133,7 +141,7 @@ class EliteAClient:
             elif hasattr(arg_value, "dict") and callable(arg_value.dict):
                 params['params']['arguments'][arg_name] = arg_value.dict()
         #
-        response = requests.post(self.mcp_tools_call, headers=self.headers, json=params, verify=False)
+        response = self._request('post', self.mcp_tools_call, headers=self.headers, json=params, verify=False)
         try:
             return response.json()
         except (ValueError, TypeError):
@@ -141,7 +149,7 @@ class EliteAClient:
 
     def get_app_details(self, application_id: int, version_name: Optional[str] = None):
         url = f"{self.app}/{application_id}" if version_name is None else f"{self.app}/{application_id}/{version_name}"
-        data = requests.get(url, headers=self.headers, verify=False).json()
+        data = self._request('get', url, headers=self.headers, verify=False).json()
         return data
 
 
@@ -167,8 +175,8 @@ class EliteAClient:
         if version_name:
             url = f"{url}/{version_name}"
 
-        resp = requests.get(
-            url, headers=self.headers, params={'runtime': 'true'}, verify=False,
+        resp = self._request(
+            'get', url, headers=self.headers, params={'runtime': 'true'}, verify=False,
         )
         if resp.ok:
             data = resp.json()
@@ -184,7 +192,7 @@ class EliteAClient:
 
     def toolkit(self, toolkit_id: int):
         url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool/prompt_lib/{self.project_id}/{toolkit_id}"
-        response = requests.get(url, headers=self.headers, verify=False)
+        response = self._request('get', url, headers=self.headers, verify=False)
         if not response.ok:
             raise ValueError(f"Failed to fetch toolkit {toolkit_id}: {response.text}")
         
@@ -203,7 +211,7 @@ class EliteAClient:
 
         while total_count is None or offset < total_count:
             params = {'offset': offset, 'limit': limit}
-            resp = requests.get(self.list_apps_url, headers=self.headers, params=params, verify=False)
+            resp = self._request('get', self.list_apps_url, headers=self.headers, params=params, verify=False)
 
             if resp.ok:
                 data = resp.json()
@@ -222,7 +230,7 @@ class EliteAClient:
             List of model dictionaries with 'name' and other properties,
             or empty list if request fails.
         """
-        resp = requests.get(self.models_url, headers=self.headers, verify=False)
+        resp = self._request('get', self.models_url, headers=self.headers, verify=False)
         if resp.ok:
             data = resp.json()
             # API returns {"items": [...], ...}
@@ -583,7 +591,7 @@ class EliteAClient:
         # over the first candidate. Falling back to low_tier_models[0] here selects the
         # alphabetically-first low_tier model, which ignores the configured default.
         selected_model = None
-        resp = requests.get(self.models_url, headers=self.headers, verify=False)
+        resp = self._request('get', self.models_url, headers=self.headers, verify=False)
         if resp.ok:
             data = resp.json()
             default_name = data.get('low_tier_default_model_name')
@@ -661,7 +669,8 @@ class EliteAClient:
         logger.info(f"Generating image with model: {self.model_image_generation}, prompt: {prompt[:50]}...")
 
         try:
-            response = requests.post(
+            response = self._request(
+                'post',
                 self.image_generation_url,
                 headers=image_headers,
                 json=image_generation_data,
@@ -681,7 +690,7 @@ class EliteAClient:
     def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
         """Get application version details for the client's project."""
         url = f"{self.application_versions}/{application_id}/{application_version_id}"
-        resp = requests.patch(url, headers=self.headers, verify=False)
+        resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         logger.error(f"Failed to fetch application version details: {resp.status_code} - {resp.text}."
@@ -691,7 +700,7 @@ class EliteAClient:
     def unsecret(self, secret_name: str):
         from elitea_sdk.runtime.utils.logging import mask_sensitive_value
         url = f"{self.secrets_url}/{secret_name}"
-        data = requests.get(url, headers=self.headers, verify=False).json()
+        data = self._request('get', url, headers=self.headers, verify=False).json()
         logger.debug(f"Unsecret response for '{secret_name}': value={mask_sensitive_value(data.get('value', ''))}")
         return data.get('value', None)
 
@@ -939,7 +948,7 @@ class EliteAClient:
     def bucket_exists(self, bucket_name):
         try:
             resp = self._process_requst(
-                requests.get(f'{self.bucket_url}', headers=self.headers, verify=False)
+                self._request('get', f'{self.bucket_url}', headers=self.headers, verify=False)
             )
             for each in resp.get('rows', []):
                 if each['name'] == bucket_name:
@@ -954,13 +963,13 @@ class EliteAClient:
             "expiration_measure": expiration_measure,
             "expiration_value": expiration_value
         }
-        resp = requests.post(f'{self.bucket_url}', headers=self.headers, json=post_data, verify=False)
+        resp = self._request('post', f'{self.bucket_url}', headers=self.headers, json=post_data, verify=False)
         return self._process_requst(resp)
 
     def list_artifacts(self, bucket_name: str):
         # Ensure bucket name is lowercase as required by the API
         url = f'{self.artifacts_url}/{bucket_name.lower()}'
-        data = requests.get(url, headers=self.headers, verify=False)
+        data = self._request('get', url, headers=self.headers, verify=False)
         return self._process_requst(data)
 
     def create_artifact(self, bucket_name, artifact_name, artifact_data, source: str = 'generated', prompt: str = None):
@@ -973,9 +982,9 @@ class EliteAClient:
         form_data = {'source': source}
         if prompt:
             form_data['prompt'] = prompt
-        data = requests.post(url, headers=self.headers, files={
+        data = self._request('post', url, headers=self.headers, files={
             'file': (sanitized_name, artifact_data)
-        }, data=form_data, verify=False)
+        }, data=form_data, verify=False, timeout=(5, 120))
         return self._process_requst(data)
     
     @staticmethod
@@ -1043,7 +1052,7 @@ class EliteAClient:
 
     def download_artifact(self, bucket_name, artifact_name):
         url = f'{self.artifact_url}/{bucket_name.lower()}/{artifact_name}'
-        data = requests.get(url, headers=self.headers, verify=False)
+        data = self._request('get', url, headers=self.headers, verify=False, timeout=(5, 120))
         if data.status_code == 403:
             return {"error": "You are not authorized to access this resource"}
         elif data.status_code == 404:
@@ -1057,7 +1066,7 @@ class EliteAClient:
 
     def delete_artifact(self, bucket_name, artifact_name):
         url = f'{self.artifact_url}/{bucket_name}'
-        data = requests.delete(url, headers=self.headers, verify=False, params={'filename': quote(artifact_name)})
+        data = self._request('delete', url, headers=self.headers, verify=False, params={'filename': quote(artifact_name)})
         return self._process_requst(data)
 
     # =========================================================================
@@ -1116,8 +1125,8 @@ class EliteAClient:
         if delimiter:
             params["delimiter"] = delimiter
         
-        response = requests.get(url, headers=self.headers, params=params, verify=False)
-        
+        response = self._request('get', url, headers=self.headers, params=params, verify=False)
+
         if response.status_code >= 400:
             return self._handle_s3_error(response, bucket=bucket_name)
         
@@ -1153,8 +1162,8 @@ class EliteAClient:
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(sanitized_key, safe='/')}"
         headers = {**self.headers, 'Content-Type': content_type}
         
-        response = requests.put(url, headers=headers, data=data,
-                               params=self._s3_params(), verify=False)
+        response = self._request('put', url, headers=headers, data=data,
+                               params=self._s3_params(), verify=False, timeout=(5, 120))
         
         if response.status_code >= 400:
             return self._handle_s3_error(response, bucket=bucket_name, key=sanitized_key)
@@ -1181,12 +1190,12 @@ class EliteAClient:
         """
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(key, safe='/')}"
         
-        response = requests.get(url, headers=self.headers,
-                               params=self._s3_params(), verify=False)
-        
+        response = self._request('get', url, headers=self.headers,
+                               params=self._s3_params(), verify=False, timeout=(5, 120))
+
         if response.status_code >= 400:
             return self._handle_s3_error(response, bucket=bucket_name, key=key)
-        
+
         return response.content
     
     def delete_artifact_s3(self, bucket_name: str, key: str) -> dict:
@@ -1201,7 +1210,7 @@ class EliteAClient:
         """
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(key, safe='/')}"
         
-        response = requests.delete(url, headers=self.headers,
+        response = self._request('delete', url, headers=self.headers,
                                   params=self._s3_params(), verify=False)
         
         if response.status_code >= 400:
@@ -1222,7 +1231,7 @@ class EliteAClient:
         """
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(key, safe='/')}"
         
-        response = requests.head(url, headers=self.headers,
+        response = self._request('head', url, headers=self.headers,
                                 params=self._s3_params(), verify=False)
         
         if response.status_code == 404:

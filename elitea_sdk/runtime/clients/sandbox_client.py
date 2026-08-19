@@ -241,9 +241,17 @@ class SandboxClient:
         self.s3_url = f'{self.base_url}/artifacts/s3'
         self.auth_user_url = f'{self.base_url}{self.api_v2_path}/auth/user'
         self.model_timeout = kwargs.get('model_timeout', 120)
+        # (connect, read) — bounds every outbound call below so a stalled
+        # endpoint raises instead of parking the worker forever (#6246).
+        self.timeout = kwargs.get('timeout', (5, 30))
+        self._session = requests.Session()
+
+    def _request(self, method: str, url: str, **kwargs):
+        kwargs.setdefault('timeout', self.timeout)
+        return self._session.request(method, url, **kwargs)
 
     def get_mcp_toolkits(self):
-        data = requests.get(self.mcp_tools_list, headers=self.headers, verify=False).json()
+        data = self._request('get', self.mcp_tools_list, headers=self.headers, verify=False).json()
         return data
 
     def mcp_tool_call(self, params: dict[str, Any]):
@@ -255,7 +263,7 @@ class SandboxClient:
                 ]
             elif hasattr(arg_value, 'dict') and callable(arg_value.dict):
                 params['params']['arguments'][arg_name] = arg_value.dict()
-        response = requests.post(self.mcp_tools_call, headers=self.headers, json=params, verify=False)
+        response = self._request('post', self.mcp_tools_call, headers=self.headers, json=params, verify=False)
         try:
             return response.json()
         except (ValueError, TypeError):
@@ -263,7 +271,7 @@ class SandboxClient:
 
     def get_app_details(self, application_id: int):
         url = f'{self.app}/{application_id}'
-        data = requests.get(url, headers=self.headers, verify=False).json()
+        data = self._request('get', url, headers=self.headers, verify=False).json()
         return data
 
     def get_list_of_apps(self):
@@ -274,7 +282,7 @@ class SandboxClient:
 
         while total_count is None or offset < total_count:
             params = {'offset': offset, 'limit': limit}
-            resp = requests.get(self.list_apps_url, headers=self.headers, params=params, verify=False)
+            resp = self._request('get', self.list_apps_url, headers=self.headers, params=params, verify=False)
 
             if resp.ok:
                 data = resp.json()
@@ -288,7 +296,7 @@ class SandboxClient:
 
     def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
         url = f'{self.application_versions}/{application_id}/{application_version_id}'
-        resp = requests.patch(url, headers=self.headers, verify=False)
+        resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         logger.error(f'Failed to fetch application version details: {resp.status_code} - {resp.text}.'
@@ -298,7 +306,7 @@ class SandboxClient:
 
     def get_user_data(self) -> Dict[str, Any]:
         """Fetch the currently authenticated user's data."""
-        resp = requests.get(self.auth_user_url, headers=self.headers, verify=False)
+        resp = self._request('get', self.auth_user_url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
         logger.error(f'Failed to fetch user data: {resp.status_code} - {resp.text}')
@@ -306,7 +314,7 @@ class SandboxClient:
 
     def unsecret(self, secret_name: str):
         url = f'{self.secrets_url}/{secret_name}'
-        data = requests.get(url, headers=self.headers, verify=False).json()
+        data = self._request('get', url, headers=self.headers, verify=False).json()
         value = data.get('value', None)
         logger.debug(f"Unsecret '{secret_name}': has_value={value is not None}")
         return value
@@ -330,7 +338,7 @@ class SandboxClient:
     def bucket_exists(self, bucket_name):
         try:
             resp = self._process_requst(
-                requests.get(f'{self.bucket_url}', headers=self.headers, verify=False)
+                self._request('get', f'{self.bucket_url}', headers=self.headers, verify=False)
             )
             for each in resp.get('rows', []):
                 if each['name'] == bucket_name:
@@ -345,25 +353,25 @@ class SandboxClient:
             'expiration_measure': expiration_measure,
             'expiration_value': expiration_value
         }
-        resp = requests.post(f'{self.bucket_url}', headers=self.headers, json=post_data, verify=False)
+        resp = self._request('post', f'{self.bucket_url}', headers=self.headers, json=post_data, verify=False)
         return self._process_requst(resp)
 
     def list_artifacts(self, bucket_name: str):
         # Ensure bucket name is lowercase as required by the API
         url = f'{self.artifacts_url}/{bucket_name.lower()}'
-        data = requests.get(url, headers=self.headers, verify=False)
+        data = self._request('get', url, headers=self.headers, verify=False)
         return self._process_requst(data)
 
     def create_artifact(self, bucket_name, artifact_name, artifact_data):
         url = f'{self.artifacts_url}/{bucket_name.lower()}'
-        data = requests.post(url, headers=self.headers, files={
+        data = self._request('post', url, headers=self.headers, files={
             'file': (artifact_name, artifact_data)
-        }, verify=False)
+        }, verify=False, timeout=(5, 120))
         return self._process_requst(data)
 
     def download_artifact(self, bucket_name, artifact_name):
         url = f'{self.artifact_url}/{bucket_name.lower()}/{artifact_name}'
-        data = requests.get(url, headers=self.headers, verify=False)
+        data = self._request('get', url, headers=self.headers, verify=False, timeout=(5, 120))
         if data.status_code == 403:
             return {'error': 'You are not authorized to access this resource'}
         elif data.status_code == 404:
@@ -377,7 +385,7 @@ class SandboxClient:
 
     def delete_artifact(self, bucket_name, artifact_name):
         url = f'{self.artifact_url}/{bucket_name}'
-        data = requests.delete(url, headers=self.headers, verify=False, params={'filename': quote(artifact_name)})
+        data = self._request('delete', url, headers=self.headers, verify=False, params={'filename': quote(artifact_name)})
         return self._process_requst(data)
 
     # =========================================================================
@@ -490,7 +498,7 @@ class SandboxClient:
         if delimiter:
             params["delimiter"] = delimiter
 
-        response = requests.get(url, headers=self.headers, params=params, verify=False)
+        response = self._request('get', url, headers=self.headers, params=params, verify=False)
 
         if response.status_code >= 400:
             return self._handle_s3_error(response, bucket=bucket_name)
@@ -524,8 +532,8 @@ class SandboxClient:
         if content_type:
             headers['Content-Type'] = content_type
 
-        response = requests.put(url, headers=headers, data=data,
-                               params=self._s3_params(), verify=False)
+        response = self._request('put', url, headers=headers, data=data,
+                               params=self._s3_params(), verify=False, timeout=(5, 120))
 
         if response.status_code >= 400:
             return self._handle_s3_error(response, bucket=bucket_name, key=sanitized_key)
@@ -552,8 +560,8 @@ class SandboxClient:
         """
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(key, safe='/')}"
 
-        response = requests.get(url, headers=self.headers,
-                               params=self._s3_params(), verify=False)
+        response = self._request('get', url, headers=self.headers,
+                               params=self._s3_params(), verify=False, timeout=(5, 120))
 
         if response.status_code >= 400:
             return self._handle_s3_error(response, bucket=bucket_name, key=key)
@@ -572,7 +580,7 @@ class SandboxClient:
         """
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(key, safe='/')}"
 
-        response = requests.delete(url, headers=self.headers,
+        response = self._request('delete', url, headers=self.headers,
                                   params=self._s3_params(), verify=False)
 
         if response.status_code >= 400:
@@ -593,7 +601,7 @@ class SandboxClient:
         """
         url = f"{self.s3_url}/{bucket_name.lower()}/{quote(key, safe='/')}"
 
-        response = requests.head(url, headers=self.headers,
+        response = self._request('head', url, headers=self.headers,
                                 params=self._s3_params(), verify=False)
 
         if response.status_code == 404:
