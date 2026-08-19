@@ -203,7 +203,7 @@ jobs:
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE:${PYTHONPATH}" >> $GITHUB_ENV
 
       - name: Ensure pytest is available
-        run: python -m pip install -q pytest && python -m pytest --version
+        run: python -m pip install -q pytest pytest-timeout && python -m pytest --version
 
       - name: Install deepeval for document loader tests
         run: python -m pip install --no-cache-dir "deepeval>=3.4.6"
@@ -218,6 +218,8 @@ jobs:
             --ignore=tests/runtime/test_elitea_llm.py \
             --ignore=tests/runtime/langchain/document_loaders \
             --ignore=tests/tools/index \
+            --timeout=60 \
+            --timeout-method=thread \
             --junit-xml=tests/reports/unit-test-results.xml
 
       - name: Upload unit test results

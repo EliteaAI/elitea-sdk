@@ -285,3 +285,8 @@ async def wait(
         if wakeup is None:
             return []
         await wakeup.wait()
+        # Consume the notification even when its commit was synchronously
+        # drained before call_soon_threadsafe(wakeup.set) ran.  Otherwise that
+        # delayed callback leaves the event permanently set and this loop spins
+        # without yielding while the mailbox is empty.
+        wakeup.clear()
