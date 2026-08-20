@@ -24,6 +24,8 @@ from urllib.parse import quote, unquote, urlparse, parse_qs
 import requests
 from langchain_core.tools import ToolException
 
+from ...runtime.utils.mcp_oauth import McpAuthorizationRequired
+
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content, parse_content_from_bytes
@@ -78,7 +80,11 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                  refresh_token: Optional[str] = None,
                  client_id: Optional[str] = None,
                  client_secret: Optional[str] = None,
-                 oauth_token_endpoint: Optional[str] = None):
+                 oauth_token_endpoint: Optional[str] = None,
+                 oauth_discovery_endpoint: Optional[str] = None,
+                 configuration_uuid: Optional[str] = None,
+                 toolkit_id: Optional[int] = None,
+                 toolkit_name: Optional[str] = None):
         self.site_url = site_url.rstrip('/')
         self._token = token
         self._scopes = scopes
@@ -88,6 +94,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         self._client_id = client_id
         self._client_secret = client_secret
         self._oauth_token_endpoint = oauth_token_endpoint
+        self._oauth_discovery_endpoint = oauth_discovery_endpoint
+        self._configuration_uuid = configuration_uuid
+        self._toolkit_id = toolkit_id
+        self._toolkit_name = toolkit_name
         # Lazily resolved and cached
         self.__site_id: Optional[str] = None
         self.__drive_id: Optional[str] = None
@@ -108,12 +118,43 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             "Content-Type": content_type,
         }
 
-    @staticmethod
-    def _raise_with_body(resp: "requests.Response") -> None:
+    def _raise_authorization_required(self, resp: "requests.Response") -> None:
+        """Turn a rejected delegated token into the standard durable auth signal."""
+        if not self._oauth_discovery_endpoint:
+            resp.raise_for_status()
+            return
+
+        from ...configurations.sharepoint import SharepointConfiguration
+
+        api_message = SharepointConfiguration._extract_api_error_message(resp)
+
+        auth_error = SharepointConfiguration._build_mcp_authorization_required(
+            message=(
+                f"SharePoint delegated access token is invalid or expired: {api_message}. "
+                "Please re-authorize to continue."
+            ),
+            site_url=self.site_url,
+            oauth_discovery_endpoint=self._oauth_discovery_endpoint,
+            scopes=self._scopes,
+            status=resp.status_code,
+            configuration_uuid=self._configuration_uuid,
+            toolkit_id=self._toolkit_id,
+            toolkit_name=self._toolkit_name,
+            client_id=self._client_id,
+            client_secret=self._client_secret,
+        )
+        # The LLM tool runner knows the exact leaf tool from BaseAction metadata.
+        # Let it supply that name instead of presenting the SharePoint site URL.
+        auth_error.tool_name = None
+        raise auth_error
+
+    def _raise_with_body(self, resp: "requests.Response") -> None:
         """Call raise_for_status() and include the Graph API response body in the
         exception message so callers can log the actual error code."""
         if resp.ok:
             return
+        if resp.status_code == 401:
+            self._raise_authorization_required(resp)
         try:
             body = resp.json()
         except Exception:
@@ -182,6 +223,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if resp.status_code == 401 and self._try_refresh_token():
             headers['Authorization'] = f"Bearer {self._token}"
             resp = requests.get(url, headers=headers, **kwargs)
+        if resp.status_code == 401:
+            self._raise_authorization_required(resp)
         return resp
 
     def _post(self, url: str, payload: dict) -> dict:
@@ -574,7 +617,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 data=file_bytes,
                 timeout=120,
             )
-        resp.raise_for_status()
+        self._raise_with_body(resp)
         return resp.json()
 
     def _upload_large_file(
@@ -605,7 +648,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             if chunk_resp.status_code == 401 and self._try_refresh_token():
                 chunk_headers["Authorization"] = f"Bearer {self._token}"
                 chunk_resp = requests.put(upload_url, headers=chunk_headers, data=chunk, timeout=120)
-            chunk_resp.raise_for_status()
+            self._raise_with_body(chunk_resp)
             if chunk_resp.status_code in (200, 201):
                 result = chunk_resp.json()
             offset += len(chunk)
@@ -1158,7 +1201,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 f"{self._onenote_prefix}/pages/{page_id}/content",
                 timeout=60,
             )
-            resp.raise_for_status()
+            self._raise_with_body(resp)
             return resp.content.decode("utf-8")
         except ToolException:
             raise
@@ -1360,7 +1403,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     f"Graph API returned {resp.status_code} when downloading "
                     f"attachment '{attachment_name}'."
                 )
-            resp.raise_for_status()
+            self._raise_with_body(resp)
             return resp.content
         except ToolException:
             raise
@@ -1453,6 +1496,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 if isinstance(result, str) and result.strip():
                     description = f"[image description: {result.strip()}]"
             return description, img_bytes, filename
+        except McpAuthorizationRequired:
+            raise
         except Exception as img_exc:
             logging.warning("Could not process OneNote image '%s': %s", src, img_exc)
             return description, None, f"image_{resource_id}.jpg"
@@ -1493,6 +1538,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     contents[placeholder] = (
                         parsed if parsed and not parsed.startswith("[attachment") else None
                     )
+                except McpAuthorizationRequired:
+                    raise
                 except Exception as att_exc:
                     logging.warning(
                         "Could not process OneNote attachment '%s': %s", fname, att_exc
@@ -1882,7 +1929,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             if resp.status_code == 401 and self._try_refresh_token():
                 onenote_headers["Authorization"] = f"Bearer {self._token}"
                 resp = requests.post(url, headers=onenote_headers, data=html_content.encode("utf-8"), timeout=60)
-            resp.raise_for_status()
+            self._raise_with_body(resp)
             result = resp.json()
             return {
                 "id": result.get("id"),
@@ -1918,7 +1965,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             resp = requests.patch(url, headers=self._auth_headers("application/json"), json=patch_commands, timeout=60)
             if resp.status_code == 401 and self._try_refresh_token():
                 resp = requests.patch(url, headers=self._auth_headers("application/json"), json=patch_commands, timeout=60)
-            resp.raise_for_status()
+            self._raise_with_body(resp)
             return (
                 f"OneNote page '{page_id}' updated successfully with "
                 f"{len(patch_commands)} patch command(s)."
