@@ -26,20 +26,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
-Status = Literal["success", "error"]
-
-
-@dataclasses.dataclass(kw_only=True)
-class CodeExecutionResult:
-    """Container for code execution results."""
-
-    result: Any = None
-    stdout: str | None = None
-    stderr: str | None = None
-    status: Status
-    execution_time: float
-    session_metadata: dict | None = None
-    session_bytes: bytes | None = None
+from .sandbox_types import CodeExecutionResult, Status  # noqa: E402
 
 
 def get_default_pkg_name() -> str | None:
