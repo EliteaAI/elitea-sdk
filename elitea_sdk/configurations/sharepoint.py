@@ -144,6 +144,10 @@ class SharepointConfiguration(BaseModel):
         status: Optional[int] = None,
         configuration_uuid: Optional[str] = None,
         auto_refresh_token: bool = False,
+        toolkit_id: Optional[int] = None,
+        toolkit_name: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[SecretStr | str] = None,
     ) -> "McpAuthorizationRequired":
         """Build a ``McpAuthorizationRequired`` exception with the same rich metadata
         shape that the MCP OAuth flow produces, so upstream handlers can treat
@@ -231,8 +235,28 @@ class SharepointConfiguration(BaseModel):
             resource_metadata["scopes_supported"] = effective_scopes
         if configuration_uuid:
             resource_metadata["configuration_uuid"] = configuration_uuid
+        if toolkit_id is not None:
+            resource_metadata["toolkit_id"] = toolkit_id
+
+        provided_settings: Dict = {}
+        if client_id:
+            provided_settings["mcp_client_id"] = client_id
+        if client_secret:
+            secret_value = (
+                client_secret.get_secret_value()
+                if hasattr(client_secret, "get_secret_value")
+                else str(client_secret)
+            )
+            if secret_value:
+                from ..runtime.utils.utils import mask_secret
+
+                provided_settings["mcp_client_secret"] = mask_secret(secret_value)
+        if effective_scopes:
+            provided_settings["scopes"] = effective_scopes
+        if provided_settings:
+            resource_metadata["provided_settings"] = provided_settings
         log.debug(f"SharePoint resource_metadata (keys): {sorted(resource_metadata.keys())}")
-        return McpAuthorizationRequired(
+        auth_error = McpAuthorizationRequired(
             message=message,
             server_url=site_url,
             resource_metadata_url=resource_metadata_url,
@@ -240,7 +264,12 @@ class SharepointConfiguration(BaseModel):
             resource_metadata=resource_metadata,
             status=status,
             tool_name=site_url,
+            toolkit_type="sharepoint",
+            toolkit_name=toolkit_name,
         )
+        if toolkit_id is not None:
+            auth_error.toolkit_id = toolkit_id
+        return auth_error
 
     @staticmethod
     def _call_graph_api(site_url: str, access_token: str, oauth_discovery_endpoint: Optional[str], scopes: Optional[List[str]] = None, configuration_uuid: Optional[str] = None) -> str | None:
