@@ -889,7 +889,7 @@ class EliteAClient:
                         llm=self.get_low_tier_llm() or llm,
                         return_detailed_errors=False
                     ),
-                    LoggingStrategy(callbacks=[])
+                    LoggingStrategy()
                 ],
                 conversation_id=conversation_id
             )
@@ -1333,7 +1333,7 @@ class EliteAClient:
                         llm=self.get_low_tier_llm() or llm,
                         return_detailed_errors=False
                     ),
-                    LoggingStrategy(callbacks=[])
+                    LoggingStrategy()
                 ],
                 conversation_id=conversation_id
             )

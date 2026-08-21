@@ -28,6 +28,9 @@ Usage:
         PlanningMiddleware,
         SummarizationMiddleware,
         ToolExceptionHandlerMiddleware,
+        TransformErrorStrategy,
+        CircuitBreakerStrategy,
+        LoggingStrategy,
         MiddlewareManager
     )
 
@@ -44,10 +47,13 @@ Usage:
         keep=("messages", 10),
     )
 
-    # Create error handler with default strategies (recommended)
-    error_handler = ToolExceptionHandlerMiddleware.create_default(
-        llm=llm,
-        threshold=3
+    # Create error handler with explicit strategies
+    error_handler = ToolExceptionHandlerMiddleware(
+        strategies=[
+            TransformErrorStrategy(llm=llm),
+            CircuitBreakerStrategy(threshold=3),
+            LoggingStrategy(),
+        ]
     )
 
     # Use with MiddlewareManager for multiple middleware

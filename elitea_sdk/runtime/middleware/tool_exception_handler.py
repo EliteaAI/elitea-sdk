@@ -15,18 +15,11 @@ Example:
         LoggingStrategy
     )
 
-    # Using factory method (recommended)
-    middleware = ToolExceptionHandlerMiddleware.create_default(
-        llm=my_llm,
-        threshold=3
-    )
-
-    # Or explicit strategies
     middleware = ToolExceptionHandlerMiddleware(
         strategies=[
-            LoggingStrategy(),
+            TransformErrorStrategy(llm=my_llm),
             CircuitBreakerStrategy(threshold=3),
-            TransformErrorStrategy(llm=my_llm, use_llm=True)
+            LoggingStrategy()
         ]
     )
 """
@@ -38,7 +31,6 @@ from typing import List, Optional, Dict, Any, Callable
 from elitea_sdk.runtime.exceptions import budget_exceeded_from
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
-from langchain_core.language_models import BaseChatModel
 from langgraph.errors import GraphBubbleUp
 
 from .base import Middleware
@@ -64,18 +56,11 @@ class ToolExceptionHandlerMiddleware(Middleware):
 
     Example:
         ```python
-        # Using factory method (recommended)
-        middleware = ToolExceptionHandlerMiddleware.create_default(
-            llm=my_llm,
-            threshold=3
-        )
-
-        # Or explicit strategies
         middleware = ToolExceptionHandlerMiddleware(
             strategies=[
-                LoggingStrategy(),
+                TransformErrorStrategy(llm=my_llm),
                 CircuitBreakerStrategy(threshold=3),
-                TransformErrorStrategy(llm=my_llm, use_llm=True)
+                LoggingStrategy()
             ]
         )
 
@@ -106,10 +91,7 @@ class ToolExceptionHandlerMiddleware(Middleware):
         super().__init__(conversation_id, callbacks, **kwargs)
 
         if not strategies:
-            raise ValueError(
-                "At least one strategy is required. "
-                "Use ToolExceptionHandlerMiddleware.create_default() for default configuration."
-            )
+            raise ValueError("At least one strategy is required.")
 
         self.strategies = strategies
         self.excluded_tools = set(excluded_tools or [])
@@ -120,60 +102,6 @@ class ToolExceptionHandlerMiddleware(Middleware):
         logger.debug(
             f"ToolExceptionHandlerMiddleware initialized with {len(strategies)} strategies: "
             f"{[s.__class__.__name__ for s in strategies]}"
-        )
-
-    @classmethod
-    def create_default(
-        cls,
-        llm: Optional[BaseChatModel] = None,
-        threshold: int = 5,
-        use_llm: bool = True,
-        return_detailed_errors: bool = False,
-        conversation_id: Optional[str] = None,
-        callbacks: Optional[Dict[str, Callable]] = None,
-        excluded_tools: Optional[List[str]] = None,
-        **kwargs
-    ) -> "ToolExceptionHandlerMiddleware":
-        """
-        Create middleware with default strategy configuration.
-
-        This factory method provides a convenient way to create middleware
-        with standard logging, circuit breaker, and error transformation strategies.
-
-        Strategy execution order:
-        1. TransformErrorStrategy - Generates human-readable error messages (runs first)
-        2. CircuitBreakerStrategy - Checks failure threshold
-        3. LoggingStrategy - Logs both original and transformed errors (runs last)
-
-        Args:
-            llm: LLM instance for generating human-readable error messages
-            threshold: Number of consecutive failures before opening circuit breaker
-            use_llm: Whether to use LLM for error transformation
-            return_detailed_errors: Include stack traces in error messages (debug mode)
-            conversation_id: Conversation ID for state tracking
-            callbacks: Optional dict of callback functions for events
-            excluded_tools: List of tool names to not wrap with error handling
-            **kwargs: Additional arguments passed to middleware
-
-        Returns:
-            Configured ToolExceptionHandlerMiddleware instance
-        """
-        strategies = [
-            TransformErrorStrategy(
-                llm=llm,
-                use_llm=use_llm,
-                return_detailed_errors=return_detailed_errors
-            ),
-            CircuitBreakerStrategy(threshold=threshold, callbacks=callbacks),
-            LoggingStrategy(callbacks=callbacks),
-        ]
-
-        return cls(
-            strategies=strategies,
-            conversation_id=conversation_id,
-            callbacks=callbacks,
-            excluded_tools=excluded_tools,
-            **kwargs
         )
 
     def get_tools(self) -> List[BaseTool]:
