@@ -1208,8 +1208,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 branch=self.active_branch,
                 commit_message=f"Update {file_path}",
             )
-        except ToolException as e:
-            return str(e)
+        except ToolException:
+            raise
         except Exception as e:
             msg = f"Unable to update file due to error:\n{str(e)}"
             logger.error(msg)

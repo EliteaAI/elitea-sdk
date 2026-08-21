@@ -485,8 +485,8 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         try:
             commit_message = f"Update {file_path}"
             return self.edit_file(file_path=file_path, file_query=update_query, branch=branch, commit_message=commit_message)
-        except ToolException as e:
-            return str(e)
+        except ToolException:
+            raise
         except Exception as e:
             raise ToolException(f"Unable to update file due to error: {str(e)}")
         finally:
