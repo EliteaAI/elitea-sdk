@@ -95,17 +95,13 @@ class TestGetSuitesErrorPaths:
         """get_suites keeps its existing empty-result contract (ToolException)."""
         wrapper._client.suites.get_suites.return_value = []
 
-        result = wrapper.get_suites(project_id="10")
-
-        assert isinstance(result, ToolException)
-        assert "No test suites found" in str(result)
+        with pytest.raises(ToolException, match="No test suites found"):
+            wrapper.get_suites(project_id="10")
 
     def test_status_code_error_is_wrapped(self, wrapper):
         wrapper._client.suites.get_suites.side_effect = StatusCodeError(
             400, "GET", "url", b'{"error": "bad"}'
         )
 
-        result = wrapper.get_suites(project_id="999")
-
-        assert isinstance(result, ToolException)
-        assert "Unable to extract test suites" in str(result)
+        with pytest.raises(ToolException, match="Unable to extract test suites"):
+            wrapper.get_suites(project_id="999")

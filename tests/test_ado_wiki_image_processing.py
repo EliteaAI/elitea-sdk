@@ -96,12 +96,13 @@ class TestProcessImagesAttachmentClassification:
         assert result == "![screen.png](A screenshot of the login page)"
         stub.process_attachment.assert_called_once()
 
-    def test_tool_exception_return_is_not_spliced_into_markdown(self):
-        """Regression: `parse_file_content` returns `ToolException` instead of
-        raising. The old code spliced its str() into the page markdown; the fix
-        must detect the ToolException instance and skip the substitution."""
+    def test_tool_exception_raise_is_not_spliced_into_markdown(self):
+        """Regression: `parse_file_content` raises `ToolException` on failure.
+        The old code spliced its str() into the page markdown; the fix must
+        catch the exception and skip the substitution."""
         err = ToolException("Not supported type of files entered. ...")
-        stub = _make_stub_wrapper(process_attachment_return=err)
+        stub = _make_stub_wrapper(process_attachment_return="unused")
+        stub.process_attachment = MagicMock(side_effect=err)
         content = "![screen.png](/.attachments/xyz.png)"
 
         result = AzureDevOpsApiWrapper._process_images(stub, content, "wiki-1")

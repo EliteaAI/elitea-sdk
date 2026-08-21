@@ -125,7 +125,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             return f"Extracted entities: {names}"
         except Exception as e:
             logger.error(f"Error getting stories: {e}")
-            return ToolException(f"Error getting stories: {e}")
+            raise ToolException(f"Error getting stories: {e}")
 
     @tool_group('read')
     def get_entities(self, entity_type: str = "UserStory", query=None, fetch=True, limit=10):
@@ -136,7 +136,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             return f"Extracted entities: {response.content['QueryResult']['Results'][:limit]}"
         except Exception as e:
             logger.error(f"Error getting stories: {e}")
-            return ToolException(f"Error getting stories: {e}")
+            raise ToolException(f"Error getting stories: {e}")
 
     @tool_group('read')
     def get_project(self, project_name=None):
@@ -149,7 +149,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             return str(response.content['QueryResult']['Results'])
         except Exception as e:
             logger.error(f"Error getting project: {e}")
-            return ToolException(f"Error getting project: {e}")
+            raise ToolException(f"Error getting project: {e}")
 
     @tool_group('read')
     def get_workspace(self, workspace_name=None):
@@ -162,7 +162,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             return str(response.content['QueryResult']['Results'])
         except Exception as e:
             logger.error(f"Error getting workspace: {e}")
-            return ToolException(f"Error getting workspace: {e}")
+            raise ToolException(f"Error getting workspace: {e}")
 
     @tool_group('read')
     def get_user(self, user_name=None):
@@ -182,7 +182,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
                 return "Undefined"
         except Exception as e:
             logger.error(f"Error getting user: {e}")
-            return ToolException(f"Error getting user: {e}")
+            raise ToolException(f"Error getting user: {e}")
 
     @tool_group('read')
     def get_context(self):
@@ -191,7 +191,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
             return f"Project: {self.get_project()}\nWorkspace: {self.get_workspace()}\nUser: {self.get_user()}"
         except Exception as e:
             logger.error(f"Error getting user: {e}")
-            return ToolException(f"Error getting user: {e}")
+            raise ToolException(f"Error getting user: {e}")
 
     @tool_group('write')
     def create_entity(self, entity_json: str, entity_type="HierarchicalRequirement"):
@@ -200,19 +200,19 @@ class RallyApiWrapper(BaseToolApiWrapper):
             # Convert the input JSON to a Python dictionary
             params = json.loads(entity_json)
         except (json.JSONDecodeError, ValueError) as e:
-            return ToolException(f"Issues during attempt to parse artifact_json: {e}")
+            raise ToolException(f"Issues during attempt to parse artifact_json: {e}")
 
         try:
             # Validate that the Rally client is initialized
             if not self._client:
-                return ToolException("Rally client not initialized.")
+                raise ToolException("Rally client not initialized.")
 
             # Use the params to create the artifact
             artifact = self._client.create(entity_type, params)
             return f"Entity {artifact.FormattedID} created successfully."
         except Exception as e:
             logger.error(f"Error creating artifact: {e}")
-            return ToolException(f"Error creating artifact: {e}")
+            raise ToolException(f"Error creating artifact: {e}")
 
     @tool_group('write')
     def update_entity(self, entity_json: str, entity_type: str = None):
@@ -221,23 +221,23 @@ class RallyApiWrapper(BaseToolApiWrapper):
             # Convert the input JSON to a Python dictionary
             params = json.loads(entity_json)
         except (json.JSONDecodeError, ValueError) as e:
-            return ToolException(f"Issues during attempt to parse artifact_json: {e}")
+            raise ToolException(f"Issues during attempt to parse artifact_json: {e}")
 
         if not entity_type:
-            return ToolException(
+            raise ToolException(
                 "Please define entity type ('Story', 'UserStory', 'User Story', etc.). Or you can call tool get_types to get available types.")
 
         try:
             # Validate that the Rally client is initialized
             if not self._client:
-                return ToolException("Rally client not initialized.")
+                raise ToolException("Rally client not initialized.")
 
             # Use the params to update the artifact
             artifact = self._client.update(entity_type, params)
             return f"Artifact {artifact.FormattedID} updated successfully."
         except Exception as e:
             logger.error(f"Error updating artifact: {e}")
-            return ToolException(f"Error updating artifact: {e}")
+            raise ToolException(f"Error updating artifact: {e}")
 
     # list of available tools for a toolkit
     @with_tool_groups

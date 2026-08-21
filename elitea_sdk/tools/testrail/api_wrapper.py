@@ -713,7 +713,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
     def get_cases(
         self, project_id: str, output_format: str = "json", keys: Optional[List[str]] = None,
             suite_id: Optional[str] = None
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """
         Extracts a list of test cases in the specified format: `json`, `csv`, or `markdown`.
 
@@ -747,7 +747,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
             return result
         except StatusCodeError as e:
-            return ToolException(self._format_status_error(e))
+            raise ToolException(self._format_status_error(e))
 
     @tool_group('read')
     def get_cases_by_filter(
@@ -756,7 +756,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         json_case_arguments: Union[str, dict],
         output_format: str = "json",
         keys: Optional[List[str]] = None
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """
         Extracts test cases from a specified project based on given case attributes.
 
@@ -780,7 +780,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             elif isinstance(json_case_arguments, dict):
                 params = json_case_arguments
             else:
-                return ToolException(
+                raise ToolException(
                     "json_case_arguments must be a JSON string or dictionary."
                 )
             self._log_tool_event(message=f"Extract test cases per filter {params}", tool_name='get_cases_by_filter')
@@ -817,9 +817,9 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
 
             return result
         except StatusCodeError as e:
-            return ToolException(self._format_status_error(e))
+            raise ToolException(self._format_status_error(e))
         except (ValueError, json.JSONDecodeError) as e:
-            return ToolException(f"Invalid parameter for json_case_arguments: {e}")
+            raise ToolException(f"Invalid parameter for json_case_arguments: {e}")
 
     @tool_group('write')
     def update_case(self, case_id: str, case_properties: str = "{}"):
@@ -836,7 +836,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         except (json.JSONDecodeError, ValueError) as e:
             raise ToolException(f"Invalid JSON in case_properties: {e}")
         except StatusCodeError as e:
-            return ToolException(f"Unable to update testcase #{case_id} due to {e}")
+            raise ToolException(f"Unable to update testcase #{case_id} due to {e}")
         return f"Test case #{case_id} has been updated at '{updated_case['updated_on']}'" 
 
     @tool_group('delete')
@@ -972,13 +972,13 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             return suites_response if isinstance(suites_response, list) else []
     
     @tool_group('read')
-    def get_suites(self, project_id: str, output_format: str = "json",) -> Union[str, ToolException]:
+    def get_suites(self, project_id: str, output_format: str = "json",) -> str:
         """Extracts a list of test suites for a given project from Testrail"""
         try:
             suites = self._get_raw_suites(project_id)
 
             if not suites:
-                return ToolException("No test suites found for the specified project.")
+                raise ToolException("No test suites found for the specified project.")
 
             suite_fields = [
                 "id", "name", "description", "project_id", "is_baseline",
@@ -987,7 +987,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             suite_dicts = _project_records(suites, suite_fields, "suite", ("completed_on",))
             return self._to_markup(suite_dicts, output_format)
         except StatusCodeError as e:
-            return ToolException(f"Unable to extract test suites: {e}")
+            raise ToolException(f"Unable to extract test suites: {e}")
 
     def _fetch_sections_with_suite_handling(
         self,
@@ -1042,7 +1042,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
     @tool_group('read')
     def get_sections(
         self, project_id: str, suite_id: Optional[str] = None, output_format: str = "json"
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """Extracts a list of sections for a given project from Testrail.
 
         For projects in multiple suite mode (suite_mode 2 or 3), pass a suite_id
@@ -1054,7 +1054,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             )
 
             if not sections:
-                return ToolException("No sections found for the specified project.")
+                raise ToolException("No sections found for the specified project.")
 
             section_fields = [
                 "id", "suite_id", "name", "description", "parent_id", "display_order", "depth",
@@ -1062,7 +1062,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             section_dicts = _project_records(sections, section_fields, "section")
             return self._to_markup(section_dicts, output_format)
         except StatusCodeError as e:
-            return ToolException(self._format_status_error(e))
+            raise ToolException(self._format_status_error(e))
 
     @tool_group('write')
     def add_section(self, project_id: str, name: str, section_properties: Union[str, dict] = "{}"):
@@ -1162,7 +1162,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         return _project_records(runs, run_fields, "run", ("created_on", "completed_on"))
 
     @tool_group('read')
-    def get_run(self, run_id: str, output_format: str = "json") -> Union[str, ToolException]:
+    def get_run(self, run_id: str, output_format: str = "json") -> str:
         """Extracts a single test run from Testrail.
 
         Note: this returns the run's metadata and status counts. For the list of
@@ -1172,15 +1172,15 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             run = self._client.runs.get_run(run_id=int(run_id))
         except (ValueError, TypeError):
-            return ToolException(f"run_id must be numeric, got: {run_id!r}")
+            raise ToolException(f"run_id must be numeric, got: {run_id!r}")
         except StatusCodeError as e:
-            return ToolException(self._format_status_error(e))
+            raise ToolException(self._format_status_error(e))
         return self._to_markup(self._to_run_dicts([run]), output_format)
 
     @tool_group('read')
     def get_runs(
         self, project_id: str, run_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """Extracts a list of test runs for a given project from Testrail.
 
         Only returns test runs that are not part of a test plan. Pass an optional
@@ -1190,7 +1190,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             int(project_id)
         except (ValueError, TypeError):
-            return ToolException(f"project_id must be numeric, got: {project_id!r}")
+            raise ToolException(f"project_id must be numeric, got: {project_id!r}")
 
         try:
             if run_filter is None:
@@ -1200,12 +1200,12 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             elif isinstance(run_filter, dict):
                 params = dict(run_filter)
             else:
-                return ToolException("run_filter must be a JSON string or dictionary.")
+                raise ToolException("run_filter must be a JSON string or dictionary.")
         except (ValueError, json.JSONDecodeError) as e:
-            return ToolException(f"Invalid parameter for run_filter: {e}")
+            raise ToolException(f"Invalid parameter for run_filter: {e}")
 
         if not isinstance(params, dict):
-            return ToolException(
+            raise ToolException(
                 f"run_filter must be a JSON object of filters, got {type(params).__name__}."
             )
 
@@ -1216,7 +1216,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             response = self._client.runs.get_runs(project_id=project_id, **params)
         except StatusCodeError as e:
-            return ToolException(self._format_status_error(e))
+            raise ToolException(self._format_status_error(e))
 
         # Newer testrail_api wraps results in {'runs': [...]}; older returns a bare list.
         runs = response['runs'] if isinstance(response, dict) and 'runs' in response else (
@@ -1233,7 +1233,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         ]
         return _project_records(results, result_fields, "result", ("created_on",))
 
-    def _read_results(self, fetcher, result_filter, output_format) -> Union[str, ToolException]:
+    def _read_results(self, fetcher, result_filter, output_format) -> str:
         """Shared parse/fetch/render path for the get_results* tools.
 
         `fetcher` is a callable taking the parsed filter kwargs and returning the
@@ -1247,12 +1247,12 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             elif isinstance(result_filter, dict):
                 params = dict(result_filter)
             else:
-                return ToolException("result_filter must be a JSON string or dictionary.")
+                raise ToolException("result_filter must be a JSON string or dictionary.")
         except (ValueError, json.JSONDecodeError) as e:
-            return ToolException(f"Invalid parameter for result_filter: {e}")
+            raise ToolException(f"Invalid parameter for result_filter: {e}")
 
         if not isinstance(params, dict):
-            return ToolException(
+            raise ToolException(
                 f"result_filter must be a JSON object of filters, got {type(params).__name__}."
             )
 
@@ -1264,7 +1264,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             response = fetcher(**params)
         except StatusCodeError as e:
-            return ToolException(self._format_status_error(e))
+            raise ToolException(self._format_status_error(e))
 
         results = response['results'] if isinstance(response, dict) and 'results' in response else (
             response if isinstance(response, list) else []
@@ -1274,7 +1274,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
     @tool_group('read')
     def get_results_for_run(
         self, run_id: str, result_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """Extracts all test results for a given test run from Testrail.
 
         Returns every result recorded in the run (auto-paginated). Pass an optional
@@ -1284,7 +1284,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             rid = int(run_id)
         except (ValueError, TypeError):
-            return ToolException(f"run_id must be numeric, got: {run_id!r}")
+            raise ToolException(f"run_id must be numeric, got: {run_id!r}")
         return self._read_results(
             lambda **p: self._client.results.get_results_for_run_bulk(run_id=rid, **p),
             result_filter, output_format,
@@ -1294,7 +1294,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
     def get_results_for_case(
         self, run_id: str, case_id: str, result_filter: Optional[Union[str, dict]] = None,
         output_format: str = "json",
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """Extracts the test results for a run + case combination from Testrail.
 
         A 'test' is the instance of a case within a run; this returns that test's
@@ -1304,7 +1304,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             rid, cid = int(run_id), int(case_id)
         except (ValueError, TypeError):
-            return ToolException(f"run_id and case_id must be numeric, got: run_id={run_id!r}, case_id={case_id!r}")
+            raise ToolException(f"run_id and case_id must be numeric, got: run_id={run_id!r}, case_id={case_id!r}")
         return self._read_results(
             lambda **p: self._client.results.get_results_for_case_bulk(run_id=rid, case_id=cid, **p),
             result_filter, output_format,
@@ -1313,7 +1313,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
     @tool_group('read')
     def get_results(
         self, test_id: str, result_filter: Optional[Union[str, dict]] = None, output_format: str = "json"
-    ) -> Union[str, ToolException]:
+    ) -> str:
         """Extracts the result history for a single test from Testrail.
 
         A 'test' is an instance of a case within a run (list them via get_tests).
@@ -1322,7 +1322,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         try:
             tid = int(test_id)
         except (ValueError, TypeError):
-            return ToolException(f"test_id must be numeric, got: {test_id!r}")
+            raise ToolException(f"test_id must be numeric, got: {test_id!r}")
         return self._read_results(
             lambda **p: self._client.results.get_results_bulk(test_id=tid, **p),
             result_filter, output_format,
@@ -1535,7 +1535,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             str: The data in the specified format.
         """
         if output_format not in {"json", "csv", "markdown"}:
-            return ToolException(
+            raise ToolException(
                 f"Invalid format `{output_format}`. Supported formats: 'json', 'csv', 'markdown'."
             )
 

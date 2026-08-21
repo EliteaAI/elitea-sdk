@@ -269,7 +269,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         try:
             repo_instance = self._get_repo(repository)
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
         try:
             repo_instance.branches.create(
                 {
@@ -281,7 +281,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             if "Branch already exists" in str(e):
                 self._active_branch = branch_name
                 return f"Branch {branch_name} already exists. set it as active"
-            return ToolException(f"Unable to create branch due to error:\n{e}")
+            raise ToolException(f"Unable to create branch due to error:\n{e}")
         self._active_branch = branch_name
         return f"Branch {branch_name} created successfully and set as active"
 
@@ -298,7 +298,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             else:
                 return "No open issues available"
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
     @tool_group('read')
     def get_issue(self, issue_number: int, repository: Optional[str] = None) -> Dict[str, Any]:
@@ -310,7 +310,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             comments = [{"body": comment.body, "user": comment.author["username"]} for comment in issue.notes.list()[:10]]
             return {"title": issue.title, "body": issue.description, "comments": comments}
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
     @tool_group('write')
     def create_pull_request(self, pr_title: str, pr_body: str, branch: str, repository: Optional[str] = None) -> str:
@@ -319,7 +319,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         try:
             repo_instance = self._get_repo(repository)
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
         try:
             pr = repo_instance.mergerequests.create(
@@ -333,7 +333,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             )
             return f"Successfully created PR number {pr.iid}"
         except Exception as e:
-            return ToolException(f"Unable to make pull request due to error:\n{e}")
+            raise ToolException(f"Unable to make pull request due to error:\n{e}")
 
     @tool_group('read')
     def get_pr_changes(self, pr_number:str, repository: Optional[str] = None):
@@ -354,7 +354,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             if e.response_code == 404:
                 raise ToolException(f"Merge request number {pr_number} wasn't found: {e}")
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
     @tool_group('write')
     def comment_on_issue(self, comment_query: str, repository: Optional[str] = None) -> str:
@@ -370,7 +370,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             except Exception as e:
                 return f"Unable to make comment due to error:\n{e}"
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
     @tool_group('write')
     def create_file(self, file_path: str, file_contents: str, branch: str, repository: Optional[str] = None) -> str:
@@ -390,7 +390,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
                 repo_instance.files.create(data)
                 return "Created file " + file_path
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
     @tool_group('read')
     def read_file(self, file_path: str, branch: str, repository: Optional[str] = None,
@@ -406,7 +406,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             file = repo_instance.files.get(file_path, branch)
             full_content = file.decode().decode("utf-8")
         except Exception as e:
-            return ToolException(e)
+            raise ToolException(e)
 
         content = full_content
         if start_line is not None or end_line is not None:
@@ -471,7 +471,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except ToolException:
             raise
         except Exception as e:
-            return ToolException(f"Unable to write file due to error: {str(e)}")
+            raise ToolException(f"Unable to write file due to error: {str(e)}")
 
     @tool_group('write')
     def update_file(self, file_path: str, update_query: str, branch: str, repository: Optional[str] = None) -> str:
@@ -488,7 +488,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         except ToolException as e:
             return str(e)
         except Exception as e:
-            return ToolException(f"Unable to update file due to error: {str(e)}")
+            raise ToolException(f"Unable to update file due to error: {str(e)}")
         finally:
             # Clear temporary context
             try:
@@ -506,7 +506,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             )
             return "Deleted file " + file_path
         except Exception as e:
-            return ToolException(f"Unable to delete file due to error: {str(e)}")
+            raise ToolException(f"Unable to delete file due to error: {str(e)}")
 
 
     @tool_group('write')
@@ -562,7 +562,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             mr.discussions.create({"body": comment, "position": position})
             return "Comment added"
         except Exception as e:
-            return ToolException(f"An error occurred: {e}")
+            raise ToolException(f"An error occurred: {e}")
 
     @tool_group('read')
     def list_files(self, path: str = None, recursive: bool = True, branch: str = None, repository: str = None) -> List[str]:
@@ -637,7 +637,7 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
 
             return commit_list
         except Exception as e:
-            return ToolException(f"Unable to retrieve commits due to error:\n{str(e)}")
+            raise ToolException(f"Unable to retrieve commits due to error:\n{str(e)}")
 
     @with_tool_groups
     def get_available_tools(self):

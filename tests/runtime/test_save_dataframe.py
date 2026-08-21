@@ -55,11 +55,10 @@ class TestSaveDataframe:
         mock_wrapper.bucket = 'test-bucket'
         mock_wrapper.create_file.side_effect = RuntimeError('Storage error')
         
-        result = save_dataframe_to_artifact(mock_wrapper, df, 'test.csv')
-        
-        assert isinstance(result, ToolException)
-        assert 'Failed to save DataFrame to artifact repository' in str(result)
-        assert 'Storage error' in str(result)
+        with pytest.raises(ToolException, match='Failed to save DataFrame to artifact repository') as excinfo:
+            save_dataframe_to_artifact(mock_wrapper, df, 'test.csv')
+
+        assert 'Storage error' in str(excinfo.value)
     
     def test_save_dataframe_csv_conversion_error(self):
         """Test when DataFrame.to_csv raises exception"""
@@ -70,10 +69,8 @@ class TestSaveDataframe:
         
         # Mock the to_csv method to raise an exception
         with patch.object(pd.DataFrame, 'to_csv', side_effect=ValueError('CSV conversion error')):
-            result = save_dataframe_to_artifact(mock_wrapper, df, 'test.csv')
-        
-        assert isinstance(result, ToolException)
-        assert 'Failed to save DataFrame to artifact repository' in str(result)
+            with pytest.raises(ToolException, match='Failed to save DataFrame to artifact repository'):
+                save_dataframe_to_artifact(mock_wrapper, df, 'test.csv')
     
     def test_save_dataframe_none_csv_options(self):
         """Test with None csv_options"""

@@ -4,7 +4,7 @@ from typing import Optional, Type, Any
 from langchain_core.callbacks import CallbackManagerForToolRun
 from pydantic import BaseModel
 from pydantic import Field
-from langchain_core.tools import BaseTool, ToolException
+from langchain_core.tools import BaseTool
 
 
 class BaseAction(BaseTool):
@@ -40,7 +40,7 @@ class BaseAction(BaseTool):
         *args: Any,
         run_manager: Optional[CallbackManagerForToolRun] = None,
         **kwargs: Any,
-    ) -> ToolException | str:
+    ) -> Any:
         """Use the Confluence API to run an operation."""
         # Strip None values — LLM sends explicit nulls for optional params
         # (Pydantic schemas show "default": null), which can cause failures

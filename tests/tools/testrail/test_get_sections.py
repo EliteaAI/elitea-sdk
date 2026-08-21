@@ -151,10 +151,8 @@ class TestGetSectionsOutputFormats:
         """_to_markup rejects unsupported format with a ToolException."""
         self._arrange_one_section(wrapper)
 
-        result = wrapper.get_sections(project_id="10", output_format="xml")
-
-        assert isinstance(result, ToolException)
-        assert "Invalid format" in str(result)
+        with pytest.raises(ToolException, match="Invalid format"):
+            wrapper.get_sections(project_id="10", output_format="xml")
 
 
 class TestGetSectionsErrorPaths:
@@ -165,10 +163,8 @@ class TestGetSectionsErrorPaths:
         wrapper._client.projects.get_project.return_value = {"suite_mode": 1}
         wrapper._client.sections.get_sections.return_value = []
 
-        result = wrapper.get_sections(project_id="10")
-
-        assert isinstance(result, ToolException)
-        assert "No sections found" in str(result)
+        with pytest.raises(ToolException, match="No sections found"):
+            wrapper.get_sections(project_id="10")
 
     def test_status_code_error_is_formatted(self, wrapper):
         """StatusCodeError on the scoped call surfaces via _format_status_error."""
@@ -177,11 +173,10 @@ class TestGetSectionsErrorPaths:
             code=400, body=b'{"error": "Field :project_id is not a valid or accessible project."}'
         )
 
-        result = wrapper.get_sections(project_id="999", suite_id="6")
+        with pytest.raises(ToolException, match="TestRail API error 400") as exc_info:
+            wrapper.get_sections(project_id="999", suite_id="6")
 
-        assert isinstance(result, ToolException)
-        assert "TestRail API error 400" in str(result)
-        assert "Field :project_id" in str(result)
+        assert "Field :project_id" in str(exc_info.value)
 
     def test_per_suite_errors_swallowed_during_aggregation(self, wrapper):
         """Aggregation loop continues past per-suite StatusCodeError — review #3."""

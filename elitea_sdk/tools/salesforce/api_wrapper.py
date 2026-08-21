@@ -113,7 +113,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
 
         if response.status_code >= 400:
             error_message = self._parse_salesforce_error(response)
-            return ToolException(f"Failed to create Case. Error: {error_message}")
+            raise ToolException(f"Failed to create Case. Error: {error_message}")
 
         return response.json()
 
@@ -135,7 +135,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
 
         if response.status_code >= 400:
             error_message = self._parse_salesforce_error(response)
-            return ToolException(f"Failed to create Lead. Error: {error_message}")
+            raise ToolException(f"Failed to create Lead. Error: {error_message}")
 
         return response.json()
 
@@ -157,9 +157,9 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
                 else:
                     error_messages = errors.get("message", "Unknown error")
             except requests.exceptions.JSONDecodeError:
-                return ToolException(f"Failed to execute SOQL query. No JSON response. Status: {response.status_code}")
+                raise ToolException(f"Failed to execute SOQL query. No JSON response. Status: {response.status_code}")
 
-            return ToolException(f"Failed to execute SOQL query. Errors: {error_messages}")
+            raise ToolException(f"Failed to execute SOQL query. Errors: {error_messages}")
 
         return response.json()
 
@@ -200,7 +200,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
             return {"success": True, "message": f"Lead {lead_id} updated successfully."}
 
         error_message = self._parse_salesforce_error(response)
-        return ToolException(f"Failed to update Lead {lead_id}. Error: {error_message}")
+        raise ToolException(f"Failed to update Lead {lead_id}. Error: {error_message}")
 
 
     @tool_group('execute')
@@ -236,7 +236,7 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
         # Check for actual errors before raising an exception
         error_message = self._parse_salesforce_error(response)
         if error_message:
-            return ToolException(f"Failed {method} request to {relative_url}. Error: {error_message}")
+            raise ToolException(f"Failed {method} request to {relative_url}. Error: {error_message}")
 
         return response.json()
 

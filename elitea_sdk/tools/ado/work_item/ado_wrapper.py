@@ -321,7 +321,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         try:
             patch_document = self._transform_work_item(work_item_json)
         except Exception as e:
-            return ToolException(f"Issues during attempt to parse work_item_json: {str(e)}")
+            raise ToolException(f"Issues during attempt to parse work_item_json: {str(e)}")
 
         try:
             # Use the transformed patch_document to create the work item
@@ -337,9 +337,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             if "unknown value" in str(e):
                 logger.error(f"Unable to create work item due to incorrect assignee: {e}")
-                return ToolException(f"Unable to create work item due to incorrect assignee: {e}")
+                raise ToolException(f"Unable to create work item due to incorrect assignee: {e}")
             logger.error(f"Error creating work item: {e}")
-            return ToolException(f"Error creating work item: {e}")
+            raise ToolException(f"Error creating work item: {e}")
 
     @tool_group('write')
     def update_work_item(self, id: str, work_item_json: str):
@@ -349,7 +349,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             patch_document = self._transform_work_item(work_item_json)
             work_item = self._client.update_work_item(id=id, document=patch_document, project=self.project)
         except Exception as e:
-            return ToolException(f"Issues during attempt to parse work_item_json: {str(e)}")
+            raise ToolException(f"Issues during attempt to parse work_item_json: {str(e)}")
         return f"Work item ({work_item.id}) was updated."
 
     @tool_group('delete')
@@ -360,7 +360,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return f"Work item {id} was successfully deleted."
         except Exception as e:
             logger.error(f"Error deleting work item {id}: {e}")
-            return ToolException(f"Error deleting work item {id}: {e}")
+            raise ToolException(f"Error deleting work item {id}: {e}")
 
     @tool_group('read')
     def get_relation_types(self) -> dict:
@@ -506,7 +506,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             # check cached relation types and trigger its collection if it is empty by that moment
             self.get_relation_types()
         if link_type not in self._relation_types.values():
-            return ToolException(f"Link type is incorrect. You have to use proper relation's reference name NOT relation's name: {self._relation_types}")
+            raise ToolException(f"Link type is incorrect. You have to use proper relation's reference name NOT relation's name: {self._relation_types}")
 
         relation = {
             "rel": link_type,
@@ -529,7 +529,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )
         except Exception as e:
             logger.error(f"Error linking work items: {e}")
-            return ToolException(f"Error linking work items: {e}")
+            raise ToolException(f"Error linking work items: {e}")
 
         return f"Work item {source_id} linked to {target_id} with link type {link_type}"
 
@@ -559,10 +559,10 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return parsed_work_items
         except ValueError as ve:
             logger.error(f"Invalid WIQL query: {ve}")
-            return ToolException(f"Invalid WIQL query: {ve}")
+            raise ToolException(f"Invalid WIQL query: {ve}")
         except Exception as e:
             logger.error(f"Error searching work items: {e}")
-            return ToolException(f"Error searching work items: {e}")
+            raise ToolException(f"Error searching work items: {e}")
 
     @property
     def _search_client(self):
@@ -598,7 +598,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             warnings.
         """
         if not query or not query.strip():
-            return ToolException("Search query cannot be empty. Provide text to search for.")
+            raise ToolException("Search query cannot be empty. Provide text to search for.")
 
         top = max(1, min(top or PAGING.default_top, PAGING.max_top))
         skip = max(0, min(skip or 0, PAGING.max_skip))
@@ -629,7 +629,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             msg = f"Unable to search work items for query '{query}': {str(e)}"
             logger.error(msg)
-            return ToolException(
+            raise ToolException(
                 f"{msg}\nWork item search requires at least Basic access and a token with the "
                 "Work Items (read) scope. On Azure DevOps Server it also requires the Search "
                 "extension to be installed."
@@ -794,8 +794,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     return _ImageNote(_IMAGE_UNAVAILABLE.format(reason="attachment exceeds the download safety limit"))
             result = parse_file_content(file_content=content, file_name=name, llm=self.llm,
                                         prompt=prompt, image_cache=self._image_cache)
-            if isinstance(result, ToolException):
-                return _ImageNote(_IMAGE_UNAVAILABLE.format(reason=str(result)))
             return result
         except Exception as e:
             logger.warning(f"Failed to describe attachment '{attachment_url}': {e}")
@@ -862,29 +860,29 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         error message if the image is inaccessible or the format is unsupported."""
         try:
             if not self._client:
-                return ToolException("Azure DevOps client not initialized.")
+                raise ToolException("Azure DevOps client not initialized.")
             if self.llm is None:
-                return ToolException("Image analysis requires an LLM, but this toolkit is configured without one.")
+                raise ToolException("Image analysis requires an LLM, but this toolkit is configured without one.")
             if attachment_url.lower().startswith('data:'):
-                return ToolException("data: URIs are not supported; provide an Azure DevOps attachment URL.")
+                raise ToolException("data: URIs are not supported; provide an Azure DevOps attachment URL.")
             if '/_apis/wit/attachments/' not in urllib.parse.urlparse(attachment_url).path.lower():
-                return ToolException(
+                raise ToolException(
                     "URL must be an Azure DevOps work item attachment URL (containing /_apis/wit/attachments/).")
             ref = self._extract_attachment_ref(attachment_url)
             if ref is None:
-                return ToolException("Could not determine the attachment id from the URL.")
+                raise ToolException("Could not determine the attachment id from the URL.")
             attachment_id, derived_name = ref
             name = file_name or derived_name
             if not name:
-                return ToolException("Provide file_name; the URL has no fileName parameter.")
+                raise ToolException("Provide file_name; the URL has no fileName parameter.")
             content, error = self._fetch_validated_image(attachment_id, name)
             if error:
-                return ToolException(error[0].upper() + error[1:])
+                raise ToolException(error[0].upper() + error[1:])
             return parse_file_content(file_content=content, file_name=name, llm=self.llm,
                                       prompt=prompt, image_cache=self._image_cache)
         except Exception as e:
             logger.error(f"Error analyzing attachment image: {e}")
-            return ToolException(f"Error analyzing attachment image: {e}")
+            raise ToolException(f"Error analyzing attachment image: {e}")
 
     def parse_attachment_by_id(self, attachment_id, file_name, image_description_prompt):
         file_content = self.get_attachment_content(attachment_id)
@@ -963,7 +961,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return parsed_item
         except Exception as e:
             logger.error(f"Error getting work item: {e}")
-            return ToolException(f"Error getting work item: {e}")
+            raise ToolException(f"Error getting work item: {e}")
 
 
     @tool_group('read')
@@ -1009,7 +1007,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return self._embed_comment_image_descriptions(comments_all, image_description_prompt)
         except Exception as e:
             logger.error(f"Error getting work item comments: {e}")
-            return ToolException(f"Error getting work item comments: {e}")
+            raise ToolException(f"Error getting work item comments: {e}")
 
     _COMMENT_TEXT_FIELDS = ('rendered_text', 'renderedText', 'text')
 
@@ -1103,7 +1101,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         if not work_item_ids:
             return "No work item IDs provided. No links created."
         if not self._client:
-            return ToolException("Work item client not initialized.")
+            raise ToolException("Work item client not initialized.")
 
         try:
             # 1. Get Artifact URI using helper method
@@ -1152,7 +1150,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         except Exception as e:
             logger.error(f"Error linking work items to wiki page '{page_name}': {str(e)}")
-            return ToolException(f"An unexpected error occurred while linking work items to wiki page '{page_name}': {str(e)}")
+            raise ToolException(f"An unexpected error occurred while linking work items to wiki page '{page_name}': {str(e)}")
 
     @tool_group('delete')
     def unlink_work_items_from_wiki_page(self, work_item_ids: List[int], wiki_identified: str, page_name: str):
@@ -1160,7 +1158,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         if not work_item_ids:
             return "No work item IDs provided. No links removed."
         if not self._client:
-            return ToolException("Work item client not initialized.")
+            raise ToolException("Work item client not initialized.")
 
         try:
             # 1. Get Artifact URI using helper method
@@ -1227,7 +1225,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         except Exception as e:
             logger.error(f"Error unlinking work items from wiki page '{page_name}': {str(e)}")
-            return ToolException(f"An unexpected error occurred while unlinking work items from wiki page '{page_name}': {str(e)}")
+            raise ToolException(f"An unexpected error occurred while unlinking work items from wiki page '{page_name}': {str(e)}")
 
     @tool_group('write')
     def attach_file_to_work_item(
@@ -1247,19 +1245,19 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         inline via an <img> tag; other file types are rendered as a link.
         """
         if not self._client:
-            return ToolException("Azure DevOps client not initialized.")
+            raise ToolException("Azure DevOps client not initialized.")
 
         try:
             file_bytes, artifact_filename = get_file_bytes_from_artifact(self.elitea, filepath)
         except Exception as e:
-            return ToolException(f"Failed to retrieve artifact '{filepath}': {e}")
+            raise ToolException(f"Failed to retrieve artifact '{filepath}': {e}")
 
         if not file_bytes:
-            return ToolException(f"Artifact '{filepath}' not found or empty")
+            raise ToolException(f"Artifact '{filepath}' not found or empty")
 
         resolved_filename = filename or artifact_filename
         if not resolved_filename:
-            return ToolException("Filename could not be resolved from artifact or arguments.")
+            raise ToolException("Filename could not be resolved from artifact or arguments.")
 
         mime_type = detect_mime_type(file_bytes, resolved_filename)
         is_image = mime_type.startswith("image/")
@@ -1273,12 +1271,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )
         except Exception as e:
             logger.error(f"Error uploading attachment '{resolved_filename}' to ADO: {e}")
-            return ToolException(f"Error uploading attachment '{resolved_filename}': {e}")
+            raise ToolException(f"Error uploading attachment '{resolved_filename}': {e}")
 
         attachment_url = getattr(attachment_ref, "url", None)
         attachment_id = getattr(attachment_ref, "id", None)
         if not attachment_url:
-            return ToolException("ADO did not return an attachment URL after upload.")
+            raise ToolException("ADO did not return an attachment URL after upload.")
 
         relation_value = {"rel": "AttachedFile", "url": attachment_url, "attributes": {"name": resolved_filename}}
         if comment:
@@ -1300,7 +1298,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             self._client.update_work_item(document=patch_document, id=work_item_id, project=self.project)
         except Exception as e:
             logger.error(f"Error attaching file to work item {work_item_id}: {e}")
-            return ToolException(f"Error attaching file to work item {work_item_id}: {e}")
+            raise ToolException(f"Error attaching file to work item {work_item_id}: {e}")
 
         if add_as_comment:
             try:

@@ -4,7 +4,7 @@ from traceback import format_exc
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool, ToolException
+from langchain_core.tools import BaseTool
 from typing import Any, Optional, Union
 from langchain_core.messages import ToolCall
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -72,8 +72,6 @@ class IndexerNode(BaseTool):
                     logger.error(f"Chunking error: {format_exc()}")
                     return {"messages": [{"role": "assistant", "content": f"""Chunking tool {self.chunking_tool} raised an error.\n\nError: {format_exc()}"""}]}
             index_results = self.index_tool.invoke({"documents": chunks if chunks else result}, config=config, kwargs=kwargs)
-            if isinstance(index_results, ToolException):
-                raise index_results
             logger.info(f"IndexNode response: {index_results}")
             total_time = round((time() - start_time), 2)
             index_results['total_time'] = total_time

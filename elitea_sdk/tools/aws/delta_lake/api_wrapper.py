@@ -25,13 +25,13 @@ def process_output(func):
         try:
             result = func(self, *args, **kwargs)
             if isinstance(result, Exception):
-                return ToolException(str(result))
+                raise ToolException(str(result))
             if isinstance(result, (dict, list)):
                 return json.dumps(result, default=str)
             return str(result)
         except Exception as e:
             logging.error(f"Error in '{func.__name__}': {str(e)}")
-            return ToolException(str(e))
+            raise ToolException(str(e))
     return wrapper
 
 

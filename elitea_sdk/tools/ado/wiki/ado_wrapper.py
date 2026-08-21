@@ -342,7 +342,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return _format_wiki_response(wiki_response)
         except Exception as e:
             logger.error(f"Error during the attempt to extract wiki: {str(e)}")
-            return ToolException(f"Error during the attempt to extract wiki: {str(e)}")
+            raise ToolException(f"Error during the attempt to extract wiki: {str(e)}")
 
     @tool_group('read')
     def get_wiki_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None, image_description_prompt=None, process_images: bool = True):
@@ -356,7 +356,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return content
         except Exception as e:
             logger.error(f"Error during the attempt to extract wiki page: {str(e)}")
-            return ToolException(f"Error during the attempt to extract wiki page: {str(e)}")
+            raise ToolException(f"Error during the attempt to extract wiki page: {str(e)}")
 
     @tool_group('read')
     def get_wiki_page_by_id(self, wiki_identified: Optional[str] = None, page_id: int = None, image_description_prompt=None, process_images: bool = True):
@@ -370,7 +370,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return content
         except Exception as e:
             logger.error(f"Error during the attempt to extract wiki page: {str(e)}")
-            return ToolException(f"Error during the attempt to extract wiki page: {str(e)}")
+            raise ToolException(f"Error during the attempt to extract wiki page: {str(e)}")
 
     @tool_group('read')
     def get_wiki_page(self, wiki_identified: Optional[str] = None, page_path: Optional[str] = None, page_id: Optional[int] = None,
@@ -456,7 +456,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 identifier = f"ID {page_id}" if page_id else f"path '{page_path}'"
                 wiki_id = wiki_identified or self.default_wiki_identifier or "unknown"
                 logger.error(f"Page {identifier} not found in wiki '{wiki_id}': {str(e)}")
-                return ToolException(
+                raise ToolException(
                     f"Page {identifier} not found in wiki '{wiki_id}'. "
                     f"Please verify the page exists and the identifier is correct."
                 )
@@ -465,7 +465,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             elif "path" in error_msg and ("correct" in error_msg or "invalid" in error_msg):
                 wiki_id = wiki_identified or self.default_wiki_identifier or "unknown"
                 logger.error(f"Invalid page path '{page_path}' in wiki '{wiki_id}': {str(e)}")
-                return ToolException(
+                raise ToolException(
                     f"Invalid page path '{page_path}'. Please ensure the path format is correct (e.g., '/PageName')."
                 )
 
@@ -473,7 +473,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             elif "wiki" in error_msg and ("not found" in error_msg or "does not exist" in error_msg):
                 wiki_id = wiki_identified or self.default_wiki_identifier or "unknown"
                 logger.error(f"Wiki '{wiki_id}' not found: {str(e)}")
-                return ToolException(
+                raise ToolException(
                     f"Wiki '{wiki_id}' not found. Please verify the wiki identifier is correct."
                 )
 
@@ -481,25 +481,25 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             elif "401" in error_msg or "unauthorized" in error_msg or "authentication" in error_msg:
                 wiki_id = wiki_identified or self.default_wiki_identifier or "unknown"
                 logger.error(f"Authentication failed for wiki '{wiki_id}': {str(e)}")
-                return ToolException(
+                raise ToolException(
                     f"Authentication failed. Please check your access token is valid and has permission to access wiki '{wiki_id}'."
                 )
 
             elif "403" in error_msg or "forbidden" in error_msg or "permission" in error_msg:
                 wiki_id = wiki_identified or self.default_wiki_identifier or "unknown"
                 logger.error(f"Permission denied for wiki '{wiki_id}': {str(e)}")
-                return ToolException(
+                raise ToolException(
                     f"Permission denied. You do not have access to wiki '{wiki_id}' or page {page_id if page_id else page_path}."
                 )
 
             # Generic Azure DevOps service errors
             else:
                 logger.error(f"Azure DevOps service error while fetching page: {str(e)}")
-                return ToolException(f"Error accessing wiki page: {str(e)}")
+                raise ToolException(f"Error accessing wiki page: {str(e)}")
 
         except ValueError as e:
             logger.error(f"Validation error: {str(e)}")
-            return ToolException(f"Validation error: {str(e)}")
+            raise ToolException(f"Validation error: {str(e)}")
 
         except Exception as e:
             error_msg = str(e).lower()
@@ -507,13 +507,13 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             # Timeout errors
             if "timeout" in error_msg or "timed out" in error_msg:
                 logger.error(f"Connection timeout while fetching page: {str(e)}")
-                return ToolException(
+                raise ToolException(
                     f"Connection timeout. Please check your network connection and try again."
                 )
 
             # Generic errors
             logger.error(f"Unexpected error during wiki page retrieval: {str(e)}")
-            return ToolException(f"Unexpected error during wiki page retrieval: {str(e)}")
+            raise ToolException(f"Unexpected error during wiki page retrieval: {str(e)}")
 
     def _get_repos_wrapper(self, wiki_identified: str) -> Optional["ReposApiWrapper"]:
         """Return a ReposApiWrapper bound to the wikiMaster branch of the given wiki.
@@ -599,15 +599,15 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                         image_description_prompt=image_description_prompt,
                         repos_wrapper=repos_wrapper,
                     )
+                except ToolException as e:
+                    logger.warning(
+                        f"Skipping image '{image_name}': attachment parser returned error for '{image_url}': "
+                        f"{str(e)}"
+                    )
+                    return image_name, image_url, None
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error parsing attachment '{image_url}': {str(e)}"
-                    )
-                    return image_name, image_url, None
-                if isinstance(description, ToolException):
-                    logger.warning(
-                        f"Skipping image '{image_name}': attachment parser returned error for '{image_url}': "
-                        f"{str(description)}"
                     )
                     return image_name, image_url, None
             else:
@@ -622,15 +622,15 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                         prompt=image_description_prompt,
                         image_cache=self._image_cache,
                     )
+                except ToolException as e:
+                    logger.warning(
+                        f"Skipping image '{image_name}': image parser returned error for '{image_url}': "
+                        f"{str(e)}"
+                    )
+                    return image_name, image_url, None
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error fetching external image '{image_url}': {str(e)}"
-                    )
-                    return image_name, image_url, None
-                if isinstance(description, ToolException):
-                    logger.warning(
-                        f"Skipping image '{image_name}': image parser returned error for '{image_url}': "
-                        f"{str(description)}"
                     )
                     return image_name, image_url, None
             return image_name, image_url, description
@@ -683,7 +683,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return f"Page '{page_name}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
             logger.error(f"Unable to delete wiki page: {str(e)}")
-            return ToolException(f"Unable to delete wiki page: {str(e)}")
+            raise ToolException(f"Unable to delete wiki page: {str(e)}")
 
     @tool_group('delete')
     def delete_page_by_id(self, wiki_identified: Optional[str] = None, page_id: int = None):
@@ -694,7 +694,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             return f"Page with id '{page_id}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
             logger.error(f"Unable to delete wiki page: {str(e)}")
-            return ToolException(f"Unable to delete wiki page: {str(e)}")
+            raise ToolException(f"Unable to delete wiki page: {str(e)}")
 
     @tool_group('write')
     def rename_wiki_page(self, wiki_identified: Optional[str] = None, old_page_name: str = None, new_page_name: str = None, version_identifier: str = None,
@@ -732,7 +732,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     raise
         except Exception as e:
             logger.error(f"Unable to rename wiki page: {str(e)}")
-            return ToolException(f"Unable to rename wiki page: {str(e)}")
+            raise ToolException(f"Unable to rename wiki page: {str(e)}")
 
     @tool_group('write')
     def modify_wiki_page(self, wiki_identified: Optional[str] = None, page_name: str = None, page_content: str = None, version_identifier: str = None, version_type: str = "branch", expanded: Optional[bool] = False):
@@ -755,7 +755,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     else:
                         return "Project ID has not been found."
                 except Exception as create_wiki_e:
-                    return ToolException(f"Unable to create new wiki due to error: {create_wiki_e}")
+                    raise ToolException(f"Unable to create new wiki due to error: {create_wiki_e}")
             try:
                 page = self._client.get_page(project=self.project, wiki_identifier=wiki_id, path=page_name)
                 version = page.eTag
@@ -764,7 +764,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     logger.info("Path is not found. New page will be created")
                     version = None
                 else:
-                    return ToolException(f"Unable to extract page by path {page_name}: {str(get_page_e)}")
+                    raise ToolException(f"Unable to extract page by path {page_name}: {str(get_page_e)}")
 
             try:
                 return _format_wiki_page_response(self._client.create_or_update_page(
@@ -789,7 +789,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     raise
         except Exception as e:
             logger.error(f"Unable to modify wiki page: {str(e)}")
-            return ToolException(f"Unable to modify wiki page: {str(e)}")
+            raise ToolException(f"Unable to modify wiki page: {str(e)}")
 
     def _iter_wiki_pages(self, wiki_identifier: str, batch_size: int = 100) -> Generator:
         """Yield every WikiPageDetail across all batches.

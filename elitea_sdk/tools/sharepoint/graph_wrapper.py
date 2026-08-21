@@ -453,7 +453,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise
         except Exception as e:
             logging.error("Graph read_list failed: %s", e)
-            return ToolException(f"Cannot read list '{list_title}': {e}")
+            raise ToolException(f"Cannot read list '{list_title}': {e}")
 
     # Graph API template names to exclude from get_lists results
     # documentLibrary = Document Libraries, webPageLibrary = Site Pages
@@ -489,7 +489,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise
         except Exception as e:
             logging.error("Graph get_lists failed: %s", e)
-            return ToolException(f"Cannot retrieve lists: {e}")
+            raise ToolException(f"Cannot retrieve lists: {e}")
 
     @staticmethod
     def _detect_column_type(col: dict) -> str:
@@ -736,7 +736,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     None
                 )
                 if not matched_drive:
-                    return ToolException(
+                    raise ToolException(
                         f"Document library '{form_name}' not found. "
                         "Please check the form name and read permissions.")
                 drive_id = matched_drive['id']
@@ -829,14 +829,16 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     "include_extensions / skip_extensions filters.",
                     _result_size, limit_files)
 
-            return result if result else ToolException(
-                "Can not get files or folder is empty. "
-                "Please, double check folder name and read permissions.")
+            if not result:
+                raise ToolException(
+                    "Can not get files or folder is empty. "
+                    "Please, double check folder name and read permissions.")
+            return result
         except ToolException:
             raise
         except Exception as e:
             logging.error("Graph get_files_list failed: %s", e)
-            return ToolException(
+            raise ToolException(
                 f"Can not get files. Please, double check folder name and "
                 f"read permissions: {e}")
 
@@ -847,19 +849,20 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         try:
             file_bytes = self.load_file_content_in_bytes(path)
             file_name = path.split('/')[-1]
-            result = parse_file_content(
-                file_name=file_name,
-                file_content=file_bytes,
-                is_capture_image=is_capture_image,
-                page_number=page_number,
-                sheet_name=sheet_name,
-                excel_by_sheets=excel_by_sheets,
-                llm=self.llm,
-                image_cache=self._image_cache,
-            )
-            if isinstance(result, ToolException):
+            try:
+                result = parse_file_content(
+                    file_name=file_name,
+                    file_content=file_bytes,
+                    is_capture_image=is_capture_image,
+                    page_number=page_number,
+                    sheet_name=sheet_name,
+                    excel_by_sheets=excel_by_sheets,
+                    llm=self.llm,
+                    image_cache=self._image_cache,
+                )
+            except ToolException as e:
                 logging.error(
-                    "Graph read_file could not parse '%s': %s", file_name, result)
+                    "Graph read_file could not parse '%s': %s", file_name, e)
                 raise ToolException(
                     f"Could not read '{file_name}'. The file type may be "
                     f"unsupported or the file may be unreadable. Supported formats "
@@ -2235,8 +2238,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         is_capture_image=is_capture_image,
                         image_cache=self._image_cache,
                     )
-                    if isinstance(result, ToolException):
-                        raise result
                     return bound_read_result(
                         result, file_name, start_line=start_line, end_line=end_line)
                 except ExcelReadLimitExceeded as e:
@@ -2279,8 +2280,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                 file_path=temp_path, llm=self.llm,
                 is_capture_image=is_capture_image,
                 image_cache=self._image_cache)
-            if isinstance(result, ToolException):
-                raise result
             return bound_read_result(
                 result, file_name, start_line=start_line, end_line=end_line)
         except ExcelReadLimitExceeded as e:

@@ -95,25 +95,21 @@ class TestGetRunsFilter:
         wrapper._client.runs.get_runs.assert_called_once_with(project_id="10")
 
     def test_invalid_json_filter_returns_tool_exception(self, wrapper):
-        result = wrapper.get_runs(project_id="10", run_filter="{not-json}")
+        with pytest.raises(ToolException, match="Invalid parameter for run_filter"):
+            wrapper.get_runs(project_id="10", run_filter="{not-json}")
 
-        assert isinstance(result, ToolException)
-        assert "Invalid parameter for run_filter" in str(result)
         wrapper._client.runs.get_runs.assert_not_called()
 
     def test_non_str_non_dict_filter_returns_tool_exception(self, wrapper):
-        result = wrapper.get_runs(project_id="10", run_filter=123)
-
-        assert isinstance(result, ToolException)
-        assert "must be a JSON string or dictionary" in str(result)
+        with pytest.raises(ToolException, match="must be a JSON string or dictionary"):
+            wrapper.get_runs(project_id="10", run_filter=123)
 
     @pytest.mark.parametrize("bad", ["[1, 2]", "5", '"hi"', "null", "true"])
     def test_json_string_parsing_to_non_object_returns_tool_exception(self, wrapper, bad):
         """A run_filter that is valid JSON but not an object must not crash with TypeError."""
-        result = wrapper.get_runs(project_id="10", run_filter=bad)
+        with pytest.raises(ToolException, match="must be a JSON object"):
+            wrapper.get_runs(project_id="10", run_filter=bad)
 
-        assert isinstance(result, ToolException)
-        assert "must be a JSON object" in str(result)
         wrapper._client.runs.get_runs.assert_not_called()
 
 
@@ -137,9 +133,8 @@ class TestGetRunsOutputFormats:
 
     def test_invalid_format_returns_tool_exception(self, wrapper):
         self._arrange(wrapper)
-        result = wrapper.get_runs(project_id="10", output_format="xml")
-        assert isinstance(result, ToolException)
-        assert "Invalid format" in str(result)
+        with pytest.raises(ToolException, match="Invalid format"):
+            wrapper.get_runs(project_id="10", output_format="xml")
 
 
 class TestGetRunsEmptyAndErrors:
@@ -157,11 +152,10 @@ class TestGetRunsEmptyAndErrors:
             code=400, body=b'{"error": "Field :project_id is not a valid or accessible project."}'
         )
 
-        result = wrapper.get_runs(project_id="999")
+        with pytest.raises(ToolException, match="TestRail API error 400") as exc_info:
+            wrapper.get_runs(project_id="999")
 
-        assert isinstance(result, ToolException)
-        assert "TestRail API error 400" in str(result)
-        assert "Field :project_id" in str(result)
+        assert "Field :project_id" in str(exc_info.value)
 
 
 class TestGetRunsFieldProjection:
@@ -219,10 +213,9 @@ class TestGetRunsIsCompletedCoercion:
 
 class TestGetRunsProjectIdGuard:
     def test_non_numeric_project_id_returns_tool_exception(self, wrapper):
-        result = wrapper.get_runs(project_id="abc")
+        with pytest.raises(ToolException, match="project_id must be numeric"):
+            wrapper.get_runs(project_id="abc")
 
-        assert isinstance(result, ToolException)
-        assert "project_id must be numeric" in str(result)
         wrapper._client.runs.get_runs.assert_not_called()
 
 
@@ -239,10 +232,9 @@ class TestGetRun:
         assert "run-5" in result
 
     def test_non_numeric_run_id_returns_tool_exception(self, wrapper):
-        result = wrapper.get_run(run_id="abc")
+        with pytest.raises(ToolException, match="run_id must be numeric"):
+            wrapper.get_run(run_id="abc")
 
-        assert isinstance(result, ToolException)
-        assert "run_id must be numeric" in str(result)
         wrapper._client.runs.get_run.assert_not_called()
 
     def test_status_code_error_is_formatted(self, wrapper):
@@ -250,10 +242,8 @@ class TestGetRun:
             code=400, body=b'{"error": "Field :run_id is not a valid test run."}'
         )
 
-        result = wrapper.get_run(run_id="999")
-
-        assert isinstance(result, ToolException)
-        assert "TestRail API error 400" in str(result)
+        with pytest.raises(ToolException, match="TestRail API error 400"):
+            wrapper.get_run(run_id="999")
 
     def test_output_format_markdown(self, wrapper):
         wrapper._client.runs.get_run.return_value = _run(5)

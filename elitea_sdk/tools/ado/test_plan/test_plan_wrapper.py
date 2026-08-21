@@ -253,7 +253,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return f"Test plan {test_plan.id} created successfully."
         except Exception as e:
             logger.error(f"Error creating test plan: {e}")
-            return ToolException(f"Error creating test plan: {e}")
+            raise ToolException(f"Error creating test plan: {e}")
 
     @tool_group('delete')
     def delete_test_plan(self, plan_id: int):
@@ -263,7 +263,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return f"Test plan {plan_id} deleted successfully."
         except Exception as e:
             logger.error(f"Error deleting test plan: {e}")
-            return ToolException(f"Error deleting test plan: {e}")
+            raise ToolException(f"Error deleting test plan: {e}")
 
     @tool_group('read')
     def get_test_plan(self, plan_id: Optional[int] = None):
@@ -277,7 +277,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                 return [plan.as_dict() for plan in test_plans]
         except Exception as e:
             logger.error(f"Error getting test plan(s): {e}")
-            return ToolException(f"Error getting test plan(s): {e}")
+            raise ToolException(f"Error getting test plan(s): {e}")
 
     @tool_group('write')
     def create_test_suite(self, test_suite_create_params: str, plan_id: int):
@@ -289,7 +289,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return f"Test suite {test_suite.id} created successfully."
         except Exception as e:
             logger.error(f"Error creating test suite: {e}")
-            return ToolException(f"Error creating test suite: {e}")
+            raise ToolException(f"Error creating test suite: {e}")
 
     @tool_group('delete')
     def delete_test_suite(self, plan_id: int, suite_id: int):
@@ -299,7 +299,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return f"Test suite {suite_id} deleted successfully."
         except Exception as e:
             logger.error(f"Error deleting test suite: {e}")
-            return ToolException(f"Error deleting test suite: {e}")
+            raise ToolException(f"Error deleting test suite: {e}")
 
     @tool_group('read')
     def get_test_suite(self, plan_id: int, suite_id: Optional[int] = None):
@@ -313,7 +313,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                 return [suite.as_dict() for suite in test_suites]
         except Exception as e:
             logger.error(f"Error getting test suite(s): {e}")
-            return ToolException(f"Error getting test suite(s): {e}")
+            raise ToolException(f"Error getting test suite(s): {e}")
 
     @tool_group('write')
     def add_test_case(self, suite_test_case_create_update_parameters, plan_id: int, suite_id: int):
@@ -328,7 +328,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return [test_case.as_dict() for test_case in test_cases]
         except Exception as e:
             logger.error(f"Error adding test case: {e}")
-            return ToolException(f"Error adding test case: {e}")
+            raise ToolException(f"Error adding test case: {e}")
 
     @tool_group('write')
     def create_test_cases(self, create_test_cases_parameters):
@@ -352,7 +352,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         elif test_steps_format == 'xml':
             steps_xml = self.convert_steps_tag_to_ado_steps(test_steps)
         else:
-            return ToolException("Unknown test steps format: " + test_steps_format)
+            raise ToolException("Unknown test steps format: " + test_steps_format)
 
         # Parse additional fields if provided
         additional_fields_dict = None
@@ -360,16 +360,17 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             try:
                 additional_fields_dict = json.loads(additional_fields) if isinstance(additional_fields, str) else additional_fields
             except json.JSONDecodeError as e:
-                return ToolException(f"Invalid JSON format for additional_fields: {e}")
+                raise ToolException(f"Invalid JSON format for additional_fields: {e}")
 
         work_item_json = self.build_ado_test_case(title, description, steps_xml, additional_fields_dict)
 
         # Use the class-level work_item wrapper instance
-        create_work_item_result = \
-        self._work_item_wrapper.create_work_item(work_item_json=json.dumps(work_item_json), wi_type="Test Case")
-        if isinstance(create_work_item_result, ToolException):
-            # issue creating work item, return error with helpful context
-            error_msg = str(create_work_item_result)
+        try:
+            create_work_item_result = self._work_item_wrapper.create_work_item(
+                work_item_json=json.dumps(work_item_json), wi_type="Test Case"
+            )
+        except ToolException as e:
+            error_msg = str(e)
             if "TF401320" in error_msg or "validation" in error_msg.lower():
                 # Add helpful suggestion about field discovery
                 enhanced_error = (
@@ -379,8 +380,8 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                     "   • Provide missing required fields via the additional_fields parameter\n"
                     "   • Example: additional_fields='{\"Custom.SDLC\": \"Development\"}'"
                 )
-                return ToolException(enhanced_error)
-            return create_work_item_result
+                raise ToolException(enhanced_error) from e
+            raise
         created_work_item_id = create_work_item_result['id']
         return self.add_test_case([{"work_item": {"id": created_work_item_id}}], plan_id, suite_id)
 
@@ -491,7 +492,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return test_case_dict
         except Exception as e:
             logger.error(f"Error getting test case: {e}")
-            return ToolException(f"Error getting test case: {e}")
+            raise ToolException(f"Error getting test case: {e}")
 
     @tool_group('read')
     def get_test_cases(self, plan_id: int, suite_id: int, fields: Optional[List[str]] = None):
@@ -535,7 +536,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             self._log_tool_event(f"Error getting test cases: {e}", 'get_test_cases')
             logger.error(f"Error getting test cases: {e}")
-            return ToolException(f"Error getting test cases: {e}")
+            raise ToolException(f"Error getting test cases: {e}")
 
     def get_suites_in_plan(self, plan_id: int) -> List[dict]:
         """Get all test suites in a test plan."""
@@ -544,7 +545,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             return [suite.as_dict() for suite in test_suites]
         except Exception as e:
             logger.error(f"Error getting test suites: {e}")
-            return ToolException(f"Error getting test suites: {e}")
+            raise ToolException(f"Error getting test suites: {e}")
 
     def _base_loader(self, plan_id: int, suite_ids: Optional[List[int]] = [], chunking_tool: str = None, **kwargs) -> Generator[Document, None, None]:
         cases = []

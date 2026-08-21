@@ -181,9 +181,9 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             if "invalid or doesn't have the required permissions" in str(e):
                 masked_secret = '*' * (len(client_secret) - 4) + client_secret[-4:] if client_secret is not None else "UNDEFINED"
-                return ToolException(f"Please, check you credentials ({values['client_id']} / {masked_secret}). Unable")
+                raise ToolException(f"Please, check you credentials ({values['client_id']} / {masked_secret}). Unable")
             else:
-                return ToolException(f"Authentication failed: {str(e)}")
+                raise ToolException(f"Authentication failed: {str(e)}")
         return super().validate_toolkit(values)
 
     def __init__(self, **data):

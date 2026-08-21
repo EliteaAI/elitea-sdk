@@ -59,7 +59,7 @@ Be as precise and thorough as possible in your responses. If something is unclea
 
 def parse_file_content(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
                        sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False,
-                       prompt=None, extra_params: dict = None, image_cache=None) -> str | ToolException:
+                       prompt=None, extra_params: dict = None, image_cache=None) -> str:
     """Parse the content of a file based on its type and return the parsed content.
 
     Args:
@@ -93,7 +93,7 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
     )
 
     if not loader:
-        return ToolException(
+        raise ToolException(
             "Not supported type of files entered. Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only.")
 
     try:
@@ -126,12 +126,12 @@ def parse_file_content(file_name=None, file_content=None, is_capture_image: bool
         root_msg = str(e)
         if getattr(e, "__cause__", None):
             root_msg = f"{root_msg} | Cause: {e.__cause__}"
-        return ToolException(
+        raise ToolException(
             f"Error reading file ({file_name or file_path}) content. Make sure these types are supported: {root_msg}"
         )
 
 def load_file_docs(file_name=None, file_content=None, is_capture_image: bool = False, page_number: int = None,
-                       sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False) -> List[Document] | ToolException:
+                       sheet_name: str = None, llm=None, file_path: str = None, excel_by_sheets: bool = False) -> List[Document]:
     loader = prepare_loader(
         file_name=file_name,
         file_content=file_content,
@@ -143,7 +143,7 @@ def load_file_docs(file_name=None, file_content=None, is_capture_image: bool = F
         excel_by_sheets=excel_by_sheets
     )
     if not loader:
-        return ToolException(
+        raise ToolException(
             "Not supported type of files entered. Supported types are TXT, DOCX, PDF, PPTX, XLSX and XLS only.")
     return loader.load()
 

@@ -47,7 +47,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         try:
             return self._client.get_test_case(testcase_id)
         except Exception as e:
-            return ToolException(f"Unable to retrieve test cases: {e}")
+            raise ToolException(f"Unable to retrieve test cases: {e}")
 
     @tool_group('read')
     def search_zql(self, zql_json: str):
@@ -56,7 +56,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         try:
             return self._client.search_by_zql(zql_json)
         except Exception as e:
-            return ToolException(f"Unable to retrieve Zephyr entities: {e}")
+            raise ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
 
     @tool_group('read')
@@ -81,7 +81,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
                 parsed_test_cases.append(f"Test case ID: {test_case.get('id')}, Test case: {test_case['testcase']}")
             return "\n".join(parsed_test_cases)
         except Exception as e:
-            return ToolException(f"Unable to retrieve Zephyr entities: {e}")
+            raise ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
     @tool_group('write')
     def create_testcase(self, create_testcase_json: str):
@@ -93,7 +93,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         try:
             return self._client.create_testcase(create_testcase_json)
         except Exception as e:
-            return ToolException(f"Unable to retrieve Zephyr entities: {e}")
+            raise ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
     def get_test_case_steps(self, testcase_tree_id: str):
         last_version = self.get_last_version(testcase_tree_id)
@@ -120,7 +120,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         """
         try:
             if not steps:
-                return ToolException("Steps cannot be empty.")
+                raise ToolException("Steps cannot be empty.")
 
             test_case_version_id = self.get_last_version(testcase_tree_id)
             logger.info(f"Test case version id: {test_case_version_id}")
@@ -155,7 +155,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
 
             return ";".join(added_steps)
         except Exception as e:
-            return ToolException(f"Unable to retrieve Zephyr entities: {e}")
+            raise ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
     def _index_tool_params(self, **kwargs) -> dict[str, tuple[type, Field]]:
         """
