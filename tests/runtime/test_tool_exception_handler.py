@@ -118,6 +118,28 @@ class TestValidationErrorHandling:
         summary = logging_strategy.get_error_summary()
         assert summary.get("update_issue", 0) == 1
 
+    def test_tool_error_callback_fires_on_failure(self):
+        """LoggingStrategy invokes the 'tool_error' callback with the failure payload."""
+        tool_error_callback = MagicMock()
+        logging_strategy = LoggingStrategy(callbacks={'tool_error': tool_error_callback})
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[
+                TransformErrorStrategy(llm=None),
+                logging_strategy,
+            ]
+        )
+        tool = _make_tool()
+        wrapped = middleware.wrap_tool(tool)
+
+        wrapped.run({"issue_number": PydanticUndefined})
+
+        tool_error_callback.assert_called_once()
+        payload = tool_error_callback.call_args[0][0]
+        assert payload['tool_name'] == 'update_issue'
+        assert payload['total_errors'] == 1
+        assert 'error_type' in payload
+        assert 'error' in payload
+
     def test_valid_input_still_works(self):
         """Normal valid input is not affected by the fix."""
         middleware = _make_middleware()
