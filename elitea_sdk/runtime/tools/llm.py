@@ -63,6 +63,18 @@ logger = logging.getLogger(__name__)
 
 SENSITIVE_TOOL_BLOCKED_RESULT_TYPE = 'sensitive_tool_blocked'
 STRUCTURED_OUTPUT_PREFILL_PROMPT = "Now produce the structured output based on the information above."
+NESTED_OUTPUT_CONTINUATION_LIMIT = 4
+NESTED_OUTPUT_CONTINUATION_PROMPT = (
+    "The previous assistant output was cut off by its output-token limit. "
+    "Continue exactly where it stopped. Output only the missing continuation; "
+    "do not repeat or restart anything already written. Preserve any leading "
+    "whitespace needed to join the continuation to the previous output."
+)
+NESTED_REASONING_ONLY_CONTINUATION_PROMPT = (
+    "The previous model attempt reached its output-token limit during internal "
+    "reasoning before producing visible output. Produce the visible answer now. "
+    "Output only the answer."
+)
 
 # ContextVar used by __perform_tool_calling to expose intermediate messages
 # accumulated during the current LLMNode execution.  The sensitive-tool guard
@@ -1647,6 +1659,11 @@ class LLMNode(BaseTool):
                 f"[Timing] LLM invoke took {(time.perf_counter() - _llm_call_start) * 1000:.1f}ms "
                 f"(messages={len(messages)}, lazy_mode={self.lazy_tools_mode})"
             )
+        completion = self._continue_nested_output(
+            messages=messages,
+            completion=completion,
+            config=config,
+        )
         logger.info(f"Initial completion: {completion}")
 
         # Handle both tool-calling and regular responses
@@ -2194,6 +2211,144 @@ class LLMNode(BaseTool):
             result['text'] = content
         
         return result
+
+    @staticmethod
+    def _completion_finished_by_length(completion: Any) -> bool:
+        """Normalize provider-specific output-limit metadata on an AI message."""
+        metadata = getattr(completion, 'response_metadata', None) or {}
+        if not isinstance(metadata, dict):
+            return False
+
+        reason = metadata.get('stop_reason') or metadata.get('finish_reason')
+        if not reason and metadata.get('status') == 'incomplete':
+            incomplete_details = metadata.get('incomplete_details') or {}
+            if isinstance(incomplete_details, dict):
+                reason = incomplete_details.get('reason')
+
+        return str(reason or '').lower() in {
+            'length',
+            'max_tokens',
+            'max_output_tokens',
+            'stop_reason_max_tokens',
+        }
+
+    @staticmethod
+    def _is_nested_execution(config: Optional[RunnableConfig]) -> bool:
+        metadata = config.get('metadata', {}) if isinstance(config, dict) else {}
+        return isinstance(metadata, dict) and bool(
+            metadata.get('parent_agent_path') or metadata.get('parent_agent_name')
+        )
+
+    @staticmethod
+    def _merge_continuation_text(existing: str, incoming: str) -> str:
+        """Join continuation text, including output-limit cuts inside a token."""
+        continuation = incoming
+        max_overlap = min(len(existing), len(continuation), 150)
+        for overlap in range(max_overlap, 3, -1):
+            suffix = existing[-overlap:]
+            if suffix != continuation[:overlap] or not any(char.isalnum() for char in suffix):
+                continue
+            starts_at_boundary = (
+                overlap == len(existing)
+                or not (existing[-overlap - 1].isalnum() and suffix[0].isalnum())
+            )
+            ends_at_boundary = (
+                overlap == len(continuation)
+                or not (suffix[-1].isalnum() and continuation[overlap].isalnum())
+            )
+            if starts_at_boundary and ends_at_boundary:
+                continuation = continuation[overlap:]
+                break
+
+        if not existing:
+            return continuation
+        if not continuation:
+            return existing
+        stripped = continuation.lstrip(' \t')
+        first_word = stripped.split(' ', 1)[0]
+        numbered_item = (
+            len(first_word) > 1
+            and first_word[-1] in '.)'
+            and first_word[:-1].isdigit()
+        )
+        block_start = (
+            numbered_item
+            or stripped.startswith(('- ', '* ', '+ ', '#', '```'))
+        )
+        separator = (
+            '\n'
+            if block_start
+            and not existing[-1].isspace()
+            and not continuation[0].isspace()
+            else ''
+        )
+        return f'{existing}{separator}{continuation}'
+
+    def _continue_nested_output(
+        self,
+        *,
+        messages: List,
+        completion: Any,
+        config: Optional[RunnableConfig],
+    ) -> Any:
+        """Finish truncated leaf output before returning it to the orchestrator."""
+        if (
+            not self._is_nested_execution(config)
+            or not self._completion_finished_by_length(completion)
+        ):
+            return completion
+
+        continuation_messages = list(messages)
+        current_completion = completion
+        current_text = self._extract_content_from_completion(completion).get('text') or ''
+        accumulated_text = current_text
+        if current_text:
+            continuation_messages.append(AIMessage(content=current_text))
+
+        for continuation_round in range(1, NESTED_OUTPUT_CONTINUATION_LIMIT + 1):
+            prompt = (
+                NESTED_OUTPUT_CONTINUATION_PROMPT
+                if accumulated_text
+                else NESTED_REASONING_ONLY_CONTINUATION_PROMPT
+            )
+            continuation_messages.append(HumanMessage(content=prompt))
+            logger.info(
+                "[NESTED_CONTINUE] Completing truncated leaf output (round=%d/%d)",
+                continuation_round,
+                NESTED_OUTPUT_CONTINUATION_LIMIT,
+            )
+            current_completion = self.client.invoke(continuation_messages, config=config)
+            current_text = (
+                self._extract_content_from_completion(current_completion).get('text') or ''
+            )
+            if current_text:
+                accumulated_text = self._merge_continuation_text(
+                    accumulated_text,
+                    current_text,
+                )
+                continuation_messages.append(AIMessage(content=current_text))
+
+            if not self._completion_finished_by_length(current_completion):
+                break
+        else:
+            logger.warning(
+                "[NESTED_CONTINUE] Leaf output remained truncated after %d continuation rounds",
+                NESTED_OUTPUT_CONTINUATION_LIMIT,
+            )
+
+        if not accumulated_text:
+            return current_completion
+        if hasattr(current_completion, 'model_copy'):
+            return current_completion.model_copy(update={
+                'content': accumulated_text,
+                'tool_calls': [],
+            })
+        return AIMessage(
+            content=accumulated_text,
+            response_metadata=dict(
+                getattr(current_completion, 'response_metadata', None) or {}
+            ),
+        )
     
     def _run_async_in_sync_context(self, coro):
         """Run async coroutine from sync context.
@@ -3702,6 +3857,11 @@ class LLMNode(BaseTool):
                 # ToolMessage tells the model the call was declined and to
                 # continue the remaining work; no forced rebinding or nudge turn.
                 current_completion = llm_client.invoke(new_messages, config=config)
+                current_completion = self._continue_nested_output(
+                    messages=new_messages,
+                    completion=current_completion,
+                    config=config,
+                )
                 normalize_null_tool_call_ids(current_completion)
                 new_messages.append(current_completion)
 
@@ -3899,6 +4059,11 @@ class LLMNode(BaseTool):
                         # the same current_completion that still has the original tool_calls
                         try:
                             current_completion = llm_client.invoke(new_messages, config=config)
+                            current_completion = self._continue_nested_output(
+                                messages=new_messages,
+                                completion=current_completion,
+                                config=config,
+                            )
                             normalize_null_tool_call_ids(current_completion)
                             new_messages.append(current_completion)
 
