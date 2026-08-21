@@ -127,10 +127,9 @@ def search(search_client, **kwargs):
 def test_empty_query_returns_tool_exception(blank_query):
     client = FakeSearchClient(FakeResponse())
 
-    result = build_wrapper(client).search_work_items_by_text(blank_query)
+    with pytest.raises(ToolException, match="cannot be empty"):
+        build_wrapper(client).search_work_items_by_text(blank_query)
 
-    assert isinstance(result, ToolException)
-    assert "cannot be empty" in str(result)
     assert client.call_count == 0
 
 
@@ -598,10 +597,10 @@ def test_empty_results_explain_search_coverage():
 def test_search_failure_returns_actionable_tool_exception():
     wrapper = build_wrapper(FailingSearchClient(Exception("boom")))
 
-    result = wrapper.search_work_items_by_text("login timeout")
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.search_work_items_by_text("login timeout")
 
-    assert isinstance(result, ToolException)
-    message = str(result)
+    message = str(exc_info.value)
     assert "login timeout" in message
     assert "boom" in message
     assert "Work Items (read)" in message

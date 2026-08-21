@@ -1993,7 +1993,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
                 if result and "__dict__" in dir(result):
                     result = result.__dict__
                 elif not result:
-                    return ToolException(
+                    raise ToolException(
                         "Response result is empty. Check your input parameters or credentials"
                     )
                 if isinstance(result, (dict, list)):
@@ -2025,7 +2025,7 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
             except Exception as e:
                 msg = f"Error in '{func.__name__}': {str(e)}"
                 logging.error(msg)
-                return ToolException(msg)
+                raise ToolException(msg)
 
         return wrapper
 

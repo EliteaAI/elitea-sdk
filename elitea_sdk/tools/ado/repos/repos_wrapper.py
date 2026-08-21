@@ -528,7 +528,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Failed to get commits for file '{file_path}' on branch '{branch}': {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     def _file_commit_hash(self, file_path: str, branch: str) -> str:
         """Get the commit hash of the last commit that modified a file in a specific branch."""
@@ -572,7 +572,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Failed to fetch files from directory due to an error: {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
         files = []
         while items:
             item = items.pop(0)
@@ -605,7 +605,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                     f"Error {branch_name} does not exist, "
                     + f"in repo with current branches: {str(current_branches)}"
             )
-            return ToolException(msg)
+            raise ToolException(msg)
 
     @tool_group('read')
     def list_branches_in_repo(self) -> str:
@@ -633,7 +633,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Error during attempt to fetch the list of branches: {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     @tool_group('read')
     def list_files(self, directory_path: str = "", branch_name: str = None) -> List[str]:
@@ -703,7 +703,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Error during attempt to get active pull request: {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
         if pull_requests:
             parsed_prs = self.parse_pull_requests(pull_requests)
@@ -732,7 +732,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Failed to find pull request with '{pull_request_id}' ID. Error: {e}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
         if pull_request:
             parsed_pr = self.parse_pull_requests(pull_request)
@@ -789,7 +789,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Failed to parse pull requests. Error: {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
         return parsed
 
@@ -804,7 +804,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         try:
             pull_request_id = int(pull_request_id)
         except Exception as e:
-            return ToolException(
+            raise ToolException(
                 f"Passed argument is not INT type: {pull_request_id}.\nError: {str(e)}"
             )
 
@@ -825,7 +825,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Error during attempt to get Pull Request iterations and changes.\nError: {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
         data = []
         source_commit_id = pr_iterations[-1].source_ref_commit.commit_id
@@ -838,15 +838,17 @@ class ReposApiWrapper(CodeIndexerToolkit):
             # it should reflects VersionControlChangeType enum,
             # but the model is not accessible in azure.devops.v7_0.git.models
             if change_type == "edit":
-                base_content = self.get_file_content(target_commit_id, path)
-                if isinstance(base_content, ToolException):
-                    msg = f"Failed to process base file content for path: {path}: {str(base_content)}"
+                try:
+                    base_content = self.get_file_content(target_commit_id, path)
+                except ToolException as e:
+                    msg = f"Failed to process base file content for path: {path}: {str(e)}"
                     logger.error(msg)
                     return msg
 
-                target_content = self.get_file_content(source_commit_id, path)
-                if isinstance(target_content, ToolException):
-                    msg = f"Failed to process target file content for path: {path}: {str(target_content)}"
+                try:
+                    target_content = self.get_file_content(source_commit_id, path)
+                except ToolException as e:
+                    msg = f"Failed to process target file content for path: {path}: {str(e)}"
                     logger.error(msg)
                     return msg
 
@@ -891,7 +893,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Failed to get item text. Error: {str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
         self._file_content_cache[cache_key] = content
         return content
@@ -1032,7 +1034,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Unable to create file due to error:\n{str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     def _read_file(self, file_path: str, branch: str, offset: Optional[int] = None, limit: Optional[int] = None, **kwargs) -> str:
         """
@@ -1056,11 +1058,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
         # Validate offset and limit when provided
         if offset is not None and offset < 1:
-            return ToolException(
+            raise ToolException(
                 f"Invalid offset={offset}: must be a positive integer (1-indexed)."
             )
         if limit is not None and limit < 1:
-            return ToolException(
+            raise ToolException(
                 f"Invalid limit={limit}: must be a positive integer."
             )
 
@@ -1096,7 +1098,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 f"`{self.active_branch}`. Error: {str(e)}"
             )
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     @tool_group('read')
     def read_file(self, file_path: str, branch: str,
@@ -1206,12 +1208,12 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 branch=self.active_branch,
                 commit_message=f"Update {file_path}",
             )
-        except ToolException as e:
-            return str(e)
+        except ToolException:
+            raise
         except Exception as e:
             msg = f"Unable to update file due to error:\n{str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     @tool_group('delete')
     def delete_file(self, branch_name: str, file_path: str) -> str:
@@ -1252,7 +1254,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Unable to delete file due to error:\n{str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     @tool_group('read')
     def get_work_items(self, pull_request_id: int):
@@ -1275,7 +1277,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Unable to get Work Items due to error:\n{str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
         return work_item_ids
 
     @tool_group('write')
@@ -1391,11 +1393,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except ValueError as ve:
             msg = f"Invalid input parameters: {str(ve)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
         except Exception as e:
             msg = f"An error occurred:\n{str(e)}"
             logger.error(msg)
-            return ToolException(msg)
+            raise ToolException(msg)
 
     @tool_group('write')
     def create_pr(
@@ -1487,7 +1489,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
             return commit_list
         except Exception as e:
-            return ToolException(f"Unable to retrieve commits due to error:\n{str(e)}")
+            raise ToolException(f"Unable to retrieve commits due to error:\n{str(e)}")
 
     @property
     def _search_client(self):
@@ -1612,7 +1614,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             service warning.
         """
         if not query or not query.strip():
-            return ToolException("Search query cannot be empty. Provide text to search for.")
+            raise ToolException("Search query cannot be empty. Provide text to search for.")
 
         top = max(1, min(top or PAGING.default_top, PAGING.max_top))
         skip = max(0, min(skip or 0, PAGING.max_skip))
@@ -1640,7 +1642,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         except Exception as e:
             msg = f"Unable to search code for query '{query}': {str(e)}"
             logger.error(msg)
-            return ToolException(
+            raise ToolException(
                 f"{msg}\nCode search requires at least Basic access and a token with the "
                 "Code (read) scope. On Azure DevOps Server it also requires the Code Search "
                 "extension to be installed."

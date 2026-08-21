@@ -658,10 +658,6 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             return build_excel_over_limit_response(
                 e.estimate, filename=path, sheet_name=sheet_name,
                 requested=describe_requested_range(start_line, end_line))
-        # rest_wrapper may return a ToolException instead of raising; pass through
-        # as-is rather than feeding an error object into the guard functions.
-        if isinstance(result, ToolException):
-            return result
         return bound_read_result(
             result, path, start_line=start_line, end_line=end_line)
 
@@ -1084,8 +1080,6 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     include_extensions=include_extensions,
                     skip_extensions=skip_extensions,
                     on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered"))
-                if isinstance(all_files, ToolException):
-                    raise all_files
                 self._log_tool_event(
                     message="List of the files has been extracted", tool_name="loader")
             except Exception as e:

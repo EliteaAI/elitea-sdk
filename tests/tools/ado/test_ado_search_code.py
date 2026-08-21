@@ -99,10 +99,8 @@ def _make_ado(response, contents_by_path=None, repository_name="MyRepo"):
 def test_empty_query_returns_tool_exception():
     wrapper = _make_ado(FakeResponse())
 
-    result = wrapper.search_code("   ")
-
-    assert isinstance(result, ToolException)
-    assert "cannot be empty" in str(result)
+    with pytest.raises(ToolException, match="cannot be empty"):
+        wrapper.search_code("   ")
 
 
 def test_defaults_scope_to_configured_project_and_repository_name():
@@ -546,10 +544,8 @@ def test_search_failure_returns_actionable_tool_exception():
     wrapper = _make_ado(FakeResponse())
     wrapper._search_client_instance = ExplodingSearchClient()
 
-    result = wrapper.search_code("q")
-
-    assert isinstance(result, ToolException)
-    assert "Code (read) scope" in str(result)
+    with pytest.raises(ToolException, match="Code \\(read\\) scope"):
+        wrapper.search_code("q")
 
 
 def test_search_code_is_registered_as_a_tool():

@@ -799,7 +799,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if not field_info:
             existing_fields = [key for key, value in client.issue(jira_issue_key).get("fields").items() if value is not None]
             existing_fields_str = ', '.join(existing_fields)
-            return ToolException(f"Unable to find field '{field_name}'. All available fields are '{existing_fields_str}'")
+            raise ToolException(f"Unable to find field '{field_name}'. All available fields are '{existing_fields_str}'")
         return f"Got the data from following Jira issue - {jira_issue_key} and field - {field_name}. The data is:\n{field_info}"
 
     @tool_group('read')
@@ -830,11 +830,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             self._add_default_labels(issue_key=issue['key'])
             return f"Done. Issue {issue['key']} is created successfully. You can view it at {issue_url}. Details: {str(issue)}"
         except ToolException as e:
-            return ToolException(e)
+            raise ToolException(e)
         except Exception:
             stacktrace = format_exc()
             logger.error(f"Error creating Jira issue: {stacktrace}")
-            return ToolException(f"Error creating Jira issue: {stacktrace}")
+            raise ToolException(f"Error creating Jira issue: {stacktrace}")
 
     @tool_group('write')
     def set_issue_status(self, issue_key: str, status_name: str, mandatory_fields_json: str):
@@ -854,11 +854,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             self._add_default_labels(issue_key=issue_key)
             return f"Done. Status for issue {issue_key} was updated successfully. You can view it at {issue_url}."
         except ToolException as e:
-            return ToolException(e)
+            raise ToolException(e)
         except Exception:
             stacktrace = format_exc()
             logger.error(f"Error creating Jira issue: {stacktrace}")
-            return ToolException(f"Error creating Jira issue: {stacktrace}")
+            raise ToolException(f"Error creating Jira issue: {stacktrace}")
 
     def _update_issue(self, client: Jira, issue_json: str):
         """ Update an issue in Jira.
@@ -876,7 +876,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.info(output)
             return output
         except ToolException as e:
-            return ToolException(e)
+            raise ToolException(e)
         except Exception:
             stacktrace = format_exc()
             logger.error(f"Error updating Jira issue: {stacktrace}")
@@ -897,7 +897,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """Updates labels of an issue in Jira."""
         client = self._get_client()
         if add_labels is None and remove_labels is None:
-            return ToolException("You must provide at least 1 label to be added or removed")
+            raise ToolException("You must provide at least 1 label to be added or removed")
         update_issue_json = {"key": issue_key, "update": {"labels": []}}
         # Add labels to the update_issue_json
         if add_labels:
@@ -946,7 +946,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         except Exception:
             stacktrace = format_exc()
             logger.error(f"Error adding comment to Jira issue: {stacktrace}")
-            return ToolException(f"Error adding comment to Jira issue: {stacktrace}")
+            raise ToolException(f"Error adding comment to Jira issue: {stacktrace}")
 
     def _text_to_adf(self, text: str) -> Dict[str, Any]:
         """Convert plain text to Atlassian Document Format."""
@@ -1232,7 +1232,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         except Exception:
             stacktrace = format_exc()
             logger.error(f"Error listing Jira projects: {stacktrace}")
-            return ToolException(f"Error listing Jira projects: {stacktrace}")
+            raise ToolException(f"Error listing Jira projects: {stacktrace}")
 
     @tool_group('read')
     def get_attachments_content(self, jira_issue_key: str, attachment_pattern: Optional[str] = None):

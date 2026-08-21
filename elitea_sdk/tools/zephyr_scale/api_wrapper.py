@@ -344,7 +344,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         try:
             test_case = self._api.test_cases.get_test_case(test_case_key)
         except Exception as e:
-            return ToolException(f"Unable to extract test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to extract test case with key: {test_case_key}:\n{str(e)}")
         return f"Extracted tests: {str(test_case)}"
 
     @tool_group('read')
@@ -363,7 +363,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 return steps_list
             all_steps_concatenated = '\n'.join(steps_list)
         except Exception as e:
-            return ToolException(f"Unable to extract test case steps from test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to extract test case steps from test case with key: {test_case_key}:\n{str(e)}")
         return f"Extracted test steps: {all_steps_concatenated}"
 
     @tool_group('write')
@@ -391,7 +391,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 result += f"\n{str(add_steps_response)}"
             return result
         except Exception as e:
-            return ToolException(f"Unable to create test case with name: {test_case_name}:\n{str(e)}")
+            raise ToolException(f"Unable to create test case with name: {test_case_name}:\n{str(e)}")
 
     @tool_group('write')
     def create_test_cases(self, create_test_cases_data: str) -> list[str | ToolException]:
@@ -419,7 +419,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             )
             return f"Steps for test case `{test_case_key}` were added/updated: {str(add_steps_response)}"
         except Exception as e:
-            return ToolException(f"Unable to add/update steps for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to add/update steps for test case with key: {test_case_key}:\n{str(e)}")
 
     @tool_group('read')
     def get_folders(self,
@@ -475,7 +475,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             )
             return f"Test case `{test_case_key}` was updated: {str(update_response)}"
         except Exception as e:
-            return ToolException(f"Unable to update test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to update test case with key: {test_case_key}:\n{str(e)}")
             
     @tool_group('read')
     def get_links(self, test_case_key: str, **kwargs) -> str:
@@ -491,7 +491,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 return links
             return f"Links for test case `{test_case_key}`: {str(links)}"
         except Exception as e:
-            return ToolException(f"Unable to get links for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to get links for test case with key: {test_case_key}:\n{str(e)}")
             
     @tool_group('write')
     def create_issue_links(self, test_case_key: str, issue_id: int) -> str:
@@ -507,7 +507,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             link_response = self._api.test_cases.create_issue_links(test_case_key, issue_id)
             return f"Issue link created for test case `{test_case_key}` with issue ID `{issue_id}`: {str(link_response)}"
         except Exception as e:
-            return ToolException(f"Unable to create issue link for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to create issue link for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('write')
     def create_web_links(self, test_case_key: str, url: str, description: str, additional_fields: str = "{}") -> str:
@@ -526,7 +526,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             web_link_response = self._api.test_cases.create_web_links(test_case_key, url, **additional_params)
             return f"Web link created for test case `{test_case_key}` with URL `{url}` and link text `{description}`: {str(web_link_response)}"
         except Exception as e:
-            return ToolException(f"Unable to create web link for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to create web link for test case with key: {test_case_key}:\n{str(e)}")
 
     def _get_last_version(self, test_case_key: str, step:int = 10):
         max_iterations = 50
@@ -570,7 +570,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             all_versions = '\n'.join(versions_list)
             return f"Versions for test case `{test_case_key}`: {all_versions}"
         except Exception as e:
-            return ToolException(f"Unable to get versions for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to get versions for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('read')
     def get_version(self, test_case_key: str, version: str, return_as_object: bool = False) -> str|dict:
@@ -580,7 +580,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             version_data = self._api.test_cases.get_version(test_case_key, version)
             return version_data if return_as_object else f"Version {version} of test case `{test_case_key}`: {str(version_data)}"
         except Exception as e:
-            return ToolException(f"Unable to get version {version} for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to get version {version} for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('read')
     def get_test_script(self, test_case_key: str, return_only_script:bool = False) -> str:
@@ -592,7 +592,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 return test_script
             return f"Test script for test case `{test_case_key}`: {str(test_script)}"
         except Exception as e:
-            return ToolException(f"Unable to get test script for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to get test script for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('write')
     def create_test_script(self, test_case_key: str, script_type: str, text: str) -> str:
@@ -602,7 +602,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             script_response = self._api.test_cases.create_test_script(test_case_key, script_type, text)
             return f"Test script created/updated for test case `{test_case_key}`: {str(script_response)}"
         except Exception as e:
-            return ToolException(f"Unable to create/update test script for test case with key: {test_case_key}:\n{str(e)}")
+            raise ToolException(f"Unable to create/update test script for test case with key: {test_case_key}:\n{str(e)}")
             
     # Helper methods for folder operations
     def _get_folders(self, project_key: str, folder_type: str = "TEST_CASE", max_results: int = 100) -> List[Dict]:
@@ -1098,7 +1098,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                     custom_fields_params = self._process_custom_fields_param(custom_fields)
                     # params.update(custom_fields_params)
                 except Exception as e:
-                    return ToolException(f"Error processing custom fields: {str(e)}")
+                    raise ToolException(f"Error processing custom fields: {str(e)}")
             
             # Get test cases from the API
             all_test_cases = []
@@ -1149,7 +1149,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             return self._finalize_test_case_results(filtered_cases, fields, search_criteria)
 
         except Exception as e:
-            return ToolException(f"Error searching test cases: {str(e)}")
+            raise ToolException(f"Error searching test cases: {str(e)}")
 
     def _finalize_test_case_results(self, filtered_cases: List[dict], fields: List[str], search_criteria: dict) -> str:
         result_cases, message = self._format_test_case_results(filtered_cases, fields, search_criteria)
@@ -1176,7 +1176,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 return_raw=True
             )
         except Exception as e:
-            return ToolException(f"Error searching test cases by JQL: {str(e)}")
+            raise ToolException(f"Error searching test cases by JQL: {str(e)}")
 
     def _parse_jql(self, jql: str) -> dict:
         import re
@@ -1316,12 +1316,18 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             yield document
 
     def _process_test_case(self, key):
-        steps = self.get_test_steps(key, return_list=True)
-        if steps and not isinstance(steps, ToolException):
-            return {"steps": steps}
-        script = self.get_test_script(key, return_only_script=True)
-        if script and not isinstance(script, ToolException):
-            return {"script": script}
+        try:
+            steps = self.get_test_steps(key, return_list=True)
+            if steps:
+                return {"steps": steps}
+        except ToolException:
+            pass
+        try:
+            script = self.get_test_script(key, return_only_script=True)
+            if script:
+                return {"script": script}
+        except ToolException:
+            pass
         return {"empty": ""}
 
     @tool_group('read')
@@ -1380,7 +1386,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             return f"Extracted {len(all_test_cases)} tests recursively: {str(parsed_tests)}"
             
         except Exception as e:
-            return ToolException(f"Error retrieving test cases recursively: {str(e)}")
+            raise ToolException(f"Error retrieving test cases recursively: {str(e)}")
 
     @staticmethod
     def _parse_tests(tests) -> list:
@@ -1467,7 +1473,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             return f"Extracted {len(all_test_cases)} tests from {len(matching_folder_ids)} folders matching '{folder_name}': {str(parsed_tests)}"
             
         except Exception as e:
-            return ToolException(f"Error getting tests by folder name: {str(e)}")
+            raise ToolException(f"Error getting tests by folder name: {str(e)}")
 
     @tool_group('read')
     def get_tests_by_folder_path(self, project_key: str, folder_path: str, include_subfolders: Optional[bool] = True,
@@ -1517,7 +1523,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             return f"Extracted {len(all_test_cases)} tests from folder path '{folder_path}': {str(parsed_tests)}"
             
         except Exception as e:
-            return ToolException(f"Error getting tests by folder path: {str(e)}")
+            raise ToolException(f"Error getting tests by folder path: {str(e)}")
 
     @tool_group('write')
     def update_test_steps(self, test_case_key: str, steps_updates: str) -> str:
@@ -1540,31 +1546,31 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             # Get current test steps
             current_steps = self._api.test_cases.get_test_steps(test_case_key)
             if not current_steps:
-                return ToolException(f"No test steps found for test case: {test_case_key}")
+                raise ToolException(f"No test steps found for test case: {test_case_key}")
             
             # Parse updates from JSON string
             try:
                 updates = json.loads(steps_updates)
                 if not isinstance(updates, list):
-                    return ToolException("Steps updates must be a JSON array")
+                    raise ToolException("Steps updates must be a JSON array")
             except json.JSONDecodeError as e:
-                return ToolException(f"Invalid JSON format for steps_updates: {str(e)}")
+                raise ToolException(f"Invalid JSON format for steps_updates: {str(e)}")
             
             # Apply updates to the steps
             for update in updates:
                 if 'index' not in update:
-                    return ToolException("Each update must contain an 'index' field")
+                    raise ToolException("Each update must contain an 'index' field")
                 
                 index = update.get('index')
                 if not isinstance(index, int) or index < 0 or index >= len(current_steps):
-                    return ToolException(f"Step index {index} is out of range. Valid range: 0-{len(current_steps)-1}")
+                    raise ToolException(f"Step index {index} is out of range. Valid range: 0-{len(current_steps)-1}")
                 
                 # Get the current step
                 step = current_steps[index]
                 
                 # Only update the inline field if it exists
                 if 'inline' not in step:
-                    return ToolException(f"Step at index {index} does not have an inline field")
+                    raise ToolException(f"Step at index {index} does not have an inline field")
                 
                 # Update the fields that are provided
                 if 'description' in update:
@@ -1583,7 +1589,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             
             return f"Test steps updated for test case `{test_case_key}`: {len(updates)} step(s) modified"
         except Exception as e:
-            return ToolException(f"Error updating test steps for test case {test_case_key}: {str(e)}")
+            raise ToolException(f"Error updating test steps for test case {test_case_key}: {str(e)}")
 
     @with_tool_groups
     @extend_with_parent_available_tools

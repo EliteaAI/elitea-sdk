@@ -84,25 +84,21 @@ class TestFilterHandling:
         wrapper._client.results.get_results_for_run_bulk.assert_called_once_with(run_id=10)
 
     def test_invalid_json_filter_returns_tool_exception(self, wrapper):
-        result = wrapper.get_results_for_run("10", result_filter="{not-json}")
+        with pytest.raises(ToolException, match="Invalid parameter for result_filter"):
+            wrapper.get_results_for_run("10", result_filter="{not-json}")
 
-        assert isinstance(result, ToolException)
-        assert "Invalid parameter for result_filter" in str(result)
         wrapper._client.results.get_results_for_run_bulk.assert_not_called()
 
     def test_non_str_non_dict_filter_returns_tool_exception(self, wrapper):
-        result = wrapper.get_results_for_run("10", result_filter=123)
-
-        assert isinstance(result, ToolException)
-        assert "must be a JSON string or dictionary" in str(result)
+        with pytest.raises(ToolException, match="must be a JSON string or dictionary"):
+            wrapper.get_results_for_run("10", result_filter=123)
 
     @pytest.mark.parametrize("bad", ["[1, 2]", "5", '"hi"', "null"])
     def test_json_string_parsing_to_non_object_returns_tool_exception(self, wrapper, bad):
         """A result_filter that is valid JSON but not an object must not crash with TypeError."""
-        result = wrapper.get_results_for_run("10", result_filter=bad)
+        with pytest.raises(ToolException, match="must be a JSON object"):
+            wrapper.get_results_for_run("10", result_filter=bad)
 
-        assert isinstance(result, ToolException)
-        assert "must be a JSON object" in str(result)
         wrapper._client.results.get_results_for_run_bulk.assert_not_called()
 
 
@@ -131,8 +127,8 @@ class TestResponseShapeAndFormats:
 
     def test_invalid_format_returns_tool_exception(self, wrapper):
         wrapper._client.results.get_results_for_run_bulk.return_value = [_result(1)]
-        out = wrapper.get_results_for_run("10", output_format="xml")
-        assert isinstance(out, ToolException) and "Invalid format" in str(out)
+        with pytest.raises(ToolException, match="Invalid format"):
+            wrapper.get_results_for_run("10", output_format="xml")
 
 
 class TestEmptyAndErrorsAndProjection:
@@ -146,9 +142,8 @@ class TestEmptyAndErrorsAndProjection:
         wrapper._client.results.get_results_for_run_bulk.side_effect = _status_code_error(
             code=400, body=b'{"error": "Field :run_id is not a valid test run."}'
         )
-        out = wrapper.get_results_for_run("999")
-        assert isinstance(out, ToolException)
-        assert "TestRail API error 400" in str(out)
+        with pytest.raises(ToolException, match="TestRail API error 400"):
+            wrapper.get_results_for_run("999")
 
     def test_non_allowlisted_non_custom_fields_dropped(self, wrapper):
         result = _result(1)
@@ -183,9 +178,9 @@ class TestGetResultsForCase:
         )
 
     def test_non_numeric_ids_return_tool_exception(self, wrapper):
-        out = wrapper.get_results_for_case("10", "abc")
-        assert isinstance(out, ToolException)
-        assert "run_id and case_id must be numeric" in str(out)
+        with pytest.raises(ToolException, match="run_id and case_id must be numeric"):
+            wrapper.get_results_for_case("10", "abc")
+
         wrapper._client.results.get_results_for_case_bulk.assert_not_called()
 
 
@@ -198,7 +193,7 @@ class TestGetResults:
         wrapper._client.results.get_results_bulk.assert_called_once_with(test_id=7, status_id=5)
 
     def test_non_numeric_test_id_returns_tool_exception(self, wrapper):
-        out = wrapper.get_results("abc")
-        assert isinstance(out, ToolException)
-        assert "test_id must be numeric" in str(out)
+        with pytest.raises(ToolException, match="test_id must be numeric"):
+            wrapper.get_results("abc")
+
         wrapper._client.results.get_results_bulk.assert_not_called()

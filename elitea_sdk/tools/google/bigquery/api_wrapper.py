@@ -26,13 +26,13 @@ def process_output(func):
         try:
             result = func(self, *args, **kwargs)
             if isinstance(result, Exception):
-                return ToolException(str(result))
+                raise ToolException(str(result))
             if isinstance(result, (dict, list)):
                 return json.dumps(result, default=str)
             return str(result)
         except Exception as e:
             logging.error(f"Error in '{func.__name__}': {str(e)}")
-            return ToolException(str(e))
+            raise ToolException(str(e))
 
     return wrapper
 
@@ -157,7 +157,7 @@ class BigQueryApiWrapper(BaseToolApiWrapper):
             return f"Vector index '{index_name}' created or already exists."
         except Exception as ex:
             logging.error(f"Vector index creation failed: {ex}")
-            return ToolException(f"Vector index creation failed: {ex}")
+            raise ToolException(f"Vector index creation failed: {ex}")
 
     @tool_group('read')
     @process_output

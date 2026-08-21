@@ -230,10 +230,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                     f"Error branch `{branch_name}` does not exist, "
                     f"in repo with current branches: {branch_list}"
                 )
-                return ToolException(msg)
+                raise ToolException(msg)
         except Exception as e:
             # Handle unexpected errors during branch fetching
-            return ToolException(f"Failed to validate branch '{branch_name}': {str(e)}")
+            raise ToolException(f"Failed to validate branch '{branch_name}': {str(e)}")
 
     @tool_group('read')
     def list_branches_in_repo(self, limit: Optional[int] = 20, branch_wildcard: Optional[str] = None) -> List[str]:
@@ -444,7 +444,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             # Pass through ToolExceptions as-is so callers can handle them uniformly.
             return e
         except Exception as e:
-            return ToolException(f"File was not updated due to error: {str(e)}")
+            raise ToolException(f"File was not updated due to error: {str(e)}")
 
     @tool_group('read')
     def get_pull_requests_commits(self, pr_id: str) -> List[Dict[str, Any]]:
@@ -459,7 +459,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             result = self._bitbucket.get_pull_request_commits(pr_id=pr_id)
             return result
         except Exception as e:
-            return ToolException(f"Can't get commits from pull request `{pr_id}` due to error:\n{str(e)}")
+            raise ToolException(f"Can't get commits from pull request `{pr_id}` due to error:\n{str(e)}")
 
     def get_pull_requests(self) -> List[Dict[str, Any]]:
         """
@@ -481,7 +481,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         try:
             return self._bitbucket.get_pull_request(pr_id=pr_id)
         except Exception as e:
-            return ToolException(f"Can't get pull request `{pr_id}` due to error:\n{str(e)}")
+            raise ToolException(f"Can't get pull request `{pr_id}` due to error:\n{str(e)}")
 
     @tool_group('read')
     def get_pull_requests_changes(self, pr_id: str) -> Dict[str, Any]:
@@ -495,7 +495,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         try:
             return self._bitbucket.get_pull_requests_changes(pr_id=pr_id)
         except Exception as e:
-            return ToolException(f"Can't get changes from pull request `{pr_id}` due to error:\n{str(e)}")
+            raise ToolException(f"Can't get changes from pull request `{pr_id}` due to error:\n{str(e)}")
 
     @tool_group('write')
     def add_pull_request_comment(self, pr_id: str, content, inline=None) -> str:
@@ -511,7 +511,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         try:
             return self._bitbucket.add_pull_request_comment(pr_id=pr_id, content=content, inline=inline)
         except Exception as e:
-            return ToolException(f"Can't add comment to pull request `{pr_id}` due to error:\n{str(e)}")
+            raise ToolException(f"Can't add comment to pull request `{pr_id}` due to error:\n{str(e)}")
 
     @tool_group('write')
     def close_pull_request(self, pr_id: str, message: str = None) -> str:
@@ -527,7 +527,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             result = self._bitbucket.close_pull_request(pr_id=pr_id, message=message)
             return f"Successfully closed pull request {pr_id}\n{str(result)}"
         except Exception as e:
-            return ToolException(f"Can't close pull request `{pr_id}` due to error:\n{str(e)}")
+            raise ToolException(f"Can't close pull request `{pr_id}` due to error:\n{str(e)}")
 
     def _get_files(self, path: str, branch: str, recursive: bool = True) -> str:
         """

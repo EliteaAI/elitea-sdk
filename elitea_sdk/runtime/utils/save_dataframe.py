@@ -45,6 +45,6 @@ def save_dataframe_to_artifact(
         )
     except Exception as e:
         logger.exception("Failed to save DataFrame to artifact repository")
-        return ToolException(
+        raise ToolException(
             f"Failed to save DataFrame to artifact repository: {str(e)}"
         )

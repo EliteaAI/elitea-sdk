@@ -216,7 +216,7 @@ def parse_payload_params(params: Optional[str]) -> Dict[str, Any]:
             return json.loads(params)
         except JSONDecodeError:
             stacktrace = traceback.format_exc()
-            return ToolException(f"Confluence tool exception. Passed params are not valid JSON. {stacktrace}")
+            raise ToolException(f"Confluence tool exception. Passed params are not valid JSON. {stacktrace}")
     return {}
 
 

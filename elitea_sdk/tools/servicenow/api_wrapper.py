@@ -81,7 +81,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
             incidents = self.parse_glide_results(gr._GlideRecord__results)
             return json.dumps(incidents)
         except Exception as e:
-            return ToolException(f"ServiceNow tool exception. {e}")
+            raise ToolException(f"ServiceNow tool exception. {e}")
 
     def parse_glide_results(self, results):
         parsed = []
@@ -103,7 +103,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
             incidents = self.parse_glide_results(gr._GlideRecord__results)
             return json.dumps(incidents)
         except Exception as e:
-            return ToolException(f"ServiceNow tool exception. {e}")
+            raise ToolException(f"ServiceNow tool exception. {e}")
 
     @tool_group('write')
     def update_incident(self, sys_id: str, update_fields: str) -> ToolException | str:
@@ -118,13 +118,13 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
         try:
             gr = self.client.GlideRecord('incident')
             if not gr.get(sys_id):
-                return ToolException(f"Incident with sys_id '{sys_id}' not found")
+                raise ToolException(f"Incident with sys_id '{sys_id}' not found")
             self._update_record(gr, json.loads(update_fields))
             gr.update()
             incidents = self.parse_glide_results(gr._GlideRecord__results)
             return json.dumps(incidents)
         except Exception as e:
-            return ToolException(f"ServiceNow tool exception. {e}")
+            raise ToolException(f"ServiceNow tool exception. {e}")
 
     def _update_record(self, gr: GlideRecord, data: dict):
         for field, value in data.items():

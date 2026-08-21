@@ -357,12 +357,18 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
             yield Document(page_content="", metadata=metadata)
 
     def _process_test_case(self, key) -> dict:
-        steps = self.get_test_case_test_steps(key)
-        if steps and not isinstance(steps, ToolException):
-            return {"steps": steps}
-        script = self.get_test_case_test_script(key)
-        if script and not isinstance(script, ToolException):
-            return {"script": script}
+        try:
+            steps = self.get_test_case_test_steps(key)
+            if steps:
+                return {"steps": steps}
+        except ToolException:
+            pass
+        try:
+            script = self.get_test_case_test_script(key)
+            if script:
+                return {"script": script}
+        except ToolException:
+            pass
         return {"empty": ""}
 
     @with_tool_groups

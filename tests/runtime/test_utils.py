@@ -6,6 +6,7 @@ import tempfile
 import os
 
 import pytest
+from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.utils.utils import clean_string
 from elitea_sdk.runtime.utils.save_dataframe import save_dataframe_to_artifact
@@ -32,8 +33,8 @@ def test_save_dataframe_failure():
     def raise_error(*a, **k):
         raise RuntimeError('fail')
     mock_wrapper.create_file.side_effect = raise_error
-    err = save_dataframe_to_artifact(mock_wrapper, df, 'file.csv')
-    assert err.args[0].startswith('Failed to save DataFrame')
+    with pytest.raises(ToolException, match='Failed to save DataFrame'):
+        save_dataframe_to_artifact(mock_wrapper, df, 'file.csv')
 
 def test_evaluate_template():
     et = EvaluateTemplate('{{ value }}', {'value': 'ok'})

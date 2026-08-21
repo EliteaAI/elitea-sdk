@@ -529,31 +529,31 @@ class TestGetImageByUrl:
 
     def test_malformed_url(self):
         wrapper = _make_wrapper()
-        assert isinstance(wrapper.get_image_by_url("not a url"), ToolException)
+        with pytest.raises(ToolException):
+            wrapper.get_image_by_url("not a url")
 
     def test_non_attachment_path_rejected(self):
         wrapper = _make_wrapper()
-        result = wrapper.get_image_by_url("https://dev.azure.com/MyOrg/Proj/_apis/wit/workitems/1")
-        assert isinstance(result, ToolException)
+        with pytest.raises(ToolException):
+            wrapper.get_image_by_url("https://dev.azure.com/MyOrg/Proj/_apis/wit/workitems/1")
         wrapper._client.get_attachment_content.assert_not_called()
 
     def test_data_uri_rejected(self):
         wrapper = _make_wrapper()
-        result = wrapper.get_image_by_url("data:image/png;base64,AAAA")
-        assert isinstance(result, ToolException)
+        with pytest.raises(ToolException):
+            wrapper.get_image_by_url("data:image/png;base64,AAAA")
         wrapper._client.get_attachment_content.assert_not_called()
 
     def test_no_llm(self):
         wrapper = _make_wrapper()
         wrapper.llm = None
-        result = wrapper.get_image_by_url(_org_img())
-        assert isinstance(result, ToolException)
-        assert "LLM" in str(result)
+        with pytest.raises(ToolException, match="LLM"):
+            wrapper.get_image_by_url(_org_img())
 
     def test_unsupported_extension_before_download(self):
         wrapper = _make_wrapper()
-        result = wrapper.get_image_by_url(_org_img(name="doc.pdf"))
-        assert isinstance(result, ToolException)
+        with pytest.raises(ToolException):
+            wrapper.get_image_by_url(_org_img(name="doc.pdf"))
         wrapper._client.get_attachment_content.assert_not_called()
 
     def test_oversize_streaming_abort(self, monkeypatch):
@@ -562,9 +562,8 @@ class TestGetImageByUrl:
         stream = _stream(b"x" * (10 * _MB), chunk_size=_MB)
         wrapper = _make_wrapper()
         wrapper._client.get_attachment_content.side_effect = _router({"guid1": stream})
-        result = wrapper.get_image_by_url(_org_img())
-        assert isinstance(result, ToolException)
-        assert "exceeds the 5 MB" in str(result)
+        with pytest.raises(ToolException, match="exceeds the 5 MB"):
+            wrapper.get_image_by_url(_org_img())
         parser.assert_not_called()
         assert stream.consumed == 6
 
@@ -574,9 +573,8 @@ class TestGetImageByUrl:
         monkeypatch.setattr(wrapper_module, '_MAX_IMAGE_PIXELS_FOR_LLM', 0)
         wrapper = _make_wrapper()
         wrapper._client.get_attachment_content.side_effect = _router({"guid1": _stream(_TINY_PNG)})
-        result = wrapper.get_image_by_url(_org_img())
-        assert isinstance(result, ToolException)
-        assert "dimensions" in str(result)
+        with pytest.raises(ToolException, match="dimensions"):
+            wrapper.get_image_by_url(_org_img())
         parser.assert_not_called()
 
     def test_svg_canvas_bomb_rejected(self, monkeypatch):
@@ -584,25 +582,23 @@ class TestGetImageByUrl:
         monkeypatch.setattr(wrapper_module, 'parse_file_content', parser)
         wrapper = _make_wrapper()
         wrapper._client.get_attachment_content.side_effect = _router({"guid1": _stream(_HUGE_SVG)})
-        result = wrapper.get_image_by_url(_org_img(name="diagram.svg"))
-        assert isinstance(result, ToolException)
+        with pytest.raises(ToolException):
+            wrapper.get_image_by_url(_org_img(name="diagram.svg"))
         parser.assert_not_called()
 
     def test_download_error_returns_tool_exception(self, monkeypatch):
         monkeypatch.setattr(wrapper_module, 'parse_file_content', _fake_parser())
         wrapper = _make_wrapper()
         wrapper._client.get_attachment_content.side_effect = _router({"guid1": RuntimeError("boom")})
-        result = wrapper.get_image_by_url(_org_img())
-        assert isinstance(result, ToolException)
-        assert "boom" in str(result)
+        with pytest.raises(ToolException, match="boom"):
+            wrapper.get_image_by_url(_org_img())
 
     def test_client_not_initialized(self, monkeypatch):
         monkeypatch.setattr(wrapper_module, 'parse_file_content', _fake_parser())
         wrapper = _make_wrapper()
         object.__setattr__(wrapper, '_client', None)
-        result = wrapper.get_image_by_url(_org_img())
-        assert isinstance(result, ToolException)
-        assert "client not initialized" in str(result)
+        with pytest.raises(ToolException, match="client not initialized"):
+            wrapper.get_image_by_url(_org_img())
 
     def test_missing_filename_needs_param(self, monkeypatch):
         parser = _fake_parser("described")
@@ -610,7 +606,8 @@ class TestGetImageByUrl:
         url = f"{ORG_URL}/Proj/_apis/wit/attachments/guid1"
         wrapper = _make_wrapper()
         wrapper._client.get_attachment_content.side_effect = _router({"guid1": _stream(_TINY_PNG)})
-        assert isinstance(wrapper.get_image_by_url(url), ToolException)
+        with pytest.raises(ToolException):
+            wrapper.get_image_by_url(url)
         assert wrapper.get_image_by_url(url, file_name="a.png") == "described"
 
 
@@ -840,7 +837,7 @@ class TestIndexerImagePass:
     def test_all_note_kinds_are_image_notes(self, monkeypatch):
         monkeypatch.setattr(
             wrapper_module, 'parse_file_content',
-            MagicMock(return_value=ToolException("Not supported type of files entered.")))
+            MagicMock(side_effect=ToolException("Not supported type of files entered.")))
         wrapper = _make_wrapper()
         wrapper._client.get_attachment_content.side_effect = _router({"guid1": _stream(_TINY_PNG)})
         notes = {
