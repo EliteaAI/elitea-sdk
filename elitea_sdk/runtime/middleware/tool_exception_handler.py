@@ -29,10 +29,17 @@ from functools import wraps
 from typing import List, Optional, Dict, Any, Callable
 
 from elitea_sdk.runtime.exceptions import budget_exceeded_from
+from elitea_sdk.runtime.tool_outcome import (
+    ToolOutcome,
+    ToolResultStatus,
+    classify_tool_error,
+    retriable_for,
+)
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langgraph.errors import GraphBubbleUp
 
+from ..langchain.utils import log_tool_result
 from .base import Middleware
 from .strategies import (
     ExceptionHandlerStrategy,
@@ -44,6 +51,11 @@ from .strategies import (
 from ..tools.application import Application
 
 logger = logging.getLogger(__name__)
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    """Tool metadata is free-form, and the envelope must never fail validation on it."""
+    return value if isinstance(value, str) else None
 
 
 class ToolExceptionHandlerMiddleware(Middleware):
@@ -207,6 +219,8 @@ When a tool fails with an error:
                     kwargs=kwargs
                 )
 
+                self._classify_into(context)
+
                 # Execute strategies in sequence
                 try:
                     for strategy in self.strategies:
@@ -216,8 +230,7 @@ When a tool fails with an error:
                     # Re-raise as-is
                     raise
 
-                # Return formatted error message from context
-                return context.error_message or str(e)
+                return self._finalize_outcome(context).message
 
         # Create wrapped tool with same metadata
         try:
@@ -227,6 +240,9 @@ When a tool fails with an error:
                 description=tool.description,
                 args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None,
                 return_direct=getattr(tool, 'return_direct', False),
+                # Load-bearing for the MCP proxies: McpAuthorizationRequired is a
+                # ToolException, so False is what lets the OAuth HITL flow propagate.
+                handle_tool_error=getattr(tool, 'handle_tool_error', False),
             )
 
             # Route pydantic ValidationError through the same strategy pipeline
@@ -240,12 +256,13 @@ When a tool fails with an error:
                     args=(),
                     kwargs={}
                 )
+                self._classify_into(context)
                 try:
                     for strategy in self.strategies:
                         context = strategy.handle_exception(context)
                 except ToolException:
                     raise
-                return context.error_message or str(e)
+                return self._finalize_outcome(context).message
 
             wrapped_tool.handle_validation_error = _route_validation_error
 
@@ -267,6 +284,35 @@ When a tool fails with an error:
         except Exception as e:
             logger.error(f"Failed to wrap tool '{tool.name}': {e}", exc_info=True)
             return tool  # Return original tool if wrapping fails
+
+    def _classify_into(self, context: ExceptionContext) -> None:
+        """Classify before the strategies run, since a strategy may gate on error_class."""
+        error_class = classify_tool_error(context.error)
+        context.metadata['error_class'] = error_class
+        context.metadata['retriable'] = retriable_for(error_class)
+        context.metadata['exception_type'] = context.error_type
+
+    def _finalize_outcome(self, context: ExceptionContext) -> ToolOutcome:
+        """Assemble the envelope once the message is final. message is a pass-through."""
+        tool_metadata = getattr(context.tool, 'metadata', None) or {}
+        outcome = ToolOutcome(
+            status=ToolResultStatus.ERROR,
+            message=context.error_message or context.error_str,
+            tool_name=_str_or_none(context.tool_name),
+            error_class=context.metadata.get('error_class'),
+            retriable=bool(context.metadata.get('retriable', False)),
+            exception_type=_str_or_none(context.metadata.get('exception_type')),
+            toolkit_type=_str_or_none(tool_metadata.get('toolkit_type')),
+        )
+        log_tool_result(
+            logger, type(self).__name__, outcome.tool_name,
+            tool_metadata.get('toolkit_id'),
+            # message is excluded so the classified fields survive the preview cap;
+            # the prose is already logged as the node's response.
+            outcome.model_dump(mode='json', exclude={'message'}),
+            label='error outcome',
+        )
+        return outcome
 
     def _get_tool_function(self, tool: BaseTool) -> Callable:
         """Extract the callable function from a tool."""
