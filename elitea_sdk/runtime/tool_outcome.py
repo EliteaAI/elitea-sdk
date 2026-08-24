@@ -4,7 +4,7 @@ Consumers (the LLM, the ToolMessage on the wire, a pipeline node's state) read t
 fields instead of each re-deriving them by substring-matching an error string.
 """
 from enum import Enum
-from typing import Optional
+from typing import Iterator, Optional
 
 from pydantic import BaseModel
 
@@ -66,6 +66,8 @@ _POLICY_NAMES = frozenset({
 # (401) and went unclassified until this existed.
 _STATUS_ATTRS = ("status", "status_code")
 _POLICY_STATUSES = frozenset({401, 403})
+# 429 spans a rate-limit window (waiting resolves it) and an exhausted plan quota (waiting
+# does not); HTTP cannot tell them apart, so the common case wins and retriable stays coarse.
 _INFRASTRUCTURE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 # Last resort, and deliberately narrow: no bare status codes, which appear in ordinary
@@ -133,6 +135,26 @@ def _class_from_exception(exc: BaseException) -> Optional[ToolErrorClass]:
     return None
 
 
+def _chain(exc: BaseException) -> Iterator[BaseException]:
+    """The exception, then the causes behind it, nearest first and depth-capped.
+
+    Toolkits overwhelmingly `raise ToolException(f"... {e}")` inside an except block, which
+    loses the type from the string but leaves __context__ set even without `from e`.
+    """
+    current, depth = exc, 0
+    while current is not None and depth <= _MAX_CHAIN_DEPTH:
+        yield current
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            # `raise X from None`: the raiser judged the context misleading, and reading it
+            # anyway would contradict them — often publishing retriable on a caller error.
+            current = None
+        else:
+            current = current.__context__
+        depth += 1
+
+
 def classify_tool_error(exc: BaseException) -> Optional[ToolErrorClass]:
     """Classify a tool failure, or return None when nothing reliable says what it was.
 
@@ -140,21 +162,10 @@ def classify_tool_error(exc: BaseException) -> Optional[ToolErrorClass]:
     substring matching only as a fallback, and None rather than a guess — an
     unclassified error is strictly better than a wrong label a consumer branches on.
     """
-    from_exception = _class_from_exception(exc)
-    if from_exception is not None:
-        return from_exception
-
-    # Toolkits overwhelmingly `raise ToolException(f"... {e}")` inside an except block,
-    # which loses the type in the string but leaves __context__ set even without `from e`.
-    current, depth = exc, 0
-    while depth < _MAX_CHAIN_DEPTH:
-        current = current.__cause__ or current.__context__
-        if current is None:
-            break
-        from_chain = _class_from_exception(current)
-        if from_chain is not None:
-            return from_chain
-        depth += 1
+    for link in _chain(exc):
+        from_exception = _class_from_exception(link)
+        if from_exception is not None:
+            return from_exception
 
     text = str(exc).lower()
     if any(phrase in text for phrase in _POLICY_PHRASES):
@@ -165,5 +176,6 @@ def classify_tool_error(exc: BaseException) -> Optional[ToolErrorClass]:
 
 
 def retriable_for(error_class: Optional[ToolErrorClass]) -> bool:
-    """Only a transient environment failure is worth retrying with identical input."""
+    """Whether retrying identical input could ever succeed — not whether to retry now.
+    Nothing in the SDK acts on this; it is published for consumers outside the epic."""
     return error_class is ToolErrorClass.INFRASTRUCTURE

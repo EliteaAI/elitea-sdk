@@ -238,6 +238,35 @@ class TestClassifyByChain:
         except ValueError as outer:
             assert classify_tool_error(outer) is ToolErrorClass.INPUT
 
+    def test_suppressed_context_is_not_read(self):
+        """`raise X from None` sets __suppress_context__ but leaves __context__ populated.
+
+        Reading it anyway contradicts the raiser, who used `from None` precisely because
+        the context was misleading. Here that is not merely a wrong label: the caller
+        error would inherit the ConnectionError's retriable=True and invite a retry of
+        input that can never succeed.
+        """
+        try:
+            try:
+                raise ConnectionError("connection refused")
+            except ConnectionError:
+                raise ToolException("Repo name is malformed") from None
+        except ToolException as wrapped:
+            assert wrapped.__context__ is not None
+            assert classify_tool_error(wrapped) is None
+
+    def test_explicit_cause_still_wins_over_suppression(self):
+        """`from e` sets both __cause__ and __suppress_context__; the cause must still be
+        read, or the suppression guard would silently disable the whole explicit path."""
+        try:
+            try:
+                raise TimeoutError("deadline exceeded")
+            except TimeoutError as e:
+                raise ToolException("wrapped") from e
+        except ToolException as wrapped:
+            assert wrapped.__suppress_context__ is True
+            assert classify_tool_error(wrapped) is ToolErrorClass.INFRASTRUCTURE
+
     def test_chain_walk_is_depth_capped(self):
         """A chain deeper than the cap is a re-wrap we do not model; stop rather than dig."""
         exc = ConnectionError("connection refused")

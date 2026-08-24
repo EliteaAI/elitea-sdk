@@ -223,8 +223,7 @@ When a tool fails with an error:
 
                 # Execute strategies in sequence
                 try:
-                    for strategy in self.strategies:
-                        context = strategy.handle_exception(context)
+                    context = self._run_strategies(context)
                 except ToolException:
                     # Strategy raised ToolException (e.g., circuit breaker)
                     # Re-raise as-is
@@ -258,8 +257,7 @@ When a tool fails with an error:
                 )
                 self._classify_into(context)
                 try:
-                    for strategy in self.strategies:
-                        context = strategy.handle_exception(context)
+                    context = self._run_strategies(context)
                 except ToolException:
                     raise
                 return self._finalize_outcome(context).message
@@ -284,6 +282,17 @@ When a tool fails with an error:
         except Exception as e:
             logger.error(f"Failed to wrap tool '{tool.name}': {e}", exc_info=True)
             return tool  # Return original tool if wrapping fails
+
+    def _run_strategies(self, context: ExceptionContext) -> ExceptionContext:
+        """A strategy may return a replacement context instead of mutating this one; carry
+        the metadata over so neither later strategies nor the envelope lose the facts."""
+        for strategy in self.strategies:
+            result = strategy.handle_exception(context)
+            if result is not context:
+                # The replacement's own keys win; it may have classified more precisely.
+                result.metadata = {**context.metadata, **result.metadata}
+            context = result
+        return context
 
     def _classify_into(self, context: ExceptionContext) -> None:
         """Classify before the strategies run, since a strategy may gate on error_class."""

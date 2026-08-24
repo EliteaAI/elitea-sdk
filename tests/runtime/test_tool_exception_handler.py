@@ -345,6 +345,9 @@ class TestOutcomeEnvelope:
         assert outcome.retriable is True
         assert outcome.exception_type == "ConnectionError"
         assert outcome.toolkit_type == "github"
+        # Declared for sub-items 6-8, deliberately without a producer here: nothing in the
+        # epic retries, so a parsed delay would be a field no consumer could act on.
+        assert outcome.retry_after is None
 
     def test_message_falls_back_to_the_raw_error_string(self):
         """Pass-through of the pre-envelope `context.error_message or str(e)`."""
@@ -367,6 +370,100 @@ class TestOutcomeEnvelope:
         middleware._classify_into(context)
 
         assert middleware._finalize_outcome(context).toolkit_type is None
+
+
+class TestClassificationSurvivesAReplacementContext:
+    """`handle_exception(context) -> ExceptionContext` and the loop reassigns, so a
+    strategy may legally return a *new* context rather than mutating the one it was given
+    — test_validation_error_routes_through_strategies already does exactly that. None of
+    the three shipped strategies do, so this is latent rather than live; but a replacement
+    silently dropped the classification, and an envelope reporting retriable=False for a
+    ConnectionError is worse than one reporting nothing, since sub-items 6-8 publish it.
+    """
+
+    @staticmethod
+    def _replacing_strategy(tool, message="replacement message"):
+        strategy = MagicMock()
+        strategy.handle_exception.return_value = ExceptionContext(
+            tool=tool, error=ValueError("unrelated"), args=(), kwargs={},
+            error_message=message,
+        )
+        return strategy
+
+    def test_replacement_context_keeps_the_classified_facts(self):
+        tool = _make_tool()
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[self._replacing_strategy(tool)]
+        )
+        context = ExceptionContext(
+            tool=tool, error=ConnectionError("connection refused"), args=(), kwargs={},
+        )
+        middleware._classify_into(context)
+
+        outcome = middleware._finalize_outcome(middleware._run_strategies(context))
+
+        # The replacement still owns the prose — carrying metadata must not undo that.
+        assert outcome.message == "replacement message"
+        assert outcome.error_class is ToolErrorClass.INFRASTRUCTURE
+        assert outcome.retriable is True
+        assert outcome.exception_type == "ConnectionError"
+
+    def test_a_later_strategy_still_sees_the_classification(self):
+        """Why the carry-over happens per hop and not once after the loop: classification
+        runs before the strategies precisely so a strategy can gate on error_class, and a
+        mid-chain replacement would otherwise blind every strategy behind it."""
+        tool = _make_tool()
+        probe = _ProbeStrategy()
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[self._replacing_strategy(tool), probe]
+        )
+        context = ExceptionContext(
+            tool=tool, error=ConnectionError("connection refused"), args=(), kwargs={},
+        )
+        middleware._classify_into(context)
+
+        middleware._run_strategies(context)
+
+        assert probe.seen['error_class'] is ToolErrorClass.INFRASTRUCTURE
+
+    def test_replacement_may_override_the_classification(self):
+        """The replacement's own keys win, so a strategy that classifies more precisely
+        than the generic classifier is not overwritten by it."""
+        tool = _make_tool()
+        strategy = self._replacing_strategy(tool)
+        strategy.handle_exception.return_value.metadata = {
+            'error_class': ToolErrorClass.POLICY, 'retriable': False,
+        }
+        middleware = ToolExceptionHandlerMiddleware(strategies=[strategy])
+        context = ExceptionContext(
+            tool=tool, error=ConnectionError("connection refused"), args=(), kwargs={},
+        )
+        middleware._classify_into(context)
+
+        outcome = middleware._finalize_outcome(middleware._run_strategies(context))
+
+        assert outcome.error_class is ToolErrorClass.POLICY
+        assert outcome.retriable is False
+
+    def test_validation_error_path_uses_the_same_loop(self):
+        """The two finalisation points are separate code; a fix to one is not a fix to
+        the other unless they share the traversal."""
+        tool = _make_tool()
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[self._replacing_strategy(tool, "validation prose")]
+        )
+        wrapped = middleware.wrap_tool(tool)
+
+        # _route_validation_error returns only prose, so intercept the envelope itself.
+        recorded = []
+        original = middleware._finalize_outcome
+        middleware._finalize_outcome = lambda ctx: recorded.append(original(ctx)) or recorded[-1]
+
+        result = wrapped.run({"issue_number": PydanticUndefined})
+
+        assert result == "validation prose"
+        assert recorded[-1].error_class is ToolErrorClass.INPUT
+        assert recorded[-1].exception_type == "ValidationError"
 
 
 class TestPipelineFailureShapes:
