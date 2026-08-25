@@ -1729,3 +1729,72 @@ class TestSynthesizeStructuredRouting:
             node._synthesize_structured(
                 MagicMock(), [HumanMessage(content="q")], struct_model, {}
             )
+
+
+class TestStructuredOutputResultFiltering:
+    """Issue #6375: Anthropic's dict-schema path (see __get_struct_output_model)
+    returns raw tool-call arguments with no Pydantic model to filter them
+    through. Any extra key the LLM includes must not leak into the state
+    update — only the node's own declared output fields (+ ELITEA_RS) may
+    pass through.
+    """
+
+    def _make_pipeline_llm_node(self, output_variables):
+        return LLMNode(
+            name="LLM 1",
+            description="test",
+            input_variables=["input"],
+            input_mapping={
+                "chat_history": {"type": "fixed", "value": []},
+                "system": {"type": "fixed", "value": "story taller"},
+                "task": {"type": "fixed", "value": 'tell a one line story, provide in json format {"story":"value"}'},
+            },
+            output_variables=output_variables,
+            structured_output=True,
+            structured_output_dict={var: "str" for var in output_variables},
+        )
+
+    def test_leaked_key_not_in_declared_output_is_dropped(self):
+        """Extra key ('story') matching an unrelated pipeline variable, but not
+        declared as this node's output, must be filtered out of the result."""
+        node = self._make_pipeline_llm_node(["additionalContext"])
+        node.client = MagicMock()
+
+        # Simulates Anthropic's unfiltered dict-schema return: contains the
+        # declared field, the always-present ELITEA_RS field, AND a leaked
+        # "story" key the LLM invented because its own task prompt mentioned it.
+        leaked_dict = {"additionalContext": "", ELITEA_RS: "Once upon a time...", "story": "Once upon a time..."}
+
+        def fake_invoke_with_structured_output(llm_client, messages, struct_model, config):
+            return leaked_dict, None, messages
+
+        node._invoke_with_structured_output = fake_invoke_with_structured_output
+
+        result = node._invoke_llm_internal(
+            {"input": "go", "messages": [], "additionalContext": "", "story": ""},
+            {},
+            [],
+        )
+
+        assert "story" not in result
+        assert result["additionalContext"] == ""
+
+    def test_declared_output_key_still_passes_through(self):
+        """Sanity check: a key that IS declared as this node's output must
+        still make it into the result after filtering."""
+        node = self._make_pipeline_llm_node(["story"])
+        node.client = MagicMock()
+
+        leaked_dict = {"story": "Once upon a time...", ELITEA_RS: "Once upon a time..."}
+
+        node._invoke_with_structured_output = lambda llm_client, messages, struct_model, config: (
+            leaked_dict, None, messages
+        )
+
+        result = node._invoke_llm_internal(
+            {"input": "go", "messages": [], "story": ""},
+            {},
+            [],
+        )
+
+        assert result["story"] == "Once upon a time..."

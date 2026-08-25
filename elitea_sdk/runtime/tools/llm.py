@@ -1377,6 +1377,19 @@ class LLMNode(BaseTool):
             # Google / extraction-fallback all yield Pydantic instances.
             # Either way, the consumer wants a dict.
             result = completion if isinstance(completion, dict) else completion.model_dump()
+
+            # Anthropic's dict-schema path (see __get_struct_output_model) hands
+            # back the raw tool-call arguments with no Pydantic model to filter
+            # them through, so any extra key the LLM includes in its JSON output
+            # (e.g. because the node's own prompt mentions a differently-named
+            # field) passes straight into ``result`` and later gets merged into
+            # the graph state, silently overwriting an unrelated pipeline
+            # variable that happens to share that name (#6375). Restrict to the
+            # node's declared schema fields for every provider so this can't
+            # happen even where Pydantic validation was already filtering it.
+            allowed_keys = set(struct_model.model_fields.keys())
+            result = {k: v for k, v in result.items() if k in allowed_keys}
+
             result = self._format_structured_output_result(result, final_messages, initial_completion or completion)
 
             # Prepend middleware updates to messages for checkpoint
