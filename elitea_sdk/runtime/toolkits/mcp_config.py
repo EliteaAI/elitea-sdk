@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from ..utils.mcp_oauth import substitute_mcp_placeholders
 from ..utils.mcp_oauth import canonical_resource, mcp_alternate_resource, normalize_mcp_url
+from ..utils.failure_signals import mcp_is_error, log_shadow_failure
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,16 @@ def _create_stdio_tool_func(original_tool_name: str, server_name: str, server_co
                     # Call the tool directly
                     logger.debug(f"[MCP Config] Calling tool {original_tool_name} with args: {clean_args}")
                     result = await session.call_tool(original_tool_name, clean_args)
+
+                    # Shadow-mode only: detect isError, never changes the returned value (see #6168)
+                    if mcp_is_error(result):
+                        log_shadow_failure(
+                            logger,
+                            detected_by="mcp_is_error/stdio",
+                            toolkit_name=server_name,
+                            tool_name=original_tool_name,
+                            result_len=len(str(result)),
+                        )
 
                     # Format the result
                     if hasattr(result, 'content') and result.content:

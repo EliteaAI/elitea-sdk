@@ -114,6 +114,27 @@ def _inject_display_metadata(tool_conf: dict, toolkit_tools: list) -> None:
             _patch_tool_invoke(t)
 
 
+def _inject_toolkit_metadata(tool_conf: dict, toolkit_tools: list) -> None:
+    """Inject `toolkit_id`/`toolkit_type` into each tool's metadata dict.
+
+    Unlike `_inject_toolkit_id`, this targets `t.metadata` (read by strategies.py,
+    tool_exception_handler.py, etc.) rather than `t.api_wrapper.toolkit_id`, so it
+    also covers provider/dynamic-module toolkits that have no `api_wrapper`.
+    """
+    toolkit_id = tool_conf.get('id')
+    toolkit_type = tool_conf.get('type')
+    for t in toolkit_tools:
+        if not hasattr(t, 'metadata'):
+            continue
+        if t.metadata is None:
+            t.metadata = {}
+        if isinstance(t.metadata, dict):
+            if toolkit_id is not None:
+                t.metadata['toolkit_id'] = toolkit_id
+            if toolkit_type is not None:
+                t.metadata['toolkit_type'] = toolkit_type
+
+
 def _safe_import_tool(tool_name, module_path, get_tools_name=None, toolkit_class_name=None):
     """Safely import a tool module and register available functions/classes."""
     try:
@@ -316,6 +337,8 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
         _inject_toolkit_id(tool, toolkit_tools)
         # Inject user-friendly display_name for chip label rendering
         _inject_display_metadata(tool, toolkit_tools)
+        # Inject toolkit_id/toolkit_type into metadata too, for tools with no api_wrapper (see #6168)
+        _inject_toolkit_metadata(tool, toolkit_tools)
         tools.extend(toolkit_tools)
 
     return tools
