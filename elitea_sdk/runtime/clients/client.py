@@ -799,6 +799,32 @@ class EliteAClient:
         except Exception as e:
             logger.warning(f"Failed to auto-inject SensitiveToolGuardMiddleware: {e}")
 
+    def _inject_tool_exception_handler(
+        self,
+        middleware_list: list,
+        conversation_id: Optional[str],
+        llm: Optional[ChatOpenAI],
+    ) -> None:
+        """Inject the tool exception handler. Unconditional: TEHM owns error shaping for
+        every call path, so there is no flag to gate it on."""
+        try:
+            if any(isinstance(mw, ToolExceptionHandlerMiddleware) for mw in middleware_list):
+                return
+
+            error_handler = ToolExceptionHandlerMiddleware(
+                strategies=[
+                    TransformErrorStrategy(
+                        llm_factory=lambda: self.get_low_tier_llm() or llm,
+                        return_detailed_errors=False,
+                    ),
+                    LoggingStrategy()
+                ],
+                conversation_id=conversation_id
+            )
+            middleware_list.append(error_handler)
+        except Exception as e:
+            logger.warning(f"Failed to auto-inject ToolExceptionHandlerMiddleware: {e}")
+
     def application(self, application_id: int, application_version_id: int,
                     tools: Optional[list] = None, chat_history: Optional[List[Any]] = None,
                     app_type=None, memory=None, runtime='langchain',
@@ -807,7 +833,7 @@ class EliteAClient:
                     llm: Optional[ChatOpenAI] = None, mcp_tokens: Optional[dict] = None,
                     conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None,
                     is_subgraph: bool = False, middleware: Optional[list] = None,
-                    exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
+                    context_settings: Optional[dict] = None,
                     auto_approve_sensitive_actions: bool = False,
                     openai_compatible: Optional[bool] = None,
                     child_dispatcher: Optional[Any] = None,
@@ -881,19 +907,7 @@ class EliteAClient:
         self._inject_sensitive_tool_guard(middleware_list, conversation_id, auto_approve_sensitive_actions)
 
         # add ToolExceptionHandlerMiddleware to handle tool errors with LLM messages
-        # Can be disabled by setting exception_handling_enabled=False
-        if exception_handling_enabled:
-            error_handler = ToolExceptionHandlerMiddleware(
-                strategies=[
-                    TransformErrorStrategy(
-                        llm=self.get_low_tier_llm() or llm,
-                        return_detailed_errors=False
-                    ),
-                    LoggingStrategy()
-                ],
-                conversation_id=conversation_id
-            )
-            middleware_list.append(error_handler)
+        self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
 
         # Extract lazy_tools_mode from internal_tools (it's a mode flag, not an actual tool)
         # UI stores it in meta.internal_tools array, not as meta.lazy_tools_mode boolean
@@ -1255,7 +1269,7 @@ class EliteAClient:
                       mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None,
                       ignored_mcp_servers: Optional[list] = None, persona: Optional[str] = "generic",
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
-                      exception_handling_enabled: bool = False, context_settings: Optional[dict] = None,
+                      context_settings: Optional[dict] = None,
                       step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
                       child_dispatcher: Optional[Any] = None,
                       independent_parallel_hitl: bool = True,
@@ -1281,7 +1295,6 @@ class EliteAClient:
             lazy_tools_mode: Enable lazy tools mode to reduce token usage with many toolkits (default: False)
             internal_tools: Optional list of internal tool names (e.g., ['swarm', 'planner']).
                            Enables special modes like swarm for multi-agent collaboration.
-            exception_handling_enabled: Enable automatic exception handling with ToolExceptionHandlerMiddleware (default: False)
             context_settings: Optional context params
             step_limit: Optional maximum number of tool execution iterations (default: 25).
                        Use to limit or extend how many tool calls the agent can make per turn.
@@ -1325,19 +1338,7 @@ class EliteAClient:
             logger.info(f"Auto-created PlanningMiddleware for predict agent (conversation_id={conversation_id})")
 
         # Add ToolExceptionHandlerMiddleware to handle tool errors with LLM messages
-        # Can be disabled by setting exception_handling_enabled=False
-        if exception_handling_enabled:
-            error_handler = ToolExceptionHandlerMiddleware(
-                strategies=[
-                    TransformErrorStrategy(
-                        llm=self.get_low_tier_llm() or llm,
-                        return_detailed_errors=False
-                    ),
-                    LoggingStrategy()
-                ],
-                conversation_id=conversation_id
-            )
-            middleware_list.append(error_handler)
+        self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
 
         # Automatically compresses conversation history when a threshold is exceeded
         self._inject_summarization(middleware_list, context_settings, conversation_id)

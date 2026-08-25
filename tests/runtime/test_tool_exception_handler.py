@@ -1,3 +1,5 @@
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -170,6 +172,10 @@ def _failing_func(issue_number: str, title: str = "default") -> str:
     raise RuntimeError("connection refused")
 
 
+def _failing_input_func(issue_number: str, title: str = "default") -> str:
+    raise ValueError("issue_number must be numeric")
+
+
 class _StubLLM:
     """Minimal stand-in for a chat model.
 
@@ -229,7 +235,57 @@ class TestErrorProseIsByteStable:
         middleware = ToolExceptionHandlerMiddleware(
             strategies=[TransformErrorStrategy(llm=_StubLLM("STUB REWRITE")), LoggingStrategy()]
         )
+        wrapped = middleware.wrap_tool(_make_tool(func=_failing_input_func))
+
+        result = wrapped.run({"issue_number": "42"})
+
+        assert result == (
+            "STUB REWRITE\n"
+            "\n"
+            "*IMPORTANT*: if fixing logic is clear - you can re-try tool execution "
+            "according to fix.\n"
+            "If you continue experiencing issues, please [contact support]"
+            "(https://elitea.ai/docs/support/contact-support/)"
+        )
+
+
+class TestEnrichmentGatedOnErrorClass:
+    """#6167: an INFRASTRUCTURE error gains nothing from an LLM rewrite of the same
+    fact the template already states, so TransformErrorStrategy skips the LLM call
+    entirely for that one class. Everything else, including an unclassified error,
+    still enriches."""
+
+    @patch("elitea_sdk.runtime.utils.tool_code_extractor.extract_tool_code", return_value=None)
+    @patch("elitea_sdk.runtime.utils.tool_code_loader.load_tool_code", return_value=None)
+    @patch("elitea_sdk.runtime.middleware.faq_fetcher.get_toolkit_faq", return_value=None)
+    def test_infrastructure_error_stays_on_the_template_path(self, _faq, _load_code, _extract_code):
+        stub = _StubLLM("STUB REWRITE")
+        stub.invoke = MagicMock(wraps=stub.invoke)
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[TransformErrorStrategy(llm=stub), LoggingStrategy()]
+        )
         wrapped = middleware.wrap_tool(_make_tool(func=_failing_func))
+
+        result = wrapped.run({"issue_number": "42"})
+
+        assert result == (
+            "Tool 'update_issue' failed.\n"
+            "\n"
+            "Error: connection refused\n"
+            "\n"
+            "Please check the input parameters and try again, "
+            "or use an alternative approach."
+        )
+        stub.invoke.assert_not_called()
+
+    @patch("elitea_sdk.runtime.utils.tool_code_extractor.extract_tool_code", return_value=None)
+    @patch("elitea_sdk.runtime.utils.tool_code_loader.load_tool_code", return_value=None)
+    @patch("elitea_sdk.runtime.middleware.faq_fetcher.get_toolkit_faq", return_value=None)
+    def test_input_error_still_enriches(self, _faq, _load_code, _extract_code):
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[TransformErrorStrategy(llm=_StubLLM("STUB REWRITE")), LoggingStrategy()]
+        )
+        wrapped = middleware.wrap_tool(_make_tool(func=_failing_input_func))
 
         result = wrapped.run({"issue_number": "42"})
 
@@ -264,6 +320,25 @@ class TestHandleToolErrorSurvivesTheRebuild:
         wrapped = _make_middleware().wrap_tool(_make_tool())
 
         assert wrapped.handle_tool_error is False
+
+
+class TestHandleToolErrorPolicy:
+    """#6167 Part B: False everywhere, no per-tool opt-out — TEHM owns error shaping.
+
+    A grep guard rather than an AST one: the value lives in a class-body annotation
+    or a kwarg, not an import, so there is no single node type to walk.
+    """
+
+    def test_no_source_file_sets_handle_tool_error_true(self):
+        pattern = re.compile(r"handle_tool_error\s*[:=].*True")
+        source_root = Path(__file__).resolve().parents[2] / "elitea_sdk"
+
+        hits = [
+            str(path) for path in source_root.rglob("*.py")
+            if pattern.search(path.read_text())
+        ]
+
+        assert not hits
 
 
 class _ProbeStrategy:

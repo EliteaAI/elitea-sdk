@@ -176,13 +176,6 @@ When a tool fails with an error:
                 # Execute original tool
                 result = original_func(*args, **kwargs)
 
-                # Check if result is a ToolException object (not raised, but returned)
-                if isinstance(result, ToolException):
-                    logger.warning(
-                        f"Tool '{tool.name}' returned ToolException object instead of raising it, raising now"
-                    )
-                    raise result
-
                 # Success - notify all strategies
                 for strategy in self.strategies:
                     try:
@@ -239,8 +232,8 @@ When a tool fails with an error:
                 description=tool.description,
                 args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None,
                 return_direct=getattr(tool, 'return_direct', False),
-                # Load-bearing for the MCP proxies: McpAuthorizationRequired is a
-                # ToolException, so False is what lets the OAuth HITL flow propagate.
+                # Preserved from the original tool, defaulting to False — every shipped
+                # tool gets False, which is what lets McpAuthorizationRequired propagate.
                 handle_tool_error=getattr(tool, 'handle_tool_error', False),
             )
 

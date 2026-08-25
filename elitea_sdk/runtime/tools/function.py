@@ -558,7 +558,7 @@ alita_client = elitea_client
                             "messages": [{
                                 "role": "assistant",
                                 "content": safe_serialize(tool_result)
-                                if not isinstance(tool_result, ToolException) and not isinstance(tool_result, str)
+                                if not isinstance(tool_result, str)
                                 else str(tool_result)
                             }]
                         }
