@@ -36,6 +36,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool, ToolException
 
+from ..tool_outcome import ToolErrorClass
 from ..utils.prompts_loader import TransformErrorPrompts
 from ..langchain.langraph_agent import normalize_message_content
 
@@ -138,7 +139,8 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
     def __init__(
         self,
         llm: Optional[BaseChatModel] = None,
-        return_detailed_errors: bool = False
+        return_detailed_errors: bool = False,
+        llm_factory: Optional[Callable[[], Optional[BaseChatModel]]] = None,
     ):
         """
         Initialize transform strategy.
@@ -146,33 +148,48 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
         Args:
             llm: LLM instance for generating human-readable errors
             return_detailed_errors: Include stack traces in errors (debug mode)
+            llm_factory: Resolved once, on first use, instead of at construction —
+                lets callers defer the low-tier LLM's HTTP round-trips until an error
+                actually needs enriching
         """
         self.llm = llm
         self.return_detailed_errors = return_detailed_errors
+        self._llm_factory = llm_factory
+        self._llm_resolved = False
 
         logger.debug(
             f"TransformErrorStrategy initialized: "
             f"detailed={self.return_detailed_errors}"
         )
 
+    def _resolve_llm(self) -> Optional[BaseChatModel]:
+        """Call the factory at most once, even if it returns None."""
+        if not self._llm_resolved:
+            if self._llm_factory is not None:
+                self.llm = self._llm_factory()
+            self._llm_resolved = True
+        return self.llm
+
     def handle_exception(self, context: ExceptionContext) -> ExceptionContext:
         """Generate user-friendly error message."""
-        # Try LLM transformation first if enabled
-        if self.llm:
-            try:
-                human_error = self._generate_llm_error(context)
-                if human_error:
-                    context.error_message = (f'{human_error}\n\n*IMPORTANT*: if fixing logic is clear - you can re-try tool execution according to fix.\n'
-                                             f'If you continue experiencing issues, please [contact support](https://elitea.ai/docs/support/contact-support/)')
-                    logger.debug(
-                        f"Generated LLM error for '{context.tool_name}': "
-                        f"{human_error[:100]}..."
+        # Rewriting a timeout adds nothing the template does not already say, and the
+        # template keeps the raw error text a reader of an infra failure actually wants.
+        if context.metadata.get('error_class') is not ToolErrorClass.INFRASTRUCTURE:
+            if self._resolve_llm():
+                try:
+                    human_error = self._generate_llm_error(context)
+                    if human_error:
+                        context.error_message = (f'{human_error}\n\n*IMPORTANT*: if fixing logic is clear - you can re-try tool execution according to fix.\n'
+                                                 f'If you continue experiencing issues, please [contact support](https://elitea.ai/docs/support/contact-support/)')
+                        logger.debug(
+                            f"Generated LLM error for '{context.tool_name}': "
+                            f"{human_error[:100]}..."
+                        )
+                        return context
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to generate LLM error message: {e}, falling back"
                     )
-                    return context
-            except Exception as e:
-                logger.warning(
-                    f"Failed to generate LLM error message: {e}, falling back"
-                )
 
         # Fallback to template-based message
         context.error_message = self._generate_template_error(context)
