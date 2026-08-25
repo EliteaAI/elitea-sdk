@@ -122,6 +122,34 @@ GetCommitsModel = create_model(
     author=(Optional[str], Field(description="Author name", default=None)),
 )
 
+# Issue #6212: GitLab MR metadata tools for metrics workflows (throughput,
+# cycle time, aging, rejection rate, self-merge, review lag), without falling
+# back to raw diff-only get_pr_changes.
+ListMergeRequestsModel = create_model(
+    "ListMergeRequestsModel",
+    state=(Optional[str], Field(default="all", description="Merge request state filter: opened | merged | closed | all")),
+    page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when all=True)")),
+    per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when all=True)")),
+    created_after=(Optional[str], Field(default=None, description="Return MRs created after this ISO datetime")),
+    created_before=(Optional[str], Field(default=None, description="Return MRs created before this ISO datetime")),
+    updated_after=(Optional[str], Field(default=None, description="Return MRs updated after this ISO datetime")),
+    updated_before=(Optional[str], Field(default=None, description="Return MRs updated before this ISO datetime")),
+    target_branch=(Optional[str], Field(default=None, description="Filter by target branch")),
+    source_branch=(Optional[str], Field(default=None, description="Filter by source branch")),
+    author_username=(Optional[str], Field(default=None, description="Filter by author username")),
+    labels=(Optional[str], Field(default=None, description="Comma-separated list of labels to filter by")),
+    include_details=(bool, Field(default=False, description="If True, include heavier fields (assignees, reviewers) for each MR")),
+    all=(bool, Field(default=False, description="If True, fetch all pages instead of a single page")),
+)
+GetMergeRequestModel = create_model(
+    "GetMergeRequestModel",
+    pr_number=(int, Field(description="GitLab Merge Request (Pull Request) IID")),
+    include_discussions=(bool, Field(default=False, description="If True, include discussion/notes summary (heavier payload)")),
+    include_approvals=(bool, Field(default=False, description="If True, include approval state (heavier payload)")),
+    include_pipelines=(bool, Field(default=False, description="If True, include latest pipeline status (heavier payload)")),
+    include_commits=(bool, Field(default=False, description="If True, include the list of commits (heavier payload)")),
+)
+
 class GitLabAPIWrapper(CodeIndexerToolkit):
     url: str
     repository: str
@@ -751,6 +779,209 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             for commit in commits
         ]
 
+    @staticmethod
+    def _safe_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Defensive attribute access for GitLab user-like dicts (#6212).
+
+        GitLab API responses may omit fields depending on instance version
+        or permissions, so we never hard-fail on a missing key.
+        """
+        if not user:
+            return None
+        return {
+            "id": user.get("id"),
+            "username": user.get("username"),
+            "name": user.get("name"),
+        }
+
+    @classmethod
+    def _normalize_mr(cls, mr: Any, include_details: bool = False) -> Dict[str, Any]:
+        """Normalize a python-gitlab MR object into a compact, stable dict.
+
+        Only lightweight/metadata fields are included by default (#6212).
+        Raw diff content is never included here - use get_pr_changes for that.
+        """
+        data = mr.attributes if hasattr(mr, "attributes") else mr
+        result: Dict[str, Any] = {
+            "id": data.get("id"),
+            "iid": data.get("iid"),
+            "title": data.get("title"),
+            "web_url": data.get("web_url"),
+            "state": data.get("state"),
+            "draft": data.get("draft", data.get("work_in_progress")),
+            "created_at": data.get("created_at"),
+            "updated_at": data.get("updated_at"),
+            "merged_at": data.get("merged_at"),
+            "closed_at": data.get("closed_at"),
+            "source_branch": data.get("source_branch"),
+            "target_branch": data.get("target_branch"),
+            "author": cls._safe_user(data.get("author")),
+            "merge_user": cls._safe_user(data.get("merge_user") or data.get("merged_by")),
+            "labels": data.get("labels"),
+            "sha": data.get("sha"),
+            "merge_commit_sha": data.get("merge_commit_sha"),
+        }
+        if include_details:
+            result["assignees"] = [cls._safe_user(a) for a in (data.get("assignees") or [])]
+            result["reviewers"] = [cls._safe_user(r) for r in (data.get("reviewers") or [])]
+        return result
+
+    @tool_group('read')
+    def list_merge_requests(
+        self,
+        state: Optional[str] = "all",
+        page: Optional[int] = None,
+        per_page: Optional[int] = 20,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        updated_before: Optional[str] = None,
+        target_branch: Optional[str] = None,
+        source_branch: Optional[str] = None,
+        author_username: Optional[str] = None,
+        labels: Optional[str] = None,
+        include_details: bool = False,
+        all: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        List merge requests with compact metadata for analytics/metrics workflows (#6212).
+
+        Supports filtering by state, time window (created/updated), branches,
+        author and labels. Returns compact structured dictionaries (no raw
+        diff content) so it is safe to use for throughput, cycle time, MR
+        aging, rejection rate and self-merge calculations.
+
+        Parameters:
+            state: opened | merged | closed | all
+            page: Page number (ignored when all=True)
+            per_page: Results per page (ignored when all=True)
+            created_after: ISO datetime lower bound on created_at
+            created_before: ISO datetime upper bound on created_at
+            updated_after: ISO datetime lower bound on updated_at
+            updated_before: ISO datetime upper bound on updated_at
+            target_branch: Filter by target branch
+            source_branch: Filter by source branch
+            author_username: Filter by author username
+            labels: Comma-separated labels to filter by
+            include_details: Include assignees/reviewers when True
+            all: Fetch all pages when True
+
+        Returns:
+            List of compact MR metadata dictionaries.
+        """
+        params: Dict[str, Any] = {}
+        if state and state != "all":
+            params["state"] = state
+        if created_after:
+            params["created_after"] = created_after
+        if created_before:
+            params["created_before"] = created_before
+        if updated_after:
+            params["updated_after"] = updated_after
+        if updated_before:
+            params["updated_before"] = updated_before
+        if target_branch:
+            params["target_branch"] = target_branch
+        if source_branch:
+            params["source_branch"] = source_branch
+        if author_username:
+            params["author_username"] = author_username
+        if labels:
+            params["labels"] = labels
+
+        try:
+            if all:
+                params["all"] = True
+            else:
+                params["page"] = page or 1
+                params["per_page"] = per_page or 20
+            mrs = self.repo_instance.mergerequests.list(**params)
+            return [self._normalize_mr(mr, include_details=include_details) for mr in mrs]
+        except Exception as e:
+            raise ToolException(f"Unable to list merge requests due to error:\n{e}")
+
+    @tool_group('read')
+    def get_merge_request(
+        self,
+        pr_number: int,
+        include_discussions: bool = False,
+        include_approvals: bool = False,
+        include_pipelines: bool = False,
+        include_commits: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Get compact metadata for a single merge request (#6212).
+
+        Returns structured MR metadata (no raw diff) by default. Heavier
+        optional fields (discussions, approvals, pipelines, commits) are only
+        included when explicitly requested via the corresponding flags.
+
+        Parameters:
+            pr_number: GitLab Merge Request (Pull Request) IID
+            include_discussions: Include a compact discussions/notes summary
+            include_approvals: Include approval state
+            include_pipelines: Include latest pipeline status
+            include_commits: Include the list of commits
+
+        Returns:
+            Dict of compact MR metadata, optionally extended with requested
+            heavy fields.
+        """
+        try:
+            mr = self.repo_instance.mergerequests.get(pr_number)
+        except GitlabGetError as e:
+            if e.response_code == 404:
+                raise ToolException(f"Merge request number {pr_number} wasn't found: {e}")
+            raise ToolException(f"Error retrieving merge request {pr_number}: {e}")
+        except Exception as e:
+            raise ToolException(f"Error retrieving merge request {pr_number}: {e}")
+
+        result = self._normalize_mr(mr, include_details=True)
+        result["description"] = getattr(mr, "description", None)
+
+        if include_discussions:
+            try:
+                discussions = mr.discussions.list(get_all=True)
+                result["discussions"] = [
+                    {
+                        "id": d.id,
+                        "notes_count": len(d.attributes.get("notes", []) or []),
+                    }
+                    for d in discussions
+                ]
+            except Exception as e:
+                result["discussions"] = f"Unable to retrieve discussions: {e}"
+
+        if include_approvals:
+            try:
+                approvals = mr.approvals.get()
+                result["approvals"] = {
+                    "approved": getattr(approvals, "approved", None),
+                    "approved_by": [self._safe_user(a.get("user")) for a in getattr(approvals, "approved_by", []) or []],
+                }
+            except Exception as e:
+                result["approvals"] = f"Unable to retrieve approvals: {e}"
+
+        if include_pipelines:
+            try:
+                pipelines = mr.pipelines.list(get_all=False)
+                latest = pipelines[0] if pipelines else None
+                result["pipeline"] = (
+                    {"id": latest.id, "status": latest.status, "web_url": getattr(latest, "web_url", None)}
+                    if latest else None
+                )
+            except Exception as e:
+                result["pipeline"] = f"Unable to retrieve pipeline status: {e}"
+
+        if include_commits:
+            try:
+                commits = mr.commits()
+                result["commits"] = [{"sha": c.id, "message": c.message} for c in commits]
+            except Exception as e:
+                result["commits"] = f"Unable to retrieve commits: {e}"
+
+        return result
+
     @with_tool_groups
     @extend_with_parent_available_tools
     @extend_with_file_operations
@@ -869,5 +1100,17 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
                 "ref": self.get_commits,
                 "description": "Retrieve a list of commits from the repository.",
                 "args_schema": GetCommitsModel,
+            },
+            {
+                "name": "list_merge_requests",
+                "ref": self.list_merge_requests,
+                "description": self.list_merge_requests.__doc__ or "List merge requests with compact metadata for analytics/metrics workflows.",
+                "args_schema": ListMergeRequestsModel,
+            },
+            {
+                "name": "get_merge_request",
+                "ref": self.get_merge_request,
+                "description": self.get_merge_request.__doc__ or "Get compact metadata for a single merge request.",
+                "args_schema": GetMergeRequestModel,
             }
         ]
