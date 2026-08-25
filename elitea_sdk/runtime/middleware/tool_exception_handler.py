@@ -232,8 +232,8 @@ When a tool fails with an error:
                 description=tool.description,
                 args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None,
                 return_direct=getattr(tool, 'return_direct', False),
-                # Policy: False everywhere — TEHM owns error shaping, and MCP's
-                # McpAuthorizationRequired (a ToolException) must propagate, not be stringified.
+                # Preserved from the original tool, defaulting to False — every shipped
+                # tool gets False, which is what lets McpAuthorizationRequired propagate.
                 handle_tool_error=getattr(tool, 'handle_tool_error', False),
             )
 
