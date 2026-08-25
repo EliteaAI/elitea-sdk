@@ -125,37 +125,85 @@ JiraSearch = create_model(
         ),
     )))
 
+def _jira_deployment_mode(cloud: Optional[bool], api_version: Optional[str]) -> str:
+    """Map (cloud, api_version) to one of 'server_dc_v2', 'cloud_v2', 'cloud_v3'."""
+    if cloud and str(api_version) == '3':
+        return 'cloud_v3'
+    if cloud:
+        return 'cloud_v2'
+    return 'server_dc_v2'
+
+
+_ISSUE_JSON_COMMON_RULES = (
+    "*IMPORTANT*: Return a raw JSON object as text. Do NOT wrap the whole payload in quotes "
+    "(no double-encoding) and do NOT use markdown code fences (```). The payload must start "
+    "with '{' and end with '}', and must contain a top-level 'fields' object with all JSON "
+    "keys double-quoted.\n"
+    "Escape-heavy content warning: if the content contains many backslashes/quotes, JSON or "
+    "regex snippets, Windows paths, or literal '\\n' examples, prefer a plain-text 'description' "
+    "(in server_dc_v2/cloud_v2 modes) rather than embedding that content inside ADF or "
+    "over-escaping a JSON string.\n"
+    "Omit 'update' entirely unless the user explicitly asked for issue linking or another Jira "
+    "update operation - malformed 'update' blocks are a common cause of create failures. If used, "
+    "it must follow Jira's exact API structure, e.g. {\"update\": {\"labels\": [{\"add\": \"x\"}]}}."
+)
+
+_DESCRIPTION_MODE_GUIDANCE = {
+    'server_dc_v2': (
+        "Deployment mode: Server/Data Center (API v2). 'description' should default to a plain "
+        "string; plain text is preferred. Wiki markup may be used when formatting is needed. "
+        "Literal '\\n' newline characters inside the string are valid.\n"
+        "Example: {\"fields\": {\"project\": {\"key\": \"PROJ\"}, \"summary\": \"Issue title\", "
+        "\"description\": \"Summary:\\nDetails go here.\\n\\nSteps:\\n1. First\\n2. Second\", "
+        "\"issuetype\": {\"name\": \"Task\"}}}"
+    ),
+    'cloud_v2': (
+        "Deployment mode: Cloud (API v2). 'description' should default to a plain string; plain "
+        "text is preferred for LLM-generated content. Literal '\\n' newline characters inside the "
+        "string are valid.\n"
+        "Example: {\"fields\": {\"project\": {\"key\": \"PROJ\"}, \"summary\": \"Issue title\", "
+        "\"description\": \"Summary:\\nDetails go here.\", \"issuetype\": {\"name\": \"Task\"}}}"
+    ),
+    'cloud_v3': (
+        "Deployment mode: Cloud (API v3). When rich-text formatting is required, 'description' "
+        "should be generated as Atlassian Document Format (ADF); otherwise a plain string is fine. "
+        "Do NOT use '\\n' or '\\\\n' inside ADF 'text' nodes to represent formatting - use "
+        "structural nodes such as 'hardBreak' and separate 'paragraph' blocks instead.\n"
+        "Valid example: {\"fields\": {\"project\": {\"key\": \"PROJ\"}, \"summary\": \"Issue title\", "
+        "\"description\": {\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"paragraph\", "
+        "\"content\": [{\"type\": \"text\", \"text\": \"Summary:\"}, {\"type\": \"hardBreak\"}, "
+        "{\"type\": \"text\", \"text\": \"Details go here.\"}]}]}, \"issuetype\": {\"name\": \"Task\"}}}\n"
+        "Anti-pattern (do NOT do this): {\"type\": \"text\", \"text\": \"Summary:\\\\nDetails go here.\"} "
+        "- the '\\\\n' here does not render as a line break in ADF."
+    ),
+}
+
+
+def _issue_json_field_description(mode: str, for_update: bool) -> str:
+    mode_guidance = _DESCRIPTION_MODE_GUIDANCE.get(mode, _DESCRIPTION_MODE_GUIDANCE['server_dc_v2'])
+    if for_update:
+        intro = (
+            "JSON string to update a Jira issue. Must contain 'key' (issue key) and at least one of "
+            "'fields' or 'update' objects."
+        )
+    else:
+        intro = (
+            "Pure JSON string to create a Jira issue. Must contain a 'fields' object with at minimum: "
+            "'project' (key), 'summary', 'issuetype' (name), and optionally 'description', 'priority', etc."
+        )
+    return f"{intro}\n{mode_guidance}\n{_ISSUE_JSON_COMMON_RULES}"
+
+
 JiraCreateIssue = create_model(
     "JiraCreateIssueModel",
     issue_json=(str, Field(
-        description=("Pure JSON string to create a Jira issue. Must contain a 'fields' object with at minimum: "
-                     "'project' (key), 'summary', 'issuetype' (name), and optionally 'description', 'priority', etc.\n"
-                     "For 'description' field: use Atlassian Document Format (ADF) as the preferred format, "
-                     "e.g. {\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"paragraph\", "
-                     "\"content\": [{\"type\": \"text\", \"text\": \"your text\"}]}]}. "
-                     "If ADF is not accepted, fall back to a plain text string.\n"
-                     "Example: {\"fields\": {\"project\": {\"key\": \"PROJ\"}, \"summary\": \"Issue title\", "
-                     "\"description\": {\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"paragraph\", "
-                     "\"content\": [{\"type\": \"text\", \"text\": \"Description text\"}]}]}, "
-                     "\"issuetype\": {\"name\": \"Task\"}, \"priority\": {\"name\": \"Major\"}}}\n"
-                     "*IMPORTANT*: All JSON keys must be double-quoted and it should not have any '```' at very beginning or end."))))
+        description=_issue_json_field_description('server_dc_v2', for_update=False))))
 
 
 JiraUpdateIssue = create_model(
     "JiraUpdateIssueModel",
     issue_json=(str, Field(
-        description=("JSON string to update a Jira issue. Must contain 'key' (issue key) and at least one of "
-                     "'fields' or 'update' objects.\n"
-                     "For 'description' and other rich-text fields: use Atlassian Document Format (ADF) as the "
-                     "preferred format, e.g. {\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"paragraph\", "
-                     "\"content\": [{\"type\": \"text\", \"text\": \"your text\"}]}]}. "
-                     "If ADF is not accepted, fall back to a plain text string.\n"
-                     "Example: {\"key\": \"PROJ-123\", \"fields\": {\"summary\": \"Updated title\", "
-                     "\"description\": {\"type\": \"doc\", \"version\": 1, \"content\": [{\"type\": \"paragraph\", "
-                     "\"content\": [{\"type\": \"text\", \"text\": \"Updated description\"}]}]}}, "
-                     "\"update\": {\"labels\": [{\"add\": \"new-label\"}]}}\n"
-                     "*IMPORTANT*: All JSON keys must be double-quoted.")
-    )))
+        description=_issue_json_field_description('server_dc_v2', for_update=True))))
 
 AddCommentInput = create_model(
     "AddCommentInputModel",
@@ -426,6 +474,54 @@ def clean_json_string(json_string):
     if match:
         return match.group(1)
     return json_string
+
+_FENCE_PATTERN = re.compile(r'^```(?:json)?\s*(.*?)\s*```$', re.DOTALL)
+
+
+def normalize_and_parse_issue_json(issue_json: str) -> Dict[str, Any]:
+    """
+    Parse an LLM-generated issue payload into a dict, recovering from the most
+    common malformed shapes: markdown-fenced JSON, prose wrapped around the
+    JSON object, and one extra layer of JSON string-encoding.
+    """
+    if not isinstance(issue_json, str):
+        raise ToolException("issue_json must be a JSON string, e.g. '{\"fields\": {...}}'.")
+
+    text = issue_json.strip()
+    fence_match = _FENCE_PATTERN.match(text)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    try:
+        parsed = json.loads(text)
+    except JSONDecodeError:
+        cleaned = clean_json_string(text)
+        try:
+            parsed = json.loads(cleaned)
+        except JSONDecodeError as e:
+            raise ToolException(
+                f"issue_json is not valid JSON ({e}). Return a raw JSON object as text: it must "
+                "start with '{' and end with '}', must not be wrapped in quotes, and must not be "
+                "wrapped in markdown code fences (```)."
+            )
+
+    if isinstance(parsed, str):
+        inner = clean_json_string(parsed.strip())
+        try:
+            parsed = json.loads(inner)
+        except JSONDecodeError as e:
+            raise ToolException(
+                f"issue_json appears to be a double-encoded JSON string ({e}). Return the raw "
+                "JSON object directly, not a JSON string that itself contains JSON."
+            )
+
+    if not isinstance(parsed, dict):
+        raise ToolException(
+            f"issue_json must decode to a JSON object containing a top-level 'fields' object, "
+            f"got {type(parsed).__name__} instead."
+        )
+
+    return parsed
+
 
 def parse_payload_params(params: Optional[str]) -> Dict[str, Any]:
     if params:
@@ -820,7 +916,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """ Create an issue in Jira."""
         client = self._get_client()
         try:
-            params = json.loads(issue_json)
+            params = normalize_and_parse_issue_json(issue_json)
             self.create_issue_validate(params)
             # used in case linkage via `update` is required
             update = dict(params["update"]) if (params.get("update")) is not None else None
@@ -842,7 +938,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         client = self._get_client()
         try:
             self.set_issue_status_validate(issue_key, status_name)
-            fields = json.loads(mandatory_fields_json)
+            fields = normalize_and_parse_issue_json(mandatory_fields_json)
             # prepare field block
             fields_data = dict(fields["update"]) if (fields.get("update")) is not None else None
             # prepare update block
@@ -865,7 +961,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             IMPORTANT: default labels won't be changed
         """
         try:
-            params = json.loads(issue_json)
+            params = normalize_and_parse_issue_json(issue_json)
             self.update_issue_validate(params)
             key = params["key"]
             update_body = {"fields": dict(params["fields"])} if params.get("fields") else {}
@@ -886,8 +982,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
     def update_issue(self, issue_json: str):
         """ Update an issue in Jira."""
         client = self._get_client()
-        params = json.loads(issue_json)
-        key = params["key"]
+        try:
+            params = normalize_and_parse_issue_json(issue_json)
+        except ToolException as e:
+            return e
+        key = params.get("key")
+        if key is None:
+            return ToolException("Jira issue key is required to update an issue. Ask user to provide it.")
         result = self._update_issue(client, issue_json)
         self._add_default_labels(issue_key=key)
         return result
@@ -2388,6 +2489,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
     @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
+        mode = _jira_deployment_mode(getattr(self, 'cloud', None), getattr(self, 'api_version', '2'))
+        create_issue_schema = create_model(
+            "JiraCreateIssueModel",
+            issue_json=(str, Field(description=_issue_json_field_description(mode, for_update=False))))
+        update_issue_schema = create_model(
+            "JiraUpdateIssueModel",
+            issue_json=(str, Field(description=_issue_json_field_description(mode, for_update=True))))
         return [
             {
                 "name": "search_using_jql",
@@ -2398,13 +2506,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             {
                 "name": "create_issue",
                 "description": self.create_issue.__doc__,
-                "args_schema": JiraCreateIssue,
+                "args_schema": create_issue_schema,
                 "ref": self.create_issue,
             },
             {
                 "name": "update_issue",
                 "description": self.update_issue.__doc__,
-                "args_schema": JiraUpdateIssue,
+                "args_schema": update_issue_schema,
                 "ref": self.update_issue,
             },
             {
