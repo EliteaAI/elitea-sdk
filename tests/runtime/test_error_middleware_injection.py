@@ -95,6 +95,20 @@ class TestUnconditionalInjection:
         assert sum(isinstance(mw, ToolExceptionHandlerMiddleware) for mw in middleware) == 1
 
 
+class TestCallerSuppliedTehmIsRespected:
+    """Unconditional injection must not double up on a TEHM the caller already built —
+    that's exactly the class docstring's own documented usage pattern, and assistant.py
+    rejects more than one instance."""
+
+    def test_application_keeps_the_callers_instance_only(self):
+        caller_tehm = ToolExceptionHandlerMiddleware(strategies=[MagicMock()])
+
+        middleware = _capture_application_middleware(_make_client(), middleware=[caller_tehm])
+
+        tehms = [mw for mw in middleware if isinstance(mw, ToolExceptionHandlerMiddleware)]
+        assert tehms == [caller_tehm]
+
+
 def _make_failing_tool():
     """A StructuredTool whose call raises ValueError -> ToolErrorClass.INPUT, which
     enriches (unlike INFRASTRUCTURE), so it drives the LLM factory."""

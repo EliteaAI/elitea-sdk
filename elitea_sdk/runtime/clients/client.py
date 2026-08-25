@@ -808,6 +808,9 @@ class EliteAClient:
         """Inject the tool exception handler. Unconditional: TEHM owns error shaping for
         every call path, so there is no flag to gate it on."""
         try:
+            if any(isinstance(mw, ToolExceptionHandlerMiddleware) for mw in middleware_list):
+                return
+
             error_handler = ToolExceptionHandlerMiddleware(
                 strategies=[
                     TransformErrorStrategy(
