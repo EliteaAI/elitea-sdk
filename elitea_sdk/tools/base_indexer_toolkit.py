@@ -1810,10 +1810,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata = copy.deepcopy(index_meta_raw.get("metadata", {}))
             # indexed_chunks = chunks stored in the vector store. Counting scans the
             # whole collection, so a caller that only moves updated_on keeps the
-            # previous number rather than making the tenant's database pay for it.
+            # previous number rather than making the tenant's database pay for it —
+            # and must leave every derived count alone too, since the row a platform
+            # dispatch creates carries none of them yet.
             if refresh_counts:
                 metadata["indexed_chunks"] = self.get_indexed_count(index_name)
-            metadata["updated"] = result
+            if refresh_counts:
+                metadata["updated"] = result
             # Promote a successful completion to 'scheduled_reindex' when the run was
             # triggered by the platform scheduler AND the index had already been built
             # before. At this point the history still carries the current run as
@@ -1875,7 +1878,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     # Non-code indexer: items_processed is all fetched, skipped is subset
                     metadata["total"] = items_processed
                     metadata["indexed"] = docs_count if docs_count is not None else items_processed - total_skipped
-            elif report is None:
+            elif report is None and refresh_counts:
                 metadata["indexed"] = metadata["indexed_chunks"]
             else:
                 # A failed run leaves both counts alone: the store still holds and
