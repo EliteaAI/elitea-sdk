@@ -75,6 +75,19 @@ class TestIndexMetaHeartbeatTimer:
 
         assert wrapper.index_meta_update.call_count == after_exit
 
+    def test_teardown_returns_even_if_a_tick_is_stuck_in_a_write(self):
+        # This teardown runs inside index_data: waiting on a hung write would hang the
+        # run itself, leaving exactly the abandoned row this heartbeat prevents.
+        wrapper = _wrapper()
+        wrapper.index_meta_update.side_effect = lambda *a, **k: time.sleep(30)
+
+        started = time.monotonic()
+        with wrapper._index_meta_heartbeat("idx", interval=0.01):
+            time.sleep(0.1)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15
+
     def test_tick_failure_does_not_break_loading(self):
         wrapper = _wrapper()
         wrapper.index_meta_update.side_effect = RuntimeError("db gone")

@@ -714,11 +714,23 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             yield
         finally:
             stop.set()
-            with write_lock:
+            # Bounded: this teardown sits inside index_data, so waiting on a tick that
+            # is itself stuck in a slow write would hang the run it is reporting on —
+            # producing the abandoned row the heartbeat exists to prevent.
+            acquired = write_lock.acquire(timeout=5)
+            try:
                 # The throttle is shared with the chunk-saving loop, whose first
                 # progress write depends on this index having no recorded write yet.
                 getattr(self, "_index_meta_last_update_time", {}).pop(index_name, None)
+            finally:
+                if acquired:
+                    write_lock.release()
             thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning(
+                    f"Load-phase heartbeat for index '{index_name}' did not stop within 5s; "
+                    f"one in-flight tick may still land"
+                )
 
     def get_indexing_stats(self) -> Optional[IndexingStats]:
         """Get the indexing statistics from the current or last indexing run."""
