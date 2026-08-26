@@ -60,6 +60,21 @@ class TestIndexMetaHeartbeatTimer:
             for thread in threading.enumerate()
         )
 
+    def test_a_slow_tick_cannot_land_after_teardown(self):
+        # Otherwise it re-creates the bug this whole change exists to fix: a write
+        # arriving after the run's terminal state puts the row back to in_progress.
+        wrapper = _wrapper()
+        released = threading.Event()
+        wrapper.index_meta_update.side_effect = lambda *a, **k: released.wait(2)
+
+        with wrapper._index_meta_heartbeat("idx", interval=0.01):
+            time.sleep(0.1)
+        after_exit = wrapper.index_meta_update.call_count
+        released.set()
+        time.sleep(0.1)
+
+        assert wrapper.index_meta_update.call_count == after_exit
+
     def test_tick_failure_does_not_break_loading(self):
         wrapper = _wrapper()
         wrapper.index_meta_update.side_effect = RuntimeError("db gone")

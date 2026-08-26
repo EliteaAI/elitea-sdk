@@ -693,29 +693,32 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         def _tick():
             while not stop.wait(interval):
-                try:
-                    self.index_meta_update(
-                        index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, 0,
-                        update_force=False, refresh_counts=False,
-                    )
-                except Exception as exc:  # best-effort, do not break loading
-                    logger.warning(f"Load-phase heartbeat failed for index '{index_name}': {exc}")
+                # Held across the write so a tick that entered a slow one cannot land
+                # after teardown and put the row back to in_progress — over the run's
+                # own terminal state, or over a user's Stop.
+                with write_lock:
+                    if stop.is_set():
+                        return
+                    try:
+                        self.index_meta_update(
+                            index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, 0,
+                            update_force=False, refresh_counts=False,
+                        )
+                    except Exception as exc:  # best-effort, do not break loading
+                        logger.warning(f"Load-phase heartbeat failed for index '{index_name}': {exc}")
 
+        write_lock = threading.Lock()
         thread = threading.Thread(target=_tick, name=f"index-heartbeat-{index_name}", daemon=True)
         thread.start()
         try:
             yield
         finally:
             stop.set()
+            with write_lock:
+                # The throttle is shared with the chunk-saving loop, whose first
+                # progress write depends on this index having no recorded write yet.
+                getattr(self, "_index_meta_last_update_time", {}).pop(index_name, None)
             thread.join(timeout=5)
-            # The throttle is shared with the chunk-saving loop, whose first progress
-            # write depends on this index having no recorded write yet.
-            getattr(self, "_index_meta_last_update_time", {}).pop(index_name, None)
-            if thread.is_alive():
-                logger.warning(
-                    f"Load-phase heartbeat for index '{index_name}' did not stop within 5s; "
-                    f"one in-flight tick may still land"
-                )
 
     def get_indexing_stats(self) -> Optional[IndexingStats]:
         """Get the indexing statistics from the current or last indexing run."""
