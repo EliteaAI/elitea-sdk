@@ -596,8 +596,6 @@ def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]
 
 DEFAULT_CUT_OFF = 0.1
 INDEX_META_UPDATE_INTERVAL = 600.0
-# Load-phase ticker cadence; actual write frequency is still bounded by
-# INDEX_META_UPDATE_INTERVAL through index_meta_update's throttle.
 LOAD_HEARTBEAT_INTERVAL = 60.0
 
 class IndexTools(str, Enum):
@@ -678,19 +676,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     @contextmanager
     def _index_meta_heartbeat(self, index_name: str, interval: float = LOAD_HEARTBEAT_INTERVAL):
-        """Tick index_meta.updated_on on a timer for the whole load phase.
+        """Report progress on a timer while documents are being loaded.
 
-        Loading is the longest phase with no other `updated_on` writes, and most
-        loaders bulk-fetch their entire source before the first yield, so a
-        per-document tick would miss the work that actually takes hours — and a
-        single hung request produces no documents at all. A timer covers both,
-        while keeping the row's writer count at one: the main thread issues no
-        meta writes during the drain. Each tick still goes through
-        index_meta_update's own throttle.
+        Timed rather than per-document because most loaders fetch their whole source
+        before yielding anything, and a hung request yields nothing at all. Ticks pass
+        through index_meta_update's throttle, so the write rate is unchanged.
 
-        The join before the chunk-saving phase is best-effort: a tick blocked in a
-        hung write can straggle past the timeout, but `stop` is re-checked before
-        every write, so at most the already-in-flight one can land afterwards.
+        Leaves the row with a single writer: the caller must not write meta until this
+        exits, and the join is best-effort, so a tick already inside a hung write can
+        still land afterwards.
         """
         stop = threading.Event()
 
