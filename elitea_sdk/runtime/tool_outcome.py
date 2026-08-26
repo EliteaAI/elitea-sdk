@@ -198,6 +198,7 @@ _PROVIDER_CATEGORY_CLASSES = {
     "artifact_error": ToolErrorClass.INFRASTRUCTURE,
     "invalid_input": ToolErrorClass.INPUT,
     "input_error": ToolErrorClass.INPUT,
+    "resource_not_found": ToolErrorClass.INPUT,
     "branch_not_found": ToolErrorClass.INPUT,
     "repository_not_found": ToolErrorClass.INPUT,
     "empty_repository": ToolErrorClass.INPUT,

@@ -5,6 +5,8 @@ is a silent no-op for them. `_inject_toolkit_metadata` closes that gap by
 writing into `t.metadata` instead, which is what every real consumer reads.
 """
 import logging
+import types
+from unittest.mock import patch
 
 import pytest
 from langchain_core.tools import StructuredTool
@@ -13,6 +15,7 @@ from elitea_sdk.tools import (
     _inject_display_metadata,
     _inject_toolkit_id,
     _inject_toolkit_metadata,
+    get_tools,
 )
 
 
@@ -109,3 +112,41 @@ class TestExistingBehaviourUnchanged:
             "toolkit_id": 3,
             "toolkit_type": "jira",
         }
+
+
+class TestDynamicModuleBranchForwardsIdAndType:
+    """get_tools()'s custom-toolkit branch must forward the tool's own id/type into
+    get_toolkit_params, so provider toolkits can attribute their own shadow logs (#6168).
+    Before this fix, only settings (a nested dict without id/type) was copied."""
+
+    def _make_fake_toolkit_module(self, recorded_calls):
+        class FakeToolkit:
+            @classmethod
+            def get_toolkit(cls, **kwargs):
+                recorded_calls.append(kwargs)
+                instance = cls()
+                instance.get_tools = lambda: []
+                return instance
+
+        return types.SimpleNamespace(FakeToolkit=FakeToolkit)
+
+    def test_id_and_type_reach_get_toolkit_params(self):
+        recorded_calls = []
+        fake_module = self._make_fake_toolkit_module(recorded_calls)
+
+        tools_list = [{
+            "id": 42,
+            "type": "custom_provider",
+            "name": "My Provider Toolkit",
+            "settings": {
+                "module": "fake.module.path",
+                "class": "FakeToolkit",
+            },
+        }]
+
+        with patch("elitea_sdk.tools.import_module", return_value=fake_module):
+            get_tools(tools_list, elitea=None, llm=None)
+
+        assert len(recorded_calls) == 1
+        assert recorded_calls[0]["id"] == 42
+        assert recorded_calls[0]["type"] == "custom_provider"

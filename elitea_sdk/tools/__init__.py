@@ -318,6 +318,10 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
                 tkitclass = getattr(mod, settings.pop("class"))
                 get_toolkit_params = settings.copy()
                 get_toolkit_params["name"] = tool.get("name")
+                # Forwarded so provider toolkits can attribute their own shadow logs (#6168);
+                # settings.copy() above never carries these since they live on `tool`, not `settings`.
+                get_toolkit_params["id"] = tool.get("id")
+                get_toolkit_params["type"] = tool_type
                 toolkit = tkitclass.get_toolkit(**get_toolkit_params)
                 toolkit_tools.extend(toolkit.get_tools())
             except Exception as e:

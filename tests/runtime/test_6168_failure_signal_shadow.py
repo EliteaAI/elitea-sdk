@@ -71,6 +71,7 @@ class TestClassifyProviderErrorCategory:
         ("artifact_error", ToolErrorClass.INFRASTRUCTURE),
         ("invalid_input", ToolErrorClass.INPUT),
         ("input_error", ToolErrorClass.INPUT),
+        ("resource_not_found", ToolErrorClass.INPUT),
         ("branch_not_found", ToolErrorClass.INPUT),
         ("repository_not_found", ToolErrorClass.INPUT),
         ("empty_repository", ToolErrorClass.INPUT),
@@ -83,7 +84,7 @@ class TestClassifyProviderErrorCategory:
     def test_full_vocabulary(self, category, expected):
         assert classify_provider_error_category(category) is expected
 
-    @pytest.mark.parametrize("category", [None, "", "resource_not_found", "unknown_error", "totally_made_up"])
+    @pytest.mark.parametrize("category", [None, "", "unknown_error", "totally_made_up"])
     def test_unmapped_or_absent_returns_none(self, category):
         assert classify_provider_error_category(category) is None
 
@@ -96,9 +97,10 @@ class TestSharedVocabulary:
     """
 
     def _load_provider_table(self):
-        assert _PROVIDER_WORKER_FAILURE_SIGNALS.exists(), (
-            f"expected provider_worker's failure_signals.py at {_PROVIDER_WORKER_FAILURE_SIGNALS}"
-        )
+        # Sibling repo, not an SDK dependency: absent in a standalone SDK checkout
+        # (e.g. CI), so skip rather than fail when it isn't there.
+        if not _PROVIDER_WORKER_FAILURE_SIGNALS.exists():
+            pytest.skip(f"provider_worker checkout not found at {_PROVIDER_WORKER_FAILURE_SIGNALS}")
         spec = importlib.util.spec_from_file_location(
             "provider_worker_failure_signals", _PROVIDER_WORKER_FAILURE_SIGNALS
         )
