@@ -12,6 +12,12 @@ from requests_openapi import Client, Operation
 
 from ..elitea_base import BaseToolApiWrapper
 from ..utils import clean_string
+from .response_selection import (
+    MAX_RESPONSE_LIMIT,
+    ResponseSelectionError,
+    get_response_collection_paths,
+    select_response_content,
+)
 
 
 def _coerce_empty_string_to_none(v: Any) -> Any:
@@ -1112,11 +1118,38 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
         return create_model(
             model_name,
             __base__=_BaseParamsModel,
+            response_search=(
+                Annotated[Optional[str], BeforeValidator(_coerce_empty_string_to_none)],
+                Field(
+                    description=(
+                        "Search a large response collection using words or quoted phrases. "
+                        "Bare terms contribute to BM25 relevance, quoted phrases must match, "
+                        "and terms prefixed with '-' are excluded. "
+                        "Example: active \"north america\" -archived. Leave empty to skip selection."
+                    ),
+                    default=None,
+                ),
+            ),
+            response_limit=(
+                Annotated[Optional[int], BeforeValidator(_coerce_empty_string_to_none)],
+                Field(
+                    description=(
+                        "Maximum response collection items to return after response_search. "
+                        "It can be used alone to preview the first items."
+                    ),
+                    default=None,
+                    ge=1,
+                    le=MAX_RESPONSE_LIMIT,
+                ),
+            ),
             # Use BeforeValidator to coerce empty strings to None for optional regexp
             regexp=(
                 Annotated[Optional[str], BeforeValidator(_coerce_empty_string_to_none)],
                 Field(
-                    description="Regular expression to remove from the final output (optional)",
+                    description=(
+                        "Legacy regular expression that removes matching text from the final output. "
+                        "Do not combine it with response_search or response_limit."
+                    ),
                     default=None,
                 ),
             ),
@@ -1221,7 +1254,22 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
         
         # Extract special fields (already coerced by BeforeValidator at validation time)
         regexp = kwargs.pop("regexp", None)
+        response_search = kwargs.pop("response_search", None)
+        response_limit = kwargs.pop("response_limit", None)
         extra_headers = kwargs.pop("headers", None)
+        selection_requested = bool(
+            isinstance(response_search, str) and response_search.strip()
+        ) or response_limit is not None
+
+        if regexp and selection_requested:
+            _raise_openapi_tool_exception(
+                code="incompatible_response_controls",
+                message=(
+                    "'regexp' cannot be combined with 'response_search' or 'response_limit'. "
+                    "Use structured response selection without regexp to keep JSON output valid."
+                ),
+                operation_id=str(operation_id),
+            )
 
         # Restore original parameter names from sanitized field names
         # LangChain passes kwargs using Pydantic field names (sanitized like 'dollar_top'),
@@ -1442,7 +1490,33 @@ class OpenApiApiWrapper(BaseToolApiWrapper):
 
         output_str = _normalize_output(output)
 
-        if regexp:
+        if selection_requested:
+            meta = self._op_meta.get(str(operation_id), {})
+            op_raw = meta.get("raw") if isinstance(meta, dict) else None
+            try:
+                output_str = select_response_content(
+                    output_str,
+                    response_search=response_search,
+                    response_limit=response_limit,
+                    preferred_collection_paths=get_response_collection_paths(
+                        self.spec,
+                        op_raw if isinstance(op_raw, dict) else {},
+                    ),
+                )
+            except ResponseSelectionError as e:
+                _raise_openapi_tool_exception(
+                    code="invalid_response_selection",
+                    message=f"Invalid OpenAPI response selection: {e}",
+                    operation_id=str(operation_id),
+                    retryable=True,
+                    details={
+                        "hint": (
+                            "Use response_search with words/quoted phrases and optional -excluded terms; "
+                            f"response_limit must be between 1 and {MAX_RESPONSE_LIMIT}."
+                        )
+                    },
+                )
+        elif regexp:
             try:
                 output_str = re.sub(rf"{regexp}", "", output_str)
             except Exception as e:
