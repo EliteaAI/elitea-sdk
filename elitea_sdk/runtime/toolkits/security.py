@@ -88,11 +88,26 @@ def qualified_tool_identity(tool_name: Optional[str], toolkit_name: Optional[str
     return f'{prefix}.{base}' if prefix else base
 
 
+def _canonical_type_aliases() -> Dict[str, str]:
+    """The toolkit registry's legacy-type aliases, in canonical-key form.
+
+    Guardrail entries written against a legacy type spelling must match the
+    same toolkits as ones written against the registered type. Imported lazily:
+    the toolkit registry imports this module's check functions.
+    """
+    from elitea_sdk.tools import TOOLKIT_TYPE_ALIASES
+    return {
+        canonical_match_key(legacy): canonical_match_key(registered)
+        for legacy, registered in TOOLKIT_TYPE_ALIASES.items()
+    }
+
+
 def _canonical_toolkit_key(key: str) -> str:
     """Canonical key for a toolkit identifier, preserving the ``*`` wildcard."""
     if str(key).strip() == '*':
         return '*'
-    return canonical_match_key(key)
+    match_key = canonical_match_key(key)
+    return _canonical_type_aliases().get(match_key, match_key)
 
 
 def _normalize_tools_mapping(tool_map: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
@@ -124,7 +139,7 @@ def configure_blocklist(
     """
     global _blocked_toolkits, _blocked_tools, _blocklist_initialized
 
-    _blocked_toolkits = [key for key in (canonical_match_key(t) for t in (blocked_toolkits or [])) if key]
+    _blocked_toolkits = [key for key in (_canonical_toolkit_key(t) for t in (blocked_toolkits or [])) if key]
     _blocked_tools = _normalize_tools_mapping(blocked_tools)
     _blocklist_initialized = True
 
@@ -161,7 +176,7 @@ def _load_blocklist_from_env() -> None:
 
     if env_toolkits:
         try:
-            _blocked_toolkits = [key for key in (canonical_match_key(t) for t in env_toolkits.split(',')) if key]
+            _blocked_toolkits = [key for key in (_canonical_toolkit_key(t) for t in env_toolkits.split(',')) if key]
             logger.info(f"[SECURITY] Loaded blocked toolkits from env: {_blocked_toolkits}")
         except Exception as e:
             logger.warning(f"[SECURITY] Failed to parse ELITEA_BLOCKED_TOOLKITS: {e}")
@@ -215,7 +230,7 @@ def is_toolkit_blocked(toolkit_type: str) -> bool:
     """
     _load_blocklist_from_env()
 
-    blocked = canonical_match_key(toolkit_type) in _blocked_toolkits
+    blocked = _canonical_toolkit_key(toolkit_type) in _blocked_toolkits
     if blocked:
         logger.warning(f"[SECURITY] Blocked toolkit type: {toolkit_type}")
     return blocked
@@ -239,7 +254,7 @@ def is_tool_blocked(toolkit_type: str, tool_name: str) -> bool:
         return True
 
     # Check specific tool
-    toolkit_key = canonical_match_key(toolkit_type)
+    toolkit_key = _canonical_toolkit_key(toolkit_type)
     if toolkit_key in _blocked_tools:
         blocked_tool_names = set(_blocked_tools[toolkit_key])
         for candidate_name in get_tool_name_aliases(tool_name):
@@ -263,7 +278,7 @@ def get_blocked_tools_for_toolkit(toolkit_type: str) -> List[str]:
         comparison keys, not the original tool names.
     """
     _load_blocklist_from_env()
-    return _blocked_tools.get(canonical_match_key(toolkit_type), [])
+    return _blocked_tools.get(_canonical_toolkit_key(toolkit_type), [])
 
 
 def get_blocklist_config() -> Dict:
@@ -292,7 +307,7 @@ def find_sensitive_tool_match(
 
     normalized_identifiers = []
     for identifier in toolkit_identifiers or []:
-        normalized = canonical_match_key(identifier)
+        normalized = _canonical_toolkit_key(identifier)
         if normalized and normalized not in normalized_identifiers:
             normalized_identifiers.append(normalized)
 
