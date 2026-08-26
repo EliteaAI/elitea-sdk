@@ -1,5 +1,6 @@
 import base64
 import logging
+import re
 from typing import Any, Dict, Literal, Optional
 
 import requests
@@ -64,6 +65,15 @@ class OpenApiConfiguration(BaseModel):
                                     "scope",
                                     "method",
                                 ],
+                            },
+                        ],
+                    },
+                    "additional headers": {
+                        "required": False,
+                        "subsections": [
+                            {
+                                "name": "Additional Secret Headers",
+                                "fields": ["headers"],
                             },
                         ],
                     },
@@ -161,11 +171,34 @@ class OpenApiConfiguration(BaseModel):
         json_schema_extra={'hidden': True},
     )
 
+    headers: Dict[str, SecretStr] = Field(
+        default_factory=dict,
+        title="Additional Secret Headers",
+        description=(
+            "Static HTTP headers appended to every API request in addition to the selected "
+            "authentication method. Each value is stored securely."
+        ),
+        json_schema_extra={'ui_component': 'secret_headers'},
+    )
+
     @model_validator(mode='before')
     @classmethod
     def _validate_auth_consistency(cls, values):
         if not isinstance(values, dict):
             return values
+
+        headers = values.get('headers') or {}
+        if isinstance(headers, dict):
+            header_name_pattern = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+            for name, value in headers.items():
+                if not isinstance(name, str) or not header_name_pattern.fullmatch(name):
+                    raise ValueError(f"Invalid additional header name: {name!r}")
+                if hasattr(value, 'get_secret_value'):
+                    value = value.get_secret_value()
+                if not value:
+                    raise ValueError(f"Additional header '{name}' must have a value")
+                if isinstance(value, str) and ('\r' in value or '\n' in value):
+                    raise ValueError(f"Additional header '{name}' contains an invalid value")
 
         is_delegated = bool(values.get('oauth_discovery_endpoint'))
 

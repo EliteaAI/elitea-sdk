@@ -623,7 +623,8 @@ class EliteAOpenAPIToolkit(BaseToolkit):
 
             if token is not None:
                 access_token = token.get('access_token') if isinstance(token, dict) else token
-                headers = {'Authorization': f'Bearer {access_token}'}
+                headers = _build_additional_headers(merged_settings)
+                _merge_primary_headers(headers, {'Authorization': f'Bearer {access_token}'})
                 logger.debug("Using delegated OAuth token for OpenAPI authentication")
             else:
                 logger.debug("OpenAPI OAuth mode active but no token found — raising McpAuthorizationRequired.")
@@ -704,13 +705,14 @@ def _build_headers_from_settings(settings: Dict[str, Any]) -> Dict[str, str]:
     Returns:
         Dictionary of HTTP headers to include in requests
     """
-    headers: Dict[str, str] = {}
+    headers = _build_additional_headers(settings)
+    primary_headers: Dict[str, str] = {}
 
     # First, try OAuth authentication (client credentials flow)
     # This takes priority because it's more secure and commonly used with modern APIs
     oauth_token, oauth_error = _get_oauth_access_token(settings)
     if oauth_token:
-        headers['Authorization'] = f'Bearer {oauth_token}'
+        _merge_primary_headers(headers, {'Authorization': f'Bearer {oauth_token}'})
         logger.debug("Using OAuth Bearer token for authentication")
         return headers
     elif oauth_error:
@@ -730,27 +732,49 @@ def _build_headers_from_settings(settings: Dict[str, Any]) -> Dict[str, str]:
             api_key = _secret_to_str(auth_settings.get('api_key'))
             if api_key:
                 if auth_type == 'bearer':
-                    headers['Authorization'] = f'Bearer {api_key}'
+                    primary_headers['Authorization'] = f'Bearer {api_key}'
                 elif auth_type == 'basic':
-                    headers['Authorization'] = f'Basic {api_key}'
+                    primary_headers['Authorization'] = f'Basic {api_key}'
                 elif auth_type == 'custom':
                     header_name = auth_settings.get('custom_header_name')
                     if header_name:
-                        headers[str(header_name)] = f'{api_key}'
+                        primary_headers[str(header_name)] = f'{api_key}'
 
     # New regular-schema structure (GitHub-style sections) uses flattened fields
-    if not headers:
+    if not primary_headers:
         api_key = _secret_to_str(settings.get('api_key'))
         if api_key:
             auth_type = str(settings.get('auth_type', 'Bearer'))
             auth_type_norm = auth_type.strip().lower()
             if auth_type_norm == 'bearer':
-                headers['Authorization'] = f'Bearer {api_key}'
+                primary_headers['Authorization'] = f'Bearer {api_key}'
             elif auth_type_norm == 'basic':
-                headers['Authorization'] = f'Basic {api_key}'
+                primary_headers['Authorization'] = f'Basic {api_key}'
             elif auth_type_norm == 'custom':
                 header_name = settings.get('custom_header_name')
                 if header_name:
-                    headers[str(header_name)] = f'{api_key}'
+                    primary_headers[str(header_name)] = f'{api_key}'
 
+    _merge_primary_headers(headers, primary_headers)
     return headers
+
+
+def _build_additional_headers(settings: Dict[str, Any]) -> Dict[str, str]:
+    configured_headers = settings.get('headers') or {}
+    if not isinstance(configured_headers, dict):
+        return {}
+
+    return {
+        str(name): _secret_to_str(value)
+        for name, value in configured_headers.items()
+        if str(name).strip() and _secret_to_str(value)
+    }
+
+
+def _merge_primary_headers(headers: Dict[str, str], primary_headers: Dict[str, str]) -> None:
+    """Merge primary authentication headers with case-insensitive precedence."""
+    for name, value in primary_headers.items():
+        for existing_name in list(headers):
+            if existing_name.lower() == name.lower():
+                del headers[existing_name]
+        headers[name] = value
