@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Optional, List, Dict, Generator, Set, Tuple
@@ -595,6 +596,9 @@ def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]
 
 DEFAULT_CUT_OFF = 0.1
 INDEX_META_UPDATE_INTERVAL = 600.0
+# Load-phase ticker cadence; actual write frequency is still bounded by
+# INDEX_META_UPDATE_INTERVAL through index_meta_update's throttle.
+LOAD_HEARTBEAT_INTERVAL = 60.0
 
 class IndexTools(str, Enum):
     """Enum for index-related tool names."""
@@ -671,6 +675,46 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """ Loads documents from a source, processes them,
         and returns a list of Document objects with base metadata: id and created_on."""
         yield from ()
+
+    @contextmanager
+    def _index_meta_heartbeat(self, index_name: str, interval: float = LOAD_HEARTBEAT_INTERVAL):
+        """Tick index_meta.updated_on on a timer for the whole load phase.
+
+        Loading is the longest phase with no other `updated_on` writes, and most
+        loaders bulk-fetch their entire source before the first yield, so a
+        per-document tick would miss the work that actually takes hours — and a
+        single hung request produces no documents at all. A timer covers both,
+        while keeping the row's writer count at one: the main thread issues no
+        meta writes during the drain. Each tick still goes through
+        index_meta_update's own throttle.
+
+        The join before the chunk-saving phase is best-effort: a tick blocked in a
+        hung write can straggle past the timeout, but `stop` is re-checked before
+        every write, so at most the already-in-flight one can land afterwards.
+        """
+        stop = threading.Event()
+
+        def _tick():
+            while not stop.wait(interval):
+                if stop.is_set():
+                    break
+                try:
+                    self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, 0, update_force=False)
+                except Exception as exc:  # best-effort, do not break loading
+                    logger.warning(f"Load-phase heartbeat failed for index '{index_name}': {exc}")
+
+        thread = threading.Thread(target=_tick, name=f"index-heartbeat-{index_name}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning(
+                    f"Load-phase heartbeat for index '{index_name}' did not stop within 5s; "
+                    f"one in-flight tick may still land"
+                )
 
     def get_indexing_stats(self) -> Optional[IndexingStats]:
         """Get the indexing statistics from the current or last indexing run."""
@@ -755,8 +799,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # A second index_data call on the same wrapper would otherwise accumulate
             # the previous run's counts into this run's report.
             self._indexing_stats = IndexingStats()
-            documents = self._base_loader(**kwargs)
-            documents = list(documents) # consume/exhaust generator to count items
+            with self._index_meta_heartbeat(index_name):
+                documents = list(self._base_loader(**kwargs))
             documents_count = len(documents)
             self._stamp_loader_stats(documents_count)
             documents = (doc for doc in documents)
