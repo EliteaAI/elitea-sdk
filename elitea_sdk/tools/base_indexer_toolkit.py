@@ -679,8 +679,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """Report progress on a timer while documents are being loaded.
 
         Timed rather than per-document because most loaders fetch their whole source
-        before yielding anything, and a hung request yields nothing at all. Ticks pass
-        through index_meta_update's throttle, so the write rate is unchanged.
+        before yielding anything, and a hung request yields nothing at all.
+
+        `interval` only sets how often a write is *offered*: index_meta_update throttles
+        to `update_interval` (INDEX_META_UPDATE_INTERVAL by default), which is what the
+        effective write cadence should be tuned by.
 
         Leaves the row with a single writer: the caller must not write meta until this
         exits, and the join is best-effort, so a tick already inside a hung write can
@@ -690,10 +693,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         def _tick():
             while not stop.wait(interval):
-                if stop.is_set():
-                    break
                 try:
-                    self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, 0, update_force=False)
+                    self.index_meta_update(
+                        index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, 0,
+                        update_force=False, refresh_counts=False,
+                    )
                 except Exception as exc:  # best-effort, do not break loading
                     logger.warning(f"Load-phase heartbeat failed for index '{index_name}': {exc}")
 
@@ -704,6 +708,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         finally:
             stop.set()
             thread.join(timeout=5)
+            # The throttle is shared with the chunk-saving loop, whose first progress
+            # write depends on this index having no recorded write yet.
+            getattr(self, "_index_meta_last_update_time", {}).pop(index_name, None)
             if thread.is_alive():
                 logger.warning(
                     f"Load-phase heartbeat for index '{index_name}' did not stop within 5s; "
@@ -1750,7 +1757,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._index_meta_config: Dict[str, Any] = {}
         self._index_meta_config["previous_runs"] = self._count_completed_runs(metadata)
 
-    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None, docs_count: Optional[int] = None, report: Optional[Dict] = None):
+    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None, docs_count: Optional[int] = None, report: Optional[Dict] = None, refresh_counts: bool = True):
         """Update `index_meta` document with optional time-based throttling.
 
         Args:
@@ -1801,8 +1808,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         #
         if index_meta_raw:
             metadata = copy.deepcopy(index_meta_raw.get("metadata", {}))
-            # indexed_chunks = number of chunks stored in vector store
-            metadata["indexed_chunks"] = self.get_indexed_count(index_name)
+            # indexed_chunks = chunks stored in the vector store. Counting scans the
+            # whole collection, so a caller that only moves updated_on keeps the
+            # previous number rather than making the tenant's database pay for it.
+            if refresh_counts:
+                metadata["indexed_chunks"] = self.get_indexed_count(index_name)
             metadata["updated"] = result
             # Promote a successful completion to 'scheduled_reindex' when the run was
             # triggered by the platform scheduler AND the index had already been built

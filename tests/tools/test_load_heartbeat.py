@@ -39,7 +39,8 @@ class TestIndexMetaHeartbeatTimer:
         assert wrapper.index_meta_update.call_count >= 1
         for call in wrapper.index_meta_update.call_args_list:
             assert call.args == ("idx", IndexerKeywords.INDEX_META_IN_PROGRESS.value, 0)
-            assert call.kwargs == {"update_force": False}
+            assert call.kwargs["update_force"] is False
+            assert call.kwargs["refresh_counts"] is False
 
     def test_stops_ticking_after_exit(self):
         wrapper = _wrapper()
