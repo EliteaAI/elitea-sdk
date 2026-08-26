@@ -14,6 +14,11 @@ AVAILABLE_TOOLS = {}
 AVAILABLE_TOOLKITS = {}
 FAILED_IMPORTS = {}
 
+# Legacy toolkit type strings still present in persisted configs, mapped to the
+# registered type they must be treated as. Guardrail matching in
+# runtime.toolkits.security applies the same mapping.
+TOOLKIT_TYPE_ALIASES = {'azure_devops_repos': 'ado_repos'}
+
 
 def _inject_toolkit_id(tool_conf: dict, toolkit_tools) -> None:
     """Inject `toolkit_id` into tools that expose `api_wrapper.toolkit_id`.
@@ -248,7 +253,7 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
             raise ValueError(f"Tool names {invalid_tools} from toolkit '{tool.get('type', '')}' cannot start with '_'")
 
         # Cache tool type and add common settings
-        tool_type = tool['type']
+        tool_type = TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type'])
         settings['elitea'] = elitea
         settings['llm'] = llm
         settings['store'] = store
@@ -262,11 +267,6 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
         # Handle ADO special cases
         if tool_type in ['ado_boards', 'ado_wiki', 'ado_plans']:
             toolkit_tools.extend(AVAILABLE_TOOLS['ado']['get_tools'](tool_type, tool))
-        elif tool_type in ['ado_repos', 'azure_devops_repos'] and 'ado_repos' in AVAILABLE_TOOLS:
-            try:
-                toolkit_tools.extend(AVAILABLE_TOOLS['ado_repos']['get_tools'](tool))
-            except Exception as e:
-                logger.error(f"Error getting ADO repos tools: {e}")
         elif tool_type == 'mcp':
             logger.debug(f"Skipping MCP toolkit '{tool.get('toolkit_name')}' - handled by runtime toolkit system")
         elif tool_type == 'planning':

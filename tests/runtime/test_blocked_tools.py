@@ -71,6 +71,24 @@ class TestBlocklistConfiguration:
         assert not is_toolkit_blocked("github")
 
 
+class TestToolkitTypeAliases:
+    def test_legacy_spelling_blocks_canonical_type(self):
+        configure_blocklist(blocked_toolkits=["azure_devops_repos"])
+        assert is_toolkit_blocked("ado_repos")
+        assert is_toolkit_blocked("azure_devops_repos")
+
+    def test_canonical_spelling_blocks_legacy_type(self):
+        configure_blocklist(blocked_toolkits=["ado_repos"])
+        assert is_toolkit_blocked("azure_devops_repos")
+
+    def test_blocked_tools_map_matches_across_spellings(self):
+        configure_blocklist(blocked_tools={"azure_devops_repos": ["delete_file"]})
+        assert is_tool_blocked("ado_repos", "delete_file")
+        assert is_tool_blocked("azure_devops_repos", "delete_file")
+        assert not is_tool_blocked("ado_repos", "read_file")
+        assert get_blocked_tools_for_toolkit("ado_repos") == ["deletefile"]
+
+
 # ── Separator/format-insensitive matching (issue #5199) ──────────────────
 
 class TestCanonicalMatching:
