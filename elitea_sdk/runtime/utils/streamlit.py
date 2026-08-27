@@ -101,11 +101,41 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
         clear_chat_history()
 
     def create_tooklit_schema(tkit_schema):
+        defs = tkit_schema.get('$defs', {})
+
+        def resolve_refs(value):
+            if not isinstance(value, dict):
+                return value
+            ref = value.get('$ref')
+            # Optional[Model] fields serialize as anyOf: [{$ref: ...}, {type: null}]
+            if not ref:
+                for option in value.get('anyOf', []):
+                    if isinstance(option, dict) and option.get('$ref'):
+                        ref = option['$ref']
+                        break
+            if ref:
+                def_name = ref.split('/')[-1]
+                resolved = dict(defs.get(def_name, {}))
+                # preserve outer metadata (description, configuration_types, etc.)
+                for k, v in value.items():
+                    if k not in ('$ref', 'anyOf'):
+                        resolved[k] = v
+                return resolved
+            # Optional[dict]/Optional[list]/etc. serialize as anyOf: [{type: X}, {type: null}]
+            # with no top-level "type" — hoist the first non-null type up.
+            if 'type' not in value:
+                for option in value.get('anyOf', []):
+                    if isinstance(option, dict) and option.get('type') and option.get('type') != 'null':
+                        value = dict(value)
+                        value['type'] = option['type']
+                        break
+            return value
+
         schema = {}
         for key, value in tkit_schema.get('properties', {}).items():
             if value.get('autopopulate'):
                 continue
-            schema[key] = value
+            schema[key] = resolve_refs(value)
         return schema
     
     def render_function_parameters_form(tool, form_key_prefix=""):
@@ -362,6 +392,12 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
         st.session_state.agent_raw_config = None  # Store raw agent configuration for debugging
     if 'configured_toolkit_ready' not in st.session_state:
         st.session_state.configured_toolkit_ready = False  # Track when toolkit config is ready
+    if 'platform_toolkits' not in st.session_state:
+        st.session_state.platform_toolkits = None  # Cache of toolkit instances listed from the platform
+    if 'platform_toolkit_configs' not in st.session_state:
+        st.session_state.platform_toolkit_configs = {}  # Store settings loaded from a platform toolkit instance
+    if 'platform_toolkit_pending_select' not in st.session_state:
+        st.session_state.platform_toolkit_pending_select = None  # Index to pre-select in toolkit_selector after loading
 
     # Initialize toolkit configurations
     if not(st.session_state.tooklit_configs and len(st.session_state.tooklit_configs) > 0):
@@ -701,7 +737,75 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                 # Toolkit selection and configuration
                 st.markdown("---")
                 st.subheader("📋 Step 1: Select and Configure Toolkit")
-                
+
+                # Load a saved toolkit instance from the remote platform
+                with st.expander("🌐 Load Toolkit from Platform", expanded=False):
+                    if st.button("🔄 Fetch Toolkits from Platform", key="fetch_platform_toolkits"):
+                        try:
+                            st.session_state.platform_toolkits = st.session_state.client.get_list_of_toolkits()
+                        except Exception as e:
+                            st.error(f"Failed to fetch toolkits from platform: {e}")
+                            st.session_state.platform_toolkits = []
+
+                    if st.session_state.platform_toolkits:
+                        platform_toolkit_options = list(range(len(st.session_state.platform_toolkits)))
+                        selected_platform_idx = st.selectbox(
+                            "Saved toolkit instances",
+                            options=platform_toolkit_options,
+                            format_func=lambda i: f"{st.session_state.platform_toolkits[i]['name']} "
+                                                   f"(type: {st.session_state.platform_toolkits[i].get('type', 'N/A')})",
+                            key="platform_toolkit_selector"
+                        )
+
+                        if st.button("📥 Load Selected", key="load_platform_toolkit"):
+                            selected_platform_toolkit = st.session_state.platform_toolkits[selected_platform_idx]
+                            try:
+                                details = st.session_state.client.get_toolkit_details(
+                                    selected_platform_toolkit['id'], expand=True
+                                )
+                            except Exception as e:
+                                st.error(f"Failed to load toolkit details: {e}")
+                                details = None
+
+                            if details:
+                                platform_type = details.get('type', '')
+                                platform_name = details.get('name', selected_platform_toolkit['name'])
+
+                                # Match the platform toolkit's type/name against SDK toolkit names,
+                                # reusing the same matching strategy as agent toolkit loading below.
+                                matched_idx = None
+                                for i, toolkit_name in enumerate(st.session_state.tooklit_names):
+                                    if toolkit_name == platform_name:
+                                        matched_idx = i
+                                        break
+                                if matched_idx is None and platform_type:
+                                    for i, toolkit_name in enumerate(st.session_state.tooklit_names):
+                                        toolkit_lower = toolkit_name.lower()
+                                        type_lower = platform_type.lower()
+                                        if (type_lower == toolkit_lower or
+                                                type_lower in toolkit_lower or
+                                                toolkit_lower in type_lower):
+                                            matched_idx = i
+                                            break
+                                if matched_idx is None:
+                                    platform_normalized = platform_name.replace('_', '').replace('-', '').replace(' ', '').lower()
+                                    for i, toolkit_name in enumerate(st.session_state.tooklit_names):
+                                        toolkit_normalized = toolkit_name.replace('_', '').replace('-', '').replace(' ', '').lower()
+                                        if (platform_normalized in toolkit_normalized or
+                                                toolkit_normalized in platform_normalized or
+                                                platform_normalized == toolkit_normalized):
+                                            matched_idx = i
+                                            break
+
+                                if matched_idx is not None:
+                                    matched_toolkit_name = st.session_state.tooklit_names[matched_idx]
+                                    st.session_state.platform_toolkit_configs[matched_toolkit_name] = details.get('settings', {})
+                                    st.session_state.platform_toolkit_pending_select = matched_idx
+                                    st.success(f"✅ Loaded '{platform_name}' → SDK toolkit `{matched_toolkit_name}`")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ No matching SDK toolkit found for '{platform_name}' (type: `{platform_type}`)")
+
                 # Determine which toolkits to show
                 if st.session_state.agent_chat and st.session_state.agent_toolkits:
                     # Show only agent's toolkits
@@ -823,6 +927,11 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                 # Select toolkit type (outside of form to allow dynamic updates)
                 selected_toolkit_idx = None
                 if available_toolkits:
+                    if st.session_state.platform_toolkit_pending_select is not None:
+                        pending_idx = st.session_state.platform_toolkit_pending_select
+                        if pending_idx in [idx for idx, name in available_toolkits]:
+                            st.session_state["toolkit_selector"] = pending_idx
+                        st.session_state.platform_toolkit_pending_select = None
                     selected_toolkit_idx = st.selectbox(
                         "🛠️ Select a toolkit", 
                         options=[idx for idx, name in available_toolkits],
@@ -845,11 +954,14 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                         toolkit_config_values = {}
                         config_schema = create_tooklit_schema(toolkit_schema)
                         
-                        # Get agent's pre-configured values for this toolkit
+                        # Get agent's or platform's pre-configured values for this toolkit
                         agent_config = {}
                         if st.session_state.agent_chat and toolkit_schema['title'] in st.session_state.agent_toolkit_configs:
                             agent_config = st.session_state.agent_toolkit_configs[toolkit_schema['title']]
                             st.success(f"✅ **Auto-populated from agent:** {st.session_state.agent_name}")
+                        elif toolkit_schema['title'] in st.session_state.platform_toolkit_configs:
+                            agent_config = st.session_state.platform_toolkit_configs[toolkit_schema['title']]
+                            st.success("✅ **Auto-populated from platform toolkit instance**")
                         
                         if config_schema:
                             st.markdown("### Configuration Parameters")
@@ -1555,6 +1667,7 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                                         with st.expander("🔍 Error Details"):
                                             error_details = {
                                                 'error': result['error'],
+                                                'debug_error': result.get('debug_error'),
                                                 'tool_name': result['tool_name'],
                                                 'toolkit_config': result['toolkit_config'],
                                                 'llm_model': result.get('llm_model'),

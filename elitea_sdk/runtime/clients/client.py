@@ -106,6 +106,8 @@ class EliteAClient:
         self.mcp_tools_call = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_call/{self.project_id}"
         self.application_versions = f"{self.base_url}{self.api_v2_path}/elitea_core/version/prompt_lib/{self.project_id}"
         self.list_apps_url = f"{self.base_url}{self.api_v2_path}/elitea_core/applications/prompt_lib/{self.project_id}"
+        self.list_toolkits_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tools/prompt_lib/{self.project_id}"
+        self.toolkit_details_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool/prompt_lib/{self.project_id}"
         self.secrets_url = f"{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}"
         self.artifacts_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifacts/default/{self.project_id}"
         self.artifact_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}"
@@ -202,6 +204,55 @@ class EliteAClient:
         tool_data['settings']['elitea'] = self
         
         return instantiate_toolkit(tool_data)
+
+    def get_list_of_toolkits(self, query: Optional[str] = None):
+        """
+        List toolkit instances already configured/saved on the remote platform
+        for the current project (mirrors get_list_of_apps for applications).
+
+        Returns a list of {"name": str, "id": int, "type": str} dicts.
+        """
+        toolkits = []
+        limit = 10
+        offset = 0
+        total_count = None
+
+        while total_count is None or offset < total_count:
+            params = {'offset': offset, 'limit': limit}
+            if query:
+                params['query'] = query
+            resp = self._request('get', self.list_toolkits_url, headers=self.headers, params=params, verify=False)
+
+            if resp.ok:
+                data = resp.json()
+                total_count = data.get('total')
+                toolkits.extend([
+                    {"name": t['name'], "id": t['id'], "type": t.get('type')}
+                    for t in data.get('rows', [])
+                ])
+                offset += limit
+            else:
+                break
+
+        return toolkits
+
+    def get_toolkit_details(self, toolkit_id: int, expand: bool = False) -> dict:
+        """
+        Fetch the raw configuration of a toolkit instance saved on the remote
+        platform, without instantiating it. Use this to pre-populate a testing
+        UI (e.g. Streamlit) with the toolkit's saved name/type/settings.
+
+        Args:
+            toolkit_id: ID of the saved toolkit instance.
+            expand: If True, ask the platform to expand credential references
+                (e.g. secrets/provider-hub tokens) into their resolved values.
+        """
+        url = f"{self.toolkit_details_url}/{toolkit_id}"
+        params = {'expand': 'true'} if expand else None
+        response = self._request('get', url, headers=self.headers, params=params, verify=False)
+        if not response.ok:
+            raise ValueError(f"Failed to fetch toolkit {toolkit_id}: {response.text}")
+        return response.json()
 
     def get_list_of_apps(self):
         apps = []
@@ -1373,7 +1424,7 @@ class EliteAClient:
         ).runnable()
 
     def _validate_toolkit_config(self, toolkit_config: dict) -> dict:
-        toolkit_config_type = toolkit_config.get('type')
+        toolkit_config_type = toolkit_config.get('type') or toolkit_config.get('toolkit_name')
         try:
             available_toolkit_models = get_available_toolkit_models().get(toolkit_config_type)
             toolkit_config_parsed_json = deepcopy(toolkit_config)
