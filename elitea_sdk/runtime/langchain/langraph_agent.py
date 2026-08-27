@@ -2928,7 +2928,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 for intr in task.interrupts:
                     if hasattr(intr, 'value') and isinstance(intr.value, dict):
                         if intr.value.get('type') == 'hitl':
-                            return intr.value
+                            value = dict(intr.value)
+                            interrupt_id = getattr(intr, 'id', None)
+                            if interrupt_id:
+                                value.setdefault(HITL_INTERRUPT_ID_KEY, interrupt_id)
+                            return value
         return None
 
     @classmethod

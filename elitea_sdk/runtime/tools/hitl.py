@@ -26,6 +26,9 @@ HITL_ACTION_EDIT = "edit"
 
 HITL_VALID_ACTIONS = {HITL_ACTION_APPROVE, HITL_ACTION_REJECT, HITL_ACTION_EDIT}
 
+PIPELINE_HITL_INTERACTION_TYPE = "pipeline_hitl_node"
+PIPELINE_HITL_HISTORY_CONTRACT_VERSION = 1
+
 # State key used for HITL interrupt metadata
 HITL_STATE_KEY = "hitl_interrupt"
 
@@ -207,6 +210,8 @@ class HITLNode(Runnable):
         # Build interrupt payload with all metadata the UI needs
         interrupt_payload = {
             "type": "hitl",
+            "interaction_type": PIPELINE_HITL_INTERACTION_TYPE,
+            "history_contract_version": PIPELINE_HITL_HISTORY_CONTRACT_VERSION,
             "node_name": self.name,
             "message": user_message,
             "available_actions": available_actions,

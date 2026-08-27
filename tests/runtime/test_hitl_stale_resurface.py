@@ -165,6 +165,21 @@ class TestHitlStaleInterruptResurface:
         result = LangGraphAgentRunnable._get_hitl_interrupt(state)
         assert result is None
 
+    def test_get_hitl_interrupt_exposes_checkpoint_interrupt_identity(self):
+        payload = {
+            'type': 'hitl',
+            'interaction_type': 'pipeline_hitl_node',
+            'node_name': 'Review',
+        }
+        intr = SimpleNamespace(value=payload, id='checkpoint-interrupt-1')
+        task = SimpleNamespace(interrupts=[intr])
+        state = SimpleNamespace(tasks=[task], next=('Review',))
+
+        result = LangGraphAgentRunnable._get_hitl_interrupt(state)
+
+        assert result['interrupt_id'] == 'checkpoint-interrupt-1'
+        assert 'interrupt_id' not in payload
+
     def test_is_hitl_resume_various_inputs(self):
         """_is_hitl_resume correctly identifies HITL resume payloads."""
         assert LangGraphAgentRunnable._is_hitl_resume(
