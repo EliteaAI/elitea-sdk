@@ -1,7 +1,9 @@
 from unittest.mock import Mock
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
 
+from elitea_sdk.runtime.langchain.langraph_agent import create_graph
 from elitea_sdk.runtime.tools.llm import LLMNode
 
 
@@ -11,6 +13,14 @@ def _nested_config():
             'parent_agent_path': [
                 {'name': 'General Purpose', 'call_id': 'call-1'},
             ],
+        },
+    }
+
+
+def _pipeline_config():
+    return {
+        'metadata': {
+            'langgraph_node': 'LLM1',
         },
     }
 
@@ -56,6 +66,106 @@ def test_direct_chat_length_completion_remains_user_controlled():
 
     assert result is first
     client.invoke.assert_not_called()
+
+
+def test_direct_pipeline_llm_node_is_finished_automatically():
+    client = Mock()
+    client.invoke.return_value = AIMessage(
+        content='missing ending',
+        response_metadata={'finish_reason': 'stop'},
+    )
+    node = LLMNode(client=client)
+    first = AIMessage(
+        content='partial answer ',
+        response_metadata={'finish_reason': 'length'},
+    )
+
+    result = node._continue_nested_output(
+        messages=[HumanMessage(content='Write an answer')],
+        completion=first,
+        config=_pipeline_config(),
+    )
+
+    assert result.content == 'partial answer missing ending'
+    client.invoke.assert_called_once()
+
+
+class _PipelineLLM:
+    def __init__(self):
+        self.calls = []
+        self.responses = [
+            AIMessage(
+                content='first part ',
+                response_metadata={'finish_reason': 'length'},
+            ),
+            AIMessage(
+                content='second part',
+                response_metadata={'finish_reason': 'stop'},
+            ),
+            AIMessage(
+                content='downstream result',
+                response_metadata={'finish_reason': 'stop'},
+            ),
+        ]
+
+    def invoke(self, messages, config=None):
+        self.calls.append(list(messages))
+        return self.responses.pop(0)
+
+
+def test_assembled_output_is_mapped_to_state_before_the_next_pipeline_node():
+    client = _PipelineLLM()
+    pipeline = create_graph(
+        client=client,
+        yaml_schema='''
+name: continuation-state
+state:
+  input:
+    type: str
+  draft:
+    type: str
+  final:
+    type: str
+  messages:
+    type: list
+nodes:
+  - id: LLM1
+    type: llm
+    input_mapping:
+      system:
+        type: fixed
+        value: Write the draft.
+      task:
+        type: variable
+        value: input
+    input: [input]
+    output: [draft]
+    transition: LLM2
+  - id: LLM2
+    type: llm
+    input_mapping:
+      system:
+        type: fixed
+        value: Use the complete draft.
+      task:
+        type: variable
+        value: draft
+    input: [draft]
+    output: [final]
+    transition: END
+entry_point: LLM1
+''',
+        tools=[],
+        memory=MemorySaver(),
+    )
+    config = {'configurable': {'thread_id': 'direct-pipeline-continuation'}}
+
+    pipeline.invoke({'input': 'start'}, config=config)
+
+    state = pipeline.get_state(config).values
+    assert state['draft'] == 'first part second part'
+    assert state['final'] == 'downstream result'
+    assert client.calls[2][-1].content == 'first part second part'
 
 
 def test_continuation_merge_preserves_output_limit_seams():
