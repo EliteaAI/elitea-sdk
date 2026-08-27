@@ -11,7 +11,11 @@ from unittest.mock import patch
 
 import pytest
 
-from elitea_sdk.runtime.tools.hitl import HITLNode
+from elitea_sdk.runtime.tools.hitl import (
+    HITLNode,
+    PIPELINE_HITL_HISTORY_CONTRACT_VERSION,
+    PIPELINE_HITL_INTERACTION_TYPE,
+)
 
 
 def _make_node(routes):
@@ -49,3 +53,20 @@ def test_block_with_comment_without_reject_route_fails_loud():
     ):
         with pytest.raises(ValueError, match="not configured"):
             node.invoke({"messages": []})
+
+
+def test_pipeline_hitl_interrupt_advertises_durable_history_contract():
+    node = _make_node({"approve": "do_work", "edit": "edit_work"})
+    captured = {}
+
+    def resume(payload):
+        captured.update(payload)
+        return {"action": "approve", "value": ""}
+
+    with patch("elitea_sdk.runtime.tools.hitl.dispatch_custom_event"), patch(
+        "elitea_sdk.runtime.tools.hitl.interrupt", side_effect=resume,
+    ):
+        node.invoke({"messages": []})
+
+    assert captured["interaction_type"] == PIPELINE_HITL_INTERACTION_TYPE
+    assert captured["history_contract_version"] == PIPELINE_HITL_HISTORY_CONTRACT_VERSION
