@@ -1,6 +1,5 @@
 import logging
 import types
-from copy import deepcopy
 from importlib import import_module
 from typing import Optional
 
@@ -239,12 +238,27 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
 
     for tool in tools_list:
         toolkit_tools = []
-        settings = tool.get('settings')
+        raw_settings = tool.get('settings')
 
         # Skip tools without settings early
-        if not settings:
+        if not raw_settings:
             logger.warning(f"Tool '{tool.get('type', '')}' has no settings, skipping...")
             continue
+
+        # Copy the settings dict (and any nested config dicts we mutate) so we never
+        # inject live objects (elitea client, llm, store) into the caller's own dict.
+        # Callers (e.g. Streamlit toolkit testing UI) may reuse/persist that same dict
+        # object across calls (including later re-validation), and a live object with
+        # a threading.RLock inside (e.g. an HTTP session/connection pool) is not
+        # deepcopy/pickle-able, causing "cannot pickle '_thread.RLock' object" errors.
+        settings = dict(raw_settings)
+        if isinstance(settings.get('pgvector_configuration'), dict):
+            settings['pgvector_configuration'] = dict(settings['pgvector_configuration'])
+        # Downstream branches below (ADO special cases, per-toolkit get_tools(tool), etc.)
+        # read settings via `tool['settings']`, not the local `settings` var directly -
+        # repoint it at our copy so they still see the injected elitea/llm/store below.
+        tool = dict(tool)
+        tool['settings'] = settings
 
         # Validate tool names once
         selected_tools = settings.get('selected_tools', [])
@@ -362,7 +376,7 @@ def get_available_toolkits():
 
 def get_available_toolkit_models():
     """Return dict with available toolkit classes."""
-    return deepcopy(AVAILABLE_TOOLS)
+    return AVAILABLE_TOOLS
 
 
 def get_toolkit_available_tools(toolkit_type: str, settings: dict) -> dict:
