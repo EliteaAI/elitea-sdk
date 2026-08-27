@@ -180,16 +180,20 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                 elif param_type == 'array':
                     items_schema = param_schema.get('items', {})
                     if items_schema.get('type') == 'string':
+                        default_array_value = '\n'.join(str(item) for item in param_default) if isinstance(param_default, list) else ''
                         array_input = st.text_area(
                             f"{label} (one per line)",
+                            value=default_array_value,
                             help=f"{param_description} - Enter one item per line",
                             key=key
                         )
                         parameters[param_name] = [line.strip() for line in array_input.split('\n') if line.strip()]
                     else:
                         # For complex array types, fall back to JSON input
+                        default_array_json = json.dumps(param_default) if isinstance(param_default, list) else ''
                         array_input = st.text_area(
                             f"{label} (JSON array)",
+                            value=default_array_json,
                             help=f"{param_description} - Enter as JSON array",
                             placeholder='["item1", "item2"]',
                             key=key
@@ -201,8 +205,10 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                             st.error(f"Invalid JSON format for {param_name}")
                 elif param_type == 'object':
                     # For object types, use JSON input
+                    default_obj_json = json.dumps(param_default) if isinstance(param_default, dict) else ''
                     obj_input = st.text_area(
                         f"{label} (JSON object)",
+                        value=default_obj_json,
                         help=f"{param_description} - Enter as JSON object",
                         placeholder='{"key": "value"}',
                         key=key
