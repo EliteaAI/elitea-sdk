@@ -2249,7 +2249,9 @@ class LLMNode(BaseTool):
     def _is_nested_execution(config: Optional[RunnableConfig]) -> bool:
         metadata = config.get('metadata', {}) if isinstance(config, dict) else {}
         return isinstance(metadata, dict) and bool(
-            metadata.get('parent_agent_path') or metadata.get('parent_agent_name')
+            metadata.get('parent_agent_path')
+            or metadata.get('parent_agent_name')
+            or metadata.get('langgraph_node')
         )
 
     @staticmethod
@@ -2304,7 +2306,7 @@ class LLMNode(BaseTool):
         completion: Any,
         config: Optional[RunnableConfig],
     ) -> Any:
-        """Finish truncated leaf output before returning it to the orchestrator."""
+        """Finish truncated graph-node output before returning it to the graph."""
         if (
             not self._is_nested_execution(config)
             or not self._completion_finished_by_length(completion)
