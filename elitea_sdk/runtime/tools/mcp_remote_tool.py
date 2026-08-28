@@ -22,6 +22,7 @@ from ..utils.mcp_oauth import (
 )
 # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient
 from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
+from ..utils.failure_signals import mcp_is_error, log_shadow_failure
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,17 @@ class McpRemoteTool(McpServerTool):
             raise
         except Exception as e:
             logger.error(f"Error executing remote MCP tool '{self.name}': {e}")
+            # Shadow-mode only: this branch turns a real exception into a return value (see #6168)
+            metadata = self.metadata or {}
+            log_shadow_failure(
+                logger,
+                detected_by="mcp_exception_swallowed",
+                toolkit_name=metadata.get("toolkit_name"),
+                toolkit_type=metadata.get("toolkit_type"),
+                toolkit_id=metadata.get("toolkit_id"),
+                tool_name=self.name,
+                result_len=len(str(e)),
+            )
             return f"Error executing tool: {e}"
 
     def _run_in_new_loop(self, kwargs: Dict[str, Any]) -> str:
@@ -140,7 +152,20 @@ class McpRemoteTool(McpServerTool):
             async with client:
                 await client.initialize()
                 result = await client.call_tool(tool_name_for_server, kwargs)
-            
+
+            # Shadow-mode only: detect isError, never changes the returned value (see #6168)
+            if mcp_is_error(result):
+                metadata = self.metadata or {}
+                log_shadow_failure(
+                    logger,
+                    detected_by="mcp_is_error/remote",
+                    toolkit_name=metadata.get("toolkit_name"),
+                    toolkit_type=metadata.get("toolkit_type"),
+                    toolkit_id=metadata.get("toolkit_id"),
+                    tool_name=self.name,
+                    result_len=len(str(result)),
+                )
+
             # Format the result
             if isinstance(result, dict):
                 # Check for content array (common in MCP responses)

@@ -179,3 +179,44 @@ def retriable_for(error_class: Optional[ToolErrorClass]) -> bool:
     """Whether retrying identical input could ever succeed — not whether to retry now.
     Nothing in the SDK acts on this; it is published for consumers outside the epic."""
     return error_class is ToolErrorClass.INFRASTRUCTURE
+
+
+# Kept identical to provider_worker/utils/failure_signals.py's PROVIDER_CATEGORY_CLASSES
+# (see the shared-vocabulary test) — one vocabulary, no cross-plugin import.
+_PROVIDER_CATEGORY_CLASSES = {
+    "timeout": ToolErrorClass.INFRASTRUCTURE,
+    "timeout_error": ToolErrorClass.INFRASTRUCTURE,
+    "service_busy": ToolErrorClass.INFRASTRUCTURE,
+    "rate_limit": ToolErrorClass.INFRASTRUCTURE,
+    "out_of_memory": ToolErrorClass.INFRASTRUCTURE,
+    "killed": ToolErrorClass.INFRASTRUCTURE,
+    "terminated": ToolErrorClass.INFRASTRUCTURE,
+    "deadline_exceeded": ToolErrorClass.INFRASTRUCTURE,
+    "backoff_limit_exceeded": ToolErrorClass.INFRASTRUCTURE,
+    "scheduling_failed": ToolErrorClass.INFRASTRUCTURE,
+    "platform_upload_failed": ToolErrorClass.INFRASTRUCTURE,
+    "artifact_error": ToolErrorClass.INFRASTRUCTURE,
+    "invalid_input": ToolErrorClass.INPUT,
+    "input_error": ToolErrorClass.INPUT,
+    "resource_not_found": ToolErrorClass.INPUT,
+    "branch_not_found": ToolErrorClass.INPUT,
+    "repository_not_found": ToolErrorClass.INPUT,
+    "empty_repository": ToolErrorClass.INPUT,
+    "runtime_error": ToolErrorClass.TOOL_INTERNAL,
+    "training_failed": ToolErrorClass.TOOL_INTERNAL,
+    "inference_failed": ToolErrorClass.TOOL_INTERNAL,
+    "indexing_failed": ToolErrorClass.TOOL_INTERNAL,
+    "authentication_error": ToolErrorClass.POLICY,
+}
+
+
+def classify_provider_error_category(category: Optional[str]) -> Optional[ToolErrorClass]:
+    """Map a provider's raw `error_category` string to a `ToolErrorClass`, or None.
+
+    Same contract as `classify_tool_error`: unmapped or absent categories return
+    None rather than a guess.
+    """
+    if category is None:
+        return None
+    return _PROVIDER_CATEGORY_CLASSES.get(category)
+

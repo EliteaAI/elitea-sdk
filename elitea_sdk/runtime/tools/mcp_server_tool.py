@@ -5,6 +5,8 @@ from typing import Any, Type, Literal, Optional, Union, List, Annotated
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, create_model, ConfigDict, StringConstraints
 
+from ..utils.failure_signals import mcp_is_error, log_shadow_failure
+
 # EmailStr moved to pydantic_extra_types in pydantic v2, use str for simplicity
 EmailStr = str
 
@@ -110,4 +112,19 @@ class McpServerTool(BaseTool):
             }
         }
         
-        return self.client.mcp_tool_call(call_data)
+        result = self.client.mcp_tool_call(call_data)
+
+        # Shadow-mode only: detect isError, never changes the returned value (see #6168)
+        if mcp_is_error(result):
+            metadata = self.metadata or {}
+            log_shadow_failure(
+                logger,
+                detected_by="mcp_is_error/proxied",
+                toolkit_name=metadata.get("toolkit_name"),
+                toolkit_type=metadata.get("toolkit_type"),
+                toolkit_id=metadata.get("toolkit_id"),
+                tool_name=self.name,
+                result_len=len(str(result)),
+            )
+
+        return result
