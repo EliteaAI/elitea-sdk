@@ -760,7 +760,7 @@ def indexing_toolkit(toolkit, monkeypatch):
     """A toolkit whose index_data runs end to end against stubbed IO."""
     monkeypatch.setattr(RecordingToolkit, "_clean_index", lambda self, name: None)
     monkeypatch.setattr(RecordingToolkit, "_log_tool_event", lambda self, *a, **kw: None)
-    monkeypatch.setattr(RecordingToolkit, "_emit_index_event", lambda self, name, error=None: None)
+    monkeypatch.setattr(RecordingToolkit, "_emit_index_event", lambda self, name, error=None, state=None: None)
     monkeypatch.setattr(RecordingToolkit, "_reduce_duplicates", lambda self, docs, name: docs)
 
     def fake_save(self, base_documents, base_total, chunking_tool, chunking_config, result, index_name=None):

@@ -42,6 +42,10 @@ class IndexerKeywords(Enum):
     UPDATED_ON = 'updated_on'
     CONTENT_IN_BYTES = 'loader_content'
     CONTENT_FILE_NAME = 'loader_content_type'
+    # Underscore-prefixed: the metadata namespace is toolkit-controlled and an
+    # unprefixed `run_id` collides with source-supplied fields (test-management
+    # toolkits carry run ids as tool params).
+    RUN_ID = '_elitea_run_id'
     INDEX_META_TYPE = 'index_meta'
     INDEX_META_CREATED = 'created'
     INDEX_META_IN_PROGRESS = 'in_progress'

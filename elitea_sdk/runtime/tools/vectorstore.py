@@ -12,6 +12,7 @@ from elitea_sdk.tools.vector_adapters.VectorStoreAdapter import VectorStoreAdapt
 from logging import getLogger
 
 from ..utils.logging import dispatch_custom_event
+from ..utils.utils import IndexerKeywords
 from ..langchain.utils import extract_text_from_completion
 
 logger = getLogger(__name__)
@@ -257,6 +258,13 @@ class VectorStoreWrapper(BaseToolApiWrapper):
         """ Get all indexed data from vectorstore for code content """
         return self.vector_adapter.get_code_indexed_data(self, index_name)
 
+    def _get_pending_run_ids_safe(self) -> List[str]:
+        try:
+            return self.vector_adapter.get_pending_run_ids(self, "")
+        except Exception as e:
+            logger.debug(f"Could not fetch pending index run ids: {e}")
+            return []
+
     def _add_to_collection(self, entry_id, new_collection_value):
         """Add a new collection name to the `collection` key in the `metadata` column."""
         self.vector_adapter.add_to_collection(self, entry_id, new_collection_value)
@@ -431,12 +439,22 @@ class VectorStoreWrapper(BaseToolApiWrapper):
                          ):
         """Enhanced search documents method using JSON configurations for full-text search and reranking"""
         from elitea_sdk.tools.code.loaders.codesearcher import search_format as code_format
-        
+
         if not filter:
             filter = None
         else:
             if isinstance(filter, str):
                 filter = json.loads(filter)
+
+        pending_run_ids = self._get_pending_run_ids_safe()
+        if pending_run_ids:
+            # A bare $nin is NULL-false for rows without the key — the
+            # $exists:False disjunct is what keeps every legacy row visible.
+            pending_exclusion = {"$or": [
+                {IndexerKeywords.RUN_ID.value: {"$exists": False}},
+                {IndexerKeywords.RUN_ID.value: {"$nin": pending_run_ids}},
+            ]}
+            filter = pending_exclusion if filter is None else {"$and": [filter, pending_exclusion]}
 
         # Extended search implementation
         if extended_search:

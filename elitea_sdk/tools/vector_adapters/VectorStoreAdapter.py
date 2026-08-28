@@ -1,3 +1,4 @@
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, List
 from logging import getLogger
@@ -6,9 +7,15 @@ from ...runtime.utils.utils import IndexerKeywords
 
 logger = getLogger(__name__)
 
+PROMOTE_DELETE_BATCH_SIZE = 50000
+
 
 class VectorStoreAdapter(ABC):
     """Abstract base class for vector store adapters."""
+
+    # Adapters without run staging keep the pre-run-coordination indexing
+    # lifecycle: immediate dedup deletes, pre-load clean, no promote contract.
+    supports_run_staging = False
 
     @abstractmethod
     def get_vectorstore_params(self, collection_name: str, connection_string: Optional[str] = None) -> Dict[str, Any]:
@@ -59,9 +66,44 @@ class VectorStoreAdapter(ABC):
         """Get all index_meta entries from the vector store."""
         pass
 
+    @abstractmethod
+    def promote_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                    superseded_ids: List[str], orphan_ids: List[str],
+                    damaged_ids: List[str]) -> str:
+        """Publish a run's staged rows atomically. Returns the promote outcome."""
+        pass
+
+    @abstractmethod
+    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str) -> str:
+        """Delete a run's staged rows and terminal its run row."""
+        pass
+
+    def get_pending_run_ids(self, vectorstore_wrapper, index_name: str,
+                            include_cancelled: bool = True) -> List[str]:
+        """Run ids whose rows must stay invisible to every read path."""
+        return []
+
+    def ensure_index_runs_table(self, vectorstore_wrapper) -> None:
+        raise NotImplementedError("Run staging is not supported by this adapter")
+
+    def register_index_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                           task_id: Optional[str] = None,
+                           meta_lock_id: Optional[str] = None):
+        raise NotImplementedError("Run staging is not supported by this adapter")
+
+    def heartbeat_index_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                            meta_id: Optional[str]) -> None:
+        raise NotImplementedError("Run staging is not supported by this adapter")
+
+    def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
+                               stale_before: float) -> List[str]:
+        raise NotImplementedError("Run staging is not supported by this adapter")
+
 
 class PGVectorAdapter(VectorStoreAdapter):
     """Adapter for PGVector database operations."""
+
+    supports_run_staging = True
 
     def get_vectorstore_params(self, collection_name: str, connection_string: Optional[str] = None) -> Dict[str, Any]:
         try:
@@ -169,13 +211,15 @@ class PGVectorAdapter(VectorStoreAdapter):
             vectorstore_wrapper._log_tool_event("Retrieving already indexed data from PGVector vectorstore",
                            tool_name="get_indexed_data")
             store = vectorstore_wrapper.vectorstore
+            pending_run_ids = self.get_pending_run_ids(vectorstore_wrapper, index_name)
             with Session(store.session_maker.bind) as session:
                 docs = session.query(
                     store.EmbeddingStore.id,
                     store.EmbeddingStore.document,
                     store.EmbeddingStore.cmetadata
                 ).filter(
-                    func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name
+                    func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name,
+                    self._active_data_rows_clause(store, pending_run_ids)
                 ).all()
 
             # Process the retrieved data
@@ -200,13 +244,31 @@ class PGVectorAdapter(VectorStoreAdapter):
                         'id': db_id,
                         'all_chunks': [db_id],
                         IndexerKeywords.DEPENDENT_DOCS.value: dependent_docs,
-                        IndexerKeywords.PARENT.value: parent_id
+                        IndexerKeywords.PARENT.value: parent_id,
+                        # Rows keyed by their row PK (no source id) have no stable
+                        # identity: the orphan math must skip them, or they are
+                        # deleted on every attested promote with no replacement.
+                        'pk_fallback': 'id' not in meta,
                     }
 
         except Exception as e:
             logger.error(f"Failed to get indexed data from PGVector: {str(e)}. Continuing with empty index.")
 
         return result
+
+    def _active_data_rows_clause(self, store, pending_run_ids: Optional[List[str]] = None):
+        from sqlalchemy import and_, func, or_
+
+        clause = or_(
+            func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type').is_(None),
+            func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value
+        )
+        if pending_run_ids:
+            run_id_text = func.jsonb_extract_path_text(
+                store.EmbeddingStore.cmetadata, IndexerKeywords.RUN_ID.value
+            )
+            clause = and_(clause, or_(run_id_text.is_(None), run_id_text.notin_(pending_run_ids)))
+        return clause
 
     def get_code_indexed_data(self, vectorstore_wrapper, index_name: str) -> Dict[str, Dict[str, Any]]:
         """Get all indexed code data from PGVector per collection suffix."""
@@ -218,12 +280,14 @@ class PGVectorAdapter(VectorStoreAdapter):
             vectorstore_wrapper._log_tool_event(message="Retrieving already indexed code data from PGVector vectorstore",
                            tool_name="index_code_data")
             store = vectorstore_wrapper.vectorstore
+            pending_run_ids = self.get_pending_run_ids(vectorstore_wrapper, index_name)
             with (Session(store.session_maker.bind) as session):
                 docs = session.query(
                     store.EmbeddingStore.id,
                     store.EmbeddingStore.cmetadata
                 ).filter(
-                    func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name
+                    func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name,
+                    self._active_data_rows_clause(store, pending_run_ids)
                 ).all()
 
             for db_id, meta in docs:
@@ -315,6 +379,268 @@ class PGVectorAdapter(VectorStoreAdapter):
         except Exception as e:
             logger.error(f"Failed to get index_meta from PGVector: {str(e)}")
             raise e
+
+    def ensure_index_runs_table(self, vectorstore_wrapper) -> None:
+        from ...runtime.tools.index_runs_model import ensure_index_runs_table
+
+        store = vectorstore_wrapper.vectorstore
+        ensure_index_runs_table(store.session_maker.bind, store.collection_name)
+
+    def get_pending_run_ids(self, vectorstore_wrapper, index_name: str,
+                            include_cancelled: bool = True) -> List[str]:
+        from sqlalchemy.exc import ProgrammingError
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_PENDING, is_undefined_table_error,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        statuses = (
+            (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)
+            if include_cancelled else (RUN_STATUS_PENDING,)
+        )
+        try:
+            with Session(store.session_maker.bind) as session:
+                query = session.query(IndexRun.run_id).filter(
+                    IndexRun.status.in_(statuses)
+                )
+                if index_name:
+                    query = query.filter(IndexRun.collection == index_name)
+                return [row[0] for row in query.all()]
+        except ProgrammingError as exc:
+            # Read paths never provision the table: a schema without it means no
+            # run ever staged there, so search degrades to unfiltered, not broken.
+            if is_undefined_table_error(exc):
+                return []
+            raise
+
+    def register_index_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                           task_id: Optional[str] = None,
+                           meta_lock_id: Optional[str] = None):
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_PENDING, live_run_where,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        now = time.time()
+        with Session(store.session_maker.bind) as session:
+            if meta_lock_id is not None:
+                # Pure lock, deliberately unused by the INSERT itself: core's
+                # dispatch guard and failed-state writers read this table inside
+                # a meta-row FOR UPDATE, and only queueing the registration
+                # behind that same lock keeps their in-lock read authoritative.
+                # Removing it silently reopens the guard TOCTOU.
+                session.query(store.EmbeddingStore.id).filter(
+                    store.EmbeddingStore.id == meta_lock_id
+                ).with_for_update().all()
+            statement = pg_insert(IndexRun).values(
+                run_id=run_id,
+                collection=index_name,
+                status=RUN_STATUS_PENDING,
+                task_id=task_id,
+                started_on=now,
+                heartbeat=now,
+            ).on_conflict_do_nothing(
+                index_elements=[IndexRun.collection],
+                index_where=live_run_where(),
+            ).returning(IndexRun.run_id)
+            registered = session.execute(statement).first() is not None
+            session.commit()
+        if registered:
+            return True, None
+        with Session(store.session_maker.bind) as session:
+            blocker = session.query(IndexRun).filter(
+                IndexRun.collection == index_name,
+                live_run_where(),
+            ).first()
+            if blocker is None:
+                return False, None
+            return False, {
+                "run_id": blocker.run_id,
+                "heartbeat": blocker.heartbeat,
+                "started_on": blocker.started_on,
+            }
+
+    def heartbeat_index_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                            meta_id: Optional[str]) -> None:
+        import json as json_module
+        from sqlalchemy import cast, exists, func, literal, update
+        from sqlalchemy.dialects.postgresql import JSONB, array
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_PENDING, live_run_where,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        now = time.time()
+        # Two SEPARATE transactions: one transaction would hold the run-row lock
+        # while waiting on the meta row — an AB-BA inversion against meta-first
+        # promote/discard/cancel. Cancelled rows tick too, so a tombstoned
+        # surviving worker stays fresh and the sweep cannot reclaim it mid-run.
+        with Session(store.session_maker.bind) as session:
+            session.execute(
+                update(IndexRun)
+                .where(
+                    IndexRun.run_id == run_id,
+                    IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                )
+                .values(heartbeat=now)
+            )
+            session.commit()
+        if meta_id is None:
+            return
+        with Session(store.session_maker.bind) as session:
+            # The EXISTS(pending own row) guard makes a tick queued behind
+            # promote's meta lock a 0-row no-op after promote commits.
+            session.execute(
+                update(store.EmbeddingStore)
+                .where(
+                    store.EmbeddingStore.id == meta_id,
+                    exists().where(IndexRun.run_id == run_id, live_run_where()),
+                )
+                .values(
+                    cmetadata=func.jsonb_set(
+                        func.coalesce(store.EmbeddingStore.cmetadata, cast(literal("{}"), JSONB)),
+                        array(["updated_on"]),
+                        cast(literal(json_module.dumps(now)), JSONB),
+                    )
+                )
+            )
+            session.commit()
+
+    def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
+                               stale_before: float) -> List[str]:
+        from sqlalchemy import update
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED, RUN_STATUS_PENDING,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            stale_run_ids = [
+                row[0]
+                for row in session.query(IndexRun.run_id).filter(
+                    IndexRun.collection == index_name,
+                    IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                    IndexRun.heartbeat < stale_before,
+                ).all()
+            ]
+        for stale_run_id in stale_run_ids:
+            # The chunk DELETE commits lock-free BEFORE the status flip: a single
+            # transaction would hold chunk-row locks while wanting the run row,
+            # inverting cancel's meta -> run -> chunk order. A crash between the
+            # two transactions leaves the row to be re-swept next run.
+            with Session(store.session_maker.bind) as session:
+                self._delete_run_chunks(session, store, stale_run_id)
+                session.commit()
+            with Session(store.session_maker.bind) as session:
+                session.execute(
+                    update(IndexRun)
+                    .where(
+                        IndexRun.run_id == stale_run_id,
+                        IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                    )
+                    .values(status=RUN_STATUS_DISCARDED)
+                )
+                session.commit()
+        return stale_run_ids
+
+    def promote_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                    superseded_ids: List[str], orphan_ids: List[str],
+                    damaged_ids: List[str]) -> str:
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED,
+            RUN_STATUS_PENDING, RUN_STATUS_PROMOTED,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            # Universal lock order for promote, discard AND cancel:
+            # meta row -> run row -> chunk rows. Any other order deadlocks
+            # against the other two parties.
+            meta_ids = self._lock_index_meta_rows(session, store, index_name)
+            run_row = session.get(IndexRun, run_id, with_for_update=True)
+            if not meta_ids:
+                if run_row is not None and run_row.status in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                    run_row.status = RUN_STATUS_DISCARDED
+                session.commit()
+                return "aborted-row-deleted"
+            if run_row is None or run_row.status not in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                session.rollback()
+                return "aborted-not-pending"
+            if run_row.status == RUN_STATUS_CANCELLED:
+                self._delete_run_chunks(session, store, run_id)
+                run_row.status = RUN_STATUS_DISCARDED
+                session.commit()
+                return "aborted-cancelled"
+            delete_ids = list(dict.fromkeys([*superseded_ids, *orphan_ids, *damaged_ids]))
+            for ids_batch in self._iter_id_batches(delete_ids):
+                self._delete_rows_by_pk(session, store, ids_batch)
+            run_row.status = RUN_STATUS_PROMOTED
+            run_row.promoted_on = time.time()
+            session.commit()
+            return "promoted"
+
+    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str) -> str:
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED, RUN_STATUS_PENDING,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            self._lock_index_meta_rows(session, store, index_name)
+            run_row = session.get(IndexRun, run_id, with_for_update=True)
+            if run_row is None or run_row.status not in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                session.rollback()
+                return "noop"
+            self._delete_run_chunks(session, store, run_id)
+            run_row.status = RUN_STATUS_DISCARDED
+            session.commit()
+            return "discarded"
+
+    def _lock_index_meta_rows(self, session, store, index_name: str):
+        from sqlalchemy import func
+
+        return session.query(store.EmbeddingStore.id).filter(
+            store.EmbeddingStore.cmetadata['type'].astext == IndexerKeywords.INDEX_META_TYPE.value,
+            func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name
+        ).with_for_update().all()
+
+    def _delete_run_chunks(self, session, store, run_id: str) -> int:
+        from sqlalchemy import func, or_
+
+        # No `collection` conjunct: multi-index rows carry `collection` as an
+        # appended "a;b" string that equality would miss, leaving escaped rows
+        # permanently visible once the run row goes terminal. The run id is
+        # globally unique; the type conjunct shields the meta row belt-and-braces.
+        return session.query(store.EmbeddingStore).filter(
+            store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
+            or_(
+                func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type').is_(None),
+                func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value
+            )
+        ).delete(synchronize_session=False)
+
+    @staticmethod
+    def _iter_id_batches(ids: List[str]):
+        for start in range(0, len(ids), PROMOTE_DELETE_BATCH_SIZE):
+            yield ids[start:start + PROMOTE_DELETE_BATCH_SIZE]
+
+    @staticmethod
+    def _delete_rows_by_pk(session, store, ids_batch: List[str]) -> int:
+        from sqlalchemy import String as SAString
+        from sqlalchemy import any_, cast, literal
+        from sqlalchemy.dialects.postgresql import ARRAY
+
+        # `= ANY(:array)` is a single bind: `.in_()` fails past 65535 parameters.
+        return session.query(store.EmbeddingStore).filter(
+            store.EmbeddingStore.id == any_(cast(literal(ids_batch), ARRAY(SAString)))
+        ).delete(synchronize_session=False)
 
 
 class ChromaAdapter(VectorStoreAdapter):
@@ -441,6 +767,19 @@ class ChromaAdapter(VectorStoreAdapter):
 
     def get_index_meta(self, vectorstore_wrapper, index_name: str) -> List[Dict[str, Any]]:
         logger.warning("get_index_meta for Chroma is not implemented yet")
+        return []
+
+    def promote_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                    superseded_ids: List[str], orphan_ids: List[str],
+                    damaged_ids: List[str]) -> str:
+        logger.warning("promote_run is a no-op for Chroma: the preserve-on-failure "
+                       "guarantee does not extend to Chroma")
+        return "promoted"
+
+    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str) -> str:
+        logger.warning("discard_run is a no-op for Chroma: the preserve-on-failure "
+                       "guarantee does not extend to Chroma")
+        return "noop"
 
 
 class VectorStoreAdapterFactory:

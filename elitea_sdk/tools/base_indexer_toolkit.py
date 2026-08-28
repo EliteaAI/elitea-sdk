@@ -8,6 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Optional, List, Dict, Generator, Set, Tuple
+from uuid import uuid4
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
@@ -534,6 +535,9 @@ def render_report_text(report: Dict[str, Any]) -> str:
             f"ℹ {unchanged} {_pick_noun(unchanged, item_labels)} already indexed (unchanged)"
         )
 
+    for warning in report.get("warnings") or []:
+        lines.append(f"⚠ {warning}")
+
     errors = report.get("errors") or []
     if errors:
         lines.append("Errors:")
@@ -595,6 +599,45 @@ def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]
 
 DEFAULT_CUT_OFF = 0.1
 INDEX_META_UPDATE_INTERVAL = 600.0
+# Mirrors the core-side vault default for `task_disconnected_timeout_sec`; used
+# only when the meta row never carried the key (agent-invoked fresh runs).
+TASK_DISCONNECTED_TIMEOUT_DEFAULT = 7200.0
+INDEX_RUN_HEARTBEAT_INTERVAL = 60.0
+# All id-less documents normalize to this shared key; sharing one key would
+# mutually damage-mark and mis-attribute supersedes across unrelated documents,
+# so they stay insert-only — never staged, never damage-attributed.
+IDLESS_STAGING_KEY = "None"
+
+
+class IndexRunRefusedError(ToolException):
+    """Refusal to start an indexing run while another one owns the index.
+
+    Must never flow through the generic index_data failure handling: the shared
+    meta row and the failed-state event both belong to the run that IS live.
+    """
+
+
+@dataclass
+class _IndexRunState:
+    """Per-run coordination state; recreated at every index_data entry so a
+    reused wrapper can never inherit another run's latch or staging maps."""
+    run_id: str
+    clean_index: bool = False
+    finalized: bool = False
+    meta_id: Optional[str] = None
+    disconnected_timeout: float = TASK_DISCONNECTED_TIMEOUT_DEFAULT
+    loader_attested: bool = False
+    staged_removal_ids: Dict[str, Set[str]] = field(default_factory=dict)
+    pending_chunk_counts: Dict[str, int] = field(default_factory=dict)
+    recorded_row_pks: Dict[str, List[str]] = field(default_factory=dict)
+    damaged_keys: Set[str] = field(default_factory=set)
+    pipeline_failed_keys: Set[str] = field(default_factory=set)
+    counted_doc_keys: Set[str] = field(default_factory=set)
+    seen_keys: Set[str] = field(default_factory=set)
+    orphan_candidate_ids: List[str] = field(default_factory=list)
+    orphan_candidate_doc_count: int = 0
+    heartbeat_stop: Optional[threading.Event] = None
+    heartbeat_thread: Optional[threading.Thread] = None
 
 class IndexTools(str, Enum):
     """Enum for index-related tool names."""
@@ -622,6 +665,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     # When true the document count comes from the stats, not from the chunk count.
     loader_yields_chunks: ClassVar[bool] = False
+
+    # Orphan deletion (removing docs absent from the source) is the sole delete
+    # built on absence evidence, so it only ever runs for toolkits that positively
+    # attest their paging loop ran to its natural end — generator exhaustion is
+    # NOT attestation, and a mid-paging 429 returning a short page set would
+    # otherwise mass-delete the difference under a green banner. Opt in only
+    # after a reviewed paging-loop audit.
+    loader_attests_completion: ClassVar[bool] = False
 
     connection_string: Optional[SecretStr] = None
     collection_name: Optional[str] = None
@@ -740,14 +791,22 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         initiator_hint = kwargs.get("_initiator")
         if initiator_hint:
             self._index_meta_config["initiator"] = initiator_hint
+        else:
+            self._index_meta_config.pop("initiator", None)
+
+        self._index_run = _IndexRunState(run_id=uuid4().hex[:12], clean_index=bool(clean_index))
 
         result = {"count": 0, "failed_count": 0, "docs_count": 0}
         #
         try:
-            if clean_index:
+            self._ensure_vectorstore_initialized()
+            staging = getattr(self.vector_adapter, "supports_run_staging", False)
+            if clean_index and not staging:
                 self._clean_index(index_name)
             #
             self.index_meta_init(index_name, kwargs)
+            if staging:
+                self._start_run_heartbeat(index_name)
             self._emit_index_event(index_name)
             #
             self._log_tool_event(f"Indexing data into collection with suffix '{index_name}'. It can take some time...")
@@ -755,17 +814,27 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # A second index_data call on the same wrapper would otherwise accumulate
             # the previous run's counts into this run's report.
             self._indexing_stats = IndexingStats()
-            documents = self._base_loader(**kwargs)
-            documents = list(documents) # consume/exhaust generator to count items
-            documents_count = len(documents)
-            self._stamp_loader_stats(documents_count)
-            documents = (doc for doc in documents)
-            self._log_tool_event(f"Base documents were pre-loaded. "
-                                 f"Search for possible document duplicates and remove them from the indexing list...")
-            documents = self._reduce_duplicates(documents, index_name)
-            self._log_tool_event(f"Duplicates were removed. "
-                                 f"Processing documents to collect dependencies and prepare them for indexing...")
-            self._save_index_generator(documents, documents_count, chunking_tool, chunking_config, index_name=index_name, result=result)
+            empty_loader = False
+            try:
+                documents = self._base_loader(**kwargs)
+                documents = list(documents) # consume/exhaust generator to count items
+                documents_count = len(documents)
+                self._stamp_loader_stats(documents_count)
+                # A loader that soft-fails to zero documents over a previously
+                # built index must never publish or rewrite counts.
+                empty_loader = documents_count == 0 and self._has_previous_index_run()
+                if not empty_loader:
+                    documents = (doc for doc in documents)
+                    self._log_tool_event(f"Base documents were pre-loaded. "
+                                         f"Search for possible document duplicates and remove them from the indexing list...")
+                    documents = self._reduce_duplicates(documents, index_name)
+                    self._log_tool_event(f"Duplicates were removed. "
+                                         f"Processing documents to collect dependencies and prepare them for indexing...")
+                    self._save_index_generator(documents, documents_count, chunking_tool, chunking_config, index_name=index_name, result=result)
+            finally:
+                self._stop_run_heartbeat()
+            if empty_loader:
+                return self._finalize_empty_loader_run(index_name)
             #
             chunks_count = result["count"]
             failed_chunks_count = result.get("failed_count", 0)
@@ -789,6 +858,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if self.loader_yields_chunks and effective_processed > 0:
                 docs_count = effective_processed
 
+            run = self._index_run
+            damaged_doc_keys = (run.damaged_keys | run.pipeline_failed_keys) if staging else set()
+            if damaged_doc_keys:
+                # Counted on buffer append, before any flush outcome — keeping
+                # them would render the damaged docs as retained content.
+                docs_count = max(docs_count - len(run.counted_doc_keys & damaged_doc_keys), 0)
+
             # Chunk counts drive the state only — never the user-facing summary.
             if failed_chunks_count > 0 and succeeded_chunks_count > 0:
                 final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
@@ -796,6 +872,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             elif failed_chunks_count > 0 >= succeeded_chunks_count:
                 final_state = IndexerKeywords.INDEX_META_FAILED.value
                 status = IndexingStatus.ERROR
+            elif damaged_doc_keys:
+                # The parallel pipeline swallows per-doc failures into errors
+                # without touching either chunk counter — a run that lost
+                # documents must not land 'completed'.
+                final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
+                status = IndexingStatus.PARTLY_INDEXED
             else:
                 final_state = IndexerKeywords.INDEX_META_COMPLETED.value
                 status = IndexingStatus.OK
@@ -807,37 +889,318 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 dependent_labels=self.index_dependent_labels,
                 errors=errors,
             )
+            if staging and final_state != IndexerKeywords.INDEX_META_FAILED.value:
+                self._append_retained_orphan_warning(report)
             message = render_report_text(report)
+
+            if staging:
+                if final_state in (IndexerKeywords.INDEX_META_COMPLETED.value,
+                                   IndexerKeywords.INDEX_META_PARTLY_OK.value):
+                    superseded_ids, damaged_pk_ids, orphan_ids = self._assemble_promote_sets()
+                    promote_outcome = self._promote_index_run(
+                        index_name, superseded_ids, orphan_ids, damaged_pk_ids
+                    )
+                    if promote_outcome != "promoted":
+                        return self._build_aborted_result(promote_outcome, index_name)
+                else:
+                    self._discard_index_run(index_name)
 
             # Final update should always be forced (pass chunks count for indexed_chunks field).
             # Include unchanged docs in the indexed count so the UI reflects total items
             # currently in the vector store, not just newly indexed ones.
             indexed_total = docs_count + unchanged_count
-            self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
+            written_state = self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
+                                                   error=message if status is not IndexingStatus.OK else None,
+                                                   skipped=skipped_data, docs_count=indexed_total, report=report)
+            self._emit_index_event(index_name,
                                    error=message if status is not IndexingStatus.OK else None,
-                                   skipped=skipped_data, docs_count=indexed_total, report=report)
-            self._emit_index_event(index_name)
+                                   state=written_state or final_state)
             #
             return {"status": status.value, "message": message, "report": report}
+        except IndexRunRefusedError:
+            # The refusal must not flip the SHARED meta row or emit a failed-state
+            # event — both belong to the live run that owns the index; the raised
+            # exception is how this caller learns about the refusal.
+            self._stop_run_heartbeat()
+            raise
         except Exception as e:
             # Do maximum effort at least send custom event for supposed changed status
+            self._stop_run_heartbeat()
             msg = str(e)
+            if self._staging_active():
+                try:
+                    self._discard_index_run(index_name)
+                except Exception as de:
+                    logger.error(f"Failed to discard staged rows for index '{index_name}': {de}")
+                    msg = f"{msg}; additionally failed to discard staged rows for the run: {de}"
             try:
-                # Without an error report the history entry would keep rendering the
-                # previous run's summary.
-                error_report = build_error_report(
-                    msg,
-                    item_labels=self.index_item_labels,
-                    dependent_labels=self.index_dependent_labels,
-                    stats=self.get_indexing_stats(),
-                )
-                self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
-                                       update_force=True, error=msg, report=error_report)
+                if self._staging_active() and self._foreign_live_run_exists(index_name):
+                    # A pre-registration failure inside the dispatch window must not
+                    # flip the shared row while a registered run is mid-flight; the
+                    # emit below still surfaces this run's failure to its initiator.
+                    logger.warning(
+                        f"Skipping FAILED index_meta write for '{index_name}': another live run owns the index"
+                    )
+                else:
+                    # Without an error report the history entry would keep rendering the
+                    # previous run's summary.
+                    error_report = build_error_report(
+                        msg,
+                        item_labels=self.index_item_labels,
+                        dependent_labels=self.index_dependent_labels,
+                        stats=self.get_indexing_stats(),
+                    )
+                    self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
+                                           update_force=True, error=msg, report=error_report)
             except Exception as ie:
                 logger.error(f"Failed to update index meta status to FAILED for index '{index_name}': {ie}")
                 msg = f"{msg}; additionally failed to update index meta status to FAILED: {ie}"
-            self._emit_index_event(index_name, error=msg)
+            self._emit_index_event(index_name, error=msg, state=IndexerKeywords.INDEX_META_FAILED.value)
             raise e
+
+    def _staging_active(self) -> bool:
+        adapter = self.vector_adapter
+        return bool(
+            adapter is not None
+            and getattr(adapter, "supports_run_staging", False)
+            and getattr(self, "_index_run", None) is not None
+        )
+
+    def _ensure_index_runs_table(self):
+        try:
+            self.vector_adapter.ensure_index_runs_table(self)
+        except Exception as exc:
+            # A provisioning failure must ride the refusal path: through the
+            # generic handler it would flip the shared meta row to failed.
+            raise IndexRunRefusedError(
+                f"Could not provision the index run coordination table: {exc}"
+            ) from exc
+
+    def _register_index_run(self, index_name: str, task_id: Optional[str], meta_lock_id: Optional[str]):
+        run = self._index_run
+        registered, blocker = self.vector_adapter.register_index_run(
+            self, index_name, run.run_id, task_id=task_id, meta_lock_id=meta_lock_id
+        )
+        if registered:
+            return
+        if blocker is None:
+            raise IndexRunRefusedError(
+                f"Another indexing run for index '{index_name}' was in progress; please retry."
+            )
+        heartbeat = blocker.get("heartbeat")
+        if heartbeat is not None and (time.time() - heartbeat) > run.disconnected_timeout:
+            # The reclaim sweep runs immediately before registration and cannot
+            # have missed a stale blocker — this is a sweep/timeout-source
+            # failure, never a live concurrent run.
+            logger.error(
+                f"Registration refused for index '{index_name}' by STALE pending run "
+                f"'{blocker.get('run_id')}' (heartbeat {heartbeat}); the reclaim sweep or its "
+                f"timeout source is broken"
+            )
+            raise IndexRunRefusedError(
+                f"Indexing for '{index_name}' is blocked by a stale run marker that could not be "
+                "reclaimed; check the indexer logs."
+            )
+        raise IndexRunRefusedError(
+            f"Another indexing run is already in progress for index '{index_name}'; wait for it "
+            "to finish or stop it before starting a new one."
+        )
+
+    def _read_disconnected_timeout(self, metadata: Dict[str, Any]) -> float:
+        try:
+            timeout = float(metadata.get("task_disconnected_timeout_sec"))
+        except (TypeError, ValueError):
+            return TASK_DISCONNECTED_TIMEOUT_DEFAULT
+        return timeout if timeout > 0 else TASK_DISCONNECTED_TIMEOUT_DEFAULT
+
+    def _start_run_heartbeat(self, index_name: str):
+        run = self._index_run
+        stop_signal = threading.Event()
+
+        def _tick_forever():
+            while not stop_signal.wait(INDEX_RUN_HEARTBEAT_INTERVAL):
+                if run.finalized:
+                    return
+                try:
+                    self.vector_adapter.heartbeat_index_run(self, index_name, run.run_id, run.meta_id)
+                except Exception as exc:
+                    logger.warning(f"Index run heartbeat failed for '{index_name}': {exc}")
+
+        run.heartbeat_stop = stop_signal
+        run.heartbeat_thread = threading.Thread(
+            target=_tick_forever,
+            name=f"index-run-heartbeat-{run.run_id}",
+            daemon=True,
+        )
+        run.heartbeat_thread.start()
+
+    def _stop_run_heartbeat(self):
+        run = getattr(self, "_index_run", None)
+        if run is not None and run.heartbeat_stop is not None:
+            run.heartbeat_stop.set()
+
+    def _assemble_promote_sets(self):
+        run = self._index_run
+        damaged_doc_keys = run.damaged_keys | run.pipeline_failed_keys
+        superseded_ids: List[str] = []
+        for doc_key, removal_ids in run.staged_removal_ids.items():
+            if doc_key in damaged_doc_keys:
+                continue
+            if run.pending_chunk_counts.get(doc_key, 0) != 0:
+                continue
+            superseded_ids.extend(removal_ids)
+        damaged_pk_ids = [
+            row_pk
+            for doc_key in damaged_doc_keys
+            for row_pk in run.recorded_row_pks.get(doc_key, [])
+        ]
+        orphan_ids = (
+            run.orphan_candidate_ids
+            if self.loader_attests_completion and run.loader_attested
+            else []
+        )
+        return superseded_ids, damaged_pk_ids, orphan_ids
+
+    def _promote_index_run(self, index_name: str, superseded_ids: List[str],
+                           orphan_ids: List[str], damaged_pk_ids: List[str]) -> str:
+        run = self._index_run
+        outcome = self.vector_adapter.promote_run(
+            self, index_name, run.run_id, superseded_ids, orphan_ids, damaged_pk_ids
+        )
+        run.finalized = True
+        return outcome
+
+    def _discard_index_run(self, index_name: str):
+        run = getattr(self, "_index_run", None)
+        # The latch makes promote and discard mutually exclusive: a terminal meta
+        # write failing AFTER promote must not delete the corpus just published.
+        if run is None or run.finalized:
+            return
+        self.vector_adapter.discard_run(self, index_name, run.run_id)
+        run.finalized = True
+
+    def _foreign_live_run_exists(self, index_name: str) -> bool:
+        run = self._index_run
+        try:
+            live_run_ids = self.vector_adapter.get_pending_run_ids(
+                self, index_name, include_cancelled=False
+            )
+        except Exception as exc:
+            logger.warning(f"Could not check live runs for index '{index_name}': {exc}")
+            return False
+        return any(live_run_id != run.run_id for live_run_id in live_run_ids)
+
+    def _finalize_empty_loader_run(self, index_name: str):
+        message = ("Indexing failed: the loader returned no content while the index holds data "
+                   "from previous runs.")
+        if self._staging_active():
+            # Only staging adapters preserve the previous generation; a
+            # non-staging clean run has already wiped it before loading.
+            message += " Previously indexed data remains available for search."
+            self._discard_index_run(index_name)
+        report = build_error_report(
+            message,
+            item_labels=self.index_item_labels,
+            dependent_labels=self.index_dependent_labels,
+            stats=self.get_indexing_stats(),
+        )
+        self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, 0,
+                               update_force=True, error=message, report=report)
+        self._emit_index_event(index_name, error=message,
+                               state=IndexerKeywords.INDEX_META_FAILED.value)
+        return {"status": IndexingStatus.ERROR.value, "message": message, "report": report}
+
+    def _build_aborted_result(self, outcome: str, index_name: str):
+        # Terminal meta write AND success emit are both skipped on every aborted
+        # branch: cancel's snapshot already finalized the row, and a success
+        # report for a discarded corpus must never reach the transcript.
+        if outcome == "aborted-cancelled":
+            message = ("Indexing run was cancelled: the new data was discarded and the previously "
+                       "indexed data remains available for search.")
+        elif outcome == "aborted-row-deleted":
+            message = f"Index '{index_name}' was deleted while the run was in progress; nothing was published."
+        else:
+            message = ("Indexing run was superseded or reclaimed before completion: nothing was "
+                       "published and the previously indexed data remains available for search.")
+            logger.error(f"Promote aborted for index '{index_name}': the run is no longer pending")
+        report = build_error_report(
+            message,
+            item_labels=self.index_item_labels,
+            dependent_labels=self.index_dependent_labels,
+            stats=self.get_indexing_stats(),
+        )
+        return {"status": IndexingStatus.ERROR.value, "message": message, "report": report}
+
+    @staticmethod
+    def _staging_key(metadata: dict) -> str:
+        parent = metadata.get(IndexerKeywords.PARENT.value)
+        if parent is not None:
+            return str(parent)
+        doc_id = metadata.get('id')
+        if doc_id is not None:
+            return str(doc_id)
+        return str(metadata.get('filename'))
+
+    def _record_flushed_chunk(self, run: _IndexRunState, chunk_keys: List[str], inserted_ids):
+        if inserted_ids is None or len(inserted_ids) != len(chunk_keys):
+            # Empty-content chunks are dropped before buffering, so add_documents
+            # inserts one row per buffered chunk; a length mismatch means the
+            # per-doc attribution is unknowable, and deleting by a bad zip could
+            # destroy an undamaged doc's rows — damage the whole batch instead.
+            logger.error(
+                f"add_documents returned {0 if inserted_ids is None else len(inserted_ids)} ids "
+                f"for {len(chunk_keys)} chunks; marking the whole batch damaged"
+            )
+            self._mark_batch_damaged(run, chunk_keys)
+            return
+        for chunk_key, row_pk in zip(chunk_keys, inserted_ids):
+            if chunk_key == IDLESS_STAGING_KEY:
+                continue
+            run.recorded_row_pks.setdefault(chunk_key, []).append(str(row_pk))
+            run.pending_chunk_counts[chunk_key] = run.pending_chunk_counts.get(chunk_key, 0) - 1
+
+    @staticmethod
+    def _mark_batch_damaged(run: _IndexRunState, chunk_keys: List[str]):
+        run.damaged_keys.update(
+            chunk_key for chunk_key in set(chunk_keys) if chunk_key != IDLESS_STAGING_KEY
+        )
+
+    def _append_retained_orphan_warning(self, report: Dict[str, Any]):
+        run = self._index_run
+        if not run.orphan_candidate_ids:
+            return
+        if self.loader_attests_completion and run.loader_attested:
+            return
+        count = run.orphan_candidate_doc_count
+        noun = self.index_item_labels[0] if count == 1 else self.index_item_labels[1]
+        report.setdefault("warnings", []).append(
+            f"Kept {count} previously indexed {noun} the source did not return in this run: "
+            "the loader cannot confirm source deletions, so previously indexed data stays searchable."
+        )
+
+    def _collect_orphan_candidates(self, indexed_data: Dict[str, Dict[str, Any]],
+                                   seen_keys: Set[str]) -> Tuple[List[str], int]:
+        dependent_keys = set()
+        for entry in indexed_data.values():
+            for dependent_key in entry.get(IndexerKeywords.DEPENDENT_DOCS.value) or []:
+                dependent_keys.add(str(dependent_key))
+        orphan_ids: List[str] = []
+        orphan_doc_count = 0
+        for doc_key, entry in indexed_data.items():
+            if doc_key in seen_keys or doc_key in dependent_keys:
+                continue
+            if entry.get('pk_fallback'):
+                continue
+            # -1 is the adapter's no-parent sentinel; any other value (including
+            # None — a dependent whose parent had no id and so can never appear
+            # in seen_keys) marks a dependent row that falls with its parent.
+            if entry.get(IndexerKeywords.PARENT.value, -1) != -1:
+                continue
+            orphan_doc_count += 1
+            orphan_ids.extend(
+                str(row_id) for row_id in (entry.get('all_chunks') or entry.get('ids') or [])
+            )
+        return orphan_ids, orphan_doc_count
 
     def _save_index_generator(self, base_documents: Generator[Document, None, None], base_total: int, chunking_tool, chunking_config, result, index_name: Optional[str] = None):
         self._ensure_vectorstore_initialized()
@@ -846,13 +1209,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         #
         pg_vector_add_docs_chunk: list = []
 
+        staging = self._staging_active()
+        run = getattr(self, "_index_run", None)
+
         def _flush_chunk(chunk: list):
             """Flush a chunk of documents to the vectorstore, tracking failures in result."""
             if not chunk:
                 return
+            chunk_keys = [self._staging_key(doc.metadata) for doc in chunk] if staging else []
             try:
-                add_documents(vectorstore=self.vectorstore, documents=chunk)
+                inserted_ids = add_documents(vectorstore=self.vectorstore, documents=chunk)
                 self._log_tool_event(f"{len(chunk)} documents have been indexed. Continuing...")
+                if staging:
+                    self._record_flushed_chunk(run, chunk_keys, inserted_ids)
             except Exception as exc:
                 from traceback import format_exc
                 err = format_exc()
@@ -861,6 +1230,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 error_msg = str(exc)
                 if error_msg not in result.setdefault("errors", []):
                     result["errors"].append(error_msg)
+                if staging:
+                    # Failed chunks are dropped, never retried, so a doc with any
+                    # chunk in this batch can never reach pending count zero —
+                    # damaged is what routes its staged ids OUT of the promote set
+                    # and its already-persisted rows INTO the promote-txn delete.
+                    self._mark_batch_damaged(run, chunk_keys)
 
         def _run_pipeline(base_doc: Document) -> List[Document]:
             """Full serial pipeline for one base doc → materialized chunk list.
@@ -875,6 +1250,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             docs_gen = self._apply_loaders_chunkers(docs_gen, chunking_tool, chunking_config)
             docs_gen = self._clean_metadata(docs_gen)
             return list(docs_gen)
+
+        def _run_pipeline_with_retry(base_doc: Document) -> List[Document]:
+            # Bounded retry for the fetch/parse half only — the flush path already
+            # retries inside add_documents, and stacking the two would multiply a
+            # flush failure by the whole backoff chain.
+            try:
+                return _run_pipeline(base_doc)
+            except Exception as exc:
+                logger.warning(
+                    f"Pipeline failed for '{self._extract_doc_name(base_doc.metadata)}', "
+                    f"retrying once: {exc}"
+                )
+                return _run_pipeline(base_doc)
 
         def _consume_pipeline_output(base_doc: Document, base_doc_counter: int, chunks: List[Document]) -> None:
             """Main-thread-only. Applies index_name/collection metadata, buffers
@@ -891,11 +1279,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     continue
                 if 'id' not in doc.metadata or 'updated_on' not in doc.metadata:
                     logger.warning(f"Document is missing required metadata field 'id' or 'updated_on': {doc.metadata}")
+                if staging:
+                    doc.metadata[IndexerKeywords.RUN_ID.value] = run.run_id
                 if index_name:
                     if not doc.metadata.get('collection'):
                         doc.metadata['collection'] = index_name
                     else:
                         doc.metadata['collection'] += f";{index_name}"
+                if staging:
+                    chunk_key = self._staging_key(doc.metadata)
+                    if chunk_key != IDLESS_STAGING_KEY:
+                        run.pending_chunk_counts[chunk_key] = run.pending_chunk_counts.get(chunk_key, 0) + 1
                 pg_vector_add_docs_chunk.append(doc)
                 dependent_docs_counter += 1
                 if len(pg_vector_add_docs_chunk) >= self.max_docs_per_add:
@@ -908,6 +1302,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             result["count"] += dependent_docs_counter
             if dependent_docs_counter > 0:
                 result["docs_count"] += 1
+                if staging:
+                    counted_key = str(self.key_fn(base_doc))
+                    if counted_key != IDLESS_STAGING_KEY:
+                        run.counted_doc_keys.add(counted_key)
             else:
                 # Base doc yielded zero chunks (empty content, chunker returned nothing,
                 # or every chunk got filtered as empty/parse-error). Track as skipped so
@@ -934,7 +1332,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     f"Dependent documents for '{_doc_name}' were processed. "
                     f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
                 )
-                chunks = _run_pipeline(base_doc)
+                chunks = _run_pipeline_with_retry(base_doc)
                 _consume_pipeline_output(base_doc, base_doc_counter, chunks)
             if pg_vector_add_docs_chunk:
                 _flush_chunk(pg_vector_add_docs_chunk)
@@ -968,7 +1366,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     f"Dependent documents for '{_doc_name}' were processed. "
                     f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
                 )
-                in_flight[executor.submit(_run_pipeline, base_doc)] = (base_doc, counter)
+                in_flight[executor.submit(_run_pipeline_with_retry, base_doc)] = (base_doc, counter)
                 return True
 
             for _ in range(workers):
@@ -985,6 +1383,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         from traceback import format_exc
                         logger.error(f"Pipeline failed for base doc #{base_doc_counter}: {format_exc()}")
                         result.setdefault("errors", []).append(str(exc))
+                        if staging:
+                            # The zero-chunk branch below cannot tell a legitimately
+                            # emptied doc from a failed one — this mark is the only
+                            # signal that keeps a failed doc's staged ids out of the
+                            # promote set.
+                            failed_doc_key = str(self.key_fn(base_doc))
+                            if failed_doc_key != IDLESS_STAGING_KEY:
+                                run.pipeline_failed_keys.add(failed_doc_key)
                         chunks = []
                     _consume_pipeline_output(base_doc, base_doc_counter, chunks)
                     _submit_next()
@@ -1298,18 +1704,26 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         self._log_tool_event(log_msg, tool_name="index_documents")
         indexed_data = self._get_indexed_data(index_name)
         indexed_keys = set(indexed_data.keys())
+        run = getattr(self, "_index_run", None)
+        staging = self._staging_active()
         if not indexed_keys:
             self._log_tool_event("Vectorstore is empty, indexing all incoming documents", tool_name="index_documents")
             yield from documents
             return
 
         docs_to_remove = set()
+        # clean_index means the unchanged-skip is disabled — every visited doc is
+        # nominated for a full rebuild — while the dedup pass itself still runs:
+        # nomination and the seen-keys record only exist at visit time.
+        skip_unchanged = not (staging and run.clean_index)
 
         for document in documents:
             key = self.key_fn(document)
             key = key if isinstance(key, str) else str(key)
+            if run is not None:
+                run.seen_keys.add(key)
             if key in indexed_keys and index_name == indexed_data[key]['metadata'].get('collection'):
-                if self.compare_fn(document, indexed_data[key]):
+                if skip_unchanged and self.compare_fn(document, indexed_data[key]):
                     if hasattr(self, '_track_document_unchanged'):
                         self._track_document_unchanged(
                             document.metadata.get('path')
@@ -1318,10 +1732,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         )
                     continue
                 yield document
-                docs_to_remove.update(self.remove_ids_fn(indexed_data, key))
+                removal_ids = self.remove_ids_fn(indexed_data, key)
+                if staging:
+                    # Nominations are staged, never deleted here: they enter the
+                    # promote set only once the doc's replacement chunks actually
+                    # flushed (or the doc legitimately produced zero chunks).
+                    if key != IDLESS_STAGING_KEY:
+                        run.staged_removal_ids.setdefault(key, set()).update(
+                            str(removal_id) for removal_id in removal_ids
+                        )
+                else:
+                    docs_to_remove.update(removal_ids)
             else:
                 yield document
 
+        if staging:
+            run.orphan_candidate_ids, run.orphan_candidate_doc_count = (
+                self._collect_orphan_candidates(indexed_data, run.seen_keys)
+            )
         if docs_to_remove:
             self._log_tool_event(
                 f"Removing {len(docs_to_remove)} documents from vectorstore that are already indexed with different updated_on.",
@@ -1368,22 +1796,26 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 "$eq": index_name.strip()
             }})
 
-        if filter:
-            # Exclude index meta documents from search results
-            filter = {
-                "$and": [
-                    filter,
-                    {"$or": [
-                        {"type": {"$exists": False}},
-                        {"type": {"$ne": IndexerKeywords.INDEX_META_TYPE.value}}
-                    ]},
-                ]
-            }
-        else:
-            filter = {"$or": [
+        # Exclude index meta documents from search results
+        exclusions: List[dict] = [
+            {"$or": [
                 {"type": {"$exists": False}},
                 {"type": {"$ne": IndexerKeywords.INDEX_META_TYPE.value}}
             ]}
+        ]
+        pending_run_ids = self.get_pending_run_ids(index_name.strip() if index_name else "")
+        if pending_run_ids:
+            # A bare $nin is NULL-false for rows without the key — the
+            # $exists:False disjunct is what keeps every legacy row visible.
+            exclusions.append({"$or": [
+                {IndexerKeywords.RUN_ID.value: {"$exists": False}},
+                {IndexerKeywords.RUN_ID.value: {"$nin": pending_run_ids}}
+            ]})
+
+        if filter:
+            filter = {"$and": [filter, *exclusions]}
+        else:
+            filter = exclusions[0] if len(exclusions) == 1 else {"$and": exclusions}
         return filter
 
     @tool_group('read')
@@ -1573,16 +2005,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             extended_search=extended_search
         )
     
-    def _is_scheduled_run(self) -> bool:
-        """Return True when the current indexing run was triggered by the platform scheduler.
+    def _resolve_initiator(self) -> Optional[str]:
+        """Raw initiator value for the current run ('schedule', 'user', 'llm', ...).
 
         Reads the initiator hint from (in order):
           1. ``self._index_meta_config["initiator"]`` — set by callers of ``index_data`` via
              the ``_initiator`` kwarg (see ``index_data``).
           2. ``self._runnable_config["metadata"]["initiator"]`` — set by the pylon
              indexer worker on the RunnableConfig.metadata before invoking the tool.
-        Any value whose string form equals ``"schedule"`` (case-insensitive) is treated as
-        scheduler-triggered.
+          3. The ambient LangChain runnable config (contextvar-based propagation).
         """
         def _pluck(config):
             if not isinstance(config, dict):
@@ -1599,8 +2030,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if not candidate:
             candidate = _pluck(self._runnable_config)
         if not candidate:
-            # Fall back to the ambient LangChain runnable config so this works when
-            # the tool is invoked via LangChain's contextvar-based propagation.
             try:
                 from langchain_core.runnables.config import var_child_runnable_config
                 ambient = var_child_runnable_config.get()
@@ -1609,8 +2038,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 logger.debug(f"Ambient runnable config unavailable, skipping initiator lookup: {e}")
                 candidate = None
         if candidate is None:
-            return False
-        return str(candidate).strip().lower() == "schedule"
+            return None
+        return str(candidate).strip() or None
+
+    def _is_scheduled_run(self) -> bool:
+        """Return True when the current indexing run was triggered by the platform scheduler."""
+        initiator = self._resolve_initiator()
+        return initiator is not None and initiator.lower() == "schedule"
 
     def _has_previous_index_run(self) -> bool:
         """True when this index was already built before the current run started."""
@@ -1638,12 +2072,22 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         self._ensure_vectorstore_initialized()
+        run = getattr(self, "_index_run", None)
+        staging = self._staging_active()
+        if staging:
+            self._ensure_index_runs_table()
         index_meta = super().get_index_meta(index_name)
+        initiator = self._resolve_initiator()
         if not index_meta:
             self._log_tool_event(
                 f"There is no existing index_meta for collection '{index_name}'. Initializing it.",
                 tool_name="index_data"
             )
+            if staging:
+                # Fresh init: no meta row exists yet, so no guard can flip it and
+                # registration needs no meta lock; registering before the row is
+                # created closes the two-simultaneous-first-calls race.
+                self._register_index_run(index_name, task_id=None, meta_lock_id=None)
             created_on = time.time()
             metadata = {
                 "collection": index_name,
@@ -1657,6 +2101,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 "task_id": None,
                 "conversation_id": None,
                 "toolkit_id": self.toolkit_id,
+                "initiator": initiator,
+                "reindex": False,
                 # Initialize error field to keep track of the latest failure reason if any
                 "error": None,
             }
@@ -1664,6 +2110,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata["history"] = json.dumps([created_entry, metadata])
             index_meta_doc = Document(page_content=f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}", metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc])
+            if staging:
+                refreshed_meta = super().get_index_meta(index_name)
+                run.meta_id = refreshed_meta.get("id") if refreshed_meta else None
         else:
             # Reindex: the collection already has an index_meta row. Reset it to
             # in_progress with a fresh created_on so the start event (emitted right after)
@@ -1672,6 +2121,25 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # reindex (it only registers on in_progress), so a stopped reindex stays stuck.
             now = time.time()
             metadata = copy.deepcopy(index_meta.get("metadata", {}))
+            if staging:
+                run.meta_id = index_meta.get("id")
+                run.disconnected_timeout = self._read_disconnected_timeout(metadata)
+                # Order is normative: reclaim sweep BEFORE registration (the
+                # partial unique index has no staleness carve-out, so an unswept
+                # dead pending row would refuse every later run forever), and
+                # registration BEFORE the reset write below — a REFUSED run must
+                # never rewrite the live run's created_on/history, which core's
+                # Stop and task-id corroborations key on.
+                self.vector_adapter.sweep_stale_index_runs(
+                    self, index_name, time.time() - run.disconnected_timeout
+                )
+                self._register_index_run(
+                    index_name,
+                    task_id=metadata.get("task_id"),
+                    meta_lock_id=index_meta.get("id"),
+                )
+            metadata["initiator"] = initiator
+            metadata["reindex"] = self._count_completed_runs(metadata) > 0
             previous_state = metadata.get("state")
             metadata["state"] = IndexerKeywords.INDEX_META_IN_PROGRESS.value
             metadata["created_on"] = now
@@ -1752,7 +2220,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             last_time = self._index_meta_last_update_time.get(index_name)
             now = time.time()
             if last_time is not None and (now - last_time) < eff_interval:
-                return
+                return None
             self._index_meta_last_update_time[index_name] = now
         else:
             # For forced updates, always refresh last update time
@@ -1765,7 +2233,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata = copy.deepcopy(index_meta_raw.get("metadata", {}))
             # indexed_chunks = number of chunks stored in vector store
             metadata["indexed_chunks"] = self.get_indexed_count(index_name)
-            metadata["updated"] = result
+            if update_force:
+                metadata["updated"] = result
+            else:
+                # Mid-run progress must not overwrite the retained index's
+                # `updated` — the run's own running chunk count lives under a
+                # key no reader treats as the index size.
+                metadata["run_chunks"] = result
             # Promote a successful completion to 'scheduled_reindex' when the run was
             # triggered by the platform scheduler AND the index had already been built
             # before. At this point the history still carries the current run as
@@ -1828,7 +2302,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     metadata["total"] = items_processed
                     metadata["indexed"] = docs_count if docs_count is not None else items_processed - total_skipped
             elif report is None:
-                metadata["indexed"] = metadata["indexed_chunks"]
+                # Only a report-less TERMINAL success may equate the doc count
+                # with the chunk count; on the throttled mid-run path this
+                # overwrote the retained index's `indexed` long before any
+                # terminal write could preserve it.
+                if update_force and state in COMPLETED_INDEX_STATES:
+                    metadata["indexed"] = metadata["indexed_chunks"]
             else:
                 # A failed run leaves both counts alone: the store still holds and
                 # serves the previous run's documents, so those remain the true counts.
@@ -1849,14 +2328,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata["history"] = json.dumps(history)
             index_meta_doc = Document(page_content=index_meta_raw.get("content", ""), metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta_raw.get("id")])
+            return state
+        return None
 
-    def _emit_index_event(self, index_name: str, error: Optional[str] = None):
+    def _emit_index_event(self, index_name: str, error: Optional[str] = None, state: Optional[str] = None):
         """
         Emit custom event for index data operation.
-        
+
         Args:
             index_name: The name of the index
             error: Error message if the operation failed, None otherwise
+            state: Explicit event state; terminal emits always pass it so the
+                   state can never be derived from error-presence
         """
         index_meta = super().get_index_meta(index_name)
         
@@ -1877,13 +2360,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         event_data = {
             "id": index_meta.get("id"),
             "index_name": index_name,
-            "state": "failed" if error is not None else metadata.get("state"),
+            "state": state if state is not None else ("failed" if error is not None else metadata.get("state")),
             "error": error,
             "reindex": is_reindex,
             "indexed": metadata.get("indexed", 0),
             "total": metadata.get("total", 0),
             "report": metadata.get("report"),
             "updated": metadata.get("updated", 0),
+            # Retention claims downstream key on this live pending-excluded count,
+            # never on the remembered reindex flag.
+            "indexed_chunks": metadata.get("indexed_chunks", 0),
             "toolkit_id": metadata.get("toolkit_id"),
             "created_at": metadata.get("created_on"),
             "updated_on": metadata.get("updated_on"),
@@ -1975,7 +2461,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             ),
             "clean_index": (
                 Optional[bool],
-                Field(default=False, description="Optional flag to enforce clean existing index before indexing new data")
+                Field(default=False,
+                      description="Optional flag to rebuild the index by re-processing every document "
+                                  "from the source instead of skipping unchanged ones; previously "
+                                  "indexed documents the source no longer returns may remain searchable")
             ),
             "progress_step": (
                 Optional[int],
