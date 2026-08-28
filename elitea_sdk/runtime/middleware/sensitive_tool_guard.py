@@ -4,7 +4,6 @@ import inspect
 import json
 import logging
 import re
-import types
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
@@ -13,6 +12,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.types import interrupt
 
 from .base import Middleware
+from .tool_patching import rebind_invoke_after_copy
 
 logger = logging.getLogger(__name__)
 
@@ -348,28 +348,12 @@ class SensitiveToolGuardMiddleware(Middleware):
         identifiers = [i for i in [toolkit_type, toolkit_name] if i]
         if find_sensitive_tool_match(tool_name, identifiers) is not None:
             return True
-        # invoke_tool (lazy mode) can invoke any tool dynamically
+        # invoke_tool (lazy mode) can invoke any tool dynamically. Unreachable today:
+        # the meta-tools are wrapped with skip_sensitive_guard, because the registry tools
+        # invoke_tool dispatches to are already guarded - guarding both double-prompts.
         if tool.name == 'invoke_tool':
             return True
         return False
-
-    @staticmethod
-    def _rebind_invoke_after_copy(copied: BaseTool) -> None:
-        """Re-bind any instance-level ``invoke`` method to the new copy.
-
-        ``_patch_tool_invoke`` uses ``types.MethodType`` to bind a metadata-
-        forwarding wrapper to a specific tool instance.  ``model_copy()``
-        preserves this bound method in ``__dict__``, but it remains bound to
-        the *original* instance — so ``invoke()`` on the copy routes execution
-        back to the original, bypassing ``_run``/``func`` patches on the copy.
-        """
-        if 'invoke' in copied.__dict__:
-            stale = copied.__dict__['invoke']
-            if callable(stale) and hasattr(stale, '__func__'):
-                object.__setattr__(
-                    copied, 'invoke',
-                    types.MethodType(stale.__func__, copied),
-                )
 
     def wrap_tool(self, tool: BaseTool) -> BaseTool:
         if not has_sensitive_tools_config():
@@ -389,7 +373,7 @@ class SensitiveToolGuardMiddleware(Middleware):
 
         if isinstance(tool, StructuredTool) and hasattr(tool, 'func'):
             copied = tool.model_copy()
-            self._rebind_invoke_after_copy(copied)
+            rebind_invoke_after_copy(copied)
             original_func = tool.func
             original_coroutine = getattr(tool, 'coroutine', None)
 
@@ -433,7 +417,7 @@ class SensitiveToolGuardMiddleware(Middleware):
 
         if isinstance(tool, Application):
             copied = tool.model_copy()
-            self._rebind_invoke_after_copy(copied)
+            rebind_invoke_after_copy(copied)
             original_invoke = tool.invoke
             original_ainvoke = tool.ainvoke
 
@@ -472,7 +456,7 @@ class SensitiveToolGuardMiddleware(Middleware):
 
         # Generic BaseTool subclass (e.g. BaseAction): patch _run/_arun on a copy
         copied = tool.model_copy()
-        self._rebind_invoke_after_copy(copied)
+        rebind_invoke_after_copy(copied)
         original_run = tool._run
         original_async_func = self._get_async_tool_function(tool)
         run_accepts_run_manager = "run_manager" in inspect.signature(original_run).parameters

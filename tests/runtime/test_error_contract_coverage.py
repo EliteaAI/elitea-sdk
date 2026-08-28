@@ -10,6 +10,7 @@ Three separate holes are covered here:
 
 import asyncio
 import re
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -319,6 +320,36 @@ class TestPreservedContracts:
         with pytest.raises(type(error)):
             asyncio.run(wrapped.ainvoke({"value": "x"}))
 
+    def test_the_loop_keeps_running_while_the_strategies_block(self):
+        """TransformErrorStrategy spends a blocking LLM completion shaping the message.
+        On the event loop that stalls every sibling of an asyncio.gather tool batch, so the
+        async wrapper must offload it - a live ticker proves the loop was never held."""
+        class _Blocking(LoggingStrategy):
+            def handle_exception(self, context):
+                time.sleep(0.3)  # stands in for llm.invoke
+                return context
+
+        wrapped = ToolExceptionHandlerMiddleware(strategies=[_Blocking()]).wrap_tool(
+            _coroutine_only_tool())
+
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        async def run():
+            ticker = asyncio.create_task(tick())
+            result = await wrapped.ainvoke({"value": "x"})
+            ticker.cancel()
+            return result
+
+        assert "async boom" in asyncio.run(run())
+        # Held on the loop this is 0-2 (only the awaits before the block); offloaded it is ~30
+        assert ticks > 5, f"event loop was blocked by the strategies ({ticks} ticks)"
+
     def test_not_implemented_error_is_not_turned_into_prose(self):
         """The agent loop branches on it to fall back from ainvoke to invoke."""
         wrapped = _tehm().wrap_tool(_sync_failing_tool(error=NotImplementedError("no sync")))
@@ -413,7 +444,10 @@ nodes:
         import inspect
 
         source = inspect.getsource(langraph_agent.create_graph)
-        branches = re.split(r"\n            (?:el)?if node_type", source)
+        # Indent-insensitive: a hardcoded indent would collapse every branch into one
+        # element on a reindent, and the assert below would pass vacuously.
+        branches = re.split(r"\n\s+(?:el)?if node_type", source)
+        assert len(branches) > 5, "branch split broke - this guard would pass vacuously"
         constructs = ("create_sandbox_tool(", "StructuredTool(", "StructuredTool.from_function(",
                       "instantiate_toolkit", "get_tools(")
 

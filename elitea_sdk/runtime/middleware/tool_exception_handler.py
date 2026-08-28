@@ -24,9 +24,9 @@ Example:
     )
 """
 
+import asyncio
 import inspect
 import logging
-import types
 from functools import wraps
 from typing import List, Optional, Dict, Any, Callable, Tuple
 
@@ -50,6 +50,7 @@ from .strategies import (
     CircuitBreakerStrategy,
     LoggingStrategy
 )
+from .tool_patching import rebind_invoke_after_copy
 from ..tools.application import Application
 
 logger = logging.getLogger(__name__)
@@ -210,7 +211,7 @@ When a tool fails with an error:
         """Copy the tool and replace only its execution callables, as the sensitive-action
         guard does - a rebuilt StructuredTool silently drops coroutine and patched invoke."""
         copied = tool.model_copy()
-        self._rebind_invoke_after_copy(copied)
+        rebind_invoke_after_copy(copied)
 
         if sync_target is not None:
             attr, original = sync_target
@@ -254,7 +255,12 @@ When a tool fails with an error:
             try:
                 result = await original(*args, **kwargs)
             except Exception as e:
-                return self._shape_error_output(tool, self._handle_tool_exception(tool, e, args, kwargs))
+                # Signals are pure control flow - re-raise on the loop, no thread hop.
+                self._reraise_signals(e)
+                # The strategies do a blocking LLM completion; on the loop it would stall
+                # every sibling of a parallel tool batch for the length of a completion.
+                message = await asyncio.to_thread(self._run_error_pipeline, tool, e, args, kwargs)
+                return self._shape_error_output(tool, message)
             self._notify_success(tool.name)
             return result
 
@@ -278,8 +284,13 @@ When a tool fails with an error:
         return route_validation_error
 
     def _handle_tool_exception(self, tool: BaseTool, error: Exception, args, kwargs) -> str:
-        """Shared by both wrappers so the sync and async paths shape errors identically.
-        Anything re-raised here is a signal for the caller, not a tool failure."""
+        """Shared by both wrappers so the sync and async paths shape errors identically."""
+        self._reraise_signals(error)
+        return self._run_error_pipeline(tool, error, args, kwargs)
+
+    @staticmethod
+    def _reraise_signals(error: Exception) -> None:
+        """Anything re-raised here is a signal for the caller, not a tool failure."""
         # MCP authorization is a cross-cutting auth concern; GraphBubbleUp carries
         # interrupt() and other graph-level signals that must reach the graph.
         if isinstance(error, (McpAuthorizationRequired, GraphBubbleUp)):
@@ -296,6 +307,8 @@ When a tool fails with an error:
         if budget_error is not None:
             raise budget_error from error
 
+    def _run_error_pipeline(self, tool: BaseTool, error: Exception, args, kwargs) -> str:
+        """Blocking: TransformErrorStrategy spends an LLM completion in here."""
         context = ExceptionContext(tool=tool, error=error, args=args, kwargs=kwargs)
         self._classify_into(context)
         # A strategy may raise ToolException (e.g. circuit breaker) - let it through as-is
@@ -355,15 +368,6 @@ When a tool fails with an error:
             return 'run_manager' in inspect.signature(func).parameters
         except (TypeError, ValueError):
             return False
-
-    @staticmethod
-    def _rebind_invoke_after_copy(copied: BaseTool) -> None:
-        """model_copy() keeps a _patch_tool_invoke-bound ``invoke`` in __dict__ still bound to
-        the original, so without re-binding the copy's invoke bypasses the error handling."""
-        if 'invoke' in copied.__dict__:
-            stale = copied.__dict__['invoke']
-            if callable(stale) and hasattr(stale, '__func__'):
-                object.__setattr__(copied, 'invoke', types.MethodType(stale.__func__, copied))
 
     @staticmethod
     def _sync_target(tool: BaseTool) -> Optional[Tuple[str, Callable]]:

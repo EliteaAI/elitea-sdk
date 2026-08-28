@@ -184,7 +184,8 @@ class MiddlewareManager:
 
     @property
     def wrapping_middleware(self) -> List[Middleware]:
-        """Wrapping order: wrap-only middleware runs last, so it ends up outermost."""
+        """Wrapping order: wrap-only middleware runs last, so it ends up outermost.
+        Also the lifecycle set - wrap-only middleware holds per-conversation state too."""
         return [*self._middleware, *self._wrap_only]
 
     def wrap_tool(self, tool: BaseTool, skip_sensitive_guard: bool = False) -> BaseTool:
@@ -252,7 +253,7 @@ class MiddlewareManager:
             List of context messages from middleware
         """
         messages = []
-        for mw in self._middleware:
+        for mw in self.wrapping_middleware:
             try:
                 msg = mw.on_conversation_start(conversation_id)
                 if msg:
@@ -268,7 +269,7 @@ class MiddlewareManager:
         Args:
             conversation_id: The conversation ID ending
         """
-        for mw in self._middleware:
+        for mw in self.wrapping_middleware:
             try:
                 mw.on_conversation_end(conversation_id)
             except Exception as e:

@@ -1835,9 +1835,9 @@ class EliteAClient:
                 return {
                     "success": False,
                     "error": f"Tool execution failed: {str(tool_error)}",
-                    "error_class": outcome.error_class.value if outcome.error_class is not None else None,
-                    "retriable": outcome.retriable,
-                    "exception_type": outcome.exception_type,
+                    **outcome.model_dump(
+                        mode='json', include={'error_class', 'retriable', 'exception_type'}
+                    ),
                     "tool_name": tool_name,
                     "toolkit_config": toolkit_config_parsed_json,
                     "llm_model": llm_model,

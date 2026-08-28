@@ -511,7 +511,8 @@ class Assistant:
         if middleware:
             for mw in middleware:
                 if isinstance(mw, ToolExceptionHandlerMiddleware):
-                    # Wrap-only: it owns no tools, and its prompt would displace PLAN_ADDON
+                    # Wrap-only keeps it out of the prompt/tool aggregations exactly as the
+                    # previous isinstance skip did - _middleware_prompt REPLACES PLAN_ADDON.
                     self.middleware_manager.add_wrap_only(mw)
                 else:
                     self.middleware_manager.add(mw)
