@@ -1,3 +1,4 @@
+import re
 import uuid
 from logging import getLogger
 from typing import Any, Type, Literal, Optional, Union, List, Annotated
@@ -11,6 +12,29 @@ from ..utils.failure_signals import mcp_is_error, log_shadow_failure
 EmailStr = str
 
 logger = getLogger(__name__)
+
+# Anthropic (and other LLM providers) require tool schema property names to
+# match this pattern. MCP servers are free to expose arbitrary property
+# names (e.g. "fname[]"), so we sanitize them before building the pydantic
+# model that is turned into the JSON schema sent to the LLM. See
+# https://github.com/EliteaAI/elitea_issues/issues/6274
+PROPERTY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
+_INVALID_PROPERTY_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
+
+
+def sanitize_property_name(name: str) -> str:
+    """Sanitize a schema property name so it matches ^[a-zA-Z0-9_.-]{1,64}$.
+
+    Invalid characters (e.g. "[", "]") are stripped. If sanitization yields
+    an empty string, a generic fallback name is used. The result is
+    truncated to 64 characters.
+    """
+    if PROPERTY_NAME_PATTERN.match(name):
+        return name
+    sanitized = _INVALID_PROPERTY_CHARS.sub("", name)
+    if not sanitized:
+        sanitized = "field"
+    return sanitized[:64]
 
 
 class McpServerTool(BaseTool):
@@ -87,20 +111,39 @@ class McpServerTool(BaseTool):
         properties = schema.get("properties", {})
         required = set(schema.get("required", []))
         fields = {}
+        # Maps the sanitized (pydantic/schema) field name back to the
+        # original property name expected by the MCP server, for any
+        # property whose name had to be sanitized.
+        property_name_map = {}
         for name, prop in properties.items():
-            typ = parse_type(prop, name.capitalize())
+            sanitized_name = sanitize_property_name(name)
+            if sanitized_name != name:
+                property_name_map[sanitized_name] = name
+            typ = parse_type(prop, sanitized_name.capitalize())
             default = prop.get("default", ... if name in required else None)
             field_args = {}
             if "description" in prop:
                 field_args["description"] = prop["description"]
             if "format" in prop:
                 field_args["format"] = prop["format"]
-            fields[name] = (typ, Field(default, **field_args))
-        return create_model(model_name, **fields)
+            fields[sanitized_name] = (typ, Field(default, **field_args))
+        model = create_model(model_name, **fields)
+        # Attached so McpServerTool._run can translate sanitized argument
+        # names back to what the MCP server actually expects.
+        model.__property_name_map__ = property_name_map
+        return model
 
     def _run(self, *args, **kwargs):
         # Strip None values — MCP servers reject null for typed optional params
         clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        # Translate sanitized property names (used in the schema shown to
+        # the LLM, see create_pydantic_model_from_schema) back to the
+        # original names the MCP server expects.
+        property_name_map = getattr(self.args_schema, "__property_name_map__", None)
+        if property_name_map:
+            clean_kwargs = {
+                property_name_map.get(k, k): v for k, v in clean_kwargs.items()
+            }
         # Use the tool name directly (no prefix extraction needed)
         call_data = {
             "server": self.server,
