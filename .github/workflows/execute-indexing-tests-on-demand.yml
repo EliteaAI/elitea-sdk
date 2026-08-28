@@ -462,9 +462,9 @@ jobs:
         PGVECTOR_CONNECTION_STRING: postgresql://postgres:postgres@pgvector:5432/postgres
         DEFAULT_LLM_MODEL: ${{ vars.DEFAULT_LLM_MODEL }}
         DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ vars.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
-        ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE }}
-        ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE }}
-        ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE }}
+        ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE2 }}
+        ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE2 }}
+        ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE2 }}
         RP_ENABLED: ${{ inputs.reportportal }}
         RP_ENDPOINT: ${{ secrets.RP_ENDPOINT }}
         RP_PROJECT: ${{ secrets.RP_PROJECT }}
@@ -574,9 +574,9 @@ jobs:
         PGVECTOR_CONNECTION_STRING: postgresql://postgres:postgres@pgvector:5432/postgres
         DEFAULT_LLM_MODEL: ${{ vars.DEFAULT_LLM_MODEL }}
         DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS: ${{ vars.DEFAULT_LLM_MODEL_FOR_CODE_ANALYSIS }}
-        ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE }}
-        ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE }}
-        ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE }}
+        ELITEA_DEPLOYMENT_URL: ${{ secrets.DEPLOYMENT_URL_STAGE2 }}
+        ELITEA_TOKEN: ${{ secrets.ELITEA_API_KEY_STAGE2 }}
+        ELITEA_PROJECT_ID: ${{ secrets.PROJECT_ID_STAGE2 }}
         RP_ENABLED: ${{ inputs.reportportal }}
         RP_ENDPOINT: ${{ secrets.RP_ENDPOINT }}
         RP_PROJECT: ${{ secrets.RP_PROJECT }}

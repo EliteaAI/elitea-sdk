@@ -109,7 +109,7 @@ jobs:
       - name: Resolve environment secrets
         run: |
           if [ "${{ inputs.environment }}" = "local" ]; then
-            ENV_UPPER="STAGE"
+            ENV_UPPER="STAGE2"
           else
             ENV_UPPER=$(echo "${{ inputs.environment }}" | tr '[:lower:]' '[:upper:]')
           fi
