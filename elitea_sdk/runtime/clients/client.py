@@ -21,6 +21,7 @@ from .artifact import Artifact
 from ..middleware import TransformErrorStrategy, LoggingStrategy, SensitiveToolGuardMiddleware
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..exceptions import budget_exceeded_from
+from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools
 from ...tools.exceptions import ToolkitConfigurationError
@@ -1819,9 +1820,24 @@ class EliteAClient:
                     elif hasattr(callback, 'dispatched_events'):
                         events_dispatched.extend(callback.dispatched_events)
 
+                # Classified, not rewritten: the test panel must keep showing the raw
+                # provider error, so only the typed fields are added beside it.
+                error_class = classify_tool_error(tool_error)
+                outcome = ToolOutcome(
+                    status=ToolResultStatus.ERROR,
+                    message=str(tool_error),
+                    tool_name=tool_name,
+                    error_class=error_class,
+                    retriable=retriable_for(error_class),
+                    exception_type=type(tool_error).__name__,
+                    toolkit_type=toolkit_config.get('type') if isinstance(toolkit_config.get('type'), str) else None,
+                )
                 return {
                     "success": False,
                     "error": f"Tool execution failed: {str(tool_error)}",
+                    **outcome.model_dump(
+                        mode='json', include={'error_class', 'retriable', 'exception_type'}
+                    ),
                     "tool_name": tool_name,
                     "toolkit_config": toolkit_config_parsed_json,
                     "llm_model": llm_model,

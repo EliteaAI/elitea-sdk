@@ -161,6 +161,7 @@ class MiddlewareManager:
 
     def __init__(self):
         self._middleware: List[Middleware] = []
+        self._wrap_only: List[Middleware] = []
 
     def add(self, middleware: Middleware) -> 'MiddlewareManager':
         """
@@ -174,6 +175,18 @@ class MiddlewareManager:
         """
         self._middleware.append(middleware)
         return self
+
+    def add_wrap_only(self, middleware: Middleware) -> 'MiddlewareManager':
+        """Wrap tools only, stay out of every aggregation: a non-empty middleware prompt
+        displaces PLAN_ADDON, so a wrapper-only middleware must not contribute one."""
+        self._wrap_only.append(middleware)
+        return self
+
+    @property
+    def wrapping_middleware(self) -> List[Middleware]:
+        """Wrapping order: wrap-only middleware runs last, so it ends up outermost.
+        Also the lifecycle set - wrap-only middleware holds per-conversation state too."""
+        return [*self._middleware, *self._wrap_only]
 
     def wrap_tool(self, tool: BaseTool, skip_sensitive_guard: bool = False) -> BaseTool:
         """Apply wrap_tool from all registered middleware that support it.
@@ -190,7 +203,7 @@ class MiddlewareManager:
                 #5348) so static code is not interrupted, while every other
                 middleware (e.g. exception handling) is still applied.
         """
-        for mw in self._middleware:
+        for mw in self.wrapping_middleware:
             if skip_sensitive_guard and getattr(mw, 'GUARDS_SENSITIVE_ACTIONS', False):
                 continue
             if hasattr(mw, 'wrap_tool'):
@@ -240,7 +253,7 @@ class MiddlewareManager:
             List of context messages from middleware
         """
         messages = []
-        for mw in self._middleware:
+        for mw in self.wrapping_middleware:
             try:
                 msg = mw.on_conversation_start(conversation_id)
                 if msg:
@@ -256,7 +269,7 @@ class MiddlewareManager:
         Args:
             conversation_id: The conversation ID ending
         """
-        for mw in self._middleware:
+        for mw in self.wrapping_middleware:
             try:
                 mw.on_conversation_end(conversation_id)
             except Exception as e:

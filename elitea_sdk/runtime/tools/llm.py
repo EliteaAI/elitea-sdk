@@ -725,7 +725,15 @@ class LLMNode(BaseTool):
         """
         if self._meta_tools is None:
             from .lazy_tools import create_meta_tools
-            self._meta_tools = create_meta_tools(self.tool_registry)
+            meta_tools = create_meta_tools(self.tool_registry)
+            # Locally built, so nothing else applied the error contract. Guard is skipped:
+            # registry tools are already guarded, guarding invoke_tool too double-prompts.
+            if self.middleware_manager is not None:
+                meta_tools = [
+                    self.middleware_manager.wrap_tool(t, skip_sensitive_guard=True)
+                    for t in meta_tools
+                ]
+            self._meta_tools = meta_tools
             logger.info(
                 f"[LazyTools] Created {len(self._meta_tools)} meta-tools for "
                 f"{len(self.tool_registry.get_toolkit_names())} toolkits, "

@@ -24,9 +24,11 @@ Example:
     )
 """
 
+import asyncio
+import inspect
 import logging
 from functools import wraps
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any, Callable, Tuple
 
 from elitea_sdk.runtime.exceptions import budget_exceeded_from
 from elitea_sdk.runtime.tool_outcome import (
@@ -48,6 +50,7 @@ from .strategies import (
     CircuitBreakerStrategy,
     LoggingStrategy
 )
+from .tool_patching import rebind_invoke_after_copy
 from ..tools.application import Application
 
 logger = logging.getLogger(__name__)
@@ -82,6 +85,9 @@ class ToolExceptionHandlerMiddleware(Middleware):
         )
         ```
     """
+
+    # Set on every wrapped tool so coverage of new construction paths is assertable
+    WRAPPED_MARKER = '_elitea_error_wrapped'
 
     def __init__(
         self,
@@ -138,6 +144,9 @@ When a tool fails with an error:
         """
         Wrap a tool with exception handling logic.
 
+        Sync and async entry points are both covered, and the tool keeps its own class so
+        nothing carried on the instance (patched invoke, response_format) is lost.
+
         Args:
             tool: Original tool to wrap
 
@@ -165,116 +174,153 @@ When a tool fails with an error:
             logger.debug(f"Tool '{tool.name}' already wrapped, returning cached version")
             return self._wrapped_tools_cache[cache_key]
 
-        # Get the original function to wrap
-        original_func = self._get_tool_function(tool)
+        if getattr(tool, self.WRAPPED_MARKER, False):
+            return tool
 
-        # Create wrapped function
-        @wraps(original_func)
-        def error_handled_func(*args, **kwargs) -> str:
-            """Wrapped function with error handling."""
-            try:
-                # Execute original tool
-                result = original_func(*args, **kwargs)
-
-                # Success - notify all strategies
-                for strategy in self.strategies:
-                    try:
-                        strategy.on_success(tool.name)
-                    except Exception as e:
-                        logger.error(
-                            f"Strategy {strategy.__class__.__name__} on_success failed: {e}"
-                        )
-
-                return result
-
-            except McpAuthorizationRequired:
-                # MCP authorization required - re-raise to be handled by agent
-                # This is a cross-cutting auth concern, not delegated to strategies
-                raise
-
-            except GraphBubbleUp:
-                # GraphInterrupt (from interrupt()) and other graph-level
-                # signals must propagate — never handle as tool errors.
-                raise
-
-            except Exception as e:
-                # Budget rejections bypass the strategies: TransformErrorStrategy would
-                # spend another LLM call rewriting a policy error into tool output
-                budget_error = budget_exceeded_from(e)
-                if budget_error is not None:
-                    raise budget_error from e
-
-                # Create exception context
-                context = ExceptionContext(
-                    tool=tool,
-                    error=e,
-                    args=args,
-                    kwargs=kwargs
-                )
-
-                self._classify_into(context)
-
-                # Execute strategies in sequence
-                try:
-                    context = self._run_strategies(context)
-                except ToolException:
-                    # Strategy raised ToolException (e.g., circuit breaker)
-                    # Re-raise as-is
-                    raise
-
-                return self._finalize_outcome(context).message
-
-        # Create wrapped tool with same metadata
-        try:
-            wrapped_tool = StructuredTool.from_function(
-                func=error_handled_func,
-                name=tool.name,
-                description=tool.description,
-                args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None,
-                return_direct=getattr(tool, 'return_direct', False),
-                # Preserved from the original tool, defaulting to False — every shipped
-                # tool gets False, which is what lets McpAuthorizationRequired propagate.
-                handle_tool_error=getattr(tool, 'handle_tool_error', False),
+        sync_target = self._sync_target(tool)
+        async_target = self._async_target(tool)
+        if sync_target is None and async_target is None:
+            # Loud on purpose: this tool's failures reach the LLM as raw provider errors
+            logger.error(
+                "Tool '%s' (%s) exposes no wrappable callable - its errors bypass the "
+                "tool error contract", tool.name, type(tool).__name__,
             )
+            return tool
 
-            # Route pydantic ValidationError through the same strategy pipeline
-            # as runtime exceptions. Without this, ValidationError fires during
-            # BaseTool.run() input parsing — before error_handled_func — and
-            # crashes the pipeline instead of being handled gracefully.
-            def _route_validation_error(e):
-                context = ExceptionContext(
-                    tool=tool,
-                    error=e,
-                    args=(),
-                    kwargs={}
-                )
-                self._classify_into(context)
-                try:
-                    context = self._run_strategies(context)
-                except ToolException:
-                    raise
-                return self._finalize_outcome(context).message
-
-            wrapped_tool.handle_validation_error = _route_validation_error
-
-            # Preserve metadata if present
-            if hasattr(tool, 'metadata'):
-                wrapped_tool.metadata = tool.metadata
-
-            # Preserve a reference to the original tool so that downstream code
-            # (e.g., swarm agent detection) can inspect the unwrapped type and
-            # attributes like Application.client, Application.args_runnable, etc.
-            wrapped_tool._original_tool = tool
-
-            # Cache the wrapped tool by object identity
-            self._wrapped_tools_cache[cache_key] = wrapped_tool
-
-            logger.debug(f"Successfully wrapped tool '{tool.name}' with error handling")
-            return wrapped_tool
-
+        try:
+            wrapped_tool = self._patched_copy(tool, sync_target, async_target)
         except Exception as e:
             logger.error(f"Failed to wrap tool '{tool.name}': {e}", exc_info=True)
             return tool  # Return original tool if wrapping fails
+
+        self._wrapped_tools_cache[cache_key] = wrapped_tool
+        logger.debug(
+            "Wrapped tool '%s' with error handling (sync=%s, async=%s)",
+            tool.name,
+            sync_target[0] if sync_target else None,
+            async_target[0] if async_target else None,
+        )
+        return wrapped_tool
+
+    def _patched_copy(
+        self,
+        tool: BaseTool,
+        sync_target: Optional[Tuple[str, Callable]],
+        async_target: Optional[Tuple[str, Callable]],
+    ) -> BaseTool:
+        """Copy the tool and replace only its execution callables, as the sensitive-action
+        guard does - a rebuilt StructuredTool silently drops coroutine and patched invoke."""
+        copied = tool.model_copy()
+        rebind_invoke_after_copy(copied)
+
+        if sync_target is not None:
+            attr, original = sync_target
+            setattr(copied, attr, self._sync_wrapper(tool, original))
+        if async_target is not None:
+            attr, original = async_target
+            setattr(copied, attr, self._async_wrapper(tool, original))
+
+        # Routes pydantic ValidationError, raised during BaseTool.run() input parsing
+        # before the wrapped callable is ever reached, through the same strategies.
+        copied.handle_validation_error = self._validation_error_router(tool)
+
+        # Downstream code (e.g. swarm agent detection) inspects the unwrapped tool
+        object.__setattr__(copied, '_original_tool', tool)
+        object.__setattr__(copied, self.WRAPPED_MARKER, True)
+        return copied
+
+    def _sync_wrapper(self, tool: BaseTool, original: Callable) -> Callable:
+        forward_run_manager = self._accepts_run_manager(original)
+
+        @wraps(original)
+        def error_handled_func(*args, run_manager=None, **kwargs):
+            if forward_run_manager:
+                kwargs['run_manager'] = run_manager
+            try:
+                result = original(*args, **kwargs)
+            except Exception as e:
+                return self._shape_error_output(tool, self._handle_tool_exception(tool, e, args, kwargs))
+            self._notify_success(tool.name)
+            return result
+
+        return error_handled_func
+
+    def _async_wrapper(self, tool: BaseTool, original: Callable) -> Callable:
+        forward_run_manager = self._accepts_run_manager(original)
+
+        @wraps(original)
+        async def error_handled_coroutine(*args, run_manager=None, **kwargs):
+            if forward_run_manager:
+                kwargs['run_manager'] = run_manager
+            try:
+                result = await original(*args, **kwargs)
+            except Exception as e:
+                # Signals are pure control flow - re-raise on the loop, no thread hop.
+                self._reraise_signals(e)
+                # The strategies do a blocking LLM completion; on the loop it would stall
+                # every sibling of a parallel tool batch for the length of a completion.
+                message = await asyncio.to_thread(self._run_error_pipeline, tool, e, args, kwargs)
+                return self._shape_error_output(tool, message)
+            self._notify_success(tool.name)
+            return result
+
+        return error_handled_coroutine
+
+    @staticmethod
+    def _shape_error_output(tool: BaseTool, message: str):
+        """A content_and_artifact tool must return a two-tuple or BaseTool.run raises over
+        it; the artifact is None because the failed call produced no raw output."""
+        if getattr(tool, 'response_format', 'content') == 'content_and_artifact':
+            return message, None
+        return message
+
+    def _validation_error_router(self, tool: BaseTool) -> Callable:
+        def route_validation_error(e):
+            context = ExceptionContext(tool=tool, error=e, args=(), kwargs={})
+            self._classify_into(context)
+            context = self._run_strategies(context)
+            return self._finalize_outcome(context).message
+
+        return route_validation_error
+
+    def _handle_tool_exception(self, tool: BaseTool, error: Exception, args, kwargs) -> str:
+        """Shared by both wrappers so the sync and async paths shape errors identically."""
+        self._reraise_signals(error)
+        return self._run_error_pipeline(tool, error, args, kwargs)
+
+    @staticmethod
+    def _reraise_signals(error: Exception) -> None:
+        """Anything re-raised here is a signal for the caller, not a tool failure."""
+        # MCP authorization is a cross-cutting auth concern; GraphBubbleUp carries
+        # interrupt() and other graph-level signals that must reach the graph.
+        if isinstance(error, (McpAuthorizationRequired, GraphBubbleUp)):
+            raise error
+
+        # "This execution path does not exist" - the agent loop branches on it to fall
+        # back from ainvoke to invoke, so turning it into prose would break that fallback.
+        if isinstance(error, NotImplementedError):
+            raise error
+
+        # Budget rejections bypass the strategies: TransformErrorStrategy would
+        # spend another LLM call rewriting a policy error into tool output
+        budget_error = budget_exceeded_from(error)
+        if budget_error is not None:
+            raise budget_error from error
+
+    def _run_error_pipeline(self, tool: BaseTool, error: Exception, args, kwargs) -> str:
+        """Blocking: TransformErrorStrategy spends an LLM completion in here."""
+        context = ExceptionContext(tool=tool, error=error, args=args, kwargs=kwargs)
+        self._classify_into(context)
+        # A strategy may raise ToolException (e.g. circuit breaker) - let it through as-is
+        context = self._run_strategies(context)
+        return self._finalize_outcome(context).message
+
+    def _notify_success(self, tool_name: str) -> None:
+        for strategy in self.strategies:
+            try:
+                strategy.on_success(tool_name)
+            except Exception as e:
+                logger.error(f"Strategy {strategy.__class__.__name__} on_success failed: {e}")
 
     def _run_strategies(self, context: ExceptionContext) -> ExceptionContext:
         """A strategy may return a replacement context instead of mutating this one; carry
@@ -316,16 +362,39 @@ When a tool fails with an error:
         )
         return outcome
 
-    def _get_tool_function(self, tool: BaseTool) -> Callable:
-        """Extract the callable function from a tool."""
-        if hasattr(tool, 'func') and callable(tool.func):
-            return tool.func
-        elif hasattr(tool, '_run') and callable(tool._run):
-            return tool._run
-        elif callable(tool):
-            return tool
-        else:
-            raise ValueError(f"Cannot extract callable from tool '{tool.name}'")
+    @staticmethod
+    def _accepts_run_manager(func: Callable) -> bool:
+        try:
+            return 'run_manager' in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _sync_target(tool: BaseTool) -> Optional[Tuple[str, Callable]]:
+        """Which attribute holds the sync implementation, and the callable behind it."""
+        if isinstance(tool, StructuredTool) and type(tool)._run is StructuredTool._run:
+            return ('func', tool.func) if callable(tool.func) else None
+        # BaseTool._run is an abstract stub that raises; patching it would fabricate a
+        # sync path an async-only tool never had.
+        if type(tool)._run is not BaseTool._run and callable(getattr(tool, '_run', None)):
+            return '_run', tool._run
+        if callable(getattr(tool, 'func', None)):
+            return 'func', tool.func
+        return None
+
+    @staticmethod
+    def _async_target(tool: BaseTool) -> Optional[Tuple[str, Callable]]:
+        """Same for the async implementation. None also covers the tools whose inherited
+        ``_arun`` just runs the sync path in an executor - patching sync already covers it."""
+        if isinstance(tool, StructuredTool) and type(tool)._arun is StructuredTool._arun:
+            coroutine = getattr(tool, 'coroutine', None)
+            return ('coroutine', coroutine) if callable(coroutine) else None
+        if type(tool)._arun is not BaseTool._arun and callable(getattr(tool, '_arun', None)):
+            return '_arun', tool._arun
+        coroutine = getattr(tool, 'coroutine', None)
+        if callable(coroutine):
+            return 'coroutine', coroutine
+        return None
 
     def on_conversation_start(self, conversation_id: str) -> Optional[str]:
         """Reset strategy state on conversation start."""

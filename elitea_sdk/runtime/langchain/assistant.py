@@ -510,7 +510,11 @@ class Assistant:
         self._always_bind_tools = []  # Tools to always bind directly (not via ToolRegistry)
         if middleware:
             for mw in middleware:
-                if not isinstance(mw, ToolExceptionHandlerMiddleware):
+                if isinstance(mw, ToolExceptionHandlerMiddleware):
+                    # Wrap-only keeps it out of the prompt/tool aggregations exactly as the
+                    # previous isinstance skip did - _middleware_prompt REPLACES PLAN_ADDON.
+                    self.middleware_manager.add_wrap_only(mw)
+                else:
                     self.middleware_manager.add(mw)
             # Get tools from all middleware - these are always-bind tools
             middleware_tools = self.middleware_manager.get_all_tools()
@@ -536,16 +540,11 @@ class Assistant:
                     f"Found {len(exception_handlers)} instances."
                 )
 
-            # Apply tool wrapping from all middleware that support wrap_tool
-            wrapped_tools = list(self.tools)
-            wrapped_always_bind_tools = list(self._always_bind_tools)
-            for mw in middleware:
-                if hasattr(mw, 'wrap_tool'):
-                    wrapped_tools = [mw.wrap_tool(tool) for tool in wrapped_tools]
-                    wrapped_always_bind_tools = [mw.wrap_tool(tool) for tool in wrapped_always_bind_tools]
-
-            self.tools = wrapped_tools
-            self._always_bind_tools = wrapped_always_bind_tools
+            # One wrapping implementation for every path: the manager, not a local loop
+            self.tools = [self.middleware_manager.wrap_tool(tool) for tool in self.tools]
+            self._always_bind_tools = [
+                self.middleware_manager.wrap_tool(tool) for tool in self._always_bind_tools
+            ]
 
         # In lazy tools mode, don't rename tools - ToolRegistry handles namespacing by toolkit.
         # Only add suffixes in non-lazy mode where tools are bound directly to LLM.
