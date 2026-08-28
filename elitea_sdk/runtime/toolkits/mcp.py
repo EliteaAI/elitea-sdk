@@ -33,6 +33,74 @@ logger = logging.getLogger(__name__)
 
 name = "mcp"
 
+
+def _shorten_description(text: str, max_length: int) -> str:
+    """Shorten text without cutting a nearby sentence, line, or word boundary."""
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return "." * max_length
+
+    cutoff = max_length - 3
+    candidate = text[:cutoff]
+    nearby_boundary = max(0, int(cutoff * 0.6))
+
+    sentence_ends = [
+        match.end()
+        for match in re.finditer(r"[.!?](?=\s|$)", candidate)
+        if match.end() >= nearby_boundary
+    ]
+    if sentence_ends:
+        boundary = sentence_ends[-1]
+    else:
+        boundary = candidate.rfind("\n", nearby_boundary)
+        if boundary < 0:
+            boundary = candidate.rfind(" ", nearby_boundary)
+        if boundary < 0:
+            boundary = cutoff
+
+    shortened = candidate[:boundary].rstrip()
+    return f"{shortened.rstrip('.!?')}..."
+
+
+def _build_tool_description(
+    base_description: Optional[str],
+    toolkit_context: str,
+    max_length: int,
+    *,
+    tool_name: str,
+) -> str:
+    """Build an agent-facing MCP description, preserving toolkit context when capped."""
+    base_description = base_description or ""
+    full_description = (
+        f"{base_description}\n{toolkit_context}"
+        if base_description
+        else toolkit_context
+    )
+    if max_length <= 0 or len(full_description) <= max_length:
+        return full_description
+
+    # Reserve room for the toolkit identity so capped descriptions remain attributable.
+    if max_length > len(toolkit_context) + 4 and base_description:
+        base_limit = max_length - len(toolkit_context) - 1
+        description = (
+            f"{_shorten_description(base_description, base_limit)}\n"
+            f"{toolkit_context}"
+        )
+    else:
+        description = _shorten_description(full_description, max_length)
+
+    logger.warning(
+        "MCP tool '%s' description shortened from %d to %d characters "
+        "(configured maximum: %d)",
+        tool_name,
+        len(full_description),
+        len(description),
+        max_length,
+    )
+    return description
+
+
 def safe_int(value, default):
     """Convert value to int, handling string inputs."""
     if value is None:
@@ -192,6 +260,23 @@ class McpToolkit(BaseToolkit):
                     }
                 )
             ),
+            max_tool_description_length=(
+                int,
+                Field(
+                    default=0,
+                    ge=0,
+                    description=(
+                        "Maximum agent-facing MCP tool description length in characters "
+                        "(0 keeps the full description)"
+                    ),
+                    json_schema_extra={
+                        'tooltip': (
+                            'Use 0 to preserve full MCP tool descriptions. A positive value '
+                            'shortens descriptions at a readable boundary and logs a warning.'
+                        )
+                    }
+                )
+            ),
             __config__=ConfigDict(
                 json_schema_extra={
                     'metadata': {
@@ -218,6 +303,7 @@ class McpToolkit(BaseToolkit):
         toolkit_name: str = None,
         toolkit_type: str = "mcp",
         client = None,
+        max_tool_description_length: int = 0,
         **kwargs
     ) -> 'McpToolkit':
         """
@@ -236,6 +322,7 @@ class McpToolkit(BaseToolkit):
             selected_tools: List of specific tools to enable (empty = all tools)
             enable_caching: Whether to enable caching
             cache_ttl: Cache TTL in seconds
+            max_tool_description_length: Maximum agent-facing description length; 0 keeps it whole
             toolkit_name: Toolkit name/identifier and prefix for tools
             client: EliteA client for MCP communication
             **kwargs: Additional configuration options
@@ -252,6 +339,13 @@ class McpToolkit(BaseToolkit):
         # Convert numeric parameters that may come as strings from UI
         timeout = safe_int(timeout, 60)
         cache_ttl = safe_int(cache_ttl, 300)
+        max_tool_description_length = safe_int(max_tool_description_length, 0)
+        if max_tool_description_length < 0:
+            logger.warning(
+                "Invalid max_tool_description_length '%s', keeping full MCP descriptions",
+                max_tool_description_length,
+            )
+            max_tool_description_length = 0
 
         logger.info(f"Creating MCP toolkit: {toolkit_name}")
 
@@ -307,6 +401,7 @@ class McpToolkit(BaseToolkit):
             client=client,
             ssl_verify=ssl_verify,
             oauth_token_injected=oauth_token_injected,
+            max_tool_description_length=max_tool_description_length,
         )
 
         return toolkit
@@ -322,6 +417,7 @@ class McpToolkit(BaseToolkit):
         client,
         ssl_verify: bool = True,
         oauth_token_injected: bool = False,
+        max_tool_description_length: int = 0,
     ) -> List[BaseTool]:
         """
         Create tools from a single MCP server. Always performs live discovery when connection config is provided.
@@ -364,7 +460,8 @@ class McpToolkit(BaseToolkit):
                     timeout=timeout,
                     client=client,
                     session_id=session_id,  # Use session from discovery
-                    ssl_verify=ssl_verify  # Pass SSL verification setting
+                    ssl_verify=ssl_verify,  # Pass SSL verification setting
+                    max_tool_description_length=max_tool_description_length,
                 )
 
                 if server_tool:
@@ -394,6 +491,7 @@ class McpToolkit(BaseToolkit):
                 selected_tools,
                 timeout,
                 client,
+                max_tool_description_length,
             )
 
         # Don't add inspection tool to agent - it's only for internal use by toolkit
@@ -690,7 +788,8 @@ class McpToolkit(BaseToolkit):
         timeout: int,
         client,
         session_id: Optional[str] = None,
-        ssl_verify: bool = True
+        ssl_verify: bool = True,
+        max_tool_description_length: int = 0,
     ) -> Optional[BaseTool]:
         """Create a BaseTool from a tool/prompt dictionary (from direct HTTP discovery)."""
         try:
@@ -701,12 +800,13 @@ class McpToolkit(BaseToolkit):
             is_prompt = tool_dict.get("_mcp_type") == "prompt"
             item_type = "prompt" if is_prompt else "tool"
 
-            # Build description with toolkit context and ensure it doesn't exceed 1000 characters
             base_description = tool_dict.get('description', '')
-            description = f"{base_description}\nToolkit: {toolkit_name} ({connection_config.url})"
-            if len(description) > 1000:
-                description = description[:997] + "..."
-                logger.debug(f"Trimmed description for tool '{tool_name}' to 1000 chars")
+            description = _build_tool_description(
+                base_description,
+                f"Toolkit: {toolkit_name} ({connection_config.url})",
+                max_tool_description_length,
+                tool_name=tool_name,
+            )
 
             # Use McpRemoteTool for remote MCP servers (HTTP/SSE)
             return McpRemoteTool(
@@ -738,7 +838,8 @@ class McpToolkit(BaseToolkit):
         toolkit_type: str,
         selected_tools: List[str],
         timeout: int,
-        client
+        client,
+        max_tool_description_length: int = 0,
     ) -> List[BaseTool]:
         """Fallback static tool creation using the original method."""
         tools = []
@@ -772,7 +873,8 @@ class McpToolkit(BaseToolkit):
                     toolkit_type=toolkit_type,
                     available_tool=available_tool,
                     timeout=timeout,
-                    client=client
+                    client=client,
+                    max_tool_description_length=max_tool_description_length,
                 )
 
                 if server_tool:
@@ -808,18 +910,20 @@ class McpToolkit(BaseToolkit):
         toolkit_name: str,
         toolkit_type: str,
         timeout: int,
-        client
+        client,
+        max_tool_description_length: int = 0,
     ) -> Optional[BaseTool]:
         """Create a BaseTool from discovered metadata."""
         try:
             # Use original tool name directly
             tool_name = tool_metadata.name
 
-            # Build description with toolkit context and ensure it doesn't exceed 1000 characters
-            description = f"{tool_metadata.description}\nToolkit: {toolkit_name}"
-            if len(description) > 1000:
-                description = description[:997] + "..."
-                logger.debug(f"Trimmed description for tool '{tool_name}' to 1000 chars")
+            description = _build_tool_description(
+                tool_metadata.description,
+                f"Toolkit: {toolkit_name}",
+                max_tool_description_length,
+                tool_name=tool_name,
+            )
 
             return McpServerTool(
                 name=tool_name,
@@ -841,19 +945,21 @@ class McpToolkit(BaseToolkit):
         toolkit_type: str,
         available_tool: Dict[str, Any],
         timeout: int,
-        client
+        client,
+        max_tool_description_length: int = 0,
     ) -> Optional[BaseTool]:
         """Create a single MCP tool."""
         try:
             # Use original tool name directly
             tool_name = available_tool["name"]
 
-            # Build description with toolkit context and ensure it doesn't exceed 1000 characters
             base_description = available_tool.get('description', '')
-            description = f"{base_description}\nToolkit: {toolkit_name}"
-            if len(description) > 1000:
-                description = description[:997] + "..."
-                logger.debug(f"Trimmed description for tool '{tool_name}' to 1000 chars")
+            description = _build_tool_description(
+                base_description,
+                f"Toolkit: {toolkit_name}",
+                max_tool_description_length,
+                tool_name=tool_name,
+            )
 
             return McpServerTool(
                 name=tool_name,
@@ -970,6 +1076,9 @@ def get_tools(tool_config: dict, elitea_client, llm=None, memory_store=None) -> 
         enable_caching=settings.get('enable_caching', True),
         cache_ttl=safe_int(settings.get('cache_ttl'), 300),
         ssl_verify=settings.get('ssl_verify', True),
+        max_tool_description_length=safe_int(
+            settings.get('max_tool_description_length'), 0
+        ),
         toolkit_name=toolkit_name,
         toolkit_type=tool_config.get('type', 'mcp'),
         client=elitea_client
