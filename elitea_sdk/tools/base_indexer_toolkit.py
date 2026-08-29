@@ -562,6 +562,19 @@ def is_up_to_date_run(totals: Dict[str, int]) -> bool:
     )
 
 
+def snapshot_loader_metadata(document: Document) -> Optional[Dict[str, Any]]:
+    """Copy of the loader's metadata for a pipeline retry to restart from.
+
+    None when the metadata holds something uncopyable: the retry then keeps the
+    mutated-in-place document rather than failing it outright on the snapshot.
+    """
+    try:
+        return copy.deepcopy(document.metadata)
+    except Exception as exc:
+        logger.warning(f"Could not snapshot document metadata for a pipeline retry: {exc}")
+        return None
+
+
 def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]) -> List[str]:
     kind = ReportKind(category["kind"])
     icon, verb = _CATEGORY_RENDERING[kind]
@@ -1255,6 +1268,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Bounded retry for the fetch/parse half only — the flush path already
             # retries inside add_documents, and stacking the two would multiply a
             # flush failure by the whole backoff chain.
+            # The pipeline consumes and rewrites the doc's own metadata (content
+            # bytes popped, keys stripped, dependent ids appended), so the retry
+            # gets the loader's state back instead of attempt 1's leftovers.
+            loader_metadata = snapshot_loader_metadata(base_doc)
             try:
                 return _run_pipeline(base_doc)
             except Exception as exc:
@@ -1262,6 +1279,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     f"Pipeline failed for '{self._extract_doc_name(base_doc.metadata)}', "
                     f"retrying once: {exc}"
                 )
+                if loader_metadata is not None:
+                    base_doc.metadata = loader_metadata
                 return _run_pipeline(base_doc)
 
         def _consume_pipeline_output(base_doc: Document, base_doc_counter: int, chunks: List[Document]) -> None:
@@ -2087,6 +2106,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # Fresh init: no meta row exists yet, so no guard can flip it and
                 # registration needs no meta lock; registering before the row is
                 # created closes the two-simultaneous-first-calls race.
+                # The reclaim sweep still has to run first, with the default
+                # timeout since there is no meta row to read one from: a pending
+                # row can outlive its meta row (crash before the row is written,
+                # or an index removal) and would otherwise refuse this name for good.
+                self.vector_adapter.sweep_stale_index_runs(
+                    self, index_name, time.time() - run.disconnected_timeout
+                )
                 self._register_index_run(index_name, task_id=None, meta_lock_id=None)
             created_on = time.time()
             metadata = {

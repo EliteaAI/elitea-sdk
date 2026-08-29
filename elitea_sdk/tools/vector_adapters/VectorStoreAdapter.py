@@ -8,6 +8,11 @@ from ...runtime.utils.utils import IndexerKeywords
 logger = getLogger(__name__)
 
 PROMOTE_DELETE_BATCH_SIZE = 50000
+# Caps how many strands one sweep reclaims. The candidate read returns only
+# discarded runs whose chunks actually survived, so the cap bounds the deletes of
+# a single index run without ever excluding a strand: whatever it leaves behind
+# is still a candidate for the next sweep.
+STRANDED_RECLAIM_RUN_LIMIT = 50
 
 
 class VectorStoreAdapter(ABC):
@@ -195,7 +200,15 @@ class PGVectorAdapter(VectorStoreAdapter):
                         func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value)
                 ).delete(synchronize_session=False)
             session.commit()
-            return deleted_count
+        if including_index_meta and index_name:
+            try:
+                self._delete_index_runs(vectorstore_wrapper, index_name)
+            except Exception as exc:
+                # Bookkeeping after an already committed destructive delete:
+                # the chunks are gone, so failing the removal here would report
+                # a failure for work that succeeded and skip its removal event.
+                logger.warning(f"Failed to delete run rows of index '{index_name}': {exc}")
+        return deleted_count
 
     def is_vectorstore_type(self, vectorstore) -> bool:
         """Check if the vectorstore is a PGVector store."""
@@ -205,6 +218,7 @@ class PGVectorAdapter(VectorStoreAdapter):
         """Get all indexed data from PGVector for non-code content per index_name."""
         from sqlalchemy.orm import Session
         from sqlalchemy import func
+        from ...runtime.tools.index_runs_model import is_undefined_table_error
 
         result = {}
         try:
@@ -215,7 +229,6 @@ class PGVectorAdapter(VectorStoreAdapter):
             with Session(store.session_maker.bind) as session:
                 docs = session.query(
                     store.EmbeddingStore.id,
-                    store.EmbeddingStore.document,
                     store.EmbeddingStore.cmetadata
                 ).filter(
                     func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name,
@@ -252,7 +265,15 @@ class PGVectorAdapter(VectorStoreAdapter):
                     }
 
         except Exception as e:
-            logger.error(f"Failed to get indexed data from PGVector: {str(e)}. Continuing with empty index.")
+            # An unreadable index must never look like an empty one: the caller
+            # would nominate nothing for supersede and publish this run's
+            # generation on top of the surviving one, duplicating every document
+            # with nothing reported. A missing table is the one honest empty —
+            # no run can have indexed anything there.
+            if not is_undefined_table_error(e):
+                logger.error(f"Failed to get indexed data from PGVector: {str(e)}")
+                raise
+            logger.warning(f"No embedding table to read indexed data from: {str(e)}. Continuing with empty index.")
 
         return result
 
@@ -274,6 +295,7 @@ class PGVectorAdapter(VectorStoreAdapter):
         """Get all indexed code data from PGVector per collection suffix."""
         from sqlalchemy.orm import Session
         from sqlalchemy import func
+        from ...runtime.tools.index_runs_model import is_undefined_table_error
 
         result = {}
         try:
@@ -305,7 +327,12 @@ class PGVectorAdapter(VectorStoreAdapter):
                     result[filename]['commit_hashes'].append(commit_hash)
                 result[filename]['ids'].append(db_id)
         except Exception as e:
-            logger.error(f"Failed to get indexed code data from PGVector: {str(e)}. Continuing with empty index.")
+            # Same polarity as get_indexed_data: a failed read that reports an
+            # empty index makes the run publish duplicates of every file.
+            if not is_undefined_table_error(e):
+                logger.error(f"Failed to get indexed code data from PGVector: {str(e)}")
+                raise
+            logger.warning(f"No embedding table to read indexed code data from: {str(e)}. Continuing with empty index.")
         return result
 
     def add_to_collection(self, vectorstore_wrapper, entry_id, new_collection_value):
@@ -359,7 +386,6 @@ class PGVectorAdapter(VectorStoreAdapter):
 
     def get_index_meta(self, vectorstore_wrapper, index_name: str) -> List[Dict[str, Any]]:
         from sqlalchemy.orm import Session
-        from sqlalchemy import func
 
         store = vectorstore_wrapper.vectorstore
         try:
@@ -369,8 +395,7 @@ class PGVectorAdapter(VectorStoreAdapter):
                     store.EmbeddingStore.document,
                     store.EmbeddingStore.cmetadata
                 ).filter(
-                    store.EmbeddingStore.cmetadata['type'].astext == IndexerKeywords.INDEX_META_TYPE.value,
-                    func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name
+                    self._index_meta_clause(store, index_name)
                 ).all()
                 result = []
                 for id, document, cmetadata in meta:
@@ -512,15 +537,15 @@ class PGVectorAdapter(VectorStoreAdapter):
 
     def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
                                stale_before: float) -> List[str]:
-        from sqlalchemy import update
         from sqlalchemy.orm import Session
         from ...runtime.tools.index_runs_model import (
             IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED, RUN_STATUS_PENDING,
         )
 
         store = vectorstore_wrapper.vectorstore
+        self._reclaim_discarded_run_chunks(store, index_name)
         with Session(store.session_maker.bind) as session:
-            stale_run_ids = [
+            candidate_run_ids = [
                 row[0]
                 for row in session.query(IndexRun.run_id).filter(
                     IndexRun.collection == index_name,
@@ -528,25 +553,76 @@ class PGVectorAdapter(VectorStoreAdapter):
                     IndexRun.heartbeat < stale_before,
                 ).all()
             ]
-        for stale_run_id in stale_run_ids:
-            # The chunk DELETE commits lock-free BEFORE the status flip: a single
-            # transaction would hold chunk-row locks while wanting the run row,
-            # inverting cancel's meta -> run -> chunk order. A crash between the
-            # two transactions leaves the row to be re-swept next run.
+        reclaimed_run_ids = []
+        for candidate_run_id in candidate_run_ids:
+            # One transaction per run, run row FIRST. The candidate read above is
+            # lock-free, and staleness is a heartbeat guess: a worker whose
+            # heartbeat thread died keeps indexing and can promote inside that
+            # window. Re-verifying under the row lock is what stops the DELETE
+            # from erasing a corpus that just went live, and committing the flip
+            # with the DELETE leaves no window where chunks outlive a terminal
+            # row. Lock order run -> chunks is the tail of the universal
+            # meta -> run -> chunks: the chunk DELETE excludes the index_meta
+            # row, so the sweep never wants a meta row it does not already hold
+            # and cannot close a cycle against promote/discard/cancel.
             with Session(store.session_maker.bind) as session:
-                self._delete_run_chunks(session, store, stale_run_id)
+                run_row = session.get(IndexRun, candidate_run_id, with_for_update=True)
+                if (
+                    run_row is None
+                    or run_row.status not in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)
+                    or run_row.heartbeat >= stale_before
+                ):
+                    session.rollback()
+                    continue
+                self._delete_run_chunks(session, store, candidate_run_id)
+                run_row.status = RUN_STATUS_DISCARDED
                 session.commit()
+                reclaimed_run_ids.append(candidate_run_id)
+        return reclaimed_run_ids
+
+    def _reclaim_discarded_run_chunks(self, store, index_name: str) -> None:
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import IndexRun, RUN_STATUS_DISCARDED
+
+        # Chunks under a 'discarded' row are unreachable garbage: neither the read
+        # filter (pending/cancelled) nor the reclaim loop below can see them, so
+        # they resurface as visible phantoms once the name is reused. Only the
+        # best-effort cleanup on promote's and discard's abort branches deletes
+        # them today, and when it fails nothing else ever retries — this pass is
+        # that retry. Runs ahead of the loop because the loop's own flips are
+        # committed with their DELETEs and leave nothing behind.
+        #
+        # 'promoted' rows are the live corpus and stay out of the id set; ids with
+        # no run row at all stay out too — rows are only ever deleted by index
+        # removal or the rollback runbook, so an absent row is not abandonment.
+        #
+        # Candidates are picked by surviving chunks, never by recency: a run
+        # stranded by the sweep stops heartbeating the moment it goes terminal, so
+        # its heartbeat is older than that of every run discarded after it, and a
+        # newest-first window would push it out permanently once the collection
+        # has accumulated a window's worth of discarded rows. The predicate is the
+        # delete's own, so every candidate is deletable and each sweep makes
+        # progress; the probe per candidate row is GIN-served.
+        try:
             with Session(store.session_maker.bind) as session:
-                session.execute(
-                    update(IndexRun)
-                    .where(
-                        IndexRun.run_id == stale_run_id,
-                        IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
-                    )
-                    .values(status=RUN_STATUS_DISCARDED)
-                )
+                stranded_run_ids = [
+                    row[0]
+                    for row in session.query(IndexRun.run_id).filter(
+                        IndexRun.collection == index_name,
+                        IndexRun.status == RUN_STATUS_DISCARDED,
+                        self._run_chunks_exist_clause(store, IndexRun.run_id),
+                    ).limit(STRANDED_RECLAIM_RUN_LIMIT).all()
+                ]
+                if not stranded_run_ids:
+                    return
+                self._delete_runs_chunks(session, store, stranded_run_ids)
                 session.commit()
-        return stale_run_ids
+        except Exception as exc:
+            # Reclaiming a previous run's leftovers must never fail the run that
+            # sweeps; the next sweep retries.
+            logger.warning(
+                f"Failed to reclaim stranded chunks of discarded runs in '{index_name}': {exc}"
+            )
 
     def promote_run(self, vectorstore_wrapper, index_name: str, run_id: str,
                     superseded_ids: List[str], orphan_ids: List[str],
@@ -565,12 +641,21 @@ class PGVectorAdapter(VectorStoreAdapter):
             meta_ids = self._lock_index_meta_rows(session, store, index_name)
             run_row = session.get(IndexRun, run_id, with_for_update=True)
             if not meta_ids:
-                if run_row is not None and run_row.status in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
-                    run_row.status = RUN_STATUS_DISCARDED
+                # Every non-promoted status takes its staged rows along: a run
+                # already swept to DISCARDED is out of reach of both the sweep
+                # (pending/cancelled only) and the read filter, so rows this
+                # worker flushed after the sweep would stay visible forever.
+                if run_row is None or run_row.status != RUN_STATUS_PROMOTED:
+                    self._delete_run_chunks(session, store, run_id)
+                    if run_row is not None and run_row.status in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                        run_row.status = RUN_STATUS_DISCARDED
                 session.commit()
                 return "aborted-row-deleted"
             if run_row is None or run_row.status not in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                already_promoted = run_row is not None and run_row.status == RUN_STATUS_PROMOTED
                 session.rollback()
+                if not already_promoted:
+                    self._discard_stranded_run_chunks(store, run_id)
                 return "aborted-not-pending"
             if run_row.status == RUN_STATUS_CANCELLED:
                 self._delete_run_chunks(session, store, run_id)
@@ -589,6 +674,7 @@ class PGVectorAdapter(VectorStoreAdapter):
         from sqlalchemy.orm import Session
         from ...runtime.tools.index_runs_model import (
             IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED, RUN_STATUS_PENDING,
+            RUN_STATUS_PROMOTED,
         )
 
         store = vectorstore_wrapper.vectorstore
@@ -596,35 +682,125 @@ class PGVectorAdapter(VectorStoreAdapter):
             self._lock_index_meta_rows(session, store, index_name)
             run_row = session.get(IndexRun, run_id, with_for_update=True)
             if run_row is None or run_row.status not in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                already_promoted = run_row is not None and run_row.status == RUN_STATUS_PROMOTED
                 session.rollback()
+                if not already_promoted:
+                    self._discard_stranded_run_chunks(store, run_id)
                 return "noop"
+            # The flip is committed WITH the delete, never ahead of it: 'discarded' sits
+            # outside both the read filter's and the sweep's status set, so a row flipped
+            # over chunks that survived turns them into permanently visible phantoms. A
+            # failed cleanup therefore leaves the row pending — invisible, and reclaimable.
             self._delete_run_chunks(session, store, run_id)
             run_row.status = RUN_STATUS_DISCARDED
             session.commit()
             return "discarded"
 
     def _lock_index_meta_rows(self, session, store, index_name: str):
-        from sqlalchemy import func
-
         return session.query(store.EmbeddingStore.id).filter(
-            store.EmbeddingStore.cmetadata['type'].astext == IndexerKeywords.INDEX_META_TYPE.value,
-            func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'collection') == index_name
+            self._index_meta_clause(store, index_name)
         ).with_for_update().all()
 
+    @staticmethod
+    def _index_meta_clause(store, index_name: str):
+        # Containment, not ->>: the table's only jsonb index is GIN
+        # jsonb_path_ops, which serves @> alone. An extract-text predicate
+        # sequential-scans the whole collection inside promote's transaction,
+        # with every core meta writer queued behind it.
+        return store.EmbeddingStore.cmetadata.contains({
+            "type": IndexerKeywords.INDEX_META_TYPE.value,
+            "collection": index_name,
+        })
+
+    def _discard_stranded_run_chunks(self, store, run_id: str) -> None:
+        from sqlalchemy.orm import Session
+
+        # Own-run rows only, in a transaction of its own so the meta lock is
+        # already released. Once the run row is terminal neither the sweep
+        # (pending/cancelled only) nor the read filter can reach these rows, so
+        # leaving them turns them into visible phantoms the moment an index of
+        # the same name is recreated.
+        try:
+            with Session(store.session_maker.bind) as session:
+                self._delete_run_chunks(session, store, run_id)
+                session.commit()
+        except Exception as exc:
+            # Best effort by contract: the abort branches that call this publish
+            # nothing, write no terminal meta state and emit no event, and
+            # raising from here would turn that silent abort into a reported
+            # run failure.
+            logger.warning(f"Failed to delete stranded chunks of run '{run_id}': {exc}")
+
+    def _delete_index_runs(self, vectorstore_wrapper, index_name: str) -> None:
+        from sqlalchemy.exc import ProgrammingError
+        from sqlalchemy.orm import Session
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_PENDING, is_undefined_table_error,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        try:
+            with Session(store.session_maker.bind) as session:
+                # Terminal rows only. A live run keeps staging chunks whose run id
+                # has to stay in the pending set, and its row is what holds the
+                # name against a second registration. Reclaiming a crashed run's
+                # row is the stale sweep's job, which index_data runs before it
+                # registers on both the fresh and the reindex branch.
+                session.query(IndexRun).filter(
+                    IndexRun.collection == index_name,
+                    IndexRun.status.notin_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                ).delete(synchronize_session=False)
+                session.commit()
+        except ProgrammingError as exc:
+            if not is_undefined_table_error(exc):
+                raise
+
     def _delete_run_chunks(self, session, store, run_id: str) -> int:
-        from sqlalchemy import func, or_
+        return self._delete_runs_chunks(session, store, [run_id])
+
+    def _delete_runs_chunks(self, session, store, run_ids: List[str]) -> int:
+        from sqlalchemy import or_
 
         # No `collection` conjunct: multi-index rows carry `collection` as an
         # appended "a;b" string that equality would miss, leaving escaped rows
         # permanently visible once the run row goes terminal. The run id is
         # globally unique; the type conjunct shields the meta row belt-and-braces.
+        # Containment per id rather than one array predicate: only `@>` is served
+        # by the table's jsonb_path_ops GIN, and the planner bitmap-ORs the probes.
         return session.query(store.EmbeddingStore).filter(
-            store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
-            or_(
-                func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type').is_(None),
-                func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value
-            )
+            or_(*[
+                store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id})
+                for run_id in run_ids
+            ]),
+            self._non_index_meta_clause(store),
         ).delete(synchronize_session=False)
+
+    @staticmethod
+    def _non_index_meta_clause(store):
+        from sqlalchemy import func, or_
+
+        return or_(
+            func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type').is_(None),
+            func.jsonb_extract_path_text(store.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value
+        )
+
+    @classmethod
+    def _run_chunks_exist_clause(cls, store, run_id_column):
+        from sqlalchemy import String as SAString
+        from sqlalchemy import cast, func, literal, select
+
+        # Correlated on the run row, so the right-hand side of `@>` is built per
+        # candidate and stays a plain jsonb value the jsonb_path_ops GIN can probe.
+        # The key is cast because jsonb_build_object is VARIADIC "any": an untyped
+        # bind leaves its type undeterminable to any server-side-binding driver.
+        return select(store.EmbeddingStore.id).where(
+            store.EmbeddingStore.cmetadata.contains(
+                func.jsonb_build_object(
+                    cast(literal(IndexerKeywords.RUN_ID.value), SAString), run_id_column
+                )
+            ),
+            cls._non_index_meta_clause(store),
+        ).exists()
 
     @staticmethod
     def _iter_id_batches(ids: List[str]):

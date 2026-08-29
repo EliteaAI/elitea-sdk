@@ -30,6 +30,8 @@ Covers:
     store's engine lands in the toolkit schema
   - legacy-row visibility through the $exists/$nin read filter on a real store
   - promote/discard end-to-end against real rows
+  - the sweep's reclamation of chunks stranded under an already-discarded run,
+    whose candidate read is a correlated containment probe
 """
 
 import os
@@ -46,6 +48,7 @@ from elitea_sdk.runtime.tools.index_runs_model import (
     RUN_STATUS_DISCARDED,
     RUN_STATUS_PENDING,
     RUN_STATUS_PROMOTED,
+    IndexRun,
     ensure_index_runs_table,
 )
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
@@ -629,3 +632,100 @@ class TestReadFilterAndPromoteLive:
                 "WHERE cmetadata->>'type' = 'index_meta'"
             )).scalar()
         assert updated_on > time.time() - 60
+
+
+def stage_a_stranded_run(adapter, wrapper, scratch_schema):
+    """The state a failed best-effort cleanup leaves: a terminal run row over
+    surviving chunks, alongside a discarded run whose cleanup did succeed."""
+    adapter.ensure_index_runs_table(wrapper)
+    store = wrapper.vectorstore
+    adapter.register_index_run(wrapper, "idx", "run-strand")
+    add_store_documents(store, [
+        ("index meta stub", {"id": "meta", "collection": "idx", "type": "index_meta"}),
+        ("live generation", {"id": "doc-1", "collection": "idx"}),
+        ("stranded row", {"id": "doc-2", "collection": "idx", RUN_ID_KEY: "run-strand"}),
+        ("stranded multi index row", {"id": "doc-3", "collection": "idx;other",
+                                      RUN_ID_KEY: "run-strand"}),
+    ])
+    with sa.orm.Session(store.session_maker.bind) as session:
+        # The strand's heartbeat froze when the sweep flipped it, so it is OLDER
+        # than that of every run discarded afterwards.
+        session.execute(
+            sa.text(f'UPDATE "{scratch_schema}".elitea_index_runs '
+                    "SET status = :status, heartbeat = :heartbeat WHERE run_id = 'run-strand'"),
+            {"status": RUN_STATUS_DISCARDED, "heartbeat": time.time() - 11 * 3600},
+        )
+        session.execute(
+            sa.text(f'INSERT INTO "{scratch_schema}".elitea_index_runs '
+                    "(run_id, collection, status, started_on, heartbeat) "
+                    "VALUES ('run-clean', 'idx', :status, :now, :now)"),
+            {"status": RUN_STATUS_DISCARDED, "now": time.time()},
+        )
+        session.commit()
+    return store
+
+
+class TestStrandedChunkReclaimLive:
+    """The reclamation pass picks its candidates with a correlated containment
+    probe built by jsonb_build_object. Only a real server proves it binds, that it
+    discriminates chunk-bearing rows from clean ones, and that it never nominates
+    the index_meta row."""
+
+    def test_the_candidate_read_selects_only_runs_whose_chunks_survived(
+        self, pgvector_wrapper, scratch_schema
+    ):
+        adapter = PGVectorAdapter()
+        store = stage_a_stranded_run(adapter, pgvector_wrapper, scratch_schema)
+
+        with sa.orm.Session(store.session_maker.bind) as session:
+            candidates = session.query(IndexRun.run_id).filter(
+                IndexRun.collection == "idx",
+                IndexRun.status == RUN_STATUS_DISCARDED,
+                adapter._run_chunks_exist_clause(store, IndexRun.run_id),
+            ).all()
+
+        # 'run-clean' is the newer row: a recency-ordered window would reclaim it
+        # and starve the strand, which is the only row with anything to reclaim.
+        assert [row[0] for row in candidates] == ["run-strand"]
+
+    def test_the_sweep_deletes_the_strand_and_leaves_the_live_corpus(
+        self, pgvector_wrapper, scratch_schema
+    ):
+        adapter = PGVectorAdapter()
+        store = stage_a_stranded_run(adapter, pgvector_wrapper, scratch_schema)
+
+        assert adapter.sweep_stale_index_runs(pgvector_wrapper, "idx", time.time() - 7200) == []
+
+        with sa.orm.Session(store.session_maker.bind) as session:
+            remaining = session.execute(sa.text(
+                f'SELECT cmetadata->>\'id\' FROM "{scratch_schema}".langchain_pg_embedding ORDER BY 1'
+            )).fetchall()
+            statuses = session.execute(sa.text(
+                f'SELECT run_id, status FROM "{scratch_schema}".elitea_index_runs ORDER BY 1'
+            )).fetchall()
+        # The ";"-multi-index staged row falls with the run; the meta row and the
+        # previous generation do not. Run rows are never deleted, only flipped.
+        assert [row[0] for row in remaining] == ["doc-1", "meta"]
+        assert statuses == [
+            ("run-clean", RUN_STATUS_DISCARDED),
+            ("run-strand", RUN_STATUS_DISCARDED),
+        ]
+
+    def test_a_reclaimed_run_is_not_a_candidate_for_the_next_sweep(
+        self, pgvector_wrapper, scratch_schema
+    ):
+        adapter = PGVectorAdapter()
+        store = stage_a_stranded_run(adapter, pgvector_wrapper, scratch_schema)
+
+        adapter.sweep_stale_index_runs(pgvector_wrapper, "idx", time.time() - 7200)
+
+        with sa.orm.Session(store.session_maker.bind) as session:
+            candidates = session.query(IndexRun.run_id).filter(
+                IndexRun.collection == "idx",
+                IndexRun.status == RUN_STATUS_DISCARDED,
+                adapter._run_chunks_exist_clause(store, IndexRun.run_id),
+            ).all()
+
+        # The candidate predicate is the delete's own, so every sweep makes
+        # progress and the cap can never hold a reclaimed run in the window.
+        assert candidates == []

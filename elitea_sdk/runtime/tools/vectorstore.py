@@ -259,10 +259,14 @@ class VectorStoreWrapper(BaseToolApiWrapper):
         return self.vector_adapter.get_code_indexed_data(self, index_name)
 
     def _get_pending_run_ids_safe(self) -> List[str]:
+        from .index_runs_model import is_degradable_run_lookup_error
+
         try:
             return self.vector_adapter.get_pending_run_ids(self, "")
         except Exception as e:
-            logger.debug(f"Could not fetch pending index run ids: {e}")
+            if not is_degradable_run_lookup_error(e):
+                raise
+            logger.warning(f"Could not fetch pending index run ids, searching unfiltered: {e}")
             return []
 
     def _add_to_collection(self, entry_id, new_collection_value):

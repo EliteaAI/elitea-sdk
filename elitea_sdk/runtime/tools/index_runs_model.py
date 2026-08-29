@@ -97,6 +97,18 @@ def is_undefined_table_error(exc: Exception) -> bool:
     return _exception_sqlstate(exc) == "42P01"
 
 
+def is_degradable_run_lookup_error(exc: Exception) -> bool:
+    """Whether a failed pending-run lookup may degrade to an unfiltered read.
+
+    Keyed on sqlstate, never on exception class: a missing table is the only
+    fail-open case, and the DBAPI classes it arrives in also carry statement
+    timeouts, deadlocks, serialization failures and permission errors. Widening
+    to those would answer a transient failure with an unfiltered search, which
+    is exactly how an in-flight run's staged rows reach a reader.
+    """
+    return is_undefined_table_error(exc)
+
+
 def ensure_index_runs_table(engine, schema: str) -> None:
     """Provision the per-schema runs table. Write path only — read paths never
     ensure and treat a missing table as an empty pending set."""

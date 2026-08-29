@@ -448,13 +448,17 @@ class BaseVectorStoreToolApiWrapper(BaseToolApiWrapper):
         return filter
 
     def _get_pending_run_ids_safe(self, index_name: str = "") -> List[str]:
+        from ..runtime.tools.index_runs_model import is_degradable_run_lookup_error
+
         try:
             vectorstore_wrapper = self._init_vector_store()
             return vectorstore_wrapper.vector_adapter.get_pending_run_ids(
                 vectorstore_wrapper, index_name.strip() if index_name else ""
             )
         except Exception as e:
-            logger.debug(f"Could not fetch pending index run ids: {e}")
+            if not is_degradable_run_lookup_error(e):
+                raise
+            logger.warning(f"Could not fetch pending index run ids, searching unfiltered: {e}")
             return []
 
     def search_index(self,

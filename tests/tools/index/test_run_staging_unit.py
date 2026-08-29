@@ -20,7 +20,9 @@ refusal, the count-honesty rules in index_meta_update, and the promote
 outcome handling in index_data — all without a database.
 """
 
+import copy
 import json
+import time
 
 import pytest
 from langchain_core.documents import Document
@@ -32,8 +34,10 @@ from elitea_sdk.tools.base_indexer_toolkit import (
     IDLESS_STAGING_KEY,
     IndexRunRefusedError,
     IndexingStatus,
+    TASK_DISCONNECTED_TIMEOUT_DEFAULT,
     _IndexRunState,
     render_report_text,
+    snapshot_loader_metadata,
 )
 
 RUN_ID_KEY = IndexerKeywords.RUN_ID.value
@@ -253,6 +257,7 @@ class FakeStagingAdapter:
         self.promote_outcome = "promoted"
         self.calls = []
         self.pending = []
+        self.sweeps = []
 
     def ensure_index_runs_table(self, wrapper):
         self.calls.append("ensure")
@@ -263,6 +268,7 @@ class FakeStagingAdapter:
 
     def sweep_stale_index_runs(self, wrapper, index_name, stale_before):
         self.calls.append("sweep")
+        self.sweeps.append((index_name, stale_before))
         return []
 
     def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id):
@@ -472,6 +478,115 @@ class TestRegistrationRefusal:
             run_index_data(staged_toolkit, monkeypatch)
 
 
+class TestFreshIndexReclaim:
+    """A pending row can outlive its meta row (a crash before the row is
+    written, or an index removal), and the partial unique index has no
+    staleness carve-out — without a sweep the name would refuse every run."""
+
+    def test_fresh_branch_sweeps_before_registering(self, staged_toolkit, monkeypatch):
+        run_index_data(staged_toolkit, monkeypatch)
+
+        calls = staged_toolkit.vector_adapter.calls
+        assert calls.index("sweep") < calls.index("register")
+
+    def test_fresh_sweep_uses_the_default_staleness_timeout(self, staged_toolkit, monkeypatch):
+        run_index_data(staged_toolkit, monkeypatch)
+
+        index_name, stale_before = staged_toolkit.vector_adapter.sweeps[0]
+        assert index_name == "x"
+        assert time.time() - stale_before == pytest.approx(
+            TASK_DISCONNECTED_TIMEOUT_DEFAULT, abs=10
+        )
+
+    def test_fresh_run_starts_once_the_sweep_reclaims_the_stale_row(self, staged_toolkit, monkeypatch):
+        adapter = staged_toolkit.vector_adapter
+        adapter.register_result = (False, {"run_id": "dead", "heartbeat": 1.0, "started_on": 1.0})
+        original_sweep = adapter.sweep_stale_index_runs
+
+        def reclaiming_sweep(wrapper, index_name, stale_before):
+            original_sweep(wrapper, index_name, stale_before)
+            adapter.register_result = (True, None)
+            return ["dead"]
+
+        adapter.sweep_stale_index_runs = reclaiming_sweep
+
+        run_index_data(staged_toolkit, monkeypatch)
+
+        assert "promote" in adapter.calls
+
+
+class TestPipelineRetryIsolation:
+    """The pipeline consumes the document's own metadata; without a snapshot the
+    retry starts from attempt 1's leftovers — duplicated dependent ids, extra
+    round-trips and a silent zero-chunk re-parse once the content bytes are gone."""
+
+    def run_two_attempts(self, monkeypatch, failures=1):
+        toolkit = StagingToolkit.model_construct()
+        object.__setattr__(toolkit, "max_docs_per_add", 100)
+        seen = []
+        attempts = {"count": 0}
+
+        def fake_extend_data(self, documents):
+            base_doc = next(iter(documents))
+            seen.append(copy.deepcopy(base_doc.metadata))
+            base_doc.metadata.pop("content_in_bytes", None)
+            base_doc.metadata.setdefault("dependent_docs", []).append("dep-1")
+            attempts["count"] += 1
+            if attempts["count"] <= failures:
+                raise RuntimeError("transient parse failure")
+            return iter([base_doc])
+
+        monkeypatch.setattr(StagingToolkit, "_extend_data", fake_extend_data)
+        monkeypatch.setattr(StagingToolkit, "_collect_dependencies", lambda self, docs: docs)
+        monkeypatch.setattr(
+            StagingToolkit, "_apply_loaders_chunkers",
+            lambda self, docs, chunking_tool=None, chunking_config=None: docs,
+        )
+        monkeypatch.setattr(StagingToolkit, "_clean_metadata", lambda self, docs: docs)
+        monkeypatch.setattr(VectorStoreWrapperBase, "_ensure_vectorstore_initialized", lambda self: None)
+        monkeypatch.setattr(StagingToolkit, "_log_tool_event", lambda self, *a, **kw: None)
+        monkeypatch.setattr(StagingToolkit, "index_meta_update", lambda self, *a, **kw: None)
+        monkeypatch.setattr(
+            "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
+            lambda vectorstore=None, documents=None, ids=None: ["row-1"],
+        )
+
+        base_doc = Document(
+            page_content="body",
+            metadata={"id": "d1", "updated_on": "1", "content_in_bytes": b"payload"},
+        )
+        toolkit._save_index_generator(
+            iter([base_doc]), 1, None, None,
+            {"count": 0, "docs_count": 0, "errors": []}, index_name="x"
+        )
+        return seen
+
+    def test_both_attempts_start_from_the_loaders_metadata(self, monkeypatch):
+        seen = self.run_two_attempts(monkeypatch)
+
+        assert len(seen) == 2
+        assert seen[1] == seen[0]
+
+    def test_dependent_ids_are_not_accumulated_across_attempts(self, monkeypatch):
+        seen = self.run_two_attempts(monkeypatch)
+
+        assert "dependent_docs" not in seen[1]
+
+    def test_content_bytes_are_restored_for_the_retry(self, monkeypatch):
+        seen = self.run_two_attempts(monkeypatch)
+
+        assert seen[1]["content_in_bytes"] == b"payload"
+
+    def test_an_uncopyable_metadata_value_does_not_fail_the_document(self, monkeypatch):
+        class Uncopyable:
+            def __deepcopy__(self, memo):
+                raise TypeError("cannot copy")
+
+        document = Document(page_content="body", metadata={"handle": Uncopyable()})
+
+        assert snapshot_loader_metadata(document) is None
+
+
 class TestForeignLiveRunSkip:
     def test_generic_failure_with_foreign_live_run_skips_the_meta_flip(self, staged_toolkit, monkeypatch):
         seed_completed_meta(staged_toolkit)
@@ -587,6 +702,39 @@ class TestReduceDuplicatesStaging:
         list(toolkit._reduce_duplicates(iter(documents), "idx"))
 
         assert toolkit._index_run.seen_keys == {"d1"}
+
+
+class TestUnreadableIndexNeverPublishes:
+    def test_a_failed_indexed_data_read_fails_the_run_instead_of_republishing(
+        self, staged_toolkit, monkeypatch
+    ):
+        seed_completed_meta(staged_toolkit)
+        monkeypatch.setattr(
+            StagingToolkit, "_reduce_duplicates", BaseIndexerToolkit._reduce_duplicates
+        )
+        monkeypatch.setattr(
+            StagingToolkit, "_get_indexed_data",
+            lambda self, index_name: (_ for _ in ()).throw(RuntimeError("pgvector read failed")),
+        )
+
+        with pytest.raises(RuntimeError):
+            run_index_data(staged_toolkit, monkeypatch)
+
+        adapter = staged_toolkit.vector_adapter
+        assert "promote" not in adapter.calls
+        assert "discard" in adapter.calls
+        assert staged_toolkit.written[-1]["state"] == IndexerKeywords.INDEX_META_FAILED.value
+
+    def test_a_readable_empty_index_still_indexes_everything(self, staged_toolkit, monkeypatch):
+        monkeypatch.setattr(
+            StagingToolkit, "_reduce_duplicates", BaseIndexerToolkit._reduce_duplicates
+        )
+        monkeypatch.setattr(StagingToolkit, "_get_indexed_data", lambda self, index_name: {})
+
+        outcome = run_index_data(staged_toolkit, monkeypatch)
+
+        assert outcome["status"] == IndexingStatus.OK.value
+        assert "promote" in staged_toolkit.vector_adapter.calls
 
 
 class TestOrphanCandidates:
@@ -706,3 +854,45 @@ class TestRetainedOrphanWarning:
 
         assert "⚠ Kept 2 previously indexed documents" in text
         assert text.index("⚠ Kept") < text.index("Errors:")
+
+
+class TestDiscardFailureStillRecordsTheFailure:
+    """A discard that cannot delete its chunks leaves the run row pending, so the failure
+    reaches the platform with the index still looking busy. Both the meta write and the
+    emit must carry the failure, including the cleanup error appended to it."""
+
+    def _failing_save(self, base_documents, base_total, chunking_tool, chunking_config,
+                      result, index_name=None):
+        list(base_documents)
+        result["count"] = 5
+        result["failed_count"] = 5
+        result.setdefault("errors", []).append("pgvector down")
+
+    def test_the_failed_state_is_written_and_emitted(self, staged_toolkit, monkeypatch):
+        seed_completed_meta(staged_toolkit)
+
+        def failing_discard(wrapper, index_name, run_id):
+            raise RuntimeError("chunk delete timed out")
+
+        monkeypatch.setattr(staged_toolkit.vector_adapter, "discard_run", failing_discard)
+
+        with pytest.raises(RuntimeError):
+            run_index_data(staged_toolkit, monkeypatch, save=self._failing_save)
+
+        assert staged_toolkit.written[-1]["state"] == IndexerKeywords.INDEX_META_FAILED.value
+        assert staged_toolkit.emitted[-1]["state"] == IndexerKeywords.INDEX_META_FAILED.value
+        assert "failed to discard staged rows" in staged_toolkit.emitted[-1]["error"]
+
+    def test_the_retained_counts_survive_the_failed_write(self, staged_toolkit, monkeypatch):
+        seed_completed_meta(staged_toolkit)
+
+        def failing_discard(wrapper, index_name, run_id):
+            raise RuntimeError("chunk delete timed out")
+
+        monkeypatch.setattr(staged_toolkit.vector_adapter, "discard_run", failing_discard)
+
+        with pytest.raises(RuntimeError):
+            run_index_data(staged_toolkit, monkeypatch, save=self._failing_save)
+
+        assert staged_toolkit.written[-1]["indexed"] == 191
+        assert staged_toolkit.written[-1]["total"] == 205

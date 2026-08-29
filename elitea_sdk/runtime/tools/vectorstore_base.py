@@ -260,6 +260,8 @@ class VectorStoreWrapperBase(BaseToolApiWrapper):
 
     def get_pending_run_ids(self, index_name: str) -> List[str]:
         """Run ids whose rows every read path must exclude."""
+        from .index_runs_model import is_degradable_run_lookup_error
+
         try:
             self._ensure_vectorstore_initialized()
         except ToolException:
@@ -269,7 +271,13 @@ class VectorStoreWrapperBase(BaseToolApiWrapper):
         # would surface a just-registered run's staged rows, and a stale
         # non-empty set would filter a just-promoted corpus. The fetch is an
         # index-assisted point SELECT on the tiny per-schema runs table.
-        return self.vector_adapter.get_pending_run_ids(self, index_name)
+        try:
+            return self.vector_adapter.get_pending_run_ids(self, index_name)
+        except Exception as e:
+            if not is_degradable_run_lookup_error(e):
+                raise
+            logger.warning(f"Could not fetch pending index run ids, searching unfiltered: {e}")
+            return []
 
     def get_indexed_count(self, index_name: str) -> int:
         self._ensure_vectorstore_initialized()
