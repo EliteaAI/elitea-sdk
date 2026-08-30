@@ -10,6 +10,7 @@ from pydantic import SecretStr
 from elitea_sdk.tools.qtest.api_wrapper import (
     QTEST_ID,
     QtestApiWrapper,
+    UpdateTestRunStatus,
     _TimeoutApiClient,
     _default_qtest_timeout,
 )
@@ -1168,6 +1169,45 @@ def test_update_test_run_status_forwards_testcase_version_id(monkeypatch):
     assert 'Test case version id: 222' in result
 
 
+def test_update_test_run_status_resolves_decimal_version_name(monkeypatch):
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    get_calls = _patch_qtest_get(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=777))
+    calls = _patch_test_log_api(monkeypatch, response=_FakeSubmitTestLogResponse(987))
+
+    result = wrapper.update_test_run_status(
+        'TR-39', 'Passed', testcase_version_id='2.0',
+    )
+
+    assert calls[0]['body'].test_case_version_id == 222
+    assert 'Test case version id: 222' in result
+    assert get_calls[1]['url'].endswith('/test-cases/777/versions')
+    assert get_calls[2]['url'].endswith('/test-cases/777/versions/222')
+
+
+def test_update_test_run_status_rejects_unknown_decimal_version_name(monkeypatch):
+    from langchain_core.tools import ToolException
+
+    wrapper = _make_wrapper()
+    wrapper._client = None
+
+    _patch_qtest_get(monkeypatch)
+    _patch_search_entity(monkeypatch, test_run=_test_run_dict(test_case_id=777))
+    calls = _patch_test_log_api(monkeypatch, response=None)
+
+    with pytest.raises(ToolException) as exc_info:
+        wrapper.update_test_run_status(
+            'TR-39', 'Passed', testcase_version_id='4.0',
+        )
+
+    message = str(exc_info.value)
+    assert "Version '4.0'" in message
+    assert '1.0 (id=111)' in message and '2.0 (id=222)' in message
+    assert calls == []
+
+
 def test_update_test_run_status_omits_version_by_default(monkeypatch):
     """Existing calls without the new field stay byte-identical on the wire."""
     import swagger_client
@@ -1311,3 +1351,17 @@ def test_get_test_case_versions_is_registered_as_a_tool():
     assert tools['get_test_case_versions']['ref'] == wrapper.get_test_case_versions
     version_field = tools['update_test_run_status']['args_schema'].model_fields['testcase_version_id']
     assert version_field.default is None
+
+
+def test_update_test_run_status_version_schema_accepts_bounded_decimal_text():
+    value = UpdateTestRunStatus(
+        test_run_id='TR-39', status='Passed', testcase_version_id=4.0,
+    )
+    assert value.testcase_version_id == '4.0'
+
+    property_schema = UpdateTestRunStatus.model_json_schema()['properties']['testcase_version_id']
+    string_schema = next(
+        item for item in property_schema['anyOf'] if item.get('type') == 'string'
+    )
+    assert string_schema['maxLength'] == 10
+    assert string_schema['pattern'] == r'^\d+(?:\.\d+)?$'
