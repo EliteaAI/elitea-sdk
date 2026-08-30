@@ -335,10 +335,14 @@ class Application(BaseTool):
         _hitl_deferred_mode = False
         _hitl_parallel_call_id = None
         _hitl_parallel_resume = None
+        _live_mcp_tokens = None
         if invoke_config and invoke_config.get('configurable'):
             _hitl_deferred_mode = invoke_config['configurable'].pop('__hitl_deferred_mode__', False)
             _hitl_parallel_call_id = invoke_config['configurable'].pop('__hitl_parallel_call_id__', None)
             _hitl_parallel_resume = invoke_config['configurable'].pop('__hitl_parallel_resume__', None)
+            _live_mcp_tokens = invoke_config['configurable'].pop(
+                '__live_mcp_tokens__', None,
+            )
 
         # A tool instance is shared by every invocation of the same bound
         # Application.  Keep the invocation-specific runnable local: assigning it
@@ -392,6 +396,12 @@ class Application(BaseTool):
                     )
                 ),
             }
+            if _live_mcp_tokens is not None:
+                # The live parallel-HITL supervisor received OAuth tokens after
+                # this shared Application tool was created. Override only this
+                # child rebuild; mutating self.args_runnable would leak one
+                # sibling's invocation state into concurrent calls.
+                runnable_args['mcp_tokens'] = _live_mcp_tokens
             application_runnable = self.client.application(
                 **runnable_args, application_variables=application_variables,
             )
@@ -581,6 +591,7 @@ class Application(BaseTool):
                 from langgraph.errors import GraphBubbleUp, GraphInterrupt
                 if not isinstance(gb, GraphBubbleUp):
                     raise
+                deferred_interrupts = []
                 if isinstance(gb, GraphInterrupt) and gb.args:
                     for interrupts in gb.args:
                         if not isinstance(interrupts, (tuple, list)):
@@ -626,6 +637,27 @@ class Application(BaseTool):
                                     "parent intermediate messages (tool=%s)",
                                     len(_parent_pending_serialized), self.name,
                                 )
+                            deferred_interrupts.append(dict(value))
+                if _hitl_deferred_mode and deferred_interrupts:
+                    # A standalone child graph may propagate GraphInterrupt
+                    # directly instead of returning a hitl_interrupt state.
+                    # Parallel Application fan-out must convert both shapes to
+                    # the same deferred sentinel; re-raising here lets the first
+                    # paused sibling abort the gather and loses every other
+                    # sibling's checkpoint/card.
+                    child_hitl = deferred_interrupts[0]
+                    logger.info(
+                        "[APP_RUN] Deferring bubbled HITL interrupt for child "
+                        "'%s' (parallel batch, tool=%s)",
+                        self.name,
+                        child_hitl.get('tool_name', ''),
+                    )
+                    return {
+                        "__hitl_deferred__": True,
+                        "hitl_interrupt": child_hitl,
+                        "nested_config": nested_config,
+                        "tool_call_id": _hitl_parallel_call_id,
+                    }
                 raise
 
         # HITL bubble-up (dict-bridge): when the child returns hitl_interrupt

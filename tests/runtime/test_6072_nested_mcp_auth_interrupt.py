@@ -260,6 +260,512 @@ class _ContinueAfterAuthBound(_BoundChildLLM):
         )
 
 
+class _PipelineAfterAuthLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.invocations = []
+        self.responses = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "mcp_authorize_sharepoint",
+                    "args": {"arguments": {"operation": "get_lists"}},
+                    "id": "call-sharepoint-auth",
+                    "type": "tool_call",
+                }],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "get_lists",
+                    "args": {},
+                    "id": "call-get-lists",
+                    "type": "tool_call",
+                }],
+            ),
+            AIMessage(content="lists-complete"),
+            AIMessage(content="summary-complete"),
+        ]
+
+    @property
+    def _get_model_default_parameters(self):
+        return {"temperature": self.temperature, "max_tokens": self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        _ = tools, kwargs
+        return self
+
+    def invoke(self, messages, config=None):
+        _ = config
+        self.invocations.append(list(messages))
+        return self.responses.pop(0)
+
+
+class _NestedPipelineParentLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.invocations = []
+
+    @property
+    def _get_model_default_parameters(self):
+        return {"temperature": self.temperature, "max_tokens": self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        _ = tools, kwargs
+        return self
+
+    def invoke(self, messages, config=None):
+        _ = config
+        self.invocations.append(list(messages))
+        if any(
+            isinstance(message, ToolMessage)
+            and "summary-complete" in str(message.content)
+            for message in messages
+        ):
+            return AIMessage(content="parent-finished")
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "NestedPipeline",
+                "args": {"task": "list sites"},
+                "id": "call-nested-pipeline",
+                "type": "tool_call",
+            }],
+        )
+
+
+class _ParallelNestedPipelineParentLLM(_NestedPipelineParentLLM):
+    def invoke(self, messages, config=None):
+        _ = config
+        self.invocations.append(list(messages))
+        tool_messages = [
+            message for message in messages if isinstance(message, ToolMessage)
+        ]
+        if tool_messages:
+            return AIMessage(content="parent-finished")
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "NestedPipeline",
+                    "args": {"task": "input-a"},
+                    "id": "call-pipeline-a",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "NestedPipeline",
+                    "args": {"task": "input-b"},
+                    "id": "call-pipeline-b",
+                    "type": "tool_call",
+                },
+            ],
+        )
+
+
+class _ParallelPipelineChildLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.invocations = []
+
+    @property
+    def _get_model_default_parameters(self):
+        return {"temperature": self.temperature, "max_tokens": self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        _ = tools, kwargs
+        return self
+
+    def invoke(self, messages, config=None):
+        configurable = (config or {}).get("configurable", {})
+        thread_id = configurable.get("thread_id", "")
+        checkpoint_ns = configurable.get("checkpoint_ns", "")
+        node_name = checkpoint_ns.rsplit("|", 1)[-1].split(":", 1)[0]
+        tag = "a" if thread_id.endswith("call-pipeline-a") else "b"
+        self.invocations.append((thread_id, node_name, list(messages)))
+
+        if node_name == "LLM2":
+            return AIMessage(content=f"summary-{tag}")
+
+        tool_messages = [
+            message for message in messages if isinstance(message, ToolMessage)
+        ]
+        if any(
+            message.tool_call_id == f"call-get-lists-{tag}"
+            for message in tool_messages
+        ):
+            return AIMessage(content=f"lists-complete-{tag}")
+        if any("mcp_auth_decision" in str(message.content) for message in tool_messages):
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "get_lists",
+                    "args": {"request": tag},
+                    "id": f"call-get-lists-{tag}",
+                    "type": "tool_call",
+                }],
+            )
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "mcp_authorize_sharepoint",
+                "args": {"arguments": {"operation": "get_lists"}},
+                "id": f"call-sharepoint-auth-{tag}",
+                "type": "tool_call",
+            }],
+        )
+
+
+class _RebuildingApplicationClient:
+    def __init__(self, runnable):
+        self.runnable = runnable
+
+    def application(self, *args, **kwargs):
+        _ = args, kwargs
+        return self.runnable
+
+
+class _TokenAwareRebuildingApplicationClient:
+    def __init__(self, unauthorized_runnable, authorized_runnable):
+        self.unauthorized_runnable = unauthorized_runnable
+        self.authorized_runnable = authorized_runnable
+        self.token_snapshots = []
+
+    def application(self, *args, **kwargs):
+        _ = args
+        tokens = kwargs.get("mcp_tokens")
+        self.token_snapshots.append(bool(tokens))
+        if tokens:
+            return self.authorized_runnable
+        return self.unauthorized_runnable
+
+
+def _llm_pipeline_schema():
+    return yaml.safe_dump({
+        "name": "llm-toolkit-auth",
+        "state": {
+            "input": {"type": "str"},
+            "sharepoint": {"type": "str"},
+            "summary": {"type": "str"},
+            "messages": {"type": "list"},
+        },
+        "nodes": [{
+            "id": "LLM1",
+            "type": "llm",
+            "input_mapping": {
+                "system": {"type": "fixed", "value": "Use SharePoint tools."},
+                "task": {"type": "variable", "value": "input"},
+            },
+            "input": ["input"],
+            "output": ["sharepoint"],
+            "tool_names": {"sharepoint": ["get_lists"]},
+            "transition": "LLM2",
+        }, {
+            "id": "LLM2",
+            "type": "llm",
+            "input_mapping": {
+                "system": {"type": "fixed", "value": "Summarize the result."},
+                "task": {"type": "variable", "value": "sharepoint"},
+            },
+            "input": ["sharepoint"],
+            "output": ["summary"],
+            "transition": "END",
+        }],
+        "entry_point": "LLM1",
+    })
+
+
+def test_pipeline_does_not_resurface_resolved_mcp_auth_after_downstream_node():
+    memory = MemorySaver()
+    client = _PipelineAfterAuthLLM()
+    config = {"configurable": {"thread_id": "issue-6451-llm-pipeline"}}
+
+    def require_auth(arguments=None):
+        _ = arguments
+        raise McpAuthorizationRequired(
+            "SharePoint authorization is required",
+            server_url="https://tenant.sharepoint.com/sites/pipeline",
+            tool_name="get_lists",
+            toolkit_name="sharepoint",
+            toolkit_type="sharepoint",
+        )
+
+    auth_proxy = StructuredTool.from_function(
+        func=require_auth,
+        name="mcp_authorize_sharepoint",
+        description="SharePoint authorization gateway",
+        metadata={
+            "tool_name": "mcp_authorize_sharepoint",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    paused_graph = create_graph(
+        client=client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[auth_proxy],
+        memory=memory,
+    )
+    paused = paused_graph.invoke({"input": "list sites"}, config=config)
+
+    assert paused["execution_finished"] is False
+    original_interrupt_id = paused["hitl_interrupt"]["interrupt_id"]
+
+    list_calls = []
+    real_tool = StructuredTool.from_function(
+        func=lambda: list_calls.append(True) or "list-a",
+        name="get_lists",
+        description="List SharePoint lists",
+        metadata={
+            "tool_name": "get_lists",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    resumed_graph = create_graph(
+        client=client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[auth_proxy, real_tool],
+        memory=memory,
+    )
+    resumed = resumed_graph.invoke(
+        {
+            "mcp_auth_resume": True,
+            "mcp_auth_action": "authorize",
+            "authorization_request_id": original_interrupt_id,
+        },
+        config=config,
+    )
+
+    assert list_calls == [True]
+    assert resumed["execution_finished"] is True
+    assert "hitl_interrupt" not in resumed
+    assert resumed["summary"] == "summary-complete"
+
+
+def test_nested_pipeline_auth_resumes_parent_application_without_replanning():
+    child_memory = MemorySaver()
+    child_client = _PipelineAfterAuthLLM()
+
+    def require_auth(arguments=None):
+        _ = arguments
+        raise McpAuthorizationRequired(
+            "SharePoint authorization is required",
+            server_url="https://tenant.sharepoint.com/sites/pipeline",
+            tool_name="get_lists",
+            toolkit_name="sharepoint",
+            toolkit_type="sharepoint",
+        )
+
+    auth_proxy = StructuredTool.from_function(
+        func=require_auth,
+        name="mcp_authorize_sharepoint",
+        description="SharePoint authorization gateway",
+        metadata={
+            "tool_name": "mcp_authorize_sharepoint",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    list_calls = []
+    real_tool = StructuredTool.from_function(
+        func=lambda: list_calls.append(True) or "list-a",
+        name="get_lists",
+        description="List SharePoint lists",
+        metadata={
+            "tool_name": "get_lists",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    child_graph = create_graph(
+        client=child_client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[auth_proxy, real_tool],
+        memory=child_memory,
+    )
+    child_tool = Application(
+        name="Nested Pipeline",
+        description="Delegated pipeline",
+        application=child_graph,
+        return_type="str",
+        client=_RebuildingApplicationClient(child_graph),
+        args_runnable={
+            "application_id": 25,
+            "application_version_id": 1,
+            "version_details": {},
+        },
+        metadata={
+            "original_name": "Nested Pipeline",
+            "agent_type": "pipeline",
+        },
+    )
+
+    parent_memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6451-nested-pipeline"}}
+    first_parent = _NestedPipelineParentLLM()
+    paused = _assistant(first_parent, [child_tool], parent_memory).invoke(
+        {"messages": [HumanMessage(content="Run the delegated pipeline")]},
+        config=config,
+    )
+
+    assert paused["execution_finished"] is False
+    assert paused["hitl_interrupt"]["parent_agent_call_id"] == (
+        "call-nested-pipeline"
+    )
+
+    resumed_parent = _NestedPipelineParentLLM()
+    resumed = _assistant(resumed_parent, [child_tool], parent_memory).invoke(
+        {"mcp_auth_resume": True, "mcp_auth_action": "authorize"},
+        config=config,
+    )
+
+    assert resumed["execution_finished"] is True
+    assert resumed["output"] == "parent-finished"
+    assert list_calls == [True]
+    # Only the post-tool finalization is allowed. A second invocation before
+    # the Application result means the orchestrator replanned a new child call.
+    assert len(resumed_parent.invocations) == 1
+
+
+def test_parallel_same_nested_pipeline_resumes_isolated_calls_without_replanning():
+    child_memory = MemorySaver()
+    child_client = _ParallelPipelineChildLLM()
+
+    def require_auth(arguments=None):
+        _ = arguments
+        raise McpAuthorizationRequired(
+            "SharePoint authorization is required",
+            server_url="https://tenant.sharepoint.com/sites/pipeline",
+            tool_name="get_lists",
+            toolkit_name="sharepoint",
+            toolkit_type="sharepoint",
+        )
+
+    auth_proxy = StructuredTool.from_function(
+        func=require_auth,
+        name="mcp_authorize_sharepoint",
+        description="SharePoint authorization gateway",
+        metadata={
+            "tool_name": "mcp_authorize_sharepoint",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    list_calls = []
+
+    def get_lists(request: str):
+        list_calls.append(request)
+        return f"lists-{request}"
+
+    real_tool = StructuredTool.from_function(
+        func=get_lists,
+        name="get_lists",
+        description="List SharePoint lists for one request",
+        metadata={
+            "tool_name": "get_lists",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    unauthorized_child_graph = create_graph(
+        client=child_client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[auth_proxy],
+        memory=child_memory,
+    )
+    authorized_child_graph = create_graph(
+        client=child_client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[real_tool],
+        memory=child_memory,
+    )
+    rebuilding_client = _TokenAwareRebuildingApplicationClient(
+        unauthorized_child_graph,
+        authorized_child_graph,
+    )
+    child_tool = Application(
+        name="Nested Pipeline",
+        description="Delegated pipeline",
+        application=unauthorized_child_graph,
+        return_type="str",
+        client=rebuilding_client,
+        args_runnable={
+            "application_id": 25,
+            "application_version_id": 1,
+            "version_details": {},
+        },
+        metadata={
+            "original_name": "Nested Pipeline",
+            "agent_type": "pipeline",
+        },
+    )
+
+    parent_memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6451-parallel-pipelines"}}
+    initial_parent = _ParallelNestedPipelineParentLLM()
+    paused = _assistant(initial_parent, [child_tool], parent_memory).invoke(
+        {"messages": [HumanMessage(content="Run both pipeline inputs")]},
+        config=config,
+    )
+
+    assert paused["execution_finished"] is False
+    interrupts = paused["hitl_interrupts"]
+    by_call = {interrupt["tool_call_id"]: interrupt for interrupt in interrupts}
+    assert set(by_call) == {"call-pipeline-a", "call-pipeline-b"}
+    assert by_call["call-pipeline-a"]["child_thread_id"].endswith(
+        ":call-pipeline-a"
+    )
+    assert by_call["call-pipeline-b"]["child_thread_id"].endswith(
+        ":call-pipeline-b"
+    )
+    assert (
+        by_call["call-pipeline-a"]["child_thread_id"]
+        != by_call["call-pipeline-b"]["child_thread_id"]
+    )
+
+    resumed_parent = _ParallelNestedPipelineParentLLM()
+    resumed = _assistant(resumed_parent, [child_tool], parent_memory).invoke(
+        {
+            "hitl_decisions": [
+                {
+                    "tool_call_id": "call-pipeline-a",
+                    "action": "authorize",
+                    "_mcp_tokens": {
+                        "sharepoint": {"access_token": "test-token"},
+                    },
+                },
+                {
+                    "tool_call_id": "call-pipeline-b",
+                    "action": "authorize",
+                    "_mcp_tokens": {
+                        "sharepoint": {"access_token": "test-token"},
+                    },
+                },
+            ],
+        },
+        config=config,
+    )
+
+    assert resumed["execution_finished"] is True
+    assert resumed["output"] == "parent-finished"
+    assert sorted(list_calls) == ["a", "b"]
+    assert rebuilding_client.token_snapshots.count(False) == 2
+    assert rebuilding_client.token_snapshots.count(True) == 2
+    assert len(resumed_parent.invocations) == 1
+    final_tool_results = {
+        str(message.content)
+        for message in resumed_parent.invocations[0]
+        if isinstance(message, ToolMessage)
+    }
+    assert final_tool_results == {"summary-a", "summary-b"}
+
+
 def test_direct_agent_auth_decision_continues_same_leaf_tool_loop():
     counter = _AuthToolCounter()
     auth_tool = StructuredTool.from_function(
@@ -425,6 +931,36 @@ def _direct_toolkit_schema():
     })
 
 
+def _direct_toolkit_schema_with_downstream_node():
+    return yaml.safe_dump({
+        "name": "direct-toolkit-auth-with-downstream",
+        "state": {
+            "messages": {"type": "list"},
+            "toolkit_result": {"type": "str"},
+            "downstream_result": {"type": "str"},
+        },
+        "nodes": [{
+            "id": "SharePointNode",
+            "type": "toolkit",
+            "toolkit_name": "SharePoint",
+            "tool": "get_lists",
+            "output": ["toolkit_result"],
+            "transition": "DownstreamNode",
+        }, {
+            "id": "DownstreamNode",
+            "type": "llm",
+            "input_mapping": {
+                "system": {"type": "fixed", "value": "Summarize the result."},
+                "task": {"type": "variable", "value": "toolkit_result"},
+            },
+            "input": ["toolkit_result"],
+            "output": ["downstream_result"],
+            "transition": "END",
+        }],
+        "entry_point": "SharePointNode",
+    })
+
+
 @pytest.mark.parametrize("action", ["authorize", "skip"])
 def test_direct_pipeline_toolkit_auth_interrupt_resumes_exact_function_node(action):
     memory = MemorySaver()
@@ -498,6 +1034,77 @@ def test_direct_pipeline_toolkit_auth_interrupt_resumes_exact_function_node(acti
     else:
         assert resumed["toolkit_result"] is None
         assert "authorization for **SharePoint**" in resumed["output"]
+
+
+def test_direct_pipeline_does_not_resurface_resolved_auth_after_downstream_node():
+    memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6451-direct-pipeline"}}
+    client = _PipelineAfterAuthLLM()
+    client.responses = [AIMessage(content="summary-complete")]
+
+    def require_auth(arguments=None):
+        _ = arguments
+        raise McpAuthorizationRequired(
+            "SharePoint authorization is required",
+            server_url="https://tenant.sharepoint.com/sites/pipeline",
+            tool_name="get_lists",
+            toolkit_name="SharePoint",
+            toolkit_type="sharepoint",
+        )
+
+    proxy = StructuredTool.from_function(
+        func=require_auth,
+        name="mcp_authorize_SharePoint",
+        description="SharePoint authorization gateway",
+        metadata={
+            "tool_name": "mcp_authorize_SharePoint",
+            "toolkit_name": "SharePoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    paused_graph = create_graph(
+        client=client,
+        yaml_schema=_direct_toolkit_schema_with_downstream_node(),
+        tools=[proxy],
+        memory=memory,
+    )
+    paused = paused_graph.invoke(
+        {"messages": [HumanMessage(content="run the pipeline")]},
+        config=config,
+    )
+
+    assert paused["execution_finished"] is False
+    original_interrupt_id = paused["hitl_interrupt"]["interrupt_id"]
+
+    real_tool = StructuredTool.from_function(
+        func=lambda: "authorized-lists",
+        name="get_lists",
+        description="List SharePoint lists",
+        metadata={
+            "tool_name": "get_lists",
+            "toolkit_name": "SharePoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    resumed_graph = create_graph(
+        client=client,
+        yaml_schema=_direct_toolkit_schema_with_downstream_node(),
+        tools=[real_tool],
+        memory=memory,
+    )
+    resumed = resumed_graph.invoke(
+        {
+            "mcp_auth_resume": True,
+            "mcp_auth_action": "authorize",
+            "authorization_request_id": original_interrupt_id,
+        },
+        config=config,
+    )
+
+    assert resumed["execution_finished"] is True
+    assert "hitl_interrupt" not in resumed
+    assert resumed["toolkit_result"] == "authorized-lists"
+    assert resumed["downstream_result"] == "summary-complete"
 
 
 def test_direct_pipeline_authorize_fails_closed_if_rebuild_has_no_real_tool():
