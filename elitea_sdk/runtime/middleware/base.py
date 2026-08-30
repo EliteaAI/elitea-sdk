@@ -123,6 +123,15 @@ class Middleware(ABC):
         """
         return None
 
+    def transform_messages_for_model(self, messages: list, config: dict) -> Optional[list]:
+        """Optionally replace the transient model-input view of message history.
+
+        Unlike ``before_model`` message updates, this view is never written back
+        to the checkpoint. Use it to redact prompt-only data while preserving the
+        stored message graph and tool-call pairing.
+        """
+        return None
+
     def after_model(self, state: dict, config: dict) -> Optional[dict]:
         """
         Called after model invocation. Can modify state.
@@ -300,6 +309,12 @@ class MiddlewareManager:
         remove_ops = []
         for mw in self._middleware:
             try:
+                transformed_messages = mw.transform_messages_for_model(
+                    state.get('messages', []), config
+                )
+                if transformed_messages is not None:
+                    state = {**state, 'messages': transformed_messages}
+
                 updates = mw.before_model(state, config)
                 if updates and 'messages' in updates:
                     # Only collect RemoveMessage operations for checkpoint

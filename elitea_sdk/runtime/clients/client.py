@@ -18,7 +18,12 @@ from pydantic import ValidationError
 
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
-from ..middleware import TransformErrorStrategy, LoggingStrategy, SensitiveToolGuardMiddleware
+from ..middleware import (
+    LoggingStrategy,
+    ProjectContextMiddleware,
+    SensitiveToolGuardMiddleware,
+    TransformErrorStrategy,
+)
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..exceptions import budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
@@ -828,6 +833,25 @@ class EliteAClient:
         except Exception as e:
             logger.warning(f"Failed to auto-inject ContextEditingMiddleware: {e}")
 
+    @staticmethod
+    def _inject_project_context(
+        middleware_list: list,
+        project_context: Optional[dict],
+        conversation_id: Optional[str] = None,
+    ) -> None:
+        """Bind Project Context as one local, always-visible tool when fully configured."""
+        if not project_context:
+            return
+        if any(isinstance(mw, ProjectContextMiddleware) for mw in middleware_list):
+            return
+        try:
+            middleware_list.append(ProjectContextMiddleware(
+                project_context=project_context,
+                conversation_id=conversation_id,
+            ))
+        except ValueError as e:
+            logger.warning("Skipping invalid on-demand Project Context: %s", e)
+
     def _inject_sensitive_tool_guard(
         self,
         middleware_list: list,
@@ -891,7 +915,8 @@ class EliteAClient:
                     child_dispatcher: Optional[Any] = None,
                     independent_parallel_hitl: bool = True,
                     parallel_hitl_max_concurrency: int = 8,
-                    user_declined_mcp_servers: Optional[list] = None):
+                    user_declined_mcp_servers: Optional[list] = None,
+                    project_context: Optional[dict] = None):
         if tools is None:
             tools = []
         if chat_history is None:
@@ -948,6 +973,8 @@ class EliteAClient:
             )
             middleware_list.append(planning_middleware)
             logger.info(f"Auto-created PlanningMiddleware for conversation_id={conversation_id}")
+
+        self._inject_project_context(middleware_list, project_context, conversation_id)
 
         # Automatically compresses conversation history when threshold is exceeded
         self._inject_summarization(middleware_list, context_settings, conversation_id)
@@ -1326,7 +1353,8 @@ class EliteAClient:
                       child_dispatcher: Optional[Any] = None,
                       independent_parallel_hitl: bool = True,
                       parallel_hitl_max_concurrency: int = 8,
-                      user_declined_mcp_servers: Optional[list] = None):
+                      user_declined_mcp_servers: Optional[list] = None,
+                      project_context: Optional[dict] = None):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -1388,6 +1416,8 @@ class EliteAClient:
             )
             middleware_list.append(planning_middleware)
             logger.info(f"Auto-created PlanningMiddleware for predict agent (conversation_id={conversation_id})")
+
+        self._inject_project_context(middleware_list, project_context, conversation_id)
 
         # Add ToolExceptionHandlerMiddleware to handle tool errors with LLM messages
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
