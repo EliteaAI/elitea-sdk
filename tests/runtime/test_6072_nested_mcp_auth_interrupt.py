@@ -260,6 +260,152 @@ class _ContinueAfterAuthBound(_BoundChildLLM):
         )
 
 
+class _PipelineAfterAuthLLM:
+    temperature = 0
+    max_tokens = 1000
+
+    def __init__(self):
+        self.invocations = []
+        self.responses = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "mcp_authorize_sharepoint",
+                    "args": {"arguments": {"operation": "get_lists"}},
+                    "id": "call-sharepoint-auth",
+                    "type": "tool_call",
+                }],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "get_lists",
+                    "args": {},
+                    "id": "call-get-lists",
+                    "type": "tool_call",
+                }],
+            ),
+            AIMessage(content="lists-complete"),
+            AIMessage(content="summary-complete"),
+        ]
+
+    @property
+    def _get_model_default_parameters(self):
+        return {"temperature": self.temperature, "max_tokens": self.max_tokens}
+
+    def bind_tools(self, tools, **kwargs):
+        _ = tools, kwargs
+        return self
+
+    def invoke(self, messages, config=None):
+        _ = config
+        self.invocations.append(list(messages))
+        return self.responses.pop(0)
+
+
+def _llm_pipeline_schema():
+    return yaml.safe_dump({
+        "name": "llm-toolkit-auth",
+        "state": {
+            "input": {"type": "str"},
+            "sharepoint": {"type": "str"},
+            "summary": {"type": "str"},
+            "messages": {"type": "list"},
+        },
+        "nodes": [{
+            "id": "LLM1",
+            "type": "llm",
+            "input_mapping": {
+                "system": {"type": "fixed", "value": "Use SharePoint tools."},
+                "task": {"type": "variable", "value": "input"},
+            },
+            "input": ["input"],
+            "output": ["sharepoint"],
+            "tool_names": {"sharepoint": ["get_lists"]},
+            "transition": "LLM2",
+        }, {
+            "id": "LLM2",
+            "type": "llm",
+            "input_mapping": {
+                "system": {"type": "fixed", "value": "Summarize the result."},
+                "task": {"type": "variable", "value": "sharepoint"},
+            },
+            "input": ["sharepoint"],
+            "output": ["summary"],
+            "transition": "END",
+        }],
+        "entry_point": "LLM1",
+    })
+
+
+def test_pipeline_does_not_resurface_resolved_mcp_auth_after_downstream_node():
+    memory = MemorySaver()
+    client = _PipelineAfterAuthLLM()
+    config = {"configurable": {"thread_id": "issue-6451-llm-pipeline"}}
+
+    def require_auth(arguments=None):
+        _ = arguments
+        raise McpAuthorizationRequired(
+            "SharePoint authorization is required",
+            server_url="https://tenant.sharepoint.com/sites/pipeline",
+            tool_name="get_lists",
+            toolkit_name="sharepoint",
+            toolkit_type="sharepoint",
+        )
+
+    auth_proxy = StructuredTool.from_function(
+        func=require_auth,
+        name="mcp_authorize_sharepoint",
+        description="SharePoint authorization gateway",
+        metadata={
+            "tool_name": "mcp_authorize_sharepoint",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    paused_graph = create_graph(
+        client=client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[auth_proxy],
+        memory=memory,
+    )
+    paused = paused_graph.invoke({"input": "list sites"}, config=config)
+
+    assert paused["execution_finished"] is False
+    original_interrupt_id = paused["hitl_interrupt"]["interrupt_id"]
+
+    list_calls = []
+    real_tool = StructuredTool.from_function(
+        func=lambda: list_calls.append(True) or "list-a",
+        name="get_lists",
+        description="List SharePoint lists",
+        metadata={
+            "tool_name": "get_lists",
+            "toolkit_name": "sharepoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    resumed_graph = create_graph(
+        client=client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[auth_proxy, real_tool],
+        memory=memory,
+    )
+    resumed = resumed_graph.invoke(
+        {
+            "mcp_auth_resume": True,
+            "mcp_auth_action": "authorize",
+            "authorization_request_id": original_interrupt_id,
+        },
+        config=config,
+    )
+
+    assert list_calls == [True]
+    assert resumed["execution_finished"] is True
+    assert "hitl_interrupt" not in resumed
+    assert resumed["summary"] == "summary-complete"
+
+
 def test_direct_agent_auth_decision_continues_same_leaf_tool_loop():
     counter = _AuthToolCounter()
     auth_tool = StructuredTool.from_function(
@@ -425,6 +571,36 @@ def _direct_toolkit_schema():
     })
 
 
+def _direct_toolkit_schema_with_downstream_node():
+    return yaml.safe_dump({
+        "name": "direct-toolkit-auth-with-downstream",
+        "state": {
+            "messages": {"type": "list"},
+            "toolkit_result": {"type": "str"},
+            "downstream_result": {"type": "str"},
+        },
+        "nodes": [{
+            "id": "SharePointNode",
+            "type": "toolkit",
+            "toolkit_name": "SharePoint",
+            "tool": "get_lists",
+            "output": ["toolkit_result"],
+            "transition": "DownstreamNode",
+        }, {
+            "id": "DownstreamNode",
+            "type": "llm",
+            "input_mapping": {
+                "system": {"type": "fixed", "value": "Summarize the result."},
+                "task": {"type": "variable", "value": "toolkit_result"},
+            },
+            "input": ["toolkit_result"],
+            "output": ["downstream_result"],
+            "transition": "END",
+        }],
+        "entry_point": "SharePointNode",
+    })
+
+
 @pytest.mark.parametrize("action", ["authorize", "skip"])
 def test_direct_pipeline_toolkit_auth_interrupt_resumes_exact_function_node(action):
     memory = MemorySaver()
@@ -498,6 +674,77 @@ def test_direct_pipeline_toolkit_auth_interrupt_resumes_exact_function_node(acti
     else:
         assert resumed["toolkit_result"] is None
         assert "authorization for **SharePoint**" in resumed["output"]
+
+
+def test_direct_pipeline_does_not_resurface_resolved_auth_after_downstream_node():
+    memory = MemorySaver()
+    config = {"configurable": {"thread_id": "issue-6451-direct-pipeline"}}
+    client = _PipelineAfterAuthLLM()
+    client.responses = [AIMessage(content="summary-complete")]
+
+    def require_auth(arguments=None):
+        _ = arguments
+        raise McpAuthorizationRequired(
+            "SharePoint authorization is required",
+            server_url="https://tenant.sharepoint.com/sites/pipeline",
+            tool_name="get_lists",
+            toolkit_name="SharePoint",
+            toolkit_type="sharepoint",
+        )
+
+    proxy = StructuredTool.from_function(
+        func=require_auth,
+        name="mcp_authorize_SharePoint",
+        description="SharePoint authorization gateway",
+        metadata={
+            "tool_name": "mcp_authorize_SharePoint",
+            "toolkit_name": "SharePoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    paused_graph = create_graph(
+        client=client,
+        yaml_schema=_direct_toolkit_schema_with_downstream_node(),
+        tools=[proxy],
+        memory=memory,
+    )
+    paused = paused_graph.invoke(
+        {"messages": [HumanMessage(content="run the pipeline")]},
+        config=config,
+    )
+
+    assert paused["execution_finished"] is False
+    original_interrupt_id = paused["hitl_interrupt"]["interrupt_id"]
+
+    real_tool = StructuredTool.from_function(
+        func=lambda: "authorized-lists",
+        name="get_lists",
+        description="List SharePoint lists",
+        metadata={
+            "tool_name": "get_lists",
+            "toolkit_name": "SharePoint",
+            "toolkit_type": "sharepoint",
+        },
+    )
+    resumed_graph = create_graph(
+        client=client,
+        yaml_schema=_direct_toolkit_schema_with_downstream_node(),
+        tools=[real_tool],
+        memory=memory,
+    )
+    resumed = resumed_graph.invoke(
+        {
+            "mcp_auth_resume": True,
+            "mcp_auth_action": "authorize",
+            "authorization_request_id": original_interrupt_id,
+        },
+        config=config,
+    )
+
+    assert resumed["execution_finished"] is True
+    assert "hitl_interrupt" not in resumed
+    assert resumed["toolkit_result"] == "authorized-lists"
+    assert resumed["downstream_result"] == "summary-complete"
 
 
 def test_direct_pipeline_authorize_fails_closed_if_rebuild_has_no_real_tool():

@@ -1099,6 +1099,15 @@ class LLMNode(BaseTool):
         has_selected_tools = bool(configurable.get('selected_tools'))
         hitl_ctx = configurable.pop('_hitl_resume_context', None)
 
+        source_node_name = hitl_ctx.get('source_node_name') if hitl_ctx else None
+        if source_node_name and source_node_name != self.name:
+            logger.info(
+                "[HITL] Ignoring resume context from node '%s' in downstream node '%s'",
+                source_node_name,
+                self.name,
+            )
+            hitl_ctx = None
+
         # Guard: only honour the HITL resume context when the tool it
         # references actually belongs to *this* LLM node.  In pipelines
         # the HITL interrupt may have fired inside a preceding Toolkit
@@ -2770,6 +2779,7 @@ class LLMNode(BaseTool):
             'status': auth_metadata.get('status'),
             'thread_id': configurable.get('thread_id'),
             'checkpoint_ns': configurable.get('checkpoint_ns') or '',
+            '_source_node_name': self.name,
         }
         if serialized_pending:
             payload['_pending_messages'] = serialized_pending

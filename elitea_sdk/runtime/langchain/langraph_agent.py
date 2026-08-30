@@ -2094,9 +2094,28 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     # where re-executing the LLM produces a different response.
                     guardrail_type = hitl_interrupt.get('guardrail_type')
                     if guardrail_type == 'mcp_auth':
-                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
-                        if hitl_interrupt.get('_parent_tool_name'):
+                        source_node_name = hitl_interrupt.get('_source_node_name')
+                        if not source_node_name:
+                            checkpoint_ns = str(
+                                hitl_interrupt.get('checkpoint_ns') or ''
+                            ).rsplit('|', 1)[-1]
+                            source_node_name = checkpoint_ns.split(':', 1)[0]
+                        is_direct_pipeline_auth = str(
+                            hitl_interrupt.get('tool_call_id') or ''
+                        ).startswith('pipeline:')
+                        if is_direct_pipeline_auth:
+                            # FunctionTool owns this interrupt and consumes the
+                            # Command resume itself. Passing the MCP payload to a
+                            # downstream LLM node would make that node interrupt
+                            # on the already-resolved authorization request.
+                            resume_ctx = None
+                        else:
                             resume_ctx = {
+                                'source_node_name': source_node_name,
+                            }
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        if resume_ctx is not None and hitl_interrupt.get('_parent_tool_name'):
+                            resume_ctx.update({
                                 'tool_name': hitl_interrupt['_parent_tool_name'],
                                 'toolkit_name': '',
                                 'tool_args': hitl_interrupt.get('_parent_tool_args', {}),
@@ -2105,12 +2124,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     or f"call_{uuid4().hex[:24]}"
                                 ),
                                 'mcp_auth_bridge': True,
-                            }
-                        else:
-                            resume_ctx = {
+                            })
+                        elif resume_ctx is not None:
+                            resume_ctx.update({
                                 'mcp_auth_payload': dict(hitl_interrupt),
-                            }
-                        if pending_msgs_dicts:
+                            })
+                        if resume_ctx is not None and pending_msgs_dicts:
                             if resume_ctx.get('mcp_auth_payload'):
                                 # The MCP resume path closes the interrupted call
                                 # with a ToolMessage directly. Keep the original
@@ -2121,8 +2140,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 trimmed = self._trim_pending_messages(pending_msgs_dicts)
                                 if trimmed:
                                     resume_ctx['pending_messages'] = trimmed
-                        hitl_resume_ctx = resume_ctx
-                        config['configurable']['_hitl_resume_context'] = resume_ctx
+                        if resume_ctx is not None:
+                            hitl_resume_ctx = resume_ctx
+                            config['configurable']['_hitl_resume_context'] = resume_ctx
                     elif guardrail_type == 'sensitive_tool':
                         # When the interrupt bubbled up from a child Application
                         # tool, reference the PARENT tool so the LLMNode builds
@@ -3072,6 +3092,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
     # Internal payload keys that must never leak to the UI/transport layer.
     _HITL_INTERNAL_KEYS = (
         'tool_args_raw', '_pending_messages',
+        '_source_node_name',
         '_parent_tool_name', '_parent_tool_args', '_parent_tool_call_id',
         *HITL_PRIVATE_ROUTING_KEYS,
         'nested_config',
