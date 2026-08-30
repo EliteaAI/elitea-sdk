@@ -430,6 +430,21 @@ class _RebuildingApplicationClient:
         return self.runnable
 
 
+class _TokenAwareRebuildingApplicationClient:
+    def __init__(self, unauthorized_runnable, authorized_runnable):
+        self.unauthorized_runnable = unauthorized_runnable
+        self.authorized_runnable = authorized_runnable
+        self.token_snapshots = []
+
+    def application(self, *args, **kwargs):
+        _ = args
+        tokens = kwargs.get("mcp_tokens")
+        self.token_snapshots.append(bool(tokens))
+        if tokens:
+            return self.authorized_runnable
+        return self.unauthorized_runnable
+
+
 def _llm_pipeline_schema():
     return yaml.safe_dump({
         "name": "llm-toolkit-auth",
@@ -658,18 +673,28 @@ def test_parallel_same_nested_pipeline_resumes_isolated_calls_without_replanning
             "toolkit_type": "sharepoint",
         },
     )
-    child_graph = create_graph(
+    unauthorized_child_graph = create_graph(
         client=child_client,
         yaml_schema=_llm_pipeline_schema(),
-        tools=[auth_proxy, real_tool],
+        tools=[auth_proxy],
         memory=child_memory,
+    )
+    authorized_child_graph = create_graph(
+        client=child_client,
+        yaml_schema=_llm_pipeline_schema(),
+        tools=[real_tool],
+        memory=child_memory,
+    )
+    rebuilding_client = _TokenAwareRebuildingApplicationClient(
+        unauthorized_child_graph,
+        authorized_child_graph,
     )
     child_tool = Application(
         name="Nested Pipeline",
         description="Delegated pipeline",
-        application=child_graph,
+        application=unauthorized_child_graph,
         return_type="str",
-        client=_RebuildingApplicationClient(child_graph),
+        client=rebuilding_client,
         args_runnable={
             "application_id": 25,
             "application_version_id": 1,
@@ -708,8 +733,20 @@ def test_parallel_same_nested_pipeline_resumes_isolated_calls_without_replanning
     resumed = _assistant(resumed_parent, [child_tool], parent_memory).invoke(
         {
             "hitl_decisions": [
-                {"tool_call_id": "call-pipeline-a", "action": "authorize"},
-                {"tool_call_id": "call-pipeline-b", "action": "authorize"},
+                {
+                    "tool_call_id": "call-pipeline-a",
+                    "action": "authorize",
+                    "_mcp_tokens": {
+                        "sharepoint": {"access_token": "test-token"},
+                    },
+                },
+                {
+                    "tool_call_id": "call-pipeline-b",
+                    "action": "authorize",
+                    "_mcp_tokens": {
+                        "sharepoint": {"access_token": "test-token"},
+                    },
+                },
             ],
         },
         config=config,
@@ -718,6 +755,8 @@ def test_parallel_same_nested_pipeline_resumes_isolated_calls_without_replanning
     assert resumed["execution_finished"] is True
     assert resumed["output"] == "parent-finished"
     assert sorted(list_calls) == ["a", "b"]
+    assert rebuilding_client.token_snapshots.count(False) == 2
+    assert rebuilding_client.token_snapshots.count(True) == 2
     assert len(resumed_parent.invocations) == 1
     final_tool_results = {
         str(message.content)

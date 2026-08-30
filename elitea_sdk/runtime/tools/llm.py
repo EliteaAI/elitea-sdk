@@ -2975,6 +2975,18 @@ class LLMNode(BaseTool):
                         or decision.get(HITL_INTERRUPT_ID_KEY)
                     ),
                 }
+                # A supervised parallel child stays alive inside the original
+                # worker process. Unlike an ordinary checkpoint continuation,
+                # its Application instance is not reconstructed by the worker
+                # after OAuth, so its args_runnable still contains the pre-auth
+                # token snapshot. Core sends newly issued tokens only on the
+                # internal decision transport; pass them as an invocation-local
+                # control that Application consumes before rebuilding the child.
+                # Never place this value in interrupt/checkpoint payloads.
+                if decision.get('_mcp_tokens') is not None:
+                    child_config['configurable']['__live_mcp_tokens__'] = (
+                        decision['_mcp_tokens']
+                    )
             elif grandchild_decisions:
                 # This child is itself a container: its OWN prior pause was a
                 # nested `parallel_sensitive_tools` aggregate (issue #5778). Pass

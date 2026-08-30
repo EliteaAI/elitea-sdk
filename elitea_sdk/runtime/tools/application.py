@@ -335,10 +335,14 @@ class Application(BaseTool):
         _hitl_deferred_mode = False
         _hitl_parallel_call_id = None
         _hitl_parallel_resume = None
+        _live_mcp_tokens = None
         if invoke_config and invoke_config.get('configurable'):
             _hitl_deferred_mode = invoke_config['configurable'].pop('__hitl_deferred_mode__', False)
             _hitl_parallel_call_id = invoke_config['configurable'].pop('__hitl_parallel_call_id__', None)
             _hitl_parallel_resume = invoke_config['configurable'].pop('__hitl_parallel_resume__', None)
+            _live_mcp_tokens = invoke_config['configurable'].pop(
+                '__live_mcp_tokens__', None,
+            )
 
         # A tool instance is shared by every invocation of the same bound
         # Application.  Keep the invocation-specific runnable local: assigning it
@@ -392,6 +396,12 @@ class Application(BaseTool):
                     )
                 ),
             }
+            if _live_mcp_tokens is not None:
+                # The live parallel-HITL supervisor received OAuth tokens after
+                # this shared Application tool was created. Override only this
+                # child rebuild; mutating self.args_runnable would leak one
+                # sibling's invocation state into concurrent calls.
+                runnable_args['mcp_tokens'] = _live_mcp_tokens
             application_runnable = self.client.application(
                 **runnable_args, application_variables=application_variables,
             )
