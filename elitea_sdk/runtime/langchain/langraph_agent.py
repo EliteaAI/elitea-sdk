@@ -2109,13 +2109,15 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                             # downstream LLM node would make that node interrupt
                             # on the already-resolved authorization request.
                             resume_ctx = None
-                        else:
+                        elif hitl_interrupt.get('_parent_tool_name'):
+                            # This is a child Application interrupt bridged into
+                            # its parent graph. The child leaf owns
+                            # ``source_node_name`` (for example ``LLM1``), while
+                            # the bridge is owned by the parent Application tool
+                            # in a different LLM node (for example ``agent``).
+                            # Scope the leaf only; the existing parent-tool
+                            # membership guard selects the correct bridge node.
                             resume_ctx = {
-                                'source_node_name': source_node_name,
-                            }
-                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
-                        if resume_ctx is not None and hitl_interrupt.get('_parent_tool_name'):
-                            resume_ctx.update({
                                 'tool_name': hitl_interrupt['_parent_tool_name'],
                                 'toolkit_name': '',
                                 'tool_args': hitl_interrupt.get('_parent_tool_args', {}),
@@ -2124,11 +2126,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     or f"call_{uuid4().hex[:24]}"
                                 ),
                                 'mcp_auth_bridge': True,
-                            })
-                        elif resume_ctx is not None:
-                            resume_ctx.update({
+                            }
+                        else:
+                            resume_ctx = {
+                                'source_node_name': source_node_name,
                                 'mcp_auth_payload': dict(hitl_interrupt),
-                            })
+                            }
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
                         if resume_ctx is not None and pending_msgs_dicts:
                             if resume_ctx.get('mcp_auth_payload'):
                                 # The MCP resume path closes the interrupted call
