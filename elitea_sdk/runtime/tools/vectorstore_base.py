@@ -252,25 +252,55 @@ class VectorStoreWrapperBase(BaseToolApiWrapper):
     def get_index_meta(self, index_name: str):
         self._ensure_vectorstore_initialized()
         index_metas = self.vector_adapter.get_index_meta(self, index_name)
+        if index_metas is None:
+            index_metas = []
         if len(index_metas) > 1:
             raise RuntimeError(f"Multiple index_meta documents found: {index_metas}")
         return index_metas[0] if index_metas else None
+
+    def get_pending_run_ids(self, index_name: str) -> List[str]:
+        """Run ids whose rows every read path must exclude."""
+        from .index_runs_model import is_degradable_run_lookup_error
+
+        try:
+            self._ensure_vectorstore_initialized()
+        except ToolException:
+            return []
+        # Never cached, in either direction: search runs in a different process
+        # from the indexer, so no invalidation path exists — a stale empty set
+        # would surface a just-registered run's staged rows, and a stale
+        # non-empty set would filter a just-promoted corpus. The fetch is an
+        # index-assisted point SELECT on the tiny per-schema runs table.
+        try:
+            return self.vector_adapter.get_pending_run_ids(self, index_name)
+        except Exception as e:
+            if not is_degradable_run_lookup_error(e):
+                raise
+            logger.warning(f"Could not fetch pending index run ids, searching unfiltered: {e}")
+            return []
 
     def get_indexed_count(self, index_name: str) -> int:
         self._ensure_vectorstore_initialized()
         from sqlalchemy.orm import Session
         from sqlalchemy import func, or_
 
+        filters = [
+            func.jsonb_extract_path_text(self.vectorstore.EmbeddingStore.cmetadata, 'collection') == index_name,
+            or_(
+                func.jsonb_extract_path_text(self.vectorstore.EmbeddingStore.cmetadata, 'type').is_(None),
+                func.jsonb_extract_path_text(self.vectorstore.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value
+            )
+        ]
+        pending_run_ids = self.get_pending_run_ids(index_name)
+        if pending_run_ids:
+            run_id_text = func.jsonb_extract_path_text(
+                self.vectorstore.EmbeddingStore.cmetadata, IndexerKeywords.RUN_ID.value
+            )
+            filters.append(or_(run_id_text.is_(None), run_id_text.notin_(pending_run_ids)))
         with Session(self.vectorstore.session_maker.bind) as session:
             return session.query(
                 self.vectorstore.EmbeddingStore.id,
-            ).filter(
-                func.jsonb_extract_path_text(self.vectorstore.EmbeddingStore.cmetadata, 'collection') == index_name,
-                or_(
-                    func.jsonb_extract_path_text(self.vectorstore.EmbeddingStore.cmetadata, 'type').is_(None),
-                    func.jsonb_extract_path_text(self.vectorstore.EmbeddingStore.cmetadata, 'type') != IndexerKeywords.INDEX_META_TYPE.value
-                )
-            ).count()
+            ).filter(*filters).count()
 
     def _clean_collection(self, index_name: str = '', including_index_meta: bool = False) -> int:
         """

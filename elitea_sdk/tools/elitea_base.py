@@ -425,7 +425,41 @@ class BaseVectorStoreToolApiWrapper(BaseToolApiWrapper):
             filter.update({"collection": {
                 "$eq": index_name.strip()
             }})
+
+        exclusions = [
+            {"$or": [
+                {"type": {"$exists": False}},
+                {"type": {"$ne": IndexerKeywords.INDEX_META_TYPE.value}}
+            ]}
+        ]
+        pending_run_ids = self._get_pending_run_ids_safe(index_name)
+        if pending_run_ids:
+            # A bare $nin is NULL-false for rows without the key — the
+            # $exists:False disjunct is what keeps every legacy row visible.
+            exclusions.append({"$or": [
+                {IndexerKeywords.RUN_ID.value: {"$exists": False}},
+                {IndexerKeywords.RUN_ID.value: {"$nin": pending_run_ids}}
+            ]})
+
+        if filter:
+            filter = {"$and": [filter, *exclusions]}
+        else:
+            filter = exclusions[0] if len(exclusions) == 1 else {"$and": exclusions}
         return filter
+
+    def _get_pending_run_ids_safe(self, index_name: str = "") -> List[str]:
+        from ..runtime.tools.index_runs_model import is_degradable_run_lookup_error
+
+        try:
+            vectorstore_wrapper = self._init_vector_store()
+            return vectorstore_wrapper.vector_adapter.get_pending_run_ids(
+                vectorstore_wrapper, index_name.strip() if index_name else ""
+            )
+        except Exception as e:
+            if not is_degradable_run_lookup_error(e):
+                raise
+            logger.warning(f"Could not fetch pending index run ids, searching unfiltered: {e}")
+            return []
 
     def search_index(self,
                      query: str,
