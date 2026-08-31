@@ -176,6 +176,10 @@ def _failing_input_func(issue_number: str, title: str = "default") -> str:
     raise ValueError("issue_number must be numeric")
 
 
+def _failing_policy_func(issue_number: str, title: str = "default") -> str:
+    raise PermissionError("permission denied")
+
+
 class _StubLLM:
     """Minimal stand-in for a chat model.
 
@@ -252,8 +256,8 @@ class TestErrorProseIsByteStable:
 class TestEnrichmentGatedOnErrorClass:
     """#6167: an INFRASTRUCTURE error gains nothing from an LLM rewrite of the same
     fact the template already states, so TransformErrorStrategy skips the LLM call
-    entirely for that one class. Everything else, including an unclassified error,
-    still enriches."""
+    entirely for that one class. #6401 added POLICY for the same reason. Everything
+    else, including an unclassified error, still enriches."""
 
     @patch("elitea_sdk.runtime.utils.tool_code_extractor.extract_tool_code", return_value=None)
     @patch("elitea_sdk.runtime.utils.tool_code_loader.load_tool_code", return_value=None)
@@ -272,6 +276,31 @@ class TestEnrichmentGatedOnErrorClass:
             "Tool 'update_issue' failed.\n"
             "\n"
             "Error: connection refused\n"
+            "\n"
+            "Please check the input parameters and try again, "
+            "or use an alternative approach."
+        )
+        stub.invoke.assert_not_called()
+
+    @patch("elitea_sdk.runtime.utils.tool_code_extractor.extract_tool_code", return_value=None)
+    @patch("elitea_sdk.runtime.utils.tool_code_loader.load_tool_code", return_value=None)
+    @patch("elitea_sdk.runtime.middleware.faq_fetcher.get_toolkit_faq", return_value=None)
+    def test_policy_error_stays_on_the_template_path(self, _faq, _load_code, _extract_code):
+        """#6401 joined POLICY to the skip list: rewriting a refusal adds nothing the
+        template already says, and enforcing provider failures multiplies the volume."""
+        stub = _StubLLM("STUB REWRITE")
+        stub.invoke = MagicMock(wraps=stub.invoke)
+        middleware = ToolExceptionHandlerMiddleware(
+            strategies=[TransformErrorStrategy(llm=stub), LoggingStrategy()]
+        )
+        wrapped = middleware.wrap_tool(_make_tool(func=_failing_policy_func))
+
+        result = wrapped.run({"issue_number": "42"})
+
+        assert result == (
+            "Tool 'update_issue' failed.\n"
+            "\n"
+            "Error: permission denied\n"
             "\n"
             "Please check the input parameters and try again, "
             "or use an alternative approach."

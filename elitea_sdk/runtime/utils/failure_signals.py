@@ -29,6 +29,40 @@ def mcp_is_error(result: Any) -> bool:
     return bool(getattr(result, "isError", False))
 
 
+def mcp_error_message(result: Any) -> str:
+    """Render an MCP failure result as the same text the success path would return (#6401)."""
+    content = result.get("content") if isinstance(result, dict) else getattr(result, "content", None)
+    if isinstance(content, list) and content:
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", item.get("data", item))))
+            else:
+                text = getattr(item, "text", None)
+                data = getattr(item, "data", None)
+                parts.append(str(text if text is not None else data if data is not None else item))
+        return "\n".join(parts)
+    text = result.get("text") if isinstance(result, dict) else getattr(result, "text", None)
+    if text:
+        return str(text)
+    if isinstance(result, dict):
+        return json.dumps(result, indent=2)
+    return str(result)
+
+
+SHADOW_LOGGED_ATTR = "_elitea_shadow_logged"
+
+
+def mark_shadow_logged(exc):
+    """Tag an exception whose failure was already shadow-logged, so a re-raise does not log it twice."""
+    setattr(exc, SHADOW_LOGGED_ATTR, True)
+    return exc
+
+
+def is_shadow_logged(exc) -> bool:
+    return bool(getattr(exc, SHADOW_LOGGED_ATTR, False))
+
+
 def log_shadow_failure(logger, **fields) -> None:
     """Emit one TOOL_FAILURE_SHADOW line. Never logs a payload — only `result_len`.
 
@@ -36,5 +70,6 @@ def log_shadow_failure(logger, **fields) -> None:
     across both the provider and MCP detection sites.
     """
     payload = {key: fields.get(key) for key in _SHADOW_FIELDS}
-    payload["delivered_as_success"] = True
+    # False once the site enforces the signal by raising instead of returning it (#6401).
+    payload["delivered_as_success"] = bool(fields.get("delivered_as_success", True))
     logger.warning("TOOL_FAILURE_SHADOW %s", json.dumps(payload))

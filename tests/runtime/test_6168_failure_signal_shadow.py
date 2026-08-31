@@ -1,9 +1,11 @@
 """Unit tests for #6168 shadow-mode failure detection (SDK side).
 
 Covers the pure helpers (mcp_is_error, classify_provider_error_category), the
-shared-vocabulary contract with provider_worker's table, and that each of the
-three MCP call sites still returns exactly what it returned before when
-isError is true — shadow mode must never change a tool's return value.
+shared-vocabulary contract with provider_worker's table, and the shadow-log
+payload each of the three MCP call sites emits.
+
+Since #6401 those sites also raise on isError, so the failure tests here assert the
+log line while the raise semantics themselves live in test_6401_enforcement.py.
 """
 import asyncio
 import importlib.util
@@ -13,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.tool_outcome import ToolErrorClass, classify_provider_error_category
 from elitea_sdk.runtime.utils.failure_signals import mcp_is_error, log_shadow_failure
@@ -156,9 +159,9 @@ class TestLogShadowFailure:
         }
 
 
-class TestMcpServerToolProxiedSiteUnchanged:
-    """Site 2 (platform-proxied): McpServerTool._run must return client.mcp_tool_call's
-    result unmodified, whether or not it signals isError."""
+class TestMcpServerToolProxiedSite:
+    """Site 2 (platform-proxied): McpServerTool._run returns client.mcp_tool_call's
+    result unmodified on success, and shadow-logs before raising on isError."""
 
     def _make_tool(self, client):
         return McpServerTool(
@@ -180,15 +183,15 @@ class TestMcpServerToolProxiedSiteUnchanged:
         assert result == {"content": [{"type": "text", "text": "ok"}]}
         assert not any("TOOL_FAILURE_SHADOW" in r.message for r in caplog.records)
 
-    def test_error_result_passthrough_and_logged(self, caplog):
+    def test_error_result_logged_then_raised(self, caplog):
         client = MagicMock()
         client.mcp_tool_call.return_value = {"isError": True, "content": [{"type": "text", "text": "boom"}]}
         tool = self._make_tool(client)
 
         with caplog.at_level(logging.WARNING):
-            result = tool._run(query="x")
+            with pytest.raises(ToolException):
+                tool._run(query="x")
 
-        assert result == {"isError": True, "content": [{"type": "text", "text": "boom"}]}
         shadow_lines = [r.getMessage() for r in caplog.records if "TOOL_FAILURE_SHADOW" in r.getMessage()]
         assert len(shadow_lines) == 1
         payload = json.loads(shadow_lines[0][len("TOOL_FAILURE_SHADOW "):])
@@ -197,11 +200,12 @@ class TestMcpServerToolProxiedSiteUnchanged:
         assert payload["toolkit_type"] == "mcp"
         assert payload["toolkit_id"] == 42
         assert payload["tool_name"] == "do_thing"
+        assert payload["delivered_as_success"] is False
 
 
-class TestMcpRemoteToolRemoteSiteUnchanged:
-    """Site 3 (remote HTTP/SSE): _execute_remote_tool's formatted return value must be
-    unaffected by isError, and the exception-swallowing branch keeps its old message."""
+class TestMcpRemoteToolRemoteSite:
+    """Site 3 (remote HTTP/SSE): _execute_remote_tool formats the same text either way,
+    and shadow-logs before raising rather than returning it."""
 
     def _make_tool(self):
         return McpRemoteTool(
@@ -233,39 +237,42 @@ class TestMcpRemoteToolRemoteSiteUnchanged:
         assert result == "ok"
         assert not any("TOOL_FAILURE_SHADOW" in r.message for r in caplog.records)
 
-    def test_error_result_passthrough_and_logged(self, caplog):
+    def test_error_result_logged_then_raised(self, caplog):
         tool = self._make_tool()
         with caplog.at_level(logging.WARNING):
-            result = self._run_with_mocked_client(
-                tool, {"isError": True, "content": [{"type": "text", "text": "boom"}]}
-            )
+            with pytest.raises(ToolException, match="boom"):
+                self._run_with_mocked_client(
+                    tool, {"isError": True, "content": [{"type": "text", "text": "boom"}]}
+                )
 
-        assert result == "boom"
         shadow_lines = [r.getMessage() for r in caplog.records if "TOOL_FAILURE_SHADOW" in r.getMessage()]
         assert len(shadow_lines) == 1
         payload = json.loads(shadow_lines[0][len("TOOL_FAILURE_SHADOW "):])
         assert payload["detected_by"] == "mcp_is_error/remote"
         assert payload["toolkit_name"] == "github"
         assert payload["toolkit_id"] == 7
+        assert payload["delivered_as_success"] is False
 
-    def test_exception_swallowed_branch_message_and_shadow_log_unchanged(self, caplog):
+    def test_execution_exception_shadow_logged_and_reraised(self, caplog):
+        """Since #6401 this branch re-raises instead of returning prose as tool output."""
         tool = self._make_tool()
 
         with patch.object(McpRemoteTool, "_run_in_new_loop", side_effect=RuntimeError("connection refused")):
             with caplog.at_level(logging.WARNING):
-                result = tool._run()
+                with pytest.raises(RuntimeError, match="connection refused"):
+                    tool._run()
 
-        assert result == "Error executing tool: connection refused"
         shadow_lines = [r.getMessage() for r in caplog.records if "TOOL_FAILURE_SHADOW" in r.getMessage()]
         assert len(shadow_lines) == 1
         payload = json.loads(shadow_lines[0][len("TOOL_FAILURE_SHADOW "):])
         assert payload["detected_by"] == "mcp_exception_swallowed"
         assert payload["toolkit_name"] == "github"
+        assert payload["delivered_as_success"] is False
 
 
-class TestMcpConfigStdioSiteUnchanged:
-    """Site 1 (stdio): the local-config tool_func must format the CallToolResult the
-    same way regardless of isError, and log a shadow line only when it is set."""
+class TestMcpConfigStdioSite:
+    """Site 1 (stdio): the local-config tool_func formats the CallToolResult the same
+    way regardless of isError, and logs a shadow line only when it is set."""
 
     def _make_result(self, is_error, text):
         result = MagicMock()
@@ -303,14 +310,15 @@ class TestMcpConfigStdioSiteUnchanged:
         assert result == "ok"
         assert not any("TOOL_FAILURE_SHADOW" in r.message for r in caplog.records)
 
-    def test_error_result_passthrough_and_logged(self, caplog):
+    def test_error_result_logged_then_raised(self, caplog):
         with caplog.at_level(logging.WARNING):
-            result = self._call_tool_func(self._make_result(True, "boom"))
+            with pytest.raises(ToolException, match="boom"):
+                self._call_tool_func(self._make_result(True, "boom"))
 
-        assert result == "boom"
         shadow_lines = [r.getMessage() for r in caplog.records if "TOOL_FAILURE_SHADOW" in r.getMessage()]
         assert len(shadow_lines) == 1
         payload = json.loads(shadow_lines[0][len("TOOL_FAILURE_SHADOW "):])
         assert payload["detected_by"] == "mcp_is_error/stdio"
         assert payload["toolkit_name"] == "playwright"
         assert payload["tool_name"] == "do_thing"
+        assert payload["delivered_as_success"] is False

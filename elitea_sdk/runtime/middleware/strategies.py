@@ -27,6 +27,7 @@ Example:
 """
 
 import logging
+import re
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -39,6 +40,13 @@ from langchain_core.tools import BaseTool, ToolException
 from ..tool_outcome import ToolErrorClass
 from ..utils.prompts_loader import TransformErrorPrompts
 from ..langchain.langraph_agent import normalize_message_content
+
+# Classes an LLM rewrite cannot improve on: the template already carries what a reader
+# of a transient failure or a refusal needs.
+_ENRICHMENT_SKIPPED_CLASSES = (ToolErrorClass.INFRASTRUCTURE, ToolErrorClass.POLICY)
+
+_ENRICHMENT_CACHE_MAX_ENTRIES = 64
+_ENRICHMENT_KEY_MAX_CHARS = 500
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +164,9 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
         self.return_detailed_errors = return_detailed_errors
         self._llm_factory = llm_factory
         self._llm_resolved = False
+        # A retry loop hits the same failure repeatedly; without this each attempt pays
+        # another completion. Bounded and cleared per conversation.
+        self._enrichment_cache: Dict[str, str] = {}
 
         logger.debug(
             f"TransformErrorStrategy initialized: "
@@ -170,17 +181,38 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
             self._llm_resolved = True
         return self.llm
 
+    def reset(self) -> None:
+        """Drop per-conversation enrichment results."""
+        self._enrichment_cache.clear()
+
+    @staticmethod
+    def _enrichment_key(context: ExceptionContext) -> str:
+        """Same tool, same exception type, same message shape -> same enrichment."""
+        message = re.sub(r'\s+', ' ', (context.error_str or '')).strip().lower()
+        return f"{context.tool_name}|{context.error_type}|{message[:_ENRICHMENT_KEY_MAX_CHARS]}"
+
+    def _cache_enrichment(self, key: str, value: str) -> None:
+        if len(self._enrichment_cache) >= _ENRICHMENT_CACHE_MAX_ENTRIES:
+            # Oldest first; dicts preserve insertion order.
+            del self._enrichment_cache[next(iter(self._enrichment_cache))]
+        self._enrichment_cache[key] = value
+
     def handle_exception(self, context: ExceptionContext) -> ExceptionContext:
         """Generate user-friendly error message."""
-        # Rewriting a timeout adds nothing the template does not already say, and the
-        # template keeps the raw error text a reader of an infra failure actually wants.
-        if context.metadata.get('error_class') is not ToolErrorClass.INFRASTRUCTURE:
+        # Rewriting a timeout or an auth refusal adds nothing the template does not
+        # already say, and the template keeps the raw error text a reader wants.
+        if context.metadata.get('error_class') not in _ENRICHMENT_SKIPPED_CLASSES:
+            cache_key = self._enrichment_key(context)
+            cached = self._enrichment_cache.get(cache_key)
+            if cached is not None:
+                context.error_message = self._decorate_enrichment(cached)
+                return context
             if self._resolve_llm():
                 try:
                     human_error = self._generate_llm_error(context)
                     if human_error:
-                        context.error_message = (f'{human_error}\n\n*IMPORTANT*: if fixing logic is clear - you can re-try tool execution according to fix.\n'
-                                                 f'If you continue experiencing issues, please [contact support](https://elitea.ai/docs/support/contact-support/)')
+                        self._cache_enrichment(cache_key, human_error)
+                        context.error_message = self._decorate_enrichment(human_error)
                         logger.debug(
                             f"Generated LLM error for '{context.tool_name}': "
                             f"{human_error[:100]}..."
@@ -194,6 +226,11 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
         # Fallback to template-based message
         context.error_message = self._generate_template_error(context)
         return context
+
+    @staticmethod
+    def _decorate_enrichment(human_error: str) -> str:
+        return (f'{human_error}\n\n*IMPORTANT*: if fixing logic is clear - you can re-try tool execution according to fix.\n'
+                f'If you continue experiencing issues, please [contact support](https://elitea.ai/docs/support/contact-support/)')
 
     def _generate_llm_error(self, context: ExceptionContext) -> Optional[str]:
         """Use LLM to generate human-readable error."""
