@@ -95,6 +95,7 @@ _INTERNAL_STATE_KEYS = {
     'context_info', 'state_types',
     'hitl_decisions', 'hitl_interrupt',
     ELITEA_RS, PRINTER_NODE_RS,
+    TOOL_OUTCOMES_KEY, LAST_TOOL_OUTCOME_KEY,
 }
 
 

@@ -599,6 +599,13 @@ alita_client = elitea_client
                                 f"[FUNC_TOOL] Mapping agent text output to output_variable '{var}'"
                             )
 
+                # The child ran in its own outcome sink, isolated from this node's — without
+                # this, a child pipeline that ends on a failed tool call reports SUCCESS here.
+                child_outcome = tool_result.get(LAST_TOOL_OUTCOME_KEY)
+                if isinstance(child_outcome, dict) and child_outcome.get('status') in (
+                        ToolResultStatus.ERROR.value, ToolResultStatus.BLOCKED.value):
+                    record_outcome(ToolOutcome(**child_outcome))
+
                 return result_dict
 
             if not self.output_variables:
@@ -646,7 +653,9 @@ alita_client = elitea_client
             # continuations rebuild the application with the new OAuth token,
             # so the real tool executes before reaching this catch.
             return self._build_mcp_auth_refresh_termination(auth_payload)
-        # save the whole error message to the tool's output
+        # save the whole error message to the tool's output.
+        # Behavior change (#6171): an unwrapped ValueError used to re-raise as a bare
+        # ToolException here; it now resolves gracefully like every other local failure.
         except Exception as e:
             # A budget rejection is not a tool-input problem and cannot be retried
             budget_error = budget_exceeded_from(e)

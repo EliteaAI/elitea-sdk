@@ -71,22 +71,11 @@ def _parallel_tasks_reducer(current: dict | None, update: dict | None) -> dict:
     return merged
 
 
-def _tool_outcomes_reducer(current: dict | None, update: dict | None) -> dict:
-    """Reducer for the ``tool_outcomes`` state field (issue #6171).
-
-    A per-node map of serialised ``ToolOutcome`` envelopes, written by every
-    ``FunctionTool`` node so a pipeline can branch on a typed status instead of
-    substring-matching the message history.
-
-    * Sending a ``dict`` **merges** per node id, so a re-entered node overwrites
-      only its own entry.
-    * Sending ``None`` **clears** the map (fresh turn).
-    """
-    if update is None:
-        return {}
-    merged = dict(current or {})
-    merged.update(update)
-    return merged
+# Reducer for the ``tool_outcomes`` state field (issue #6171): a per-node map of
+# serialised ``ToolOutcome`` envelopes, written by every ``FunctionTool`` node so a
+# pipeline can branch on a typed status instead of substring-matching the message
+# history. Same merge-per-key / clear-on-None shape as ``_parallel_tasks_reducer``.
+_tool_outcomes_reducer = _parallel_tasks_reducer
 
 
 def _normalize_for_args_match(value: Any) -> Any:
