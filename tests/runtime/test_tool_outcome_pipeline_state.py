@@ -305,18 +305,21 @@ class TestMessageCapped:
 
         outcome = _outcome(result)
         assert len(outcome["message"]) == _MAX_OUTCOME_MESSAGE_CHARS
-        assert outcome["truncated"] is True
+        assert outcome["message_truncated"] is True
         # The middleware wraps the raw exception in its own prose, so the persisted
-        # original_size reflects that wrapped message, not the raw string above verbatim.
-        assert outcome["original_size"] > _MAX_OUTCOME_MESSAGE_CHARS
+        # message_original_size reflects that wrapped message, not the raw string above verbatim.
+        assert outcome["message_original_size"] > _MAX_OUTCOME_MESSAGE_CHARS
+        # Distinct from the result-truncation signal (status=TRUNCATED), which this is not.
+        assert outcome["truncated"] is False
+        assert outcome["original_size"] is None
 
     def test_short_message_is_untouched(self):
         node = _node(_middleware().wrap_tool(_tool(_raise_runtime)))
         result = _run(node)
 
         outcome = _outcome(result)
-        assert outcome["truncated"] is False
-        assert outcome["original_size"] is None
+        assert "message_truncated" not in outcome
+        assert "message_original_size" not in outcome
 
 
 # ─── No output variable declared ─────────────────────────────────────

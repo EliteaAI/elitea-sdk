@@ -458,10 +458,13 @@ alita_client = elitea_client
         payload = self._outcome_for(result, sink).model_dump(mode='json')
         # message is LLM-facing prose already living on the message channel; routing only
         # ever needs status/error_class/retriable, so cap what gets duplicated into state.
+        # Distinct keys from truncated/original_size: those describe the TOOL RESULT being
+        # cut (status=TRUNCATED), a data-completeness signal for the pipeline author. This is
+        # an unrelated storage detail about the envelope itself.
         message = payload.get('message') or ''
         if len(message) > _MAX_OUTCOME_MESSAGE_CHARS:
-            payload['original_size'] = len(message)
-            payload['truncated'] = True
+            payload['message_original_size'] = len(message)
+            payload['message_truncated'] = True
             payload['message'] = message[:_MAX_OUTCOME_MESSAGE_CHARS]
         node_key = self.name or getattr(self.tool, 'name', '') or ''
         result[TOOL_OUTCOMES_KEY] = {node_key: payload}
