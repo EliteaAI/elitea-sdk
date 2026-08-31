@@ -265,7 +265,7 @@ addFileToTestCase = create_model(
 UpdateTestRunStatus = create_model(
     "UpdateTestRunStatus",
     test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
-    status=(str, Field(description="Manual test run status. Standard values: 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete'. Must match a status name configured in the project's Field Settings.")),
+    status=(str, Field(description="Manual test run status. Standard values: 'Passed', 'Failed', 'Blocked', 'Unexecuted', 'Incomplete'. Must match a status name configured in the project's Field Settings.")),
     note=(Optional[str], Field(description="Optional execution note/comment to attach to the test log.", default=None)),
     testcase_version_id=(Optional[str], Field(
         description="Optional numeric test case version ID or decimal version name such as '2.0'. Decimal names are resolved to qTest's internal ID before submission. If omitted, the test run's current version is used.",
@@ -2807,7 +2807,7 @@ new manual execution log so the existing execution history remains unchanged.
 
 Parameters:
 - test_run_id: Test run ID in format TR-123 or QTest numeric ID
-- status: One of 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete' (must match project's configured status names)
+- status: One of 'Passed', 'Failed', 'Blocked', 'Unexecuted', 'Incomplete' (must match project's configured status names)
 - note: Optional execution note
 - testcase_version_id: Optional numeric version ID or decimal version name (for example '2.0'). Decimal names are resolved to qTest's internal ID. Omit to keep the run's current version.
 
