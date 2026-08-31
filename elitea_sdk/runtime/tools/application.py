@@ -43,12 +43,15 @@ def formulate_query(kwargs, is_subgraph=False):
     # - hitl_decisions, hitl_interrupt: parent's HITL state
     # - thread_id, execution_finished: parent's execution state
     # - ELITEA_RS, PRINTER_NODE_RS: internal output keys
+    # - tool_outcomes, last_tool_outcome: parent's own tool result (#6171) — otherwise
+    #   the child starts life with a stale outcome that predates anything it has run.
     excluded_keys = {
         "task", "chat_history",
         "messages", "input", "output",
         "context_info", "state_types",
         "hitl_decisions", "hitl_interrupt",
         "thread_id", "execution_finished",
+        "tool_outcomes", "last_tool_outcome",
         ELITEA_RS, PRINTER_NODE_RS,
     }
 
@@ -806,6 +809,7 @@ class Application(BaseTool):
             excluded_keys = {'messages', 'output', 'input', 'chat_history', 'state_types',
                            'thread_id', 'execution_finished',
                            'hitl_decisions', 'hitl_interrupt',
+                           'tool_outcomes', 'last_tool_outcome',
                            ELITEA_RS, PRINTER_NODE_RS}
             for key, value in response.items():
                 if key not in excluded_keys:

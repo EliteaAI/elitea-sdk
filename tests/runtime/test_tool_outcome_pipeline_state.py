@@ -235,6 +235,90 @@ class TestUnwrappedValueError:
         assert _outcome(result)["error_class"] == ToolErrorClass.INPUT.value
 
 
+# ─── Parent's outcome must not leak into a fresh child pipeline ──────
+
+
+class TestOutcomeDoesNotLeakToChild:
+    """A child pipeline/agent must start life without the parent's own last tool
+    result, or a condition on last_tool_outcome.status reads stale, foreign data
+    before the child has called anything itself."""
+
+    def test_formulate_query_excludes_outcome_keys(self):
+        from elitea_sdk.runtime.tools.application import formulate_query
+
+        kwargs = {
+            "task": "do the thing",
+            TOOL_OUTCOMES_KEY: {"prior_node": {"status": "error"}},
+            LAST_TOOL_OUTCOME_KEY: {"status": "error"},
+            "my_var": "keep me",
+        }
+        result = formulate_query(kwargs)
+
+        assert TOOL_OUTCOMES_KEY not in result
+        assert LAST_TOOL_OUTCOME_KEY not in result
+        assert result["my_var"] == "keep me"
+
+    def test_nested_app_func_args_excludes_outcome_keys(self):
+        from unittest.mock import patch
+
+        captured = {}
+
+        def _record(issue_number):
+            return "x"
+
+        # is_nested_app is detected by class name == "Application" (function.py:492),
+        # since StructuredTool is a pydantic model and rejects an ad-hoc is_subgraph attr.
+        class Application(StructuredTool):
+            pass
+
+        node = _node(Application.from_function(
+            func=_record, name="child_app", description="child",
+            args_schema=_Args, metadata={"toolkit_type": "jira", "toolkit_name": "jira"},
+        ))
+
+        state = {
+            "issue_number": "42",
+            TOOL_OUTCOMES_KEY: {"prior_node": {"status": "error"}},
+            LAST_TOOL_OUTCOME_KEY: {"status": "error"},
+        }
+        with patch.object(type(node.tool), "invoke", side_effect=lambda args, *a, **kw: (
+            captured.update(args) or "x"
+        )):
+            node._invoke_node(state, config=None)
+
+        assert TOOL_OUTCOMES_KEY not in captured
+        assert LAST_TOOL_OUTCOME_KEY not in captured
+
+
+# ─── Message is capped, not duplicated unbounded into state ──────────
+
+
+class TestMessageCapped:
+    def test_long_message_is_capped_and_flagged_truncated(self):
+        from elitea_sdk.runtime.tools.function import _MAX_OUTCOME_MESSAGE_CHARS
+
+        long_message = "x" * (_MAX_OUTCOME_MESSAGE_CHARS + 500)
+        node = _node(_middleware().wrap_tool(_tool(lambda issue_number: (_ for _ in ()).throw(
+            RuntimeError(long_message)
+        ))))
+        result = _run(node)
+
+        outcome = _outcome(result)
+        assert len(outcome["message"]) == _MAX_OUTCOME_MESSAGE_CHARS
+        assert outcome["truncated"] is True
+        # The middleware wraps the raw exception in its own prose, so the persisted
+        # original_size reflects that wrapped message, not the raw string above verbatim.
+        assert outcome["original_size"] > _MAX_OUTCOME_MESSAGE_CHARS
+
+    def test_short_message_is_untouched(self):
+        node = _node(_middleware().wrap_tool(_tool(_raise_runtime)))
+        result = _run(node)
+
+        outcome = _outcome(result)
+        assert outcome["truncated"] is False
+        assert outcome["original_size"] is None
+
+
 # ─── No output variable declared ─────────────────────────────────────
 
 

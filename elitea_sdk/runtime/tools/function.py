@@ -39,6 +39,10 @@ PIPELINE_BLOCKED_KEY = '_pipeline_blocked'
 TOOL_OUTCOMES_KEY = 'tool_outcomes'
 LAST_TOOL_OUTCOME_KEY = 'last_tool_outcome'
 
+# Cap on the outcome message duplicated into state (routing needs status/error_class, never
+# the full prose, which already lives on the message channel).
+_MAX_OUTCOME_MESSAGE_CHARS = 4000
+
 def replace_escaped_newlines(data):
     """
         Replace \\n with \n in all string values recursively.
@@ -452,6 +456,13 @@ alita_client = elitea_client
         if not isinstance(result, dict):
             return result
         payload = self._outcome_for(result, sink).model_dump(mode='json')
+        # message is LLM-facing prose already living on the message channel; routing only
+        # ever needs status/error_class/retriable, so cap what gets duplicated into state.
+        message = payload.get('message') or ''
+        if len(message) > _MAX_OUTCOME_MESSAGE_CHARS:
+            payload['original_size'] = len(message)
+            payload['truncated'] = True
+            payload['message'] = message[:_MAX_OUTCOME_MESSAGE_CHARS]
         node_key = self.name or getattr(self.tool, 'name', '') or ''
         result[TOOL_OUTCOMES_KEY] = {node_key: payload}
         result[LAST_TOOL_OUTCOME_KEY] = payload
@@ -483,7 +494,7 @@ alita_client = elitea_client
         if is_nested_app:
             logger.debug(f"[FUNC_TOOL] Passing state variables to nested app. State keys: {list(state.keys())}, func_args keys: {list(func_args.keys())}")
             for key, value in state.items():
-                if key in ['messages', 'input']:
+                if key in ('messages', 'input', TOOL_OUTCOMES_KEY, LAST_TOOL_OUTCOME_KEY):
                     continue
                 # Pass state variables to child, overriding input_mapping values
                 # when the parent has explicitly set a value (not None/empty).
@@ -563,7 +574,8 @@ alita_client = elitea_client
                 # For pipelines (is_subgraph=True): do NOT exclude output_variables — the child
                 # pipeline may have explicitly computed and set them.
                 is_pipeline = hasattr(self.tool, 'is_subgraph') and self.tool.is_subgraph
-                excluded_keys = {'messages', 'output', 'input', 'chat_history'}
+                excluded_keys = {'messages', 'output', 'input', 'chat_history',
+                                  TOOL_OUTCOMES_KEY, LAST_TOOL_OUTCOME_KEY}
                 if not is_pipeline:
                     # React agent: stale parent-state values for output vars must not leak back
                     excluded_keys.update(self.output_variables or [])
@@ -601,10 +613,15 @@ alita_client = elitea_client
 
                 # The child ran in its own outcome sink, isolated from this node's — without
                 # this, a child pipeline that ends on a failed tool call reports SUCCESS here.
+                # Isolated in its own try: a malformed child payload must not be misread by
+                # the outer `except Exception` as THIS node's own call having failed.
                 child_outcome = tool_result.get(LAST_TOOL_OUTCOME_KEY)
                 if isinstance(child_outcome, dict) and child_outcome.get('status') in (
                         ToolResultStatus.ERROR.value, ToolResultStatus.BLOCKED.value):
-                    record_outcome(ToolOutcome(**child_outcome))
+                    try:
+                        record_outcome(ToolOutcome(**child_outcome))
+                    except Exception:
+                        logger.debug("[FUNC_TOOL] Malformed child last_tool_outcome, skipping relay", exc_info=True)
 
                 return result_dict
 
