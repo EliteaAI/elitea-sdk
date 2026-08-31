@@ -35,10 +35,12 @@ from elitea_sdk.runtime.tool_outcome import (
     ToolOutcome,
     ToolResultStatus,
     classify_tool_error,
+    outcome_sink,
     record_outcome,
     retriable_for,
 )
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langgraph.errors import GraphBubbleUp
 
@@ -104,6 +106,37 @@ def swarm_handle_tool_errors(error: Exception) -> str:
     )
     record_outcome(outcome)
     return outcome.message
+
+
+def _stamp_error_status(result, recorded):
+    """Mark a ToolMessage as failed when the middleware recorded a non-success outcome.
+
+    The middleware returns its error prose instead of raising, so ToolNode builds a
+    success message over it (#6477). The signal is the recorded envelope, never the text.
+    """
+    if not any(o.status is not ToolResultStatus.SUCCESS for o in recorded):
+        return result
+    if isinstance(result, list):
+        return [_stamp_error_status(item, recorded) for item in result]
+    # A status ToolNode already set (its own error path) is more specific - leave it.
+    if isinstance(result, ToolMessage) and result.status == 'success':
+        return result.model_copy(update={'status': 'error'})
+    # Command: handoff control flow, never a middleware-wrapped tool.
+    return result
+
+
+def swarm_wrap_tool_call(request, execute):
+    """``wrap_tool_call`` for the swarm ToolNodes (#6477)."""
+    with outcome_sink() as recorded:
+        result = execute(request)
+    return _stamp_error_status(result, recorded)
+
+
+async def swarm_awrap_tool_call(request, execute):
+    """``awrap_tool_call``: without it ToolNode would run the sync wrapper on the loop."""
+    with outcome_sink() as recorded:
+        result = await execute(request)
+    return _stamp_error_status(result, recorded)
 
 
 class ToolExceptionHandlerMiddleware(Middleware):

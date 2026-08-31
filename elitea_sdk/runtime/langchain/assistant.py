@@ -23,7 +23,9 @@ from .constants import (
 )
 from ..middleware.tool_exception_handler import (
     ToolExceptionHandlerMiddleware,
+    swarm_awrap_tool_call,
     swarm_handle_tool_errors,
+    swarm_wrap_tool_call,
 )
 from ..middleware.base import Middleware, MiddlewareManager
 from ..models.agent_response import AgentResponse
@@ -1145,7 +1147,14 @@ class Assistant:
             # handle_tool_errors is explicit: the upstream default re-raises and kills
             # the graph, and True would swallow MCP-auth/budget signals (#6172).
             if tools:
-                tool_node = ToolNode(tools, handle_tool_errors=swarm_handle_tool_errors)
+                tool_node = ToolNode(
+                    tools,
+                    handle_tool_errors=swarm_handle_tool_errors,
+                    # The middleware returns error prose instead of raising, so
+                    # handle_tool_errors never sees it; these stamp status (#6477).
+                    wrap_tool_call=swarm_wrap_tool_call,
+                    awrap_tool_call=swarm_awrap_tool_call,
+                )
                 builder.add_node("tools", tool_node)
 
             def should_continue(state):
@@ -1283,7 +1292,12 @@ class Assistant:
                     )
                 ]}
 
-            tool_node = ToolNode([handoff_back_tool], handle_tool_errors=swarm_handle_tool_errors)
+            tool_node = ToolNode(
+                [handoff_back_tool],
+                handle_tool_errors=swarm_handle_tool_errors,
+                wrap_tool_call=swarm_wrap_tool_call,
+                awrap_tool_call=swarm_awrap_tool_call,
+            )
 
             builder.add_node("invoke", invoke_application)
             builder.add_node("tools", tool_node)
