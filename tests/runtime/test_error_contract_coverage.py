@@ -167,6 +167,29 @@ class TestAssistantWiring:
 
         assert late.invoke({"value": "x"}) == "sync boom"
 
+    def test_every_prebuilt_tool_node_passes_handle_tool_errors(self):
+        """Source-level because the swarm path needs a full peer graph to drive (#6172).
+        The default would re-raise and kill the graph; True would swallow signals."""
+        import ast
+        import inspect
+
+        from elitea_sdk.runtime.langchain import assistant as assistant_module
+
+        tree = ast.parse(inspect.getsource(assistant_module))
+        constructions = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "ToolNode"
+        ]
+
+        assert len(constructions) == 2, "a new ToolNode site needs its own explicit value"
+        for call in constructions:
+            handler = next(
+                (kw.value for kw in call.keywords if kw.arg == "handle_tool_errors"), None
+            )
+            assert isinstance(handler, ast.Name)
+            assert handler.id == "swarm_handle_tool_errors"
+
     def test_middleware_prompt_stays_empty(self):
         assistant = self._assistant([_sync_failing_tool()])
 

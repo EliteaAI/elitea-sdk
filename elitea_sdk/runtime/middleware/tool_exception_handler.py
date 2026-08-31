@@ -62,6 +62,50 @@ def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+def reraise_signal_exceptions(error: Exception) -> None:
+    """Anything re-raised here is a signal for the caller, not a tool failure.
+
+    Module-level so the swarm ToolNode handler below shares one list with the
+    middleware; two copies would drift and silently start swallowing a signal.
+    """
+    # MCP authorization is a cross-cutting auth concern; GraphBubbleUp carries
+    # interrupt() and other graph-level signals that must reach the graph.
+    if isinstance(error, (McpAuthorizationRequired, GraphBubbleUp)):
+        raise error
+
+    # "This execution path does not exist" - the agent loop branches on it to fall
+    # back from ainvoke to invoke, so turning it into prose would break that fallback.
+    if isinstance(error, NotImplementedError):
+        raise error
+
+    # Budget rejections bypass the strategies: TransformErrorStrategy would
+    # spend another LLM call rewriting a policy error into tool output
+    budget_error = budget_exceeded_from(error)
+    if budget_error is not None:
+        raise budget_error from error
+
+
+def swarm_handle_tool_errors(error: Exception) -> str:
+    """``handle_tool_errors`` for the swarm ToolNodes (#6172).
+
+    ToolNode's own default re-raises anything but a ToolInvocationError, which takes
+    the whole swarm graph down; plain ``True`` would swallow the signals above, since
+    ToolNode only protects GraphBubbleUp before consulting this callable. The
+    ``Exception`` annotation is what langgraph's _infer_handled_types reads.
+    """
+    reraise_signal_exceptions(error)
+    error_class = classify_tool_error(error)
+    outcome = ToolOutcome(
+        status=ToolResultStatus.ERROR,
+        message=f"Error executing tool: {error}",
+        error_class=error_class,
+        retriable=retriable_for(error_class),
+        exception_type=type(error).__name__,
+    )
+    record_outcome(outcome)
+    return outcome.message
+
+
 class ToolExceptionHandlerMiddleware(Middleware):
     """
     Wraps agent tools with intelligent exception handling using pluggable strategies.
@@ -291,22 +335,7 @@ When a tool fails with an error:
 
     @staticmethod
     def _reraise_signals(error: Exception) -> None:
-        """Anything re-raised here is a signal for the caller, not a tool failure."""
-        # MCP authorization is a cross-cutting auth concern; GraphBubbleUp carries
-        # interrupt() and other graph-level signals that must reach the graph.
-        if isinstance(error, (McpAuthorizationRequired, GraphBubbleUp)):
-            raise error
-
-        # "This execution path does not exist" - the agent loop branches on it to fall
-        # back from ainvoke to invoke, so turning it into prose would break that fallback.
-        if isinstance(error, NotImplementedError):
-            raise error
-
-        # Budget rejections bypass the strategies: TransformErrorStrategy would
-        # spend another LLM call rewriting a policy error into tool output
-        budget_error = budget_exceeded_from(error)
-        if budget_error is not None:
-            raise budget_error from error
+        reraise_signal_exceptions(error)
 
     def _run_error_pipeline(self, tool: BaseTool, error: Exception, args, kwargs) -> str:
         """Blocking: TransformErrorStrategy spends an LLM completion in here."""
