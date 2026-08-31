@@ -451,6 +451,34 @@ class EliteAClient:
             request_timeout=self.model_timeout
         )
 
+    def _required_provider_max_tokens(self, model_name: str, model_config: dict) -> int:
+        """Resolve the configured model maximum for APIs that require a value."""
+        configured_limit = model_config.get("max_output_tokens")
+        try:
+            configured_limit = int(configured_limit)
+        except (TypeError, ValueError):
+            configured_limit = None
+        if configured_limit and configured_limit > 0:
+            return configured_limit
+
+        model_project_id = model_config.get("model_project_id")
+        for model in self.get_available_models():
+            if model.get("name") != model_name:
+                continue
+            if model_project_id not in (None, "") and model.get("project_id") != model_project_id:
+                continue
+            try:
+                configured_limit = int(model.get("max_output_tokens"))
+            except (TypeError, ValueError):
+                configured_limit = None
+            if configured_limit and configured_limit > 0:
+                return configured_limit
+
+        raise ValueError(
+            f"Model '{model_name}' requires max_tokens, but its configured "
+            "max_output_tokens value is missing or invalid"
+        )
+
     def get_llm(self, model_name: str, model_config: dict):
         """
         Get a ChatOpenAI or ChatAnthropic model instance based on the model name and configuration.
@@ -498,16 +526,19 @@ class EliteAClient:
                     use_responses_api = True
                     break
 
-        # handle case when max_tokens are auto-configurable == -1 or None
+        # Default means no Elitea-defined custom output cap. Optional provider
+        # fields are omitted; required APIs resolve the configured model maximum.
         llm_max_tokens = model_config.get("max_tokens", None)
-        if llm_max_tokens is None or llm_max_tokens == -1:
-            logger.warning(f'User selected `MAX COMPLETION TOKENS` as `auto` or value is None/missing')
-            # default number for a case when auto is selected for an agent
-            llm_max_tokens = 4000
+        has_custom_output_limit = llm_max_tokens not in (None, -1)
+        if not has_custom_output_limit:
+            llm_max_tokens = None
 
         if is_anthropic:
             # ChatAnthropic configuration
-            # Anthropic requires max_tokens to be an integer, never None
+            # Anthropic requires max_tokens to be an integer, never None. In
+            # Default mode use model capability metadata, not a cross-model cap.
+            if llm_max_tokens is None:
+                llm_max_tokens = self._required_provider_max_tokens(model_name, model_config)
             target_kwargs = {
                 "base_url": f"{self.base_url}{self.allm_path}",
                 "model": model_name,
@@ -540,19 +571,18 @@ class EliteAClient:
                 if any(p in model_name_lower for p in _adaptive_only):
                     target_kwargs['thinking'] = {"type": "adaptive", "display": "summarized"}
                     target_kwargs['effort'] = effort
-                    # Adaptive thinking counts toward max_tokens just like
-                    # "enabled" thinking does. Without padding, a low/default
-                    # max_tokens (e.g. the 4000 auto-default) lets Anthropic
-                    # spend the entire budget on thinking and stop with
-                    # stop_reason="max_tokens" before emitting any text block,
-                    # producing a genuinely empty completion.
+                    # Adaptive thinking counts toward a custom visible-output
+                    # budget. A provider/model maximum already includes all
+                    # output, so padding that Default value would exceed it.
                     budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
-                    target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
+                    if has_custom_output_limit:
+                        target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
                 else:
                     target_kwargs['temperature'] = 1
                     budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
                     target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": budget}
-                    target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
+                    if has_custom_output_limit:
+                        target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
                     
             # Add http_client if provided
             if "http_client" in model_config:
@@ -567,12 +597,13 @@ class EliteAClient:
                 "api_key": self.auth_token,
                 "streaming": model_config.get("streaming", True),
                 "stream_usage": model_config.get("stream_usage", True),
-                "max_tokens": llm_max_tokens,
                 "temperature": model_config.get("temperature"),
                 "max_retries": model_config.get("max_retries", 3),
                 "seed": model_config.get("seed", None),
                 "openai_organization": str(self.project_id),
             }
+            if llm_max_tokens is not None:
+                target_kwargs["max_tokens"] = llm_max_tokens
             extra_headers = getattr(self, "api_extra_headers", None) or {}
             if extra_headers:
                 target_kwargs["default_headers"] = dict(extra_headers)
@@ -936,10 +967,7 @@ class EliteAClient:
                 if var['name'] in application_variables:
                     var.update(application_variables[var['name']])
         if llm is None:
-            max_tokens = data['llm_settings'].get('max_tokens', 4000)
-            if max_tokens == -1:
-                # default nuber for case when auto is selected for agent
-                max_tokens = 4000
+            max_tokens = data['llm_settings'].get('max_tokens')
             # The explicit param is authoritative — it is always available from the
             # request's llm kwargs, whereas llm_settings is absent when version_details
             # is refetched (e.g. API-endpoint requests), where it would default to False.
@@ -949,6 +977,7 @@ class EliteAClient:
                 model_name=data['llm_settings']['model_name'],
                 model_config={
                     "max_tokens": max_tokens,
+                    "max_output_tokens": data['llm_settings'].get('max_output_tokens'),
                     "reasoning_effort": data['llm_settings'].get('reasoning_effort'),
                     "temperature": data['llm_settings']['temperature'],
                     "model_project_id": data['llm_settings'].get('model_project_id'),

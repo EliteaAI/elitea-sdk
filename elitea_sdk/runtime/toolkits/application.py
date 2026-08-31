@@ -195,6 +195,7 @@ class ApplicationToolkit(BaseToolkit):
         if _model_name:
             model_settings = {
                 "max_tokens": llm_settings.get('max_tokens'),
+                "max_output_tokens": llm_settings.get('max_output_tokens'),
                 "reasoning_effort": llm_settings.get('reasoning_effort'),
                 "temperature": llm_settings.get('temperature'),
                 # Honor this sub-agent's own OpenAI-passthrough routing. Without it the child

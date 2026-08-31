@@ -376,7 +376,7 @@ class TestAnthropicBetaHeader:
     def test_anthropic_model_gets_beta_header(self):
         client = self._make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
-            client.get_llm("claude-sonnet-4-6", {})
+            client.get_llm("claude-sonnet-4-6", {"max_output_tokens": 64000})
         headers = mock_anthropic.call_args.kwargs["default_headers"]
         assert headers.get("anthropic-beta") == "prompt-caching-2024-07-31"
 
@@ -423,7 +423,10 @@ class TestAnthropicBetaHeader:
         """Claude model without the flag uses ChatAnthropic with the full beta header."""
         client = self._make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
-            client.get_llm("claude-3-5-sonnet-20241022", {})
+            client.get_llm(
+                "claude-3-5-sonnet-20241022",
+                {"max_output_tokens": 64000},
+            )
         headers = mock_anthropic.call_args.kwargs.get("default_headers", {})
         assert headers.get("anthropic-beta") == "prompt-caching-2024-07-31"
 
