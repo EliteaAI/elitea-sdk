@@ -1,7 +1,6 @@
 import json
 import logging
 import re
-import time
 from typing import Union, Any, Optional, Annotated, get_type_hints, cast
 from uuid import uuid4
 from typing import Dict
@@ -1081,17 +1080,11 @@ def create_graph(
 
     # Create ToolRegistry for lazy tools mode
     # This organizes all tools by toolkit for efficient lookup and lazy loading
-    # Threshold applies symmetrically: auto-disable when explicitly enabled but
-    # tool count is small (overhead exceeds savings), and auto-enable when not
-    # explicitly enabled but tool count is large (avoids binding 100k+ tokens
-    # of tool schemas on every turn — see issue #5989).
-    LAZY_TOOLS_THRESHOLD = 20  # Tool count boundary for auto lazy-mode switching
-
-    _lazy_tools_setup_start = time.perf_counter()
+    # Auto-disable for small tool sets where overhead exceeds savings
+    LAZY_TOOLS_MIN_THRESHOLD = 20  # Minimum tools to enable lazy mode
 
     tool_registry = None
     effective_lazy_mode = lazy_tools_mode
-    explicit_lazy_mode = lazy_tools_mode
 
     # Normalize always_bind_tools
     always_bind_tools = always_bind_tools or []
@@ -1110,51 +1103,38 @@ def create_graph(
 
     always_bind_tool_names = {t.name for t in always_bind_tools if hasattr(t, 'name')}
 
-    # Exclude always_bind_tools from the registry - they'll be bound directly
-    base_tools = [
-        t for t in tools
-        if isinstance(t, BaseTool) and t.name not in always_bind_tool_names
-    ]
-    tool_count = len(base_tools)
+    if lazy_tools_mode:
+        # Exclude always_bind_tools from the registry - they'll be bound directly
+        base_tools = [
+            t for t in tools
+            if isinstance(t, BaseTool) and t.name not in always_bind_tool_names
+        ]
+        tool_count = len(base_tools)
 
-    if explicit_lazy_mode and tool_count < LAZY_TOOLS_THRESHOLD:
-        # Auto-disable for small tool sets - overhead exceeds savings
-        effective_lazy_mode = False
-        logger.info(
-            f"[LazyTools] Auto-disabled: only {tool_count} tools "
-            f"(threshold: {LAZY_TOOLS_THRESHOLD}). Using direct binding."
-        )
-        # Dedup tool names: lazy_tools_mode=True caused __init__ to skip dedup,
-        # but direct binding (bind_tools) requires unique names.
-        renamed = deduplicate_tool_names(tools, context="lazy-auto-disable")
-        if renamed:
-            logger.info(f"[LazyTools] Deduplicated {renamed} tool names after auto-disable")
-    elif not explicit_lazy_mode and tool_count > LAZY_TOOLS_THRESHOLD:
-        # Auto-enable for large tool sets - avoids 100k+ token tool-schema binds
-        effective_lazy_mode = True
-        logger.info(
-            f"[LazyTools] Auto-enabled: {tool_count} tools "
-            f"(threshold: {LAZY_TOOLS_THRESHOLD}). Using meta-tools instead of direct binding."
-        )
-
-    if effective_lazy_mode and base_tools:
-        tool_registry = ToolRegistry.from_tools(base_tools)
-        toolkit_count = len(tool_registry.get_toolkit_names())
-        logger.info(
-            f"[LazyTools] Enabled with {toolkit_count} toolkits, {tool_count} tools. "
-            f"Estimated token savings: ~{(tool_count - 3) * 300:,} tokens"
-        )
-        if always_bind_tools:
+        if tool_count < LAZY_TOOLS_MIN_THRESHOLD:
+            # Auto-disable for small tool sets - overhead exceeds savings
+            effective_lazy_mode = False
             logger.info(
-                f"[LazyTools] Always-bind tools ({len(always_bind_tools)}): "
-                f"{[t.name for t in always_bind_tools]}"
+                f"[LazyTools] Auto-disabled: only {tool_count} tools "
+                f"(threshold: {LAZY_TOOLS_MIN_THRESHOLD}). Using direct binding."
             )
-
-    logger.debug(
-        f"[LazyTools][Timing] Setup decision took "
-        f"{(time.perf_counter() - _lazy_tools_setup_start) * 1000:.1f}ms "
-        f"(tool_count={tool_count}, explicit={explicit_lazy_mode}, effective={effective_lazy_mode})"
-    )
+            # Dedup tool names: lazy_tools_mode=True caused __init__ to skip dedup,
+            # but direct binding (bind_tools) requires unique names.
+            renamed = deduplicate_tool_names(tools, context="lazy-auto-disable")
+            if renamed:
+                logger.info(f"[LazyTools] Deduplicated {renamed} tool names after auto-disable")
+        elif base_tools:
+            tool_registry = ToolRegistry.from_tools(base_tools)
+            toolkit_count = len(tool_registry.get_toolkit_names())
+            logger.info(
+                f"[LazyTools] Enabled with {toolkit_count} toolkits, {tool_count} tools. "
+                f"Estimated token savings: ~{(tool_count - 3) * 300:,} tokens"
+            )
+            if always_bind_tools:
+                logger.info(
+                    f"[LazyTools] Always-bind tools ({len(always_bind_tools)}): "
+                    f"{[t.name for t in always_bind_tools]}"
+                )
 
     # Update lazy_tools_mode to effective value for use in LLMNode creation
     lazy_tools_mode = effective_lazy_mode
