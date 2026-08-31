@@ -12,6 +12,7 @@ Available middleware:
 - PlanningMiddleware: Task planning and progress tracking
 - SummarizationMiddleware: Automatic context compression when token limits approached
 - SensitiveToolGuardMiddleware: User authorization pause for configured sensitive tools
+- ProjectContextMiddleware: On-demand loading of project-specific background
 - ToolExceptionHandlerMiddleware: Smart tool error handling with strategies
 
 Available strategies (for ToolExceptionHandlerMiddleware):
@@ -72,6 +73,7 @@ from .base import (
     MiddlewareManager,
 )
 from .planning import PlanningMiddleware
+from .project_context import ProjectContextMiddleware
 from .sensitive_tool_guard import SensitiveToolGuardMiddleware
 from .summarization import SummarizationMiddleware
 from .tool_exception_handler import ToolExceptionHandlerMiddleware
@@ -88,6 +90,7 @@ __all__ = [
     "Middleware",
     "MiddlewareManager",
     "PlanningMiddleware",
+    "ProjectContextMiddleware",
     "SensitiveToolGuardMiddleware",
     "SummarizationMiddleware",
     "ToolExceptionHandlerMiddleware",
