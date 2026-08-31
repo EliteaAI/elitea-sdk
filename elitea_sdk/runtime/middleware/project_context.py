@@ -92,7 +92,12 @@ class ProjectContextMiddleware(Middleware):
         return [self._tool]
 
     def get_system_prompt(self) -> str:
-        return ""
+        return (
+            "Before answering, check whether the user's current request matches the "
+            "activation description of the `read_project_context` tool. You MUST call "
+            "that tool before answering every matching request, and skip it for unrelated "
+            "requests. Never apply Project Context unless you have loaded it."
+        )
 
     @staticmethod
     def _is_project_context_result(message) -> bool:

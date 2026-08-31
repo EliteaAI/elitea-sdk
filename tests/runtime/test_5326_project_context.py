@@ -23,12 +23,16 @@ def _middleware(**overrides):
 def test_loader_schema_carries_activation_but_not_full_context():
     middleware = _middleware()
     tool = middleware.get_tools()[0]
+    system_prompt = middleware.get_system_prompt()
 
     assert tool.name == "read_project_context"
     assert "generate, rewrite, or evaluate jokes" in tool.description
     assert "revision-7" in tool.description
     assert "dry, concise humor" not in tool.description
-    assert middleware.get_system_prompt() == ""
+    assert "MUST call" in system_prompt
+    assert "read_project_context" in system_prompt
+    assert "generate, rewrite, or evaluate jokes" not in system_prompt
+    assert "dry, concise humor" not in system_prompt
 
 
 def test_loader_returns_full_context_and_revision(caplog):
