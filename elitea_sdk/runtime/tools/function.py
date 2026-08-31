@@ -10,7 +10,7 @@ from uuid import uuid4
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.messages import ToolCall
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool, ToolException
+from langchain_core.tools import BaseTool
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
@@ -646,10 +646,6 @@ alita_client = elitea_client
             # continuations rebuild the application with the new OAuth token,
             # so the real tool executes before reaching this catch.
             return self._build_mcp_auth_refresh_termination(auth_payload)
-        except ValueError as value_error:
-            # re-raise the error as ToolException since it is related to toolkit configuration:
-            # example: incorrect input mappings etc.
-            raise ToolException(str(value_error))
         # save the whole error message to the tool's output
         except Exception as e:
             # A budget rejection is not a tool-input problem and cannot be retried

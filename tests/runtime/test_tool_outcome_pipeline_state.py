@@ -215,6 +215,26 @@ class TestNoFalsePositive:
         assert _outcome(result)["status"] == ToolResultStatus.SUCCESS.value
 
 
+# ─── Unwrapped ValueError still gets an outcome ──────────────────────
+
+
+class TestUnwrappedValueError:
+    """A ValueError from an unwrapped tool used to be re-raised as a bare ToolException
+    before the local classifier ran, so it produced no outcome at all. Regression guard."""
+
+    def test_unwrapped_value_error_reports_error(self):
+        node = _node(_tool(lambda issue_number: (_ for _ in ()).throw(ValueError("bad input"))))
+        result = _run(node)
+
+        assert _outcome(result)["status"] == ToolResultStatus.ERROR.value
+
+    def test_unwrapped_value_error_classified_as_input(self):
+        node = _node(_tool(lambda issue_number: (_ for _ in ()).throw(ValueError("bad input"))))
+        result = _run(node)
+
+        assert _outcome(result)["error_class"] == ToolErrorClass.INPUT.value
+
+
 # ─── No output variable declared ─────────────────────────────────────
 
 
@@ -446,3 +466,58 @@ class TestPipelineRouting:
 
         assert result["last_tool_outcome"]["status"] == "success"
         assert result["landed"] == "success-branch"
+
+
+# ─── Stale outcome must not leak into the next turn ──────────────────
+
+
+class TestStaleOutcomeCleared:
+    """A condition evaluated before this turn's first tool call must see this turn's
+    state, not a leftover outcome from whatever the previous turn's last tool call did."""
+
+    def _checkpoint_state(self, **values):
+        from unittest.mock import MagicMock
+
+        state = MagicMock()
+        state.values = values
+        return state
+
+    def test_stale_tool_outcomes_are_cleared(self):
+        from unittest.mock import MagicMock
+
+        from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable
+
+        fake_self = MagicMock()
+        checkpoint_state = self._checkpoint_state(
+            messages=[],
+            tool_outcomes={"prior_node": {"status": "error"}},
+            last_tool_outcome={"status": "error"},
+        )
+
+        LangGraphAgentRunnable._clear_stale_checkpoint(fake_self, {}, checkpoint_state)
+
+        cleared_keys = {
+            key
+            for call in fake_self.update_state.call_args_list
+            for key in call.args[1]
+        }
+        assert TOOL_OUTCOMES_KEY in cleared_keys
+        assert LAST_TOOL_OUTCOME_KEY in cleared_keys
+
+    def test_nothing_cleared_when_no_stale_outcome_present(self):
+        from unittest.mock import MagicMock
+
+        from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable
+
+        fake_self = MagicMock()
+        checkpoint_state = self._checkpoint_state(messages=[])
+
+        LangGraphAgentRunnable._clear_stale_checkpoint(fake_self, {}, checkpoint_state)
+
+        cleared_keys = {
+            key
+            for call in fake_self.update_state.call_args_list
+            for key in call.args[1]
+        }
+        assert TOOL_OUTCOMES_KEY not in cleared_keys
+        assert LAST_TOOL_OUTCOME_KEY not in cleared_keys

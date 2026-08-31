@@ -32,7 +32,9 @@ from .utils import (
     safe_format,
 )
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
-from ..tools.function import FunctionTool, PIPELINE_BLOCKED_KEY
+from ..tools.function import (
+    FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
+)
 from ..tools.hitl import (
     HITLNode,
     HITL_INTERRUPT_ID_KEY,
@@ -3430,6 +3432,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             self.update_state(config, {'_pipeline_blocked': None})
         if checkpoint_state.values.get('context_info'):
             self.update_state(config, {'context_info': None})
+        # A previous turn's tool outcome must not leak into a condition evaluated
+        # before this turn has called a tool of its own.
+        if checkpoint_state.values.get(TOOL_OUTCOMES_KEY):
+            self.update_state(config, {TOOL_OUTCOMES_KEY: None})
+        if checkpoint_state.values.get(LAST_TOOL_OUTCOME_KEY):
+            self.update_state(config, {LAST_TOOL_OUTCOME_KEY: None})
 
     @staticmethod
     def _inject_deferred_chat_history(input: dict, deferred_history: list | None) -> None:
