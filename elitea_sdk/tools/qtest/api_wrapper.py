@@ -267,9 +267,12 @@ UpdateTestRunStatus = create_model(
     test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
     status=(str, Field(description="Manual test run status. Standard values: 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete'. Must match a status name configured in the project's Field Settings.")),
     note=(Optional[str], Field(description="Optional execution note/comment to attach to the test log.", default=None)),
-    testcase_version_id=(Optional[int], Field(
-        description="Optional numeric test case version ID, not the version name. Use get_test_case_versions to resolve a name like '2.0'. If omitted, the test run's current version is used.",
-        default=None)),
+    testcase_version_id=(Optional[str], Field(
+        description="Optional numeric test case version ID or decimal version name such as '2.0'. Decimal names are resolved to qTest's internal ID before submission. If omitted, the test run's current version is used.",
+        default=None,
+        max_length=10,
+        pattern=r'^\d+(?:\.\d+)?$',
+        coerce_numbers_to_str=True)),
 )
 
 GetTestCaseVersions = create_model(
@@ -2429,6 +2432,46 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             )
         response.raise_for_status()
 
+    def __resolve_test_case_version_reference(
+            self, qtest_test_case_id: Optional[int], testcase_version_id: str | int | float) -> int:
+        """Resolve a numeric version ID or decimal version name to qTest's ID."""
+        version_reference = str(testcase_version_id).strip()
+        if len(version_reference) > 10 or not re.fullmatch(r'\d+(?:\.\d+)?', version_reference):
+            raise ToolException(
+                "Test case version must be a numeric ID or decimal version name "
+                "such as '2.0', up to 10 characters."
+            )
+
+        if '.' not in version_reference:
+            return int(version_reference)
+
+        if not qtest_test_case_id:
+            raise ToolException(
+                f"Unable to resolve test case version '{version_reference}' because the "
+                "selected test run exposes no test case ID. Use a numeric version ID instead."
+            )
+
+        versions = self.__fetch_test_case_versions(qtest_test_case_id)
+        match = next(
+            (
+                version for version in versions
+                if str(version.get('version') or '').strip() == version_reference
+            ),
+            None,
+        )
+        if not match or match.get('version_id') is None:
+            available = ', '.join(
+                f"{version.get('version')} (id={version.get('version_id')})"
+                for version in versions
+            ) or 'none'
+            raise ToolException(
+                f"Version '{version_reference}' is not among the versions qTest lists for "
+                f"test case {qtest_test_case_id} in project {self.qtest_project_id}. "
+                f"Known versions: {available}. Use get_test_case_versions to retrieve "
+                "valid version names and IDs."
+            )
+        return int(match['version_id'])
+
     @tool_group('read')
     def get_test_case_versions(self, test_case_id: str, version_name: str = None) -> dict:
         """List the versions of a QTest test case with their numeric version IDs."""
@@ -2470,7 +2513,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
     @tool_group('write')
     def update_test_run_status(self, test_run_id: str, status: str, note: str = None,
-                               testcase_version_id: int = None) -> str:
+                               testcase_version_id: str = None) -> str:
         """Record a manual test run's execution result (status) in QTest."""
         try:
             status_resource = self.__resolve_test_run_status(status)
@@ -2488,15 +2531,21 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                     f"{self.qtest_project_id}; a new execution log cannot be submitted."
                 )
 
+            resolved_testcase_version_id = None
             if testcase_version_id is not None:
                 qtest_test_case_id = test_run.get('Test Case Id')
+                resolved_testcase_version_id = self.__resolve_test_case_version_reference(
+                    qtest_test_case_id, testcase_version_id,
+                )
                 if qtest_test_case_id:
-                    self.__validate_test_case_version_id(qtest_test_case_id, testcase_version_id)
+                    self.__validate_test_case_version_id(
+                        qtest_test_case_id, resolved_testcase_version_id,
+                    )
                 else:
                     logger.debug(
                         "Test run %s exposes no test case id; submitting "
                         "test_case_version_id=%s without pre-validation.",
-                        test_run_id, testcase_version_id,
+                        test_run_id, resolved_testcase_version_id,
                     )
 
             # qTest requires a completed execution interval. Use the current UTC
@@ -2510,7 +2559,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 exe_start_date=execution_start,
                 exe_end_date=execution_end,
                 note=note,
-                test_case_version_id=testcase_version_id,
+                test_case_version_id=resolved_testcase_version_id,
             )
             serializer = self._client or swagger_client.ApiClient()
             payload_for_log = serializer.sanitize_for_serialization(body)
@@ -2553,7 +2602,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"in project {self.qtest_project_id} by creating a new manual execution log."
             )
             if testcase_version_id is not None:
-                message += f" Test case version id: {testcase_version_id}."
+                message += f" Test case version id: {resolved_testcase_version_id}."
             if test_log_id is not None:
                 message += f" Test log id: {test_log_id}."
             return message
@@ -2760,12 +2809,13 @@ Parameters:
 - test_run_id: Test run ID in format TR-123 or QTest numeric ID
 - status: One of 'Passed', 'Failed', 'Skipped', 'Blocked', 'Broken', 'No Result', 'Pending', 'Unknown', 'Incomplete' (must match project's configured status names)
 - note: Optional execution note
-- testcase_version_id: Optional numeric version ID (not the name - resolve it with get_test_case_versions). Omit to keep the run's current version.
+- testcase_version_id: Optional numeric version ID or decimal version name (for example '2.0'). Decimal names are resolved to qTest's internal ID. Omit to keep the run's current version.
 
 Examples:
 - Mark passed: test_run_id='TR-39', status='Passed'
 - Mark failed with note: test_run_id='TR-39', status='Failed', note='Login button unresponsive'
-- With a version: test_run_id='TR-39', status='Passed', testcase_version_id=4626964
+- With a version name: test_run_id='TR-39', status='Passed', testcase_version_id='2.0'
+- With a version ID: test_run_id='TR-39', status='Passed', testcase_version_id='4626964'
 """,
                 "args_schema": UpdateTestRunStatus,
                 "ref": self.update_test_run_status,
