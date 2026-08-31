@@ -3421,6 +3421,7 @@ class LLMNode(BaseTool):
                 new_messages.append(ToolMessage(
                     content=f"Error executing {tool_name}: {result}",
                     tool_call_id=tool_call_id,
+                    status="error",
                 ))
                 continue
             if isinstance(result, dict) and result.get('__hitl_deferred__'):
@@ -3739,6 +3740,8 @@ class LLMNode(BaseTool):
                                     **blocked_payload,
                                     'message': self._build_blocked_tool_guidance(blocked_payload),
                                 }
+                            # status stays 'success': a declined sensitive action is not
+                            # a tool failure, and status cannot carry ToolOutcome BLOCKED.
                             tool_message = ToolMessage(
                                 content=json.dumps(
                                     blocked_payload,
@@ -3829,7 +3832,8 @@ class LLMNode(BaseTool):
                         from langchain_core.messages import ToolMessage
                         tool_message = ToolMessage(
                             content=f"Error executing {tool_name}: {str(e)}",
-                            tool_call_id=tool_call_id
+                            tool_call_id=tool_call_id,
+                            status="error",
                         )
                         new_messages.append(tool_message)
                 else:
@@ -3838,7 +3842,8 @@ class LLMNode(BaseTool):
                     from langchain_core.messages import ToolMessage
                     tool_message = ToolMessage(
                         content=f"Tool '{tool_name}' not available",
-                        tool_call_id=tool_call_id
+                        tool_call_id=tool_call_id,
+                        status="error",
                     )
                     new_messages.append(tool_message)
 
@@ -4075,6 +4080,8 @@ class LLMNode(BaseTool):
                                 f"Please retry with more restrictive parameters."
                             )
                         
+                        # status stays 'success': the call succeeded, and status cannot
+                        # carry ToolOutcome TRUNCATED.
                         truncated_msg = ToolMessage(
                             content=truncated_content,
                             tool_call_id=tool_call_id
@@ -4158,7 +4165,8 @@ class LLMNode(BaseTool):
                             logger.info(f"Adding placeholder ToolMessage for interrupted tool call: {tool_name} ({tool_call_id})")
                             placeholder_msg = ToolMessage(
                                 content=f"[Tool execution interrupted - step limit ({effective_limit}) reached before {tool_name} could be executed]",
-                                tool_call_id=tool_call_id
+                                tool_call_id=tool_call_id,
+                                status="error",
                             )
                             new_messages.append(placeholder_msg)
             

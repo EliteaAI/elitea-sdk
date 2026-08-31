@@ -21,7 +21,10 @@ from .constants import (
     SEARCH_INDEX_ADDON, FILE_HANDLING_INSTRUCTIONS, DEAULT_AGENT_NAME,
     TASK_DELEGATION_ADDON,
 )
-from ..middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
+from ..middleware.tool_exception_handler import (
+    ToolExceptionHandlerMiddleware,
+    swarm_handle_tool_errors,
+)
 from ..middleware.base import Middleware, MiddlewareManager
 from ..models.agent_response import AgentResponse
 from ..utils.utils import deduplicate_tool_names
@@ -1138,9 +1141,11 @@ class Assistant:
             model_node = make_agent_node(model, tools, system_prompt, agent_name)
             builder.add_node("model", model_node)
 
-            # Standard ToolNode — handles Command objects natively for handoffs
+            # Standard ToolNode — handles Command objects natively for handoffs.
+            # handle_tool_errors is explicit: the upstream default re-raises and kills
+            # the graph, and True would swallow MCP-auth/budget signals (#6172).
             if tools:
-                tool_node = ToolNode(tools)
+                tool_node = ToolNode(tools, handle_tool_errors=swarm_handle_tool_errors)
                 builder.add_node("tools", tool_node)
 
             def should_continue(state):
@@ -1278,7 +1283,7 @@ class Assistant:
                     )
                 ]}
 
-            tool_node = ToolNode([handoff_back_tool])
+            tool_node = ToolNode([handoff_back_tool], handle_tool_errors=swarm_handle_tool_errors)
 
             builder.add_node("invoke", invoke_application)
             builder.add_node("tools", tool_node)
