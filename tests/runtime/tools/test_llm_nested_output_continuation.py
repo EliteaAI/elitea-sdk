@@ -197,9 +197,11 @@ def test_each_continuation_uses_fresh_context_with_accumulated_output_and_progre
     [
         ('Write a complete 1200-word story now.', 1200),
         ('Explain the design in approximately 900 words.', 900),
+        ('Tell a story about Elitea that contains 1000 words.', 1000),
         ('Please tell me in detail how to build a Rust worker system.', None),
         ('Review this 1200-word story and identify plot holes.', None),
         ('Summarize the attached 800-word report.', None),
+        ('Tell me whether this story contains 1000 words.', None),
     ],
 )
 def test_requested_output_word_target_is_confident_and_optional(prompt, expected):
@@ -235,6 +237,41 @@ def test_explicit_word_target_bounds_the_next_continuation_and_stops_at_boundary
     assert '100 words' in continuation_prompt
     assert '30 words remain' in continuation_prompt
     assert 45 < client.invoke.call_args.kwargs['max_tokens'] < client.max_tokens
+
+
+def test_pipeline_contains_word_target_stops_after_the_completed_story():
+    initial = ' '.join(f'word-{index}' for index in range(700))
+    target_sentence = ' '.join(f'word-{index}' for index in range(700, 1005))
+    overflow = ' '.join(f'word-{index}' for index in range(1005, 1100))
+    completed = f'{initial} {target_sentence}. {overflow}'
+    client = Mock()
+    client.max_tokens = 1000
+    client.invoke.return_value = AIMessage(
+        content=completed,
+        response_metadata={'finish_reason': 'length'},
+    )
+    node = LLMNode(client=client)
+
+    result = node._continue_nested_output(
+        messages=[
+            HumanMessage(
+                content='Tell a story about Elitea that contains 1000 words.'
+            )
+        ],
+        completion=AIMessage(
+            content=initial,
+            response_metadata={'finish_reason': 'length'},
+        ),
+        config=_pipeline_config(),
+    )
+
+    assert len(result.content.split()) == 1005
+    assert result.content.endswith('word-1004.')
+    assert 'word-1005' not in result.content
+    client.invoke.assert_called_once()
+    continuation_prompt = client.invoke.call_args.args[0][-1].content
+    assert '300 words remain' in continuation_prompt
+    assert client.invoke.call_args.kwargs['max_tokens'] < client.max_tokens
 
 
 def test_word_target_already_reached_at_safe_boundary_needs_no_continuation():

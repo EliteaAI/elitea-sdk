@@ -2334,6 +2334,10 @@ class LLMNode(BaseTool):
             return None
 
         creation_verb = r'(?:write|draft|compose|create|generate|produce)'
+        output_noun = (
+            r'(?:answer|article|content|description|document|essay|explanation|'
+            r'guide|report|response|story|summary|text)'
+        )
         count = r'(?P<count>[1-9]\d{1,5}(?:,\d{3})*)'
         qualified_count = re.search(
             rf'(?is)\b(?:in\s+)?(?:about|approximately|around|roughly|exactly|'
@@ -2341,7 +2345,15 @@ class LLMNode(BaseTool):
             rf'\s+words?\b',
             user_text,
         )
-        match = qualified_count or re.search(
+        contained_count = re.search(
+            rf'(?is)(?:\b{creation_verb}\b[^.\n]{{0,80}}?\b{output_noun}\b|'
+            rf'\btell(?:\s+me)?\s+(?:a|an|the)\s+story\b)'
+            rf'[^.\n]{{0,120}}?\b(?:that\s+)?(?:contains?|has|with)\s+'
+            rf'(?:about\s+|approximately\s+|around\s+|roughly\s+|exactly\s+)?'
+            rf'{count}\s+words?\b',
+            user_text,
+        )
+        match = qualified_count or contained_count or re.search(
             rf'(?is)\b{creation_verb}\b[^.\n]{{0,100}}?\b{count}'
             rf'\s*(?:-\s*|\s+)words?\b',
             user_text,
@@ -2352,10 +2364,38 @@ class LLMNode(BaseTool):
         return int(match.group('count').replace(',', ''))
 
     @staticmethod
-    def _ends_at_sentence_boundary(text: str) -> bool:
-        """Return whether an explicit prose budget ended at a safe stop point."""
-        stripped = text.rstrip().rstrip('"\'”’)]}')
-        return bool(stripped) and stripped[-1] in '.?!'
+    def _truncate_at_sentence_boundary_after_word_target(
+        text: str,
+        word_target: int,
+    ) -> Optional[str]:
+        """Bound explicit prose output at its first safe post-target sentence."""
+        words = list(re.finditer(r'\S+', text))
+        if len(words) < word_target:
+            return None
+
+        search_start = words[word_target - 1].start()
+        sentence_end = re.search(
+            r'[.?!](?:["\'”’)}\]]+)?(?=\s|$)',
+            text[search_start:],
+        )
+        if sentence_end is None:
+            return None
+        return text[:search_start + sentence_end.end()].rstrip()
+
+    @staticmethod
+    def _completion_with_text(completion: Any, text: str) -> Any:
+        """Return a completion with accumulated visible text and no tool calls."""
+        if hasattr(completion, 'model_copy'):
+            return completion.model_copy(update={
+                'content': text,
+                'tool_calls': [],
+            })
+        return AIMessage(
+            content=text,
+            response_metadata=dict(
+                getattr(completion, 'response_metadata', None) or {}
+            ),
+        )
 
     def _continuation_max_tokens(
         self,
@@ -2530,18 +2570,22 @@ class LLMNode(BaseTool):
         invalid_seam_retries = 0
         retrying_invalid_seam = False
 
-        if (
-            word_target is not None
-            and len(accumulated_text.split()) >= word_target
-            and self._ends_at_sentence_boundary(accumulated_text)
-        ):
+        bounded_text = (
+            self._truncate_at_sentence_boundary_after_word_target(
+                accumulated_text,
+                word_target,
+            )
+            if word_target is not None
+            else None
+        )
+        if bounded_text is not None:
             logger.info(
                 "[NESTED_CONTINUE] Explicit word target reached at a safe boundary "
                 "without another request (target=%d, actual=%d)",
                 word_target,
-                len(accumulated_text.split()),
+                len(bounded_text.split()),
             )
-            return completion
+            return self._completion_with_text(completion, bounded_text)
 
         for continuation_round in range(1, NESTED_OUTPUT_CONTINUATION_LIMIT + 1):
             accumulated_word_count = len(accumulated_text.split())
@@ -2645,11 +2689,16 @@ class LLMNode(BaseTool):
                     failure_reason='no_progress',
                 )
 
-            if (
-                word_target is not None
-                and len(accumulated_text.split()) >= word_target
-                and self._ends_at_sentence_boundary(accumulated_text)
-            ):
+            bounded_text = (
+                self._truncate_at_sentence_boundary_after_word_target(
+                    accumulated_text,
+                    word_target,
+                )
+                if word_target is not None
+                else None
+            )
+            if bounded_text is not None:
+                accumulated_text = bounded_text
                 logger.info(
                     "[NESTED_CONTINUE] Explicit word target reached at a safe boundary "
                     "(round=%d, target=%d, actual=%d)",
@@ -2683,17 +2732,7 @@ class LLMNode(BaseTool):
 
         if not accumulated_text:
             return current_completion
-        if hasattr(current_completion, 'model_copy'):
-            return current_completion.model_copy(update={
-                'content': accumulated_text,
-                'tool_calls': [],
-            })
-        return AIMessage(
-            content=accumulated_text,
-            response_metadata=dict(
-                getattr(current_completion, 'response_metadata', None) or {}
-            ),
-        )
+        return self._completion_with_text(current_completion, accumulated_text)
     
     def _run_async_in_sync_context(self, coro):
         """Run async coroutine from sync context.
