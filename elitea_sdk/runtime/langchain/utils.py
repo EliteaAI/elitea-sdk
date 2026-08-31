@@ -71,6 +71,13 @@ def _parallel_tasks_reducer(current: dict | None, update: dict | None) -> dict:
     return merged
 
 
+# Reducer for the ``tool_outcomes`` state field (issue #6171): a per-node map of
+# serialised ``ToolOutcome`` envelopes, written by every ``FunctionTool`` node so a
+# pipeline can branch on a typed status instead of substring-matching the message
+# history. Same merge-per-key / clear-on-None shape as ``_parallel_tasks_reducer``.
+_tool_outcomes_reducer = _parallel_tasks_reducer
+
+
 def _normalize_for_args_match(value: Any) -> Any:
     """Recursively normalize a value for HITL tool-args equality.
 
@@ -429,6 +436,12 @@ def create_state(data: Optional[dict] = None):
     # can use it directly.  Checked by conditional edges (truthy) to route
     # the pipeline to END cleanly.
     state_dict["_pipeline_blocked"] = Optional[str]
+    # Typed outcome of each FunctionTool node's tool call (issue #6171). Additive:
+    # declared output variables keep exactly the values they had before. Custom
+    # reducer: dict → per-node merge, None → clear. last_tool_outcome is the
+    # most recently written envelope, for the common single-check condition.
+    state_dict["tool_outcomes"] = Annotated[dict, _tool_outcomes_reducer]
+    state_dict["last_tool_outcome"] = Optional[dict]
     logger.debug(f"Created state: {state_dict}")
     return TypedDict('State', state_dict)
 

@@ -31,7 +31,9 @@ from .utils import (
     safe_format,
 )
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
-from ..tools.function import FunctionTool, PIPELINE_BLOCKED_KEY
+from ..tools.function import (
+    FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
+)
 from ..tools.hitl import (
     HITLNode,
     HITL_INTERRUPT_ID_KEY,
@@ -92,6 +94,7 @@ _INTERNAL_STATE_KEYS = {
     'context_info', 'state_types',
     'hitl_decisions', 'hitl_interrupt',
     ELITEA_RS, PRINTER_NODE_RS,
+    TOOL_OUTCOMES_KEY, LAST_TOOL_OUTCOME_KEY,
 }
 
 
@@ -585,8 +588,11 @@ class ConditionalEdge(Runnable):
         for field in self.condition_inputs:
             if field == 'messages':
                 input_data['messages'] = convert_message_to_json(state.get('messages', []))
-            elif field == 'last_message' and state.get('messages'):
-                input_data['last_message'] = state['messages'][-1].content
+            elif field == 'last_message':
+                # Always defined: an undefined name makes a valid condition fail as a
+                # template error on a message-less predecessor (issue #6171).
+                messages = state.get('messages') or []
+                input_data['last_message'] = messages[-1].content if messages else ''
             else:
                 input_data[field] = state.get(field, "")
         template = EvaluateTemplate(self.condition, input_data)
@@ -3432,6 +3438,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             self.update_state(config, {'_pipeline_blocked': None})
         if checkpoint_state.values.get('context_info'):
             self.update_state(config, {'context_info': None})
+        # A previous turn's tool outcome must not leak into a condition evaluated
+        # before this turn has called a tool of its own.
+        if checkpoint_state.values.get(TOOL_OUTCOMES_KEY):
+            self.update_state(config, {TOOL_OUTCOMES_KEY: None})
+        if checkpoint_state.values.get(LAST_TOOL_OUTCOME_KEY):
+            self.update_state(config, {LAST_TOOL_OUTCOME_KEY: None})
 
     @staticmethod
     def _inject_deferred_chat_history(input: dict, deferred_history: list | None) -> None:
