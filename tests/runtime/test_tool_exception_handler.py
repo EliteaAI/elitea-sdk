@@ -570,7 +570,8 @@ class TestPipelineFailureShapes:
         with patch("elitea_sdk.runtime.tools.function.dispatch_custom_event"):
             result = node.invoke({})
 
-        assert set(result) == {"issue"}
+        # The outcome keys are additive (issue #6171); the declared variable is unchanged.
+        assert set(result) == {"issue", "tool_outcomes", "last_tool_outcome"}
         assert result["issue"] == (
             "Tool 'update_issue' failed.\n"
             "\n"
@@ -587,5 +588,5 @@ class TestPipelineFailureShapes:
             result = node.invoke({})
 
         # The declared output variable is absent entirely — not empty, absent.
-        assert set(result) == {"messages"}
+        assert set(result) == {"messages", "tool_outcomes", "last_tool_outcome"}
         assert "connection refused" in result["messages"][0]["content"]

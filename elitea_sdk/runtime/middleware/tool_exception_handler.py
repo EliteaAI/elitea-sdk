@@ -35,6 +35,7 @@ from elitea_sdk.runtime.tool_outcome import (
     ToolOutcome,
     ToolResultStatus,
     classify_tool_error,
+    record_outcome,
     retriable_for,
 )
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
@@ -360,6 +361,9 @@ When a tool fails with an error:
             outcome.model_dump(mode='json', exclude={'message'}),
             label='error outcome',
         )
+        # Hand the envelope to a caller that installed a sink (a pipeline node); the
+        # agent loop installs none, so this is a no-op there.
+        record_outcome(outcome)
         return outcome
 
     @staticmethod

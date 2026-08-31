@@ -3,8 +3,10 @@
 Consumers (the LLM, the ToolMessage on the wire, a pipeline node's state) read these
 fields instead of each re-deriving them by substring-matching an error string.
 """
+import contextvars
+from contextlib import contextmanager
 from enum import Enum
-from typing import Iterator, Optional
+from typing import Iterator, List, Optional
 
 from pydantic import BaseModel
 
@@ -38,6 +40,31 @@ class ToolOutcome(BaseModel):
     toolkit_type: Optional[str] = None
     truncated: bool = False
     original_size: Optional[int] = None
+
+
+# Channel from the middleware that builds an outcome back to the caller that needs it.
+# Caller-owned so a stale read is impossible: no sink installed, nothing recorded.
+_OUTCOME_SINK: contextvars.ContextVar[Optional[List[ToolOutcome]]] = contextvars.ContextVar(
+    '_tool_outcome_sink', default=None,
+)
+
+
+@contextmanager
+def outcome_sink() -> Iterator[List[ToolOutcome]]:
+    """Collect the outcomes recorded while running the block."""
+    sink: List[ToolOutcome] = []
+    token = _OUTCOME_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _OUTCOME_SINK.reset(token)
+
+
+def record_outcome(outcome: ToolOutcome) -> None:
+    """No-op unless a caller installed a sink, which the agent tool loop never does."""
+    sink = _OUTCOME_SINK.get()
+    if sink is not None:
+        sink.append(outcome)
 
 
 # Matched by isinstance. ValueError covers pydantic ValidationError, which subclasses it.

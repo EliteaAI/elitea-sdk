@@ -42,10 +42,19 @@ class EvaluateTemplate(metaclass=MyABC):
             template = environment.from_string(self.query)
             logger.info(f"Condition context: {self.context}")
             result = template.render(**self.context)
-        except (TemplateSyntaxError, UndefinedError):
+        except TemplateSyntaxError as exc:
             logger.critical(format_exc())
             logger.info('Template str: %s', self.query)
-            raise Exception("Invalid jinja template in context")
+            raise Exception(f"Invalid jinja template: {exc.message}")
+        except UndefinedError as exc:
+            # The template is valid; the data it referenced is missing. Saying "invalid
+            # template" here sends the author to debug the wrong thing (issue #6171).
+            logger.critical(format_exc())
+            logger.info('Template str: %s', self.query)
+            raise Exception(
+                f"Jinja template referenced a value that is not available: {exc}. "
+                f"Available names: {sorted(self.context)}"
+            )
         return result
         
     # template method

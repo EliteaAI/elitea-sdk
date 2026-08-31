@@ -15,6 +15,14 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from ..exceptions import budget_exceeded_from
+from ..tool_outcome import (
+    ToolOutcome,
+    ToolResultStatus,
+    classify_tool_error,
+    outcome_sink,
+    record_outcome,
+    retriable_for,
+)
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -25,6 +33,11 @@ logger = logging.getLogger(__name__)
 
 # State key used to signal that a FunctionTool node was blocked
 PIPELINE_BLOCKED_KEY = '_pipeline_blocked'
+
+# State keys carrying the typed outcome of this node's tool call, so a pipeline can
+# route on failure without pattern-matching the message history.
+TOOL_OUTCOMES_KEY = 'tool_outcomes'
+LAST_TOOL_OUTCOME_KEY = 'last_tool_outcome'
 
 def replace_escaped_newlines(data):
     """
@@ -409,6 +422,47 @@ alita_client = elitea_client
             config: Optional[RunnableConfig] = None,
             **kwargs: Any,
     ) -> Any:
+        with outcome_sink() as sink:
+            result = self._invoke_node(state, config, **kwargs)
+        return self._with_outcome(result, sink)
+
+    def _outcome_for(self, result: dict, sink: list) -> ToolOutcome:
+        """The typed outcome of the call that produced ``result``."""
+        tool_name = getattr(self.tool, 'name', None)
+        toolkit_type = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_type')
+        if result.get(PIPELINE_BLOCKED_KEY):
+            # A decline or an auth skip is a deliberate user choice, not a failure.
+            return ToolOutcome(
+                status=ToolResultStatus.BLOCKED,
+                message=str(result[PIPELINE_BLOCKED_KEY]),
+                tool_name=tool_name,
+                toolkit_type=toolkit_type,
+            )
+        if sink:
+            return sink[-1]
+        return ToolOutcome(
+            status=ToolResultStatus.SUCCESS,
+            message='',
+            tool_name=tool_name,
+            toolkit_type=toolkit_type,
+        )
+
+    def _with_outcome(self, result: Any, sink: list) -> Any:
+        """Add the outcome keys. Purely additive — declared output variables are untouched."""
+        if not isinstance(result, dict):
+            return result
+        payload = self._outcome_for(result, sink).model_dump(mode='json')
+        node_key = self.name or getattr(self.tool, 'name', '') or ''
+        result[TOOL_OUTCOMES_KEY] = {node_key: payload}
+        result[LAST_TOOL_OUTCOME_KEY] = payload
+        return result
+
+    def _invoke_node(
+            self,
+            state: Union[str, dict, ToolCall],
+            config: Optional[RunnableConfig] = None,
+            **kwargs: Any,
+    ) -> Any:
         params = convert_to_openai_tool(self.tool).get(
             'function', {'parameters': {}}).get(
             'parameters', {'properties': {}}).get('properties', {})
@@ -602,6 +656,16 @@ alita_client = elitea_client
             budget_error = budget_exceeded_from(e)
             if budget_error is not None:
                 raise budget_error from e
+            # Reached only when the middleware never wrapped this tool, so classify here.
+            error_class = classify_tool_error(e)
+            record_outcome(ToolOutcome(
+                status=ToolResultStatus.ERROR,
+                message=str(e),
+                tool_name=getattr(self.tool, 'name', None),
+                error_class=error_class,
+                retriable=retriable_for(error_class),
+                exception_type=type(e).__name__,
+            ))
             return {"messages": [
                 {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
                         \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}"""}]}

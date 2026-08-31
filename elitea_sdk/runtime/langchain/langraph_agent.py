@@ -586,8 +586,11 @@ class ConditionalEdge(Runnable):
         for field in self.condition_inputs:
             if field == 'messages':
                 input_data['messages'] = convert_message_to_json(state.get('messages', []))
-            elif field == 'last_message' and state.get('messages'):
-                input_data['last_message'] = state['messages'][-1].content
+            elif field == 'last_message':
+                # Always defined: an undefined name makes a valid condition fail as a
+                # template error on a message-less predecessor (issue #6171).
+                messages = state.get('messages') or []
+                input_data['last_message'] = messages[-1].content if messages else ''
             else:
                 input_data[field] = state.get(field, "")
         template = EvaluateTemplate(self.condition, input_data)
