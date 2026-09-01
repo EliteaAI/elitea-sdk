@@ -97,6 +97,16 @@ ListFoldersModel = create_model(
 )
 GetIssuesModel = create_model(
     "GetIssuesModel",
+    state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
+    page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
+    per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
+    created_after=(Optional[str], Field(default=None, description="Return issues created after this ISO datetime")),
+    created_before=(Optional[str], Field(default=None, description="Return issues created before this ISO datetime")),
+    updated_after=(Optional[str], Field(default=None, description="Return issues updated after this ISO datetime")),
+    updated_before=(Optional[str], Field(default=None, description="Return issues updated before this ISO datetime")),
+    author_username=(Optional[str], Field(default=None, description="Filter by author username")),
+    labels=(Optional[str], Field(default=None, description="Comma-separated list of labels to filter by")),
+    fetch_all=(bool, Field(default=False, description="If True, fetch all pages instead of a single page")),
 )
 SetActiveBranchModel = create_model(
     "SetActiveBranchModel",
@@ -389,14 +399,76 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     def parse_issues(self, issues: List[Any]) -> List[dict]:
         parsed = []
         for issue in issues:
-            title = issue.title
-            number = issue.iid
-            parsed.append({"title": title, "number": number})
+            parsed.append({
+                "title": issue.title,
+                "number": issue.iid,
+                "state": issue.state,
+                "labels": issue.labels,
+                "author": (issue.author or {}).get("username"),
+                "created_at": issue.created_at,
+                "updated_at": issue.updated_at,
+            })
         return parsed
 
     @tool_group('read')
-    def get_issues(self) -> str:
-        issues = self.repo_instance.issues.list(state="opened")
+    def get_issues(
+        self,
+        state: Optional[str] = "opened",
+        page: Optional[int] = None,
+        per_page: Optional[int] = 20,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        updated_before: Optional[str] = None,
+        author_username: Optional[str] = None,
+        labels: Optional[str] = None,
+        fetch_all: bool = False,
+    ) -> str:
+        """
+        List issues in the repository (#6213).
+
+        Supports filtering by state, time window (created/updated), author
+        and labels, plus pagination so large issue sets are no longer
+        silently truncated to a single ~20-item page.
+
+        Parameters:
+            state: opened | closed | all
+            page: Page number (ignored when fetch_all=True)
+            per_page: Results per page (ignored when fetch_all=True)
+            created_after: ISO datetime lower bound on created_at
+            created_before: ISO datetime upper bound on created_at
+            updated_after: ISO datetime lower bound on updated_at
+            updated_before: ISO datetime upper bound on updated_at
+            author_username: Filter by author username
+            labels: Comma-separated labels to filter by
+            fetch_all: Fetch all pages when True
+        """
+        params: Dict[str, Any] = {}
+        if state and state != "all":
+            params["state"] = state
+        if created_after:
+            params["created_after"] = created_after
+        if created_before:
+            params["created_before"] = created_before
+        if updated_after:
+            params["updated_after"] = updated_after
+        if updated_before:
+            params["updated_before"] = updated_before
+        if author_username:
+            params["author_username"] = author_username
+        if labels:
+            params["labels"] = labels
+
+        try:
+            if fetch_all:
+                params["all"] = True
+            else:
+                params["page"] = page or 1
+                params["per_page"] = per_page or 20
+            issues = self.repo_instance.issues.list(**params)
+        except Exception as e:
+            raise ToolException(f"Unable to list issues due to error:\n{e}")
+
         if len(issues) > 0:
             parsed_issues = self.parse_issues(issues)
             parsed_issues_str = (
@@ -404,7 +476,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             )
             return parsed_issues_str
         else:
-            return "No open issues available"
+            return "No issues found matching the given filters"
 
     @tool_group('read')
     def get_issue(self, issue_number: int) -> Dict[str, Any]:
@@ -422,7 +494,11 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             for comment in comments_page:
                 comment = issue.notes.get(comment.id)
                 comments.append(
-                    {"body": comment.body, "user": comment.author["username"]}
+                    {
+                        "body": comment.body,
+                        "user": comment.author["username"],
+                        "created_at": comment.created_at,
+                    }
                 )
             page += 1
 
@@ -1020,7 +1096,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             {
                 "name": "get_issues",
                 "ref": self.get_issues,
-                "description": self.get_issues.__doc__ or "Get all open issues in the repository.",
+                "description": self.get_issues.__doc__ or "List issues in the repository with state, pagination and filters.",
                 "args_schema": GetIssuesModel,
             },
             {
