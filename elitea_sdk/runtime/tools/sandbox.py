@@ -319,9 +319,15 @@ class PyodideSandboxTool(BaseTool):
                 with open(sandbox_client_path, 'r') as f:
                     sandbox_client_code = f.read()
                 pyodide_predata += f"{sandbox_client_code.replace('\\n', '\\\n')}\n"
+                # Session auth (#6486): no PAT to hand over, so pass the session reference.
+                _token = self.elitea_client.auth_token
+                _session = getattr(self.elitea_client, 'auth_session', None)
+                _cookie = getattr(self.elitea_client, 'session_cookie_name', None)
                 pyodide_predata += (f"elitea_client = SandboxClient(base_url='{self.elitea_client.base_url}',"
                                     f"project_id={self.elitea_client.project_id},"
-                                    f"auth_token='{self.elitea_client.auth_token}')\n")
+                                    f"auth_token={_token!r},"
+                                    f"auth_session={_session!r},"
+                                    f"session_cookie_name={_cookie!r})\n")
             except FileNotFoundError:
                 logger.error(f"sandbox_client.py not found. Ensure the file exists.")
 

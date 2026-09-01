@@ -217,16 +217,19 @@ class SandboxClient:
                  project_id: int,
                  auth_token: str,
                  api_extra_headers: Optional[dict] = None,
+                 auth_session: Optional[str] = None,
+                 session_cookie_name: Optional[str] = None,
                  **kwargs):
 
         self.base_url = base_url.rstrip('/')
         self.api_v2_path = '/api/v2'
         self.project_id = project_id
         self.auth_token = auth_token
-        self.headers = {
-            'Authorization': f'Bearer {auth_token}',
-            'X-SECRET': kwargs.get('XSECRET', 'secret')
-        }
+        self.auth_session = auth_session if not auth_token else None
+        self.session_cookie_name = session_cookie_name
+        self.headers = {'X-SECRET': kwargs.get('XSECRET', 'secret')}
+        if auth_token:
+            self.headers['Authorization'] = f'Bearer {auth_token}'
         if api_extra_headers is not None:
             self.headers.update(api_extra_headers)
         self.app = f'{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/{self.project_id}'
@@ -245,6 +248,9 @@ class SandboxClient:
         # endpoint raises instead of parking the worker forever (#6246).
         self.timeout = kwargs.get('timeout', (5, 30))
         self._session = requests.Session()
+        # No PAT: authenticate with the user's session cookie, like the browser does.
+        if self.auth_session and self.session_cookie_name:
+            self._session.cookies.set(self.session_cookie_name, self.auth_session)
 
     def _request(self, method: str, url: str, **kwargs):
         kwargs.setdefault('timeout', self.timeout)
