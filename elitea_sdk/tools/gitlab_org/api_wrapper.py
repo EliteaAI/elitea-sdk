@@ -38,7 +38,17 @@ GitlabSetActiveBranch = create_model(
 
 GitLabGetIssues = create_model(
     "GitLabGetIssuesModel",
-    repository=(Optional[str], Field(description="Name of the repository", default=None))
+    repository=(Optional[str], Field(description="Name of the repository", default=None)),
+    state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
+    page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
+    per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
+    created_after=(Optional[str], Field(default=None, description="Return issues created after this ISO datetime")),
+    created_before=(Optional[str], Field(default=None, description="Return issues created before this ISO datetime")),
+    updated_after=(Optional[str], Field(default=None, description="Return issues updated after this ISO datetime")),
+    updated_before=(Optional[str], Field(default=None, description="Return issues updated before this ISO datetime")),
+    author_username=(Optional[str], Field(default=None, description="Filter by author username")),
+    labels=(Optional[str], Field(default=None, description="Comma-separated list of labels to filter by")),
+    fetch_all=(bool, Field(default=False, description="If True, fetch all pages instead of a single page")),
 )
 
 GitLabGetIssue = create_model(
@@ -286,17 +296,77 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         return f"Branch {branch_name} created successfully and set as active"
 
     @tool_group('read')
-    def get_issues(self, repository: Optional[str] = None) -> str:
-        """Fetches all open issues from the repo."""
+    def get_issues(
+        self,
+        repository: Optional[str] = None,
+        state: Optional[str] = "opened",
+        page: Optional[int] = None,
+        per_page: Optional[int] = 20,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        updated_before: Optional[str] = None,
+        author_username: Optional[str] = None,
+        labels: Optional[str] = None,
+        fetch_all: bool = False,
+    ) -> str:
+        """
+        List issues from the repo with state, pagination and filters (#6213).
+
+        Parameters:
+            repository: Name of the repository (targets a specific repo in the org)
+            state: opened | closed | all
+            page: Page number (ignored when fetch_all=True)
+            per_page: Results per page (ignored when fetch_all=True)
+            created_after: ISO datetime lower bound on created_at
+            created_before: ISO datetime upper bound on created_at
+            updated_after: ISO datetime lower bound on updated_at
+            updated_before: ISO datetime upper bound on updated_at
+            author_username: Filter by author username
+            labels: Comma-separated labels to filter by
+            fetch_all: Fetch all pages when True
+        """
 
         try:
             repo_instance = self._get_repo(repository)
-            issues = repo_instance.issues.list(state="opened")
+            params: Dict[str, Any] = {}
+            if state and state != "all":
+                params["state"] = state
+            if created_after:
+                params["created_after"] = created_after
+            if created_before:
+                params["created_before"] = created_before
+            if updated_after:
+                params["updated_after"] = updated_after
+            if updated_before:
+                params["updated_before"] = updated_before
+            if author_username:
+                params["author_username"] = author_username
+            if labels:
+                params["labels"] = labels
+            if fetch_all:
+                params["all"] = True
+            else:
+                params["page"] = page or 1
+                params["per_page"] = per_page or 20
+
+            issues = repo_instance.issues.list(**params)
             if issues:
-                parsed_issues = [{"title": issue.title, "number": issue.iid} for issue in issues]
+                parsed_issues = [
+                    {
+                        "title": issue.title,
+                        "number": issue.iid,
+                        "state": issue.state,
+                        "labels": issue.labels,
+                        "author": (issue.author or {}).get("username"),
+                        "created_at": issue.created_at,
+                        "updated_at": issue.updated_at,
+                    }
+                    for issue in issues
+                ]
                 return f"Found {len(parsed_issues)} issues:\n{parsed_issues}"
             else:
-                return "No open issues available"
+                return "No issues found matching the given filters"
         except Exception as e:
             raise ToolException(e)
 
@@ -307,7 +377,10 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         try:
             repo_instance = self._get_repo(repository)
             issue = repo_instance.issues.get(issue_number)
-            comments = [{"body": comment.body, "user": comment.author["username"]} for comment in issue.notes.list()[:10]]
+            comments = [
+                {"body": comment.body, "user": comment.author["username"], "created_at": comment.created_at}
+                for comment in issue.notes.list()[:10]
+            ]
             return {"title": issue.title, "body": issue.description, "comments": comments}
         except Exception as e:
             raise ToolException(e)
