@@ -498,3 +498,41 @@ class TestNestedEnvelopeErrorText:
     def test_top_level_content_is_still_preferred(self):
         flat = {"isError": True, "content": [{"type": "text", "text": "boom"}]}
         assert mcp_error_message(flat) == "boom"
+
+
+class TestProxiedClientContract:
+    """The proxied path crosses three repos: elitea-mcp-client renders the CallToolResult,
+    pylon_main forwards it verbatim, and McpServerTool inspects it here. The client used to
+    flatten every result to content[0].text, so isError never survived the trip and the
+    enforcement below could not fire. These pin the shapes the client now emits."""
+
+    def _tool(self, payload):
+        client = MagicMock()
+        client.mcp_tool_call.return_value = payload
+        from elitea_sdk.runtime.tools.mcp_server_tool import McpServerTool
+        return McpServerTool(
+            name="do_thing", description="test tool", client=client, server="test-server",
+            metadata={"toolkit_name": "github", "toolkit_type": "mcp"},
+        )
+
+    def test_client_failure_envelope_raises(self):
+        """Exactly what render_tool_result returns for an isError CallToolResult."""
+        payload = {"isError": True, "content": [{"type": "text", "text": "repo not found"}]}
+
+        with pytest.raises(ToolException, match="repo not found"):
+            self._tool(payload)._run(query="x")
+
+    def test_client_success_string_still_passes_through(self):
+        """Success stays a bare string on that channel, and must not be read as a failure."""
+        assert self._tool("all good")._run(query="x") == "all good"
+
+    def test_platform_served_failure_envelope_raises(self):
+        """elitea_core serves MCP too; its CallToolResult now carries isError, and it
+        arrives wrapped in a JSON-RPC envelope."""
+        payload = {
+            "jsonrpc": "2.0", "id": 3,
+            "result": {"isError": True, "content": [{"type": "text", "text": "Prediction failure"}]},
+        }
+
+        with pytest.raises(ToolException, match="Prediction failure"):
+            self._tool(payload)._run(query="x")
