@@ -8,6 +8,46 @@ class PipelineConfigurationError(Exception):
     pass
 
 
+class OutputContinuationExhausted(Exception):
+    """Raised when a non-interactive LLM output cannot be completed safely."""
+
+    error_code = "output_continuation_exhausted"
+
+    def __init__(
+        self,
+        *,
+        attempts: int,
+        partial_output: str = "",
+        stop_reason: str | None = None,
+        failure_reason: str = "attempt_limit",
+    ):
+        self.attempts = attempts
+        self.partial_output = partial_output
+        self.stop_reason = stop_reason
+        self.failure_reason = failure_reason
+        if failure_reason == "attempt_limit":
+            self.user_message = (
+                f"All {attempts} automatic continuation attempts were exhausted. "
+                "The model response is incomplete."
+            )
+        elif failure_reason == "no_progress":
+            self.user_message = (
+                "Automatic continuation stopped because the model did not produce "
+                "any new output. The model response is incomplete."
+            )
+        elif failure_reason == "invalid_continuation":
+            self.user_message = (
+                "Automatic continuation stopped because the model did not resume "
+                "from the verified output boundary. The model response is incomplete."
+            )
+        else:
+            self.user_message = (
+                "Automatic continuation failed while requesting more output from "
+                "the model. The model response is incomplete."
+            )
+        super().__init__(self.user_message)
+
+
 # Error shape the platform's LLM proxy returns when a cost budget blocks a request.
 # Scope tells the caller which budget was reached, which drives the message shown.
 BUDGET_ERROR_TYPE = "budget_exceeded"

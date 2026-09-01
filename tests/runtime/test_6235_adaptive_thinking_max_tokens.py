@@ -44,16 +44,20 @@ class TestAdaptiveThinkingMaxTokensPadding:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["effort"] == effort
 
-    def test_adaptive_model_pads_default_auto_max_tokens(self):
-        """max_tokens: -1 (auto) is defaulted to 4000, then padded by the budget."""
+    def test_adaptive_model_default_uses_model_max_without_padding(self):
+        """Default uses the configured model maximum, which already includes thinking."""
         client = _make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
             client.get_llm(
                 "eu.anthropic.claude-sonnet-5",
-                {"reasoning_effort": "medium", "max_tokens": -1},
+                {
+                    "reasoning_effort": "medium",
+                    "max_tokens": -1,
+                    "max_output_tokens": 64000,
+                },
             )
         kwargs = mock_anthropic.call_args.kwargs
-        assert kwargs["max_tokens"] == 4000 + 4096
+        assert kwargs["max_tokens"] == 64000
 
     def test_opus_4_7_adaptive_model_also_padded(self):
         client = _make_client()

@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 from traceback import format_exc
 from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -35,7 +36,7 @@ from ..langchain.utils import (
     normalize_null_tool_call_ids,
     propagate_the_input_mapping,
 )
-from ..exceptions import budget_exceeded_from
+from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ..utils.mcp_oauth import (
     McpAuthorizationRequired,
@@ -63,12 +64,10 @@ logger = logging.getLogger(__name__)
 SENSITIVE_TOOL_BLOCKED_RESULT_TYPE = 'sensitive_tool_blocked'
 STRUCTURED_OUTPUT_PREFILL_PROMPT = "Now produce the structured output based on the information above."
 NESTED_OUTPUT_CONTINUATION_LIMIT = 4
-NESTED_OUTPUT_CONTINUATION_PROMPT = (
-    "The previous assistant output was cut off by its output-token limit. "
-    "Continue exactly where it stopped. Output only the missing continuation; "
-    "do not repeat or restart anything already written. Preserve any leading "
-    "whitespace needed to join the continuation to the previous output."
-)
+NESTED_OUTPUT_CONTINUATION_ANCHOR_MAX_CHARS = 160
+NESTED_OUTPUT_CONTINUATION_MIN_OVERLAP_CHARS = 8
+NESTED_OUTPUT_CLOSURE_MAX_TOKENS = 128
+NESTED_OUTPUT_INVALID_SEAM_RETRY_LIMIT = 1
 NESTED_REASONING_ONLY_CONTINUATION_PROMPT = (
     "The previous model attempt reached its output-token limit during internal "
     "reasoning before producing visible output. Produce the visible answer now. "
@@ -1051,6 +1050,8 @@ class LLMNode(BaseTool):
         try:
             result = self._invoke_llm_internal(state, config, middleware_updates)
         except GraphBubbleUp:
+            raise
+        except OutputContinuationExhausted:
             raise
         except Exception as e:
             # A budget rejection is a policy outcome with no recovery, so it must not
@@ -2227,11 +2228,11 @@ class LLMNode(BaseTool):
         return result
 
     @staticmethod
-    def _completion_finished_by_length(completion: Any) -> bool:
-        """Normalize provider-specific output-limit metadata on an AI message."""
+    def _completion_stop_reason(completion: Any) -> str:
+        """Return a normalized provider stop reason from an AI message."""
         metadata = getattr(completion, 'response_metadata', None) or {}
         if not isinstance(metadata, dict):
-            return False
+            return ''
 
         reason = metadata.get('stop_reason') or metadata.get('finish_reason')
         if not reason and metadata.get('status') == 'incomplete':
@@ -2239,7 +2240,13 @@ class LLMNode(BaseTool):
             if isinstance(incomplete_details, dict):
                 reason = incomplete_details.get('reason')
 
-        return str(reason or '').lower() in {
+        return str(reason or '').lower()
+
+    @classmethod
+    def _completion_finished_by_length(cls, completion: Any) -> bool:
+        """Normalize provider-specific output-limit metadata on an AI message."""
+
+        return cls._completion_stop_reason(completion) in {
             'length',
             'max_tokens',
             'max_output_tokens',
@@ -2300,6 +2307,248 @@ class LLMNode(BaseTool):
         )
         return f'{existing}{separator}{continuation}'
 
+    @staticmethod
+    def _continuation_anchor(existing: str) -> str:
+        """Return a bounded, visible suffix used to prove the merge seam."""
+        return existing.rstrip()[-NESTED_OUTPUT_CONTINUATION_ANCHOR_MAX_CHARS:]
+
+    @staticmethod
+    def _requested_output_word_target(messages: List) -> Optional[int]:
+        """Return a confidently stated output word target from the latest request.
+
+        A hyphenated count is accepted only after an output-creation verb. A
+        plain ``N words`` count additionally needs either that verb or a length
+        qualifier. This deliberately ignores source descriptions such as
+        ``review this 1200-word story``.
+        """
+        user_text = next(
+            (
+                message.content
+                for message in reversed(messages)
+                if isinstance(message, HumanMessage)
+                and isinstance(message.content, str)
+            ),
+            '',
+        )
+        if not user_text:
+            return None
+
+        creation_verb = r'(?:write|draft|compose|create|generate|produce)'
+        output_noun = (
+            r'(?:answer|article|content|description|document|essay|explanation|'
+            r'guide|report|response|story|summary|text)'
+        )
+        count = r'(?P<count>[1-9]\d{1,5}(?:,\d{3})*)'
+        qualified_count = re.search(
+            rf'(?is)\b(?:in\s+)?(?:about|approximately|around|roughly|exactly|'
+            rf'at\s+least|no\s+more\s+than|up\s+to|under|within)\s+{count}'
+            rf'\s+words?\b',
+            user_text,
+        )
+        contained_count = re.search(
+            rf'(?is)(?:\b{creation_verb}\b[^.\n]{{0,80}}?\b{output_noun}\b|'
+            rf'\btell(?:\s+me)?\s+(?:a|an|the)\s+story\b)'
+            rf'[^.\n]{{0,120}}?\b(?:that\s+)?(?:contains?|has|with)\s+'
+            rf'(?:about\s+|approximately\s+|around\s+|roughly\s+|exactly\s+)?'
+            rf'{count}\s+words?\b',
+            user_text,
+        )
+        match = qualified_count or contained_count or re.search(
+            rf'(?is)\b{creation_verb}\b[^.\n]{{0,100}}?\b{count}'
+            rf'\s*(?:-\s*|\s+)words?\b',
+            user_text,
+        )
+        if not match:
+            return None
+
+        return int(match.group('count').replace(',', ''))
+
+    @staticmethod
+    def _truncate_at_sentence_boundary_after_word_target(
+        text: str,
+        word_target: int,
+    ) -> Optional[str]:
+        """Bound explicit prose output at its first safe post-target sentence."""
+        words = list(re.finditer(r'\S+', text))
+        if len(words) < word_target:
+            return None
+
+        search_start = words[word_target - 1].start()
+        sentence_end = re.search(
+            r'[.?!](?:["\'”’)}\]]+)?(?=\s|$)',
+            text[search_start:],
+        )
+        if sentence_end is None:
+            return None
+        return text[:search_start + sentence_end.end()].rstrip()
+
+    @staticmethod
+    def _completion_with_text(completion: Any, text: str) -> Any:
+        """Return a completion with accumulated visible text and no tool calls."""
+        if hasattr(completion, 'model_copy'):
+            return completion.model_copy(update={
+                'content': text,
+                'tool_calls': [],
+            })
+        return AIMessage(
+            content=text,
+            response_metadata=dict(
+                getattr(completion, 'response_metadata', None) or {}
+            ),
+        )
+
+    def _continuation_max_tokens(
+        self,
+        *,
+        remaining_words: int,
+        anchor: str,
+        closure_only: bool,
+    ) -> Optional[int]:
+        """Reduce, but never increase, a configured per-call output limit."""
+        if closure_only:
+            desired_limit = NESTED_OUTPUT_CLOSURE_MAX_TOKENS
+        else:
+            # English prose is normally about 1.3 tokens per word. The 3/2
+            # multiplier plus the echoed seam leaves modest tokenizer variance.
+            desired_limit = max(1, (remaining_words * 3 + 1) // 2)
+            desired_limit += max(8, len(anchor) // 4)
+
+        configured_limit = None
+        for field_name in ('max_tokens', 'max_completion_tokens'):
+            value = getattr(self.client, field_name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                configured_limit = value
+                break
+
+        if configured_limit is None:
+            # Default mode intentionally has no Elitea-defined provider cap.
+            # Keep that contract and rely on the semantic budget prompt.
+            return None
+        return min(configured_limit, desired_limit)
+
+    @classmethod
+    def _build_output_continuation_prompt(
+        cls,
+        accumulated_text: str,
+        *,
+        word_target: Optional[int] = None,
+        closure_only: bool = False,
+        seam_retry: bool = False,
+    ) -> tuple[str, str]:
+        """Build a compact continuation contract for a fresh model request."""
+        anchor = cls._continuation_anchor(accumulated_text)
+        word_count = len(accumulated_text.split())
+        char_count = len(accumulated_text)
+        scope_contract = ''
+        if word_target is not None:
+            remaining_words = max(0, word_target - word_count)
+            if closure_only:
+                scope_contract = (
+                    f"The original {word_target}-word budget is already satisfied. "
+                    "CLOSURE-ONLY MODE: add only what is required to finish the "
+                    "cut-off sentence and close the answer immediately. Do not "
+                    "start another paragraph, scene, section, example, or topic.\n\n"
+                )
+            else:
+                scope_contract = (
+                    f"The original request sets one total target of {word_target} "
+                    f"words. The accepted output has {word_count} words, so "
+                    f"approximately {remaining_words} words remain for the entire "
+                    "answer, across this and any later continuation. Complete the "
+                    "answer within that remaining budget; it is not a fresh budget "
+                    "for this call.\n\n"
+                )
+        seam_contract = ''
+        if seam_retry:
+            seam_contract = (
+                "BOUNDARY REPAIR: the prior continuation was rejected because it "
+                "replaced or skipped accepted boundary text. Do not revise, remove, "
+                "or reinterpret the final word. First copy the exact anchor with "
+                "identical case and punctuation, then append new characters.\n\n"
+            )
+        prompt = (
+            "The previous assistant output reached its output-token limit. "
+            "The original task and conversation above remain authoritative. "
+            "Silently re-read them together with the accepted assistant output, "
+            "then complete only the missing portion of that same answer. Preserve "
+            "its existing semantic scope and structure; do not restart, repeat "
+            "covered material, introduce optional new topics, or make the answer "
+            "longer merely because this is another request. Stop as soon as the "
+            "original task is coherently satisfied.\n\n"
+            f"{scope_contract}"
+            f"{seam_contract}"
+            f"Accepted output progress: {word_count} words, {char_count} characters. "
+            "These counts are progress information, not a new requested target.\n\n"
+            "Your response must begin character-for-character with the exact anchor "
+            "below, immediately followed by the missing continuation. Return only "
+            "that anchor plus the continuation; do not explain this protocol.\n"
+            f"Exact anchor: {json.dumps(anchor, ensure_ascii=False)}"
+        )
+        return prompt, anchor
+
+    @staticmethod
+    def _merge_anchored_continuation(
+        existing: str,
+        incoming: str,
+        anchor: str,
+    ) -> Optional[str]:
+        """Merge only when ``incoming`` proves an exact accepted-output seam."""
+        if not anchor:
+            return None
+
+        overlap = len(anchor) if incoming.startswith(anchor) else 0
+        if not overlap:
+            existing_without_trailing_space = existing.rstrip()
+            max_overlap = min(
+                len(existing_without_trailing_space),
+                len(incoming),
+                NESTED_OUTPUT_CONTINUATION_ANCHOR_MAX_CHARS,
+            )
+            for candidate in range(
+                max_overlap,
+                NESTED_OUTPUT_CONTINUATION_MIN_OVERLAP_CHARS - 1,
+                -1,
+            ):
+                suffix = existing_without_trailing_space[-candidate:]
+                if suffix != incoming[:candidate]:
+                    continue
+                starts_at_boundary = (
+                    candidate == len(existing_without_trailing_space)
+                    or not (
+                        existing_without_trailing_space[-candidate - 1].isalnum()
+                        and suffix[0].isalnum()
+                    )
+                )
+                ends_at_boundary = (
+                    candidate == len(incoming)
+                    or not (suffix[-1].isalnum() and incoming[candidate].isalnum())
+                )
+                if starts_at_boundary and ends_at_boundary:
+                    overlap = candidate
+                    break
+
+            if not overlap:
+                final_line = existing_without_trailing_space.rsplit('\n', 1)[-1]
+                if (
+                    len(final_line) >= 4
+                    and sum(character.isalnum() for character in final_line) >= 4
+                    and incoming.startswith(final_line)
+                ):
+                    overlap = len(final_line)
+
+        if not overlap:
+            return None
+
+        continuation = incoming[overlap:]
+        if not continuation:
+            return existing
+
+        base = existing.rstrip()
+        removed_whitespace = existing[len(base):]
+        if removed_whitespace and not continuation[0].isspace():
+            continuation = f'{removed_whitespace}{continuation}'
+        return f'{base}{continuation}'
+
     def _continue_nested_output(
         self,
         *,
@@ -2314,35 +2563,158 @@ class LLMNode(BaseTool):
         ):
             return completion
 
-        continuation_messages = list(messages)
         current_completion = completion
         current_text = self._extract_content_from_completion(completion).get('text') or ''
         accumulated_text = current_text
-        if current_text:
-            continuation_messages.append(AIMessage(content=current_text))
+        word_target = self._requested_output_word_target(messages)
+        invalid_seam_retries = 0
+        retrying_invalid_seam = False
+
+        bounded_text = (
+            self._truncate_at_sentence_boundary_after_word_target(
+                accumulated_text,
+                word_target,
+            )
+            if word_target is not None
+            else None
+        )
+        if bounded_text is not None:
+            logger.info(
+                "[NESTED_CONTINUE] Explicit word target reached at a safe boundary "
+                "without another request (target=%d, actual=%d)",
+                word_target,
+                len(bounded_text.split()),
+            )
+            return self._completion_with_text(completion, bounded_text)
 
         for continuation_round in range(1, NESTED_OUTPUT_CONTINUATION_LIMIT + 1):
-            prompt = (
-                NESTED_OUTPUT_CONTINUATION_PROMPT
-                if accumulated_text
-                else NESTED_REASONING_ONLY_CONTINUATION_PROMPT
+            accumulated_word_count = len(accumulated_text.split())
+            closure_only = (
+                word_target is not None and accumulated_word_count >= word_target
             )
-            continuation_messages.append(HumanMessage(content=prompt))
+            continuation_max_tokens = None
+            if accumulated_text.strip():
+                prompt, anchor = self._build_output_continuation_prompt(
+                    accumulated_text,
+                    word_target=word_target,
+                    closure_only=closure_only,
+                    seam_retry=retrying_invalid_seam,
+                )
+                if word_target is not None:
+                    continuation_max_tokens = self._continuation_max_tokens(
+                        remaining_words=max(0, word_target - accumulated_word_count),
+                        anchor=anchor,
+                        closure_only=closure_only,
+                    )
+                continuation_messages = [
+                    *messages,
+                    AIMessage(content=accumulated_text),
+                    HumanMessage(content=prompt),
+                ]
+            else:
+                anchor = ''
+                continuation_messages = [
+                    *messages,
+                    HumanMessage(content=NESTED_REASONING_ONLY_CONTINUATION_PROMPT),
+                ]
             logger.info(
                 "[NESTED_CONTINUE] Completing truncated leaf output (round=%d/%d)",
                 continuation_round,
                 NESTED_OUTPUT_CONTINUATION_LIMIT,
             )
-            current_completion = self.client.invoke(continuation_messages, config=config)
+            try:
+                invoke_kwargs = {'config': config}
+                if continuation_max_tokens is not None:
+                    invoke_kwargs['max_tokens'] = continuation_max_tokens
+                current_completion = self.client.invoke(
+                    continuation_messages,
+                    **invoke_kwargs,
+                )
+            except (GraphBubbleUp, McpAuthorizationRequired, OutputContinuationExhausted):
+                raise
+            except Exception as exc:
+                budget_error = budget_exceeded_from(exc)
+                if budget_error is not None:
+                    raise budget_error from exc
+                raise OutputContinuationExhausted(
+                    attempts=continuation_round,
+                    partial_output=accumulated_text,
+                    stop_reason=self._completion_stop_reason(current_completion),
+                    failure_reason='provider_error',
+                ) from exc
             current_text = (
                 self._extract_content_from_completion(current_completion).get('text') or ''
             )
             if current_text:
-                accumulated_text = self._merge_continuation_text(
-                    accumulated_text,
-                    current_text,
+                merged_text = (
+                    self._merge_anchored_continuation(
+                        accumulated_text,
+                        current_text,
+                        anchor,
+                    )
+                    if anchor
+                    else current_text
                 )
-                continuation_messages.append(AIMessage(content=current_text))
+                if merged_text is None:
+                    if invalid_seam_retries < NESTED_OUTPUT_INVALID_SEAM_RETRY_LIMIT:
+                        invalid_seam_retries += 1
+                        retrying_invalid_seam = True
+                        logger.warning(
+                            "[NESTED_CONTINUE] Rejected an unverified output seam; "
+                            "retrying once with the strict boundary contract "
+                            "(round=%d)",
+                            continuation_round,
+                        )
+                        continue
+                    raise OutputContinuationExhausted(
+                        attempts=continuation_round,
+                        partial_output=accumulated_text,
+                        stop_reason=self._completion_stop_reason(current_completion),
+                        failure_reason='invalid_continuation',
+                    )
+                retrying_invalid_seam = False
+                if merged_text == accumulated_text:
+                    raise OutputContinuationExhausted(
+                        attempts=continuation_round,
+                        partial_output=accumulated_text,
+                        stop_reason=self._completion_stop_reason(current_completion),
+                        failure_reason='no_progress',
+                    )
+                accumulated_text = merged_text
+            else:
+                raise OutputContinuationExhausted(
+                    attempts=continuation_round,
+                    partial_output=accumulated_text,
+                    stop_reason=self._completion_stop_reason(current_completion),
+                    failure_reason='no_progress',
+                )
+
+            bounded_text = (
+                self._truncate_at_sentence_boundary_after_word_target(
+                    accumulated_text,
+                    word_target,
+                )
+                if word_target is not None
+                else None
+            )
+            if bounded_text is not None:
+                accumulated_text = bounded_text
+                logger.info(
+                    "[NESTED_CONTINUE] Explicit word target reached at a safe boundary "
+                    "(round=%d, target=%d, actual=%d)",
+                    continuation_round,
+                    word_target,
+                    len(accumulated_text.split()),
+                )
+                break
+
+            if closure_only and self._completion_finished_by_length(current_completion):
+                raise OutputContinuationExhausted(
+                    attempts=continuation_round,
+                    partial_output=accumulated_text,
+                    stop_reason=self._completion_stop_reason(current_completion),
+                    failure_reason='attempt_limit',
+                )
 
             if not self._completion_finished_by_length(current_completion):
                 break
@@ -2351,20 +2723,16 @@ class LLMNode(BaseTool):
                 "[NESTED_CONTINUE] Leaf output remained truncated after %d continuation rounds",
                 NESTED_OUTPUT_CONTINUATION_LIMIT,
             )
+            raise OutputContinuationExhausted(
+                attempts=NESTED_OUTPUT_CONTINUATION_LIMIT,
+                partial_output=accumulated_text,
+                stop_reason=self._completion_stop_reason(current_completion),
+                failure_reason='attempt_limit',
+            )
 
         if not accumulated_text:
             return current_completion
-        if hasattr(current_completion, 'model_copy'):
-            return current_completion.model_copy(update={
-                'content': accumulated_text,
-                'tool_calls': [],
-            })
-        return AIMessage(
-            content=accumulated_text,
-            response_metadata=dict(
-                getattr(current_completion, 'response_metadata', None) or {}
-            ),
-        )
+        return self._completion_with_text(current_completion, accumulated_text)
     
     def _run_async_in_sync_context(self, coro):
         """Run async coroutine from sync context.
@@ -3412,6 +3780,21 @@ class LLMNode(BaseTool):
             if isinstance(result, GraphBubbleUp):
                 raise result
             if isinstance(result, BaseException):
+                if isinstance(result, OutputContinuationExhausted):
+                    continuation_error = {
+                        'code': result.error_code,
+                        'user_message': result.user_message,
+                        'attempts': result.attempts,
+                        'failure_reason': result.failure_reason,
+                        'stop_reason': result.stop_reason,
+                        'partial_output_available': bool(result.partial_output),
+                    }
+                    new_messages.append(ToolMessage(
+                        content=json.dumps({'error': continuation_error}),
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    ))
+                    continue
                 # Never hand a budget rejection back as tool output: the parent model
                 # would reason about it as data and may retry or paraphrase it
                 budget_error = budget_exceeded_from(result)
@@ -3818,6 +4201,9 @@ class LLMNode(BaseTool):
                         ))
                         continue
                     except Exception as e:
+                        if isinstance(e, OutputContinuationExhausted):
+                            _PENDING_TOOL_MESSAGES.set([])
+                            raise
                         # Same reasoning as the MCP clause above: swallowing a budget
                         # rejection here hides it from the user entirely
                         budget_error = budget_exceeded_from(e)
@@ -3912,6 +4298,9 @@ class LLMNode(BaseTool):
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
+                if isinstance(e, OutputContinuationExhausted):
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise
                 # Checked before the string-matching classification below, which has no
                 # budget bucket and would fall through to the generic append-and-break
                 budget_error = budget_exceeded_from(e)
@@ -4111,6 +4500,9 @@ class LLMNode(BaseTool):
                                 logger.info("LLM completed after truncation without requesting more tools")
                                 break
                         except Exception as retry_error:
+                            if isinstance(retry_error, OutputContinuationExhausted):
+                                _PENDING_TOOL_MESSAGES.set([])
+                                raise
                             logger.error(f"Error retrying LLM after truncation: {retry_error}")
                             error_msg = f"Failed to retry after truncation: {str(retry_error)}"
                             new_messages.append(AIMessage(content=error_msg))

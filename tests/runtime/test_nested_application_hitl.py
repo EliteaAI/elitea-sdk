@@ -10,6 +10,7 @@ from langgraph.types import interrupt
 
 from elitea_sdk.runtime.langchain.assistant import Assistant
 from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable
+from elitea_sdk.runtime.exceptions import OutputContinuationExhausted
 from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
 from elitea_sdk.runtime.tools.application import Application
 from elitea_sdk.runtime.tools.llm import LLMNode
@@ -102,6 +103,15 @@ class StaticApplication:
     def invoke(self, payload, config=None):
         self.calls.append({'payload': payload, 'config': config})
         return {'output': self.output}
+
+
+class ContinuationExhaustedApplication:
+    def invoke(self, payload, config=None):
+        raise OutputContinuationExhausted(
+            attempts=4,
+            partial_output='large partial child output',
+            stop_reason='length',
+        )
 
 
 class FakeToolkitClient:
@@ -2255,6 +2265,30 @@ def test_two_parallel_children_pause_aggregate_into_one_interrupt():
         assert 'nested_config' not in entry
 
 
+def test_parallel_continuation_failure_reaches_parent_with_successful_sibling():
+    """One truncated child is branch-local and cannot skip parent synthesis."""
+    parent_memory = MemorySaver()
+    tools = [
+        _subagent('child_a', ContinuationExhaustedApplication()),
+        _subagent('child_b', StaticApplication(output='B-done')),
+    ]
+    llm = MultiAppParentLLM('child_a', 'child_b', 'call-A', 'call-B')
+    runnable = _build_parent_runnable(parent_memory, llm, tools)
+
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate both')]},
+        config={'configurable': {'thread_id': 'parallel-continuation-failure'}},
+    )
+
+    assert result['execution_finished'] is True
+    assert result['output'] == 'parent-done'
+    final_contents = llm.calls[-1]
+    assert any('B-done' in item for item in final_contents)
+    assert any('output_continuation_exhausted' in item for item in final_contents)
+    assert any('partial_output_available' in item for item in final_contents)
+    assert all('large partial child output' not in item for item in final_contents)
+
+
 def test_parallel_resume_routes_decisions_to_correct_children():
     """A single resume carrying a hitl_decisions map routes approve→A and
     reject→B to the right children (each resumes from its own checkpoint), both
@@ -3147,7 +3181,12 @@ def test_parallel_reconcile_turns_terminal_child_failures_into_tool_results():
     result = runnable.invoke({
         'parallel_reconcile': parked['dispatch_epoch'],
         'parallel_terminal_errors': {
-            parked['parallel_dispatch'][0]['child_thread_id']: {'error': 'child A failed'},
+            parked['parallel_dispatch'][0]['child_thread_id']: {
+                'code': 'output_continuation_exhausted',
+                'user_message': 'child A failed',
+                'attempts': 4,
+                'partial_output_available': True,
+            },
             parked['parallel_dispatch'][1]['child_thread_id']: {'error': 'child B was not dispatched'},
         },
     }, config=config)
@@ -3155,6 +3194,8 @@ def test_parallel_reconcile_turns_terminal_child_failures_into_tool_results():
     assert result['execution_finished'] is True
     assert result['output'] == 'parent-done'
     assert any('child A failed' in item for item in reconcile_llm.calls[-1])
+    assert any('output_continuation_exhausted' in item for item in reconcile_llm.calls[-1])
+    assert any('partial_output_available' in item for item in reconcile_llm.calls[-1])
     assert any('child B was not dispatched' in item for item in reconcile_llm.calls[-1])
 
 
