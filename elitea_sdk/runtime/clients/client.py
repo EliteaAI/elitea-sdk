@@ -2,7 +2,7 @@ import logging
 from copy import deepcopy
 
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from typing import Dict, List, Any, Optional
 
@@ -81,12 +81,18 @@ class ApiDetailsRequestError(Exception):
     ...
 
 
+class AuthSessionExpiredError(Exception):
+    """ Platform rejected the runtime's auth session (expired or invalidated) """
+
+
 class EliteAClient:
     def __init__(self,
                  base_url: str,
                  project_id: int,
                  auth_token: str,
                  api_extra_headers: Optional[dict] = None,
+                 auth_session: Optional[str] = None,
+                 session_cookie_name: Optional[str] = None,
                  **kwargs):
 
         self.base_url = base_url.rstrip('/')
@@ -95,10 +101,11 @@ class EliteAClient:
         self.allm_path = '/llm'
         self.project_id = project_id
         self.auth_token = auth_token
-        self.headers = {
-            "Authorization": f"Bearer {auth_token}",
-            'X-SECRET': kwargs.get('XSECRET', 'secret')
-        }
+        self.auth_session = auth_session if not auth_token else None
+        self.session_cookie_name = session_cookie_name
+        self.headers = {'X-SECRET': kwargs.get('XSECRET', 'secret')}
+        if auth_token:
+            self.headers["Authorization"] = f"Bearer {auth_token}"
         if api_extra_headers is not None:
             self.headers.update(api_extra_headers)
         # Kept separate so LLM call path (default_headers on ChatOpenAI /
@@ -127,10 +134,48 @@ class EliteAClient:
         # endpoint raises instead of parking the worker forever (#6246).
         self.timeout = kwargs.get('timeout', (5, 30))
         self._session = requests.Session()
+        # No PAT: authenticate exactly like the browser does, with the user's session cookie.
+        # Scoped to our own host so a redirect elsewhere never carries the cookie along.
+        if self.auth_session and self.session_cookie_name:
+            base_url_parts = urlparse(self.base_url)
+            self._session.cookies.set(
+                self.session_cookie_name, self.auth_session,
+                domain=base_url_parts.hostname, secure=base_url_parts.scheme == 'https',
+            )
+
+    @property
+    def _llm_api_key(self) -> str:
+        # openai/anthropic clients reject a missing key outright; the proxy authenticates
+        # via the session cookie instead and ignores this placeholder.
+        return getattr(self, 'auth_token', None) or 'session'
+
+    @property
+    def _llm_cookie_headers(self) -> dict:
+        session = getattr(self, 'auth_session', None)
+        name = getattr(self, 'session_cookie_name', None)
+        if not (session and name):
+            return {}
+        return {'Cookie': f'{name}={session}'}
 
     def _request(self, method: str, url: str, **kwargs):
         kwargs.setdefault('timeout', self.timeout)
-        return self._session.request(method, url, **kwargs)
+        response = self._session.request(method, url, **kwargs)
+        # Session auth has no silent fallback: surface expiry instead of parsing a login page.
+        # 403 alone is NOT expiry — it's also how a legitimate permission denial (e.g. no
+        # membership in the target project) is reported, and must reach the caller as such.
+        if getattr(self, 'auth_session', None):
+            if response.status_code == 401:
+                reason = f"HTTP {response.status_code}"
+            elif any(r.status_code in (301, 302, 303, 307, 308) for r in response.history):
+                reason = f"redirected to {response.url}"
+            else:
+                reason = None
+            if reason is not None:
+                raise AuthSessionExpiredError(
+                    f"Auth session rejected by {url} ({reason}) — "
+                    "the user session is no longer valid"
+                )
+        return response
 
     def get_mcp_toolkits(self):
         data = self._request('get', self.mcp_tools_list, headers=self.headers, verify=False).json()
@@ -446,9 +491,10 @@ class EliteAClient:
         return OpenAIEmbeddings(
             base_url=f"{self.base_url}{self.llm_path}",
             model=embedding_model,
-            api_key=self.auth_token,
+            api_key=self._llm_api_key,
             openai_organization=str(self.project_id),
-            request_timeout=self.model_timeout
+            request_timeout=self.model_timeout,
+            default_headers=self._llm_cookie_headers or None
         )
 
     def get_llm(self, model_name: str, model_config: dict):
@@ -511,16 +557,17 @@ class EliteAClient:
             target_kwargs = {
                 "base_url": f"{self.base_url}{self.allm_path}",
                 "model": model_name,
-                "api_key": self.auth_token,
+                "api_key": self._llm_api_key,
                 "streaming": model_config.get("streaming", True),
                 "max_tokens": llm_max_tokens,  # Always an integer now
                 "temperature": model_config.get("temperature"),
                 "max_retries": model_config.get("max_retries", 3),
                 "default_headers": {
                     "openai-organization": str(self.project_id),
-                    "Authorization": f"Bearer {self.auth_token}",
+                    **({"Authorization": f"Bearer {self.auth_token}"} if getattr(self, 'auth_token', None) else {}),
                     "anthropic-beta": "prompt-caching-2024-07-31",
                     **(getattr(self, "api_extra_headers", None) or {}),
+                    **self._llm_cookie_headers,
                 },
             }
             
@@ -564,7 +611,7 @@ class EliteAClient:
             target_kwargs = {
                 "base_url": f"{self.base_url}{self.llm_path}",
                 "model": model_name,
-                "api_key": self.auth_token,
+                "api_key": self._llm_api_key,
                 "streaming": model_config.get("streaming", True),
                 "stream_usage": model_config.get("stream_usage", True),
                 "max_tokens": llm_max_tokens,
@@ -573,7 +620,8 @@ class EliteAClient:
                 "seed": model_config.get("seed", None),
                 "openai_organization": str(self.project_id),
             }
-            extra_headers = getattr(self, "api_extra_headers", None) or {}
+            extra_headers = {**(getattr(self, "api_extra_headers", None) or {}),
+                             **self._llm_cookie_headers}
             if extra_headers:
                 target_kwargs["default_headers"] = dict(extra_headers)
 
