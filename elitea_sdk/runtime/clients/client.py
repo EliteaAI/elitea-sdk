@@ -2,7 +2,7 @@ import logging
 from copy import deepcopy
 
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from typing import Dict, List, Any, Optional
 
@@ -135,8 +135,13 @@ class EliteAClient:
         self.timeout = kwargs.get('timeout', (5, 30))
         self._session = requests.Session()
         # No PAT: authenticate exactly like the browser does, with the user's session cookie.
+        # Scoped to our own host so a redirect elsewhere never carries the cookie along.
         if self.auth_session and self.session_cookie_name:
-            self._session.cookies.set(self.session_cookie_name, self.auth_session)
+            base_url_parts = urlparse(self.base_url)
+            self._session.cookies.set(
+                self.session_cookie_name, self.auth_session,
+                domain=base_url_parts.hostname, secure=base_url_parts.scheme == 'https',
+            )
 
     @property
     def _llm_api_key(self) -> str:
@@ -156,8 +161,10 @@ class EliteAClient:
         kwargs.setdefault('timeout', self.timeout)
         response = self._session.request(method, url, **kwargs)
         # Session auth has no silent fallback: surface expiry instead of parsing a login page.
+        # 403 alone is NOT expiry — it's also how a legitimate permission denial (e.g. no
+        # membership in the target project) is reported, and must reach the caller as such.
         if getattr(self, 'auth_session', None):
-            if response.status_code in (401, 403):
+            if response.status_code == 401:
                 reason = f"HTTP {response.status_code}"
             elif any(r.status_code in (301, 302, 303, 307, 308) for r in response.history):
                 reason = f"redirected to {response.url}"

@@ -2,7 +2,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Dict, Optional, Any, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 import chardet
@@ -249,8 +249,13 @@ class SandboxClient:
         self.timeout = kwargs.get('timeout', (5, 30))
         self._session = requests.Session()
         # No PAT: authenticate with the user's session cookie, like the browser does.
+        # Scoped to our own host so a redirect elsewhere never carries the cookie along.
         if self.auth_session and self.session_cookie_name:
-            self._session.cookies.set(self.session_cookie_name, self.auth_session)
+            base_url_parts = urlparse(self.base_url)
+            self._session.cookies.set(
+                self.session_cookie_name, self.auth_session,
+                domain=base_url_parts.hostname, secure=base_url_parts.scheme == 'https',
+            )
 
     def _request(self, method: str, url: str, **kwargs):
         kwargs.setdefault('timeout', self.timeout)
