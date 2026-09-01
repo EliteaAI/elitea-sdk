@@ -11,6 +11,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
+from langchain_core.tools import ToolException
+
 from .mcp_server_tool import McpServerTool
 from pydantic import Field
 from ..utils.mcp_oauth import (
@@ -22,7 +24,12 @@ from ..utils.mcp_oauth import (
 )
 # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient
 from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
-from ..utils.failure_signals import mcp_is_error, log_shadow_failure
+from ..utils.failure_signals import (
+    is_shadow_logged,
+    log_shadow_failure,
+    mark_shadow_logged,
+    mcp_is_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,18 +101,21 @@ class McpRemoteTool(McpServerTool):
             raise
         except Exception as e:
             logger.error(f"Error executing remote MCP tool '{self.name}': {e}")
-            # Shadow-mode only: this branch turns a real exception into a return value (see #6168)
+            # Re-raised, not returned as prose: the exception middleware wraps this tool's
+            # _run and shapes the error properly, which hand-rolled text cannot (#6401).
             metadata = self.metadata or {}
-            log_shadow_failure(
-                logger,
-                detected_by="mcp_exception_swallowed",
-                toolkit_name=metadata.get("toolkit_name"),
-                toolkit_type=metadata.get("toolkit_type"),
-                toolkit_id=metadata.get("toolkit_id"),
-                tool_name=self.name,
-                result_len=len(str(e)),
-            )
-            return f"Error executing tool: {e}"
+            if not is_shadow_logged(e):
+                log_shadow_failure(
+                    logger,
+                    detected_by="mcp_exception_swallowed",
+                    toolkit_name=metadata.get("toolkit_name"),
+                    toolkit_type=metadata.get("toolkit_type"),
+                    toolkit_id=metadata.get("toolkit_id"),
+                    tool_name=self.name,
+                    result_len=len(str(e)),
+                    delivered_as_success=False,
+                )
+            raise
 
     def _run_in_new_loop(self, kwargs: Dict[str, Any]) -> str:
         """Run the async tool invocation in a new event loop."""
@@ -153,7 +163,10 @@ class McpRemoteTool(McpServerTool):
                 await client.initialize()
                 result = await client.call_tool(tool_name_for_server, kwargs)
 
-            # Shadow-mode only: detect isError, never changes the returned value (see #6168)
+            formatted = self._format_result(result)
+
+            # Formatted first on purpose: the raise must carry the same text a successful
+            # call would have returned, not a bare status flag (#6401).
             if mcp_is_error(result):
                 metadata = self.metadata or {}
                 log_shadow_failure(
@@ -164,37 +177,38 @@ class McpRemoteTool(McpServerTool):
                     toolkit_id=metadata.get("toolkit_id"),
                     tool_name=self.name,
                     result_len=len(str(result)),
+                    delivered_as_success=False,
                 )
+                raise mark_shadow_logged(ToolException(formatted))
 
-            # Format the result
-            if isinstance(result, dict):
-                # Check for content array (common in MCP responses)
-                if "content" in result:
-                    content_items = result["content"]
-                    if isinstance(content_items, list):
-                        # Extract text from content items
-                        text_parts = []
-                        for item in content_items:
-                            if isinstance(item, dict):
-                                if item.get("type") == "text" and "text" in item:
-                                    text_parts.append(item["text"])
-                                elif "text" in item:
-                                    text_parts.append(item["text"])
-                                else:
-                                    text_parts.append(json.dumps(item))
-                            else:
-                                text_parts.append(str(item))
-                        return "\n".join(text_parts)
-                
-                # Return formatted JSON if no content field
-                return json.dumps(result, indent=2)
-            
-            # Return as string for other types
-            return str(result)
-            
+            return formatted
+
         except Exception as e:
             logger.error(f"[MCP] Tool execution failed: {e}", exc_info=True)
             raise
+
+    @staticmethod
+    def _format_result(result: Any) -> str:
+        """Render an MCP result as tool output. Same text whether or not isError is set."""
+        if isinstance(result, dict):
+            # Check for content array (common in MCP responses)
+            if "content" in result:
+                content_items = result["content"]
+                if isinstance(content_items, list):
+                    text_parts = []
+                    for item in content_items:
+                        if isinstance(item, dict):
+                            if "text" in item:
+                                text_parts.append(item["text"])
+                            else:
+                                text_parts.append(json.dumps(item))
+                        else:
+                            text_parts.append(str(item))
+                    return "\n".join(text_parts)
+
+            return json.dumps(result, indent=2)
+
+        return str(result)
 
     def _parse_sse(self, text: str) -> Dict[str, Any]:
         """Parse Server-Sent Events (SSE) format response."""

@@ -3,10 +3,10 @@ import uuid
 from logging import getLogger
 from typing import Any, Type, Literal, Optional, Union, List, Annotated
 
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, ToolException
 from pydantic import BaseModel, Field, create_model, ConfigDict, StringConstraints
 
-from ..utils.failure_signals import mcp_is_error, log_shadow_failure
+from ..utils.failure_signals import mcp_is_error, log_shadow_failure, mcp_error_message
 
 # EmailStr moved to pydantic_extra_types in pydantic v2, use str for simplicity
 EmailStr = str
@@ -157,7 +157,8 @@ class McpServerTool(BaseTool):
         
         result = self.client.mcp_tool_call(call_data)
 
-        # Shadow-mode only: detect isError, never changes the returned value (see #6168)
+        # An isError result is a failure; raise so it takes the same path as any other
+        # tool error instead of being delivered as successful output (#6401).
         if mcp_is_error(result):
             metadata = self.metadata or {}
             log_shadow_failure(
@@ -168,6 +169,8 @@ class McpServerTool(BaseTool):
                 toolkit_id=metadata.get("toolkit_id"),
                 tool_name=self.name,
                 result_len=len(str(result)),
+                delivered_as_success=False,
             )
+            raise ToolException(mcp_error_message(result))
 
         return result

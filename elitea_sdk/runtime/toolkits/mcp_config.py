@@ -45,7 +45,7 @@ import threading
 from typing import List, Optional, Dict, Any
 
 import yaml
-from langchain_core.tools import BaseToolkit, BaseTool
+from langchain_core.tools import BaseToolkit, BaseTool, ToolException
 from pydantic import BaseModel, Field
 
 from ..utils.mcp_oauth import substitute_mcp_placeholders
@@ -111,7 +111,10 @@ def _create_stdio_tool_func(original_tool_name: str, server_name: str, server_co
                     logger.debug(f"[MCP Config] Calling tool {original_tool_name} with args: {clean_args}")
                     result = await session.call_tool(original_tool_name, clean_args)
 
-                    # Shadow-mode only: detect isError, never changes the returned value (see #6168)
+                    formatted = _format_stdio_result(result)
+
+                    # Formatted first on purpose: the raise must carry the same text a
+                    # successful call would have returned, not a bare status flag (#6401).
                     if mcp_is_error(result):
                         log_shadow_failure(
                             logger,
@@ -119,24 +122,28 @@ def _create_stdio_tool_func(original_tool_name: str, server_name: str, server_co
                             toolkit_name=server_name,
                             tool_name=original_tool_name,
                             result_len=len(str(result)),
+                            delivered_as_success=False,
                         )
+                        raise ToolException(formatted)
 
-                    # Format the result
-                    if hasattr(result, 'content') and result.content:
-                        # MCP returns CallToolResult with content list
-                        content_parts = []
-                        for content_item in result.content:
-                            if hasattr(content_item, 'text'):
-                                content_parts.append(content_item.text)
-                            elif hasattr(content_item, 'data'):
-                                content_parts.append(str(content_item.data))
-                            else:
-                                content_parts.append(str(content_item))
-                        return '\n'.join(content_parts)
-                    elif hasattr(result, 'text'):
-                        return result.text
+                    return formatted
+
+        def _format_stdio_result(result) -> str:
+            """Render a stdio MCP result as tool output, isError or not."""
+            if hasattr(result, 'content') and result.content:
+                # MCP returns CallToolResult with content list
+                content_parts = []
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        content_parts.append(content_item.text)
+                    elif hasattr(content_item, 'data'):
+                        content_parts.append(str(content_item.data))
                     else:
-                        return str(result)
+                        content_parts.append(str(content_item))
+                return '\n'.join(content_parts)
+            if hasattr(result, 'text'):
+                return result.text
+            return str(result)
 
         # Run async code - use asyncio.run for clean event loop management
         try:
