@@ -3781,7 +3781,20 @@ class LLMNode(BaseTool):
                 raise result
             if isinstance(result, BaseException):
                 if isinstance(result, OutputContinuationExhausted):
-                    raise result
+                    continuation_error = {
+                        'code': result.error_code,
+                        'user_message': result.user_message,
+                        'attempts': result.attempts,
+                        'failure_reason': result.failure_reason,
+                        'stop_reason': result.stop_reason,
+                        'partial_output_available': bool(result.partial_output),
+                    }
+                    new_messages.append(ToolMessage(
+                        content=json.dumps({'error': continuation_error}),
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    ))
+                    continue
                 # Never hand a budget rejection back as tool output: the parent model
                 # would reason about it as data and may retry or paraphrase it
                 budget_error = budget_exceeded_from(result)
