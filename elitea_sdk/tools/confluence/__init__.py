@@ -32,7 +32,7 @@ def get_toolkit(tool):
 
     return ConfluenceToolkit().get_toolkit(
         selected_tools=settings.get('selected_tools', []),
-        space=settings.get('space', None),
+        space=settings.get('space_key', settings.get('space', None)),
         cloud=cloud,
         api_version=settings.get('api_version', 'Auto'),
         confluence_configuration=confluence_configuration,
@@ -101,7 +101,7 @@ class ConfluenceToolkit(BaseToolkit):
 
         model = create_model(
             name,
-            space=(str, Field(
+            space_key=(str, Field(
                 description="Space Key — the short code identifying the Confluence space "
                             "(not the human-readable Space Name).\n"
                             "Found in the space URL, right after the `/display/` path segment, "
