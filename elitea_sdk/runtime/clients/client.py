@@ -536,13 +536,17 @@ class EliteAClient:
         except:  # pylint: disable=W0702
             worker_config = {}
 
-        use_responses_api = False
+        if not isinstance(worker_config, dict):
+            worker_config = {}
 
-        if worker_config and isinstance(worker_config, dict):
-            for target_name_tag in worker_config.get("use_responses_api_for", []):
-                if target_name_tag in model_name:
-                    use_responses_api = True
-                    break
+        use_responses_api = any(
+            tag in model_name for tag in worker_config.get("use_responses_api_for", [])
+        )
+        # Models needing the reasoning param nested in the request body instead of a
+        # top-level reasoning_effort string (e.g. Bedrock-hosted OpenAI models).
+        reasoning_in_body = any(
+            tag in model_name for tag in worker_config.get("reasoning_in_body_for", [])
+        )
 
         # handle case when max_tokens are auto-configurable == -1 or None
         llm_max_tokens = model_config.get("max_tokens", None)
@@ -633,6 +637,14 @@ class EliteAClient:
                     target_kwargs["reasoning"] = {
                         "effort": reasoning_effort.lower(),
                         "summary": "auto"
+                    }
+                elif reasoning_in_body:
+                    # Bedrock-hosted OpenAI models reject both reasoning_effort and the
+                    # Anthropic `thinking` that LiteLLM rewrites it into; they want a
+                    # nested reasoning object, which extra_body passes through verbatim.
+                    target_kwargs["extra_body"] = {
+                        **(target_kwargs.get("extra_body") or {}),
+                        "reasoning": {"effort": reasoning_effort.lower()},
                     }
                 else:
                     # Chat Completions API path (default): use top-level reasoning_effort
