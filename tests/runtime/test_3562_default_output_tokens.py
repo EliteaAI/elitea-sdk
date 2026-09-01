@@ -35,6 +35,28 @@ def test_openai_compatible_custom_limit_is_preserved():
     assert mock_openai.call_args.kwargs["max_tokens"] == 1234
 
 
+def test_custom_proxy_default_preserves_provider_and_session_headers():
+    client = _make_client()
+    client.auth_token = None
+    client.auth_session = "session-ref"
+    client.session_cookie_name = "auth_session_id"
+    client.api_extra_headers = {"X-Databricks-Scope": "workspace"}
+
+    with patch("elitea_sdk.runtime.clients.client.ChatOpenAI") as mock_openai:
+        client.get_llm(
+            "custom-databricks-model",
+            {"max_tokens": -1, "openai_compatible": True},
+        )
+
+    kwargs = mock_openai.call_args.kwargs
+    assert "max_tokens" not in kwargs
+    assert kwargs["api_key"] == "session"
+    assert kwargs["default_headers"] == {
+        "X-Databricks-Scope": "workspace",
+        "Cookie": "auth_session_id=session-ref",
+    }
+
+
 def test_native_anthropic_default_uses_configured_model_maximum():
     client = _make_client()
     with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
