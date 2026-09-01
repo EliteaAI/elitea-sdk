@@ -111,6 +111,10 @@ _POLICY_PHRASES = (
 
 _MAX_CHAIN_DEPTH = 3
 
+# Set on the raised exception instance, not a subclass, so provider_worker can
+# attach its own machine-readable category without importing elitea_sdk.
+PROVIDER_CATEGORY_ATTR = "provider_error_category"
+
 
 def _attr(obj: object, name: str) -> object:
     """Guarded because these are arbitrary third-party objects: a property that raises
@@ -145,6 +149,14 @@ def _class_from_status(exc: BaseException) -> Optional[ToolErrorClass]:
 
 
 def _class_from_exception(exc: BaseException) -> Optional[ToolErrorClass]:
+    # Top rung: the provider's own category, which is a declared field rather than a
+    # guess, so it beats every heuristic below. Unmapped falls through deliberately.
+    category = _attr(exc, PROVIDER_CATEGORY_ATTR)
+    if isinstance(category, str):
+        from_category = classify_provider_error_category(category)
+        if from_category is not None:
+            return from_category
+
     mro_names = {cls.__name__ for cls in type(exc).__mro__}
     if mro_names & _INFRASTRUCTURE_NAMES:
         return ToolErrorClass.INFRASTRUCTURE

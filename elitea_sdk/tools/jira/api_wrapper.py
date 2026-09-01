@@ -477,6 +477,119 @@ def clean_json_string(json_string):
 
 _FENCE_PATTERN = re.compile(r'^```(?:json)?\s*(.*?)\s*```$', re.DOTALL)
 
+# Fields Jira Cloud v3 stores as Atlassian Document Format and Jira v2 stores as plain text.
+_ADF_TEXT_FIELDS = ("description", "environment")
+
+
+def text_to_adf(text: str) -> Dict[str, Any]:
+    """Convert plain text to Atlassian Document Format."""
+    if not text:
+        return {"type": "doc", "version": 1, "content": []}
+    content = []
+    for paragraph in text.split('\n\n'):
+        if not paragraph.strip():
+            continue
+        nodes: List[Dict[str, Any]] = []
+        for line in paragraph.split('\n'):
+            if nodes:
+                nodes.append({"type": "hardBreak"})
+            nodes.append({"type": "text", "text": line})
+        content.append({"type": "paragraph", "content": nodes})
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def adf_to_text(adf: Any) -> str:
+    """Flatten an Atlassian Document Format document to plain text."""
+    if isinstance(adf, str):
+        return adf
+    if not isinstance(adf, dict):
+        return ''
+
+    def inline(nodes) -> str:
+        parts = []
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            node_type = node.get('type')
+            if node_type == 'text':
+                parts.append(node.get('text', ''))
+            elif node_type == 'hardBreak':
+                parts.append('\n')
+            elif node.get('content'):
+                parts.append(inline(node['content']))
+        return ''.join(parts)
+
+    blocks = []
+    for node in adf.get('content', []) or []:
+        if not isinstance(node, dict):
+            continue
+        node_type = node.get('type')
+        if node_type in ('bulletList', 'orderedList'):
+            for index, item in enumerate(node.get('content', []) or [], start=1):
+                prefix = '* ' if node_type == 'bulletList' else f'{index}. '
+                blocks.append(prefix + inline(item.get('content', [])))
+        else:
+            blocks.append(inline(node.get('content', [])))
+    return '\n\n'.join(block for block in blocks if block)
+
+
+def normalize_rich_text_fields(fields: Any, api_version: Any) -> Any:
+    """Coerce rich-text field values to the representation the target Jira API accepts.
+
+    Cloud v3 rejects plain strings for these fields, while v2 rejects ADF objects with
+    "Operation value must be a string", so the payload has to be reshaped per version.
+    """
+    if not isinstance(fields, dict):
+        return fields
+    is_v3 = str(api_version) == '3'
+    normalized = dict(fields)
+    for name in _ADF_TEXT_FIELDS:
+        if name not in normalized:
+            continue
+        value = normalized[name]
+        if is_v3 and isinstance(value, str):
+            normalized[name] = text_to_adf(value)
+        elif not is_v3 and isinstance(value, dict):
+            normalized[name] = adf_to_text(value)
+    return normalized
+
+
+def _http_error_detail(error: HTTPError) -> str:
+    """Extract Jira's own error text from an HTTPError without leaking a stack trace."""
+    response = getattr(error, 'response', None)
+    if response is None:
+        return str(error)
+    messages = []
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            messages.extend(payload.get('errorMessages') or [])
+            errors = payload.get('errors')
+            if isinstance(errors, dict):
+                messages.extend(f"{field}: {message}" for field, message in errors.items())
+    except ValueError:
+        pass
+    detail = '; '.join(str(message) for message in messages) or (response.text or '').strip() or str(error)
+    return f"HTTP {response.status_code}: {detail}"
+
+
+def normalize_rich_text_operations(update: Any, api_version: Any) -> Any:
+    """Apply `normalize_rich_text_fields` to values inside Jira update-operation blocks."""
+    if not isinstance(update, dict):
+        return update
+    normalized = dict(update)
+    for name in _ADF_TEXT_FIELDS:
+        operations = normalized.get(name)
+        if not isinstance(operations, list):
+            continue
+        normalized[name] = [
+            {key: normalize_rich_text_fields({name: value}, api_version)[name]
+             for key, value in operation.items()}
+            if isinstance(operation, dict) else operation
+            for operation in operations
+        ]
+    return normalized
+
 
 def normalize_and_parse_issue_json(issue_json: str) -> Dict[str, Any]:
     """
@@ -960,23 +1073,31 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         """ Update an issue in Jira.
             IMPORTANT: default labels won't be changed
         """
+        params: Dict[str, Any] = {}
         try:
             params = normalize_and_parse_issue_json(issue_json)
             self.update_issue_validate(params)
             key = params["key"]
-            update_body = {"fields": dict(params["fields"])} if params.get("fields") else {}
-            update_body = update_body | {"update": dict(params["update"])} if params.get('update') else update_body
-            issue = client.update_issue(issue_key=key, update=dict(update_body))
+            update_body = {}
+            if params.get("fields"):
+                update_body["fields"] = normalize_rich_text_fields(dict(params["fields"]), self.api_version)
+            if params.get("update"):
+                update_body["update"] = normalize_rich_text_operations(dict(params["update"]), self.api_version)
+            # PUT via the version-aware resource URL: `client.update_issue` hardcodes /rest/api/2,
+            # which rejects the ADF values Cloud v3 requires for description.
+            issue = client.put(f"{client.resource_url('issue')}/{key}", data=update_body)
             issue_url = f"{client.url.rstrip('/')}/browse/{key}"
             output = f"Done. Issue {key} has been updated successfully. You can view it at {issue_url}. Details: {str(issue)}"
             logger.info(output)
             return output
         except ToolException as e:
             raise ToolException(e)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error updating Jira issue: {stacktrace}")
-            return f"Error updating Jira issue: {stacktrace}"
+        except HTTPError as e:
+            logger.error(f"Error updating Jira issue {params.get('key')}: {format_exc()}")
+            return f"Error updating Jira issue: Jira rejected the update. {_http_error_detail(e)}"
+        except Exception as e:
+            logger.error(f"Error updating Jira issue: {format_exc()}")
+            return f"Error updating Jira issue: {type(e).__name__}: {e}"
 
     @tool_group('write')
     def update_issue(self, issue_json: str):
@@ -1051,31 +1172,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
     def _text_to_adf(self, text: str) -> Dict[str, Any]:
         """Convert plain text to Atlassian Document Format."""
-        if not text:
-            return {"type": "doc", "version": 1, "content": []}
-        paragraphs = text.split('\n\n')
-        content = []
-        for para in paragraphs:
-            if para.strip():
-                content.append({
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": para}]
-                })
-        return {"type": "doc", "version": 1, "content": content}
+        return text_to_adf(text)
 
     def _adf_to_text(self, adf: Any) -> str:
         """Convert Atlassian Document Format to plain text."""
-        if isinstance(adf, str):
-            return adf
-        if not isinstance(adf, dict):
-            return ''
-        content = adf.get('content', [])
-        paragraphs = []
-        for item in content:
-            if item.get('type') == 'paragraph':
-                texts = [c.get('text', '') for c in item.get('content', []) if c.get('type') == 'text']
-                paragraphs.append(''.join(texts))
-        return '\n\n'.join(paragraphs)
+        return adf_to_text(adf)
 
     def _get_file_markup(self, filename: str, mime_type: str) -> str:
         """Generate Jira markup for file based on MIME type."""
