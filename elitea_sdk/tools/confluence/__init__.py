@@ -101,7 +101,12 @@ class ConfluenceToolkit(BaseToolkit):
 
         model = create_model(
             name,
-            space=(str, Field(description="Space")),
+            space=(str, Field(
+                description="Space Key — the short code identifying the Confluence space "
+                            "(not the human-readable Space Name).\n"
+                            "Found in the space URL, right after the `/display/` path segment, "
+                            "e.g. `MPS` in `https://your-domain.atlassian.net/wiki/display/MPS/...`"
+            )),
             api_version=(Literal['Auto', '1', '2'], Field(
                 description="REST API version used for all Confluence operations.\n\n"
                         "• **Auto** (default) — automatically selected based on the Hosting setting "
