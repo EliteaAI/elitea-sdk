@@ -3147,7 +3147,12 @@ def test_parallel_reconcile_turns_terminal_child_failures_into_tool_results():
     result = runnable.invoke({
         'parallel_reconcile': parked['dispatch_epoch'],
         'parallel_terminal_errors': {
-            parked['parallel_dispatch'][0]['child_thread_id']: {'error': 'child A failed'},
+            parked['parallel_dispatch'][0]['child_thread_id']: {
+                'code': 'output_continuation_exhausted',
+                'user_message': 'child A failed',
+                'attempts': 4,
+                'partial_output_available': True,
+            },
             parked['parallel_dispatch'][1]['child_thread_id']: {'error': 'child B was not dispatched'},
         },
     }, config=config)
@@ -3155,6 +3160,8 @@ def test_parallel_reconcile_turns_terminal_child_failures_into_tool_results():
     assert result['execution_finished'] is True
     assert result['output'] == 'parent-done'
     assert any('child A failed' in item for item in reconcile_llm.calls[-1])
+    assert any('output_continuation_exhausted' in item for item in reconcile_llm.calls[-1])
+    assert any('partial_output_available' in item for item in reconcile_llm.calls[-1])
     assert any('child B was not dispatched' in item for item in reconcile_llm.calls[-1])
 
 

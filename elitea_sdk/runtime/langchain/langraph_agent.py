@@ -2788,14 +2788,29 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             if status != 'completed':
                 terminal_error = terminal_errors.get(child_thread_id)
                 if terminal_error:
-                    error_text = (
-                        terminal_error.get('error')
-                        if isinstance(terminal_error, dict)
-                        else str(terminal_error)
-                    )
+                    if isinstance(terminal_error, dict):
+                        allowed_keys = (
+                            'code', 'user_message', 'attempts', 'failure_reason',
+                            'stop_reason', 'partial_output_available',
+                        )
+                        error_payload = {
+                            key: terminal_error[key]
+                            for key in allowed_keys
+                            if terminal_error.get(key) is not None
+                        }
+                        error_payload.setdefault(
+                            'user_message',
+                            str(terminal_error.get('error') or 'Parallel child failed'),
+                        )
+                        error_payload.setdefault('code', 'parallel_child_failed')
+                    else:
+                        error_payload = {
+                            'code': 'parallel_child_failed',
+                            'user_message': str(terminal_error),
+                        }
                     tool_messages.append(ToolMessage(
                         content=json.dumps(
-                            {'error': error_text or 'Parallel child failed'},
+                            {'error': error_payload},
                             ensure_ascii=False,
                         ),
                         tool_call_id=tool_call_id,
