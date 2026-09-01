@@ -27,6 +27,7 @@ Example:
 """
 
 import logging
+import hashlib
 import re
 import traceback
 from abc import ABC, abstractmethod
@@ -187,9 +188,20 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
 
     @staticmethod
     def _enrichment_key(context: ExceptionContext) -> str:
-        """Same tool, same exception type, same message shape -> same enrichment."""
+        """Every input the enrichment prompt varies on: tool, toolkit type (it selects the
+        FAQ and source code), exception type, arguments, and the full message."""
         message = re.sub(r'\s+', ' ', (context.error_str or '')).strip().lower()
-        return f"{context.tool_name}|{context.error_type}|{message[:_ENRICHMENT_KEY_MAX_CHARS]}"
+        metadata = getattr(context.tool, 'metadata', None) or {}
+        args_digest = hashlib.sha256(
+            repr((context.args, sorted((context.kwargs or {}).items(), key=lambda kv: str(kv[0])))).encode()
+        ).hexdigest()[:16]
+        # Hashed, not truncated: two errors sharing a long common prefix must not collide.
+        message_digest = hashlib.sha256(message.encode()).hexdigest()[:16]
+        return "|".join((
+            str(context.tool_name), str(metadata.get('toolkit_type')),
+            str(context.error_type), args_digest,
+            message[:_ENRICHMENT_KEY_MAX_CHARS], message_digest,
+        ))
 
     def _cache_enrichment(self, key: str, value: str) -> None:
         if len(self._enrichment_cache) >= _ENRICHMENT_CACHE_MAX_ENTRIES:

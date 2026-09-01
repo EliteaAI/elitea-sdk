@@ -39,6 +39,7 @@ from elitea_sdk.runtime.tool_outcome import (
     outcome_sink,
 )
 from elitea_sdk.runtime.tools.mcp_remote_tool import McpRemoteTool
+from elitea_sdk.runtime.utils.failure_signals import mcp_error_message, mcp_is_error
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 
 
@@ -438,3 +439,62 @@ class TestShadowLogEmittedOncePerFailure:
         payloads = self._shadow_payloads(caplog.records)
         assert len(payloads) == 1
         assert payloads[0]["detected_by"] == "mcp_exception_swallowed"
+
+
+class TestEnrichmentKeyCoversEveryPromptInput:
+    """The enrichment prompt varies on arguments, toolkit type (which selects the FAQ and
+    the tool source code) and the whole message. Anything the prompt reads but the key
+    omits lets one failure serve a cached answer written for a different one."""
+
+    def _context(self, message="bad value", tool_name="get_file_contents",
+                 toolkit_type="github", kwargs=None):
+        tool = _tool_raising(ValueError(message), name=tool_name)
+        tool.metadata = {"toolkit_type": toolkit_type}
+        return ExceptionContext(
+            tool=tool,
+            error=ValueError(message),
+            args=(),
+            kwargs=kwargs or {},
+            metadata={"error_class": ToolErrorClass.INPUT},
+        )
+
+    def test_same_tool_and_message_but_different_arguments_do_not_collide(self):
+        key_a = TransformErrorStrategy._enrichment_key(self._context(kwargs={"path": "a.py"}))
+        key_b = TransformErrorStrategy._enrichment_key(self._context(kwargs={"path": "b.py"}))
+        assert key_a != key_b
+
+    def test_same_tool_name_in_two_toolkits_does_not_collide(self):
+        """A generic name like get_file_contents exists in several toolkits, and each one
+        loads its own FAQ and source code into the prompt."""
+        key_a = TransformErrorStrategy._enrichment_key(self._context(toolkit_type="github"))
+        key_b = TransformErrorStrategy._enrichment_key(self._context(toolkit_type="gitlab"))
+        assert key_a != key_b
+
+    def test_messages_sharing_a_long_prefix_do_not_collide(self):
+        prefix = "x" * 600
+        key_a = TransformErrorStrategy._enrichment_key(self._context(message=prefix + "first"))
+        key_b = TransformErrorStrategy._enrichment_key(self._context(message=prefix + "second"))
+        assert key_a != key_b
+
+    def test_genuinely_identical_failures_still_share_a_key(self):
+        assert (
+            TransformErrorStrategy._enrichment_key(self._context(kwargs={"path": "a.py"}))
+            == TransformErrorStrategy._enrichment_key(self._context(kwargs={"path": "a.py"}))
+        )
+
+
+class TestNestedEnvelopeErrorText:
+    """mcp_is_error looks inside a JSON-RPC envelope, so the text extraction must too."""
+
+    def test_nested_result_yields_the_error_text_not_the_envelope(self):
+        envelope = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {"isError": True, "content": [{"type": "text", "text": "repo not found"}]},
+        }
+        assert mcp_is_error(envelope) is True
+        assert mcp_error_message(envelope) == "repo not found"
+
+    def test_top_level_content_is_still_preferred(self):
+        flat = {"isError": True, "content": [{"type": "text", "text": "boom"}]}
+        assert mcp_error_message(flat) == "boom"

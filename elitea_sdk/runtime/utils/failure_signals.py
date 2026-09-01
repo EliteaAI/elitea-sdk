@@ -31,6 +31,10 @@ def mcp_is_error(result: Any) -> bool:
 
 def mcp_error_message(result: Any) -> str:
     """Render an MCP failure result as the same text the success path would return (#6401)."""
+    # mcp_is_error looks inside a JSON-RPC envelope, so the text extraction must too,
+    # or a nested failure raises with the whole envelope instead of the error text.
+    if isinstance(result, dict) and not result.get("content") and isinstance(result.get("result"), dict):
+        result = result["result"]
     content = result.get("content") if isinstance(result, dict) else getattr(result, "content", None)
     if isinstance(content, list) and content:
         parts = []
