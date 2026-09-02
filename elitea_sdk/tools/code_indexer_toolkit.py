@@ -63,10 +63,10 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 description="Branch to index files from. Defaults to active branch if None.",
                 default=None)),
             "whitelist": (Optional[List[str]], Field(
-                description='File extensions or paths to include. Defaults to all files if None. Example: ["*.md", "*.java"]',
+                description='File extensions or paths to include. Defaults to all files if None. Example: `["*.md", "*.java"]`',
                 default=None)),
             "blacklist": (Optional[List[str]], Field(
-                description='File extensions or paths to exclude. Defaults to no exclusions if None. Example: ["*.md", "*.java"]',
+                description='File extensions or paths to exclude. Defaults to no exclusions if None. Example: `["*.md", "*.java"]`',
                 default=None)),
             "skip_unsupported_extensions": (Optional[bool], Field(
                 description='Skip files with unsupported extensions (default: True). Supported: .py, .js, .ts, .java, .go, .rs, .md, .json, etc.',
