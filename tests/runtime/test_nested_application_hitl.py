@@ -2012,6 +2012,9 @@ class _MultiAppParentBound:
         tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
         tool_contents = [str(m.content) for m in tool_messages]
         self.root.calls.append(tool_contents)
+        self.root.call_statuses.append({
+            m.tool_call_id: m.status for m in tool_messages
+        })
         if tool_messages:
             return AIMessage(content='parent-done')
         return AIMessage(
@@ -2038,6 +2041,7 @@ class MultiAppParentLLM:
         self.id_a = id_a
         self.id_b = id_b
         self.calls = []
+        self.call_statuses = []
 
     @property
     def _get_model_default_parameters(self):
@@ -2287,6 +2291,10 @@ def test_parallel_continuation_failure_reaches_parent_with_successful_sibling():
     assert any('output_continuation_exhausted' in item for item in final_contents)
     assert any('partial_output_available' in item for item in final_contents)
     assert all('large partial child output' not in item for item in final_contents)
+    assert llm.call_statuses[-1] == {
+        'call-A': 'error',
+        'call-B': 'success',
+    }
 
 
 def test_parallel_resume_routes_decisions_to_correct_children():
