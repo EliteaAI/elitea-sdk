@@ -53,8 +53,8 @@ BaseCodeIndexParams = create_model(
     progress_step=(Optional[int], Field(default=5, ge=0, le=100,
                          description="Optional step size for progress reporting during indexing")),
     branch=(Optional[str], Field(description="Branch to index files from. Defaults to active branch if None.", default=None)),
-    whitelist=(Optional[List[str]], Field(description='File extensions or paths to include. Defaults to all files if None. Example: ["*.md", "*.java"]', default=None)),
-    blacklist=(Optional[List[str]], Field(description='File extensions or paths to exclude. Defaults to no exclusions if None. Example: ["*.md", "*.java"]', default=None)),
+    whitelist=(Optional[List[str]], Field(description='File extensions or paths to include. Defaults to all files if None. Example: `["*.md", "*.java"]`', default=None)),
+    blacklist=(Optional[List[str]], Field(description='File extensions or paths to exclude. Defaults to no exclusions if None. Example: `["*.md", "*.java"]`', default=None)),
 
 )
 
