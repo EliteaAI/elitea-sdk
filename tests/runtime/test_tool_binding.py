@@ -6,6 +6,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from elitea_sdk.runtime.langchain.langraph_agent import create_graph
+from elitea_sdk.runtime.tools.lazy_tools import ToolRegistry
 from elitea_sdk.runtime.tools.llm import LLMNode
 from elitea_sdk.runtime.tools.tool_binding import (
     build_tool_binding_plan,
@@ -255,6 +256,34 @@ def test_llm_node_binds_and_executes_both_qualified_collisions():
         "configurations__list_indexes",
     ]
     assert client.invocations == 2
+    assert [
+        message.content for message in result["messages"] if isinstance(message, ToolMessage)
+    ] == ["bucket indexes", "repo indexes"]
+
+
+def test_smart_tool_selection_preserves_colliding_toolkit_tools():
+    attachments = _tool("attachments", "artifact", "list_indexes", "bucket indexes")
+    configurations = _tool("configurations", "github", "list_indexes", "repo indexes")
+    selected_tools = [attachments, configurations]
+    client = _CollisionCallingClient()
+    node = LLMNode(
+        client=client,
+        available_tools=selected_tools,
+        tool_registry=ToolRegistry.from_tools(selected_tools),
+        lazy_tools_mode=True,
+        input_mapping={},
+        output_variables=["messages"],
+    )
+
+    result = node.invoke(
+        {"messages": [HumanMessage(content="list indexes")]},
+        config={"configurable": {"selected_tools": selected_tools}},
+    )
+
+    assert client.bound_tool_names == [
+        "attachments__list_indexes",
+        "configurations__list_indexes",
+    ]
     assert [
         message.content for message in result["messages"] if isinstance(message, ToolMessage)
     ] == ["bucket indexes", "repo indexes"]
