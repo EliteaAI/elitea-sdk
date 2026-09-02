@@ -47,8 +47,9 @@ from ..tools.loop import LoopNode
 from ..tools.loop_output import LoopToolNode
 from ..tools.tool import ToolNode
 from ..tools.lazy_tools import ToolRegistry
+from ..tools.tool_binding import select_tools_for_binding
 from ..utils.evaluate import EvaluateTemplate
-from ..utils.utils import clean_string, deduplicate_tool_names
+from ..utils.utils import clean_string
 from ..tools.router import RouterNode
 from ..exceptions import PipelineConfigurationError
 
@@ -1124,11 +1125,6 @@ def create_graph(
                 f"[LazyTools] Auto-disabled: only {tool_count} tools "
                 f"(threshold: {LAZY_TOOLS_MIN_THRESHOLD}). Using direct binding."
             )
-            # Dedup tool names: lazy_tools_mode=True caused __init__ to skip dedup,
-            # but direct binding (bind_tools) requires unique names.
-            renamed = deduplicate_tool_names(tools, context="lazy-auto-disable")
-            if renamed:
-                logger.info(f"[LazyTools] Deduplicated {renamed} tool names after auto-disable")
         elif base_tools:
             tool_registry = ToolRegistry.from_tools(base_tools)
             toolkit_count = len(tool_registry.get_toolkit_names())
@@ -1347,16 +1343,24 @@ def create_graph(
                 
                 # Check if tools should be bound to this LLM node
                 connected_tools = node.get('tool_names', {})
-                tool_names = []
+                explicit_tool_selection = bool(connected_tools)
                 connected_toolkit_names = set()
                 if isinstance(connected_tools, dict):
-                    for toolkit, selected_tools in connected_tools.items():
+                    for toolkit in connected_tools:
                         connected_toolkit_names.add(str(toolkit).lower())
-                        # Add tool names directly (no prefix)
-                        tool_names.extend(selected_tools)
-                elif isinstance(connected_tools, list):
-                    # Use provided tool names as-is
-                    tool_names = connected_tools
+
+                available_tools = []
+                missing_tools = []
+                if explicit_tool_selection:
+                    try:
+                        available_tools, missing_tools = select_tools_for_binding(
+                            tools,
+                            connected_tools,
+                        )
+                    except ValueError as exc:
+                        raise PipelineConfigurationError(
+                            f"Invalid tool selection for LLM node '{node_id}': {exc}"
+                        ) from exc
 
                 # When an explicitly connected toolkit cannot load before OAuth, its
                 # real tools are replaced by a deferred authorization gateway. Preserve
@@ -1377,22 +1381,30 @@ def create_graph(
                         if connected_toolkit_names.intersection(toolkit_aliases):
                             auth_gateway_names.append(tool.name)
                     if auth_gateway_names:
-                        tool_names.extend(auth_gateway_names)
+                        selected_ids = {id(tool) for tool in available_tools}
+                        for tool in tools:
+                            if (
+                                isinstance(tool, BaseTool)
+                                and tool.name in auth_gateway_names
+                                and id(tool) not in selected_ids
+                            ):
+                                available_tools.append(tool)
+                                selected_ids.add(id(tool))
                         if any(
                             isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
                             for tool in tools
                         ):
-                            tool_names.append('mcp_auth_control')
-                        tool_names = list(dict.fromkeys(tool_names))
+                            auth_control = next(
+                                tool for tool in tools
+                                if isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
+                            )
+                            if id(auth_control) not in selected_ids:
+                                available_tools.append(auth_control)
+                                selected_ids.add(id(auth_control))
 
                 # For non-agent LLM nodes (PIPELINE node without toolkits defined) we don't add any hidden tools by default, to avoid confusion and encourage explicit tool selection
-                available_tools = []
-                if tool_names:
-                    # Filter tools by name
-                    tool_dict = {tool.name: tool for tool in tools if isinstance(tool, BaseTool)}
-                    available_tools = [tool_dict[name] for name in tool_names if name in tool_dict]
-                    if len(available_tools) != len(tool_names):
-                        missing_tools = [name for name in tool_names if name not in tool_dict]
+                if explicit_tool_selection:
+                    if missing_tools:
                         logger.warning(f"Some tools not found for LLM node {node_id}: {missing_tools}")
                 # If this is an agent (NOT A PIPELINE NODE) without explicit tool_names, bind all tools by default for backward compatibility
                 elif yaml.safe_load(yaml_schema).get('name', '').lower() == DEAULT_AGENT_NAME:
@@ -1408,7 +1420,7 @@ def create_graph(
                 use_lazy_for_node = (
                     lazy_tools_mode and
                     tool_registry is not None and
-                    not tool_names  # If specific tools requested, use direct binding
+                    not explicit_tool_selection
                 )
 
                 if use_lazy_for_node:
@@ -1425,7 +1437,8 @@ def create_graph(
                     structured_output=node.get('structured_output', False),
                     tool_execution_timeout=node.get('tool_execution_timeout', 900),
                     available_tools=available_tools,
-                    tool_names=tool_names,
+                    # Selection is already resolved above while toolkit identity is available.
+                    tool_names=None,
                     steps_limit=kwargs.get('steps_limit', 25),
                     # Lazy tools mode parameters
                     lazy_tools_mode=use_lazy_for_node,

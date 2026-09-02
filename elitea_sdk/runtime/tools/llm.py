@@ -56,6 +56,11 @@ from .skill_tools import (
     loaded_skill_names_from_messages,
     render_skill_registry_index,
 )
+from .tool_binding import (
+    build_tool_binding_plan,
+    get_tool_identity,
+    select_tools_for_binding,
+)
 if TYPE_CHECKING:
     from .lazy_tools import ToolRegistry
 
@@ -636,20 +641,11 @@ class LLMNode(BaseTool):
         )
 
         def merge_skill_tools(tools):
-            # Anthropic rejects duplicate tool names in the bind list; on a name
-            # collision the pre-existing tool wins and load_skill is skipped.
             if not skill_tools:
                 return tools
-            taken = {getattr(t, 'name', None) for t in tools}
             merged = list(tools)
             for skill_tool in skill_tools:
-                if skill_tool.name in taken:
-                    logger.warning(
-                        "[Skills] Tool name %r already bound by another toolkit — "
-                        "skipping the progressive-disclosure skill tool this turn",
-                        skill_tool.name,
-                    )
-                else:
+                if all(existing is not skill_tool for existing in merged):
                     merged.append(skill_tool)
             return merged
 
@@ -687,21 +683,27 @@ class LLMNode(BaseTool):
                 # If no specific tool names provided, use all available tools
                 base_tools = list(self.available_tools)
             else:
-                # Filter tools by name
-                available_tool_names = {tool.name: tool for tool in self.available_tools}
-                for tool_name in self.tool_names:
-                    if tool_name in available_tool_names:
-                        base_tools.append(available_tool_names[tool_name])
-                        logger.debug(f"Added tool '{tool_name}' to LLM node")
-                    else:
-                        logger.warning(f"Tool '{tool_name}' not found in available tools: {list(available_tool_names.keys())}")
+                base_tools, missing_tools = select_tools_for_binding(
+                    self.available_tools,
+                    self.tool_names,
+                )
+                if missing_tools:
+                    logger.warning(
+                        "Tools %s not found in available tools: %s",
+                        missing_tools,
+                        [tool.name for tool in self.available_tools],
+                    )
 
         # Always include always_bind_tools (agent/pipeline tools, planning tools)
         # These need direct LLM access regardless of lazy mode status
         if self.always_bind_tools:
-            # Avoid duplicates - only add tools not already in base_tools
-            existing_names = {t.name for t in base_tools}
-            additional_tools = [t for t in self.always_bind_tools if t.name not in existing_names]
+            # Avoid adding the same object twice. Same-named tools from different
+            # toolkits are intentionally retained and qualified at bind time.
+            existing_ids = {id(tool) for tool in base_tools}
+            additional_tools = [
+                tool for tool in self.always_bind_tools
+                if id(tool) not in existing_ids
+            ]
             if additional_tools:
                 logger.info(
                     f"[DirectBinding] Including {len(additional_tools)} always-bind tools: "
@@ -826,16 +828,14 @@ class LLMNode(BaseTool):
         # Try to get suggestions from the tool itself
         if tool_name:
             filtered_tools = self.get_filtered_tools()
-            for tool in filtered_tools:
-                if tool.name == tool_name:
-                    # Check for truncation_suggestions attribute
-                    if hasattr(tool, 'truncation_suggestions') and tool.truncation_suggestions:
-                        suggestions = tool.truncation_suggestions
-                        break
-                    # Check for get_truncation_suggestions method
-                    elif hasattr(tool, 'get_truncation_suggestions') and callable(tool.get_truncation_suggestions):
-                        suggestions = tool.get_truncation_suggestions()
-                        break
+            tool = build_tool_binding_plan(filtered_tools).resolve(tool_name)
+            if tool is not None:
+                # Check for truncation_suggestions attribute
+                if hasattr(tool, 'truncation_suggestions') and tool.truncation_suggestions:
+                    suggestions = tool.truncation_suggestions
+                # Check for get_truncation_suggestions method
+                elif hasattr(tool, 'get_truncation_suggestions') and callable(tool.get_truncation_suggestions):
+                    suggestions = tool.get_truncation_suggestions()
         
         # Fall back to generic suggestions if tool doesn't provide any
         if not suggestions:
@@ -979,10 +979,9 @@ class LLMNode(BaseTool):
         return cleaned_messages
 
     def _get_tool_identity(self, tool: BaseTool) -> Dict[str, Optional[str]]:
-        metadata = getattr(tool, 'metadata', None) or {}
-        toolkit_name = metadata.get('toolkit_name')
-        toolkit_type = metadata.get('toolkit_type') or metadata.get('type')
-        resolved_tool_name = normalize_tool_name(metadata.get('tool_name') or tool.name)
+        identity = get_tool_identity(tool)
+        toolkit_name = identity.toolkit_name
+        toolkit_type = identity.toolkit_type
 
         if not toolkit_name and self.tool_registry is not None:
             toolkit_name = self.tool_registry.get_toolkit_for_tool(tool.name)
@@ -991,7 +990,7 @@ class LLMNode(BaseTool):
             toolkit_type = self.tool_registry.get_toolkit_type(toolkit_name)
 
         return {
-            'tool_name': resolved_tool_name,
+            'tool_name': normalize_tool_name(identity.tool_name),
             'toolkit_name': toolkit_name,
             'toolkit_type': toolkit_type,
         }
@@ -1355,8 +1354,13 @@ class LLMNode(BaseTool):
                 else self.get_filtered_tools(config=config)
             )
             if filtered_tools:
-                logger.info(f"Binding {len(filtered_tools)} tools to LLM: {[t.name for t in filtered_tools]}")
-                llm_client = self.client.bind_tools(filtered_tools)
+                binding_plan = build_tool_binding_plan(filtered_tools)
+                logger.info(
+                    "Binding %d tools to LLM: %s",
+                    len(binding_plan.provider_tools),
+                    [tool.name for tool in binding_plan.provider_tools],
+                )
+                llm_client = self.client.bind_tools(binding_plan.provider_tools)
             else:
                 logger.warning("No tools to bind to LLM")
 
@@ -1911,13 +1915,16 @@ class LLMNode(BaseTool):
         so the parallel fan-out partition and the sequential loop resolve tools
         identically.
         """
-        for tool in self.get_filtered_tools(config=config):
-            if tool.name == tool_name:
-                return tool
-        for tool in (self.available_tools or []):
-            if tool.name == tool_name:
-                logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
-                return tool
+        filtered_plan = build_tool_binding_plan(self.get_filtered_tools(config=config))
+        filtered_tool = filtered_plan.resolve(tool_name)
+        if filtered_tool is not None:
+            return filtered_tool
+
+        available_plan = build_tool_binding_plan(self.available_tools or [])
+        available_tool = available_plan.resolve(tool_name)
+        if available_tool is not None:
+            logger.info("Resolved tool '%s' via available_tools fallback", tool_name)
+            return available_tool
         if self.tool_registry is not None:
             registry_tool = self.tool_registry.get_tool_by_name(tool_name)
             if registry_tool is not None:

@@ -149,10 +149,13 @@ def test_parallel_subagent_failure_sets_error_status():
     assert all('child exploded' in m.content for m in failures)
 
 
-def test_only_the_four_failure_sites_carry_a_status():
-    """Pins both directions: a new error path that forgets status="error" shows up here,
-    and so does anyone marking the blocked or truncated sites as errors — status cannot
-    carry ToolResultStatus BLOCKED or TRUNCATED, so "success" is the honest default there.
+def test_only_known_failure_sites_carry_error_status():
+    """Pin both directions: every explicit status belongs to a known failure path.
+
+    The five current sites cover a generic tool failure, an unavailable tool, a
+    step-limit placeholder, a parallel sub-agent failure, and exhausted output
+    continuation in a parallel child. Blocked and truncated results deliberately
+    retain the default status: ToolMessage.status cannot represent those states.
     """
     import ast
     import inspect
@@ -171,4 +174,4 @@ def test_only_the_four_failure_sites_carry_a_status():
                 assert isinstance(keyword.value, ast.Constant)
                 statuses.append(keyword.value.value)
 
-    assert statuses == ['error'] * 4
+    assert statuses == ['error'] * 5
