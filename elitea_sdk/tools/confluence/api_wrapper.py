@@ -195,8 +195,8 @@ GetPageAttachmentsInput = create_model(
     page_id=(str, Field(description="Confluence page ID from which attachments will be retrieved")),
     max_content_length=(int, Field(default=10000, description="Maximum number of characters to return for attachment content. Content will be truncated if longer. Default is 10000.")),
     custom_prompt=(Optional[str], Field(default=None, description="Custom prompt to use for LLM-based analysis of attachments (images, pdfs, etc). If not provided, a default prompt will be used.")),
-    allowed_extensions=(Optional[List[str]], Field(default=None, description="List of file extensions to include (e.g. ['pdf', 'docx']). If None, all extensions are included.", examples=[["pdf", "docx"]])),
-    name_pattern=(Optional[str], Field(default=None, description="Regex pattern to filter attachment names (e.g. '^report_.*\\.pdf$'). If None, all names are included.", examples=["^report_.*\\.pdf$"])),
+    allowed_extensions=(Optional[List[str]], Field(default=None, description="List of file extensions to include (e.g. `['pdf', 'docx']`). If None, all extensions are included.", examples=[["pdf", "docx"]])),
+    name_pattern=(Optional[str], Field(default=None, description="Regex pattern to filter attachment names (e.g. `'^report_.*\\.pdf$'`). If None, all names are included.", examples=["^report_.*\\.pdf$"])),
     max_attachments=(int, Field(default=50, description="Maximum number of visible attachments to process and return. A notice entry is appended when more exist. Default is 50.")),
 )
 
@@ -2373,11 +2373,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             "include_archived_content": (Optional[bool], Field(description="Include archived content.", default=False)),
             "include_attachments": (Optional[bool], Field(description="Include attachments.", default=False)),
             'include_extensions': (Optional[List[str]], Field(
-                description='List of file extensions to include when processing attachments: i.e. ["*.png", "*.jpg"]. '
+                description='List of file extensions to include when processing attachments: i.e. `["*.png", "*.jpg"]`. '
                             "If empty, all files will be processed (except skip_extensions).",
                 default=[])),
             'skip_extensions': (Optional[List[str]], Field(
-                description='List of file extensions to skip when processing attachments: i.e. ["*.png", "*.jpg"]',
+                description='List of file extensions to skip when processing attachments: i.e. `["*.png", "*.jpg"]`',
                 default=[])),
             "include_comments": (Optional[bool], Field(description="Include comments.", default=False)),
             "include_labels": (Optional[bool], Field(description="Include labels.", default=False)),
