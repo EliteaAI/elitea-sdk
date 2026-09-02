@@ -107,7 +107,7 @@ runtime = [
 ]
 
 tools = [
-    "dulwich==0.21.6",
+    "dulwich==1.2.5",
     "paramiko==3.3.1",
     "pygithub==2.3.0",
     "python-gitlab==4.5.0",
