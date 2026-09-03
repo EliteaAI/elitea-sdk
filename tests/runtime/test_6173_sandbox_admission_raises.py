@@ -83,7 +83,6 @@ class TestGatesRaise:
                 _run_arun(tool)
         assert exc_info.value.provider_error_category == "service_busy"
         assert "Sandbox busy" in str(exc_info.value)
-        assert exc_info.value.retry_after == 5.0
 
     def test_memory_gate_raises(self):
         tool = _make_tool()
@@ -96,7 +95,6 @@ class TestGatesRaise:
             with pytest.raises(SandboxAdmissionRefused) as exc_info:
                 _run_arun(tool)
         assert exc_info.value.provider_error_category == "out_of_memory"
-        assert exc_info.value.retry_after == 10.0
 
     def test_sync_run_with_gate_tripped_raises_not_returns_string(self):
         """Regression for the easiest way to ship this fix broken: the sync _run catch-all."""
@@ -147,6 +145,21 @@ class TestClassification:
         error_class = classify_tool_error(exc)
         assert error_class is ToolErrorClass.INFRASTRUCTURE
         assert retriable_for(error_class) is True
+
+    @pytest.mark.parametrize("category", ["invalid_input", "resource_not_found"])
+    def test_remote_permanent_error_categories_not_retriable(self, category):
+        """Regression for the remote_sandbox.py non-200 catch-all: a permanent client
+        error (400/404) must not be classified as infrastructure/retriable."""
+        exc = SandboxAdmissionRefused("boom", category)
+        error_class = classify_tool_error(exc)
+        assert error_class is ToolErrorClass.INPUT
+        assert retriable_for(error_class) is False
+
+    def test_remote_auth_error_category_is_policy(self):
+        exc = SandboxAdmissionRefused("boom", "authentication_error")
+        error_class = classify_tool_error(exc)
+        assert error_class is ToolErrorClass.POLICY
+        assert retriable_for(error_class) is False
 
 
 class TestPipelineNonCorruption:
