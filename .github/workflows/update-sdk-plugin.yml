@@ -1,18 +1,36 @@
 name: Update SDK Plugin
 
 on:
-  workflow_run:
-    workflows: ["Publish to PyPI 📦"]
-    types:
-      - completed
+  workflow_call:
+    inputs:
+      sdk_version:
+        description: "Published elitea-sdk version"
+        required: true
+        type: string
+      target_branch:
+        description: "Target branch in sdk_plugin"
+        required: true
+        type: string
+      create_pr:
+        description: "Create a pull request instead of pushing directly"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SDK_PLUGIN_DEPLOYMENT_KEY:
+        required: true
   workflow_dispatch:
     inputs:
-      create-pr:
+      sdk_version:
+        description: "Published elitea-sdk version"
+        required: true
+        type: string
+      create_pr:
         description: "Create a pull request? (false = push directly)"
         required: true
         type: boolean
         default: false
-      target-branch:
+      target_branch:
         description: "Target branch in sdk_plugin (leave empty to use current branch)"
         required: false
         type: string
@@ -24,43 +42,26 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      packages: read
-      id-token: write
 
     steps:
-      - name: Determine target branch
-        id: branch
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_run" ]; then
-            BRANCH="${{ github.event.workflow_run.head_branch }}"
-          elif [ -n "${{ inputs.target-branch }}" ]; then
-            BRANCH="${{ inputs.target-branch }}"
-          else
-            BRANCH="${{ github.ref_name }}"
-          fi
-          echo "target_branch=$BRANCH" >> $GITHUB_OUTPUT
-          echo "::notice title=Target Branch::Will update sdk_plugin on branch: $BRANCH"
-
-      - name: Checkout repository
+      # The former completed-workflow design checked out and executed a branch name
+      # taken from a privileged event. Keep automation code on the trusted
+      # caller commit and treat the target branch only as data for sdk_plugin.
+      - name: Checkout trusted SDK automation
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.branch.outputs.target_branch }}
+          persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Install dependencies
+      - name: Validate inputs
+        id: validated
+        env:
+          SDK_VERSION: ${{ inputs.sdk_version }}
+          TARGET_BRANCH: ${{ inputs.target_branch || github.ref_name }}
         run: |
-          python -m pip install --upgrade pip
-          pip install build
-
-      - name: Get current version
-        id: get_version
-        run: |
-          VERSION=$(python -c "import build.util; print(build.util.project_wheel_metadata('.').get('Version'))")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          python .github/scripts/update_sdk_plugin_version.py \
+            --validate-only \
+            --version "$SDK_VERSION" \
+            --target-branch "$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Checkout sdk_plugin
         uses: actions/checkout@v4
@@ -68,56 +69,52 @@ jobs:
           repository: EliteaAI/sdk_plugin
           ssh-key: ${{ secrets.SDK_PLUGIN_DEPLOYMENT_KEY }}
           path: sdk_plugin
-          ref: ${{ steps.branch.outputs.target_branch }}
+          ref: ${{ steps.validated.outputs.target_branch }}
 
       - name: Update requirements.txt and metadata.json
-        run: |
-          cd sdk_plugin
-          # Update elitea-sdk version in requirements.txt
-          sed -i "s/elitea-sdk\[all\]==[0-9.]*/elitea-sdk\[all\]==${{ steps.get_version.outputs.version }}/" requirements.txt
-          # Update version in metadata.json
-          python -c "
-          import json
-          with open('metadata.json', 'r') as f:
-              data = json.load(f)
-          data['version'] = '${{ steps.get_version.outputs.version }}'
-          with open('metadata.json', 'w') as f:
-              json.dump(data, f, indent=2)
-              f.write('\n')
-          "
+        env:
+          SDK_VERSION: ${{ steps.validated.outputs.sdk_version }}
+        run: >-
+          python .github/scripts/update_sdk_plugin_version.py
+          --plugin-dir sdk_plugin
+          --version "$SDK_VERSION"
 
       - name: Commit and push changes
-        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && inputs.create-pr == false)
+        if: inputs.create_pr == false
+        env:
+          SDK_VERSION: ${{ steps.validated.outputs.sdk_version }}
         run: |
           cd sdk_plugin
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
           git add requirements.txt metadata.json
           if git diff --cached --quiet; then
-            echo "::notice title=No Changes::sdk_plugin already at version ${{ steps.get_version.outputs.version }}"
+            echo "::notice title=No Changes::sdk_plugin already at version $SDK_VERSION"
           else
-            git commit -m "chore: update elitea-sdk to version ${{ steps.get_version.outputs.version }}"
+            git commit -m "chore: update elitea-sdk to version $SDK_VERSION"
             git push
           fi
 
       - name: Create Pull Request
-        if: github.event_name == 'workflow_dispatch' && inputs.create-pr == true
+        if: inputs.create_pr == true
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update elitea-sdk to version ${{ steps.get_version.outputs.version }}"
-          title: "Update elitea-sdk to version ${{ steps.get_version.outputs.version }}"
+          commit-message: "chore: update elitea-sdk to version ${{ steps.validated.outputs.sdk_version }}"
+          title: "Update elitea-sdk to version ${{ steps.validated.outputs.sdk_version }}"
           body: |
-            This PR updates elitea-sdk to version ${{ steps.get_version.outputs.version }}:
+            This PR updates elitea-sdk to version ${{ steps.validated.outputs.sdk_version }}:
             - `requirements.txt`: pip dependency pin
             - `metadata.json`: plugin version for pylon
 
             Automatically triggered by PyPI release.
-            Target branch: ${{ steps.branch.outputs.target_branch }}
-          branch: update-sdk-${{ steps.branch.outputs.target_branch }}
-          base: ${{ steps.branch.outputs.target_branch }}
+            Target branch: ${{ steps.validated.outputs.target_branch }}
+          branch: update-sdk-${{ steps.validated.outputs.target_branch }}
+          base: ${{ steps.validated.outputs.target_branch }}
           delete-branch: true
 
       - name: Show version bump annotation
+        env:
+          SDK_VERSION: ${{ steps.validated.outputs.sdk_version }}
         run: |
-          echo "::notice title=Version Bump::Updated sdk_plugin to elitea-sdk ${{ steps.get_version.outputs.version }}"
+          echo "::notice title=Version Bump::Updated sdk_plugin to elitea-sdk $SDK_VERSION"
