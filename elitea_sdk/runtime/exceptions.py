@@ -72,6 +72,19 @@ class BudgetExceededError(Exception):
         self.scope = scope if scope in BUDGET_SCOPES else DEFAULT_BUDGET_SCOPE
 
 
+class SandboxAdmissionRefused(Exception):
+    """Sandbox refused this execution (gate trip, timeout, backend unavailable).
+
+    Subclasses Exception rather than ToolException on purpose - same rationale as
+    BudgetExceededError above.
+    """
+
+    def __init__(self, message, category="service_busy", retry_after=None):
+        super().__init__(message)
+        self.provider_error_category = category
+        self.retry_after = retry_after
+
+
 def budget_exceeded_from(exc):
     """Return a BudgetExceededError if exc is a budget rejection, else None.
 

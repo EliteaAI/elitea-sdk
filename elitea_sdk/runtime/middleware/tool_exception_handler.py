@@ -30,7 +30,7 @@ import logging
 from functools import wraps
 from typing import List, Optional, Dict, Any, Callable, Tuple
 
-from elitea_sdk.runtime.exceptions import budget_exceeded_from
+from elitea_sdk.runtime.exceptions import budget_exceeded_from, SandboxAdmissionRefused
 from elitea_sdk.runtime.tool_outcome import (
     ToolOutcome,
     ToolResultStatus,
@@ -94,6 +94,10 @@ def swarm_handle_tool_errors(error: Exception) -> str:
     the whole swarm graph down; plain ``True`` would swallow the signals above, since
     ToolNode only protects GraphBubbleUp before consulting this callable. The
     ``Exception`` annotation is what langgraph's _infer_handled_types reads.
+
+    SandboxAdmissionRefused intentionally falls through to classification below rather
+    than being re-raised here: the middleware bypasses it (pipeline path), but on the
+    agent path the turn should degrade gracefully, not abort.
     """
     reraise_signal_exceptions(error)
     error_class = classify_tool_error(error)
@@ -103,6 +107,7 @@ def swarm_handle_tool_errors(error: Exception) -> str:
         error_class=error_class,
         retriable=retriable_for(error_class),
         exception_type=type(error).__name__,
+        retry_after=getattr(error, 'retry_after', None),
     )
     record_outcome(outcome)
     return outcome.message
@@ -368,6 +373,10 @@ When a tool fails with an error:
 
     @staticmethod
     def _reraise_signals(error: Exception) -> None:
+        # Pipeline-path only: shaping this into prose would put it back into an output
+        # variable, which is the bug this bypass exists to prevent.
+        if isinstance(error, SandboxAdmissionRefused):
+            raise error
         reraise_signal_exceptions(error)
 
     def _run_error_pipeline(self, tool: BaseTool, error: Exception, args, kwargs) -> str:
@@ -402,6 +411,7 @@ When a tool fails with an error:
         context.metadata['error_class'] = error_class
         context.metadata['retriable'] = retriable_for(error_class)
         context.metadata['exception_type'] = context.error_type
+        context.metadata['retry_after'] = getattr(context.error, 'retry_after', None)
 
     def _finalize_outcome(self, context: ExceptionContext) -> ToolOutcome:
         """Assemble the envelope once the message is final. message is a pass-through."""
@@ -414,6 +424,7 @@ When a tool fails with an error:
             retriable=bool(context.metadata.get('retriable', False)),
             exception_type=_str_or_none(context.metadata.get('exception_type')),
             toolkit_type=_str_or_none(tool_metadata.get('toolkit_type')),
+            retry_after=context.metadata.get('retry_after'),
         )
         log_tool_result(
             logger, type(self).__name__, outcome.tool_name,

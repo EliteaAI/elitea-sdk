@@ -153,6 +153,29 @@ async def test_service_unavailable_503_non_json(sandbox):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status,expected_category", [
+    (400, "invalid_input"),
+    (403, "authentication_error"),
+    (404, "resource_not_found"),
+    (422, "invalid_input"),
+    (429, "rate_limit"),
+    (500, "service_busy"),
+    (502, "service_busy"),
+])
+async def test_non_200_status_maps_to_correct_category(sandbox, status, expected_category):
+    """Permanent client errors (400/403/404/422) must not classify as retriable
+    infrastructure failures - only genuinely transient statuses (429/5xx) should."""
+    response = MockResponse(status, text_data="boom")
+    session = MockSession(response)
+    sandbox._session = session
+
+    result = await sandbox.execute("x=1")
+
+    assert result.status == "error"
+    assert result.infra_category == expected_category
+
+
+@pytest.mark.asyncio
 async def test_execution_failure(sandbox):
     response = MockResponse(200, {
         "success": False,

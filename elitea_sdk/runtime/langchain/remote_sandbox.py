@@ -16,6 +16,17 @@ _MAX_TIMEOUT_SECONDS = 55.0
 _HTTP_TIMEOUT_HEADROOM = 15
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB cap on session_bytes (binary, not trace-capped)
 
+# provider_error_category values for non-200 statuses other than 503 (handled separately).
+# Names match tool_outcome._PROVIDER_CATEGORY_CLASSES so classification is automatic;
+# unlisted/5xx statuses fall back to "service_busy" (infrastructure, retriable).
+_NON_200_CATEGORIES = {
+    400: "invalid_input",
+    403: "authentication_error",
+    404: "resource_not_found",
+    422: "invalid_input",
+    429: "rate_limit",
+}
+
 
 class RemoteSandbox:
     """HTTP client that delegates code execution to the sandbox_runner service.
@@ -86,14 +97,19 @@ class RemoteSandbox:
                         status="error",
                         stderr=detail or "Sandbox service unavailable, retry shortly",
                         execution_time=elapsed,
+                        infra_category="service_busy",
                     )
 
                 if resp.status != 200:
                     text = await resp.text()
+                    # Reuse the existing provider-category vocabulary so permanent client
+                    # errors (400/403/404/422) classify as non-retriable, not infrastructure.
+                    category = _NON_200_CATEGORIES.get(resp.status, "service_busy")
                     return CodeExecutionResult(
                         status="error",
                         stderr=f"Sandbox service returned HTTP {resp.status}: {text[:200]}",
                         execution_time=elapsed,
+                        infra_category=category,
                     )
 
                 data = await resp.json()
@@ -105,6 +121,7 @@ class RemoteSandbox:
                 status="error",
                 stderr=f"Sandbox service unreachable: {exc}",
                 execution_time=elapsed,
+                infra_category="service_busy",
             )
         except TimeoutError:
             elapsed = time.monotonic() - start
@@ -112,6 +129,7 @@ class RemoteSandbox:
                 status="error",
                 stderr=f"Sandbox service timed out after {elapsed:.1f}s",
                 execution_time=elapsed,
+                timed_out=True,
             )
 
         response_session_bytes = None

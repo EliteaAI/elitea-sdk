@@ -11,6 +11,8 @@ from langchain_core.messages import ToolCall
 from pydantic import BaseModel, create_model, ConfigDict, Field
 from pydantic.fields import FieldInfo
 
+from ..exceptions import SandboxAdmissionRefused
+
 logger = logging.getLogger(__name__)
 
 name = "pyodide"
@@ -405,6 +407,8 @@ class PyodideSandboxTool(BaseTool):
             except RuntimeError:
                 # No running loop, safe to use asyncio.run
                 return asyncio.run(self._arun(code))
+        except SandboxAdmissionRefused:
+            raise
         except (ImportError, RuntimeError) as e:
             # Handle specific dependency errors gracefully
             error_msg = str(e)
@@ -446,12 +450,11 @@ class PyodideSandboxTool(BaseTool):
                             "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
                             n_deno, max_concurrent,
                         )
-                        return {
-                            "error": f"Sandbox busy: {n_deno} concurrent executions at limit "
-                                     f"{max_concurrent}. Retry shortly.",
-                            "status": "Execution failed",
-                            "execution_info": "Execution time: 0.00s",
-                        }
+                        raise SandboxAdmissionRefused(
+                            f"Sandbox busy: {n_deno} concurrent executions at limit "
+                            f"{max_concurrent}. Retry shortly.",
+                            "service_busy",
+                        )
 
                 pressure_pct = limits["memory_pressure_pct"]
                 if pressure_pct and pressure_pct > 0:
@@ -461,12 +464,11 @@ class PyodideSandboxTool(BaseTool):
                             "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
                             current_pressure, pressure_pct,
                         )
-                        return {
-                            "error": f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
-                                     f"{pressure_pct}%. Retry shortly.",
-                            "status": "Execution failed",
-                            "execution_info": "Execution time: 0.00s",
-                        }
+                        raise SandboxAdmissionRefused(
+                            f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
+                            f"{pressure_pct}%. Retry shortly.",
+                            "out_of_memory",
+                        )
             # --- End admission gate ----------------------------------------------
 
             if self._sandbox is None:
@@ -497,6 +499,16 @@ class PyodideSandboxTool(BaseTool):
                 self.session_bytes = result.session_bytes
                 self.session_metadata = result.session_metadata
 
+            if getattr(result, "timed_out", False):
+                raise SandboxAdmissionRefused(
+                    result.stderr or "Sandbox execution timed out", "timeout",
+                )
+            infra_category = getattr(result, "infra_category", None)
+            if infra_category:
+                raise SandboxAdmissionRefused(
+                    result.stderr or "Sandbox backend unavailable", infra_category,
+                )
+
             result_dict = {}
 
             if result.result is not None:
@@ -520,6 +532,8 @@ class PyodideSandboxTool(BaseTool):
             result_dict["execution_info"] = execution_info
             return result_dict
 
+        except SandboxAdmissionRefused:
+            raise
         except Exception as e:
             logger.error(f"Error executing code in sandbox: {e}")
             return {"error": f"Error executing code: {str(e)}"}

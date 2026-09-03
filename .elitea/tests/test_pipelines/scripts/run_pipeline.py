@@ -751,6 +751,29 @@ def process_pipeline_result(
                         pass
                     # Note: Plain-text errors ("Error: ...") and HTML error pages are handled in PRIORITY 1
 
+    # Check the typed tool_outcomes envelope (#6173): infra refusals (sandbox concurrency/
+    # memory gates, timeout, backend unavailable) now raise instead of returning a
+    # "status": "Execution failed" dict, so the checks above never see them. tool_outcomes
+    # is keyed by node id, so - like the chat_history checks above - a failing node with
+    # continue_on_error: true must not fail the test. Genuine user-code errors still hit
+    # the "Execution failed" checks above unchanged.
+    if test_passed is None and isinstance(result_data, dict):
+        tool_outcomes = result_data.get("tool_outcomes")
+        if isinstance(tool_outcomes, dict):
+            for node_name, outcome in tool_outcomes.items():
+                if not (isinstance(outcome, dict) and outcome.get("status") == "error"):
+                    continue
+                if node_name in nodes_with_continue_on_error:
+                    if logger:
+                        logger.debug(f"Tool outcome error from continue_on_error node '{node_name}' - not treating as failure")
+                    continue
+                error_msg = outcome.get("message", "Tool call failed")
+                detected_error = f"Tool outcome error ({node_name}): {error_msg[:200]}"
+                test_passed = False
+                if logger:
+                    logger.error(f"Infrastructure/tool error detected via tool_outcomes: {detected_error}")
+                break
+
     # Check various result structures for test_passed (only if not already set by error checks)
     if test_passed is None and isinstance(result_data, dict):
         # Direct test_passed field

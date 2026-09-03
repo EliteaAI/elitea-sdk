@@ -690,6 +690,7 @@ alita_client = elitea_client
                 error_class=error_class,
                 retriable=retriable_for(error_class),
                 exception_type=type(e).__name__,
+                retry_after=getattr(e, 'retry_after', None),
             ))
             return {"messages": [
                 {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
