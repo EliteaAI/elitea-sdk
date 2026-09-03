@@ -2,6 +2,11 @@ name: Build and Push Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g., pyodide, pyodide-2026-09)'
+        required: false
+        default: 'pyodide'
 
 env:
   REGISTRY: ghcr.io
@@ -34,7 +39,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=pyodide
+            type=raw,value=${{ inputs.tag }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
