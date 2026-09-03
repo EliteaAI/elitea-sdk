@@ -50,7 +50,14 @@ class _StrictAnthropicParentLLMBound:
         if not non_system_messages:
             raise RuntimeError('anthropic.BadRequestError: messages: at least one message is required')
 
-        if any(isinstance(message, ToolMessage) for message in non_system_messages):
+        tool_messages = [
+            message for message in non_system_messages
+            if isinstance(message, ToolMessage)
+        ]
+        if any(not message.content for message in tool_messages):
+            raise RuntimeError('strict provider rejected empty tool result content')
+
+        if tool_messages:
             return AIMessage(content='parent-complete')
 
         return AIMessage(
@@ -108,6 +115,33 @@ def test_application_toolnode_runtime_preserves_current_user_message_for_anthrop
     assert llm.calls[1][1].content == 'Delegate this task'
     assert llm.calls[1][2].tool_calls[0]['name'] == 'child_app'
     assert llm.calls[1][3].tool_call_id == 'call-child-app'
+
+
+def test_application_toolnode_projects_empty_child_output_for_provider():
+    child_tool = Application(
+        name='child_app',
+        description='Nested child app',
+        application=StaticApplication(output=''),
+        return_type='str',
+        client=None,
+        is_subgraph=True,
+    )
+    llm = StrictAnthropicParentLLM(target_tool_name='child_app')
+    runnable = _build_parent_runnable(MemorySaver(), llm, [child_tool])
+
+    result = runnable.invoke(
+        {'messages': [HumanMessage(content='Delegate this task')]},
+        config={'configurable': {'thread_id': 'empty-child-output-thread'}},
+    )
+
+    assert result['execution_finished'] is True
+    assert result['output'] == 'parent-complete'
+    provider_tool_message = next(
+        message for message in llm.calls[1]
+        if isinstance(message, ToolMessage)
+    )
+    assert provider_tool_message.tool_call_id == 'call-child-app'
+    assert provider_tool_message.content
 
 
 def test_application_toolnode_runtime_does_not_duplicate_matching_input_and_messages():

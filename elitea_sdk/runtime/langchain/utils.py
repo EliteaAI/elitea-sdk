@@ -6,7 +6,7 @@ import re
 from uuid import uuid4
 from pydantic import create_model, Field, JsonValue
 from typing import Tuple, TypedDict, Any, Optional, Annotated
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langgraph.graph import add_messages
 
 from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
@@ -16,6 +16,18 @@ logger = logging.getLogger(__name__)
 # Max chars of a tool result rendered into the INFO summary line. The full body
 # is never logged at INFO — a tool (esp. MCP) can return megabytes and flood logs.
 TOOL_RESULT_PREVIEW_CHARS = 500
+
+# Tool implementations may legitimately complete without output, but strict
+# OpenAI-compatible gateways (notably customer-hosted Databricks models) reject
+# an empty ``role=tool`` message before the model can continue. These strings are
+# deliberately provider-neutral and deterministic: they describe the outcome
+# without inventing tool data or encouraging a retry.
+EMPTY_SUCCESSFUL_TOOL_RESULT_CONTENT = (
+    "The tool completed successfully but returned no content."
+)
+EMPTY_ERROR_TOOL_RESULT_CONTENT = (
+    "The tool execution failed but returned no error details."
+)
 
 
 def tool_result_summary(node_name, tool_name, toolkit_id, tool_result, label='response'):
@@ -300,6 +312,56 @@ def normalize_null_tool_call_ids(message: AIMessage) -> AIMessage:
             tool_use_blocks[i]['id'] = new_id
 
     return message
+
+
+def prepare_messages_for_model(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Return a provider-safe, non-mutating projection of message history.
+
+    Empty tool output is a valid application result, but it is not a portable
+    provider message: some OpenAI-compatible endpoints reject empty tool-message
+    content with HTTP 400. Repair only that wire-level ambiguity, immediately
+    before model invocation. The original ToolMessage remains untouched for
+    checkpointing, UI rendering, and audit, while ``model_copy`` preserves the
+    call id, status, name, artifact, and provider metadata on the outbound copy.
+
+    Assistant messages are intentionally outside this contract. In particular,
+    an AIMessage with empty content and non-empty tool_calls is a valid provider
+    response and must remain byte-for-byte unchanged.
+    """
+    prepared = list(messages)
+    repaired_count = 0
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+
+        content = message.content
+        is_empty = (
+            content is None
+            or (isinstance(content, str) and not content.strip())
+            or (isinstance(content, list) and not content)
+        )
+        if not is_empty:
+            continue
+
+        replacement = (
+            EMPTY_ERROR_TOOL_RESULT_CONTENT
+            if getattr(message, 'status', 'success') == 'error'
+            else EMPTY_SUCCESSFUL_TOOL_RESULT_CONTENT
+        )
+        prepared[index] = message.model_copy(update={'content': replacement})
+        repaired_count += 1
+
+    if repaired_count:
+        # Do not log message bodies, tool arguments, or call ids: this path can
+        # carry customer data. The count is enough to verify the compatibility
+        # repair in an environment where the custom provider is only available.
+        logger.info(
+            "Prepared %d empty ToolMessage result(s) for provider invocation",
+            repaired_count,
+        )
+
+    return prepared
 
 
 def _extract_json(json_string: str) -> dict:
