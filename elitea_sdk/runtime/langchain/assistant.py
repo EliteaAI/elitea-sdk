@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, Human
 from langchain_core.tools import BaseTool, ToolException
 
 from .langraph_agent import create_graph, normalize_message_content
-from .utils import normalize_null_tool_call_ids
+from .utils import normalize_null_tool_call_ids, prepare_messages_for_model
 from .constants import (
     USER_ADDON, QA_ASSISTANT, NERDY_ASSISTANT, QUIRKY_ASSISTANT, CYNICAL_ASSISTANT,
     DEFAULT_ASSISTANT, PLAN_ADDON, PYODITE_ADDON, DATA_ANALYSIS_ADDON,
@@ -1071,7 +1071,10 @@ class Assistant:
                 system_msg = SystemMessage(
                     content=_make_anthropic_system_content(prompt, model)
                 )
-                response = model_with_tools.invoke([system_msg] + filtered_messages, config)
+                response = model_with_tools.invoke(
+                    prepare_messages_for_model([system_msg] + filtered_messages),
+                    config,
+                )
                 response = normalize_null_tool_call_ids(response)
 
                 # Guard against multiple simultaneous handoff tool calls.
