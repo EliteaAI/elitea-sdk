@@ -56,3 +56,27 @@ RUN pip install --no-cache-dir -e ".[cli]"
 RUN pip install --no-cache-dir -e ".[runtime]"
 RUN pip install --no-cache-dir -e ".[tools]"
 RUN pip install --no-cache-dir -e ".[community]"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pre-installed for CI performance. These packages are used by:
+#   - .github/workflows/execute-tests-on-pr.yml (unit-tests job)
+#   - .github/workflows/test-runner-reusable.yml (toolkit tests)
+#
+# After building this image, the workflow steps that install these packages
+# can be removed or kept as no-ops (pip will skip already-installed packages).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# pytest: Test framework and plugins
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-timeout \
+    pytest-dotenv
+
+# deepeval: LLM evaluation metrics for document loader tests
+RUN pip install --no-cache-dir "deepeval>=3.4.6"
+
+# testcontainers: Docker-based integration tests (e.g., pgvector)
+# Note: Requires Docker socket access at runtime (-v /var/run/docker.sock:/var/run/docker.sock)
+RUN pip install --no-cache-dir "testcontainers==4.14.2"
