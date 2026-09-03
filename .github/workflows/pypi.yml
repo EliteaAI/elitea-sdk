@@ -13,6 +13,8 @@ jobs:
   pypi-publish:
     name: Upload release to PyPI
     runs-on: ubuntu-latest
+    outputs:
+      sdk_version: ${{ steps.package-version.outputs.version }}
     environment:
       name: pypi
       url: https://pypi.org/p/elitea-sdk
@@ -66,6 +68,16 @@ jobs:
       if: ${{ inputs.increment_version }}
       run: python increment_version.py
 
+    - name: Read package version
+      id: package-version
+      run: |
+        python - <<'PY' >> "$GITHUB_OUTPUT"
+        import tomllib
+
+        with open("pyproject.toml", "rb") as project_file:
+            print(f"version={tomllib.load(project_file)['project']['version']}")
+        PY
+
     - name: Commit changes
       if: ${{ inputs.increment_version }}
       run: |
@@ -89,3 +101,13 @@ jobs:
 
     - name: Publish package distributions to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+
+  update-sdk-plugin:
+    name: Update SDK Plugin
+    needs: pypi-publish
+    uses: ./.github/workflows/update-sdk-plugin.yml
+    with:
+      sdk_version: ${{ needs.pypi-publish.outputs.sdk_version }}
+      target_branch: ${{ github.ref_name }}
+      create_pr: false
+    secrets: inherit
