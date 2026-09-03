@@ -175,8 +175,9 @@ class OpenApiConfiguration(BaseModel):
         default_factory=dict,
         title="Additional Secret Headers",
         description=(
-            "Static HTTP headers appended to every API request in addition to the selected "
-            "authentication method. Each value is stored securely."
+            "Static HTTP headers sent with every API request. Use a standard name such as "
+            "X-API-Key or X-Tenant-ID. Header names cannot contain spaces, /, :, or line breaks. "
+            "Values are stored securely."
         ),
         json_schema_extra={'ui_component': 'secret_headers'},
     )
