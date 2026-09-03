@@ -284,7 +284,8 @@ class PyodideSandboxTool(BaseTool):
         )
         # Setup caching environment for optimal performance
         _setup_pyodide_cache_env()
-        self._initialize_sandbox()
+        # Lazy on purpose: _run/_arun init on first use, so idle binds never pay
+        # the deno probe cost or inflate the concurrency gate.
 
     def invoke(self, input, config=None, **kwargs):
         """Inject BaseTool.metadata into the LangGraph run config before invocation.
