@@ -17,3 +17,6 @@ class CodeExecutionResult:
     execution_time: float
     session_metadata: dict | None = None
     session_bytes: bytes | None = None
+    # Typed infra-refusal signal, so callers don't match stderr prose.
+    timed_out: bool = False
+    infra_category: str | None = None

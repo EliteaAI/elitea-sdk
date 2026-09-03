@@ -203,6 +203,7 @@ class PyodideSandbox(BasePyodideSandbox):
         stderr = ""
         result = None
         status: Literal["success", "error"] = "success"
+        timed_out = False
 
         cmd = self._build_command(
             session_bytes=session_bytes,
@@ -254,6 +255,7 @@ class PyodideSandbox(BasePyodideSandbox):
             await process.wait()
             status = "error"
             stderr = f"Execution timed out after {timeout_seconds} seconds"
+            timed_out = True
         except asyncio.CancelledError:
             pass
 
@@ -267,6 +269,7 @@ class PyodideSandbox(BasePyodideSandbox):
             result=result,
             session_metadata=session_metadata,
             session_bytes=session_bytes,
+            timed_out=timed_out,
         )
 
 
@@ -290,6 +293,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
         result = None
         stderr: str
         status: Literal["success", "error"]
+        timed_out = False
 
         cmd = self._build_command(
             session_bytes=session_bytes,
@@ -340,6 +344,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
         except subprocess.TimeoutExpired:
             status = "error"
             stderr = f"Execution timed out after {timeout_seconds} seconds"
+            timed_out = True
 
         end_time = time.time()
 
@@ -351,6 +356,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
             result=result,
             session_metadata=session_metadata,
             session_bytes=session_bytes,
+            timed_out=timed_out,
         )
 
 

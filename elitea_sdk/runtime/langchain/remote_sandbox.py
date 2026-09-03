@@ -86,6 +86,7 @@ class RemoteSandbox:
                         status="error",
                         stderr=detail or "Sandbox service unavailable, retry shortly",
                         execution_time=elapsed,
+                        infra_category="service_busy",
                     )
 
                 if resp.status != 200:
@@ -94,6 +95,7 @@ class RemoteSandbox:
                         status="error",
                         stderr=f"Sandbox service returned HTTP {resp.status}: {text[:200]}",
                         execution_time=elapsed,
+                        infra_category="service_busy",
                     )
 
                 data = await resp.json()
@@ -105,6 +107,7 @@ class RemoteSandbox:
                 status="error",
                 stderr=f"Sandbox service unreachable: {exc}",
                 execution_time=elapsed,
+                infra_category="service_busy",
             )
         except TimeoutError:
             elapsed = time.monotonic() - start
@@ -112,6 +115,7 @@ class RemoteSandbox:
                 status="error",
                 stderr=f"Sandbox service timed out after {elapsed:.1f}s",
                 execution_time=elapsed,
+                timed_out=True,
             )
 
         response_session_bytes = None

@@ -751,6 +751,20 @@ def process_pipeline_result(
                         pass
                     # Note: Plain-text errors ("Error: ...") and HTML error pages are handled in PRIORITY 1
 
+    # Check the typed tool_outcomes/last_tool_outcome envelope (#6173): infra refusals
+    # (sandbox concurrency/memory gates, timeout, backend unavailable) now raise instead
+    # of returning a "status": "Execution failed" dict, so the checks above never see
+    # them. Reading the envelope catches these without falling back to prose matching -
+    # genuine user-code errors still hit the "Execution failed" checks above unchanged.
+    if test_passed is None and isinstance(result_data, dict):
+        last_outcome = result_data.get("last_tool_outcome")
+        if isinstance(last_outcome, dict) and last_outcome.get("status") == "error":
+            error_msg = last_outcome.get("message", "Tool call failed")
+            detected_error = f"Tool outcome error: {error_msg[:200]}"
+            test_passed = False
+            if logger:
+                logger.error(f"Infrastructure/tool error detected via tool_outcomes: {detected_error}")
+
     # Check various result structures for test_passed (only if not already set by error checks)
     if test_passed is None and isinstance(result_data, dict):
         # Direct test_passed field
