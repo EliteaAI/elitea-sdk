@@ -416,8 +416,6 @@ class PyodideSandboxTool(BaseTool):
                 return "❌ PyodideSandboxTool requires Deno. Install from: https://docs.deno.com/runtime/getting_started/installation/"
             else:
                 return f"❌ PyodideSandboxTool initialization failed: {error_msg}"
-        except SandboxAdmissionRefused:
-            raise
         except Exception as e:
             logger.error(f"Error executing code in sandbox: {e}")
             return f"Error executing code: {str(e)}"
@@ -456,6 +454,7 @@ class PyodideSandboxTool(BaseTool):
                             f"Sandbox busy: {n_deno} concurrent executions at limit "
                             f"{max_concurrent}. Retry shortly.",
                             "service_busy",
+                            retry_after=5.0,
                         )
 
                 pressure_pct = limits["memory_pressure_pct"]
@@ -470,6 +469,7 @@ class PyodideSandboxTool(BaseTool):
                             f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
                             f"{pressure_pct}%. Retry shortly.",
                             "out_of_memory",
+                            retry_after=10.0,
                         )
             # --- End admission gate ----------------------------------------------
 

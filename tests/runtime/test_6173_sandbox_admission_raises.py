@@ -83,6 +83,7 @@ class TestGatesRaise:
                 _run_arun(tool)
         assert exc_info.value.provider_error_category == "service_busy"
         assert "Sandbox busy" in str(exc_info.value)
+        assert exc_info.value.retry_after == 5.0
 
     def test_memory_gate_raises(self):
         tool = _make_tool()
@@ -95,6 +96,7 @@ class TestGatesRaise:
             with pytest.raises(SandboxAdmissionRefused) as exc_info:
                 _run_arun(tool)
         assert exc_info.value.provider_error_category == "out_of_memory"
+        assert exc_info.value.retry_after == 10.0
 
     def test_sync_run_with_gate_tripped_raises_not_returns_string(self):
         """Regression for the easiest way to ship this fix broken: the sync _run catch-all."""
