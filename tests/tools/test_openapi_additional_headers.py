@@ -28,6 +28,11 @@ def test_openapi_configuration_marks_header_values_as_secrets():
     headers_schema = OpenApiConfiguration.model_json_schema()["properties"]["headers"]
     assert headers_schema["ui_component"] == "secret_headers"
     assert headers_schema["additionalProperties"]["format"] == "password"
+    assert headers_schema["description"] == (
+        "Static HTTP headers sent with every API request. Use a standard name such as "
+        "X-API-Key or X-Tenant-ID. Header names cannot contain spaces, /, :, or line breaks. "
+        "Values are stored securely."
+    )
 
 
 @pytest.mark.parametrize("name", ["", "bad header", "bad:header"])
