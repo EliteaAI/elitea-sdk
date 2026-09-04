@@ -43,7 +43,14 @@ class EliteAImageLoader(BaseLoader):
         meta = {
             "unit": None,
             "instruction_for_readFile": {
-                "first_class_params": {},
+                "extra_params": {
+                    "prompt": (
+                        "string — optional custom instruction for the vision "
+                        "model describing this image, overriding the default "
+                        "generic caption prompt. Pass via extra_params, e.g. "
+                        '{"prompt": "Describe only the chart\'s axis labels"}.'
+                    ),
+                },
                 "notes": (
                     f"{dims_note}Images are read whole via the AI vision model "
                     f"(multimodal) and have no chunking — there are no line/page/row "

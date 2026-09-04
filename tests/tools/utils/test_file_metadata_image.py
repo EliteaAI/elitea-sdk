@@ -4,7 +4,7 @@ Covers:
   * Raster images report image_width/image_height + bytes
   * Output conforms to the PRE-1 chunked-read schema (#5432)
   * unit is None (images have no chunk unit) and notes say multimodal/no chunking
-  * No first_class_params (no line/page/row selectors for images)
+  * extra_params advertises prompt (#6530); no first_class_params (line/page/row selectors)
   * Oversized image trips the byte-size guard (full_read_allowed=False)
   * Corrupt bytes degrade gracefully (no dimensions, still conformant)
   * SVG is registered in loaders_map for RAG/indexing (EliteADirectoryLoader),
@@ -57,8 +57,12 @@ def test_png_metadata_notes_multimodal_no_chunking():
     meta = get_file_metadata("shot.png", file_content=data, file_size=len(data))
 
     instr = meta["instruction_for_readFile"]
-    # Images have no line/page/row selectors.
+    # Images have no line/page/row selectors (no first_class_params); prompt (#6530)
+    # is an extra_params key, not a top-level read_file argument.
     assert instr["first_class_params"] == {}
+    assert set(instr["extra_params"].keys()) == {"prompt"}
+    assert isinstance(instr["extra_params"]["prompt"], str)
+    assert instr["extra_params"]["prompt"]
     notes = instr["notes"].lower()
     assert "multimodal" in notes
     assert "no chunking" in notes
@@ -149,3 +153,6 @@ def test_all_image_extensions_registered(ext):
     assert entry is not None
     assert entry["class"] is EliteAImageLoader
     assert hasattr(EliteAImageLoader, "get_file_metadata")
+
+    result = EliteAImageLoader.get_file_metadata(filename=f"file{ext}")
+    assert "prompt" in result["instruction_for_readFile"]["extra_params"]
