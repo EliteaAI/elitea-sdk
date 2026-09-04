@@ -77,6 +77,7 @@ def main(
     from .tools.utils import (
         replace_source,
         download_nltk,
+        preload_unstructured_nlp_model,
         LockedIterator,
     )
     #
@@ -86,6 +87,13 @@ def main(
         download_nltk("./nltk_data", force=False)
     except Exception as e:
         print_log("Failed to download nltk data", str(e))
+    #
+    log.info("Checking Unstructured NLP model")
+    #
+    try:
+        preload_unstructured_nlp_model()
+    except Exception as e:
+        print_log("Failed to preload Unstructured NLP model", str(e))
     #
     log.info("Starting")
     #

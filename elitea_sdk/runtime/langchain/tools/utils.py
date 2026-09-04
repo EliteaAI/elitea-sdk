@@ -181,6 +181,19 @@ def download_nltk(target, force=False):
     #
     state.nltk_punkt_downloaded = True
 
+
+def preload_unstructured_nlp_model():
+    """Load the spaCy model required by Unstructured's text classifiers."""
+    # Unstructured owns the pinned model version, checksum, install lock, and
+    # download timeout. Exercising its tokenizer keeps that contract in one place
+    # while moving the lazy install ahead of document processing.
+    from unstructured.nlp.tokenize import (  # pylint: disable=C0415,E0401
+        sent_tokenize,
+    )
+
+    sent_tokenize("Elitea NLP model preload.")
+
+
 def bytes_to_base64(bt: bytes) -> str:
     return base64.b64encode(bt).decode('utf-8')
 
