@@ -330,7 +330,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                   patterns, so indexing can report what it left out.
         
         Returns:
-            Dict with 'total' and 'rows', or empty list if folder doesn't exist.
+            Dict with 'total' and 'rows'; an empty listing when the folder does
+            not exist.
         """
         from urllib.parse import quote
         
