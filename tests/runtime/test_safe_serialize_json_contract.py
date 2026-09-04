@@ -46,3 +46,13 @@ def test_bare_datetime_and_decimal_are_json():
     # the precision the nested path deliberately preserves.
     assert json.loads(safe_serialize(datetime(2026, 1, 2))) == "2026-01-02T00:00:00"
     assert json.loads(safe_serialize(Decimal("1.10"))) == "1.10"
+
+
+def test_an_unserializable_collection_still_yields_json():
+    # serialize_tool_result degrades to plain text, which is right for a model but
+    # breaks this contract: function.py feeds the result to json.loads inside the
+    # Pyodide sandbox, where a bare repr is a JSONDecodeError.
+    payload = {"name": "root"}
+    payload["self"] = payload
+
+    assert isinstance(json.loads(safe_serialize(payload)), str)
