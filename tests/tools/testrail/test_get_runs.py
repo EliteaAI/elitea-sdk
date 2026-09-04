@@ -11,6 +11,8 @@ Test pattern mirrors `tests/tools/testrail/test_get_sections.py`: bypass the hea
 pydantic/indexer-base validator chain by constructing the wrapper via
 `object.__new__` and injecting a mocked TestRail client.
 """
+import json
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -119,7 +121,7 @@ class TestGetRunsOutputFormats:
 
     def test_json_default(self, wrapper):
         self._arrange(wrapper)
-        assert wrapper.get_runs(project_id="10").startswith("Extracted data:")
+        assert json.loads(wrapper.get_runs(project_id="10")) == [_run(1)]
 
     def test_csv(self, wrapper):
         self._arrange(wrapper)
@@ -145,7 +147,7 @@ class TestGetRunsEmptyAndErrors:
         result = wrapper.get_runs(project_id="10")
 
         assert not isinstance(result, ToolException)
-        assert result == "Extracted data:\n[]"
+        assert json.loads(result) == []
 
     def test_status_code_error_is_formatted(self, wrapper):
         wrapper._client.runs.get_runs.side_effect = _status_code_error(
@@ -228,8 +230,7 @@ class TestGetRun:
         result = wrapper.get_run(run_id="5")
 
         wrapper._client.runs.get_run.assert_called_once_with(run_id=5)
-        assert result.startswith("Extracted data:")
-        assert "run-5" in result
+        assert json.loads(result) == [_run(5)]
 
     def test_non_numeric_run_id_returns_tool_exception(self, wrapper):
         with pytest.raises(ToolException, match="run_id must be numeric"):

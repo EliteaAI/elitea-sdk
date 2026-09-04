@@ -39,6 +39,27 @@ from ..langchain.utils import (
 )
 from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
+from ...tools.utils.serialization import serialize_tool_result
+
+_STANDARD_CONTENT_TYPES = {"text", "image", "image_url", "document", "search_result"}
+
+
+def is_structured_tool_content(result: Any) -> bool:
+    """True when a result is a list of content blocks the provider accepts as-is.
+
+    Shared by the sequential and parallel boundaries: a sub-agent returning image
+    blocks kept its structure in one and was flattened to text in the other.
+    Bytes disqualify a block -- they are not JSON-serializable and draw a 400.
+    """
+    if not isinstance(result, list) or not result:
+        return False
+    return all(
+        isinstance(item, dict)
+        and item.get('type') in _STANDARD_CONTENT_TYPES
+        and not any(isinstance(value, bytes) for value in item.values())
+        for item in result
+    )
+
 from ..utils.mcp_oauth import (
     McpAuthorizationRequired,
     build_mcp_auth_decision_result,
@@ -3830,8 +3851,12 @@ class LLMNode(BaseTool):
                 if not result.tool_call_id:
                     result.tool_call_id = tool_call_id
                 new_messages.append(result)
+            elif is_structured_tool_content(result):
+                new_messages.append(ToolMessage(content=result, tool_call_id=tool_call_id))
             else:
-                new_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+                new_messages.append(
+                    ToolMessage(content=serialize_tool_result(result), tool_call_id=tool_call_id)
+                )
 
         if not pending_deferred:
             return
@@ -4157,27 +4182,15 @@ class LLMNode(BaseTool):
                         # LLM-standard content block type AND no bytes values are
                         # present (bytes are not JSON-serializable and would cause
                         # a 400 from the LLM API).
-                        _STANDARD_CONTENT_TYPES = {"text", "image", "image_url", "document", "search_result"}
-
-                        def _is_llm_safe_content_block(item: dict) -> bool:
-                            if not isinstance(item, dict):
-                                return False
-                            if item.get('type') not in _STANDARD_CONTENT_TYPES:
-                                return False
-                            return not any(isinstance(v, bytes) for v in item.values())
-
-                        if isinstance(tool_result, list) and tool_result and all(
-                                _is_llm_safe_content_block(item) for item in tool_result
-                        ):
+                        if is_structured_tool_content(tool_result):
                             # Use structured content directly for multimodal support
                             tool_message = ToolMessage(
                                 content=tool_result,
                                 tool_call_id=tool_call_id
                             )
                         else:
-                            # Fallback to string conversion for other tool results
                             tool_message = ToolMessage(
-                                content=str(tool_result),
+                                content=serialize_tool_result(tool_result),
                                 tool_call_id=tool_call_id
                             )
                         new_messages.append(tool_message)

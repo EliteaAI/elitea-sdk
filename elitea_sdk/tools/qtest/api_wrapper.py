@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from traceback import format_exc
-from typing import Any, Optional, Generator, Literal
+from typing import Any, List, Optional, Generator, Literal
 
 import requests
 import swagger_client
@@ -1923,7 +1923,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
     @tool_group('read')
     def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
-                      append_test_steps: bool=False, include_external_properties: bool=False):
+                      append_test_steps: bool=False, include_external_properties: bool=False) -> dict:
         """Search for the test cases in qTest using Data Query Language.
         
         Args:
@@ -1939,13 +1939,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                         for every result. Defaults to False for lighter responses.
         
         Returns:
-            String with search results summary and first no_of_tests_shown_in_dql_search items
+            A dict with the match count, how many are shown, and the first
+            no_of_tests_shown_in_dql_search items.
         """
         parsed_data = self.__perform_search_by_dql(dql, extract_images, prompt, max_results,
                                                    append_test_steps=append_test_steps,
                                                    include_external_properties=include_external_properties)
-        return "Found " + str(
-            len(parsed_data)) + f" Qtest test cases:\n" + str(parsed_data[:self.no_of_tests_shown_in_dql_search])
+        shown = parsed_data[:self.no_of_tests_shown_in_dql_search]
+        return {'total': len(parsed_data), 'shown': len(shown), 'items': shown}
 
     @tool_group('read')
     def search_entities_by_dql(self, object_type: str, dql: str) -> dict:
@@ -2171,10 +2172,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 f"""Unable to update test case in project with id - {self.qtest_project_id} and test id - {test_id}.\n Exception: \n {stacktrace}""") from e
 
     @tool_group('read')
-    def find_test_case_by_id(self, test_id: str, extract_images=False, prompt=None) -> str:
+    def find_test_case_by_id(self, test_id: str, extract_images=False, prompt=None) -> dict:
         """ Find the test case by its id. Id should be in format TC-123. """
         dql: str = f"Id = '{test_id}'"
-        return f"{self.search_by_dql(dql=dql, extract_images=extract_images, prompt=prompt)}"
+        return self.search_by_dql(dql=dql, extract_images=extract_images, prompt=prompt)
 
     @tool_group('delete')
     def delete_test_case(self, qtest_id: int) -> str:
@@ -2679,7 +2680,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(str(e)) from e
 
     @tool_group('read')
-    def get_modules(self, parent_id: int = None, search: str = None):
+    def get_modules(self, parent_id: int = None, search: str = None) -> List[dict]:
         """
         :param int project_id: ID of the project (required)
         :param int parent_id: ID of the parent Module. Leave it blank to retrieve Modules under root
@@ -2730,10 +2731,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         for module in modules:
             format_module(module)
         
-        if not formatted:
-            return "No modules found in the specified location."
-        
-        return f"Found {len(formatted)} module(s):\n{str(formatted)}"
+        return formatted
 
     @with_tool_groups
     @extend_with_parent_available_tools

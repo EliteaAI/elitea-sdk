@@ -246,7 +246,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         return self._auth_token
 
     @tool_group('read')
-    def get_tests(self, jql: str):
+    def get_tests(self, jql: str) -> List[dict]:
         """get all tests"""
 
         start_at = 0
@@ -278,10 +278,10 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
                 break
 
             start_at += self.limit
-        return f"Extracted tests ({len(all_tests)}):\n{all_tests}"
+        return all_tests
 
     @tool_group('write')
-    def create_test(self, graphql_mutation: str) -> str:
+    def create_test(self, graphql_mutation: str) -> dict:
         """Create new test in XRAY per defined XRAY graphql mutation"""
 
         logger.debug(f"graphql_mutation to create new test: {graphql_mutation}")
@@ -289,20 +289,20 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
             create_test_response = self._client.execute(query=graphql_mutation)
         except Exception as e:
             raise ToolException(f"Unable to create new test due to error:\n{str(e)}")
-        return f"Created test case:\n{create_test_response}"
+        return {'message': 'Created test case.', 'test': create_test_response}
 
     @tool_group('write')
-    def create_tests(self, graphql_mutations: list[str]) -> list[str]:
+    def create_tests(self, graphql_mutations: list[str]) -> list[dict]:
         """Create new tests in XRAY per defined XRAY graphql mutations"""
         return [self.create_test(mutation) for mutation in graphql_mutations]
 
     @tool_group('execute')
-    def execute_graphql(self, graphql: str) -> str:
+    def execute_graphql(self, graphql: str) -> dict:
         """Executes custom graphql query or mutation"""
 
         logger.debug(f"The following graphql will be executed: {graphql}")
         try:
-            return f"Result of graphql execution:\n{self._client.execute(query=graphql)}"
+            return self._client.execute(query=graphql)
         except Exception as e:
             raise ToolException(f"Unable to execute custom graphql due to error:\n{str(e)}")
 

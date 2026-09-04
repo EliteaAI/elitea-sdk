@@ -702,16 +702,26 @@ def safe_serialize(obj: Any) -> str:
     Returns:
         JSON string representation of the object
     """
-    try:
+    # Imported here, not at module scope: this module is pulled in while the
+    # toolkit registry is being built, and a top-level import of elitea_sdk.tools
+    # closes the cycle and silently drops toolkits (tests/tools/test_registry_integrity.py).
+    from ...tools.utils.serialization import serialize_tool_result
+
+    # Every caller here embeds the result where JSON is expected -- function.py
+    # feeds it to json.loads inside the Pyodide sandbox -- so scalars must render
+    # as JSON literals (null/true), not as str() would spell them.
+    from math import isfinite
+
+    from ...tools.utils.serialization import to_json_primitive
+
+    if isinstance(obj, float) and not isfinite(obj):
+        return 'null'
+    if obj is None or isinstance(obj, (str, bool, int, float)):
         return json.dumps(obj, ensure_ascii=False)
-    except (TypeError, ValueError) as e:
-        # If json.dumps fails, convert to string
-        logger.debug(f"JSON serialization failed for {type(obj).__name__}: {e}. Falling back to str() conversion.")
-        try:
-            return json.dumps(str(obj), ensure_ascii=False)
-        except Exception:
-            # Ultimate fallback - just return string representation
-            return str(obj)
+    if isinstance(obj, (dict, list, tuple, set, frozenset)):
+        return serialize_tool_result(obj)
+    # A bare datetime or Decimal would otherwise render as text json.loads rejects.
+    return json.dumps(to_json_primitive(obj), ensure_ascii=False, default=to_json_primitive)
 
 
 def object_to_dict(obj: Any) -> dict | str | list | Any:

@@ -109,13 +109,13 @@ class TestCreateIssueRecovery:
                                "issuetype": {"name": "Task"}}}
         fenced = f"```json\n{json.dumps(payload)}\n```"
         result = wrapper.create_issue(fenced)
-        assert "created successfully" in result
+        assert "created successfully" in result["message"]
 
     def test_create_issue_accepts_double_encoded_json(self, wrapper):
         payload = {"fields": {"project": {"key": "PROJ"}, "summary": "Issue title"}}
         double_encoded = json.dumps(json.dumps(payload))
         result = wrapper.create_issue(double_encoded)
-        assert "created successfully" in result
+        assert "created successfully" in result["message"]
 
     def test_create_issue_rejects_missing_fields(self, wrapper):
         with pytest.raises(ToolException):

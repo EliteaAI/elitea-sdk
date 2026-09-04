@@ -1,6 +1,6 @@
 import logging
 import json
-from typing import Optional, Any
+from typing import Any, List, Optional
 
 from pyral import Rally
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator, SecretStr
@@ -114,7 +114,7 @@ class RallyApiWrapper(BaseToolApiWrapper):
 
     # Tool declaration
     @tool_group('read')
-    def get_types(self):
+    def get_types(self) -> List[str]:
         """Get available entity types from Rally."""
         try:
             names = []
@@ -122,44 +122,44 @@ class RallyApiWrapper(BaseToolApiWrapper):
                 name = item.get('ElementName', "")
                 if name:
                     names.append(name)
-            return f"Extracted entities: {names}"
+            return names
         except Exception as e:
             logger.error(f"Error getting stories: {e}")
             raise ToolException(f"Error getting stories: {e}")
 
     @tool_group('read')
-    def get_entities(self, entity_type: str = "UserStory", query=None, fetch=True, limit=10):
+    def get_entities(self, entity_type: str = "UserStory", query=None, fetch=True, limit=10) -> List[dict]:
         """Get user stories from Rally."""
         try:
             response = self._client.get(entity_type, query=query, fetch=fetch, limit=limit)
             # extra limit since API doesn't limit the results output
-            return f"Extracted entities: {response.content['QueryResult']['Results'][:limit]}"
+            return response.content['QueryResult']['Results'][:limit]
         except Exception as e:
             logger.error(f"Error getting stories: {e}")
             raise ToolException(f"Error getting stories: {e}")
 
     @tool_group('read')
-    def get_project(self, project_name=None):
+    def get_project(self, project_name=None) -> List[dict]:
         """Get a project from Rally by name."""
         try:
             if not project_name:
                 # undefined project name
                 project_name = self.project
             response = self._client.get('Project', query=f'Name = "{project_name}"')
-            return str(response.content['QueryResult']['Results'])
+            return response.content['QueryResult']['Results']
         except Exception as e:
             logger.error(f"Error getting project: {e}")
             raise ToolException(f"Error getting project: {e}")
 
     @tool_group('read')
-    def get_workspace(self, workspace_name=None):
+    def get_workspace(self, workspace_name=None) -> List[dict]:
         """Get a workspace from Rally by name."""
         try:
             if not workspace_name:
                 # undefined ws name
                 workspace_name = self.workspace
             response = self._client.get('Workspace', query=f'Name = "{workspace_name}"')
-            return str(response.content['QueryResult']['Results'])
+            return response.content['QueryResult']['Results']
         except Exception as e:
             logger.error(f"Error getting workspace: {e}")
             raise ToolException(f"Error getting workspace: {e}")
@@ -173,22 +173,22 @@ class RallyApiWrapper(BaseToolApiWrapper):
             else:
                 user_name_query = f'UserName = "{user_name}"'
             response = self._client.get('User', query=user_name_query)
-            if response.content is not None:
-                if 'User' in response.content:
-                    return str(response.content['User'])
-                else:
-                    return str(response.content)
-            else:
+            if response.content is None:
                 return "Undefined"
+            return response.content.get('User', response.content)
         except Exception as e:
             logger.error(f"Error getting user: {e}")
             raise ToolException(f"Error getting user: {e}")
 
     @tool_group('read')
-    def get_context(self):
-        """Get a user from Rally by username."""
+    def get_context(self) -> dict:
+        """Get the current Rally project, workspace and user."""
         try:
-            return f"Project: {self.get_project()}\nWorkspace: {self.get_workspace()}\nUser: {self.get_user()}"
+            return {
+                'project': self.get_project(),
+                'workspace': self.get_workspace(),
+                'user': self.get_user(),
+            }
         except Exception as e:
             logger.error(f"Error getting user: {e}")
             raise ToolException(f"Error getting user: {e}")

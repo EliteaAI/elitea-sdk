@@ -13,6 +13,7 @@ from pydantic import ValidationError, BaseModel, create_model
 from .application import Application
 from ..langchain.utils import _extract_json, log_tool_result
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
+from ...tools.utils.serialization import serialize_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +106,7 @@ Answer must be JSON only extractable by JSON.LOADS."""
                     "state": state,
                 }, config=config
             )
-            message_result = tool_result
-            if isinstance(tool_result, dict) or isinstance(tool_result, list):
-                try:
-                    message_result = dumps(tool_result)
-                except TypeError:
-                    logger.error(f"ToolNode tool result is not JSON serializable: {tool_result}")
-                    message_result = str(tool_result)
+            message_result = serialize_tool_result(tool_result)
             _tk = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_id')
             log_tool_result(logger, self.name, getattr(self.tool, 'name', None),
                             _tk, tool_result)

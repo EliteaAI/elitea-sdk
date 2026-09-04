@@ -77,12 +77,9 @@ class ZephyrV1ApiWrapper(BaseToolApiWrapper):
         return parsed
 
     @tool_group('read')
-    def get_test_case_steps(self, issue_id: int, project_id: int):
+    def get_test_case_steps(self, issue_id: int, project_id: int) -> List[dict]:
         """ Get test case steps by issue_id."""
-        parsed = self._parse_test_steps(self._client.get_test_case_steps(issue_id, project_id).json())
-        if len(parsed) == 0:
-            return "No Zephyr test steps found"
-        return "Found " + str(len(parsed)) + " test steps:\n" + str(parsed)
+        return self._parse_test_steps(self._client.get_test_case_steps(issue_id, project_id).json())
 
     @tool_group('write')
     def add_new_test_case_step(self, issue_id: int, project_id: int, step: str, data: str, result: str):

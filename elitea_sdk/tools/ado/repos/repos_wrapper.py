@@ -684,13 +684,12 @@ class ReposApiWrapper(CodeIndexerToolkit):
         return parsed_comments
 
     @tool_group('read')
-    def list_open_pull_requests(self) -> str:
+    def list_open_pull_requests(self) -> List[dict]:
         """
         Fetches all open pull requests from the Azure DevOps repository.
 
         Returns:
-            str: A plaintext report containing the number of PRs
-            and each PR's title and ID.
+            A list of open pull requests. Empty list when there are none.
         """
         try:
             pull_requests = self._client.get_pull_requests(
@@ -705,17 +704,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             logger.error(msg)
             raise ToolException(msg)
 
-        if pull_requests:
-            parsed_prs = self.parse_pull_requests(pull_requests)
-            parsed_prs_str = (
-                    "Found "
-                    + str(len(parsed_prs))
-                    + " open pull requests:\n"
-                    + str(parsed_prs)
-            )
-            return parsed_prs_str
-        else:
-            return "No open pull requests available"
+        return self.parse_pull_requests(pull_requests) if pull_requests else []
 
     @tool_group('read')
     def get_pull_request(self, pull_request_id: str) -> str:

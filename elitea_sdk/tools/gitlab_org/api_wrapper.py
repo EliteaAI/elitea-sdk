@@ -309,9 +309,9 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         author_username: Optional[str] = None,
         labels: Optional[str] = None,
         fetch_all: bool = False,
-    ) -> str:
+    ) -> List[dict]:
         """
-        List issues from the repo with state, pagination and filters (#6213).
+        List issues from the repo with state, pagination and filters.
 
         Parameters:
             repository: Name of the repository (targets a specific repo in the org)
@@ -325,6 +325,10 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             author_username: Filter by author username
             labels: Comma-separated labels to filter by
             fetch_all: Fetch all pages when True
+
+        Returns:
+            A list of issues, each with title, number, state, labels, author,
+            created_at and updated_at. Empty list when nothing matches.
         """
 
         try:
@@ -351,22 +355,18 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
                 params["per_page"] = per_page or 20
 
             issues = repo_instance.issues.list(**params)
-            if issues:
-                parsed_issues = [
-                    {
-                        "title": issue.title,
-                        "number": issue.iid,
-                        "state": issue.state,
-                        "labels": issue.labels,
-                        "author": (issue.author or {}).get("username"),
-                        "created_at": issue.created_at,
-                        "updated_at": issue.updated_at,
-                    }
-                    for issue in issues
-                ]
-                return f"Found {len(parsed_issues)} issues:\n{parsed_issues}"
-            else:
-                return "No issues found matching the given filters"
+            return [
+                {
+                    "title": issue.title,
+                    "number": issue.iid,
+                    "state": issue.state,
+                    "labels": issue.labels,
+                    "author": (issue.author or {}).get("username"),
+                    "created_at": issue.created_at,
+                    "updated_at": issue.updated_at,
+                }
+                for issue in issues
+            ]
         except Exception as e:
             raise ToolException(e)
 
@@ -642,16 +642,14 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         """List files by defined path."""
 
         files = self._get_all_files(path=path, recursive=recursive, branch=branch, repository=repository)
-        paths = [file['path'] for file in files if file['type'] == 'blob']
-        return f"Files: {paths}"
+        return [file['path'] for file in files if file['type'] == 'blob']
 
     @tool_group('read')
     def list_folders(self, path: str = None, recursive: bool = True, branch: str = None, repository: str = None) -> List[str]:
         """List folders by defined path."""
 
         files = self._get_all_files(path=path, recursive=recursive, branch=branch, repository=repository)
-        paths = [file['path'] for file in files if file['type'] == 'tree']
-        return f"Folders: {paths}"
+        return [file['path'] for file in files if file['type'] == 'tree']
 
     def _get_all_files(self, path: str = None, recursive: bool = True, branch: str = None, repository: str = None):
         return self._get_repo(repository).repository_tree(path=path, ref=branch if branch else self._active_branch,
