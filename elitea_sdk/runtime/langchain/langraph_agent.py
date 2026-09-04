@@ -61,6 +61,12 @@ logger = logging.getLogger(__name__)
 _CONTENT_BLOCK_TYPES = {
     'text', 'thinking', 'reasoning', 'tool_use', 'tool_result',
     'image', 'image_url', 'document', 'search_result',
+    # Provider block types that carry no text of their own but are still content:
+    # treating one as a record would serialize the whole message instead of
+    # returning the answer sitting in the text block beside it.
+    'redacted_thinking', 'server_tool_use', 'web_search_tool_result',
+    'mcp_tool_use', 'mcp_tool_result', 'code_execution_tool_result',
+    'container_upload',
 }
 
 
@@ -72,7 +78,7 @@ _CONTENT_BLOCK_KEYS = {
     'text': ('text',),
     'thinking': ('thinking', 'text'),
     'reasoning': ('reasoning', 'text'),
-    'image': ('image_url', 'source', 'data'),
+    'image': ('image_url', 'source', 'data', 'url'),
     'image_url': ('image_url', 'url'),
     'document': ('source', 'data'),
 }
@@ -107,13 +113,14 @@ def normalize_message_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        if content and not all(_is_content_block(block) for block in content):
-            # Records, not content: joining them would discard every field but one
-            # and could yield '' outright, dropping the answer the user reads.
-            return serialize_tool_result(content)
         # Filter out thinking blocks, keep only text responses
         text_parts = []
         for block in content:
+            # A block this does not recognise contributes no text, but must not
+            # condemn the list: a provider block type added tomorrow would
+            # otherwise dump the whole message in place of the answer beside it.
+            if not _is_content_block(block):
+                continue
             if isinstance(block, dict):
                 if block.get('type') == 'text':
                     text_parts.append(block.get('text', ''))
@@ -122,7 +129,12 @@ def normalize_message_content(content: Any) -> str:
                     text_parts.append(block.get('text', ''))
             elif isinstance(block, str):
                 text_parts.append(block)
-        return ''.join(text_parts)
+        if any(text_parts) or (content and all(_is_content_block(block) for block in content)):
+            # Either real text, or a recognised list that genuinely carries none
+            # (thinking only). Anything else is records, and joining them would
+            # discard every field but one -- or yield '' and drop the answer.
+            return ''.join(text_parts)
+        return serialize_tool_result(content)
     # This value becomes a pipeline's `output`, i.e. the answer the user reads, so
     # a terminal node writing a dict output variable must not surface as a repr.
     return serialize_tool_result(content)
