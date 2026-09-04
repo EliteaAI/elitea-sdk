@@ -13,6 +13,7 @@ from .utils.trace_limits import (
     cap_tool_result_structure,
     cap_tool_result_text,
     estimate_chars,
+    measure_ceiling,
     resolve_tool_result_limit,
     structure_is_bounded,
     text_is_bounded,
@@ -77,9 +78,10 @@ def bound_tool_result(
         )
         return value, None
 
-    # Real size for the marker: only reached on the rare oversized path, and a walk
-    # costs CPU without allocating the full serialized copy json.dumps would.
-    original = estimate_chars(value)
+    # Size for the marker, ceiling-bounded: an exact figure would cost a full walk of
+    # a payload that may be hundreds of megabytes, which is the CPU-bound stall this
+    # guard exists to prevent. Reported as a floor instead ("over N chars").
+    original = estimate_chars(value, ceiling=measure_ceiling(limit))
     if isinstance(value, str):
         bounded = cap_tool_result_text(value, limit, tool_name, original)
     elif isinstance(value, (dict, list)):
@@ -93,7 +95,7 @@ def bound_tool_result(
         return value, None
 
     logger.info(
-        "Tool result truncated: tool=%s toolkit=%s chars=%s limit=%s",
+        "Tool result truncated: tool=%s toolkit=%s chars>=%s limit=%s",
         tool_name, toolkit_type, original, limit,
     )
     return bounded, original

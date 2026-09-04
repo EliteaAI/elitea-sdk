@@ -134,12 +134,16 @@ def estimate_chars(value: Any, ceiling: Optional[int] = None) -> int:
             total += 8
         elif isinstance(item, dict):
             total += 2 + 2 * len(item)
-            for key, sub in item.items():
-                total += len(key) if isinstance(key, str) else 8
-                stack.append(sub)
+            # Guarded: pushing the children of a container we are already over costs
+            # O(len) and cannot change the answer.
+            if ceiling is None or total <= ceiling:
+                for key, sub in item.items():
+                    total += len(key) if isinstance(key, str) else 8
+                    stack.append(sub)
         elif isinstance(item, (list, tuple, set)):
             total += 2 + len(item)
-            stack.extend(item)
+            if ceiling is None or total <= ceiling:
+                stack.extend(item)
         else:
             # Arbitrary object: str() could itself be the expensive thing we are
             # trying to avoid (a DataFrame repr), so probe cheaply and accept an
@@ -160,6 +164,19 @@ _B64_MIN_CHARS = 1024
 # Below this a leaf cannot meaningfully reduce the payload, and cutting it only
 # destroys a structural value ('status': 'ok') that downstream nodes index into.
 _MIN_TRIM_CHARS = 512
+# Every measurement while trimming stops at limit * this, so cost stays O(limit)
+# instead of O(payload): an unbounded walk here is the CPU-bound stall we prevent.
+# Kept small deliberately - it is the worst case for the exact-measurement path.
+_MEASURE_FACTOR = 2
+# Nodes a leaf-collecting walk may visit. A payload of a million tiny values cannot
+# be shrunk leaf-by-leaf anyway, so walking all of it only burns CPU: stop early and
+# let the root pass drop what is left.
+_WALK_NODE_BUDGET = 20_000
+
+
+def measure_ceiling(limit: int) -> int:
+    """Cap for any size measurement taken while bounding a result."""
+    return limit * _MEASURE_FACTOR
 
 
 def looks_like_encoded_blob(value: Any) -> bool:
@@ -186,7 +203,7 @@ def looks_like_encoded_blob(value: Any) -> bool:
 def _text_marker(original: int, limit: int, tool_name: Any) -> str:
     name = f" for tool '{tool_name}'" if tool_name else ''
     return (
-        f"\n\n...{TOOL_RESULT_TEXT_SENTINEL} {original} chars exceeded the "
+        f"\n\n...{TOOL_RESULT_TEXT_SENTINEL} over {original} chars exceeded the "
         f"{limit}-char limit{name}.] {_DO_NOT_TRUST}"
     )
 
@@ -207,7 +224,9 @@ def cap_tool_result_text(
 def _structured_marker(original: int, limit: int, tool_name: Any) -> dict:
     return {
         'truncated': True,
-        'original_characters': original,
+        # A floor, not a measurement: sizing stops at the ceiling rather than walking
+        # a multi-megabyte payload just to print an exact number.
+        'original_characters_at_least': original,
         'limit': limit,
         'tool_name': str(tool_name) if tool_name else None,
         'note': _DO_NOT_TRUST,
@@ -217,8 +236,9 @@ def _structured_marker(original: int, limit: int, tool_name: Any) -> dict:
 def _collect_text_leaves(container: Any) -> list:
     """(parent, key, size) for every text/bytes leaf, so the biggest can be cut first."""
     leaves = []
+    budget = _WALK_NODE_BUDGET
     stack = [container]
-    while stack:
+    while stack and budget > 0:
         item = stack.pop()
         if isinstance(item, dict):
             pairs = item.items()
@@ -227,6 +247,9 @@ def _collect_text_leaves(container: Any) -> list:
         else:
             continue
         for key, sub in list(pairs):
+            budget -= 1
+            if budget < 0:
+                break
             if isinstance(sub, (str, bytes, bytearray)):
                 leaves.append((item, key, len(sub)))
             elif isinstance(sub, (dict, list)):
@@ -235,15 +258,16 @@ def _collect_text_leaves(container: Any) -> list:
     return leaves
 
 
-def _collect_bulk_leaves(container: Any) -> list:
+def _collect_bulk_leaves(container: Any, ceiling: int) -> list:
     """(parent, key, size) for every non-text leaf, biggest first.
 
     Text leaves are handled by ``_collect_text_leaves``; this covers the payloads
     that pass leaves alone cannot shrink - long numeric lists, arrays of records.
     """
     leaves = []
+    budget = _WALK_NODE_BUDGET
     stack = [container]
-    while stack:
+    while stack and budget > 0:
         item = stack.pop()
         if isinstance(item, dict):
             pairs = item.items()
@@ -252,11 +276,14 @@ def _collect_bulk_leaves(container: Any) -> list:
         else:
             continue
         for key, sub in list(pairs):
+            budget -= 1
+            if budget < 0:
+                break
             if isinstance(sub, (str, bytes, bytearray)):
                 continue
             if isinstance(sub, (dict, list)):
                 stack.append(sub)
-                leaves.append((item, key, estimate_chars(sub)))
+                leaves.append((item, key, estimate_chars(sub, ceiling=ceiling)))
     leaves.sort(key=lambda entry: entry[2], reverse=True)
     return leaves
 
@@ -281,7 +308,71 @@ def _drop_tail(seq: list, excess: int, before: int) -> None:
         seq.append(f'{_TAIL_NOTE} {drop} more items]')
 
 
-def _trim_root(container: Any, excess: int) -> None:
+def _cheap_size(value: Any) -> int:
+    """Size without walking: ``len`` for text, element count for containers."""
+    if isinstance(value, (str, bytes, bytearray)):
+        return len(value)
+    if isinstance(value, (dict, tuple, set)):
+        return 2 * len(value)
+    if isinstance(value, list):
+        return int(_mean_element_cost(value) * len(value))
+    return 8
+
+
+def _mean_element_cost(seq: Any) -> float:
+    """Per-element cost from a small sample, so a million-element list stays O(1)."""
+    sample = min(len(seq), 64)
+    if not sample:
+        return 1.0
+    return max(estimate_chars(seq[:sample]) / sample, 1.0)
+
+
+def _fitting_prefix(seq: Any, budget: int) -> int:
+    """How many leading elements fit in ``budget``, from a sampled mean cost."""
+    return max(min(len(seq), int(budget / _mean_element_cost(seq))), 0)
+
+
+def _crude_bound(container: Any, limit: int) -> None:
+    """Single pass for a payload many times over the limit: no walk, no re-measure.
+
+    Every top-level value is sized cheaply (``len``, a sample) and cut or dropped.
+    """
+    if isinstance(container, list):
+        keep = _fitting_prefix(container, limit)
+        dropped = len(container) - keep
+        if dropped > 0:
+            del container[keep:]
+            container.append(f'{_TAIL_NOTE} {dropped} more items]')
+        return
+    if not isinstance(container, dict):
+        return
+    sizes = {key: _cheap_size(sub) for key, sub in container.items()
+             if key != TOOL_RESULT_MARKER_KEY}
+    fat = [key for key, size in sizes.items() if size > _MIN_TRIM_CHARS]
+    if not fat:
+        return
+    # What the small keys do not use goes to the fat ones, so the common envelope with
+    # a single large value keeps most of the limit rather than a flat 1/N slice.
+    spent = sum(size for key, size in sizes.items() if key not in fat)
+    share = max((limit - spent) // len(fat), _MIN_TRIM_CHARS)
+    for key in fat:
+        sub = container[key]
+        if isinstance(sub, (str, bytes, bytearray)):
+            if len(sub) > share:
+                container[key] = (f'[binary content dropped: {len(sub)} chars]'
+                                  if looks_like_encoded_blob(sub)
+                                  else sub[:share] + f'{_TAIL_NOTE} {len(sub)} chars]')
+        elif isinstance(sub, list):
+            keep = _fitting_prefix(sub, share) if sub else 0
+            if len(sub) > keep:
+                dropped = len(sub) - keep
+                del sub[keep:]
+                sub.append(f'{_TAIL_NOTE} {dropped} more items]')
+        elif isinstance(sub, (dict, tuple, set)):
+            container[key] = f'[oversized value dropped: {len(sub)} entries]'
+
+
+def _trim_root(container: Any, excess: int, ceiling: int) -> None:
     """Shrink the root container itself when the leaf passes under-shot.
 
     Size estimates are deliberately approximate, and a root list of many small
@@ -289,12 +380,12 @@ def _trim_root(container: Any, excess: int) -> None:
     stamped as truncated while still being oversized.
     """
     if isinstance(container, list) and container:
-        _drop_tail(container, excess, estimate_chars(container))
+        _drop_tail(container, excess, estimate_chars(container, ceiling=ceiling))
         return
     if not isinstance(container, dict):
         return
     sizes = sorted(
-        ((key, estimate_chars(sub)) for key, sub in container.items()
+        ((key, estimate_chars(sub, ceiling=ceiling)) for key, sub in container.items()
          if key != TOOL_RESULT_MARKER_KEY),
         key=lambda entry: entry[1], reverse=True,
     )
@@ -306,7 +397,7 @@ def _trim_root(container: Any, excess: int) -> None:
         for dead in reversed(keys[1:]):
             if excess <= 0:
                 break
-            excess -= estimate_chars(container.pop(dead)) + len(str(dead))
+            excess -= estimate_chars(container.pop(dead), ceiling=ceiling) + len(str(dead))
         return
     for key, size in trimmable:
         if excess <= 0:
@@ -319,21 +410,21 @@ def _trim_root(container: Any, excess: int) -> None:
             container[key] = sub[:max(len(sub) - excess - 32, 0)] + f'{_TAIL_NOTE} {len(sub)} chars]'
         else:
             container[key] = f'[oversized value dropped: {size} chars]'
-        excess -= size - estimate_chars(container[key])
+        excess -= size - estimate_chars(container[key], ceiling=ceiling)
 
 
-def _trim_bulk_leaf(parent: Any, key: Any, excess: int) -> int:
+def _trim_bulk_leaf(parent: Any, key: Any, excess: int, ceiling: int) -> int:
     """Shrink one non-text leaf, returning the characters reclaimed.
 
     Lists only: a dict is either shrunk via its own children (already queued as
     leaves) or dropped whole by the root pass.
     """
     leaf = parent[key]
-    before = estimate_chars(leaf)
+    before = estimate_chars(leaf, ceiling=ceiling)
     if not isinstance(leaf, list) or not leaf:
         return 0
     _drop_tail(leaf, excess, before)
-    return before - estimate_chars(parent[key])
+    return before - estimate_chars(parent[key], ceiling=ceiling)
 
 
 def cap_tool_result_structure(
@@ -349,13 +440,21 @@ def cap_tool_result_structure(
     Mutating in place is safe because the caller is the first consumer of a value
     that has just come back from ``tool.invoke``.
     """
-    size = original if original is not None else estimate_chars(value)
+    ceiling = measure_ceiling(limit)
+    size = original if original is not None else estimate_chars(value, ceiling=ceiling)
     marker = _structured_marker(size, limit, tool_name)
     # Budget the marker itself (plus its key and a small margin), so the bounded
     # result respects the contract rather than landing just over it.
-    excess = size - limit + estimate_chars(marker) + len(TOOL_RESULT_MARKER_KEY) + 64
+    reserve = estimate_chars(marker) + len(TOOL_RESULT_MARKER_KEY) + 64
+    excess = size - limit + reserve
 
-    for parent, key, leaf_size in _collect_text_leaves(value):
+    if size > ceiling:
+        # Measurement aborted at the ceiling, so every number here is a floor and the
+        # gentle passes would iterate against unreliable arithmetic.
+        _crude_bound(value, limit - reserve)
+        excess = 0
+
+    for parent, key, leaf_size in (_collect_text_leaves(value) if excess > 0 else []):
         if excess <= 0:
             break
         if leaf_size < _MIN_TRIM_CHARS:
@@ -376,7 +475,7 @@ def cap_tool_result_structure(
     if excess > 0:
         # Text leaves alone were not enough (a huge numeric list, arrays of records),
         # so the result would stay oversized while stamped as truncated.
-        for parent, key, _ in _collect_bulk_leaves(value):
+        for parent, key, _ in _collect_bulk_leaves(value, ceiling):
             if excess <= 0:
                 break
             # Trimming a list shortens it, so a later entry's index can be stale.
@@ -386,16 +485,18 @@ def cap_tool_result_structure(
                 continue
             if isinstance(parent[key], (str, bytes, bytearray)):
                 continue  # already replaced by an earlier trim
-            excess -= _trim_bulk_leaf(parent, key, excess)
+            excess -= _trim_bulk_leaf(parent, key, excess, ceiling)
 
     # Estimates are approximate by design, so confirm the contract instead of
     # trusting the arithmetic: never stamp a result truncated while still oversized.
-    reserve = estimate_chars(marker) + len(TOOL_RESULT_MARKER_KEY) + 64
+    # Ceiling-bounded: an untrimmable shape (dict of dicts, tuple) arrives here at
+    # full size, and an exact walk of it is the stall this feature exists to prevent.
+    # Aborting early only under-states the excess, which the next pass corrects.
     for _ in range(4):
-        current = estimate_chars(value)
+        current = estimate_chars(value, ceiling=ceiling)
         if current + reserve <= limit:
             break
-        _trim_root(value, current + reserve - limit)
+        _trim_root(value, current + reserve - limit, ceiling)
 
     if isinstance(value, dict):
         value[TOOL_RESULT_MARKER_KEY] = marker

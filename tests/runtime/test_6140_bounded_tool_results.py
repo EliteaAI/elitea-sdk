@@ -65,7 +65,7 @@ def test_oversized_dict_keeps_its_type_and_its_small_keys():
     assert estimate_chars(value) <= LIMIT
     marker = value[TOOL_RESULT_MARKER_KEY]
     assert marker['truncated'] is True
-    assert marker['original_characters'] == original
+    assert marker['original_characters_at_least'] == original
 
 
 def test_oversized_list_keeps_its_type_and_carries_the_marker_as_last_element():
@@ -388,7 +388,9 @@ def test_non_text_payloads_actually_shrink(payload):
     assert before > LIMIT, 'probe must start oversized'
     bounded, reported = bound_tool_result(payload, 'probe')
     assert estimate_chars(bounded) <= LIMIT
-    assert reported == before
+    # A floor, not the exact size: measuring stops at the ceiling rather than walking
+    # the whole payload, so the reported number is somewhere between the two.
+    assert LIMIT < reported <= before
 
 
 def test_bounding_a_non_text_payload_preserves_small_structural_keys():
@@ -399,14 +401,43 @@ def test_bounding_a_non_text_payload_preserves_small_structural_keys():
     assert isinstance(bounded['rows'], list)
 
 
-def test_bounding_a_huge_non_text_payload_is_not_cpu_bound():
-    """Trimming must not re-measure per candidate length: that reintroduces the
-    CPU-bound serialization cost this whole feature exists to remove."""
-    payload = {'status': 'ok', 'rows': list(range(2_000_000))}
+def test_a_far_oversized_envelope_still_spends_most_of_the_limit_on_its_big_value():
+    """The cheap path must not answer with a stub.
+
+    A payload many times over the limit skips leaf-by-leaf trimming, but the useful
+    part of the result is the large value - handing back a few hundred characters
+    would be a bound in name only.
+    """
+    payload = {'status': 'ok', 'body': 'x' * 5_000_000}
+    bounded, _ = bound_tool_result(payload, 'probe')
+    assert bounded['status'] == 'ok'
+    assert estimate_chars(bounded) <= LIMIT
+    assert len(bounded['body']) > LIMIT * 0.9
+
+
+@pytest.mark.parametrize('build', [
+    pytest.param(lambda: {'status': 'ok', 'rows': list(range(2_000_000))}, id='trimmable-int-list'),
+    # Nothing here can be shrunk in place, so this shape reaches the final
+    # verify-and-converge pass at full size - the one place an unbounded walk would hide.
+    pytest.param(lambda: {'status': 'ok', 'm': {str(i): {'a': i} for i in range(300_000)}},
+                 id='untrimmable-dict-of-dicts'),
+    pytest.param(lambda: {'status': 'ok', 'm': tuple(range(2_000_000))}, id='untrimmable-tuple'),
+    pytest.param(lambda: {'status': 'ok', 't': 'x' * 200_000_000}, id='200mb-string'),
+])
+def test_bounding_a_huge_payload_is_not_cpu_bound(build):
+    """Every measurement while trimming must stop at a ceiling.
+
+    An exact walk of a multi-megabyte result is precisely the CPU-bound stall this
+    feature exists to prevent, so bounding stays sub-second no matter how large or
+    how untrimmable the payload is. A loose budget here would let an O(payload)
+    walk creep back in unnoticed.
+    """
+    payload = build()
     started = time.monotonic()
     bounded, _ = bound_tool_result(payload, 'probe')
-    assert estimate_chars(bounded) <= LIMIT
-    assert time.monotonic() - started < 30
+    elapsed = time.monotonic() - started
+    assert estimate_chars(bounded, ceiling=LIMIT) <= LIMIT
+    assert elapsed < 0.5, f'bounding took {elapsed:.2f}s'
 
 
 def test_configure_rejects_a_non_mapping_without_partially_updating_state():
