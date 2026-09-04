@@ -43,7 +43,7 @@ class EliteAImageLoader(BaseLoader):
         meta = {
             "unit": None,
             "instruction_for_readFile": {
-                "first_class_params": {
+                "extra_params": {
                     "user_prompt": (
                         "string — optional custom instruction for the vision "
                         "model describing this image, overriding the default "

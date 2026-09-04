@@ -4,7 +4,7 @@ Covers:
   * Raster images report image_width/image_height + bytes
   * Output conforms to the PRE-1 chunked-read schema (#5432)
   * unit is None (images have no chunk unit) and notes say multimodal/no chunking
-  * first_class_params advertises user_prompt (#6530); no line/page/row selectors
+  * extra_params advertises user_prompt (#6530); no first_class_params (line/page/row selectors)
   * Oversized image trips the byte-size guard (full_read_allowed=False)
   * Corrupt bytes degrade gracefully (no dimensions, still conformant)
   * SVG is registered in loaders_map for RAG/indexing (EliteADirectoryLoader),
@@ -57,10 +57,12 @@ def test_png_metadata_notes_multimodal_no_chunking():
     meta = get_file_metadata("shot.png", file_content=data, file_size=len(data))
 
     instr = meta["instruction_for_readFile"]
-    # Images have no line/page/row selectors, but do advertise user_prompt (#6530).
-    assert set(instr["first_class_params"].keys()) == {"user_prompt"}
-    assert isinstance(instr["first_class_params"]["user_prompt"], str)
-    assert instr["first_class_params"]["user_prompt"]
+    # Images have no line/page/row selectors (no first_class_params); user_prompt (#6530)
+    # is an extra_params key, not a top-level read_file argument.
+    assert instr["first_class_params"] == {}
+    assert set(instr["extra_params"].keys()) == {"user_prompt"}
+    assert isinstance(instr["extra_params"]["user_prompt"], str)
+    assert instr["extra_params"]["user_prompt"]
     notes = instr["notes"].lower()
     assert "multimodal" in notes
     assert "no chunking" in notes
@@ -153,4 +155,4 @@ def test_all_image_extensions_registered(ext):
     assert hasattr(EliteAImageLoader, "get_file_metadata")
 
     result = EliteAImageLoader.get_file_metadata(filename=f"file{ext}")
-    assert "user_prompt" in result["instruction_for_readFile"]["first_class_params"]
+    assert "user_prompt" in result["instruction_for_readFile"]["extra_params"]
