@@ -23,6 +23,7 @@ from .index_params import (
 )
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
 from .utils.tool_groups import tool_group, with_tool_groups
+from .utils.serialization import serialize_tool_result
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
 from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
@@ -1799,11 +1800,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
 
         if index_name and deleted_count == 0:
-            raise ToolException(f"Index '{index_name}' not found. Available indexes: {self.list_indexes()}")
+            raise ToolException(
+                f"Index '{index_name}' not found. "
+                f"Available indexes: {serialize_tool_result(self.list_indexes())}"
+            )
 
         self._emit_index_data_removed_event(index_name)
         return (f"Index '{index_name}' has been removed from the vector store.\n"
-                f"Available indexes: {self.list_indexes()}") if index_name \
+                f"Available indexes: {serialize_tool_result(self.list_indexes())}") if index_name \
             else "All indexes have been removed from the vector store."
 
     def _build_collection_filter(self, filter: dict | str, index_name: str = "") -> dict:
@@ -1873,7 +1877,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """
         available_indexes = self.list_indexes()
         if index_name and index_name not in available_indexes:
-            return f"Index '{index_name}' not found. Available indexes: {available_indexes}"
+            return f"Index '{index_name}' not found. Available indexes: {serialize_tool_result(available_indexes)}"
 
         filter = self._build_collection_filter(filter, index_name)
         found_docs = super().search_documents(

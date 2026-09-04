@@ -43,6 +43,7 @@ from ..utils.mcp_oauth import McpAuthorizationRequired
 from pydantic import BaseModel, Field
 
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
+from ...tools.utils.serialization import serialize_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -761,7 +762,8 @@ class InvokeToolTool(BaseTool):
 
             logger.info(f"[LazyTools] Invoking {toolkit}.{tool} with args: {arguments}")
             result = actual_tool.invoke(arguments)
-            return str(result) if result is not None else "Tool executed successfully (no output)"
+            return serialize_tool_result(result) if result is not None \
+                else "Tool executed successfully (no output)"
         except GraphBubbleUp:
             raise
         except McpAuthorizationRequired:
@@ -904,7 +906,8 @@ class InvokeToolTool(BaseTool):
                 result = await actual_tool.ainvoke(arguments)
             else:
                 result = actual_tool.invoke(arguments)
-            return str(result) if result is not None else "Tool executed successfully (no output)"
+            return serialize_tool_result(result) if result is not None \
+                else "Tool executed successfully (no output)"
         except GraphBubbleUp:
             raise
         except McpAuthorizationRequired:

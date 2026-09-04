@@ -10,6 +10,8 @@ Test pattern mirrors `tests/tools/jira/test_jira_auth_error_handling.py`:
 bypass the heavy pydantic/indexer-base validator chain by constructing the
 wrapper via `object.__new__` and injecting a mocked TestRail client.
 """
+import json
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -130,7 +132,7 @@ class TestGetSectionsOutputFormats:
 
         result = wrapper.get_sections(project_id="10")
 
-        assert result.startswith("Extracted data:")
+        assert json.loads(result) == [_section(1)]
 
     def test_csv(self, wrapper):
         self._arrange_one_section(wrapper)

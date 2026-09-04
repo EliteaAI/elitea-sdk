@@ -337,7 +337,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         """
         try:
             pr = self._bitbucket.create_pull_request(pr_json_data)
-            return f"Successfully created PR\n{str(pr)}"
+            return {'message': 'Successfully created PR.', 'pull_request': pr}
         except Exception as e:
             if "Bad request" in str(e):
                 logger.info(f"Make sure your pr_json matches to {create_pr_data}")
@@ -525,11 +525,11 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         """
         try:
             result = self._bitbucket.close_pull_request(pr_id=pr_id, message=message)
-            return f"Successfully closed pull request {pr_id}\n{str(result)}"
+            return {'message': f'Successfully closed pull request {pr_id}.', 'pull_request': result}
         except Exception as e:
             raise ToolException(f"Can't close pull request `{pr_id}` due to error:\n{str(e)}")
 
-    def _get_files(self, path: str, branch: str, recursive: bool = True) -> str:
+    def _get_files(self, path: str, branch: str, recursive: bool = True) -> List[str]:
         """
         Get files from the bitbucket repo
         Parameters:
@@ -539,7 +539,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: List of the files
         """
-        return str(self._bitbucket.get_files_list(file_path=path if path else '', branch=branch if branch else self._active_branch, recursive=recursive))
+        return self._bitbucket.get_files_list(file_path=path if path else '', branch=branch if branch else self._active_branch, recursive=recursive)
 
     # TODO: review this method, it may not work as expected
     # def _file_commit_hash(self, file_path: str, branch: str):
@@ -579,18 +579,8 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         """List files in the repository with optional path, recursive search, and branch."""
         branch = branch if branch else self._active_branch
         try:
-            files_str = self._get_files(path, branch, recursive)
-            # Parse the string response to extract file paths
-            # This is a simplified implementation - might need adjustment based on actual response format
-            import ast
-            try:
-                files_list = ast.literal_eval(files_str)
-                if isinstance(files_list, list):
-                    return files_list
-                else:
-                    return [str(files_list)]
-            except:
-                return [files_str] if files_str else []
+            files = self._get_files(path, branch, recursive)
+            return files if isinstance(files, list) else [str(files)]
         except Exception as e:
             raise ToolException(f"Failed to list files: {str(e)}")
 

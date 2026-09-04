@@ -432,7 +432,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         self._add_default_labels(page_id=created_page['id'])
 
         parent_display = f"parent page '{parent_id_filled}'" if parent_id_filled else "space root level"
-        return f"The page '{title}' was created under {parent_display}: '{page_details['link']}'. \nDetails: {str(page_details)}"
+        return {
+            'message': f"The page '{title}' was created under {parent_display}: '{page_details['link']}'.",
+            'page': page_details,
+        }
 
     @tool_group('write')
     def create_pages(self, pages_info: str, status: str = 'current', space: str = None, parent_id: str = None):
@@ -460,7 +463,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 created_page = self.create_page(title=title, body=body, status=status, parent_id=parent_id_filled,
                                                 space=user_space)
                 created_pages.append(created_page)
-        return str(created_pages)
+        return created_pages
 
     def _create_page_v2(self, space: str, title: str, body: str, parent_id: Optional[str],
                         representation: str, status: str) -> dict:
@@ -627,7 +630,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
         self._add_default_labels(page_id=page_id)
 
-        return f"The page '{page_id}' was updated successfully: '{webui_link}'. \nDetails: {str(update_details)}"
+        return {
+            'message': f"The page '{page_id}' was updated successfully: '{webui_link}'.",
+            'page': update_details,
+        }
 
     @tool_group('write')
     def update_page_by_title(self, page_title: str, representation: str = 'storage', new_title: str = None,
@@ -653,7 +659,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                                                 new_body=new_contents[index if len(new_contents) != 1 else 0],
                                                 new_labels=new_labels)
                 statuses.append(status)
-            return str(statuses)
+            return statuses
         else:
             return "Either list of page_ids or parent_id (to update descendants) should be provided."
 
@@ -673,18 +679,14 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             for index, page_id in enumerate(page_ids):
                 status = self.update_page_by_id(page_id=page_id, new_labels=new_labels)
                 statuses.append(status)
-            return str(statuses)
+            return statuses
         else:
             return "Either list of page_ids should be provided."
 
     @tool_group('read')
-    def get_page_tree(self, page_id: str):
-        """ Gets page tree for the Confluence space """
-        descendant_pages = self.get_all_descendants(page_id)  # Pass None as the parent for the root
-        for page in descendant_pages:
-            logger.info(f"Page ID: {page['id']}, Title: {page['title']}, Parent ID: {page['parent_id']}")
-        descendants = {page['id']: (page['title'], page['parent_id']) for page in descendant_pages}
-        return f"The list of pages under the '{page_id}' was extracted: {descendants}"
+    def get_page_tree(self, page_id: str) -> List[dict]:
+        """ Gets page tree for the Confluence space, each page with id, title and parent_id """
+        return self.get_all_descendants(page_id)
 
     def get_all_descendants(self, page_id: str):
         """ Recursively gets all descendant pages of a given page. """
@@ -712,7 +714,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     @tool_group('read')
     def get_pages_with_label(self, label: str):
         """ Gets pages with specific label in the Confluence space."""
-        return str(self._get_labeled_page(label))
+        return self._get_labeled_page(label)
 
     @tool_group('read')
     def list_pages_with_label(self, label: str):
@@ -938,7 +940,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 }
                 pages_info.append(page_info)
             start += self.limit
-        return str(pages_info) if pages_info else f"Unable to find anything using query {cql}. Check space or query."
+        return pages_info if pages_info else f"Unable to find anything using query {cql}. Check space or query."
 
     @tool_group('read')
     def search_pages(self, query: str, skip_images: bool = False):
@@ -997,7 +999,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             }
             page_data['preview'] = page['excerpt'] if page['excerpt'] else ""
             content.append(page_data)
-        return '---'.join([str(page_data) for page_data in content])
+        return content
 
     def process_page(self, page: dict, skip_images: bool = False, content_format: Optional[Any] = None) -> Document:
         if self.keep_markdown_format:

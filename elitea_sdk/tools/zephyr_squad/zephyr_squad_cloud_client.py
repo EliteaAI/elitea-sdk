@@ -6,6 +6,8 @@ import jwt
 import requests
 from langchain_core.tools import ToolException
 
+from ..utils.serialization import serialize_tool_result
+
 
 class ZephyrSquadCloud(object):
     """
@@ -95,7 +97,7 @@ class ZephyrSquadCloud(object):
 
             if resp.ok:
                 if resp.headers.get("Content-Type", "").startswith("application/json"):
-                    return str(resp.json())
+                    return serialize_tool_result(resp.json())
                 else:
                     return resp.text
             else:

@@ -53,7 +53,22 @@ from ..utils.utils import clean_string
 from ..tools.router import RouterNode
 from ..exceptions import PipelineConfigurationError
 
+from ...tools.utils.serialization import serialize_tool_result
+
 logger = logging.getLogger(__name__)
+
+
+_CONTENT_BLOCK_TYPES = {
+    'text', 'thinking', 'reasoning', 'tool_use', 'tool_result',
+    'image', 'image_url', 'document', 'search_result',
+}
+
+
+def _is_content_block(block) -> bool:
+    """A message content block, as opposed to a record that merely lives in a list."""
+    if isinstance(block, str):
+        return True
+    return isinstance(block, dict) and ('text' in block or block.get('type') in _CONTENT_BLOCK_TYPES)
 
 
 def normalize_message_content(content: Any) -> str:
@@ -81,9 +96,14 @@ def normalize_message_content(content: Any) -> str:
                     text_parts.append(block.get('text', ''))
             elif isinstance(block, str):
                 text_parts.append(block)
-        return ''.join(text_parts)
-    # Fallback for other types
-    return str(content)
+        if text_parts or all(_is_content_block(block) for block in content):
+            # A content-block list that yields no text (thinking only) really is
+            # empty; a list of RECORDS is not, and returning '' dropped the answer.
+            return ''.join(text_parts)
+        return serialize_tool_result(content)
+    # This value becomes a pipeline's `output`, i.e. the answer the user reads, so
+    # a terminal node writing a dict output variable must not surface as a repr.
+    return serialize_tool_result(content)
 
 
 # Internal graph-I/O, HITL, and summarization-metadata state keys that must never

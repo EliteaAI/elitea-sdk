@@ -4,6 +4,8 @@ Covers happy path, filter/pagination parameter forwarding, the fetch_all
 flag, and comment created_at inclusion in get_issue.
 """
 
+import json
+
 from elitea_sdk.tools.gitlab.api_wrapper import GitLabAPIWrapper
 
 
@@ -69,9 +71,18 @@ class TestGetIssues:
 
         result = wrapper.get_issues()
 
-        assert "Found 1 issues" in result
-        assert "'number': 7" in result
-        assert "'state': 'opened'" in result
+        assert result == [
+            {
+                "title": "Bug in login",
+                "number": 7,
+                "state": "opened",
+                "labels": ["bug"],
+                "author": "alice",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z",
+            }
+        ]
+        assert json.loads(json.dumps(result)) == result
 
     def test_no_issues_found(self):
         mgr = FakeIssuesManager(list_result=[])
@@ -79,7 +90,7 @@ class TestGetIssues:
 
         result = wrapper.get_issues()
 
-        assert result == "No issues found matching the given filters"
+        assert result == []
 
     def test_default_state_is_opened_and_paginated(self):
         mgr = FakeIssuesManager(list_result=[])
