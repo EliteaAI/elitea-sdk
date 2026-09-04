@@ -20,6 +20,7 @@ from elitea_sdk.tools.rally.api_wrapper import RallyApiWrapper
 from elitea_sdk.tools.testrail.api_wrapper import TestrailAPIWrapper
 from elitea_sdk.tools.xray.api_wrapper import XrayApiWrapper
 from elitea_sdk.tools.zephyr.api_wrapper import ZephyrV1ApiWrapper
+from elitea_sdk.tools.zephyr_enterprise.api_wrapper import ZephyrApiWrapper as ZephyrEnterpriseApiWrapper
 from elitea_sdk.tools.zephyr_scale.api_wrapper import ZephyrScaleApiWrapper
 
 
@@ -279,6 +280,36 @@ class TestZephyrScale:
         assert 'was created' in result['message']
         assert result['test_case'] == created
         assert result['steps']['steps'] == {'status': 'ok'}
+
+
+class TestZephyrEnterprise:
+    def test_get_testcases_by_zql_returns_native_records(self):
+        """The default path embedded each test case dict in a prose line.
+
+        `return_as_list` was never in the args_schema, so every model call took
+        the branch building "Test case ID: 1, Test case: {'name': ...}".
+        """
+        wrapper = _bare(ZephyrEnterpriseApiWrapper)
+        cases = [{'id': 1, 'name': 'Login works'}, {'id': 2, 'name': 'Logout works'}]
+        wrapper.__dict__['_client'] = SimpleNamespace(
+            get_testcases_by_zql=lambda zql: {
+                'resultSize': 2,
+                'results': [{'id': index, 'testcase': case} for index, case in enumerate(cases)],
+            }
+        )
+
+        result = wrapper.get_testcases_by_zql('project = X')
+
+        _assert_json_ready(result)
+        assert result == cases
+
+    def test_no_matches_returns_an_empty_list(self):
+        wrapper = _bare(ZephyrEnterpriseApiWrapper)
+        wrapper.__dict__['_client'] = SimpleNamespace(
+            get_testcases_by_zql=lambda zql: {'resultSize': 0, 'results': []}
+        )
+
+        assert wrapper.get_testcases_by_zql('project = EMPTY') == []
 
 
 class TestXray:
