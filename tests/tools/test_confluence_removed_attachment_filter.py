@@ -9,12 +9,16 @@ paginated before filtering so visibility is judged over the full attachment set.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 import requests
 from unittest.mock import MagicMock
 
-from elitea_sdk.tools.confluence.api_wrapper import ConfluenceAPIWrapper
+from elitea_sdk.tools.confluence.api_wrapper import (
+    ConfluenceAPIWrapper,
+    _extract_legacy_doc,
+)
 
 EMBEDDED_FILE_ID = 'a7c79fb8-e574-4061-9d38-c5b0e2bc0c1f'
 REMOVED_FILE_ID = 'f191dc06-c1ea-467c-90ef-5b6601f02c9f'
@@ -91,6 +95,25 @@ def set_body(wrapper, *media_nodes):
 
 def listed_names(result):
     return [entry['metadata']['name'] for entry in result] if isinstance(result, list) else result
+
+
+def test_legacy_doc_extraction_invokes_antiword_and_cleans_up(monkeypatch):
+    observed = {}
+
+    def run(args, **kwargs):
+        observed['path'] = args[1]
+        assert args[0] == 'antiword'
+        assert Path(args[1]).read_bytes() == b'legacy doc'
+        assert kwargs == {'check': True, 'capture_output': True}
+        return MagicMock(stdout=b'extracted text')
+
+    monkeypatch.setattr(
+        'elitea_sdk.tools.confluence.api_wrapper.subprocess.run',
+        run,
+    )
+
+    assert _extract_legacy_doc(b'legacy doc') == 'extracted text'
+    assert not Path(observed['path']).exists()
 
 
 def test_removed_attachment_is_excluded(wrapper):

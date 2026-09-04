@@ -2,9 +2,12 @@ import base64
 import json
 import logging
 import re
+import subprocess
+import tempfile
 import traceback
 from io import BytesIO
 from json import JSONDecodeError
+from pathlib import Path
 from traceback import format_exc
 from typing import Optional, List, Any, Dict, Callable, Generator, Literal, NamedTuple
 
@@ -40,6 +43,24 @@ ATTACHMENT_LISTING_MACROS = frozenset({'attachments', 'gallery', 'space-attachme
 # 'name'). Restricting the harvest to these keeps an unrelated string parameter
 # (a jira jqlQuery, a toc title) from accidentally matching an attachment title.
 FILENAME_MACRO_PARAMS = frozenset({'name', 'filename', 'file'})
+
+
+def _extract_legacy_doc(file_content: bytes) -> str:
+    """Extract legacy Word content with the same antiword backend used by textract.
+
+    Calling the executable directly preserves .doc support without installing
+    textract-py3, whose unused xlrd<2 dependency conflicts with Unstructured's
+    required xlrd>=2 dependency.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        file_path = Path(directory) / 'attachment.doc'
+        file_path.write_bytes(file_content)
+        result = subprocess.run(
+            ['antiword', str(file_path)],
+            check=True,
+            capture_output=True,
+        )
+    return result.stdout.decode('utf-8')
 
 
 class _AttachmentSelection(NamedTuple):
@@ -2021,12 +2042,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                                     content = f"[Error extracting docx: {str(e)}]"
                             elif file_ext == 'doc':
                                 try:
-                                    import textract
-                                    content = textract.process(None, extension='doc', input_data=resp.content).decode('utf-8')
+                                    content = _extract_legacy_doc(resp.content)
                                 except Exception as e:
                                     content = f"[Error extracting doc: {str(e)}]"
                         except ImportError:
-                            content = "[python-docx or textract not installed for doc/docx extraction]"
+                            content = "[python-docx not installed for docx extraction]"
                     elif file_ext in ['csv']:
                         try:
                             import io
@@ -2545,4 +2565,3 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 "args_schema": AddFileToPage,
             }
         ]
-
