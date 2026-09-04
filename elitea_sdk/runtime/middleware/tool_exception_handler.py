@@ -45,6 +45,7 @@ from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langgraph.errors import GraphBubbleUp
 
 from ..langchain.utils import log_tool_result
+from ..tool_result_bounds import bound_and_record, toolkit_type_of
 from .base import Middleware
 from .strategies import (
     ExceptionHandlerStrategy,
@@ -119,7 +120,9 @@ def _stamp_error_status(result, recorded):
     The middleware returns its error prose instead of raising, so ToolNode builds a
     success message over it (#6477). The signal is the recorded envelope, never the text.
     """
-    if not any(o.status is not ToolResultStatus.SUCCESS for o in recorded):
+    # Only ERROR flips the message: TRUNCATED is a recorded outcome on a call that
+    # still succeeded, and marking it 'error' would fail a working tool (#6140).
+    if not any(o.status is ToolResultStatus.ERROR for o in recorded):
         return result
     if isinstance(result, list):
         return [_stamp_error_status(item, recorded) for item in result]
@@ -312,6 +315,10 @@ When a tool fails with an error:
         object.__setattr__(copied, self.WRAPPED_MARKER, True)
         return copied
 
+    def _bound(self, tool: BaseTool, result):
+        """Bound an oversized result here, the one point every wrapped tool passes."""
+        return bound_and_record(result, getattr(tool, 'name', None), toolkit_type_of(tool))
+
     def _sync_wrapper(self, tool: BaseTool, original: Callable) -> Callable:
         forward_run_manager = self._accepts_run_manager(original)
 
@@ -324,7 +331,7 @@ When a tool fails with an error:
             except Exception as e:
                 return self._shape_error_output(tool, self._handle_tool_exception(tool, e, args, kwargs))
             self._notify_success(tool.name)
-            return result
+            return self._bound(tool, result)
 
         return error_handled_func
 
@@ -345,7 +352,7 @@ When a tool fails with an error:
                 message = await asyncio.to_thread(self._run_error_pipeline, tool, e, args, kwargs)
                 return self._shape_error_output(tool, message)
             self._notify_success(tool.name)
-            return result
+            return self._bound(tool, result)
 
         return error_handled_coroutine
 

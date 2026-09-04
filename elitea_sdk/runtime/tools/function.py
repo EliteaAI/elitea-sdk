@@ -28,6 +28,7 @@ from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
+from ..tool_result_bounds import bound_and_record, toolkit_type_of
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +526,8 @@ alita_client = elitea_client
 
         try:
             tool_result = self.tool.invoke(func_args, config, **kwargs)
+            tool_result = bound_and_record(
+                tool_result, getattr(self.tool, 'name', None), toolkit_type_of(self.tool))
 
             # If the tool was blocked by the sensitive-tool guard (user
             # rejected), return a clean termination instead of propagating
