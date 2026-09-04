@@ -540,7 +540,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
             extra_params: JSON-encoded string of per-file-type options
                 discovered via ``get_file_metadata`` (e.g.
                 ``{"sheet_name": "Sheet1", "start_row": 1, "end_row": 100}``
-                for Excel, or ``{"user_prompt": "Describe only the chart"}``
+                for Excel, or ``{"prompt": "Describe only the chart"}``
                 for images when is_capture_image=True).
             
         Returns:
@@ -1075,7 +1075,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                             "for Excel: '{\"sheet_name\":\"Sheet1\", "
                             "\"start_row\":1, \"end_row\":100}'. Example for "
                             "images (with is_capture_image=true): "
-                            "'{\"user_prompt\":\"Describe only the chart axis labels\"}'. "
+                            "'{\"prompt\":\"Describe only the chart axis labels\"}'. "
                             "Pass as a JSON STRING, not as an object."),
                         default=None,
                     )),

@@ -44,11 +44,11 @@ class EliteAImageLoader(BaseLoader):
             "unit": None,
             "instruction_for_readFile": {
                 "extra_params": {
-                    "user_prompt": (
+                    "prompt": (
                         "string — optional custom instruction for the vision "
                         "model describing this image, overriding the default "
                         "generic caption prompt. Pass via extra_params, e.g. "
-                        '{"user_prompt": "Describe only the chart\'s axis labels"}.'
+                        '{"prompt": "Describe only the chart\'s axis labels"}.'
                     ),
                 },
                 "notes": (

@@ -1,7 +1,7 @@
 """Regression tests for EliteAImageLoader custom prompt plumbing.
 
 Reference: EliteaAI/elitea_issues#6530 — read_file's extra_params can now pass
-a targeted user_prompt for images, translated to the loader's `prompt` kwarg.
+a targeted extra_params prompt for images, matching the loader's own `prompt` kwarg.
 These tests avoid LLM/OCR dependencies by checking constructor state directly.
 """
 
