@@ -12,6 +12,7 @@ from langchain_core.tools import ToolException
 from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map, LoaderProperties
 from ...runtime.langchain.document_loaders.EliteATextLoader import EliteATextLoader
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
+from ...runtime.langchain.document_loaders.EliteAImageLoader import EliteAImageLoader
 from ...runtime.utils.utils import IndexerKeywords
 
 logger = getLogger(__name__)
@@ -197,6 +198,15 @@ def get_loader_kwargs(loader_object, file_name=None, file_content=None, is_captu
         "json_documents": False,
         "image_cache": image_cache,
     })
+    # #6530: translate the image-only extra_params key into the kwarg the
+    # loader reads (EliteAImageLoader reads `prompt`, not `user_prompt`).
+    if extra_params and loader_object.get('class') is EliteAImageLoader:
+        user_prompt = extra_params.get('user_prompt')
+        if user_prompt:
+            extra_params = {**extra_params}
+            extra_params.pop('user_prompt')
+            loader_kwargs['prompt'] = user_prompt
+
     # Merge caller-provided extra_params LAST so they take precedence over
     # defaults from loaders_map. Sheet_name from extra_params overrides the
     # explicit sheet_name argument when both are provided.
