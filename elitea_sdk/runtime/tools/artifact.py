@@ -309,7 +309,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
 
     @tool_group('read')
     def list_files(self, bucket_name=None, folder: str = None, recursive: bool = False,
-                   include: List[str] = None, skip: List[str] = None, return_as_string=True,
+                   include: List[str] = None, skip: List[str] = None,
                    on_file_skipped: Optional[Callable[[str], None]] = None):
         """List files in the artifact bucket with S3 download links.
 
@@ -326,7 +326,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                      Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
             skip: Glob patterns to exclude. Same syntax as include.
                   Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
-            return_as_string: If True, returns str(result), else returns dict
             on_file_skipped: Called with the key of every file excluded by the
                   patterns, so indexing can report what it left out.
         
@@ -350,7 +349,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         
         if 'error' in result:
             # Return empty list for non-existent folder/bucket
-            return "[]" if return_as_string else {"total": 0, "rows": []}
+            return {"total": 0, "rows": []}
         
         # Apply include/skip pattern filtering
         include = include or []
@@ -409,7 +408,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         result['rows'] = filtered_files
         result['total'] = len(filtered_files)
 
-        return str(result) if return_as_string else result
+        return result
 
     @tool_group('write')
     def create_file(self, filename: str, bucket_name = None, filedata: str = None, filepath: str = None):
@@ -910,7 +909,6 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 recursive=True,
                 include=include_extensions,
                 skip=skip_extensions,
-                return_as_string=False,
                 on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered")
             )['rows']
         except Exception as e:
