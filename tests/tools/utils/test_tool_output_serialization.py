@@ -32,6 +32,14 @@ class Row:
     value: float
 
 
+@dataclass
+class RenderedRow:
+    name: str
+
+    def __str__(self):
+        return f"row {self.name}, rendered"
+
+
 class CustomRendering:
     """Stands in for toolkit objects whose __str__ is their documented rendering."""
 
@@ -190,6 +198,25 @@ class TestBareValues:
 
     def test_bare_object_keeps_its_own_rendering(self):
         assert serialize_tool_result(CustomRendering()) == "item one\n-----\nitem two"
+
+
+class TestOwnRenderingIsPreserved:
+    """A dataclass that defines __str__ keeps it; one that doesn't becomes JSON.
+
+    sharepoint's OnenotePageItems documents its __str__ as the LLM rendering, and
+    expanding it to a dict drops that plus the type discriminator on each item.
+    """
+
+    def test_dataclass_with_its_own_str_keeps_it(self):
+        assert serialize_tool_result(RenderedRow(name="a")) == "row a, rendered"
+
+    def test_the_same_holds_nested_in_a_collection(self):
+        result = serialize_tool_result([{"row": RenderedRow(name="a")}])
+
+        assert json.loads(result) == [{"row": "row a, rendered"}]
+
+    def test_a_plain_dataclass_still_becomes_json(self):
+        assert json.loads(serialize_tool_result(Row(name="a", value=1.5))) == {"name": "a", "value": 1.5}
 
 
 class TestNeverRaises:

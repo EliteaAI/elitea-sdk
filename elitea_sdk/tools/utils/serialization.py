@@ -42,7 +42,7 @@ def serialize_tool_result(result: Any) -> str:
             return 'null'
         # A bare dataclass, model, datetime or bytes deserves its JSON form as much
         # as a nested one; only wrapping it in a list used to get it. An object with
-        # its own __str__ is still untouched -- to_json_primitive falls through to it.
+        # a rendering of its own is left alone -- see to_json_primitive.
         converted = to_json_primitive(result)
         if isinstance(converted, _COLLECTION_TYPES):
             return serialize_tool_result(converted)
@@ -120,7 +120,14 @@ def to_json_primitive(value: Any) -> Any:
         return describe_binary(value)
     if isinstance(value, (set, frozenset)):
         return list(value)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+    if (
+        dataclasses.is_dataclass(value)
+        and not isinstance(value, type)
+        # A dataclass that DEFINES __str__ has a rendering of its own and keeps it:
+        # sharepoint's OnenotePageItems documents its __str__ as the LLM rendering,
+        # and asdict would drop it along with the type discriminator on each item.
+        and type(value).__str__ is object.__str__
+    ):
         return dataclasses.asdict(value)
     dumped = dump_model(value)
     if dumped is not None:

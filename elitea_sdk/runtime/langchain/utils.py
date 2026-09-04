@@ -719,7 +719,15 @@ def safe_serialize(obj: Any) -> str:
     if obj is None or isinstance(obj, (str, bool, int, float)):
         return json.dumps(obj, ensure_ascii=False)
     if isinstance(obj, (dict, list, tuple, set, frozenset)):
-        return serialize_tool_result(obj)
+        text = serialize_tool_result(obj)
+        try:
+            json.loads(text)
+        except ValueError:
+            # serialize_tool_result degrades an unserializable collection to plain
+            # text, which is right for a model but breaks the contract here:
+            # function.py hands this to json.loads inside the Pyodide sandbox.
+            return json.dumps(text, ensure_ascii=False)
+        return text
     # A bare datetime or Decimal would otherwise render as text json.loads rejects.
     return json.dumps(to_json_primitive(obj), ensure_ascii=False, default=to_json_primitive)
 
