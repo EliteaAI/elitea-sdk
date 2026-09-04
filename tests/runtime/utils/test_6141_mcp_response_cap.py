@@ -20,7 +20,7 @@ import json
 import httpx
 import pytest
 
-from elitea_sdk.runtime.utils import trace_limits
+from elitea_sdk.runtime.utils import mcp_response_limit, trace_limits
 from elitea_sdk.runtime.utils.mcp_response_limit import (
     MCP_RESPONSE_MAX_BYTES,
     BoundedAsyncClient,
@@ -355,3 +355,27 @@ def test_real_transport_surfaces_size_error_and_fetches_the_body_once(monkeypatc
     # Exception we would re-download the oversized body up to three times.
     assert server.tool_call_requests == 1
     assert server.oversized.sent <= limit + len(CHUNK)
+
+
+def test_httpx_override_seam_still_exists():
+    """Fails in CI the moment a transitive httpx bump moves the private method
+    BoundedAsyncClient overrides, instead of letting the cap go quietly inert."""
+    import inspect
+
+    assert hasattr(httpx.AsyncClient, '_send_single_request')
+    params = list(inspect.signature(httpx.AsyncClient._send_single_request).parameters)
+    assert params == ['self', 'request'], f'httpx {httpx.__version__} changed the seam: {params}'
+    assert mcp_response_limit._SEAM_OK is True
+
+
+def test_broken_seam_falls_back_to_unbounded_client(monkeypatch):
+    """If the seam ever disappears we must degrade to today's behaviour - a plain
+    client, compression left on - rather than hand back a client that silently
+    fails to count."""
+    monkeypatch.setattr(mcp_response_limit, '_SEAM_OK', False)
+    factory = mcp_response_limit.build_httpx_client_factory(True, 1024, SizeTrip())
+    client = factory(headers={'x-test': '1'})
+    assert type(client) is httpx.AsyncClient
+    # httpx always sets its own accept-encoding; what matters is that we did not force
+    # identity, since paying that bandwidth buys nothing once the counter cannot run.
+    assert client.headers.get('accept-encoding') != 'identity'

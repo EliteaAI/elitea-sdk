@@ -1,11 +1,31 @@
 """Wire-level cap on MCP HTTP response bodies: bytes past the cap are never read (#6141)."""
 
+import inspect
 import logging
 from typing import Any, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# httpx is a transitive dep (via mcp / langchain-mcp-adapters), so a bump can move this
+# private seam under us. Verified against httpx 0.23-0.28; checked at import so a broken
+# override is loud in logs and in CI (test_httpx_override_seam_still_exists) instead of
+# silently leaving the OOM guard inert.
+_SEAM = '_send_single_request'
+_SEAM_OK = False
+try:
+    _SEAM_OK = list(
+        inspect.signature(getattr(httpx.AsyncClient, _SEAM)).parameters
+    ) == ['self', 'request']
+except (AttributeError, TypeError, ValueError):
+    _SEAM_OK = False
+if not _SEAM_OK:
+    logger.error(
+        'httpx.AsyncClient.%s is missing or changed shape in httpx %s: MCP response byte '
+        'capping is DISABLED. Pin httpx or update BoundedAsyncClient (#6141).',
+        _SEAM, getattr(httpx, '__version__', 'unknown'),
+    )
 
 # Deliberately far above the #6140 character cap: this one protects process RAM,
 # not the LLM context, and tool-discovery catalogues are legitimately large.
@@ -138,7 +158,7 @@ def build_httpx_client_factory(ssl_verify: bool, limit: Optional[int], trip: Siz
 
     def factory(headers=None, timeout=None, auth=None):
         kwargs = {
-            'headers': _with_identity_encoding(headers, limit),
+            'headers': _with_identity_encoding(headers, limit if _SEAM_OK else None),
             'auth': auth,
             # Mirrors mcp.shared._httpx_utils.create_mcp_http_client defaults.
             'follow_redirects': True,
@@ -146,7 +166,7 @@ def build_httpx_client_factory(ssl_verify: bool, limit: Optional[int], trip: Siz
         }
         if not ssl_verify:
             kwargs['verify'] = False
-        if limit is None:
+        if limit is None or not _SEAM_OK:
             return httpx.AsyncClient(**kwargs)
         return BoundedAsyncClient(response_limit_bytes=limit, size_trip=trip, **kwargs)
 
