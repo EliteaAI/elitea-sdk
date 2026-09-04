@@ -441,6 +441,99 @@ def test_highlights_are_capped_per_result():
     assert all(set(highlight) == {"field", "text"} for highlight in highlights)
 
 
+def test_identical_field_and_text_hits_collapse_to_one():
+    tags = "automation; faker; test -data; testing"
+    hits = [FakeHit("system.tags", [tags]), FakeHit("system.tags", [tags])]
+
+    payload = search(FakeSearchClient(FakeResponse(results=[FakeResult(hits=hits)], count=1)), include_highlights=True)
+
+    assert payload["results"][0]["highlights"] == [{"field": "system.tags", "text": tags}]
+
+
+def test_a_duplicate_does_not_crowd_out_a_distinct_field():
+    tags = "automation; faker; testing"
+    hits = [
+        FakeHit("system.tags", [tags]),
+        FakeHit("system.tags", [tags]),
+        FakeHit("system.title", ["login timeout"]),
+        FakeHit("system.description", ["login timeout after 30s"]),
+    ]
+
+    payload = search(FakeSearchClient(FakeResponse(results=[FakeResult(hits=hits)], count=1)), include_highlights=True)
+
+    highlights = payload["results"][0]["highlights"]
+    assert [highlight["field"] for highlight in highlights] == [
+        "system.tags",
+        "system.title",
+        "system.description",
+    ]
+
+
+def test_the_same_field_with_different_text_is_kept():
+    hits = [
+        FakeHit("system.description", ["login timeout after 30s"]),
+        FakeHit("system.description", ["the login page also times out"]),
+    ]
+
+    payload = search(FakeSearchClient(FakeResponse(results=[FakeResult(hits=hits)], count=1)), include_highlights=True)
+
+    highlights = payload["results"][0]["highlights"]
+    assert [highlight["text"] for highlight in highlights] == [
+        "login timeout after 30s",
+        "the login page also times out",
+    ]
+
+
+def test_duplicates_are_detected_after_markup_is_stripped():
+    hits = [
+        FakeHit("system.title", ["<highlighthit>login</highlighthit> timeout"]),
+        FakeHit("system.title", ["login <highlighthit>timeout</highlighthit>"]),
+    ]
+
+    payload = search(FakeSearchClient(FakeResponse(results=[FakeResult(hits=hits)], count=1)), include_highlights=True)
+
+    assert payload["results"][0]["highlights"] == [{"field": "system.title", "text": "login timeout"}]
+
+
+def test_a_duplicate_still_spends_one_result_of_the_highlight_budget():
+    duplicated = [FakeHit("system.tags", ["testing"]) for _ in range(3)]
+    results = [FakeResult(hits=list(duplicated)) for _ in range(6)]
+
+    payload = search(FakeSearchClient(FakeResponse(results=results, count=6)), include_highlights=True, top=6)
+
+    highlighted = [entry for entry in payload["results"] if "highlights" in entry]
+    assert len(highlighted) == HIGHLIGHTS.max_results
+    assert any("1 further result(s)" in warning for warning in payload["warnings"])
+
+
+def test_the_number_of_hits_parsed_is_bounded(monkeypatch):
+    parses = []
+    real_soup = wrapper_module.BeautifulSoup
+    monkeypatch.setattr(
+        wrapper_module,
+        "BeautifulSoup",
+        lambda markup, parser: parses.append(markup) or real_soup(markup, parser),
+    )
+    hits = [FakeHit("system.history", ["same excerpt"]) for _ in range(200)]
+
+    search(FakeSearchClient(FakeResponse(results=[FakeResult(hits=hits)], count=1)), include_highlights=True)
+
+    assert len(parses) == HIGHLIGHTS.max_hits_scanned
+
+
+def test_a_zero_per_result_budget_yields_no_highlights(monkeypatch):
+    monkeypatch.setattr(
+        wrapper_module,
+        "HIGHLIGHTS",
+        wrapper_module.HighlightBudget(max_per_result=0),
+    )
+    hits = [FakeHit(f"system.field{index}", [f"match {index}"]) for index in range(5)]
+
+    payload = search(FakeSearchClient(FakeResponse(results=[FakeResult(hits=hits)], count=1)), include_highlights=True)
+
+    assert payload["results"][0]["highlights"] == []
+
+
 def test_populated_highlights_survive_leading_empty_hits():
     hits = [
         FakeHit("system.id", []),

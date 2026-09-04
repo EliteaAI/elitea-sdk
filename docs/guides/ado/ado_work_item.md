@@ -92,7 +92,7 @@ Resolves to `top=5`, `skip=5`.
 | `top` maximum | 50 - page with `skip` rather than raising it |
 | `skip` maximum | 1000 - a bound of this tool rather than a documented service limit, so matches ranked below it are unreachable here even if the index would serve them |
 | Matched-field highlights | off by default - set `include_highlights=true`; then the first 5 results that matched a field carry them, whatever `top` is |
-| Highlights per work item | up to 3 matched fields, the first excerpt from each |
+| Highlights per work item | up to 3 distinct field-and-excerpt pairs, the first excerpt from each match |
 | Highlight size | HTML flattened to plain text, then truncated at 200 characters |
 | Worst-case response | about 26 KB at `top=50`, about 30 KB with highlights on - titles and assignee names are not truncated, so this is indicative rather than a hard cap |
 
@@ -101,6 +101,8 @@ Resolves to `top=5`, `skip=5`.
 Each result carries `id`, `title`, `type`, `state`, `project` and `url`, plus `assigned_to` when the work item has an assignee. Full work item bodies, descriptions, comments, relations and attachments are never returned - use `get_work_item` on an id to read one in full.
 
 Set `include_highlights=true` to add a `highlights` list naming the field that matched and a short excerpt. Free text also matches description, acceptance criteria, tags, history and comments, so a result whose title does not contain the query term is common - without highlights there is no indication of why it was returned. Leave it off when you only need a list of ids and titles.
+
+A query that matches one field several times produces several search hits carrying the same excerpt. Those collapse to a single entry, so the three slots per work item always hold three different pieces of evidence. The same field appearing twice with genuinely different excerpts is kept as two entries.
 
 The response reports `total_count` (all matched work items), `returned`, `skip`, a `truncated` flag, and `next_skip` when there is a further window worth requesting. A `warnings` list appears only when the service returned an info code, when nothing matched, when the paging limit was reached, or when results beyond the highlight budget were returned as metadata alone.
 
