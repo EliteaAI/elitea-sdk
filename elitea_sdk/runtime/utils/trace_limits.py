@@ -323,20 +323,16 @@ def _trim_root(container: Any, excess: int) -> None:
 
 
 def _trim_bulk_leaf(parent: Any, key: Any, excess: int) -> int:
-    """Shrink one non-text leaf, returning the characters reclaimed."""
+    """Shrink one non-text leaf, returning the characters reclaimed.
+
+    Lists only: a dict is either shrunk via its own children (already queued as
+    leaves) or dropped whole by the root pass.
+    """
     leaf = parent[key]
     before = estimate_chars(leaf)
-    if isinstance(leaf, list) and leaf:
-        _drop_tail(leaf, excess, before)
-    elif isinstance(leaf, dict) and leaf:
-        if any(isinstance(sub, (dict, list, str, bytes, bytearray)) for sub in leaf.values()):
-            return 0  # its own children are trimmable leaves; shrink those instead
-        # A pure scalar bag (thousands of numeric keys): drop entries, keep the shape.
-        keys = list(leaf)
-        drop = min(len(keys), int(excess / max(before / len(keys), 1)) + 1)
-        for dead in keys[len(keys) - drop:]:
-            del leaf[dead]
-        leaf[TOOL_RESULT_MARKER_KEY] = f'...[truncated: {drop} entries dropped]'
+    if not isinstance(leaf, list) or not leaf:
+        return 0
+    _drop_tail(leaf, excess, before)
     return before - estimate_chars(parent[key])
 
 
