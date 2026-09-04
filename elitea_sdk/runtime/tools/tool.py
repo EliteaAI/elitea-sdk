@@ -12,6 +12,7 @@ from pydantic import ValidationError, BaseModel, create_model
 
 from .application import Application
 from ..langchain.utils import _extract_json, log_tool_result
+from ..tool_result_bounds import bound_and_record, toolkit_type_of
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,9 @@ Answer must be JSON only extractable by JSON.LOADS."""
                             _tk, result, label='tool params')
         try:
             tool_result = self.tool.invoke(result, config=config, kwargs=kwargs)
+            # Before the event dispatch: the event payload is what reaches the DB.
+            tool_result = bound_and_record(
+                tool_result, getattr(self.tool, 'name', None), toolkit_type_of(self.tool))
             dispatch_custom_event(
                 "on_tool_node", {
                     "input_variables": self.input_variables,

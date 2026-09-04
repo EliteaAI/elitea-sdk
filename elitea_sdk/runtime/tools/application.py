@@ -4,6 +4,7 @@ from uuid import uuid4
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 from ..models.agent_response import AgentResponse
 from ..utils.utils import clean_string
+from ..tool_result_bounds import bound_and_record, toolkit_type_of
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -288,6 +289,8 @@ class Application(BaseTool):
                     content = str(result)
             else:
                 content = str(result)
+            # Sub-agent calls skip the middleware wrapper, so this is their only bound.
+            content = bound_and_record(content, self.name, toolkit_type_of(self))
             return ToolMessage(
                 content=content,
                 name=self.name,

@@ -11,6 +11,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
 from ..langchain.utils import log_tool_result
+from ..tool_result_bounds import bound_and_record, toolkit_type_of
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ class AgentNode(BaseTool):
         try:
             agent_input = {'task': task}
             tool_result = self.tool.invoke(agent_input, config=config, kwargs=kwargs)
+            # Sub-agent output is unbounded too, and is dispatched below.
+            tool_result = bound_and_record(
+                tool_result, getattr(self.tool, 'name', None), toolkit_type_of(self.tool))
             dispatch_custom_event(
                 "on_tool_node", {
                     "input_variables": self.input_variables,
