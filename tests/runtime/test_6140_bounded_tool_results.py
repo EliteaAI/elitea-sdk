@@ -1,6 +1,7 @@
 """Tool results are bounded at the tool boundary, behind a feature flag (#6140)."""
 import base64
 import os
+import time
 
 import pytest
 from langchain_core.messages import ToolMessage
@@ -15,6 +16,7 @@ from elitea_sdk.runtime.utils.trace_limits import (
     estimate_chars,
     looks_like_encoded_blob,
     resolve_tool_result_limit,
+    tool_result_bounding_enabled,
 )
 
 LIMIT = TOOL_RESULT_MAX_CHARS
@@ -361,3 +363,58 @@ def test_sandbox_pandas_result_keeps_every_structural_key():
     assert value['execution_info'] == {'duration_ms': 8123, 'packages': ['pandas']}
     assert value['result'].startswith('0,row-0,value-0.0')
     assert 'truncated' in value['result']
+
+
+# --- Review round 1: non-text payloads and config-failure fallback ------------
+
+@pytest.mark.parametrize('payload', [
+    pytest.param({'status': 'ok', 'rows': list(range(100_000))}, id='long-int-list'),
+    pytest.param({'status': 'ok', 'rows': [{'a': i, 'b': i * 2} for i in range(40_000)]},
+                 id='array-of-records'),
+    pytest.param({'status': 'ok', 'm': {str(i): i for i in range(60_000)}},
+                 id='scalar-bag-dict'),
+    pytest.param({'status': 'ok', 'd': {'e': {'f': [list(range(200)) for _ in range(2_000)]}}},
+                 id='deeply-nested-lists'),
+    pytest.param([{'a': 'z' * 100} for _ in range(5_000)], id='root-list-of-small-records'),
+])
+def test_non_text_payloads_actually_shrink(payload):
+    """A result stamped as truncated must never still be oversized.
+
+    Trimming only string/byte leaves left numeric lists, record arrays and scalar
+    bags untouched - the payload stayed megabytes wide while carrying a marker that
+    claimed it had been cut.
+    """
+    before = estimate_chars(payload)
+    assert before > LIMIT, 'probe must start oversized'
+    bounded, reported = bound_tool_result(payload, 'probe')
+    assert estimate_chars(bounded) <= LIMIT
+    assert reported == before
+
+
+def test_bounding_a_non_text_payload_preserves_small_structural_keys():
+    payload = {'status': 'ok', 'error': None, 'rows': [{'a': i, 'b': i * 2} for i in range(40_000)]}
+    bounded, _ = bound_tool_result(payload, 'probe')
+    assert bounded['status'] == 'ok'
+    assert bounded['error'] is None
+    assert isinstance(bounded['rows'], list)
+
+
+def test_bounding_a_huge_non_text_payload_is_not_cpu_bound():
+    """Trimming must not re-measure per candidate length: that reintroduces the
+    CPU-bound serialization cost this whole feature exists to remove."""
+    payload = {'status': 'ok', 'rows': list(range(2_000_000))}
+    started = time.monotonic()
+    bounded, _ = bound_tool_result(payload, 'probe')
+    assert estimate_chars(bounded) <= LIMIT
+    assert time.monotonic() - started < 30
+
+
+def test_configure_rejects_a_non_mapping_without_partially_updating_state():
+    """A malformed per_toolkit must not leave half the bounds applied and the old
+    overrides still live."""
+    configure_tool_result_limits(enabled=True, limit=123_456, per_toolkit={'pgvector': 400_000})
+    with pytest.raises(TypeError):
+        configure_tool_result_limits(enabled=False, limit=999, per_toolkit='garbage')
+    assert tool_result_bounding_enabled() is True
+    assert resolve_tool_result_limit() == 123_456
+    assert resolve_tool_result_limit('pgvector') == 400_000

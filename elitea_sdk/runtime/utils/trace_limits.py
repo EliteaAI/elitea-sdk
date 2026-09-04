@@ -1,6 +1,7 @@
 """Shared bounds for trace-step fields transported to persistence."""
 
 import json
+from collections.abc import Mapping
 from typing import Any, Optional
 
 
@@ -75,13 +76,18 @@ def configure_tool_result_limits(enabled=True, limit=None, per_toolkit=None) -> 
     per-toolkit override takes effect, not only adding one.
     """
     global _bounding_enabled, _bounding_limit, _bounding_per_toolkit  # pylint: disable=W0603
+    overrides = {}
+    # Built fully before any global is assigned: a malformed per_toolkit value must
+    # not leave half the bounds updated and the old overrides still live.
+    if isinstance(per_toolkit, Mapping):
+        for key, value in per_toolkit.items():
+            resolved = _positive_int(value, 0)
+            if key and resolved:
+                overrides[str(key)] = resolved
+    elif per_toolkit:
+        raise TypeError(f'per_toolkit must be a mapping, got {type(per_toolkit).__name__}')
     _bounding_enabled = bool(enabled)
     _bounding_limit = _positive_int(limit, TOOL_RESULT_MAX_CHARS)
-    overrides = {}
-    for key, value in (per_toolkit or {}).items():
-        resolved = _positive_int(value, 0)
-        if key and resolved:
-            overrides[str(key)] = resolved
     _bounding_per_toolkit = overrides
 
 
@@ -151,6 +157,9 @@ _B64_ALPHABET = frozenset(
     'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=-_'
 )
 _B64_MIN_CHARS = 1024
+# Below this a leaf cannot meaningfully reduce the payload, and cutting it only
+# destroys a structural value ('status': 'ok') that downstream nodes index into.
+_MIN_TRIM_CHARS = 512
 
 
 def looks_like_encoded_blob(value: Any) -> bool:
@@ -226,6 +235,111 @@ def _collect_text_leaves(container: Any) -> list:
     return leaves
 
 
+def _collect_bulk_leaves(container: Any) -> list:
+    """(parent, key, size) for every non-text leaf, biggest first.
+
+    Text leaves are handled by ``_collect_text_leaves``; this covers the payloads
+    that pass leaves alone cannot shrink - long numeric lists, arrays of records.
+    """
+    leaves = []
+    stack = [container]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            pairs = item.items()
+        elif isinstance(item, list):
+            pairs = enumerate(item)
+        else:
+            continue
+        for key, sub in list(pairs):
+            if isinstance(sub, (str, bytes, bytearray)):
+                continue
+            if isinstance(sub, (dict, list)):
+                stack.append(sub)
+                leaves.append((item, key, estimate_chars(sub)))
+    leaves.sort(key=lambda entry: entry[2], reverse=True)
+    return leaves
+
+
+_TAIL_NOTE = '...[truncated:'
+
+
+def _drop_tail(seq: list, excess: int, before: int) -> None:
+    """Drop trailing elements, sized from the mean element cost.
+
+    Arithmetic rather than re-measuring each candidate length: a binary search over
+    ``estimate_chars`` would make bounding itself the CPU-bound step this feature
+    exists to avoid.
+    """
+    if seq and isinstance(seq[-1], str) and seq[-1].startswith(_TAIL_NOTE):
+        seq.pop()  # do not stack a second note on a re-trimmed list
+    if not seq:
+        return
+    drop = min(len(seq), int(excess / max(before / len(seq), 1)) + 1)
+    if drop > 0:
+        del seq[len(seq) - drop:]
+        seq.append(f'{_TAIL_NOTE} {drop} more items]')
+
+
+def _trim_root(container: Any, excess: int) -> None:
+    """Shrink the root container itself when the leaf passes under-shot.
+
+    Size estimates are deliberately approximate, and a root list of many small
+    records has no single leaf big enough to trim, so without this a result could be
+    stamped as truncated while still being oversized.
+    """
+    if isinstance(container, list) and container:
+        _drop_tail(container, excess, estimate_chars(container))
+        return
+    if not isinstance(container, dict):
+        return
+    sizes = sorted(
+        ((key, estimate_chars(sub)) for key, sub in container.items()
+         if key != TOOL_RESULT_MARKER_KEY),
+        key=lambda entry: entry[1], reverse=True,
+    )
+    trimmable = [entry for entry in sizes if entry[1] >= _MIN_TRIM_CHARS]
+    if not trimmable:
+        # Thousands of individually tiny values: drop entries instead of mangling
+        # the small structural ones, which is what a caller indexes into.
+        keys = [key for key, _ in sizes]
+        for dead in reversed(keys[1:]):
+            if excess <= 0:
+                break
+            excess -= estimate_chars(container.pop(dead)) + len(str(dead))
+        return
+    for key, size in trimmable:
+        if excess <= 0:
+            break
+        sub = container[key]
+        # Proportional first: a small overshoot must not cost a whole value.
+        if isinstance(sub, list) and sub:
+            _drop_tail(sub, excess, size)
+        elif isinstance(sub, str):
+            container[key] = sub[:max(len(sub) - excess - 32, 0)] + f'{_TAIL_NOTE} {len(sub)} chars]'
+        else:
+            container[key] = f'[oversized value dropped: {size} chars]'
+        excess -= size - estimate_chars(container[key])
+
+
+def _trim_bulk_leaf(parent: Any, key: Any, excess: int) -> int:
+    """Shrink one non-text leaf, returning the characters reclaimed."""
+    leaf = parent[key]
+    before = estimate_chars(leaf)
+    if isinstance(leaf, list) and leaf:
+        _drop_tail(leaf, excess, before)
+    elif isinstance(leaf, dict) and leaf:
+        if any(isinstance(sub, (dict, list, str, bytes, bytearray)) for sub in leaf.values()):
+            return 0  # its own children are trimmable leaves; shrink those instead
+        # A pure scalar bag (thousands of numeric keys): drop entries, keep the shape.
+        keys = list(leaf)
+        drop = min(len(keys), int(excess / max(before / len(keys), 1)) + 1)
+        for dead in keys[len(keys) - drop:]:
+            del leaf[dead]
+        leaf[TOOL_RESULT_MARKER_KEY] = f'...[truncated: {drop} entries dropped]'
+    return before - estimate_chars(parent[key])
+
+
 def cap_tool_result_structure(
     value: Any,
     limit: int = TOOL_RESULT_MAX_CHARS,
@@ -248,6 +362,8 @@ def cap_tool_result_structure(
     for parent, key, leaf_size in _collect_text_leaves(value):
         if excess <= 0:
             break
+        if leaf_size < _MIN_TRIM_CHARS:
+            continue
         leaf = parent[key]
         if looks_like_encoded_blob(leaf):
             parent[key] = f'[binary content dropped: {leaf_size} chars]'
@@ -260,6 +376,30 @@ def cap_tool_result_structure(
             keep = max(leaf_size - excess - len(note), 0)
             parent[key] = leaf[:keep] + note
         excess -= leaf_size - len(parent[key])
+
+    if excess > 0:
+        # Text leaves alone were not enough (a huge numeric list, arrays of records),
+        # so the result would stay oversized while stamped as truncated.
+        for parent, key, _ in _collect_bulk_leaves(value):
+            if excess <= 0:
+                break
+            # Trimming a list shortens it, so a later entry's index can be stale.
+            if isinstance(parent, list) and not 0 <= key < len(parent):
+                continue
+            if isinstance(parent, dict) and key not in parent:
+                continue
+            if isinstance(parent[key], (str, bytes, bytearray)):
+                continue  # already replaced by an earlier trim
+            excess -= _trim_bulk_leaf(parent, key, excess)
+
+    # Estimates are approximate by design, so confirm the contract instead of
+    # trusting the arithmetic: never stamp a result truncated while still oversized.
+    reserve = estimate_chars(marker) + len(TOOL_RESULT_MARKER_KEY) + 64
+    for _ in range(4):
+        current = estimate_chars(value)
+        if current + reserve <= limit:
+            break
+        _trim_root(value, current + reserve - limit)
 
     if isinstance(value, dict):
         value[TOOL_RESULT_MARKER_KEY] = marker
