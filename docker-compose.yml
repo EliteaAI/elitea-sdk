@@ -1,7 +1,7 @@
 
 services:
   elitea-sdk:
-    image: ghcr.io/eliteaai/elitea-sdk:pyodide
+    image: ghcr.io/eliteaai/elitea-sdk:pyodide092026
     platform: linux/amd64
     container_name: elitea-sdk-dev
     environment:

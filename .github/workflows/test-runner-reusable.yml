@@ -78,7 +78,7 @@ jobs:
       DEFAULT_LLM_MODEL: ${{ vars.DEFAULT_LLM_MODEL }}
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide092026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

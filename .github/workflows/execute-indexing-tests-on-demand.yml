@@ -266,7 +266,7 @@ jobs:
         data: ${{ fromJson(needs.configure-matrix.outputs.loader_matrix) }}
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide092026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -452,7 +452,7 @@ jobs:
           --health-retries 5
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide092026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -564,7 +564,7 @@ jobs:
           --health-retries 5
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide092026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
