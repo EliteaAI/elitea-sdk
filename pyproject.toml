@@ -72,6 +72,16 @@ runtime = [
     "langgraph-checkpoint-sqlite==3.1.1",
     "langgraph-checkpoint-postgres==3.1.1",
     "langsmith==0.10.15",
+    # Bound broad transitive ranges to prevent pip resolver backtracking during
+    # SDK plugin updates. These are the versions selected by a clean resolve;
+    # sse-starlette and unstructured-client also preserve the existing
+    # Starlette and HTTP transport compatibility boundaries.
+    "zstandard==0.25.0",
+    "xxhash==4.0.1",
+    "XlsxWriter==3.2.9",
+    "websocket-client==1.9.2",
+    "sse-starlette==3.0.3",
+    "unstructured-client==0.39.1",
     "anthropic==0.120.2",
     "chromadb>=1.0.20,<2.0.0",
     "pgvector==0.2.5",
@@ -155,7 +165,9 @@ tools = [
     "yagmail==0.15.293",
     "pysnc==1.1.10",
     "pyral==1.6.0",
-    "textract-py3==2.1.1",
+    # textract-py3 is intentionally omitted: its unused xlrd<2 dependency
+    # conflicts with Unstructured. Legacy .doc extraction invokes the same
+    # antiword executable directly in the Confluence toolkit.
     "slack_sdk==3.35.0",
     "deltalake==1.0.2",
     "google_cloud_bigquery==3.34.0",

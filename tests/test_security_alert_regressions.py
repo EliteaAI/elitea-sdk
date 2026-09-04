@@ -27,6 +27,12 @@ def test_critical_and_high_dependency_pins_stay_at_patched_versions():
     assert requirements["unstructured"] == "==0.24.0"
     assert requirements["unstructured-inference"] == "==1.6.12"
     assert requirements["psutil"] == "==7.2.2"
+    assert requirements["zstandard"] == "==0.25.0"
+    assert requirements["xxhash"] == "==4.0.1"
+    assert requirements["xlsxwriter"] == "==3.2.9"
+    assert requirements["websocket-client"] == "==1.9.2"
+    assert requirements["sse-starlette"] == "==3.0.3"
+    assert requirements["unstructured-client"] == "==0.39.1"
     assert requirements["langchain-unstructured"] == "==1.0.1"
     assert requirements["statsmodels"] == "==0.14.5"
     assert requirements["pdfminer-six"] == "==20251230"
@@ -35,6 +41,7 @@ def test_critical_and_high_dependency_pins_stay_at_patched_versions():
     assert requirements["gitpython"] == "==3.1.59"
     assert requirements["azure-core"] == "==1.38.0"
     assert requirements["lxml"] == "==6.1.0"
+    assert "textract-py3" not in requirements
 
 
 def test_unstructured_url_partitioning_rejects_loopback_addresses():
