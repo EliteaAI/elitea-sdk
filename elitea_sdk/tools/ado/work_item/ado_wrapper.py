@@ -70,10 +70,39 @@ class HighlightBudget:
     max_results: int = 5
     max_per_result: int = 3
     max_chars: int = 200
+    max_hits_scanned: int = 20
 
 
 PAGING = AdoSearchPaging(default_top=5, max_top=50, max_skip=1000, empty_window_stride=50)
 HIGHLIGHTS = HighlightBudget()
+
+
+def take_distinct_highlights(hits):
+    """Azure DevOps returns one hit per matched fragment, not one per field, so a term
+    matching a field repeatedly yields hits that flatten to the same snippet. Keying on
+    the rendered text rather than the raw string also catches hits whose <highlighthit>
+    markup sits at different offsets within otherwise identical content.
+
+    Duplicates are only visible once parsed, so the number of hits scanned is capped:
+    a field matched many times would otherwise make the parse cost grow with whatever
+    the service returns rather than with the highlights kept."""
+    distinct = []
+    seen = set()
+    for hit in hits[:HIGHLIGHTS.max_hits_scanned]:
+        if len(distinct) >= HIGHLIGHTS.max_per_result:
+            break
+        highlight = {
+            "field": hit.field_reference_name,
+            "text": BeautifulSoup(hit.highlights[0], "html.parser")
+            .get_text(" ", strip=True)[:HIGHLIGHTS.max_chars],
+        }
+        key = (highlight["field"], highlight["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(highlight)
+    return distinct
+
 
 SEARCH_HINTS = SearchIndexHints(
     filter_not_indexed=(
@@ -658,14 +687,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 hits_carrying_highlights = [hit for hit in (result.hits or []) if hit.highlights]
                 highlights_fit_in_budget = results_carrying_highlights < HIGHLIGHTS.max_results
                 if hits_carrying_highlights and highlights_fit_in_budget:
-                    entry["highlights"] = [
-                        {
-                            "field": hit.field_reference_name,
-                            "text": BeautifulSoup(hit.highlights[0], "html.parser")
-                            .get_text(" ", strip=True)[:HIGHLIGHTS.max_chars],
-                        }
-                        for hit in hits_carrying_highlights[:HIGHLIGHTS.max_per_result]
-                    ]
+                    entry["highlights"] = take_distinct_highlights(hits_carrying_highlights)
                     results_carrying_highlights += 1
                 elif hits_carrying_highlights:
                     results_denied_highlights_by_budget += 1
