@@ -492,3 +492,4 @@ To test your toolkit, you can use the Streamlit application (`elitea_local.py`) 
 
 ![custom_toolkit_config](docs/readme_imgs/custom_toolkit_config.png "custom_toolkit_config")
 ![custom_toolkit_testing_interface](docs/readme_imgs/toolkit_testing_interface.png "custom_toolkit_testing_interface")
+<!-- verify pyodide092026 image -->
