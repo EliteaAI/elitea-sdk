@@ -39,10 +39,17 @@ def test_critical_and_high_dependency_pins_stay_at_patched_versions():
 
 def test_unstructured_url_partitioning_rejects_loopback_addresses():
     """Keep URL-based document parsing from becoming an SSRF path again."""
+    # The generic PR job overlays this checkout onto a fixed dependency image
+    # without installing ``.[runtime]``. Keep the pin assertion above
+    # unconditional, and exercise the runtime guard whenever the patched
+    # Unstructured dependency is actually installed.
+    safe_http = pytest.importorskip(
+        "unstructured.safe_http",
+        reason="requires the patched Unstructured runtime dependency",
+    )
     from unstructured.partition.html import partition_html
-    from unstructured.safe_http import UnsafeURLError
 
-    with pytest.raises(UnsafeURLError, match="blocked IP address"):
+    with pytest.raises(safe_http.UnsafeURLError, match="blocked IP address"):
         partition_html(url="http://127.0.0.1/private")
 
 
