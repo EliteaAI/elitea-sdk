@@ -2102,7 +2102,7 @@ class GitHubClient(BaseModel):
             return f"Failed to create pull request: {str(e)}"
 
     @tool_group('read')
-    def get_issues(self, state: str = "open", repo_name: Optional[str] = None) -> str:
+    def get_issues(self, state: str = "open", repo_name: Optional[str] = None) -> List[dict]:
         """
         Get a list of issues from the repository
 
@@ -2111,7 +2111,8 @@ class GitHubClient(BaseModel):
             repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
         Returns:
-            str: JSON string with issue data
+            A list of issues, each with number, title, state, timestamps, url,
+            labels and assignees.
         """
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance

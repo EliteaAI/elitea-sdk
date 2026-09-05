@@ -1,5 +1,4 @@
 import functools
-import json
 import logging
 from typing import Any, List, Optional
 
@@ -17,6 +16,7 @@ from pydantic_core.core_schema import ValidationInfo
 from ...elitea_base import BaseToolApiWrapper
 from .schemas import ArgsSchema
 from ...utils.tool_groups import tool_group, with_tool_groups
+from ...utils.serialization import serialize_tool_result
 
 
 def process_output(func):
@@ -26,9 +26,7 @@ def process_output(func):
             result = func(self, *args, **kwargs)
             if isinstance(result, Exception):
                 raise ToolException(str(result))
-            if isinstance(result, (dict, list)):
-                return json.dumps(result, default=str)
-            return str(result)
+            return serialize_tool_result(result)
         except Exception as e:
             logging.error(f"Error in '{func.__name__}': {str(e)}")
             raise ToolException(str(e))

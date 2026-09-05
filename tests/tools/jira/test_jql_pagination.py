@@ -177,7 +177,7 @@ class TestSearchUsingJql:
 
         result = wrapper.search_using_jql(jql="project = X", limit=300)
 
-        assert "Found 300 Jira issues" in result
+        assert len(result) == 300
         # Multiple pages were fetched
         assert client.call_count >= 3
 
@@ -187,7 +187,7 @@ class TestSearchUsingJql:
 
         result = wrapper.search_using_jql(jql="project = X", limit=150)
 
-        assert "Found 150 Jira issues" in result
+        assert len(result) == 150
 
     def test_falls_back_to_toolkit_limit_when_unspecified(self):
         wrapper, client = self._make_wrapper_with_client(api_version="2", total_issues=200)
@@ -195,21 +195,21 @@ class TestSearchUsingJql:
         result = wrapper.search_using_jql(jql="project = X")
 
         # toolkit default is 5 — backward-compatible behavior
-        assert "Found 5 Jira issues" in result
+        assert len(result) == 5
 
     def test_empty_results(self):
         wrapper, client = self._make_wrapper_with_client(api_version="2", total_issues=0)
 
         result = wrapper.search_using_jql(jql="project = EMPTY", limit=1500)
 
-        assert result == "No Jira issues found"
+        assert result == []
 
     def test_v3_endpoint_paginates_via_token(self):
         wrapper, client = self._make_wrapper_with_client(api_version="3", total_issues=250)
 
         result = wrapper.search_using_jql(jql="project = X", limit=250)
 
-        assert "Found 250 Jira issues" in result
+        assert len(result) == 250
         # First call has no token; subsequent calls use nextPageToken
         assert "nextPageToken" not in client.calls[0]
         assert all("nextPageToken" in c for c in client.calls[1:])

@@ -35,8 +35,7 @@ class AWSToolConfig(BaseToolApiWrapper):
         loaded = self.json_query_load(query)
         if 'service' in loaded:
             api_instance = self._client(service=loaded["service"])
-            response = getattr(api_instance, loaded["method_name"])(**loaded["method_arguments"])
-            return str(response)
+            return getattr(api_instance, loaded["method_name"])(**loaded["method_arguments"])
 
     def json_query_load(self, query: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(query, str):

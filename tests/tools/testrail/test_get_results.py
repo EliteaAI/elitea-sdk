@@ -12,6 +12,8 @@ and the numeric-id guards on each tool.
 Test pattern mirrors `tests/tools/testrail/test_get_runs.py`: bypass the heavy
 validator chain via `object.__new__` and inject a mocked TestRail client.
 """
+import json
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -113,7 +115,11 @@ class TestResponseShapeAndFormats:
 
     def test_json_default(self, wrapper):
         wrapper._client.results.get_results_for_run_bulk.return_value = [_result(1)]
-        assert wrapper.get_results_for_run("10").startswith("Extracted data:")
+
+        # created_on is rendered as ISO by the wrapper; every other field round-trips
+        assert json.loads(wrapper.get_results_for_run("10")) == [
+            _result(1, created_on="2023-11-14T22:13:20+00:00")
+        ]
 
     def test_csv(self, wrapper):
         wrapper._client.results.get_results_for_run_bulk.return_value = [_result(1)]
@@ -136,7 +142,7 @@ class TestEmptyAndErrorsAndProjection:
         wrapper._client.results.get_results_for_run_bulk.return_value = []
         out = wrapper.get_results_for_run("10")
         assert not isinstance(out, ToolException)
-        assert out == "Extracted data:\n[]"
+        assert json.loads(out) == []
 
     def test_status_code_error_is_formatted(self, wrapper):
         wrapper._client.results.get_results_for_run_bulk.side_effect = _status_code_error(

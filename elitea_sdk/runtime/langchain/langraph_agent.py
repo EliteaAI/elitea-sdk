@@ -53,7 +53,50 @@ from ..utils.utils import clean_string
 from ..tools.router import RouterNode
 from ..exceptions import PipelineConfigurationError
 
+from ...tools.utils.serialization import serialize_tool_result
+
 logger = logging.getLogger(__name__)
+
+
+_CONTENT_BLOCK_TYPES = {
+    'text', 'thinking', 'reasoning', 'tool_use', 'tool_result',
+    'image', 'image_url', 'document', 'search_result',
+    # Provider block types that carry no text of their own but are still content:
+    # treating one as a record would serialize the whole message instead of
+    # returning the answer sitting in the text block beside it.
+    'redacted_thinking', 'server_tool_use', 'web_search_tool_result',
+    'mcp_tool_use', 'mcp_tool_result', 'code_execution_tool_result',
+    'container_upload',
+}
+
+
+# The key each block type must carry. A record can borrow the type VALUE -- a
+# SharePoint reader emits {'type': 'text', 'content': ...} -- so the value alone
+# does not identify a block. This mirrors elitea_core's _is_content_chunk.
+_TEXT_ONLY_BLOCK_KEYS = {'text', 'type', 'index'}
+_CONTENT_BLOCK_KEYS = {
+    'text': ('text',),
+    'thinking': ('thinking', 'text'),
+    'reasoning': ('reasoning', 'text'),
+    'image': ('image_url', 'source', 'data', 'url'),
+    'image_url': ('image_url', 'url'),
+    'document': ('source', 'data'),
+}
+
+
+def _is_content_block(block) -> bool:
+    """A message content block, as opposed to a record that merely lives in a list."""
+    if isinstance(block, str):
+        return True
+    if not isinstance(block, dict):
+        return False
+    block_type = block.get('type')
+    if block_type in _CONTENT_BLOCK_TYPES:
+        required = _CONTENT_BLOCK_KEYS.get(block_type)
+        return required is None or any(key in block for key in required)
+    # A bare {'text': ...} chunk is content; the same dict carrying a score is a
+    # search hit, and joining it would discard every field but one.
+    return block_type is None and 'text' in block and set(block) <= _TEXT_ONLY_BLOCK_KEYS
 
 
 def normalize_message_content(content: Any) -> str:
@@ -73,6 +116,11 @@ def normalize_message_content(content: Any) -> str:
         # Filter out thinking blocks, keep only text responses
         text_parts = []
         for block in content:
+            # A block this does not recognise contributes no text, but must not
+            # condemn the list: a provider block type added tomorrow would
+            # otherwise dump the whole message in place of the answer beside it.
+            if not _is_content_block(block):
+                continue
             if isinstance(block, dict):
                 if block.get('type') == 'text':
                     text_parts.append(block.get('text', ''))
@@ -81,9 +129,15 @@ def normalize_message_content(content: Any) -> str:
                     text_parts.append(block.get('text', ''))
             elif isinstance(block, str):
                 text_parts.append(block)
-        return ''.join(text_parts)
-    # Fallback for other types
-    return str(content)
+        if any(text_parts) or (content and all(_is_content_block(block) for block in content)):
+            # Either real text, or a recognised list that genuinely carries none
+            # (thinking only). Anything else is records, and joining them would
+            # discard every field but one -- or yield '' and drop the answer.
+            return ''.join(text_parts)
+        return serialize_tool_result(content)
+    # This value becomes a pipeline's `output`, i.e. the answer the user reads, so
+    # a terminal node writing a dict output variable must not surface as a repr.
+    return serialize_tool_result(content)
 
 
 # Internal graph-I/O, HITL, and summarization-metadata state keys that must never

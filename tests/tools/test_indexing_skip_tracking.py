@@ -120,7 +120,7 @@ class TestArtifactFilteredFileTracking:
         skipped = []
 
         result = artifact_toolkit.list_files(
-            "docs", include=["*.md"], return_as_string=False, on_file_skipped=skipped.append
+            "docs", include=["*.md"], on_file_skipped=skipped.append
         )
 
         assert [row["name"] for row in result["rows"]] == ["notes.md", "guide.md"]
@@ -130,13 +130,13 @@ class TestArtifactFilteredFileTracking:
         skipped = []
 
         artifact_toolkit.list_files(
-            "docs", skip=["*.zip"], return_as_string=False, on_file_skipped=skipped.append
+            "docs", skip=["*.zip"], on_file_skipped=skipped.append
         )
 
         assert skipped == ["archive.zip"]
 
     def test_listing_without_a_callback_still_filters(self, artifact_toolkit):
-        result = artifact_toolkit.list_files("docs", include=["*.md"], return_as_string=False)
+        result = artifact_toolkit.list_files("docs", include=["*.md"])
 
         assert len(result["rows"]) == 2
 
