@@ -64,18 +64,28 @@ _DO_NOT_TRUST = (
     'Narrow the request, page through the data, or tell the user the output was too large.'
 )
 
+# Wire-level cap on MCP HTTP response BYTES (#6141) - a different job from the
+# character caps above: it protects process RAM, not the LLM context.
+MCP_RESPONSE_MAX_BYTES = 50 * 1024 * 1024
+
 _bounding_enabled: bool = True
 _bounding_limit: int = TOOL_RESULT_MAX_CHARS
 _bounding_per_toolkit: dict = {}
+_mcp_response_bytes: int = MCP_RESPONSE_MAX_BYTES
+_mcp_cap_enabled: bool = True
 
 
-def configure_tool_result_limits(enabled=True, limit=None, per_toolkit=None) -> None:
+def configure_tool_result_limits(
+    enabled=True, limit=None, per_toolkit=None,
+    mcp_response_bytes=None, mcp_cap_enabled=False,
+) -> None:
     """Push the platform's tool-result bounds into this process.
 
     Applied unconditionally (like the toolkit blocklist) so that REMOVING a
     per-toolkit override takes effect, not only adding one.
     """
     global _bounding_enabled, _bounding_limit, _bounding_per_toolkit  # pylint: disable=W0603
+    global _mcp_response_bytes, _mcp_cap_enabled  # pylint: disable=W0603
     overrides = {}
     # Built fully before any global is assigned: a malformed per_toolkit value must
     # not leave half the bounds updated and the old overrides still live.
@@ -89,6 +99,8 @@ def configure_tool_result_limits(enabled=True, limit=None, per_toolkit=None) -> 
     _bounding_enabled = bool(enabled)
     _bounding_limit = _positive_int(limit, TOOL_RESULT_MAX_CHARS)
     _bounding_per_toolkit = overrides
+    _mcp_response_bytes = _positive_int(mcp_response_bytes, MCP_RESPONSE_MAX_BYTES)
+    _mcp_cap_enabled = bool(mcp_cap_enabled)
 
 
 def _positive_int(value: Any, fallback: int) -> int:
@@ -101,6 +113,14 @@ def _positive_int(value: Any, fallback: int) -> int:
 
 def tool_result_bounding_enabled() -> bool:
     return _bounding_enabled
+
+
+def resolve_mcp_response_limit() -> Optional[int]:
+    # Two switches on purpose: the master flag kills the whole feature, the narrow one only
+    # the wire cap - so a truncation complaint can be reverted without disarming the OOM guard.
+    if not _bounding_enabled or not _mcp_cap_enabled:
+        return None
+    return _mcp_response_bytes
 
 
 def resolve_tool_result_limit(toolkit_type: Any = None) -> int:

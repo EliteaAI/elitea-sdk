@@ -23,9 +23,26 @@ import asyncio
 import logging
 import uuid
 from datetime import timedelta
+
+from .mcp_response_limit import (
+    McpResponseTooLargeError,
+    SizeTrip,
+    build_httpx_client_factory,
+)
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_response_limit():
+    """Byte cap for MCP responses, or None when disabled. A lookup that cannot be
+    read must not crash the connection - it degrades to today's unbounded behaviour."""
+    try:
+        from .trace_limits import resolve_mcp_response_limit  # pylint: disable=C0415
+        return resolve_mcp_response_limit()
+    except Exception:  # pylint: disable=W0718
+        logger.exception("[Unified MCP] Could not resolve response byte cap - not bounding")
+        return None
 
 
 class UnifiedMcpClient:
@@ -88,6 +105,9 @@ class UnifiedMcpClient:
         self._session = None
         self._session_context = None
         self._server_name = f"mcp_server_{self.session_id[:8]}"
+        # Records a wire-level size abort so the resulting failure can be reported as
+        # "response too large" instead of the generic read timeout mcp produces (#6141).
+        self._size_trip = SizeTrip()
         self._initialized = False
         self._detected_transport = None
 
@@ -171,12 +191,14 @@ class UnifiedMcpClient:
             except BaseException:
                 pass
             self._session_context = None
+            self._raise_if_size_tripped()
             raise TimeoutError(
                 f"Timed out after {self.timeout}s connecting to MCP server "
                 f"'{self._server_name}' at {self.url}. The server may be unreachable "
                 "or behind a login proxy that never completes the MCP handshake."
             ) from e
         except BaseException as e:
+            self._raise_if_size_tripped()
             # langchain-mcp-adapters uses asyncio.TaskGroup internally, which wraps
             # exceptions in ExceptionGroup. Unwrap it so callers see the real error.
             if hasattr(e, 'exceptions') and e.exceptions:
@@ -259,10 +281,14 @@ class UnifiedMcpClient:
             else:
                 config['timeout'] = timedelta(seconds=self.timeout)
                 config['sse_read_timeout'] = timedelta(seconds=self.timeout)
-            # Use httpx_client_factory to disable SSL verification
-            # This is the proper way to configure SSL in langchain-mcp-adapters
+            # Supplied unconditionally (#6141): the factory carries both the SSL bypass
+            # and the response byte cap. resolve_mcp_response_limit() returns None when
+            # truncation is disabled, which yields a plain unbounded client.
+            byte_limit = _resolve_response_limit()
+            config['httpx_client_factory'] = build_httpx_client_factory(
+                self.ssl_verify, byte_limit, self._size_trip,
+            )
             if not self.ssl_verify:
-                config['httpx_client_factory'] = self._create_insecure_httpx_client
                 logger.warning("[Unified MCP] Using custom httpx client with SSL verification disabled")
         elif transport == 'stdio':
             # Not typically used via this adapter, but support it
@@ -270,20 +296,14 @@ class UnifiedMcpClient:
 
         return config
 
-    def _create_insecure_httpx_client(self, headers=None, timeout=None, auth=None):
-        """
-        Create an httpx.AsyncClient with SSL verification disabled.
+    def _raise_if_size_tripped(self) -> None:
+        """Turn a wire-level size abort into a clear error for the model.
 
-        This factory is passed to langchain-mcp-adapters when ssl_verify=False.
+        The abort unwinds mcp's transport without answering the pending request, so
+        without this the caller only ever sees the session read timeout.
         """
-        import httpx
-
-        return httpx.AsyncClient(
-            headers=headers,
-            timeout=timeout,
-            auth=auth,
-            verify=False  # Disable SSL certificate verification
-        )
+        if self._size_trip.tripped:
+            raise McpResponseTooLargeError(self._size_trip.message(self.tool_name))
 
     async def _preflight_auth_check(self):
         """
@@ -623,11 +643,15 @@ class UnifiedMcpClient:
 
         # Load tools using langchain-mcp-adapters
         connection = self._client.connections.get(self._server_name)
-        tools = await load_mcp_tools(
-            self._session,
-            connection=connection,
-            server_name=self._server_name
-        )
+        try:
+            tools = await load_mcp_tools(
+                self._session,
+                connection=connection,
+                server_name=self._server_name
+            )
+        except BaseException:
+            self._raise_if_size_tripped()
+            raise
 
         # Convert LangChain tools to our format
         tool_list = []
@@ -678,7 +702,13 @@ class UnifiedMcpClient:
         clean_args = {k: v for k, v in (arguments or {}).items() if v is not None}
 
         logger.debug(f"[Unified MCP] Calling tool {tool_name} with args: {clean_args}")
-        result = await self._session.call_tool(tool_name, clean_args)
+        try:
+            result = await self._session.call_tool(tool_name, clean_args)
+        except BaseException:
+            # A size abort surfaces here as a timeout or a task-group failure; the trip
+            # record is what tells us the real cause.
+            self._raise_if_size_tripped()
+            raise
 
         if isinstance(result, dict):
             return result
@@ -726,6 +756,12 @@ class UnifiedMcpClient:
                 await self._session_context.__aexit__(None, None, None)
             except Exception as e:
                 logger.warning(f"[Unified MCP] Error closing session: {e}")
+            except BaseException as e:
+                # A size abort tears the transport task group down here; swallowing it keeps
+                # the McpResponseTooLargeError from call_tool as the reported failure (#6141).
+                if not self._size_trip.tripped:
+                    raise
+                logger.warning(f"[Unified MCP] Session closed after size abort: {e!r}")
 
         self._session = None
         self._session_context = None
