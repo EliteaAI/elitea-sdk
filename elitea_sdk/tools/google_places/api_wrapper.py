@@ -56,7 +56,7 @@ class GooglePlacesAPIWrapper(BaseToolApiWrapper):
 
         location = geocode_result[0].get('geometry', {}).get('location', {})
         nearby_places = self._client.places_nearby(location=location, keyword=target, radius=radius)
-        return str(nearby_places.get('results', []))
+        return nearby_places.get('results', [])
 
     def fetch_place_details(self, place_id: str) -> Optional[str]:
         """Fetch detailed information about a place using its place ID."""

@@ -60,7 +60,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
 
 
     @tool_group('read')
-    def get_testcases_by_zql(self, zql: str, return_as_list: bool = False):
+    def get_testcases_by_zql(self, zql: str) -> List[dict]:
 
         """
         Retrieve testcases by zql.
@@ -69,17 +69,9 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
         """
         try:
             testcases = self._client.get_testcases_by_zql(zql)
-            parsed_test_cases = []
             if testcases['resultSize'] == 0:
-                if return_as_list:
-                    return []
-                return "No test cases found for the provided ZQL query."
-            logger.info(f"Retrieved test cases: {testcases}")
-            if return_as_list:
-                return [test_case['testcase'] for test_case in testcases['results']]
-            for test_case in testcases['results']:
-                parsed_test_cases.append(f"Test case ID: {test_case.get('id')}, Test case: {test_case['testcase']}")
-            return "\n".join(parsed_test_cases)
+                return []
+            return [test_case['testcase'] for test_case in testcases['results']]
         except Exception as e:
             raise ToolException(f"Unable to retrieve Zephyr entities: {e}")
 
@@ -169,7 +161,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
 
     def _base_loader(self, zql: str, **kwargs) -> Generator[Document, None, None]:
         self._chunking_tool = kwargs.get('chunking_tool', None)
-        test_cases = self.get_testcases_by_zql(zql=zql, return_as_list=True)
+        test_cases = self.get_testcases_by_zql(zql=zql)
         for test_case in test_cases:
             metadata = {
                 "updated_on": str(test_case.get("lastModifiedOn")),

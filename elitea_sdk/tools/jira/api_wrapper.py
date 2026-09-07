@@ -22,6 +22,7 @@ from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import is_cookie_token, parse_cookie_string, get_file_bytes_from_artifact, detect_mime_type
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker, process_content_by_type
+from ..utils.serialization import serialize_tool_result
 from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
@@ -711,7 +712,7 @@ def process_search_response(jira_url, response, payload_params: Dict[str, Any] =
     for issue in json_response.get('issues', []):
         processed_issues.append(process_issue(jira_url, issue, payload_params))
 
-    return str(processed_issues)
+    return serialize_tool_result(processed_issues)
 
 
 
@@ -959,11 +960,14 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
 
     @tool_group('read')
-    def search_using_jql(self, jql: str, limit: Optional[int] = None):
+    def search_using_jql(self, jql: str, limit: Optional[int] = None) -> List[dict]:
         """ Search for Jira issues using JQL.
 
         Paginates internally so `limit` can exceed Jira's 100-per-request server cap.
         If `limit` is not provided, falls back to the toolkit-level `self.limit`.
+
+        Returns:
+            A list of matching issues. Empty list when nothing matches.
         """
         client = self._get_client()
         effective_limit = limit if limit is not None else self.limit
@@ -974,10 +978,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             if effective_limit and len(aggregated) >= effective_limit:
                 break
 
-        parsed = self._parse_issues({"issues": aggregated}, limit=effective_limit)
-        if len(parsed) == 0:
-            return "No Jira issues found"
-        return "Found " + str(len(parsed)) + " Jira issues:\n" + str(parsed)
+        return self._parse_issues({"issues": aggregated}, limit=effective_limit)
 
     @tool_group('write')
     def link_issues(self, inward_issue_key: str, outward_issue_key: str, linktype:str ):
@@ -996,8 +997,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             }
         }
         client.create_issue_link(link_data)
-        """ Get the remote links from the specified jira issue key"""
-        return f"Link created using following data: {link_data}."
+        return {'message': 'Link created.', 'link': link_data}
 
     @tool_group('read')
     def get_specific_field_info(self, jira_issue_key: str, field_name: str):
@@ -1009,14 +1009,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             existing_fields = [key for key, value in client.issue(jira_issue_key).get("fields").items() if value is not None]
             existing_fields_str = ', '.join(existing_fields)
             raise ToolException(f"Unable to find field '{field_name}'. All available fields are '{existing_fields_str}'")
-        return f"Got the data from following Jira issue - {jira_issue_key} and field - {field_name}. The data is:\n{field_info}"
+        return field_info
 
     @tool_group('read')
-    def get_remote_links(self, jira_issue_key: str):
+    def get_remote_links(self, jira_issue_key: str) -> List[dict]:
         """ Get the remote links from the specified jira issue key"""
         client = self._get_client()
-        remote_links = client.get_issue_remotelinks(jira_issue_key)
-        return f"Jira issue - {jira_issue_key} has the following remote links:\n{str(remote_links)}"
+        return client.get_issue_remotelinks(jira_issue_key)
 
     def _add_default_labels(self, issue_key: str):
         """ Add default labels to the issue if they are not already present."""
@@ -1037,7 +1036,10 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             issue_url = f"{client.url}browse/{issue['key']}"
             logger.info(f"issue is created: {issue}")
             self._add_default_labels(issue_key=issue['key'])
-            return f"Done. Issue {issue['key']} is created successfully. You can view it at {issue_url}. Details: {str(issue)}"
+            return {
+                'message': f"Issue {issue['key']} is created successfully. You can view it at {issue_url}.",
+                'issue': issue,
+            }
         except ToolException as e:
             raise ToolException(e)
         except Exception:
@@ -1420,17 +1422,12 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Failed to update comment with file: {str(e)}")
 
     @tool_group('read')
-    def list_projects(self):
+    def list_projects(self) -> List[dict]:
         """ List all projects in Jira. """
         client = self._get_client()
         try:
             projects = client.projects()
-            parsed_projects = self._parse_projects(projects)
-            parsed_projects_str = (
-                    "Found " + str(len(parsed_projects)) + " projects:\n" + str(parsed_projects)
-            )
-            logger.info(f"parsed_projects_str: {parsed_projects_str}")
-            return parsed_projects_str
+            return self._parse_projects(projects)
         except Exception:
             stacktrace = format_exc()
             logger.error(f"Error listing Jira projects: {stacktrace}")

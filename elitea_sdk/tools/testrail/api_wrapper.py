@@ -17,6 +17,7 @@ from testrail_api import StatusCodeError, TestRailAPI
 from ..chunkers.code.constants import get_file_extension, image_extensions
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
+from ..utils.serialization import serialize_tool_result
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
 
@@ -701,13 +702,13 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
         return f"New test case has been created: id - {created_case['id']} at '{created_case['created_on']}'"
 
     @tool_group('read')
-    def get_case(self, testcase_id: str):
+    def get_case(self, testcase_id: str) -> dict:
         """Extracts information about single test case from Testrail"""
         try:
             extracted_case = self._client.cases.get_case(testcase_id)
         except StatusCodeError as e:
             raise ToolException(f"Unable to extract testcase {e}")
-        return f"Extracted test case:\n{str(extracted_case)}"
+        return extracted_case
 
     @tool_group('read')
     def get_cases(
@@ -743,7 +744,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             result = self._to_markup(extracted_cases_data, output_format)
 
             if invalid_keys:
-                return f"{result}\n\nInvalid keys: {invalid_keys}"
+                return f"{result}\n\nInvalid keys: {', '.join(invalid_keys)}"
 
             return result
         except StatusCodeError as e:
@@ -813,7 +814,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             result = self._to_markup(extracted_cases_data, output_format)
 
             if invalid_keys:
-                return f"{result}\n\nInvalid keys: {invalid_keys}"
+                return f"{result}\n\nInvalid keys: {', '.join(invalid_keys)}"
 
             return result
         except StatusCodeError as e:
@@ -1540,7 +1541,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             )
 
         if output_format == "json":
-            return f"Extracted data:\n{data}"
+            return serialize_tool_result(data)
 
         df = pd.DataFrame(data)
 

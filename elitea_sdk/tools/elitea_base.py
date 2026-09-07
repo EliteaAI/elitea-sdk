@@ -18,6 +18,7 @@ from .index_params import (
     build_base_stepback_search_params,
 )
 from .utils.tool_groups import tool_group
+from .utils.serialization import serialize_tool_result
 from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.utils.utils import IndexerKeywords
 
@@ -136,7 +137,24 @@ SearchFileInput = GrepFileInput
 
 
 class BaseToolApiWrapper(BaseModel):
-    
+    """Base class for toolkit API wrappers.
+
+    Return-value contract for the methods registered in ``get_available_tools``:
+
+    * Tools that read data return native ``list``/``dict`` -- never prose with a
+      collection interpolated into it, and never ``str(collection)``. The runtime
+      serializes it for the model and the toolkit test panel pretty-prints it;
+      a display string built here can be recovered by neither.
+    * Empty results are ``[]``/``{}``. Reserve a sentence for guidance the caller
+      cannot infer from an empty payload.
+    * Tools that act return ``{'message': '<what happened>', '<entity>': {...}}``.
+    * A tool whose own contract is "produce markup" (a caller-selected output
+      format, for instance) returns a string, but a bare JSON one with no prose
+      prefix so it stays machine-readable.
+    * ``elitea_sdk.tools.utils.serialization.serialize_tool_result`` is the one
+      place that turns data into text when a string is unavoidable.
+    """
+
     # Optional RunnableConfig for CLI/standalone usage (allows dispatch_custom_event to work)
     _runnable_config: Optional[Dict[str, Any]] = None
     # toolkit id propagated from backend
@@ -407,10 +425,13 @@ class BaseVectorStoreToolApiWrapper(BaseToolApiWrapper):
         deleted_count = self._init_vector_store()._clean_collection(index_name=index_name)
 
         if index_name and deleted_count == 0:
-            raise ToolException(f"Index '{index_name}' not found. Available indexes: {self.list_indexes()}")
+            raise ToolException(
+                f"Index '{index_name}' not found. "
+                f"Available indexes: {serialize_tool_result(self.list_indexes())}"
+            )
 
         return (f"Collection '{index_name}' has been removed from the vector store.\n"
-                f"Available indexes: {self.list_indexes()}")
+                f"Available indexes: {serialize_tool_result(self.list_indexes())}")
 
     def list_indexes(self):
         """Lists all indexes in the vector store."""

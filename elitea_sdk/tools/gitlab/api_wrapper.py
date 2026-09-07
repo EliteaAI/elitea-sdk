@@ -423,9 +423,9 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         author_username: Optional[str] = None,
         labels: Optional[str] = None,
         fetch_all: bool = False,
-    ) -> str:
+    ) -> List[dict]:
         """
-        List issues in the repository (#6213).
+        List issues in the repository.
 
         Supports filtering by state, time window (created/updated), author
         and labels, plus pagination so large issue sets are no longer
@@ -442,6 +442,10 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             author_username: Filter by author username
             labels: Comma-separated labels to filter by
             fetch_all: Fetch all pages when True
+
+        Returns:
+            A list of issues, each with title, number, state, labels, author,
+            created_at and updated_at. Empty list when nothing matches.
         """
         params: Dict[str, Any] = {}
         if state and state != "all":
@@ -469,14 +473,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Unable to list issues due to error:\n{e}")
 
-        if len(issues) > 0:
-            parsed_issues = self.parse_issues(issues)
-            parsed_issues_str = (
-                    "Found " + str(len(parsed_issues)) + " issues:\n" + str(parsed_issues)
-            )
-            return parsed_issues_str
-        else:
-            return "No issues found matching the given filters"
+        return self.parse_issues(issues)
 
     @tool_group('read')
     def get_issue(self, issue_number: int) -> Dict[str, Any]:

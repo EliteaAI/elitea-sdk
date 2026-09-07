@@ -432,6 +432,7 @@ class TestIOApiWrapper(BaseToolApiWrapper):
                 "description": GET_EXPLORATORY_TEST,
                 "args_schema": create_model(
                     "GetExploratoryTestModel",
+                    product_id=(int, Field(description="The ID of the product")),
                     exploratory_test_id=(int, Field(description="The ID of the exploratory test")),
                     client_fields=(Optional[List[str]], Field(description="Fields to include in the response", default=None))
                 ),

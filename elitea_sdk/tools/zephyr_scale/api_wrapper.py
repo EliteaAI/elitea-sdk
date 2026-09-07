@@ -329,9 +329,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             kwargs["startAt"] = startAt
             
         test_cases = self._api.test_cases.get_test_cases(**kwargs)
-        # Convert each test case to a string and join them with new line
-        test_cases_str = str(self._parse_tests(test_cases))
-        return f"Extracted tests: {test_cases_str}"
+        return self._parse_tests(test_cases)
 
     @tool_group('read')
     def get_test(self, test_case_key: str):
@@ -345,10 +343,10 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             test_case = self._api.test_cases.get_test_case(test_case_key)
         except Exception as e:
             raise ToolException(f"Unable to extract test case with key: {test_case_key}:\n{str(e)}")
-        return f"Extracted tests: {str(test_case)}"
+        return test_case
 
     @tool_group('read')
-    def get_test_steps(self, test_case_key: str, **kwargs):
+    def get_test_steps(self, test_case_key: str, **kwargs) -> List[dict]:
         """Returns the test steps for the given test case. Provides a paged response.
         
         Args:
@@ -357,17 +355,12 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         """
 
         try:
-            test_case_steps = self._api.test_cases.get_test_steps(test_case_key, **kwargs)
-            steps_list = [str(step) for step in test_case_steps]
-            if kwargs['return_list']:
-                return steps_list
-            all_steps_concatenated = '\n'.join(steps_list)
+            return list(self._api.test_cases.get_test_steps(test_case_key, **kwargs))
         except Exception as e:
             raise ToolException(f"Unable to extract test case steps from test case with key: {test_case_key}:\n{str(e)}")
-        return f"Extracted test steps: {all_steps_concatenated}"
 
     @tool_group('write')
-    def create_test_case(self, project_key: str, test_case_name: str, additional_fields: Union[str, dict], steps: Union[str, list] = None) -> str | ToolException:
+    def create_test_case(self, project_key: str, test_case_name: str, additional_fields: Union[str, dict], steps: Union[str, list] = None) -> dict:
         """Creates a test case. Fields priorityName and statusName will be set to default values if not informed.
         Args:
             project_key: Jira project key
@@ -385,22 +378,26 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 name=test_case_name,
                 **additional_fields
             )
-            result = f"Test case with name `{test_case_name}` was created: {str(create_test_case_response)}"
+            result = {
+                'message': f"Test case with name `{test_case_name}` was created.",
+                'test_case': create_test_case_response,
+            }
             if steps:
-                add_steps_response = self.add_test_steps(create_test_case_response['test_case_key'], 'APPEND', steps)
-                result += f"\n{str(add_steps_response)}"
+                result['steps'] = self.add_test_steps(
+                    create_test_case_response['test_case_key'], 'APPEND', steps,
+                )
             return result
         except Exception as e:
             raise ToolException(f"Unable to create test case with name: {test_case_name}:\n{str(e)}")
 
     @tool_group('write')
-    def create_test_cases(self, create_test_cases_data: str) -> list[str | ToolException]:
+    def create_test_cases(self, create_test_cases_data: str) -> list[dict]:
         """Creates a bunch of test cases"""
         test_cases = json.loads(create_test_cases_data)
         return [self.create_test_case(test_case['project_key'], test_case['test_case_name'], test_case['additional_fields'], test_case['steps']) for test_case in test_cases]
 
     @tool_group('write')
-    def add_test_steps(self, test_case_key: str, tc_mode: str, items: Union[str, list]) -> str | ToolException:
+    def add_test_steps(self, test_case_key: str, tc_mode: str, items: Union[str, list]) -> dict:
         """Assigns a series of test steps to a test case.
         
         Args:
@@ -417,7 +414,10 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 tc_mode,
                 items
             )
-            return f"Steps for test case `{test_case_key}` were added/updated: {str(add_steps_response)}"
+            return {
+                'message': f"Steps for test case `{test_case_key}` were added/updated.",
+                'steps': add_steps_response,
+            }
         except Exception as e:
             raise ToolException(f"Unable to add/update steps for test case with key: {test_case_key}:\n{str(e)}")
 
@@ -427,18 +427,15 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             startAt: Optional[int] = 0,
             projectKey: Optional[str] = None,
             folderType: Optional[str] = None,
-            return_as_list: bool = False
-    ):
+    ) -> List[dict]:
         """Retrieves all folders. Query parameters can be used to filter the results: maxResults, startAt, projectKey, folderType"""
 
-        folders_str = []
-        for folder in self._api.folders.get_folders(maxResults=maxResults, startAt=startAt,
-                                                    projectKey=projectKey, folderType=folderType):
-            folders_str.append(folder)
-        return folders_str if return_as_list else f"Extracted folders: {folders_str}"
+        return list(self._api.folders.get_folders(
+            maxResults=maxResults, startAt=startAt, projectKey=projectKey, folderType=folderType,
+        ))
 
     @tool_group('write')
-    def update_test_case(self, test_case_key: str, test_case_id: int, name: str, project_id: int, priority_id: int, status_id: int, **kwargs) -> str:
+    def update_test_case(self, test_case_key: str, test_case_id: int, name: str, project_id: int, priority_id: int, status_id: int, **kwargs) -> dict:
         """Updates an existing test case.
         
         Args:
@@ -473,12 +470,12 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 status_id,
                 **kwargs
             )
-            return f"Test case `{test_case_key}` was updated: {str(update_response)}"
+            return {'message': f"Test case `{test_case_key}` was updated.", 'test_case': update_response}
         except Exception as e:
             raise ToolException(f"Unable to update test case with key: {test_case_key}:\n{str(e)}")
             
     @tool_group('read')
-    def get_links(self, test_case_key: str, **kwargs) -> str:
+    def get_links(self, test_case_key: str) -> list:
         """Returns links for a test case with specified key
         
         Args:
@@ -486,15 +483,12 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         """
         
         try:
-            links = self._api.test_cases.get_links(test_case_key)
-            if kwargs['return_only_links']:
-                return links
-            return f"Links for test case `{test_case_key}`: {str(links)}"
+            return self._api.test_cases.get_links(test_case_key)
         except Exception as e:
             raise ToolException(f"Unable to get links for test case with key: {test_case_key}:\n{str(e)}")
             
     @tool_group('write')
-    def create_issue_links(self, test_case_key: str, issue_id: int) -> str:
+    def create_issue_links(self, test_case_key: str, issue_id: int) -> dict:
         """Creates a link between a test case and a Jira issue
         
         Args:
@@ -505,12 +499,15 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         
         try:
             link_response = self._api.test_cases.create_issue_links(test_case_key, issue_id)
-            return f"Issue link created for test case `{test_case_key}` with issue ID `{issue_id}`: {str(link_response)}"
+            return {
+                'message': f"Issue link created for test case `{test_case_key}` with issue ID `{issue_id}`.",
+                'link': link_response,
+            }
         except Exception as e:
             raise ToolException(f"Unable to create issue link for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('write')
-    def create_web_links(self, test_case_key: str, url: str, description: str, additional_fields: str = "{}") -> str:
+    def create_web_links(self, test_case_key: str, url: str, description: str, additional_fields: str = "{}") -> dict:
         """Creates a link between a test case and a generic URL
 
         Args:
@@ -524,7 +521,10 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             additional_params = json.loads(additional_fields) if additional_fields else {}
             additional_params['description'] = description
             web_link_response = self._api.test_cases.create_web_links(test_case_key, url, **additional_params)
-            return f"Web link created for test case `{test_case_key}` with URL `{url}` and link text `{description}`: {str(web_link_response)}"
+            return {
+                'message': f"Web link created for test case `{test_case_key}` with URL `{url}`.",
+                'link': web_link_response,
+            }
         except Exception as e:
             raise ToolException(f"Unable to create web link for test case with key: {test_case_key}:\n{str(e)}")
 
@@ -536,7 +536,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
 
         while count < max_iterations:
             count+=1
-            last_versions = self.get_versions(test_case_key=test_case_key, maxResults=step, startAt=start_at, return_as_list=True)
+            last_versions = self.get_versions(test_case_key=test_case_key, maxResults=step, startAt=start_at)
             last_versions_count = len(last_versions)
 
             if last_versions_count == 0:
@@ -548,12 +548,12 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         if last_version:
             match = re.search(r'/versions/(\d+)', last_version["self"])
             version_number = match.group(1)
-            return self.get_version(test_case_key=test_case_key, version=version_number, return_as_object=True)
+            return self.get_version(test_case_key=test_case_key, version=version_number)
         return None
 
 
     @tool_group('read')
-    def get_versions(self, test_case_key: str, maxResults: Optional[int] = 10, startAt: Optional[int] = 0, return_as_list: bool = False) -> str|list:
+    def get_versions(self, test_case_key: str, maxResults: Optional[int] = 10, startAt: Optional[int] = 0) -> list:
         """Returns all test case versions for a test case with specified key. Response is ordered by most recent first.
         
         Args:
@@ -563,44 +563,38 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         """
         
         try:
-            versions = self._api.test_cases.get_versions(test_case_key, maxResults=maxResults, startAt=startAt)
-            if return_as_list:
-                return [version for version in versions]
-            versions_list = [str(version) for version in versions]
-            all_versions = '\n'.join(versions_list)
-            return f"Versions for test case `{test_case_key}`: {all_versions}"
+            return list(self._api.test_cases.get_versions(test_case_key, maxResults=maxResults, startAt=startAt))
         except Exception as e:
             raise ToolException(f"Unable to get versions for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('read')
-    def get_version(self, test_case_key: str, version: str, return_as_object: bool = False) -> str|dict:
+    def get_version(self, test_case_key: str, version: str) -> dict:
         """Retrieves a specific version of a test case"""
         
         try:
-            version_data = self._api.test_cases.get_version(test_case_key, version)
-            return version_data if return_as_object else f"Version {version} of test case `{test_case_key}`: {str(version_data)}"
+            return self._api.test_cases.get_version(test_case_key, version)
         except Exception as e:
             raise ToolException(f"Unable to get version {version} for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('read')
-    def get_test_script(self, test_case_key: str, return_only_script:bool = False) -> str:
+    def get_test_script(self, test_case_key: str) -> dict:
         """Returns the test script for the given test case"""
         
         try:
-            test_script = self._api.test_cases.get_test_script(test_case_key)
-            if return_only_script:
-                return test_script
-            return f"Test script for test case `{test_case_key}`: {str(test_script)}"
+            return self._api.test_cases.get_test_script(test_case_key)
         except Exception as e:
             raise ToolException(f"Unable to get test script for test case with key: {test_case_key}:\n{str(e)}")
     
     @tool_group('write')
-    def create_test_script(self, test_case_key: str, script_type: str, text: str) -> str:
+    def create_test_script(self, test_case_key: str, script_type: str, text: str) -> dict:
         """Creates or updates the test script for a test case"""
         
         try:
             script_response = self._api.test_cases.create_test_script(test_case_key, script_type, text)
-            return f"Test script created/updated for test case `{test_case_key}`: {str(script_response)}"
+            return {
+                'message': f"Test script created/updated for test case `{test_case_key}`.",
+                'script': script_response,
+            }
         except Exception as e:
             raise ToolException(f"Unable to create/update test script for test case with key: {test_case_key}:\n{str(e)}")
             
@@ -1151,9 +1145,9 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Error searching test cases: {str(e)}")
 
-    def _finalize_test_case_results(self, filtered_cases: List[dict], fields: List[str], search_criteria: dict) -> str:
+    def _finalize_test_case_results(self, filtered_cases: List[dict], fields: List[str], search_criteria: dict) -> dict:
         result_cases, message = self._format_test_case_results(filtered_cases, fields, search_criteria)
-        return f"{message}: {json.dumps(result_cases, indent=2)}"
+        return {'message': message, 'total': len(result_cases), 'items': result_cases}
 
     def _search_test_cases_by_jql(self, project_key: str, jql: str):
         try:
@@ -1254,7 +1248,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
         start_at = 0
         while count < max_iterations:
             count+=1
-            new_folders = self.get_folders(projectKey=project_key, folderType=folder_type, maxResults=step, startAt=start_at, return_as_list=True)
+            new_folders = self.get_folders(projectKey=project_key, folderType=folder_type, maxResults=step, startAt=start_at)
 
             if new_folders and len(new_folders) > 0:
                 all_folders.extend(new_folders)
@@ -1317,13 +1311,13 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
 
     def _process_test_case(self, key):
         try:
-            steps = self.get_test_steps(key, return_list=True)
+            steps = self.get_test_steps(key)
             if steps:
                 return {"steps": steps}
         except ToolException:
             pass
         try:
-            script = self.get_test_script(key, return_only_script=True)
+            script = self.get_test_script(key)
             if script:
                 return {"script": script}
         except ToolException:
@@ -1381,55 +1375,27 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                     )
                     all_test_cases.extend(subfolder_test_cases)
             
-            # Convert the test cases to a string
-            parsed_tests = self._parse_tests(all_test_cases)
-            return f"Extracted {len(all_test_cases)} tests recursively: {str(parsed_tests)}"
+            return {'total': len(all_test_cases), 'items': self._parse_tests(all_test_cases)}
             
         except Exception as e:
             raise ToolException(f"Error retrieving test cases recursively: {str(e)}")
 
     @staticmethod
-    def _parse_tests(tests) -> list:
+    def _parse_tests(tests) -> List[dict]:
         """Parses test cases information"""
-        parsed_tests = []
-        for test in tests:
-            test_item = []
-            # Adding extracted information to the list
-            test_item.append(f"Test ID: {test.get('id')}")
-            test_item.append(f"Key: {test.get('key')}")
-            test_item.append(f"Name: {test.get('name')}")
-
-            # For project ID
-            project = test.get('project')
-            if project is not None:
-                test_item.append(f"Project ID: {project.get('id')}")
-            else:
-                test_item.append("Project ID: None")
-
-            test_item.append(f"Precondition: {test.get('precondition')}")
-
-            # For priority ID
-            priority = test.get('priority')
-            if priority is not None:
-                test_item.append(f"Priority ID: {priority.get('id')}")
-            else:
-                test_item.append("Priority ID: None")
-
-            # For status ID
-            status = test.get('status')
-            if status is not None:
-                test_item.append(f"Status ID: {status.get('id')}")
-            else:
-                test_item.append("Status ID: None")
-
-            # For owner account ID
-            owner = test.get('owner')
-            if owner is not None:
-                test_item.append(f"Owner Account ID: {owner.get('accountId')}")
-            else:
-                test_item.append("Owner Account ID: None")
-            parsed_tests.append(test_item)
-        return parsed_tests
+        return [
+            {
+                'id': test.get('id'),
+                'key': test.get('key'),
+                'name': test.get('name'),
+                'project_id': (test.get('project') or {}).get('id'),
+                'precondition': test.get('precondition'),
+                'priority_id': (test.get('priority') or {}).get('id'),
+                'status_id': (test.get('status') or {}).get('id'),
+                'owner_account_id': (test.get('owner') or {}).get('accountId'),
+            }
+            for test in tests
+        ]
     
     @tool_group('read')
     def get_tests_by_folder_name(self, project_key: str, folder_name: str, exact_match: Optional[bool] = False, 
@@ -1468,9 +1434,11 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 project_key, matching_folder_ids, maxResults, startAt
             )
             
-            # Convert the test cases to a string
-            parsed_tests = self._parse_tests(all_test_cases)
-            return f"Extracted {len(all_test_cases)} tests from {len(matching_folder_ids)} folders matching '{folder_name}': {str(parsed_tests)}"
+            return {
+                'total': len(all_test_cases),
+                'folders_matched': len(matching_folder_ids),
+                'items': self._parse_tests(all_test_cases),
+            }
             
         except Exception as e:
             raise ToolException(f"Error getting tests by folder name: {str(e)}")
@@ -1518,9 +1486,7 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                 project_key, folder_ids, maxResults, startAt
             )
             
-            # Convert the test cases to a string
-            parsed_tests = self._parse_tests(all_test_cases)
-            return f"Extracted {len(all_test_cases)} tests from folder path '{folder_path}': {str(parsed_tests)}"
+            return {'total': len(all_test_cases), 'items': self._parse_tests(all_test_cases)}
             
         except Exception as e:
             raise ToolException(f"Error getting tests by folder path: {str(e)}")

@@ -8,6 +8,8 @@ for consistency with the runs/results read tools.
 Same fixture pattern as the other testrail tests: bypass the validator chain via
 `object.__new__` and inject a mocked TestRail client.
 """
+import json
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -45,8 +47,7 @@ class TestGetSuitesHappyPath:
 
         result = wrapper.get_suites(project_id="10")
 
-        assert result.startswith("Extracted data:")
-        assert "suite-6" in result
+        assert json.loads(result) == [_suite(6)]
 
     def test_csv_format(self, wrapper):
         wrapper._client.suites.get_suites.return_value = [_suite(6)]
