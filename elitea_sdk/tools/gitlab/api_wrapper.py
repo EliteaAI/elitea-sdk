@@ -13,7 +13,7 @@ from ..utils.content_parser import parse_file_content
 from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, guard_nontext_read, capped_read_multiple_files
-from .utils import get_position
+from .utils import expand_inclusive_upper_bound, get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
 from ..utils.tool_groups import tool_group, with_tool_groups
 
@@ -100,10 +100,10 @@ GetIssuesModel = create_model(
     state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
-    created_after=(Optional[str], Field(default=None, description="Return issues created after this ISO datetime")),
-    created_before=(Optional[str], Field(default=None, description="Return issues created before this ISO datetime")),
-    updated_after=(Optional[str], Field(default=None, description="Return issues updated after this ISO datetime")),
-    updated_before=(Optional[str], Field(default=None, description="Return issues updated before this ISO datetime")),
+    created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
+    created_before=(Optional[str], Field(default=None, description="Inclusive upper bound on created_at, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally")),
+    updated_after=(Optional[str], Field(default=None, description="Inclusive lower bound on updated_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
+    updated_before=(Optional[str], Field(default=None, description="Inclusive upper bound on updated_at, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally")),
     author_username=(Optional[str], Field(default=None, description="Filter by author username")),
     labels=(Optional[str], Field(default=None, description="Comma-separated list of labels to filter by")),
     fetch_all=(bool, Field(default=False, description="If True, fetch all pages instead of a single page")),
@@ -127,8 +127,8 @@ GetCommitsModel = create_model(
     "GetCommitsModel",
     sha=(Optional[str], Field(description="Commit SHA", default=None)),
     path=(Optional[str], Field(description="File path", default=None)),
-    since=(Optional[str], Field(description="Start date", default=None)),
-    until=(Optional[str], Field(description="End date", default=None)),
+    since=(Optional[str], Field(description="Inclusive lower bound on commit date. ISO 8601; a bare date (2026-09-03) starts at midnight", default=None)),
+    until=(Optional[str], Field(description="Inclusive upper bound on commit date, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally", default=None)),
     author=(Optional[str], Field(description="Author name", default=None)),
 )
 
@@ -140,10 +140,10 @@ ListMergeRequestsModel = create_model(
     state=(Optional[str], Field(default="all", description="Merge request state filter: opened | merged | closed | all")),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when all=True)")),
-    created_after=(Optional[str], Field(default=None, description="Return MRs created after this ISO datetime")),
-    created_before=(Optional[str], Field(default=None, description="Return MRs created before this ISO datetime")),
-    updated_after=(Optional[str], Field(default=None, description="Return MRs updated after this ISO datetime")),
-    updated_before=(Optional[str], Field(default=None, description="Return MRs updated before this ISO datetime")),
+    created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
+    created_before=(Optional[str], Field(default=None, description="Inclusive upper bound on created_at, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally")),
+    updated_after=(Optional[str], Field(default=None, description="Inclusive lower bound on updated_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
+    updated_before=(Optional[str], Field(default=None, description="Inclusive upper bound on updated_at, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally")),
     target_branch=(Optional[str], Field(default=None, description="Filter by target branch")),
     source_branch=(Optional[str], Field(default=None, description="Filter by source branch")),
     author_username=(Optional[str], Field(default=None, description="Filter by author username")),
@@ -435,10 +435,10 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             state: opened | closed | all
             page: Page number (ignored when fetch_all=True)
             per_page: Results per page (ignored when fetch_all=True)
-            created_after: ISO datetime lower bound on created_at
-            created_before: ISO datetime upper bound on created_at
-            updated_after: ISO datetime lower bound on updated_at
-            updated_before: ISO datetime upper bound on updated_at
+            created_after: Inclusive ISO 8601 lower bound on created_at
+            created_before: Inclusive ISO 8601 upper bound on created_at; a bare date covers the whole day
+            updated_after: Inclusive ISO 8601 lower bound on updated_at
+            updated_before: Inclusive ISO 8601 upper bound on updated_at; a bare date covers the whole day
             author_username: Filter by author username
             labels: Comma-separated labels to filter by
             fetch_all: Fetch all pages when True
@@ -449,11 +449,11 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         if created_after:
             params["created_after"] = created_after
         if created_before:
-            params["created_before"] = created_before
+            params["created_before"] = expand_inclusive_upper_bound(created_before)
         if updated_after:
             params["updated_after"] = updated_after
         if updated_before:
-            params["updated_before"] = updated_before
+            params["updated_before"] = expand_inclusive_upper_bound(updated_before)
         if author_username:
             params["author_username"] = author_username
         if labels:
@@ -840,7 +840,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         if since:
             params["since"] = since
         if until:
-            params["until"] = until
+            params["until"] = expand_inclusive_upper_bound(until)
         if author:
             params["author"] = author
         commits = self.repo_instance.commits.list(**params)
@@ -931,10 +931,10 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
             state: opened | merged | closed | all
             page: Page number (ignored when all=True)
             per_page: Results per page (ignored when all=True)
-            created_after: ISO datetime lower bound on created_at
-            created_before: ISO datetime upper bound on created_at
-            updated_after: ISO datetime lower bound on updated_at
-            updated_before: ISO datetime upper bound on updated_at
+            created_after: Inclusive ISO 8601 lower bound on created_at
+            created_before: Inclusive ISO 8601 upper bound on created_at; a bare date covers the whole day
+            updated_after: Inclusive ISO 8601 lower bound on updated_at
+            updated_before: Inclusive ISO 8601 upper bound on updated_at; a bare date covers the whole day
             target_branch: Filter by target branch
             source_branch: Filter by source branch
             author_username: Filter by author username
@@ -951,11 +951,11 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         if created_after:
             params["created_after"] = created_after
         if created_before:
-            params["created_before"] = created_before
+            params["created_before"] = expand_inclusive_upper_bound(created_before)
         if updated_after:
             params["updated_after"] = updated_after
         if updated_before:
-            params["updated_before"] = updated_before
+            params["updated_before"] = expand_inclusive_upper_bound(updated_before)
         if target_branch:
             params["target_branch"] = target_branch
         if source_branch:
