@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime
 from typing import Optional, Any, ClassVar, List, Dict
 import fnmatch
 
@@ -9,7 +8,7 @@ from pydantic import model_validator, PrivateAttr, create_model, SecretStr
 from pydantic.fields import Field
 
 from ..elitea_base import BaseToolApiWrapper, BaseCodeToolApiWrapper
-from ..gitlab.utils import get_diff_w_position, get_position
+from ..gitlab.utils import expand_inclusive_upper_bound, get_diff_w_position, get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read
@@ -42,10 +41,10 @@ GitLabGetIssues = create_model(
     state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
-    created_after=(Optional[str], Field(default=None, description="Return issues created after this ISO datetime")),
-    created_before=(Optional[str], Field(default=None, description="Return issues created before this ISO datetime")),
-    updated_after=(Optional[str], Field(default=None, description="Return issues updated after this ISO datetime")),
-    updated_before=(Optional[str], Field(default=None, description="Return issues updated before this ISO datetime")),
+    created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
+    created_before=(Optional[str], Field(default=None, description="Inclusive upper bound on created_at, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally")),
+    updated_after=(Optional[str], Field(default=None, description="Inclusive lower bound on updated_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
+    updated_before=(Optional[str], Field(default=None, description="Inclusive upper bound on updated_at, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally")),
     author_username=(Optional[str], Field(default=None, description="Filter by author username")),
     labels=(Optional[str], Field(default=None, description="Comma-separated list of labels to filter by")),
     fetch_all=(bool, Field(default=False, description="If True, fetch all pages instead of a single page")),
@@ -151,11 +150,11 @@ GetCommits = create_model(
                 default=None)),
     since=(Optional[str],
            Field(
-               description="Only commits after this date will be returned. Use ISO 8601 format (e.g., '2023-01-01T00:00:00Z').",
+               description="Inclusive lower bound on commit date. ISO 8601; a bare date (2026-09-03) starts at midnight",
                default=None)),
     until=(Optional[str],
            Field(
-               description="Only commits before this date will be returned. Use ISO 8601 format (e.g., '2023-12-31T23:59:59Z').",
+               description="Inclusive upper bound on commit date, at the precision given: a bare date (2026-09-03) covers the whole day, a microsecond-precision value is taken literally",
                default=None)),
     author=(Optional[str],
             Field(description="The author of the commits. Can be a username (string)", default=None)),
@@ -318,10 +317,10 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             state: opened | closed | all
             page: Page number (ignored when fetch_all=True)
             per_page: Results per page (ignored when fetch_all=True)
-            created_after: ISO datetime lower bound on created_at
-            created_before: ISO datetime upper bound on created_at
-            updated_after: ISO datetime lower bound on updated_at
-            updated_before: ISO datetime upper bound on updated_at
+            created_after: Inclusive ISO 8601 lower bound on created_at
+            created_before: Inclusive ISO 8601 upper bound on created_at; a bare date covers the whole day
+            updated_after: Inclusive ISO 8601 lower bound on updated_at
+            updated_before: Inclusive ISO 8601 upper bound on updated_at; a bare date covers the whole day
             author_username: Filter by author username
             labels: Comma-separated labels to filter by
             fetch_all: Fetch all pages when True
@@ -335,11 +334,11 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             if created_after:
                 params["created_after"] = created_after
             if created_before:
-                params["created_before"] = created_before
+                params["created_before"] = expand_inclusive_upper_bound(created_before)
             if updated_after:
                 params["updated_after"] = updated_after
             if updated_before:
-                params["updated_before"] = updated_before
+                params["updated_before"] = expand_inclusive_upper_bound(updated_before)
             if author_username:
                 params["author_username"] = author_username
             if labels:
@@ -673,8 +672,8 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
         Parameters:
             sha (Optional[str]): The commit SHA to start listing commits from.
             path (Optional[str]): The file path to filter commits by.
-            since (Optional[datetime]): Only commits after this date will be returned.
-            until (Optional[datetime]): Only commits before this date will be returned.
+            since (Optional[str]): Inclusive ISO 8601 lower bound on commit date.
+            until (Optional[str]): Inclusive ISO 8601 upper bound on commit date; a bare date covers the whole day.
             author (Optional[str]): The author of the commits.
 
         Returns:
@@ -685,8 +684,8 @@ class GitLabWorkspaceAPIWrapper(BaseToolApiWrapper):
             params = {
                 "ref_name": sha,
                 "path": path,
-                "since": datetime.fromisoformat(since) if since else None,
-                "until": datetime.fromisoformat(until) if until else None,
+                "since": since,
+                "until": expand_inclusive_upper_bound(until) if until else None,
                 "author": author if isinstance(author, str) else None,
                 "all" : True
             }

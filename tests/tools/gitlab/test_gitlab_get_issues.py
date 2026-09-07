@@ -111,9 +111,45 @@ class TestGetIssues:
         assert call["page"] == 3
         assert call["per_page"] == 100
         assert call["created_after"] == "2026-01-01T00:00:00Z"
-        assert call["created_before"] == "2026-02-01T00:00:00Z"
+        assert call["created_before"] == "2026-02-01T00:00:00.999999Z"
         assert call["author_username"] == "alice"
         assert call["labels"] == "bug,urgent"
+
+    def test_upper_bounds_expanded_lower_bounds_forwarded_verbatim(self):
+        """#6533: the timestamp GitLab renders for an issue must reach that issue."""
+        mgr = FakeIssuesManager(list_result=[])
+        wrapper = _make_wrapper(mgr)
+
+        wrapper.get_issues(
+            created_after="2026-09-03T09:24:40.498Z",
+            created_before="2026-09-03T09:24:40.498Z",
+            updated_after="2026-09-03T10:02:18.692Z",
+            updated_before="2026-09-03T10:02:18.692Z",
+        )
+
+        call = mgr.list_calls[0]
+        assert call["created_after"] == "2026-09-03T09:24:40.498Z"
+        assert call["created_before"] == "2026-09-03T09:24:40.498999Z"
+        assert call["updated_after"] == "2026-09-03T10:02:18.692Z"
+        assert call["updated_before"] == "2026-09-03T10:02:18.692999Z"
+
+    def test_date_only_upper_bound_covers_the_whole_day(self):
+        mgr = FakeIssuesManager(list_result=[])
+        wrapper = _make_wrapper(mgr)
+
+        wrapper.get_issues(created_after="2026-09-03", created_before="2026-09-03")
+
+        call = mgr.list_calls[0]
+        assert call["created_after"] == "2026-09-03"
+        assert call["created_before"] == "2026-09-03T23:59:59.999999"
+
+    def test_unparseable_upper_bound_forwarded_for_gitlab_to_reject(self):
+        mgr = FakeIssuesManager(list_result=[])
+        wrapper = _make_wrapper(mgr)
+
+        wrapper.get_issues(created_before="last week")
+
+        assert mgr.list_calls[0]["created_before"] == "last week"
 
     def test_state_all_omits_state_param(self):
         mgr = FakeIssuesManager(list_result=[])

@@ -1,5 +1,6 @@
 
 import re
+from typing import Any
 
 def get_diff_w_position(change):
     diff = change["diff"]
@@ -65,3 +66,54 @@ def get_position(line_number, file_path, mr):
     })
 
     return position
+
+
+_UPPER_BOUND = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})"
+    r"(?:(?P<separator>[Tt ])(?P<hour>\d{2})"
+    r"(?::(?P<minute>\d{2})(?::(?P<second>\d{2})(?:\.(?P<fraction>\d+))?)?)?"
+    r"(?P<offset>[Zz]|[+-]\d{2}(?::?\d{2})?)?)?$"
+)
+
+
+def expand_inclusive_upper_bound(value: Any) -> Any:
+    """Widen an upper date bound to the last instant of the precision it states.
+
+    GitLab renders `created_at`/`updated_at` truncated to milliseconds but filters
+    at microsecond precision, so a bound copied out of a response names an instant
+    below the record it came from and `*_before` drops that very record. Coarser
+    bounds are floored to the start of their unit, so `created_before=2026-09-03`
+    matches nothing from that day at all.
+
+    Unspecified lower-order fields are filled with their maximum rather than
+    computed, because the last instant of a unit never crosses into the next one.
+    That keeps this total -- no date arithmetic, no timezone handling, and no
+    `datetime.fromisoformat`, which on Python 3.10 rejects both the `Z` suffix and
+    any fraction that is not exactly 3 or 6 digits, i.e. the timestamps GitLab
+    itself emits.
+
+    Values that are not timestamp strings are returned untouched so GitLab keeps
+    reporting its own validation errors rather than this raising a new one.
+
+    A value that already states microsecond precision is returned untouched, and
+    that is the deliberate escape hatch: widening applies at whatever precision
+    was stated, so a caller chunking a range on a shared boundary would otherwise
+    see the boundary second counted in both windows. Stating microseconds opts out
+    and restores an exact partition.
+    """
+    if not isinstance(value, str):
+        return value
+
+    match = _UPPER_BOUND.match(value.strip())
+    if match is None:
+        return value
+
+    fraction = match["fraction"] or ""
+    if len(fraction) >= 6:
+        return value
+
+    return (
+        f'{match["date"]}{match["separator"] or "T"}'
+        f'{match["hour"] or "23"}:{match["minute"] or "59"}:{match["second"] or "59"}'
+        f'.{fraction.ljust(6, "9")}{match["offset"] or ""}'
+    )

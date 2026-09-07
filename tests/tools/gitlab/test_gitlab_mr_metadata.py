@@ -95,6 +95,8 @@ class TestListMergeRequests:
             page=3,
             per_page=50,
             created_after="2026-01-01T00:00:00Z",
+            created_before="2026-02-01T00:00:00Z",
+            updated_before="2026-02-01T00:00:00Z",
             target_branch="main",
             source_branch="feature/x",
             author_username="alice",
@@ -107,6 +109,8 @@ class TestListMergeRequests:
         assert call["page"] == 3
         assert call["per_page"] == 50
         assert call["created_after"] == "2026-01-01T00:00:00Z"
+        assert call["created_before"] == "2026-02-01T00:00:00.999999Z"
+        assert call["updated_before"] == "2026-02-01T00:00:00.999999Z"
         assert call["target_branch"] == "main"
         assert call["source_branch"] == "feature/x"
         assert call["author_username"] == "alice"
