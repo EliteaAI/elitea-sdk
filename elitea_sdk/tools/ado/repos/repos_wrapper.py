@@ -474,12 +474,27 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 except Exception:
                     return False
 
-            if base_branch:
-                if not branch_exists(base_branch):
-                    raise ToolException(f"The base branch '{base_branch}' does not exist.")
-            if active_branch:
-                if not branch_exists(active_branch):
-                    raise ToolException(f"The active branch '{active_branch}' does not exist.")
+            base_branch_exists = bool(base_branch) and branch_exists(base_branch)
+            active_branch_exists = bool(active_branch) and branch_exists(active_branch)
+
+            if not base_branch_exists and not active_branch_exists:
+                raise ToolException(
+                    f"Neither the base branch '{base_branch}' nor the active branch "
+                    f"'{active_branch}' exist in repository '{repository_id}'. "
+                    "Please check the branch names in the toolkit configuration."
+                )
+            if not base_branch_exists:
+                logger.warning(
+                    f"The base branch '{base_branch}' does not exist in repository "
+                    f"'{repository_id}'; falling back to active branch '{active_branch}'."
+                )
+                base_branch = active_branch
+            if not active_branch_exists:
+                logger.warning(
+                    f"The active branch '{active_branch}' does not exist in repository "
+                    f"'{repository_id}'; falling back to base branch '{base_branch}'."
+                )
+                active_branch = base_branch
 
         except Exception as e:
             if isinstance(e, ToolException):
