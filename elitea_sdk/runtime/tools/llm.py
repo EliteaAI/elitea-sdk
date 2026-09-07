@@ -33,6 +33,7 @@ from ..langchain.utils import (
     extract_json_content,
     make_anthropic_compatible_schema,
     normalize_null_tool_call_ids,
+    prepare_messages_for_model,
     propagate_the_input_mapping,
 )
 from ..exceptions import budget_exceeded_from
@@ -302,7 +303,9 @@ class LLMNode(BaseTool):
         routing in ``__get_struct_output_model`` keep the supported provider
         matrix functional, so the previous local recovery is dead code.
         """
-        initial_completion = llm_client.invoke(messages, config=config)
+        initial_completion = llm_client.invoke(
+            prepare_messages_for_model(messages), config=config,
+        )
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
             # Tool-calling branch: run the agentic tool exchange first, then issue
@@ -344,7 +347,9 @@ class LLMNode(BaseTool):
 
         try:
             llm = self.__get_struct_output_model(llm_client, struct_model)
-            return llm.invoke(synth_messages, config=config)
+            return llm.invoke(
+                prepare_messages_for_model(synth_messages), config=config,
+            )
         except GraphBubbleUp:
             raise
         except Exception as exc:
@@ -399,7 +404,9 @@ class LLMNode(BaseTool):
         else:
             prompt_messages.append(HumanMessage(content=json_instruction))
 
-        completion = llm_client.invoke(prompt_messages, config=config)
+        completion = llm_client.invoke(
+            prepare_messages_for_model(prompt_messages), config=config,
+        )
         extracted = self._extract_structured_from_content(completion, struct_model)
         if extracted is not None:
             return extracted
@@ -1495,7 +1502,9 @@ class LLMNode(BaseTool):
                     }],
                 )
         else:
-            completion = llm_client.invoke(messages, config=config)
+            completion = llm_client.invoke(
+                prepare_messages_for_model(messages), config=config,
+            )
         logger.info(f"Initial completion: {completion}")
 
         # Handle both tool-calling and regular responses
@@ -2955,7 +2964,9 @@ class LLMNode(BaseTool):
                 # The invocation-scoped guidance carried inside the blocked
                 # ToolMessage tells the model the call was declined and to
                 # continue the remaining work; no forced rebinding or nudge turn.
-                current_completion = llm_client.invoke(new_messages, config=config)
+                current_completion = llm_client.invoke(
+                    prepare_messages_for_model(new_messages), config=config,
+                )
                 normalize_null_tool_call_ids(current_completion)
                 new_messages.append(current_completion)
 
@@ -3152,7 +3163,9 @@ class LLMNode(BaseTool):
                         # This prevents duplicate tool_call_ids that occur when we continue with
                         # the same current_completion that still has the original tool_calls
                         try:
-                            current_completion = llm_client.invoke(new_messages, config=config)
+                            current_completion = llm_client.invoke(
+                                prepare_messages_for_model(new_messages), config=config,
+                            )
                             normalize_null_tool_call_ids(current_completion)
                             new_messages.append(current_completion)
 
