@@ -36,7 +36,10 @@ def _inject_toolkit_id(tool_conf: dict, toolkit_tools) -> None:
             if hasattr(t, 'api_wrapper') and hasattr(t.api_wrapper, 'toolkit_id'):
                 t.api_wrapper.toolkit_id = toolkit_id
     else:
-        logger.error(
+        # Standalone and CLI runs have no backend toolkit row, so an absent `id` is
+        # expected there and nothing downstream can act on it: injection is skipped
+        # and the caller continues normally.
+        logger.debug(
             f"Toolkit ID is missing or not an integer for tool "
             f"`{tool_conf.get('type', '')}` with name `{tool_conf.get('name', '')}`"
         )

@@ -1080,9 +1080,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     collection_name=f"{tool.get('toolkit_name')}",
                     collection_schema=str(tool['settings'].get('id', tool.get('id', ''))),
                 ).get_tools()
-                # Inject toolkit_id for artifact tools as well
-                # Pass settings as the tool config since that's where the id field is
-                _inject_toolkit_id(tool['settings'], toolkit_tools)
+                _inject_toolkit_id(tool, toolkit_tools)
                 _inject_display_metadata(tool, toolkit_tools)
                 tools.extend(toolkit_tools)
 
