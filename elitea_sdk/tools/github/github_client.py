@@ -1974,57 +1974,150 @@ class GitHubClient(BaseModel):
                 "message": f"An error occurred while getting workflow status: {str(e)}"
             }
 
+    def _get_access_token(self) -> Optional[str]:
+        """Get access token from auth_config for direct API calls."""
+        if self.auth_config and self.auth_config.github_access_token:
+            token = self.auth_config.github_access_token
+            if hasattr(token, 'get_secret_value'):
+                return token.get_secret_value()
+            return token
+        return None
+
     @tool_group('read')
-    def get_workflow_logs(self, run_id: str, repo_name: Optional[str] = None) -> str:
+    def get_workflow_logs(
+        self,
+        run_id: str,
+        repo_name: Optional[str] = None,
+        include_logs: bool = False,
+        include_artifacts: bool = False
+    ) -> str:
         """
         Gets the logs from a GitHub Actions workflow run.
 
         Parameters:
             run_id (str): The ID of the workflow run to get logs for
             repo_name (Optional[str]): Name of the repository to get workflow logs from
+            include_logs (bool): If True, fetches and includes full log content in 'logs' dict.
+                If False (default), returns only job metadata (status, steps) without log content.
+            include_artifacts (bool): If True, includes list of artifacts from the run.
+                Defaults to False.
 
         Returns:
-            str: A JSON string containing logs from the workflow run's jobs
+            str: A JSON string containing details about the workflow run.
+                With include_logs=True: includes full log content in 'logs' dict.
+                With include_logs=False: includes only job metadata in 'jobs' list.
         """
+        import requests
+        import zipfile
+        from io import BytesIO
+
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
 
             # Get the workflow run
             run = repo.get_workflow_run(int(run_id))
 
-            # Get the run's logs
-            try:
-                # First approach: Try to get logs from the API directly if possible
-                log_url = run.logs_url
-                logs_zip = run.get_logs()  # This will give us a bytes object with the ZIP content
+            # Base result with run metadata
+            result = {
+                "run_id": run.id,
+                "status": run.status,
+                "conclusion": run.conclusion,
+                "html_url": run.html_url,
+                "head_branch": run.head_branch,
+                "head_sha": run.head_sha,
+            }
 
-                import zipfile
-                from io import BytesIO
+            # Optionally include artifacts
+            if include_artifacts:
+                artifacts = list(run.get_artifacts())
+                result["artifacts"] = [
+                    {
+                        "id": art.id,
+                        "name": art.name,
+                        "size_in_bytes": art.size_in_bytes,
+                        "archive_download_url": art.archive_download_url,
+                        "expired": art.expired,
+                    }
+                    for art in artifacts
+                ]
 
-                log_contents = {}
-                with zipfile.ZipFile(BytesIO(logs_zip)) as zip_file:
-                    for file_name in zip_file.namelist():
-                        with zip_file.open(file_name) as log_file:
-                            log_contents[file_name] = log_file.read().decode('utf-8', errors='replace')
-
-                # Return the extracted logs
-                return {
+            # If include_logs is False, return only job metadata (backward-compatible short version)
+            if not include_logs:
+                jobs = list(run.jobs())
+                # Build backward-compatible result (only run_id, status, conclusion, job_details, note)
+                short_result = {
                     "run_id": run.id,
                     "status": run.status,
                     "conclusion": run.conclusion,
-                    "logs": log_contents
+                    "job_details": [
+                        {
+                            "job_id": job.id,
+                            "job_name": job.name,
+                            "status": job.status,
+                            "conclusion": job.conclusion,
+                            "steps": [
+                                {
+                                    "name": step.name,
+                                    "status": step.status,
+                                    "conclusion": step.conclusion,
+                                    "number": step.number,
+                                    "started_at": step.started_at.isoformat() if step.started_at else None,
+                                    "completed_at": step.completed_at.isoformat() if step.completed_at else None,
+                                } for step in job.steps
+                            ],
+                            "logs_url": job.logs_url() if hasattr(job, 'logs_url') else "No direct logs URL available"
+                        }
+                        for job in jobs
+                    ],
+                    "note": "Full logs couldn't be retrieved directly. Only job details are available."
                 }
+                # Add artifacts if requested
+                if include_artifacts:
+                    short_result["artifacts"] = result.get("artifacts", [])
+                return short_result
+
+            # Get access token for direct API calls to run-level logs
+            access_token = self._get_access_token()
+
+            # Try to get run-level logs first (returns ZIP with all jobs)
+            try:
+                if not access_token:
+                    raise Exception("No access token for run-level logs")
+
+                logs_url = run.logs_url
+                headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Accept': 'application/vnd.github+json'
+                }
+                resp = requests.get(logs_url, headers=headers, allow_redirects=True, timeout=60)
+
+                if resp.status_code == 200 and resp.content[:4] == b'PK\x03\x04':
+                    # Valid ZIP content - logs are separated by job file
+                    log_contents = {}
+                    with zipfile.ZipFile(BytesIO(resp.content)) as zip_file:
+                        for file_name in zip_file.namelist():
+                            with zip_file.open(file_name) as log_file:
+                                log_contents[file_name] = log_file.read().decode('utf-8', errors='replace')
+
+                    result["logs"] = log_contents
+                    return result
+                else:
+                    raise Exception(f"Failed to download logs: HTTP {resp.status_code}")
+
             except Exception as e:
-                # Fallback approach: Get logs from individual jobs
+                logger.warning(f"Failed to download run logs ZIP: {e}. Falling back to job-level logs.")
+                # Fallback: use PyGithub's WorkflowJob.logs_url() method
+                # This returns a direct Azure blob URL with SAS token - no auth needed
                 jobs = list(run.jobs())
                 job_logs = []
 
                 for job in jobs:
-                    job_logs.append({
+                    job_info = {
                         "job_id": job.id,
                         "job_name": job.name,
                         "status": job.status,
                         "conclusion": job.conclusion,
+                        "html_url": job.html_url,
                         "steps": [
                             {
                                 "name": step.name,
@@ -2034,17 +2127,29 @@ class GitHubClient(BaseModel):
                                 "started_at": step.started_at.isoformat() if step.started_at else None,
                                 "completed_at": step.completed_at.isoformat() if step.completed_at else None
                             } for step in job.steps
-                        ],
-                        "logs_url": job.logs_url if hasattr(job, 'logs_url') else "No direct logs URL available"
-                    })
+                        ]
+                    }
 
-                return {
-                    "run_id": run.id,
-                    "status": run.status,
-                    "conclusion": run.conclusion,
-                    "job_details": job_logs,
-                    "note": "Full logs couldn't be retrieved directly. Only job details are available."
-                }
+                    # Fetch job logs using PyGithub's logs_url() method
+                    # Returns Azure blob URL with SAS token - no additional auth required
+                    try:
+                        blob_url = job.logs_url()  # PyGithub method that returns signed URL
+                        job_resp = requests.get(blob_url, timeout=60)
+                        if job_resp.status_code == 200:
+                            job_info["log_content"] = job_resp.text
+                        else:
+                            job_info["log_content"] = None
+                            job_info["log_error"] = f"HTTP {job_resp.status_code}"
+                    except Exception as job_e:
+                        job_info["log_content"] = None
+                        job_info["log_error"] = str(job_e)
+
+                    job_logs.append(job_info)
+
+                result["job_details"] = job_logs
+                result["note"] = "Run-level logs couldn't be retrieved. Individual job logs provided where available."
+                return result
+
         except Exception as e:
             return f"An error occurred while getting workflow logs: {str(e)}"
 
