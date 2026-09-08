@@ -778,6 +778,39 @@ def _make_mcp_auth_control_tool(
         handle_tool_error=False,
     )
 
+    # Build a map of canonical_url -> {provided_settings, toolkit_id} for the
+    # stale-HITL enrichment path in langraph_agent.py.  Checkpoints created before
+    # this fix lack provided_settings/toolkit_id; on re-surface the agent reads this
+    # map and backfills the missing fields so the modal behaves correctly even for
+    # pre-existing conversations.
+    _ps_map: Dict[str, Any] = {}
+    for _tc in tool_configs:
+        if not isinstance(_tc, dict):
+            continue
+        _tc_settings = _tc.get('settings') or {}
+        _tc_url = (
+            _tc_settings.get('url')
+            or (_tc_settings.get('server_config') or {}).get('url')
+        )
+        if not _tc_url or not _is_http_url(_tc_url):
+            continue
+        try:
+            _tc_canonical = canonical_resource(normalize_mcp_url(_tc_url))
+        except Exception:
+            _tc_canonical = _tc_url
+        _entry: Dict[str, Any] = {}
+        _ps = _build_provided_settings(_tc_settings)
+        if _ps:
+            _entry['provided_settings'] = _ps
+        _tid = _tc.get('id')
+        if _tid is not None:
+            _entry['toolkit_id'] = _tid
+        if _entry:
+            _ps_map[_tc_canonical] = _entry
+    if _ps_map:
+        mcp_auth_control_tool.metadata = mcp_auth_control_tool.metadata or {}
+        mcp_auth_control_tool.metadata['_mcp_provided_settings_map'] = _ps_map
+
     legacy_alias_tool = StructuredTool.from_function(
         func=_request_mcp_authorization,
         name="request_mcp_authorization",
