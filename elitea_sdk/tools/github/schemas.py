@@ -300,7 +300,8 @@ GetWorkflowLogs = create_model(
     run_id=(str, Field(description="The ID of the workflow run to get logs for")),
     repo_name=(Optional[str], Field(description="Name of the repository to get workflow logs from", default=None)),
     include_logs=(bool, Field(description="If True, fetches full log content. If False (default), returns only job metadata without log content.", default=False)),
-    include_artifacts=(bool, Field(description="If True, includes list of artifacts from the run. Defaults to False.", default=False))
+    include_artifacts=(bool, Field(description="If True, includes list of artifacts from the run. Defaults to False.", default=False)),
+    failed_only=(bool, Field(description="If True (with include_logs=True), fetches logs only from failed jobs to reduce output size.", default=False))
 )
 
 GenericGithubAPICall = create_model(
