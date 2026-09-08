@@ -1993,7 +1993,8 @@ class GitHubClient(BaseModel):
         run_id: str,
         repo_name: Optional[str] = None,
         include_logs: bool = False,
-        include_artifacts: bool = False
+        include_artifacts: bool = False,
+        failed_only: bool = False
     ) -> str:
         """
         Gets the logs from a GitHub Actions workflow run.
@@ -2005,6 +2006,8 @@ class GitHubClient(BaseModel):
                 If False (default), returns only job metadata (status, steps) without log content.
             include_artifacts (bool): If True, includes list of artifacts from the run.
                 Defaults to False.
+            failed_only (bool): If True (with include_logs=True), fetches logs only from
+                failed jobs to reduce output size. Defaults to False.
 
         Returns:
             str: A JSON string containing details about the workflow run.
@@ -2075,6 +2078,41 @@ class GitHubClient(BaseModel):
                 if include_artifacts:
                     short_result["artifacts"] = result.get("artifacts", [])
                 return short_result
+
+            # If failed_only, use job-level approach to fetch only failed job logs
+            # and filter to only lines containing test results
+            if failed_only:
+                jobs = list(run.jobs())
+                log_contents = {}
+                # Pattern to match relevant test output lines
+                relevant_pattern = re.compile(
+                    r'(tests/[^\s]+::|FAILED|PASSED|ERROR|'
+                    r'\[FAIL\]|AssertionError|TimeoutError|'
+                    r'=+ FAILURES =+|=+ short test summary)',
+                    re.IGNORECASE
+                )
+
+                for job in jobs:
+                    # Skip non-failed jobs when failed_only is True
+                    if job.conclusion != 'failure':
+                        continue
+
+                    try:
+                        blob_url = job.logs_url()
+                        job_resp = requests.get(blob_url, timeout=60)
+                        if job_resp.status_code == 200:
+                            # Filter to only relevant lines to reduce size
+                            filtered_lines = []
+                            for line in job_resp.text.split('\n'):
+                                if relevant_pattern.search(line):
+                                    filtered_lines.append(line)
+                            log_contents[f"{job.name}.txt"] = '\n'.join(filtered_lines)
+                    except Exception as job_e:
+                        logger.warning(f"Failed to fetch logs for job {job.name}: {job_e}")
+
+                result["logs"] = log_contents
+                result["failed_jobs_count"] = len(log_contents)
+                return result
 
             # Get access token for direct API calls to run-level logs
             access_token = self._get_access_token()
