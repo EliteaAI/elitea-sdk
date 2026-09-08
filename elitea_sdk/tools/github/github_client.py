@@ -2,9 +2,13 @@ from __future__ import annotations
 import logging
 import re
 import fnmatch
-import tiktoken
+import zipfile
+from io import BytesIO
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
+
+import requests
+import tiktoken
 
 logger = logging.getLogger(__name__)
 
@@ -2007,10 +2011,6 @@ class GitHubClient(BaseModel):
                 With include_logs=True: includes full log content in 'logs' dict.
                 With include_logs=False: includes only job metadata in 'jobs' list.
         """
-        import requests
-        import zipfile
-        from io import BytesIO
-
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
 
@@ -2091,7 +2091,7 @@ class GitHubClient(BaseModel):
                 }
                 resp = requests.get(logs_url, headers=headers, allow_redirects=True, timeout=60)
 
-                if resp.status_code == 200 and resp.content[:4] == b'PK\x03\x04':
+                if resp.status_code == 200 and len(resp.content) >= 4 and resp.content[:4] == b'PK\x03\x04':
                     # Valid ZIP content - logs are separated by job file
                     log_contents = {}
                     with zipfile.ZipFile(BytesIO(resp.content)) as zip_file:
