@@ -1078,7 +1078,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     pgvector_configuration=tool['settings'].get('pgvector_configuration', {}),
                     embedding_model=tool['settings'].get('embedding_model'),
                     collection_name=f"{tool.get('toolkit_name')}",
-                    collection_schema=str(tool['settings'].get('id', tool.get('id', ''))),
+                    collection_schema=str(tool.get('id', '')),
                 ).get_tools()
                 _inject_toolkit_id(tool, toolkit_tools)
                 _inject_display_metadata(tool, toolkit_tools)

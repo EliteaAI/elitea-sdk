@@ -87,13 +87,14 @@ class TestExistingBehaviourUnchanged:
 
         assert tool.api_wrapper.toolkit_id == 99
 
-    def test_inject_toolkit_id_no_api_wrapper_logs_debug_when_id_not_int(self, caplog):
+    def test_inject_toolkit_id_no_api_wrapper_warns_when_id_not_int(self, caplog):
         tool = _make_tool()
         with caplog.at_level(logging.DEBUG):
             _inject_toolkit_id({"id": None, "type": "imagegen", "name": "ImageGen"}, [tool])
 
-        assert any("Toolkit ID is missing or not an integer" in r.message for r in caplog.records)
-        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+        missing_id = [r for r in caplog.records
+                      if "Toolkit ID is missing or not an integer" in r.message]
+        assert [r.levelno for r in missing_id] == [logging.WARNING]
 
     def test_inject_display_metadata_still_sets_display_name(self):
         tool = _make_tool()
