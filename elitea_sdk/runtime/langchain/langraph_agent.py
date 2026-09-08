@@ -1006,6 +1006,16 @@ def prepare_output_schema(lg_builder, memory, store, debug=False, interrupt_befo
         for name, branch in branches.items():
             compiled.attach_branch(start, name, branch)
 
+    # Attach the provided-settings map built by _make_mcp_auth_control_tool so the
+    # stale-HITL path can backfill legacy checkpoints that pre-date this fix.
+    _mcp_ps_map = {}
+    for _t in (tools or []):
+        if isinstance(_t, BaseTool) and _t.name == 'mcp_auth_control':
+            _meta = getattr(_t, 'metadata', None) or {}
+            _mcp_ps_map = _meta.get('_mcp_provided_settings_map') or {}
+            break
+    compiled._mcp_provided_settings_map = _mcp_ps_map
+
     logger.info(compiled.get_graph().draw_mermaid())
     return compiled
 
@@ -2049,6 +2059,26 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     hitl_for_ui = (
                         hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
                     )
+                    # Backfill provided_settings / toolkit_id into legacy checkpoints
+                    # that were saved before this fix.  The map is keyed by canonical
+                    # server URL and built from current toolkit config at graph-build time.
+                    if (
+                        hitl_for_ui.get('guardrail_type') == 'mcp_auth'
+                        and (
+                            not hitl_for_ui.get('provided_settings')
+                            or hitl_for_ui.get('toolkit_id') is None
+                        )
+                    ):
+                        _ps_map = getattr(self, '_mcp_provided_settings_map', {}) or {}
+                        _server_url = hitl_for_ui.get('server_url') or ''
+                        _entry = _ps_map.get(_server_url) or {}
+                        if _entry:
+                            if not hitl_for_ui.get('provided_settings') and _entry.get('provided_settings'):
+                                hitl_for_ui = {**hitl_for_ui, 'provided_settings': _entry['provided_settings']}
+                            if hitl_for_ui.get('toolkit_id') is None and _entry.get('toolkit_id') is not None:
+                                hitl_for_ui = {**hitl_for_ui, 'toolkit_id': _entry['toolkit_id']}
+                            if hitl_interrupts_for_ui:
+                                hitl_interrupts_for_ui = [hitl_for_ui, *hitl_interrupts_for_ui[1:]]
                     logger.warning(
                         "[HITL] Stale HITL interrupt detected for tool '%s'. "
                         "Returning interrupt to caller for resolution "
