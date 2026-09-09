@@ -54,7 +54,6 @@ from ..tools.router import RouterNode
 from ..exceptions import PipelineConfigurationError
 
 from ...tools.utils.serialization import serialize_tool_result
-from ..utils.mcp_oauth import canonical_resource, normalize_mcp_url, _is_http_url
 
 logger = logging.getLogger(__name__)
 
@@ -1716,15 +1715,6 @@ def create_graph(
         independent_parallel_hitl=independent_parallel_hitl,
         parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
     )
-    # Attach the provided-settings map built by _make_mcp_auth_control_tool so the
-    # stale-HITL path can backfill legacy checkpoints that pre-date this fix.
-    _mcp_ps_map = {}
-    for _t in (tools or []):
-        if isinstance(_t, BaseTool) and _t.name == 'mcp_auth_control':
-            _meta = getattr(_t, 'metadata', None) or {}
-            _mcp_ps_map = _meta.get('_mcp_provided_settings_map') or {}
-            break
-    compiled._mcp_provided_settings_map = _mcp_ps_map
     return compiled.validate()
 
 def format_tools(tools_list: list) -> str:
@@ -2059,34 +2049,6 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     hitl_for_ui = (
                         hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
                     )
-                    # Backfill provided_settings / toolkit_id into every pending legacy
-                    # checkpoint that was saved before this fix.  The map is keyed by
-                    # canonical server URL and built from current toolkit config at
-                    # graph-build time.  Entries are skipped when the URL is ambiguous
-                    # (two toolkits share it) to avoid attaching wrong credentials.
-                    _ps_map = getattr(self, '_mcp_provided_settings_map', {}) or {}
-                    if _ps_map and hitl_interrupts_for_ui:
-                        def _enrich_mcp_hitl(item):
-                            if item.get('guardrail_type') != 'mcp_auth':
-                                return item
-                            if item.get('provided_settings') and item.get('toolkit_id') is not None:
-                                return item
-                            _raw_url = item.get('server_url') or ''
-                            try:
-                                _key = canonical_resource(normalize_mcp_url(_raw_url)) if _is_http_url(_raw_url) else _raw_url
-                            except Exception:
-                                _key = _raw_url
-                            _entry = _ps_map.get(_key) or {}
-                            if not _entry:
-                                return item
-                            patched = dict(item)
-                            if not patched.get('provided_settings') and _entry.get('provided_settings'):
-                                patched['provided_settings'] = _entry['provided_settings']
-                            if patched.get('toolkit_id') is None and _entry.get('toolkit_id') is not None:
-                                patched['toolkit_id'] = _entry['toolkit_id']
-                            return patched
-                        hitl_interrupts_for_ui = [_enrich_mcp_hitl(h) for h in hitl_interrupts_for_ui]
-                        hitl_for_ui = hitl_interrupts_for_ui[0]
                     logger.warning(
                         "[HITL] Stale HITL interrupt detected for tool '%s'. "
                         "Returning interrupt to caller for resolution "
