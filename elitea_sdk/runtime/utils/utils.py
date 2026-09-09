@@ -54,6 +54,13 @@ class IndexerKeywords(Enum):
     INDEX_META_PARTLY_OK = 'partly_indexed'
     INDEX_META_SCHEDULED_REINDEX = 'scheduled_reindex'
 
+# Correlates one predict/eval run across pylon_main (gateway LLM usage rows)
+# and pylon_indexer (tool-call rows) — NOT the same id as
+# IndexerKeywords.RUN_ID above (that one identifies a vector *index* run,
+# unrelated to predicts, despite the superficially similar name).
+PREDICT_RUN_ID_KWARGS_KEY = '_elitea_predict_run_id'
+PREDICT_RUN_ID_HEADER = 'X-Elitea-Run-Id'
+
 # This pattern matches characters that are NOT alphanumeric, underscores, or hyphens
 clean_string_pattern = re.compile(r'[^a-zA-Z0-9_.-]')
 
