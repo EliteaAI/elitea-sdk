@@ -419,6 +419,8 @@ alita_client = elitea_client
             'status': metadata.get('status'),
             'thread_id': configurable.get('thread_id'),
             'checkpoint_ns': configurable.get('checkpoint_ns') or '',
+            **({"provided_settings": metadata["provided_settings"]} if metadata.get("provided_settings") else {}),
+            **({"toolkit_id": metadata["toolkit_id"]} if metadata.get("toolkit_id") is not None else {}),
         }
 
     def invoke(

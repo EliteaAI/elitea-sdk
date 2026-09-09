@@ -3169,6 +3169,8 @@ class LLMNode(BaseTool):
             'thread_id': configurable.get('thread_id'),
             'checkpoint_ns': configurable.get('checkpoint_ns') or '',
             '_source_node_name': self.name,
+            **({"provided_settings": auth_metadata["provided_settings"]} if auth_metadata.get("provided_settings") else {}),
+            **({"toolkit_id": auth_metadata["toolkit_id"]} if auth_metadata.get("toolkit_id") is not None else {}),
         }
         if serialized_pending:
             payload['_pending_messages'] = serialized_pending

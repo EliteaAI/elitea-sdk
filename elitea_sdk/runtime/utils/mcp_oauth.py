@@ -211,7 +211,7 @@ class McpAuthorizationRequired(ToolException):
         authorization_servers = getattr(self, "authorization_servers", None)
         if authorization_servers is None and isinstance(self.resource_metadata, dict):
             authorization_servers = self.resource_metadata.get("authorization_servers")
-        return {
+        result = {
             "message": str(self),
             "server_url": self.server_url,
             "resource_metadata_url": self.resource_metadata_url,
@@ -224,6 +224,10 @@ class McpAuthorizationRequired(ToolException):
             "toolkit_type": self.toolkit_type,
             "toolkit_id": getattr(self, "toolkit_id", None),
         }
+        provided_settings = getattr(self, "provided_settings", None)
+        if provided_settings:
+            result["provided_settings"] = provided_settings
+        return result
 
 
 def extract_authorization_uri(www_authenticate: Optional[str]) -> Optional[str]:
