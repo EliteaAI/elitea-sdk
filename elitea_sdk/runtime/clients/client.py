@@ -693,14 +693,15 @@ class EliteAClient:
         object.__setattr__(llm, '_elitea_openai_compatible', bool(openai_compat))
         return llm
 
-    def get_low_tier_llm(self, max_tokens: int = 1024, temperature: float = 0.7,
+    def get_low_tier_llm(self, max_tokens: int = 1024, temperature: Optional[float] = None,
                          top_p: Optional[float] = None, additional_filters: Optional[Dict[str, Any]] = None):
         """
         Get a low-tier LLM instance automatically selected from available models.
 
         Args:
             max_tokens: Maximum number of tokens to generate (default: 1024)
-            temperature: Temperature for generation (default: 0.7)
+            temperature: Temperature for generation (default: None, i.e. provider default;
+                         some low-tier/reasoning models reject an explicit temperature)
             top_p: Top-p sampling parameter (optional)
             additional_filters: Additional filters to apply when selecting the model (optional)
                               e.g., {'supports_vision': True, 'name': '*claude*'}
@@ -764,11 +765,13 @@ class EliteAClient:
 
         logger.debug(f"Selected low-tier model: {model_name} (display_name: {selected_model.get('display_name', 'N/A')})")
 
-        # Build model configuration
+        # Build model configuration. temperature is omitted when None (provider
+        # default) since some low-tier/reasoning models reject the field entirely.
         model_config = {
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        if temperature is not None:
+            model_config["temperature"] = temperature
 
         # Add top_p if provided
         if top_p is not None:
