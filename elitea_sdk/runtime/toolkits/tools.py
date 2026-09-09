@@ -783,7 +783,11 @@ def _make_mcp_auth_control_tool(
     # this fix lack provided_settings/toolkit_id; on re-surface the agent reads this
     # map and backfills the missing fields so the modal behaves correctly even for
     # pre-existing conversations.
+    # When two toolkits share the same canonical URL the lookup is ambiguous, so we
+    # store None as a sentinel for that URL — the enrichment path skips None entries
+    # rather than attaching credentials from the wrong toolkit.
     _ps_map: Dict[str, Any] = {}
+    _ambiguous_urls: set = set()
     for _tc in tool_configs:
         if not isinstance(_tc, dict):
             continue
@@ -798,6 +802,13 @@ def _make_mcp_auth_control_tool(
             _tc_canonical = canonical_resource(normalize_mcp_url(_tc_url))
         except Exception:
             _tc_canonical = _tc_url
+        if _tc_canonical in _ambiguous_urls:
+            continue
+        if _tc_canonical in _ps_map:
+            # Second toolkit with the same URL — mark ambiguous and discard entry.
+            _ambiguous_urls.add(_tc_canonical)
+            del _ps_map[_tc_canonical]
+            continue
         _entry: Dict[str, Any] = {}
         _ps = _build_provided_settings(_tc_settings)
         if _ps:
