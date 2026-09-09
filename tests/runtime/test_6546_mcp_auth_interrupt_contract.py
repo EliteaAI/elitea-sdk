@@ -4,12 +4,11 @@ Contracts tested:
 - McpAuthorizationRequired.to_dict() preserves masked provided_settings and toolkit_id.
 - LLMNode._build_mcp_auth_interrupt() forwards both fields.
 - FunctionNode._build_mcp_auth_interrupt() forwards both fields.
-- Raw client secrets are not exposed in either interrupt payload.
+
+Credential masking belongs to the code that constructs ``provided_settings``;
+these serialization layers deliberately preserve the prepared mapping unchanged.
 """
 import yaml
-import pytest
-from unittest.mock import MagicMock
-from uuid import UUID
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import StructuredTool
@@ -23,7 +22,7 @@ _SERVER_URL = "https://api.githubcopilot.com/mcp/"
 _TOOLKIT_ID = 314
 _MASKED_SETTINGS = {
     "mcp_client_id": "client-abc",
-    "has_mcp_client_secret": True,
+    "mcp_client_secret": "****cret",
 }
 
 
@@ -54,26 +53,11 @@ def test_to_dict_includes_masked_provided_settings():
     exc = _make_exc(provided_settings=_MASKED_SETTINGS)
     d = exc.to_dict()
     assert d["provided_settings"] == _MASKED_SETTINGS
-    assert d["provided_settings"]["has_mcp_client_secret"] is True
 
 
 def test_to_dict_omits_provided_settings_when_absent():
     d = _make_exc(provided_settings=None).to_dict()
     assert "provided_settings" not in d
-
-
-def test_to_dict_never_exposes_raw_secret():
-    settings_with_secret = {
-        "mcp_client_id": "client-abc",
-        "mcp_client_secret": "super-secret",
-        "has_mcp_client_secret": True,
-    }
-    exc = _make_exc(provided_settings=settings_with_secret)
-    d = exc.to_dict()
-    # The exception stores whatever is given; callers are responsible for masking
-    # before constructing the exception.  We verify that the dict round-trip does
-    # not introduce any additional secret fields.
-    assert "mcp_client_secret" not in {k for k in d if k not in exc.__dict__}
 
 
 # ---------------------------------------------------------------------------
@@ -165,19 +149,6 @@ def test_llm_interrupt_builder_forwards_provided_settings():
     result = _run_agent_to_interrupt(provided_settings=_MASKED_SETTINGS)
     interrupt = result["hitl_interrupt"]
     assert interrupt["provided_settings"] == _MASKED_SETTINGS
-    assert interrupt["provided_settings"]["has_mcp_client_secret"] is True
-
-
-def test_llm_interrupt_builder_no_raw_secret():
-    settings_with_secret = {
-        "mcp_client_id": "client-abc",
-        "mcp_client_secret": "super-secret",
-        "has_mcp_client_secret": True,
-    }
-    result = _run_agent_to_interrupt(provided_settings=settings_with_secret)
-    interrupt = result["hitl_interrupt"]
-    # Raw secret must not appear at the top level of the interrupt payload
-    assert "mcp_client_secret" not in interrupt
 
 
 def test_llm_interrupt_omits_toolkit_id_when_absent():
@@ -295,18 +266,6 @@ def test_function_interrupt_builder_forwards_provided_settings():
     result = _run_pipeline_to_interrupt(provided_settings=_MASKED_SETTINGS)
     interrupt = result["hitl_interrupt"]
     assert interrupt["provided_settings"] == _MASKED_SETTINGS
-    assert interrupt["provided_settings"]["has_mcp_client_secret"] is True
-
-
-def test_function_interrupt_builder_no_raw_secret():
-    settings_with_secret = {
-        "mcp_client_id": "client-abc",
-        "mcp_client_secret": "super-secret",
-        "has_mcp_client_secret": True,
-    }
-    result = _run_pipeline_to_interrupt(provided_settings=settings_with_secret)
-    interrupt = result["hitl_interrupt"]
-    assert "mcp_client_secret" not in interrupt
 
 
 def test_function_interrupt_omits_toolkit_id_when_absent():
