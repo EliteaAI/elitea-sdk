@@ -152,6 +152,8 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             ext = os.path.splitext(file_path)[-1].lower()
             return ext in SUPPORTED_EXTENSIONS
 
+        yielded_files = set()
+
         def raw_document_generator() -> Generator[Document, None, None]:
             """Yields raw Documents without chunking - pure generator, no pre-filtering."""
             processed = 0
@@ -199,6 +201,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 file_hash = hashlib.sha256(file_content.encode("utf-8")).hexdigest()
                 processed += 1
                 stats.items_processed = processed
+                yielded_files.add(file)
 
                 yield Document(
                     page_content=file_content,
@@ -226,7 +229,28 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
         # Apply universal chunker based on file type
         from .chunkers.universal_chunker import universal_chunker
-        return universal_chunker(raw_document_generator(), config=chunking_config)
+
+        def chunked_document_generator() -> Generator[Document, None, None]:
+            """A chunker can produce nothing for a file the loader already counted. That
+            file reaches neither dedup nor the writer, so it can never be recorded
+            unchanged, and would otherwise read as freshly indexed on every run.
+            """
+            chunked_files = set()
+            for chunk in universal_chunker(raw_document_generator(), config=chunking_config):
+                chunked_files.add(chunk.metadata.get('filename'))
+                yield chunk
+
+            dropped = yielded_files - chunked_files
+            if dropped:
+                stats = self._indexing_stats
+                stats.files_skipped_empty.update(dropped)
+                # Counted at load time, so the invariant needs them back out.
+                stats.items_processed = max(stats.items_processed - len(dropped), 0)
+                self._log_tool_event(
+                    message=f"{len(dropped)} files produced no indexable content",
+                    tool_name="loader")
+
+        return chunked_document_generator()
 
     def __handle_get_files(self, path: str, branch: str):
         """
