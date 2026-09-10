@@ -384,8 +384,10 @@ def canonical_resource(server_url: str) -> str:
     )
     resource = normalized.geturl()
 
-    # Prefer form without trailing slash unless path is meaningful
-    if resource.endswith("/") and parsed.path in ("", "/"):
+    # Strip trailing slash unconditionally so the canonical form matches the
+    # frontend convention (e.g. "/mcp/" → "/mcp"). Root-only paths ("/" or "")
+    # produce the same result either way.
+    if resource.endswith("/"):
         resource = resource[:-1]
     return resource
 
