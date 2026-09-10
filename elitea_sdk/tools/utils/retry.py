@@ -22,6 +22,7 @@ Usage:
 import logging
 from typing import Tuple
 
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -33,6 +34,16 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
+_DETERMINISTIC_DB_ERRORS = (DataError, IntegrityError)
+
+
+def _is_deterministic_db_error(exception: BaseException) -> bool:
+    return isinstance(exception, _DETERMINISTIC_DB_ERRORS)
+
+
+def _is_recycled_db_connection(exception: BaseException) -> bool:
+    return isinstance(exception, DBAPIError) and exception.connection_invalidated
+
 
 def is_server_error_retriable(exception: BaseException) -> bool:
     """
@@ -43,6 +54,8 @@ def is_server_error_retriable(exception: BaseException) -> bool:
     - httpx.HTTPStatusError: HTTP errors with 5xx/429 status
     - openai.APIStatusError: OpenAI API errors with 5xx/429 status
     - openai.APIConnectionError: Connection issues
+    - sqlalchemy DBAPIError with a recycled connection: retriable
+    - sqlalchemy DataError/IntegrityError: not retriable
     - String-based detection for wrapped exceptions
 
     Args:
@@ -69,6 +82,11 @@ def is_server_error_retriable(exception: BaseException) -> bool:
             return 500 <= exception.status_code < 600 or exception.status_code == 429
     except ImportError:
         pass
+
+    if _is_recycled_db_connection(exception):
+        return True
+    if _is_deterministic_db_error(exception):
+        return False
 
     error_str = str(exception).lower()
     if any(f"{code}" in str(exception) for code in [429, 500, 502, 503, 504]):
