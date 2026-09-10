@@ -10,6 +10,19 @@ from .api_wrapper import CarrierAPIWrapper
 
 logger = logging.getLogger("carrier_ui_reports_tool")
 
+
+def _current_date() -> str:
+    """Today's date, read from the clock of the call.
+
+    A plain ``Field(default=datetime.datetime.now()...)`` is evaluated once, when
+    Python imports this module. A worker process that lives longer than one day
+    then serves the date of its own start for every later call, and the generated
+    tool schema differs between two calendar days. ``default_factory`` moves the
+    read to the call.
+    """
+    return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
 class GetUIReportsTool(BaseTool):
     api_wrapper: CarrierAPIWrapper = Field(..., description="Carrier API Wrapper instance")
     name: str = "get_ui_reports"
@@ -17,7 +30,7 @@ class GetUIReportsTool(BaseTool):
     args_schema: Type[BaseModel] = create_model(
         "GetUIReportsInput",
         report_id=(str, Field(description="UI Report id to retrieve")),
-        current_date=(str, Field(default=datetime.datetime.now().strftime("%Y-%m-%d"), description="Current date in YYYY-MM-DD format (auto-filled)")),
+        current_date=(str, Field(default_factory=_current_date, description="Current date in YYYY-MM-DD format (auto-filled)")),
         **{
             "name": (Optional[str], Field(default=None, description="Optional. Filter reports by name (case-insensitive, partial match)")),
             "start_time": (Optional[str], Field(default=None, description="Start date/time for filtering reports (YYYY-MM-DD or ISO format)")),

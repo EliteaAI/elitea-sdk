@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -468,6 +469,111 @@ def _sample_skipped_payload(skipped: Any, sample_size: int = REPORT_ITEMS_SAMPLE
     if isinstance(skipped, list):
         return skipped[:sample_size]
     return skipped
+
+
+INDEX_HISTORY_CHUNKING_REF_KEY = "chunking_config_ref"
+
+
+def _chunking_config_digest(chunking_config: Any) -> Optional[str]:
+    """Stable digest of one chunking configuration, or None when it cannot be read.
+
+    The digest is what makes a reference entry useful: two runs that used the same
+    configuration carry the same digest, and a run that used a different one is
+    visible without storing the whole object again.
+    """
+    try:
+        canonical = json.dumps(chunking_config, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _configuration_as_object(configuration: Any) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Read an index_configuration in either stored shape.
+
+    Rows written by this SDK nest the object directly. Rows written by the earlier
+    Python path nest it as a JSON string. The second return value says which shape
+    it was, so the caller can write the same shape back.
+    """
+    if isinstance(configuration, dict):
+        return configuration, False
+    if isinstance(configuration, str) and configuration.strip():
+        try:
+            decoded = json.loads(configuration)
+        except (json.JSONDecodeError, TypeError):
+            return None, False
+        if isinstance(decoded, dict):
+            return decoded, True
+    return None, False
+
+
+def compact_index_history_chunking_config(history: List[Any]) -> List[Any]:
+    """Store one full chunking_config per index and a reference on every later run.
+
+    Every history entry is a full clone of the index metadata, so without this the
+    SDK repeats the same chunking configuration — about 3.4 KB for the default set
+    of 65 file extensions — once per run. The stored history then reaches its bound
+    roughly ten times sooner than it needs to, and the user loses older runs that
+    the bound implies are still kept (issue #362).
+
+    The rules, applied from the oldest entry to the newest:
+
+    * The `created` marker never holds the configuration. It records the moment the
+      index was declared, not a run.
+    * The first run entry that carries a configuration keeps it whole.
+    * A later run entry whose configuration has the same digest keeps only
+      `chunking_config_ref`: the digest, and the position of the entry that holds
+      the whole object.
+    * A run entry whose configuration differs starts a new whole copy, so a real
+      change of configuration stays visible in the history.
+
+    The reader contract does not change. Nothing reads `chunking_config` back out
+    of a history entry: reindex, the edit form and the scheduler all read the
+    top-level `index_configuration`, which this function never touches. The entries
+    this produces are the shape the platform already writes for its own markers and
+    already tolerates on read.
+
+    The input entries are never mutated; an entry that changes is copied first.
+    """
+    if not isinstance(history, list):
+        return history
+    compacted: List[Any] = []
+    holder_by_digest: Dict[str, int] = {}
+    for position, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            compacted.append(entry)
+            continue
+        configuration, was_encoded = _configuration_as_object(entry.get("index_configuration"))
+        if configuration is None or "chunking_config" not in configuration:
+            # Already a reference, never carried one, or a shape this cannot read.
+            compacted.append(entry)
+            continue
+        digest = _chunking_config_digest(configuration["chunking_config"])
+        if digest is None:
+            # A configuration that cannot be serialised cannot be referenced either.
+            compacted.append(entry)
+            continue
+        is_created_marker = entry.get("state") == IndexerKeywords.INDEX_META_CREATED.value
+        if not is_created_marker and digest not in holder_by_digest:
+            holder_by_digest[digest] = position
+            compacted.append(entry)
+            continue
+        reference: Dict[str, Any] = {"sha256": digest}
+        holder = holder_by_digest.get(digest)
+        if holder is not None:
+            reference["same_as_entry"] = holder
+        trimmed = dict(configuration)
+        del trimmed["chunking_config"]
+        trimmed[INDEX_HISTORY_CHUNKING_REF_KEY] = reference
+        replacement = dict(entry)
+        replacement["index_configuration"] = json.dumps(trimmed) if was_encoded else trimmed
+        compacted.append(replacement)
+    return compacted
+
+
+def dump_index_history(history: List[Any]) -> str:
+    """Serialise run history for storage, with the chunking configuration compacted."""
+    return json.dumps(compact_index_history_chunking_config(history))
 
 
 def build_error_report(
@@ -2150,7 +2256,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 "error": None,
             }
             created_entry = {**metadata, "state": IndexerKeywords.INDEX_META_CREATED.value}
-            metadata["history"] = json.dumps([created_entry, metadata])
+            metadata["history"] = dump_index_history([created_entry, metadata])
             index_meta_doc = Document(page_content=f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}", metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc])
             if staging:
@@ -2211,7 +2317,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             except (json.JSONDecodeError, TypeError):
                 history = []
             history.append(dict(metadata))  # history key already popped -> no nesting
-            metadata["history"] = json.dumps(history)
+            metadata["history"] = dump_index_history(history)
             index_meta_doc = Document(
                 page_content=index_meta.get("content", f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}"),
                 metadata=metadata,
@@ -2368,7 +2474,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 logger.warning(f"Failed to load index history: {history_raw}. Create new with only current item.")
                 history = [metadata]
             #
-            metadata["history"] = json.dumps(history)
+            metadata["history"] = dump_index_history(history)
             index_meta_doc = Document(page_content=index_meta_raw.get("content", ""), metadata=metadata)
             add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta_raw.get("id")])
             return state
