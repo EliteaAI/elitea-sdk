@@ -126,11 +126,13 @@ class UnifiedMcpClient:
         """Establish connection using langchain-mcp-adapters."""
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != 'langchain_mcp_adapters':
+                raise
             raise ImportError(
                 "langchain-mcp-adapters is required. "
                 "Install with: pip install langchain-mcp-adapters"
-            )
+            ) from exc
 
         # Validate URL scheme before attempting any connection.
         # aiohttp raises InvalidURL(url) with just the URL string as the message,
@@ -635,11 +637,13 @@ class UnifiedMcpClient:
 
         try:
             from langchain_mcp_adapters.tools import load_mcp_tools
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != 'langchain_mcp_adapters':
+                raise
             raise ImportError(
                 "langchain-mcp-adapters is required. "
                 "Install with: pip install langchain-mcp-adapters"
-            )
+            ) from exc
 
         # Load tools using langchain-mcp-adapters
         connection = self._client.connections.get(self._server_name)
