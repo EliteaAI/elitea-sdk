@@ -18,6 +18,7 @@ import json
 import re
 
 import pytest
+from langchain_core.documents import Document
 
 from elitea_sdk.tools.base_indexer_toolkit import (
     REPORT_ERRORS_SAMPLE_SIZE,
@@ -34,6 +35,7 @@ from elitea_sdk.tools.base_indexer_toolkit import (
     normalize_report_errors,
     render_report_text,
 )
+from elitea_sdk.tools.code_indexer_toolkit import CodeIndexerToolkit
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
 
@@ -920,3 +922,144 @@ class TestPreviousRunDetection:
 
     def test_no_init_means_no_previous_run(self, toolkit):
         assert toolkit._has_previous_index_run() is False
+
+
+class CodeToolkit(CodeIndexerToolkit):
+    """A real code toolkit: loader_yields_chunks, filename key, commit_hash compare."""
+
+
+class FakeStore:
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, ids=None):
+        self.deleted.extend(ids or [])
+
+
+CODE_FILES = ("src/a.py", "src/b.py", "src/c.py")
+CHUNKS_PER_FILE = 4
+
+
+def code_chunks(filename: str, commit_hash: str):
+    """What universal_chunker hands _reduce_duplicates: no 'name', no 'path'."""
+    return [
+        Document(
+            page_content=f"def f{index}(): pass",
+            metadata={
+                "filename": filename,
+                "file_path": filename,
+                "commit_hash": commit_hash,
+                "method_name": f"f{index}",
+                "chunk_id": index,
+            },
+        )
+        for index in range(CHUNKS_PER_FILE)
+    ]
+
+
+def code_indexed_entry(filename: str, commit_hash: str):
+    """Shape produced by PGVectorAdapter.get_code_indexed_data."""
+    return {
+        "metadata": {"collection": "x", "filename": filename, "commit_hash": commit_hash},
+        "commit_hashes": [commit_hash],
+        "ids": [f"{filename}#{index}" for index in range(CHUNKS_PER_FILE)],
+    }
+
+
+@pytest.fixture
+def code_indexing_toolkit(monkeypatch):
+    instance = CodeToolkit.model_construct()
+    object.__setattr__(instance, "_stored_meta", None)
+    object.__setattr__(instance, "vectorstore", FakeStore())
+    written = []
+    object.__setattr__(instance, "written", written)
+
+    def fake_add_documents(vectorstore=None, documents=None, ids=None):
+        metadata = dict(documents[0].metadata)
+        written.append(metadata)
+        object.__setattr__(
+            instance, "_stored_meta", {"id": "meta-1", "content": "index_meta_x", "metadata": metadata}
+        )
+
+    monkeypatch.setattr(
+        "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents", fake_add_documents
+    )
+    monkeypatch.setattr(VectorStoreWrapperBase, "_ensure_vectorstore_initialized", lambda self: None)
+    monkeypatch.setattr(VectorStoreWrapperBase, "get_index_meta", lambda self, name: self._stored_meta)
+    monkeypatch.setattr(VectorStoreWrapperBase, "get_indexed_count", lambda self, name: 0)
+    monkeypatch.setattr(CodeToolkit, "_is_scheduled_run", lambda self: False)
+    monkeypatch.setattr(CodeToolkit, "_clean_index", lambda self, name: None)
+    monkeypatch.setattr(CodeToolkit, "_log_tool_event", lambda self, *a, **kw: None)
+    monkeypatch.setattr(CodeToolkit, "_emit_index_event", lambda self, name, error=None, state=None: None)
+
+    def count_chunks(self, base_documents, base_total, chunking_tool, chunking_config,
+                     result, index_name=None):
+        # For a chunk-yielding loader every surviving chunk is its own base doc, which is
+        # why docs_count has to be re-derived from the file stats.
+        chunks = list(base_documents)
+        result["count"] = len(chunks)
+        result["docs_count"] = len(chunks)
+
+    monkeypatch.setattr(CodeToolkit, "_save_index_generator", count_chunks)
+    return instance
+
+
+def run_code_index(toolkit, monkeypatch, changed=()):
+    indexed = {name: code_indexed_entry(name, f"sha-{name}") for name in CODE_FILES}
+    monkeypatch.setattr(CodeToolkit, "_get_indexed_data", lambda self, name: indexed)
+
+    def fake_loader(self, **kwargs):
+        # CodeIndexerToolkit.loader stamps the files it processed while yielding chunks.
+        stats = self.get_indexing_stats()
+        stats.items_processed = len(CODE_FILES)
+        stats.total_fetched = len(CODE_FILES)
+        chunks = []
+        for name in CODE_FILES:
+            chunks.extend(code_chunks(name, f"sha-new-{name}" if name in changed else f"sha-{name}"))
+        return iter(chunks)
+
+    monkeypatch.setattr(CodeToolkit, "_base_loader", fake_loader)
+    return toolkit.index_data(index_name="x")
+
+
+class TestCodeToolkitUnchangedTracking:
+    """A code reindex that touched nothing must read "up to date", not "Successfully
+    indexed N files". Regression guard for #6584: dedup matched every file, but nothing
+    on the code toolkit recorded the match, so the whole repository was reported as
+    freshly indexed."""
+
+    def test_dedup_records_unchanged_files_not_chunks(self, code_indexing_toolkit, monkeypatch):
+        run_code_index(code_indexing_toolkit, monkeypatch)
+
+        # Twelve chunks in, three file paths out: the tracked identifier falls through to
+        # key_fn (the filename) because no chunker writes 'name' or 'path'.
+        stats = code_indexing_toolkit.get_indexing_stats()
+        assert stats.documents_already_indexed == set(CODE_FILES)
+
+    def test_a_no_change_code_reindex_reads_as_up_to_date(self, code_indexing_toolkit, monkeypatch):
+        result = run_code_index(code_indexing_toolkit, monkeypatch)
+
+        totals = result["report"]["totals"]
+        assert totals["unchanged"] == 3
+        assert totals["indexed"] == 0
+        assert is_up_to_date_run(totals)
+        assert result["message"].splitlines()[0] == "Up to date — 3 files unchanged."
+
+    def test_a_partial_code_reindex_counts_files_not_chunks(self, code_indexing_toolkit, monkeypatch):
+        result = run_code_index(code_indexing_toolkit, monkeypatch, changed=("src/b.py",))
+
+        totals = result["report"]["totals"]
+        assert totals["indexed"] == 1
+        assert totals["unchanged"] == 2
+        assert not is_up_to_date_run(totals)
+        assert result["message"].splitlines()[0] == "Successfully indexed 1 file."
+
+    @pytest.mark.parametrize("changed", [(), ("src/b.py",)])
+    def test_the_chip_still_counts_everything_the_store_holds(
+        self, code_indexing_toolkit, monkeypatch, changed
+    ):
+        run_code_index(code_indexing_toolkit, monkeypatch, changed=changed)
+
+        stored = code_indexing_toolkit.written[-1]
+        assert stored["indexed"] == 3
+        assert stored["total"] == 3

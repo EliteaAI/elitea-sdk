@@ -746,6 +746,25 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         stats = self.get_indexing_stats()
         return stats.get_summary() if stats else ""
 
+    def _init_indexing_stats(self) -> IndexingStats:
+        """Initialize or reset indexing stats for this indexing run."""
+        self._indexing_stats = IndexingStats()
+        return self._indexing_stats
+
+    def _track_document_unchanged(self, doc_identifier: str):
+        """Track a document matched by incremental dedup — the indexed copy is already
+        current, so we skipped re-indexing it. Not a failure; counted separately from
+        documents_skipped_* so the report can distinguish 'nothing to do' from
+        'something went wrong'.
+
+        Lives on the base, not on NonCodeIndexerToolkit: _reduce_duplicates is base-level
+        and skips code documents too. Without it every unchanged code file falls out of the
+        count and a no-change reindex reports the whole repository as freshly indexed.
+        """
+        if not hasattr(self, '_indexing_stats'):
+            self._init_indexing_stats()
+        self._indexing_stats.documents_already_indexed.add(doc_identifier)
+
     def _stamp_loader_stats(self, documents_count: int):
         """Record what the loader produced, for toolkits that don't track it themselves.
 

@@ -91,11 +91,6 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
                 ids.extend(idx_data[dep_key]['all_chunks'])
         return ids
 
-    def _init_indexing_stats(self) -> IndexingStats:
-        """Initialize or reset indexing stats for this indexing run."""
-        self._indexing_stats = IndexingStats()
-        return self._indexing_stats
-
     def _track_skipped_document(self, doc_id: str, reason: str = "error"):
         """Track a skipped document during indexing."""
         if not hasattr(self, '_indexing_stats'):
@@ -165,15 +160,6 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
         self._indexing_stats.items_processed += 1
-
-    def _track_document_unchanged(self, doc_identifier: str):
-        """Track a document matched by incremental dedup — same updated_on as the
-        indexed copy, so we skipped re-indexing it. Not a failure; counted separately
-        from documents_skipped_* so the report can distinguish 'nothing to do' from
-        'something went wrong'."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.documents_already_indexed.add(doc_identifier)
 
     def _track_dependent_item_skipped(self, item_name: str):
         """
