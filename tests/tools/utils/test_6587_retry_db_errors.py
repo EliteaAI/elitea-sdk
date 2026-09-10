@@ -178,3 +178,28 @@ class TestAcceptedResidualGap:
         assert_substring_path_would_not_have_retried(exception)
         assert exception.connection_invalidated is False
         assert is_server_error_retriable(exception) is False
+
+
+class TestResidualDependsOnRenderedParameters:
+    """The insert path escapes the digit lottery only while SQLAlchemy renders bound
+    parameters into the message.
+
+    `create_engine(..., hide_parameters=True)` replaces the whole `[parameters: ...]` block
+    with a fixed notice, and a transient ProgrammingError on the insert path then reads
+    exactly like the digit-free case: not deny-listed, but not retried either. Since
+    embeddings and cmetadata are user content, that hardening is plausible -- pinned here so
+    the coupling is explicit, and guarded at the engine in
+    tests/runtime/langchain/test_6587_add_documents_retry_attempts.py.
+    """
+
+    def test_hiding_parameters_makes_a_transient_db_error_unretriable(self):
+        exception = ProgrammingError(
+            _INSERT_STMT,
+            _BOUND_VECTORS_CONTAINING_STATUS_CODE_DIGITS,
+            Exception('prepared statement "_pg3_0" already exists'),
+            hide_parameters=True,
+        )
+        assert "hidden due to hide_parameters" in str(exception)
+        assert_substring_path_would_not_have_retried(exception)
+        assert _is_deterministic_db_error(exception) is False
+        assert is_server_error_retriable(exception) is False
