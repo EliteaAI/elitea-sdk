@@ -746,6 +746,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         stats = self.get_indexing_stats()
         return stats.get_summary() if stats else ""
 
+    def _init_indexing_stats(self) -> IndexingStats:
+        self._indexing_stats = IndexingStats()
+        return self._indexing_stats
+
+    def _track_document_unchanged(self, doc_identifier: str):
+        """Kept apart from documents_skipped_* so the report can tell "nothing to do"
+        from "something went wrong". Lives on the base because _reduce_duplicates does:
+        code toolkits skip unchanged documents through that same path.
+        """
+        if not hasattr(self, '_indexing_stats'):
+            self._init_indexing_stats()
+        self._indexing_stats.documents_already_indexed.add(doc_identifier)
+
     def _stamp_loader_stats(self, documents_count: int):
         """Record what the loader produced, for toolkits that don't track it themselves.
 
