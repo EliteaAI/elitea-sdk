@@ -994,8 +994,7 @@ def code_indexing_toolkit(monkeypatch):
 
     def count_chunks(self, base_documents, base_total, chunking_tool, chunking_config,
                      result, index_name=None):
-        # For a chunk-yielding loader every surviving chunk is its own base doc, which is
-        # why docs_count has to be re-derived from the file stats.
+        # A chunk-yielding loader makes every surviving chunk its own base doc.
         chunks = list(base_documents)
         result["count"] = len(chunks)
         result["docs_count"] = len(chunks)
@@ -1009,7 +1008,7 @@ def run_code_index(toolkit, monkeypatch, changed=()):
     monkeypatch.setattr(CodeToolkit, "_get_indexed_data", lambda self, name: indexed)
 
     def fake_loader(self, **kwargs):
-        # CodeIndexerToolkit.loader stamps the files it processed while yielding chunks.
+        # CodeIndexerToolkit.loader stamps files processed while yielding chunks.
         stats = self.get_indexing_stats()
         stats.items_processed = len(CODE_FILES)
         stats.total_fetched = len(CODE_FILES)
@@ -1024,15 +1023,12 @@ def run_code_index(toolkit, monkeypatch, changed=()):
 
 class TestCodeToolkitUnchangedTracking:
     """A code reindex that touched nothing must read "up to date", not "Successfully
-    indexed N files". Regression guard for #6584: dedup matched every file, but nothing
-    on the code toolkit recorded the match, so the whole repository was reported as
-    freshly indexed."""
+    indexed N files" (#6584): dedup matched every file, nothing recorded the match."""
 
     def test_dedup_records_unchanged_files_not_chunks(self, code_indexing_toolkit, monkeypatch):
         run_code_index(code_indexing_toolkit, monkeypatch)
 
-        # Twelve chunks in, three file paths out: the tracked identifier falls through to
-        # key_fn (the filename) because no chunker writes 'name' or 'path'.
+        # Twelve chunks in, three file paths out.
         stats = code_indexing_toolkit.get_indexing_stats()
         assert stats.documents_already_indexed == set(CODE_FILES)
 
@@ -1063,3 +1059,146 @@ class TestCodeToolkitUnchangedTracking:
         stored = code_indexing_toolkit.written[-1]
         assert stored["indexed"] == 3
         assert stored["total"] == 3
+
+
+# A repository that exercises the chunker's own drop path: TreesitterPython collects only
+# function_definition nodes, so a module with no `def` produces no chunks at all.
+PY_CORPUS = {
+    "pkg/__init__.py": "from .a import run\nfrom .b import helper\n",
+    "pkg/constants.py": "TIMEOUT = 30\nRETRIES = 3\n",
+    "pkg/a.py": "def run():\n    return 1\n",
+    "pkg/b.py": "def helper():\n    return 2\n",
+}
+CHUNKED_FILES = {"pkg/a.py", "pkg/b.py"}
+DROPPED_FILES = {"pkg/__init__.py", "pkg/constants.py"}
+
+
+class RealChunkerToolkit(CodeIndexerToolkit):
+    """Drives the real loader and the real universal_chunker over an in-memory repo."""
+
+    def _get_files(self, path="", branch=None):
+        return list(PY_CORPUS)
+
+    def _read_file(self, file, branch=None):
+        return PY_CORPUS[file]
+
+
+@pytest.fixture
+def real_chunker_toolkit(monkeypatch):
+    """Only the vectorstore write is stubbed: loader, chunker, dedup and the counting
+    inside _save_index_generator all run for real."""
+    instance = RealChunkerToolkit.model_construct()
+    object.__setattr__(instance, "_stored_meta", None)
+    object.__setattr__(instance, "vectorstore", FakeStore())
+    object.__setattr__(instance, "active_branch", "main")
+    object.__setattr__(instance, "llm", None)
+    written_chunks = []
+    object.__setattr__(instance, "written_chunks", written_chunks)
+    written_meta = []
+    object.__setattr__(instance, "written", written_meta)
+
+    def fake_add_documents(vectorstore=None, documents=None, ids=None):
+        metadata = dict(documents[0].metadata)
+        if "filename" in metadata:
+            written_chunks.extend(documents)
+            return [f"id-{index}" for index in range(len(documents))]
+        written_meta.append(metadata)
+        object.__setattr__(
+            instance, "_stored_meta", {"id": "meta-1", "content": "index_meta_x", "metadata": metadata}
+        )
+        return ["meta-1"]
+
+    monkeypatch.setattr(
+        "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents", fake_add_documents
+    )
+    monkeypatch.setattr(VectorStoreWrapperBase, "_ensure_vectorstore_initialized", lambda self: None)
+    monkeypatch.setattr(VectorStoreWrapperBase, "get_index_meta", lambda self, name: self._stored_meta)
+    monkeypatch.setattr(VectorStoreWrapperBase, "get_indexed_count", lambda self, name: 0)
+    monkeypatch.setattr(RealChunkerToolkit, "_is_scheduled_run", lambda self: False)
+    monkeypatch.setattr(RealChunkerToolkit, "_clean_index", lambda self, name: None)
+    monkeypatch.setattr(RealChunkerToolkit, "_log_tool_event", lambda self, *a, **kw: None)
+    monkeypatch.setattr(
+        RealChunkerToolkit, "_emit_index_event", lambda self, name, error=None, state=None: None
+    )
+    return instance
+
+
+def store_from(toolkit, index_name="x"):
+    """Rebuild get_code_indexed_data's shape from what the run actually wrote."""
+    store = {}
+    for document in toolkit.written_chunks:
+        filename = document.metadata["filename"]
+        entry = store.setdefault(
+            filename,
+            {"metadata": {"collection": index_name, "filename": filename},
+             "commit_hashes": [], "ids": []},
+        )
+        entry["commit_hashes"].append(document.metadata["commit_hash"])
+        entry["ids"].append(f"{filename}#{len(entry['ids'])}")
+    return store
+
+
+def reindex(toolkit, monkeypatch, corpus=None):
+    """Second pass over a store built from the first pass."""
+    store = store_from(toolkit)
+    monkeypatch.setattr(RealChunkerToolkit, "_get_indexed_data", lambda self, name: store)
+    if corpus is not None:
+        monkeypatch.setitem(PY_CORPUS, *corpus)
+    toolkit.written_chunks.clear()
+    return toolkit.index_data(index_name="x")
+
+
+class TestRealChunkerCodeReindex:
+    """#6584 through the real chunker, which is what decides whether the fix holds: a
+    file it emits nothing for stays counted at load time yet never reaches dedup."""
+
+    def test_the_chunker_drops_python_modules_with_no_def(self, real_chunker_toolkit):
+        chunks = list(real_chunker_toolkit._base_loader(branch="main"))
+
+        produced = {chunk.metadata["filename"] for chunk in chunks}
+        assert produced == CHUNKED_FILES
+        assert not (produced & DROPPED_FILES)
+
+    def test_dropped_files_are_reported_as_skipped_not_indexed(
+        self, real_chunker_toolkit, monkeypatch
+    ):
+        monkeypatch.setattr(RealChunkerToolkit, "_get_indexed_data", lambda self, name: {})
+
+        result = real_chunker_toolkit.index_data(index_name="x")
+
+        totals = result["report"]["totals"]
+        assert totals["indexed"] == 2
+        assert totals["skipped"] == 2
+        # The count the user sees must still cover every file the loader fetched.
+        assert totals["total"] == len(PY_CORPUS)
+        assert real_chunker_toolkit.get_indexing_stats().files_skipped_empty == DROPPED_FILES
+
+    def test_a_no_change_reindex_of_a_python_repo_reads_as_up_to_date(
+        self, real_chunker_toolkit, monkeypatch
+    ):
+        monkeypatch.setattr(RealChunkerToolkit, "_get_indexed_data", lambda self, name: {})
+        real_chunker_toolkit.index_data(index_name="x")
+
+        result = reindex(real_chunker_toolkit, monkeypatch)
+
+        totals = result["report"]["totals"]
+        assert real_chunker_toolkit.written_chunks == []
+        assert totals["indexed"] == 0
+        assert totals["unchanged"] == 2
+        assert totals["total"] == len(PY_CORPUS)
+        assert is_up_to_date_run(totals)
+        assert result["message"].splitlines()[0] == "Up to date — 2 files unchanged."
+
+    def test_only_the_changed_file_is_counted_as_indexed(self, real_chunker_toolkit, monkeypatch):
+        monkeypatch.setattr(RealChunkerToolkit, "_get_indexed_data", lambda self, name: {})
+        real_chunker_toolkit.index_data(index_name="x")
+
+        result = reindex(
+            real_chunker_toolkit, monkeypatch, corpus=("pkg/a.py", "def run():\n    return 99\n")
+        )
+
+        totals = result["report"]["totals"]
+        assert totals["indexed"] == 1
+        assert totals["unchanged"] == 1
+        assert totals["total"] == len(PY_CORPUS)
+        assert result["message"].splitlines()[0] == "Successfully indexed 1 file."
