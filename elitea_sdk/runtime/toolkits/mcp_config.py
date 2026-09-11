@@ -661,14 +661,17 @@ class McpConfigToolkit(BaseToolkit):
         token_keys = [key for key in mcp_tokens.keys() if isinstance(key, str)]
         token_keys_lower_map = {key.lower(): key for key in token_keys}
 
+        # URL keys are endpoint-specific and are also where runtime places a
+        # validated family-token retry. Prefer them over historical name aliases
+        # so an expired or rejected alias cannot shadow a usable target token.
         lookup_candidates = [
+            canonical_url,
+            url,
+            atlassian_alt_url,
             server_name,
             toolkit_name,
             f"mcp_{server_name}" if server_name else None,
             f"mcp_{toolkit_name}" if toolkit_name else None,
-            canonical_url,
-            url,
-            atlassian_alt_url,
         ]
         lookup_candidates = [candidate for candidate in lookup_candidates if isinstance(candidate, str) and candidate]
 
@@ -677,30 +680,46 @@ class McpConfigToolkit(BaseToolkit):
         token_data = None
         matched_key = None
 
+        def has_access_token(value: Any) -> bool:
+            if isinstance(value, dict):
+                return bool(value.get('access_token'))
+            return bool(value) if isinstance(value, str) else False
+
         for candidate in lookup_candidates:
-            token_data = mcp_tokens.get(candidate)
-            if token_data is not None:
+            candidate_token = mcp_tokens.get(candidate)
+            if has_access_token(candidate_token):
+                token_data = candidate_token
                 matched_key = candidate
                 break
 
             lower_candidate = candidate.lower()
             actual_key = token_keys_lower_map.get(lower_candidate)
             if actual_key:
-                token_data = mcp_tokens.get(actual_key)
-                matched_key = actual_key
-                break
+                candidate_token = mcp_tokens.get(actual_key)
+                if has_access_token(candidate_token):
+                    token_data = candidate_token
+                    matched_key = actual_key
+                    break
 
         if not token_data:
             for key in token_keys:
-                if key.endswith(server_name) or key.endswith(toolkit_name or ''):
-                    token_data = mcp_tokens[key]
+                candidate_token = mcp_tokens[key]
+                if (
+                    (key.endswith(server_name) or key.endswith(toolkit_name or ''))
+                    and has_access_token(candidate_token)
+                ):
+                    token_data = candidate_token
                     matched_key = key
                     break
 
         if not token_data:
             # Try to find by URL match
             for token_key, token_info in mcp_tokens.items():
-                if isinstance(token_info, dict) and token_info.get('url') == url:
+                if (
+                    isinstance(token_info, dict)
+                    and token_info.get('url') == url
+                    and has_access_token(token_info)
+                ):
                     token_data = token_info
                     matched_key = token_key
                     break

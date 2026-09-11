@@ -159,6 +159,102 @@ def _normalize_mcp_toolkit_type(tool_type: Optional[str], server_name: Optional[
     return normalized_type or "mcp"
 
 
+def _normalize_mcp_auth_scopes(value: Any) -> List[str]:
+    if isinstance(value, str):
+        values = value.split()
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = []
+    return sorted({str(item).strip() for item in values if str(item).strip()})
+
+
+def _canonical_mcp_authorization_server(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+    return raw.rstrip("/")
+
+
+def _mcp_auth_family_id(resource_url: Any, authorization_server: Any) -> Optional[str]:
+    """Match the UI family boundary: MCP origin plus OAuth authorization server."""
+    parsed_resource = urlparse(str(resource_url or "").strip())
+    canonical_authorization_server = _canonical_mcp_authorization_server(authorization_server)
+    if not parsed_resource.scheme or not parsed_resource.netloc or not canonical_authorization_server:
+        return None
+    resource_origin = f"{parsed_resource.scheme.lower()}://{parsed_resource.netloc.lower()}"
+    return f"{resource_origin}|{canonical_authorization_server}"
+
+
+def _find_compatible_mcp_family_token(
+    mcp_tokens: Optional[dict],
+    auth_error: McpAuthorizationRequired,
+) -> Optional[Dict[str, Any]]:
+    """Return a sibling token only when both sides prove the same auth family.
+
+    Sending every known bearer token to a newly challenged server would leak
+    credentials. The browser therefore forwards non-secret provenance alongside
+    each token, and runtime independently recomputes both family IDs before a
+    one-time retry. Scope checks mirror the browser-side family reuse rules.
+    """
+    if not isinstance(mcp_tokens, dict):
+        return None
+
+    resource_metadata = (
+        auth_error.resource_metadata
+        if isinstance(auth_error.resource_metadata, dict)
+        else {}
+    )
+    authorization_servers = (
+        getattr(auth_error, "authorization_servers", None)
+        or resource_metadata.get("authorization_servers")
+        or []
+    )
+    if isinstance(authorization_servers, str):
+        authorization_servers = [authorization_servers]
+    if not authorization_servers:
+        return None
+
+    target_family_id = _mcp_auth_family_id(auth_error.server_url, authorization_servers[0])
+    if not target_family_id:
+        return None
+    target_scopes = _normalize_mcp_auth_scopes(resource_metadata.get("scopes_supported"))
+
+    for token_info in mcp_tokens.values():
+        if not isinstance(token_info, dict) or not token_info.get("access_token"):
+            continue
+
+        # Do not trust the submitted family label alone. Recompute it from the
+        # source resource and authorization server that the UI recorded after a
+        # successful OAuth exchange, then compare it with the target challenge.
+        source_family_id = _mcp_auth_family_id(
+            token_info.get("resource_server_url"),
+            token_info.get("authorization_server"),
+        )
+        if (
+            not source_family_id
+            or token_info.get("auth_family_id") != source_family_id
+            or source_family_id != target_family_id
+        ):
+            continue
+
+        source_scopes = _normalize_mcp_auth_scopes(token_info.get("resource_scopes"))
+        # An unscoped target may reuse only an unscoped source. An explicitly
+        # scoped target requires every advertised resource scope in the token.
+        if (not target_scopes and source_scopes) or not set(target_scopes).issubset(source_scopes):
+            continue
+
+        # MCP session IDs belong to one transport connection and must not be
+        # copied to a sibling endpoint. The access token is the only credential
+        # needed for the silent retry.
+        return {"access_token": token_info["access_token"]}
+
+    return None
+
+
 def _resolve_mcp_toolkit_identity(
     tool: dict,
     tool_configs: Optional[list] = None,
@@ -1241,6 +1337,40 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         **settings).get_tools()
                 except McpAuthorizationRequired as auth_err:
                     _annotate_mcp_auth_error(auth_err, tool)
+                    family_token = (
+                        None
+                        if any(str(key).lower() == "authorization" for key in (headers or {}))
+                        else _find_compatible_mcp_family_token(mcp_tokens, auth_err)
+                    )
+                    if family_token:
+                        # The target had no direct token entry, but its 401 challenge
+                        # proves that it shares the authenticated sibling's resource
+                        # origin and OAuth server. Retry loading once so the real tools
+                        # are available during this turn and no auth guard reaches the
+                        # user. A rejected token falls through to the normal guard.
+                        family_settings = dict(settings)
+                        family_headers = dict(headers) if headers else {}
+                        family_headers["Authorization"] = f"Bearer {family_token['access_token']}"
+                        family_settings["headers"] = family_headers
+                        family_settings["_oauth_token_injected"] = True
+                        try:
+                            mcp_tools = McpToolkit.get_toolkit(
+                                toolkit_name=resolved_toolkit_name,
+                                toolkit_type=resolved_toolkit_type,
+                                client=elitea_client,
+                                **family_settings,
+                            ).get_tools()
+                        except McpAuthorizationRequired as family_auth_err:
+                            auth_err = family_auth_err
+                            _annotate_mcp_auth_error(auth_err, tool)
+                        else:
+                            logger.info(
+                                "[MCP Auth] Reused a compatible family token for toolkit '%s'",
+                                resolved_toolkit_name,
+                            )
+                            _inject_display_metadata(tool, mcp_tools)
+                            tools.extend(mcp_tools)
+                            continue
                     _is_pipeline_node = (
                         pipeline_node_toolkit_names is not None
                         and (resolved_toolkit_name in pipeline_node_toolkit_names)
@@ -1381,6 +1511,37 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     logger.info(f"✅ Successfully added {len(toolkit_tools)} tools from McpConfigToolkit ({server_name})")
                 except McpAuthorizationRequired as auth_err:
                     _annotate_mcp_auth_error(auth_err, tool)
+                    family_token = _find_compatible_mcp_family_token(mcp_tokens, auth_err)
+                    if family_token:
+                        # McpConfigToolkit resolves tokens by URL/type. Add an
+                        # execution-local target alias and retry once; browser
+                        # storage remains authoritative across later turns.
+                        family_mcp_tokens = dict(mcp_tokens or {})
+                        target_url = canonical_resource(auth_err.server_url)
+                        family_mcp_tokens[target_url] = family_token
+                        try:
+                            toolkit_tools = McpConfigToolkit.get_toolkit(
+                                server_name=server_name,
+                                server_config=server_config,
+                                user_config=settings,
+                                selected_tools=selected_tools if selected_tools else None,
+                                excluded_tools=excluded_tools if excluded_tools else None,
+                                toolkit_name=toolkit_name,
+                                toolkit_type=toolkit_type,
+                                client=elitea_client,
+                                mcp_tokens=family_mcp_tokens,
+                            ).get_tools()
+                        except McpAuthorizationRequired as family_auth_err:
+                            auth_err = family_auth_err
+                            _annotate_mcp_auth_error(auth_err, tool)
+                        else:
+                            logger.info(
+                                "[MCP Auth] Reused a compatible family token for pre-configured toolkit '%s'",
+                                toolkit_name,
+                            )
+                            _inject_display_metadata(tool, toolkit_tools)
+                            tools.extend(toolkit_tools)
+                            continue
                     _is_pipeline_node = (
                         pipeline_node_toolkit_names is not None
                         and toolkit_name in pipeline_node_toolkit_names
