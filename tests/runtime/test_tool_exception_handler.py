@@ -249,7 +249,7 @@ class TestErrorProseIsByteStable:
             "*IMPORTANT*: if fixing logic is clear - you can re-try tool execution "
             "according to fix.\n"
             "If you continue experiencing issues, please [contact support]"
-            "(https://elitea.ai/docs/support/contact-support/)"
+            "(https://docs.elitea.ai/support/contact-support/)"
         )
 
 
@@ -324,7 +324,7 @@ class TestEnrichmentGatedOnErrorClass:
             "*IMPORTANT*: if fixing logic is clear - you can re-try tool execution "
             "according to fix.\n"
             "If you continue experiencing issues, please [contact support]"
-            "(https://elitea.ai/docs/support/contact-support/)"
+            "(https://docs.elitea.ai/support/contact-support/)"
         )
 
 
