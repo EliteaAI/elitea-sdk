@@ -29,6 +29,9 @@ dependencies = [
     "certifi==2024.8.30",
     "truststore>=0.10.4",
     "aiohttp>=3.9.0",
+    # Pylon 1.2.25 preloads typing-extensions 4.15.0. AnyIO 4.15+ requires
+    # typing-extensions 4.16 and fails before isolated plugin paths can override it.
+    "anyio==4.14.0",
 ]
 
 [[project.authors]]
