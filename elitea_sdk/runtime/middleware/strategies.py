@@ -242,7 +242,7 @@ class TransformErrorStrategy(ExceptionHandlerStrategy):
     @staticmethod
     def _decorate_enrichment(human_error: str) -> str:
         return (f'{human_error}\n\n*IMPORTANT*: if fixing logic is clear - you can re-try tool execution according to fix.\n'
-                f'If you continue experiencing issues, please [contact support](https://elitea.ai/docs/support/contact-support/)')
+                f'If you continue experiencing issues, please [contact support](https://docs.elitea.ai/support/contact-support/)')
 
     def _generate_llm_error(self, context: ExceptionContext) -> Optional[str]:
         """Use LLM to generate human-readable error."""
