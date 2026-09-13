@@ -51,6 +51,28 @@ class IndexingStatus(str, Enum):
     ERROR = "error"
 
 
+INDEX_DATA_TOOL_NAME = "index_data"
+INDEXING_STATUS_VALUES = frozenset(status.value for status in IndexingStatus)
+
+
+def _is_index_run_outcome(tool_name: str, result: Any) -> bool:
+    return (
+        tool_name == INDEX_DATA_TOOL_NAME
+        and isinstance(result, dict)
+        and result.get("status") in INDEXING_STATUS_VALUES
+        and isinstance(result.get("message"), str)
+        and bool(result["message"].strip())
+    )
+
+
+def read_declared_failure(tool_name: str, result: Any) -> Optional[str]:
+    if not _is_index_run_outcome(tool_name, result):
+        return None
+    if result["status"] != IndexingStatus.ERROR.value:
+        return None
+    return result["message"]
+
+
 # Kept in step with the UI's RUNNABLE_INDEX_STATUSES.
 COMPLETED_INDEX_STATES = frozenset({
     IndexerKeywords.INDEX_META_COMPLETED.value,
