@@ -28,7 +28,7 @@ from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..exceptions import budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
-from ...tools.base_indexer_toolkit import IndexTools
+from ...tools.base_indexer_toolkit import IndexTools, read_declared_failure
 from ...tools.exceptions import ToolkitConfigurationError
 from ..middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from ...configurations import get_class_configurations
@@ -1896,10 +1896,7 @@ class EliteAClient:
                     elif hasattr(callback, 'dispatched_events'):
                         events_dispatched.extend(callback.dispatched_events)
 
-                logger.info(f"Tool '{tool_name}' executed successfully in {execution_time:.3f} seconds")
-
-                return {
-                    "success": True,
+                outcome = {
                     "result": result,
                     "tool_name": tool_name,
                     "toolkit_config": toolkit_config_parsed_json,
@@ -1907,6 +1904,23 @@ class EliteAClient:
                     "events_dispatched": events_dispatched,
                     "execution_time_seconds": execution_time
                 }
+                declared_failure = read_declared_failure(normalized_tool_name, result)
+
+                if declared_failure is not None:
+                    logger.info(
+                        f"Tool '{tool_name}' reported a failure in {execution_time:.3f} seconds: "
+                        f"{declared_failure}"
+                    )
+                    return {
+                        **outcome,
+                        "success": False,
+                        "error": declared_failure,
+                        "debug_error": declared_failure
+                    }
+
+                logger.info(f"Tool '{tool_name}' executed successfully in {execution_time:.3f} seconds")
+
+                return {**outcome, "success": True}
 
             except ToolkitConfigurationError as config_error:
                 # FIXME: Consider creating a helper function to return toolkit results 
