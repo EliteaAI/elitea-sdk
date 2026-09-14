@@ -941,24 +941,26 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # the previous run's counts into this run's report.
             self._indexing_stats = IndexingStats()
             empty_loader = False
-            try:
-                documents = self._base_loader(**kwargs)
-                documents = list(documents) # consume/exhaust generator to count items
-                documents_count = len(documents)
-                self._stamp_loader_stats(documents_count)
-                # A loader that soft-fails to zero documents over a previously
-                # built index must never publish or rewrite counts.
-                empty_loader = documents_count == 0 and self._has_previous_index_run()
-                if not empty_loader:
-                    documents = (doc for doc in documents)
-                    self._log_tool_event(f"Base documents were pre-loaded. "
-                                         f"Search for possible document duplicates and remove them from the indexing list...")
-                    documents = self._reduce_duplicates(documents, index_name)
-                    self._log_tool_event(f"Duplicates were removed. "
-                                         f"Processing documents to collect dependencies and prepare them for indexing...")
-                    self._save_index_generator(documents, documents_count, chunking_tool, chunking_config, index_name=index_name, result=result)
-            finally:
-                self._stop_run_heartbeat()
+            # The heartbeat deliberately outlives the document loop: promote_run
+            # runs after it and holds the meta row for seconds to minutes on a
+            # large corpus. Stopping here left a healthy run with a frozen
+            # heartbeat and a still-pending run row, which every liveness reader
+            # is entitled to call dead. The run-scope stop is in the finally below.
+            documents = self._base_loader(**kwargs)
+            documents = list(documents) # consume/exhaust generator to count items
+            documents_count = len(documents)
+            self._stamp_loader_stats(documents_count)
+            # A loader that soft-fails to zero documents over a previously
+            # built index must never publish or rewrite counts.
+            empty_loader = documents_count == 0 and self._has_previous_index_run()
+            if not empty_loader:
+                documents = (doc for doc in documents)
+                self._log_tool_event(f"Base documents were pre-loaded. "
+                                     f"Search for possible document duplicates and remove them from the indexing list...")
+                documents = self._reduce_duplicates(documents, index_name)
+                self._log_tool_event(f"Duplicates were removed. "
+                                     f"Processing documents to collect dependencies and prepare them for indexing...")
+                self._save_index_generator(documents, documents_count, chunking_tool, chunking_config, index_name=index_name, result=result)
             if empty_loader:
                 return self._finalize_empty_loader_run(index_name)
             #
@@ -1090,6 +1092,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 msg = f"{msg}; additionally failed to update index meta status to FAILED: {ie}"
             self._emit_index_event(index_name, error=msg, state=IndexerKeywords.INDEX_META_FAILED.value)
             raise e
+        finally:
+            # Backstop for every exit: the handlers above stop it first so their
+            # ordering is unchanged, and this covers the success path, the
+            # empty-loader return and the promote-abort returns.
+            self._stop_run_heartbeat()
 
     def _staging_active(self) -> bool:
         adapter = self.vector_adapter

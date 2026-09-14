@@ -55,6 +55,10 @@ def compile_sql(clause) -> str:
     return str(clause.compile(dialect=postgresql.dialect()))
 
 
+def compiled_params(clause) -> dict:
+    return dict(clause.compile(dialect=postgresql.dialect()).params)
+
+
 class RecordingSession:
     """Session double: records the statements built against it, executes none."""
 
@@ -142,22 +146,26 @@ class TestTheWriteIsKeyedAndEmbedFree:
         PGVectorAdapter().update_index_meta_keys(
             make_wrapper(), "meta-1", "run-1", {"state": "in_progress"},
         )
-        sql = compile_sql(meta_statement(sessions))
+        statement = meta_statement(sessions)
+        sql = compile_sql(statement)
 
         assert "NOT (EXISTS" in sql
         assert "elitea_index_runs" in sql
-        assert "status" in sql
+        # The status is a BIND PARAMETER, so asserting on SQL text says nothing about
+        # WHICH status is guarded — swapping it for `pending` leaves the text identical
+        # and silently drops every terminal write.
+        assert "cancelled" in compiled_params(statement).values()
 
-    def test_the_guard_admits_a_promoted_run(self, sessions):
+    def test_the_guard_is_not_the_heartbeats_pending_rule(self, sessions):
         """The heartbeat's EXISTS(pending) guard would drop every terminal write:
         promote_run has already moved the run row off `pending` by then."""
         PGVectorAdapter().update_index_meta_keys(
             make_wrapper(), "meta-1", "run-1", {"state": "completed"},
         )
-        sql = compile_sql(meta_statement(sessions))
+        values = compiled_params(meta_statement(sessions)).values()
 
-        assert "promoted" not in sql
-        assert "pending" not in sql
+        assert "pending" not in values
+        assert "promoted" not in values
 
     def test_without_a_run_row_the_write_is_unguarded(self, sessions):
         PGVectorAdapter().update_index_meta_keys(
@@ -364,6 +372,25 @@ class TestNoEmbeddingOnTheMetaWrite:
             )
 
 
+def _bare_toolkit(monkeypatch, max_docs_per_add):
+    """A toolkit wired just enough to drive _save_index_generator directly."""
+    instance = StagingToolkit.model_construct()
+    object.__setattr__(instance, "vector_adapter", FakeStagingAdapter())
+    object.__setattr__(instance, "max_docs_per_add", max_docs_per_add)
+    object.__setattr__(instance, "_index_run", _IndexRunState(run_id="run-1"))
+    monkeypatch.setattr(VectorStoreWrapperBase, "_ensure_vectorstore_initialized", lambda self: None)
+    monkeypatch.setattr(StagingToolkit, "_log_tool_event", lambda self, *a, **kw: None)
+    monkeypatch.setattr(StagingToolkit, "_staging_active", lambda self: False)
+    monkeypatch.setattr(StagingToolkit, "_extend_data", lambda self, docs: docs)
+    monkeypatch.setattr(StagingToolkit, "_collect_dependencies", lambda self, docs: docs)
+    monkeypatch.setattr(
+        StagingToolkit, "_apply_loaders_chunkers",
+        lambda self, docs, chunking_tool=None, chunking_config=None: docs,
+    )
+    monkeypatch.setattr(StagingToolkit, "_clean_metadata", lambda self, docs: docs)
+    return instance
+
+
 def make_documents(*ids):
     return [Document(page_content="body", metadata={"id": i, "name": i, "updated_on": "1"})
             for i in ids]
@@ -429,3 +456,110 @@ class TestAFailedRunIsAlwaysRecordedBeforeItIsAnnounced:
         assert "promote" in toolkit.vector_adapter.calls
         failed = IndexerKeywords.INDEX_META_FAILED.value
         assert toolkit.emitted[-1]["state"] == failed
+
+
+class TestProgressIsSeededAndCounted:
+
+    def test_the_heartbeat_ticks_before_the_first_interval(self, toolkit):
+        # run_chunks does not survive the platform's run-start reset, so until the
+        # first tick lands the list view has only the previous run's counts.
+        seed_meta(toolkit)
+        toolkit._start_run_heartbeat("x")
+        toolkit._stop_run_heartbeat()
+
+        assert toolkit.vector_adapter.calls.count("heartbeat") >= 1
+        assert toolkit.vector_adapter.heartbeat_chunks[0] == 0
+
+    def test_the_tick_reports_the_runs_current_chunk_count(self, toolkit):
+        seed_meta(toolkit)
+        toolkit._index_run.chunks_written = 17
+
+        toolkit._start_run_heartbeat("x")
+        toolkit._stop_run_heartbeat()
+
+        assert toolkit.vector_adapter.heartbeat_chunks[-1] == 17
+
+    def test_only_chunks_that_landed_are_counted(self, monkeypatch):
+        flushed = []
+        instance = _bare_toolkit(monkeypatch, max_docs_per_add=2)
+
+        def fake_add_documents(vectorstore=None, documents=None, ids=None):
+            flushed.append(len(documents))
+            return [f"id-{n}" for n in range(len(documents))]
+
+        monkeypatch.setattr(
+            "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
+            fake_add_documents,
+        )
+        documents = make_documents("a", "b", "c")
+        result = {"count": 0, "failed_count": 0, "docs_count": 0, "failed_docs": 0}
+        instance._save_index_generator(iter(documents), len(documents), None, None, result, "x")
+
+        assert sum(flushed) == 3
+        assert instance._index_run.chunks_written == 3
+
+    def test_a_failed_flush_is_not_counted_as_written(self, monkeypatch):
+        instance = _bare_toolkit(monkeypatch, max_docs_per_add=1)
+
+        def exploding_add_documents(vectorstore=None, documents=None, ids=None):
+            raise RuntimeError("flush failed")
+
+        monkeypatch.setattr(
+            "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
+            exploding_add_documents,
+        )
+        result = {"count": 0, "failed_count": 0, "docs_count": 0, "failed_docs": 0}
+        instance._save_index_generator(iter(make_documents("a")), 1, None, None, result, "x")
+
+        assert instance._index_run.chunks_written == 0
+
+
+class TestTheHeartbeatOutlivesTheDocumentLoop:
+    """promote_run holds the meta row for seconds to minutes on a large corpus, and
+    it runs AFTER the document loop. A heartbeat that stops at the end of the loop
+    leaves a healthy run with a frozen heartbeat and a still-pending run row, which
+    every liveness reader is then entitled to call dead."""
+
+    def test_the_heartbeat_is_still_running_when_promote_is_called(self, toolkit, monkeypatch):
+        ticks_at_promote = {}
+
+        def save(self, base_documents, base_total, chunking_tool, chunking_config,
+                 result, index_name=None):
+            for _ in base_documents:
+                result["count"] += 2
+                result["docs_count"] += 1
+
+        original_promote = FakeStagingAdapter.promote_run
+
+        def recording_promote(self, wrapper, index_name, run_id, superseded, orphan, damaged):
+            run = wrapper._index_run
+            ticks_at_promote["stopped"] = (
+                run.heartbeat_stop is not None and run.heartbeat_stop.is_set()
+            )
+            return original_promote(self, wrapper, index_name, run_id, superseded, orphan, damaged)
+
+        monkeypatch.setattr(FakeStagingAdapter, "promote_run", recording_promote)
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents("a")))
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator", save)
+
+        toolkit.index_data(index_name="x")
+
+        assert ticks_at_promote["stopped"] is False, (
+            "the heartbeat must still be live while promote holds the meta row"
+        )
+
+    def test_the_run_still_stops_its_heartbeat_when_it_finishes(self, toolkit, monkeypatch):
+        def save(self, base_documents, base_total, chunking_tool, chunking_config,
+                 result, index_name=None):
+            for _ in base_documents:
+                result["count"] += 2
+                result["docs_count"] += 1
+
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents("a")))
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator", save)
+
+        toolkit.index_data(index_name="x")
+
+        assert toolkit._index_run.heartbeat_stop.is_set()
