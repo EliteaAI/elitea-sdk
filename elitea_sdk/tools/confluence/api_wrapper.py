@@ -1349,7 +1349,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     else:
                         yield Document(page_content="", metadata={
                             **metadata,
-                            IndexerKeywords.CONTENT_FILE_NAME.value: f".{file_ext}",
+                            IndexerKeywords.CONTENT_FILE_NAME.value: title or f".{file_ext}",
                             IndexerKeywords.CONTENT_IN_BYTES.value: content
                         })
         except Exception as e:

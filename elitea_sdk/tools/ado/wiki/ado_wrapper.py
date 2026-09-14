@@ -1240,7 +1240,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                         'parent_page_id': parent_id,
                         'parent_page_path': parent_path,
                         'updated_on': att_hash,
-                        IndexerKeywords.CONTENT_FILE_NAME.value: file_ext,
+                        IndexerKeywords.CONTENT_FILE_NAME.value: file_name or file_ext,
                         IndexerKeywords.CONTENT_IN_BYTES.value: attachment_bytes,
                     },
                 )

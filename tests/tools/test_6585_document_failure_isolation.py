@@ -686,6 +686,61 @@ class TestADependentIsNamedByItsOwnFile:
         assert stats.runtime_skipped_error == set()
 
 
+class TestLoadersNameTheAttachmentTheyFetch:
+
+    def test_confluence_passes_the_attachment_filename(self, monkeypatch):
+        from elitea_sdk.tools.confluence.api_wrapper import ConfluenceAPIWrapper
+
+        wrapper = ConfluenceAPIWrapper.model_construct()
+        object.__setattr__(wrapper, "_index_include_attachments", True)
+        monkeypatch.setattr(ConfluenceAPIWrapper, "_attachment_passes_extension_filters",
+                            lambda self, name: True)
+        monkeypatch.setattr(ConfluenceAPIWrapper, "_build_page_url", lambda self, links: "http://x")
+
+        class FakeClient:
+            url = "http://confluence"
+            def history(self, attachment_id):
+                return {}
+            def request(self, method=None, path=None, advanced_mode=False):
+                return type("R", (), {"status_code": 200, "content": b"%PDF-1.4"})()
+
+        object.__setattr__(wrapper, "client", FakeClient())
+        parent = Document(page_content="body", metadata={"id": "page-1", "_attachments_data": [{
+            "id": "att-1", "title": "design.pdf", "extensions": {"fileSize": 10},
+            "metadata": {"mediaType": "application/pdf", "labels": {"results": []}},
+            "_links": {"download": "/download/design.pdf"},
+        }]})
+
+        emitted = list(wrapper._process_document(parent))
+
+        assert emitted, "the attachment should have been emitted"
+        assert emitted[0].metadata[IndexerKeywords.CONTENT_FILE_NAME.value] == "design.pdf"
+
+    def test_ado_wiki_passes_the_attachment_filename(self, monkeypatch):
+        from elitea_sdk.tools.ado.wiki import ado_wrapper as ado
+        Wrapper = ado.AzureDevOpsApiWrapper
+
+        wrapper = Wrapper.model_construct()
+        object.__setattr__(wrapper, "_index_include_attachments", True)
+        object.__setattr__(wrapper, "_index_wiki_identifier", "wiki")
+        object.__setattr__(wrapper, "_index_workers", 1)
+        monkeypatch.setattr(Wrapper, "_apply_image_processing_to_parent", lambda self, doc: None)
+        monkeypatch.setattr(Wrapper, "_get_repos_wrapper", lambda self, ident: object())
+        monkeypatch.setattr(Wrapper, "_matches_extension_filter", lambda self, name: True)
+        monkeypatch.setattr(Wrapper, "_download_attachment_with_retry",
+                            lambda self, repos, path: b"\x89PNG payload")
+
+        parent = Document(page_content="body", metadata={
+            "id": "page-1", "path": "/Home",
+            "_ado_wiki_attachments": ["/.attachments/diagram.png"],
+        })
+
+        emitted = list(wrapper._process_document(parent))
+
+        assert emitted, "the attachment should have been emitted"
+        assert emitted[0].metadata[IndexerKeywords.CONTENT_FILE_NAME.value] == "diagram.png"
+
+
 class TestNamelessDocumentsDoNotCollapse:
 
     def test_two_untitled_pages_failing_are_two_failures(self, monkeypatch):
@@ -783,6 +838,36 @@ class TestTheSecondParseBranch:
         stats = self.parse(monkeypatch, {"id": 7, "path": "/Home/Setup", "updated_on": "1"})
 
         assert stats.total_fetched == stats.items_processed + stats.to_dict()["total_skipped"]
+
+
+class TestSharePointImagesAreStamped:
+
+    def test_a_onenote_image_carries_the_dependent_marker(self, monkeypatch):
+        from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
+
+        class FakeBackend:
+            def _onenote_parse_page_items(self, page_id, capture_images,
+                                          include_attachments, read_attachment_content):
+                return [{"type": "image", "raw_bytes": b"\x89PNG",
+                         "description": "", "filename": "diagram.jpg"}]
+            def onenote_get_page_content(self, page_id):
+                return "<html>page</html>"
+
+        wrapper = SharepointApiWrapper.model_construct()
+        object.__setattr__(wrapper, "_backend", FakeBackend())
+        object.__setattr__(wrapper, "_onenote_cfg", {"capture_images": True})
+        monkeypatch.setattr(SharepointApiWrapper, "_sync_backend_context", lambda self: None)
+        page = Document(page_content="", metadata={
+            "source_type": "onenote", "id": "1-abc!123", "title": "Notes",
+            "updated_on": "1", "webUrl": "http://x",
+        })
+
+        emitted = list(wrapper._extend_data(iter([page])))
+
+        images = [d for d in emitted if d.metadata.get("source_type") == "onenote_image"]
+        assert images, "the OneNote image should have been emitted"
+        assert images[0].metadata[DEPENDENT_DOC_META_KEY] is True
+        assert images[0].metadata[IndexerKeywords.PARENT.value] == "1-abc!123"
 
 
 class TestReportBudget:
