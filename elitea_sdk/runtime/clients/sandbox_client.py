@@ -12,9 +12,28 @@ logger = logging.getLogger(__name__)
 # Use only the first 10 KB for chardet so it doesn't scan the whole file (slow for large files).
 _CHARDET_SAMPLE_SIZE = 10 * 1024
 
+# Distinguishes "no default given, raise" from a caller passing None as the default.
+_UNSET = object()
+
 
 class ApiDetailsRequestError(Exception):
     ...
+
+
+class PrivateSecretError(Exception):
+    """ Base error for personal-project secret lookups """
+
+
+class NoPersonalProject(PrivateSecretError):
+    """ The executing user has no personal project to read secrets from """
+
+
+class PrivateSecretNotShared(PrivateSecretError):
+    """ The secret exists but its owner has not allowed external access to it """
+
+
+class PrivateSecretNotFound(PrivateSecretError):
+    """ No such secret in the executing user's personal project """
 
 
 class SandboxArtifact:
@@ -238,6 +257,7 @@ class SandboxClient:
         self.application_versions = f'{self.base_url}{self.api_v2_path}/elitea_core/version/prompt_lib/{self.project_id}'
         self.list_apps_url = f'{self.base_url}{self.api_v2_path}/elitea_core/applications/prompt_lib/{self.project_id}'
         self.secrets_url = f'{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}'
+        self.private_secrets_url = f'{self.base_url}{self.api_v2_path}/secrets/private_secret/{self.project_id}'
         self.artifacts_url = f'{self.base_url}{self.api_v2_path}/artifacts/artifacts/default/{self.project_id}'
         self.artifact_url = f'{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}'
         self.bucket_url = f'{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}'
@@ -329,6 +349,53 @@ class SandboxClient:
         value = data.get('value', None)
         logger.debug(f"Unsecret '{secret_name}': has_value={value is not None}")
         return value
+
+    def get_private_project_secret(self, secret_name: str, default: Any = _UNSET):
+        """Read a secret from the executing user's own personal project.
+
+        Unlike `unsecret`, which reads the current (possibly shared) project, this returns a
+        per-user value: the same pipeline run by two users resolves two different secrets. The
+        owner must have marked the secret as externally accessible; there is deliberately no
+        fallback to a same-named secret in the shared project.
+        """
+        url = f'{self.private_secrets_url}/{quote(str(secret_name), safe="")}'
+        response = self._request('get', url, headers=self.headers, verify=False)
+        #
+        if response.ok:
+            value = response.json().get('value', None)
+            logger.debug(f"Private secret '{secret_name}': has_value={value is not None}")
+            return value
+        #
+        try:
+            reason = response.json().get('error', '')
+        except ValueError:
+            reason = ''
+        #
+        if reason == 'no_personal_project':
+            error = NoPersonalProject(
+                f"Cannot read private secret '{secret_name}': the executing user has no personal"
+                " project. Unattended runs (schedules, webhooks) have no user to resolve."
+            )
+        elif reason == 'not_shared':
+            error = PrivateSecretNotShared(
+                f"Private secret '{secret_name}' is not shared. Its owner must enable"
+                " 'Allow external access' on it in their personal project's secrets."
+            )
+        elif reason == 'not_found':
+            error = PrivateSecretNotFound(
+                f"Private secret '{secret_name}' does not exist in the executing user's"
+                " personal project."
+            )
+        else:
+            error = PrivateSecretError(
+                f"Cannot read private secret '{secret_name}':"
+                f" {response.status_code} {reason or response.reason}"
+            )
+        #
+        if default is not _UNSET:
+            logger.warning(f"Private secret '{secret_name}' unavailable, using default: {error}")
+            return default
+        raise error
 
     def artifact(self, bucket_name):
         return SandboxArtifact(self, bucket_name)
