@@ -35,6 +35,11 @@ REPORT_VERSION = 1
 REPORT_ITEMS_SAMPLE_SIZE = 5
 REPORT_ERRORS_SAMPLE_SIZE = 5
 REPORT_ERROR_MAX_LENGTH = 500
+ERROR_DOC_NAMES_SAMPLE_SIZE = 3
+ERROR_DOC_NAMES_MAX_LENGTH = REPORT_ERROR_MAX_LENGTH // 2
+
+DEPENDENT_DOC_META_KEY = "indexer_dependent_doc"
+_STATS_COUNTER_LOCK = threading.Lock()
 
 # SQLAlchemy embeds the failing statement and its bound parameters into every
 # exception message. One failing batch of 20 chunks therefore yields a distinct
@@ -457,6 +462,41 @@ def normalize_report_errors(errors: Optional[List[str]]) -> Tuple[List[str], int
     return distinct[:REPORT_ERRORS_SAMPLE_SIZE], len(distinct)
 
 
+def record_grouped_error(result: Dict[str, Any], doc_names: List[str], exc: Exception) -> None:
+    root_cause = _ERROR_DETAIL_TAIL.sub("", str(exc)).strip() or str(exc)
+    names = result.setdefault("error_groups", {}).setdefault(root_cause, {})
+    for doc_name in doc_names:
+        names.setdefault(doc_name, None)
+
+
+def _sample_document_names(names: Dict[str, None]) -> str:
+    listed: List[str] = []
+    for name in list(names)[:ERROR_DOC_NAMES_SAMPLE_SIZE]:
+        candidate = ", ".join(listed + [name])
+        if len(candidate) > ERROR_DOC_NAMES_MAX_LENGTH:
+            break
+        listed.append(name)
+    if not listed:
+        return ""
+    remainder = len(names) - len(listed)
+    sampled = ", ".join(listed)
+    return f"{sampled} and {remainder} more" if remainder else sampled
+
+
+def render_grouped_errors(error_groups: Dict[str, Dict[str, None]]) -> List[str]:
+    rendered: List[str] = []
+    for root_cause, names in (error_groups or {}).items():
+        head = _sample_document_names(names)
+        if not head:
+            rendered.append(root_cause)
+            continue
+        budget = REPORT_ERROR_MAX_LENGTH - len(head) - len(": ") - len("…")
+        if budget < len(root_cause):
+            root_cause = root_cause[:budget].rstrip() + "…"
+        rendered.append(f"{head}: {root_cause}")
+    return rendered
+
+
 def _sample_skipped_payload(skipped: Any, sample_size: int = REPORT_ITEMS_SAMPLE_SIZE) -> Any:
     """Cut every name list in an IndexingStats.to_dict() payload down to a sample.
 
@@ -646,6 +686,7 @@ class _IndexRunState:
     recorded_row_pks: Dict[str, List[str]] = field(default_factory=dict)
     damaged_keys: Set[str] = field(default_factory=set)
     pipeline_failed_keys: Set[str] = field(default_factory=set)
+    doc_names: Dict[str, str] = field(default_factory=dict)
     counted_doc_keys: Set[str] = field(default_factory=set)
     seen_keys: Set[str] = field(default_factory=set)
     orphan_candidate_ids: List[str] = field(default_factory=list)
@@ -730,7 +771,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _remove_metadata_keys(self) -> List[str]:
         """ Returns a list of metadata keys to be removed from documents before indexing.
         Override this method in subclasses to provide specific keys to remove."""
-        return [IndexerKeywords.CONTENT_IN_BYTES.value, IndexerKeywords.CONTENT_FILE_NAME.value]
+        return [IndexerKeywords.CONTENT_IN_BYTES.value, IndexerKeywords.CONTENT_FILE_NAME.value,
+                DEPENDENT_DOC_META_KEY]
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         """ Loads documents from a source, processes them,
@@ -758,6 +800,34 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if not hasattr(self, '_indexing_stats'):
             self._init_indexing_stats()
         self._indexing_stats.documents_already_indexed.add(doc_identifier)
+
+    def _track_document_failed(self, doc_name: str, base_doc: Optional[Document] = None):
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        if base_doc is not None and self._is_base_doc_tracked_as_skipped(base_doc):
+            return
+        with _STATS_COUNTER_LOCK:
+            if doc_name in stats.documents_skipped_error:
+                return
+            stats.documents_skipped_error.add(doc_name)
+            stats.items_processed = max(stats.items_processed - 1, 0)
+
+    def _track_dependent_parse_failure(self, item_name: str, reason: str):
+        if hasattr(self, '_track_skipped_attachment'):
+            self._track_skipped_attachment(item_name, reason=reason)
+
+    def _track_base_parse_failure(self, doc_name: str, skip_set_name: str):
+        doc_name = str(doc_name)
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        skip_set = getattr(stats, skip_set_name)
+        with _STATS_COUNTER_LOCK:
+            if doc_name in skip_set:
+                return
+            skip_set.add(doc_name)
+            stats.items_processed = max(stats.items_processed - 1, 0)
+
+    def _track_document_damaged(self, doc_name: str):
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        stats.documents_skipped_error.add(doc_name)
 
     def _stamp_loader_stats(self, documents_count: int):
         """Record what the loader produced, for toolkits that don't track it themselves.
@@ -823,7 +893,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         self._index_run = _IndexRunState(run_id=uuid4().hex[:12], clean_index=bool(clean_index))
 
-        result = {"count": 0, "failed_count": 0, "docs_count": 0}
+        result = {"count": 0, "failed_count": 0, "docs_count": 0, "failed_docs": 0}
         #
         try:
             self._ensure_vectorstore_initialized()
@@ -867,7 +937,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             failed_chunks_count = result.get("failed_count", 0)
             succeeded_chunks_count = chunks_count - failed_chunks_count
             docs_count = result.get("docs_count", 0)
-            errors = result.get("errors", [])
+            errors = render_grouped_errors(result.get("error_groups")) + result.get("errors", [])
+
+            run = self._index_run
+            damaged_doc_keys = (run.damaged_keys | run.pipeline_failed_keys) if staging else set()
+            flush_damaged_keys = (run.damaged_keys - run.pipeline_failed_keys) if staging else set()
+            for flush_damaged_key in flush_damaged_keys:
+                self._track_document_damaged(run.doc_names.get(flush_damaged_key, flush_damaged_key))
 
             stats = self.get_indexing_stats()
             skipped_data = stats.to_dict() if stats else None
@@ -885,12 +961,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if self.loader_yields_chunks and effective_processed > 0:
                 docs_count = effective_processed
 
-            run = self._index_run
-            damaged_doc_keys = (run.damaged_keys | run.pipeline_failed_keys) if staging else set()
-            if damaged_doc_keys:
+            if flush_damaged_keys:
                 # Counted on buffer append, before any flush outcome — keeping
                 # them would render the damaged docs as retained content.
-                docs_count = max(docs_count - len(run.counted_doc_keys & damaged_doc_keys), 0)
+                docs_count = max(docs_count - len(run.counted_doc_keys & flush_damaged_keys), 0)
+
+            lost_documents = bool(damaged_doc_keys) or result.get("failed_docs", 0) > 0
+            nothing_survived = docs_count + unchanged_count <= 0
 
             # Chunk counts drive the state only — never the user-facing summary.
             if failed_chunks_count > 0 and succeeded_chunks_count > 0:
@@ -899,10 +976,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             elif failed_chunks_count > 0 >= succeeded_chunks_count:
                 final_state = IndexerKeywords.INDEX_META_FAILED.value
                 status = IndexingStatus.ERROR
-            elif damaged_doc_keys:
-                # The parallel pipeline swallows per-doc failures into errors
-                # without touching either chunk counter — a run that lost
-                # documents must not land 'completed'.
+            elif lost_documents and nothing_survived:
+                final_state = IndexerKeywords.INDEX_META_FAILED.value
+                status = IndexingStatus.ERROR
+            elif lost_documents:
                 final_state = IndexerKeywords.INDEX_META_PARTLY_OK.value
                 status = IndexingStatus.PARTLY_INDEXED
             else:
@@ -1254,9 +1331,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 err = format_exc()
                 logger.error(f"Failed to add {len(chunk)} documents to vectorstore: {err}")
                 result["failed_count"] = result.get("failed_count", 0) + len(chunk)
-                error_msg = str(exc)
-                if error_msg not in result.setdefault("errors", []):
-                    result["errors"].append(error_msg)
+                record_grouped_error(
+                    result, [self._extract_doc_name(doc.metadata) for doc in chunk], exc
+                )
                 if staging:
                     # Failed chunks are dropped, never retried, so a doc with any
                     # chunk in this batch can never reach pending count zero —
@@ -1297,6 +1374,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     base_doc.metadata = loader_metadata
                 return _run_pipeline(base_doc)
 
+        def _handle_pipeline_failure(base_doc: Document, base_doc_counter: int, exc: Exception) -> None:
+            from traceback import format_exc
+            doc_name = self._extract_doc_name(base_doc.metadata)
+            logger.error(f"Pipeline failed for base doc #{base_doc_counter} '{doc_name}': {format_exc()}")
+            record_grouped_error(result, [doc_name], exc)
+            result["failed_docs"] = result.get("failed_docs", 0) + 1
+            if staging:
+                failed_doc_key = str(self.key_fn(base_doc))
+                if failed_doc_key != IDLESS_STAGING_KEY:
+                    run.pipeline_failed_keys.add(failed_doc_key)
+                    run.doc_names.setdefault(failed_doc_key, doc_name)
+
         def _consume_pipeline_output(base_doc: Document, base_doc_counter: int, chunks: List[Document]) -> None:
             """Main-thread-only. Applies index_name/collection metadata, buffers
             chunks, and updates per-base-doc counters + skip trackers. Kept
@@ -1323,6 +1412,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     chunk_key = self._staging_key(doc.metadata)
                     if chunk_key != IDLESS_STAGING_KEY:
                         run.pending_chunk_counts[chunk_key] = run.pending_chunk_counts.get(chunk_key, 0) + 1
+                        run.doc_names.setdefault(chunk_key, _doc_name)
                 pg_vector_add_docs_chunk.append(doc)
                 dependent_docs_counter += 1
                 if len(pg_vector_add_docs_chunk) >= self.max_docs_per_add:
@@ -1340,13 +1430,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     if counted_key != IDLESS_STAGING_KEY:
                         run.counted_doc_keys.add(counted_key)
             else:
-                # Base doc yielded zero chunks (empty content, chunker returned nothing,
-                # or every chunk got filtered as empty/parse-error). Track as skipped so
-                # `total_fetched = items_processed + total_skipped` still holds. Skip if
-                # the doc was already tracked deeper to avoid double-counting.
-                if not self._is_base_doc_tracked_as_skipped(base_doc):
-                    if hasattr(self, '_track_skipped_document'):
-                        self._track_skipped_document(_doc_name, reason="error")
+                self._track_document_failed(_doc_name, base_doc)
             try:
                 self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, result["count"], update_force=False)
             except Exception as exc:  # best-effort, do not break indexing
@@ -1365,7 +1449,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     f"Dependent documents for '{_doc_name}' were processed. "
                     f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
                 )
-                chunks = _run_pipeline_with_retry(base_doc)
+                try:
+                    chunks = _run_pipeline_with_retry(base_doc)
+                except Exception as exc:
+                    _handle_pipeline_failure(base_doc, base_doc_counter, exc)
+                    chunks = []
                 _consume_pipeline_output(base_doc, base_doc_counter, chunks)
             if pg_vector_add_docs_chunk:
                 _flush_chunk(pg_vector_add_docs_chunk)
@@ -1413,17 +1501,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     try:
                         chunks = future.result()
                     except Exception as exc:
-                        from traceback import format_exc
-                        logger.error(f"Pipeline failed for base doc #{base_doc_counter}: {format_exc()}")
-                        result.setdefault("errors", []).append(str(exc))
-                        if staging:
-                            # The zero-chunk branch below cannot tell a legitimately
-                            # emptied doc from a failed one — this mark is the only
-                            # signal that keeps a failed doc's staged ids out of the
-                            # promote set.
-                            failed_doc_key = str(self.key_fn(base_doc))
-                            if failed_doc_key != IDLESS_STAGING_KEY:
-                                run.pipeline_failed_keys.add(failed_doc_key)
+                        _handle_pipeline_failure(base_doc, base_doc_counter, exc)
                         chunks = []
                     _consume_pipeline_output(base_doc, base_doc_counter, chunks)
                     _submit_next()
@@ -1441,50 +1519,48 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['embedding'] = self.embeddings
         chunking_config['llm'] = self.llm
 
-        def _filter_parsing_errors(docs_generator, source_name: str):
-            """Filter out documents with parsing errors or empty content and track them as skipped."""
+        def _filter_parsing_errors(docs_generator, source_name: str, dependent: bool = False):
             for doc in docs_generator:
                 if doc.page_content and doc.page_content.startswith("Unsupported extension for file"):
-                    # Track as skipped due to unsupported extension
-                    if hasattr(self, '_track_skipped_file_unsupported'):
-                        self._track_skipped_file_unsupported(source_name)
-                    # Skip this document - don't add to vector store
+                    if dependent:
+                        self._track_dependent_parse_failure(source_name, reason="unsupported")
+                    elif hasattr(self, '_track_skipped_file_unsupported'):
+                        self._track_base_parse_failure(source_name, 'files_unsupported_extension')
                     continue
                 if doc.page_content and doc.page_content.startswith("Error during content parsing for file"):
-                    # Track as skipped due to parsing error
-                    if hasattr(self, '_track_runtime_skipped'):
-                        self._track_runtime_skipped(source_name, reason="error")
-                    elif hasattr(self, '_track_skipped_document'):
-                        self._track_skipped_document(source_name, reason="error")
-                    # Skip this document - don't add to vector store
-                    continue
-                # Check for empty content (e.g., OCR returned nothing for image)
-                if not doc.page_content or not doc.page_content.strip():
-                    # Track as skipped due to empty content
-                    if hasattr(self, '_track_skipped_file_empty'):
-                        self._track_skipped_file_empty(source_name)
+                    if dependent:
+                        self._track_dependent_parse_failure(source_name, reason="error")
                     elif hasattr(self, '_track_runtime_skipped'):
-                        self._track_runtime_skipped(source_name, reason="error")
-                    # Skip this document - don't add to vector store with empty content
+                        self._track_base_parse_failure(source_name, 'runtime_skipped_error')
+                    elif hasattr(self, '_track_skipped_document'):
+                        self._track_document_failed(source_name)
+                    continue
+                if not doc.page_content or not doc.page_content.strip():
+                    if dependent:
+                        self._track_dependent_parse_failure(source_name, reason="empty")
+                    elif hasattr(self, '_track_skipped_file_empty'):
+                        self._track_base_parse_failure(source_name, 'files_skipped_empty')
                     continue
                 yield doc
 
         def _chunk_one(document):
             """Per-doc chunking. Returns a list of chunk Documents (materialized).
-            Safe to run on a worker thread — mutates only the doc's own metadata
-            and calls _track_* (set.add — GIL-safe). Uses a per-call shallow
-            copy of chunking_config to avoid cross-worker mutation."""
+            Safe to run on a worker thread — mutates only the doc's own metadata and
+            uses a per-call shallow copy of chunking_config."""
             local_config = dict(chunking_config)
+            dependent = bool(document.metadata.get(DEPENDENT_DOC_META_KEY))
             if content_type := document.metadata.get(IndexerKeywords.CONTENT_FILE_NAME.value, None):
                 # apply parsing based on content type and chunk if chunker was applied to parent doc
                 content = document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)
+                source_name = self._parse_failure_label(
+                    document.metadata, content_type, dependent)
                 return list(_filter_parsing_errors(
                     process_document_by_type(
                         document=document,
                         content=content,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
-                    source_name=content_type
+                    source_name=source_name, dependent=dependent
                 ))
             if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
@@ -1493,20 +1569,28 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     # silently disappearing between "fetched" and "indexed",
                     # and drop the document — yielding it downstream would end up
                     # in the vector store with no content.
-                    source_name = document.metadata.get('id') or document.metadata.get('name') or document.metadata.get('path') or 'unknown'
-                    if hasattr(self, '_track_skipped_file_empty'):
-                        self._track_skipped_file_empty(str(source_name))
+                    source_name = self._parse_failure_label(
+                        document.metadata,
+                        str(document.metadata.get(IndexerKeywords.CONTENT_FILE_NAME.value)
+                            or 'unknown'),
+                        dependent,
+                    )
+                    if dependent:
+                        self._track_dependent_parse_failure(source_name, reason="empty")
+                    elif hasattr(self, '_track_skipped_file_empty'):
+                        self._track_base_parse_failure(source_name, 'files_skipped_empty')
                     return []
                 # apply parsing based on content type resolved from chunking_tool
                 content_type = file_extension_by_chunker(chunking_tool)
-                source_name = document.metadata.get('id') or document.metadata.get('name') or content_type
+                source_name = self._parse_failure_label(
+                    document.metadata, content_type, dependent)
                 return list(_filter_parsing_errors(
                     process_document_by_type(
                         document=document,
                         content=content_in_bytes,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
-                    source_name=source_name
+                    source_name=source_name, dependent=dependent
                 ))
             if chunking_tool:
                 # apply default chunker from toolkit config. No parsing.
@@ -1556,15 +1640,26 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _extend_data(self, documents: Generator[Document, None, None]):
         yield from documents
 
-    @staticmethod
-    def _extract_doc_name(metadata: dict) -> str:
+    _DOC_NAME_KEYS: ClassVar[Tuple[str, ...]] = (
+        'name', 'file_path', 'path', 'filename', 'title', 'key', 'issue_key', 'id',
+    )
+
+    @classmethod
+    def _extract_doc_name(cls, metadata: dict) -> str:
         meta_lower = {k.lower(): v for k, v in metadata.items()}
-        return (
-            meta_lower.get('name') or
-            meta_lower.get('file_path') or
-            meta_lower.get('path') or
-            'unknown'
-        )
+        for key in cls._DOC_NAME_KEYS:
+            value = meta_lower.get(key)
+            if value:
+                return str(value)
+        return 'unknown'
+
+    def _parse_failure_label(self, metadata: dict, content_label: str, dependent: bool) -> str:
+        return content_label if dependent else self._document_label(metadata, content_label)
+
+    @classmethod
+    def _document_label(cls, metadata: dict, fallback: str) -> str:
+        name = cls._extract_doc_name(metadata)
+        return fallback if name == 'unknown' else name
 
     def _is_base_doc_tracked_as_skipped(self, base_doc: Document) -> bool:
         """Return True if any identifier of ``base_doc`` already appears in a skip set.
@@ -1704,6 +1799,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if dep_id:
                 collected_dep_ids.append(dep_id)
             dep.metadata[IndexerKeywords.PARENT.value] = parent_id
+            dep.metadata[DEPENDENT_DOC_META_KEY] = True
             if parent_updated_on is not None:
                 dep.metadata.setdefault('updated_on', parent_updated_on)
             yield dep

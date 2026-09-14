@@ -26,6 +26,7 @@ from ..utils.file_metadata import bound_read_result, describe_requested_range
 from .read_guidance import build_excel_over_limit_response
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
+from ..base_indexer_toolkit import DEPENDENT_DOC_META_KEY
 from ..utils.tool_groups import tool_group, with_tool_groups
 
 # ------------------------------------------------------------------ #
@@ -1266,6 +1267,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                                         'alt': item.get('alt', ''),
                                         'updated_on': document.metadata.get('updated_on', ''),
                                         IndexerKeywords.PARENT.value: page_id,
+                                        DEPENDENT_DOC_META_KEY: True,
                                     },
                                 )
 

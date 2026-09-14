@@ -221,6 +221,67 @@ class TestPromoteSetAssembly:
         assert toolkit._assemble_promote_sets()[2] == ["gone-1"]
 
 
+
+class TestSerialFailureReachesThePromoteSets:
+    def run_three_docs(self, monkeypatch, failing_name):
+        toolkit = make_toolkit()
+        object.__setattr__(toolkit, "vector_adapter", FakeStagingAdapter())
+        object.__setattr__(toolkit, "max_docs_per_add", 100)
+        run = _IndexRunState(run_id="r1")
+        for doc_id in ("d1", "d2", "d3"):
+            run.staged_removal_ids[doc_id] = {f"old-{doc_id}"}
+        object.__setattr__(toolkit, "_index_run", run)
+
+        def fake_extend_data(self, documents):
+            base_doc = next(iter(documents))
+            if base_doc.metadata["id"] == failing_name:
+                raise RuntimeError("boom")
+            return iter([base_doc])
+
+        monkeypatch.setattr(StagingToolkit, "_extend_data", fake_extend_data)
+        monkeypatch.setattr(StagingToolkit, "_collect_dependencies", lambda self, docs: docs)
+        monkeypatch.setattr(
+            StagingToolkit, "_apply_loaders_chunkers",
+            lambda self, docs, chunking_tool=None, chunking_config=None: docs,
+        )
+        monkeypatch.setattr(StagingToolkit, "_clean_metadata", lambda self, docs: docs)
+        monkeypatch.setattr(VectorStoreWrapperBase, "_ensure_vectorstore_initialized", lambda self: None)
+        monkeypatch.setattr(StagingToolkit, "_log_tool_event", lambda self, *a, **kw: None)
+        monkeypatch.setattr(StagingToolkit, "index_meta_update", lambda self, *a, **kw: None)
+        monkeypatch.setattr(
+            "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
+            lambda vectorstore=None, documents=None, ids=None: [
+                f"new-{document.metadata['id']}" for document in documents
+            ],
+        )
+
+        documents = [
+            Document(page_content="body", metadata={"id": doc_id, "updated_on": "1"})
+            for doc_id in ("d1", "d2", "d3")
+        ]
+        toolkit._save_index_generator(
+            iter(documents), 3, None, None,
+            {"count": 0, "docs_count": 0, "failed_docs": 0, "errors": []}, index_name="x"
+        )
+        return toolkit
+
+    def test_the_failed_doc_keeps_its_previous_version_while_the_others_supersede(self, monkeypatch):
+        toolkit = self.run_three_docs(monkeypatch, failing_name="d2")
+
+        superseded, damaged, orphans = toolkit._assemble_promote_sets()
+
+        assert sorted(superseded) == ["old-d1", "old-d3"]
+        assert damaged == []
+        assert toolkit._index_run.pipeline_failed_keys == {"d2"}
+
+    def test_a_clean_run_supersedes_every_previous_version(self, monkeypatch):
+        toolkit = self.run_three_docs(monkeypatch, failing_name=None)
+
+        superseded, _, _ = toolkit._assemble_promote_sets()
+
+        assert sorted(superseded) == ["old-d1", "old-d2", "old-d3"]
+
+
 class TestFlushAccounting:
     def test_successful_flush_records_pks_and_settles_counts(self):
         run = _IndexRunState(run_id="r")
