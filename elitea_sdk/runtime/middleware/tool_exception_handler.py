@@ -223,7 +223,7 @@ When a tool fails with an error:
 * Read the error message carefully - it contains guidance on what went wrong
 * All the issues are mostly related to 3rd party APIs used by the tools (corresponding exceptions will be raised)
 * If the error suggests a fix (e.g., missing or invalid parameter), reply with suggested fix
-* If no alternative exists, inform the user about the issue and ask for help from support team (https://elitea.ai/docs/support/contact-support/)
+* If no alternative exists, inform the user about the issue and ask for help from support team (https://docs.elitea.ai/support/contact-support/)
 """
 
     def wrap_tool(self, tool: BaseTool) -> BaseTool:

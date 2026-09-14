@@ -274,7 +274,7 @@ A: You've exceeded the API rate limit. Wait a few minutes before retrying, or im
 **Q: Network Error**
 A: Check your internet connection and verify that the API endpoint is accessible. Corporate firewalls may block certain domains.
 
-For more help, contact support at https://elitea.ai/docs/support/contact-support/
+For more help, contact support at https://docs.elitea.ai/support/contact-support/
 """
 
 
