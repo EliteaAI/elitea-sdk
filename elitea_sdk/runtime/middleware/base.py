@@ -309,9 +309,10 @@ class MiddlewareManager:
         remove_ops = []
         for mw in self._middleware:
             try:
-                transformed_messages = mw.transform_messages_for_model(
-                    state.get('messages', []), config
-                )
+                # LangChain-derived middlewares (SummarizationMiddleware) do not inherit
+                # BaseMiddleware, so this elitea-only hook can be absent
+                transform = getattr(mw, 'transform_messages_for_model', None)
+                transformed_messages = transform(state.get('messages', []), config) if transform else None
                 if transformed_messages is not None:
                     state = {**state, 'messages': transformed_messages}
 
