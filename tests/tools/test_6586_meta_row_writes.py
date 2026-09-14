@@ -23,6 +23,8 @@ Lives outside tests/tools/index/ because CI skips that directory.
 
 from types import SimpleNamespace
 
+import time
+
 import pytest
 import sqlalchemy as sa
 from langchain_core.documents import Document
@@ -74,9 +76,17 @@ class RecordingSession:
     def __exit__(self, *exc_info):
         return False
 
+    next_run_row = None
+
     def execute(self, statement):
         self.statements.append(statement)
         return SimpleNamespace(rowcount=self._rowcount)
+
+    def get(self, model, primary_key, with_for_update=False):
+        return RecordingSession.next_run_row
+
+    def rollback(self):
+        pass
 
     def commit(self):
         self.commits += 1
@@ -372,6 +382,36 @@ class TestNoEmbeddingOnTheMetaWrite:
             )
 
 
+@pytest.fixture
+def orm_sessions(monkeypatch):
+    """promote_run imports Session inside the method, so the module attribute the
+    `sessions` fixture replaces is not the one it binds."""
+    opened = []
+
+    def session_factory(bind=None):
+        session = RecordingSession(bind=bind)
+        opened.append(session)
+        return session
+
+    monkeypatch.setattr("sqlalchemy.orm.Session", session_factory)
+    yield opened
+    RecordingSession.next_run_row = None
+
+
+def sessions_with_row(run_row):
+    """Make the next Session(...) hand back this run row from session.get()."""
+    RecordingSession.next_run_row = run_row
+
+
+def _promote_adapter():
+    adapter = PGVectorAdapter()
+    adapter._lock_index_meta_rows = lambda session, store, index_name: ["meta-1"]
+    adapter._delete_rows_by_pk = lambda session, store, ids: None
+    adapter._delete_run_chunks = lambda session, store, run_id: 0
+    adapter._discard_stranded_run_chunks = lambda store, run_id: None
+    return adapter
+
+
 def _bare_toolkit(monkeypatch, max_docs_per_add):
     """A toolkit wired just enough to drive _save_index_generator directly."""
     instance = StagingToolkit.model_construct()
@@ -512,6 +552,34 @@ class TestProgressIsSeededAndCounted:
         instance._save_index_generator(iter(make_documents("a")), 1, None, None, result, "x")
 
         assert instance._index_run.chunks_written == 0
+
+
+class TestPromoteRefreshesTheHeartbeatItBlocks:
+    """promote_run holds the run row FOR UPDATE across every batched delete. The
+    worker's own tick blocks on it and then matches zero rows — its predicate is
+    status IN (pending, cancelled) and the status has moved by the time the lock
+    lifts. Without a stamp here, every liveness reader sees a heartbeat frozen at
+    the moment promote started, for the whole promote plus one interval."""
+
+    def test_the_run_row_heartbeat_is_advanced_inside_the_promote_txn(self, orm_sessions):
+        started = time.time() - 600
+        run_row = SimpleNamespace(run_id="run-1", status="pending",
+                                  heartbeat=started, promoted_on=None)
+        sessions_with_row(run_row)
+        adapter = _promote_adapter()
+
+        adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], [])
+
+        assert run_row.heartbeat > started
+        assert run_row.status == "promoted"
+
+    def test_a_run_row_that_is_gone_does_not_break_promote(self, orm_sessions):
+        # The stamp must not turn a missing run row into an AttributeError; promote
+        # still has to reach its own abort outcome.
+        sessions_with_row(None)
+        adapter = _promote_adapter()
+
+        assert adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], []) == "aborted-not-pending"
 
 
 class TestTheHeartbeatOutlivesTheDocumentLoop:

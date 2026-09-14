@@ -549,8 +549,12 @@ class PGVectorAdapter(VectorStoreAdapter):
         if chunks_written is not None:
             patch["run_chunks"] = chunks_written
         with Session(store.session_maker.bind) as session:
-            # The EXISTS(pending own row) guard makes a tick queued behind
-            # promote's meta lock a 0-row no-op after promote commits.
+            # EXISTS(pending own row) keeps a tick off a row this run no longer owns.
+            # Note it does NOT cancel a tick already queued behind promote's meta lock:
+            # the subquery is uncorrelated, so it is evaluated once when the statement
+            # starts and EvalPlanQual never revisits it. Safe only because this patch
+            # carries updated_on/run_chunks and never `state`; do not add a key here
+            # that a late tick must not resurrect.
             session.execute(
                 update(store.EmbeddingStore)
                 .where(
@@ -705,6 +709,14 @@ class PGVectorAdapter(VectorStoreAdapter):
             # against the other two parties.
             meta_ids = self._lock_index_meta_rows(session, store, index_name)
             run_row = session.get(IndexRun, run_id, with_for_update=True)
+            if run_row is not None:
+                # Promote holds this row FOR UPDATE across every batched delete, so the
+                # worker's own tick blocks here and then matches zero rows — its
+                # predicate is status IN (pending, cancelled) and the status has moved
+                # by the time the lock is released. Liveness readers would see a
+                # heartbeat frozen at the moment promote started. Stamping it here
+                # costs no extra statement: this transaction already writes this row.
+                run_row.heartbeat = time.time()
             if not meta_ids:
                 # Every non-promoted status takes its staged rows along: a run
                 # already swept to DISCARDED is out of reach of both the sweep
