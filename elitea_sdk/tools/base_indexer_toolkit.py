@@ -674,7 +674,14 @@ def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]
 
 
 DEFAULT_CUT_OFF = 0.1
-INDEX_META_UPDATE_INTERVAL = 600.0
+# The keys the SDK owns on the index_meta row. Everything else on that row —
+# task_id, conversation_id, index_configuration, task_disconnected_timeout_sec —
+# belongs to the platform, and a full-row rewrite from a stale snapshot silently
+# reverted whatever it had written in between.
+SDK_OWNED_META_KEYS = (
+    "indexed_chunks", "updated", "state", "updated_on",
+    "error", "report", "skipped", "total", "indexed", "history",
+)
 # Mirrors the core-side vault default for `task_disconnected_timeout_sec`; used
 # only when the meta row never carried the key (agent-invoked fresh runs).
 TASK_DISCONNECTED_TIMEOUT_DEFAULT = 7200.0
@@ -715,6 +722,10 @@ class _IndexRunState:
     orphan_candidate_doc_count: int = 0
     heartbeat_stop: Optional[threading.Event] = None
     heartbeat_thread: Optional[threading.Thread] = None
+    # Read by the heartbeat thread; written only from the main thread, which is
+    # where _consume_pipeline_output and every _flush_chunk run even on the
+    # parallel path (the executor wraps the pipeline, not the flush).
+    chunks_written: int = 0
 
 class IndexTools(str, Enum):
     """Enum for index-related tool names."""
@@ -900,10 +911,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if not hasattr(self, "_index_meta_config"):
             self._index_meta_config: Dict[str, Any] = {}
 
-        self._index_meta_config["update_interval"] = kwargs.get(
-            "meta_update_interval",
-            INDEX_META_UPDATE_INTERVAL,
-        )
         # Optional initiator hint (e.g. 'schedule', 'user', 'llm') — used by
         # index_meta_update to promote a successful completion to
         # 'scheduled_reindex' when the run came from the platform scheduler.
@@ -1035,7 +1042,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Include unchanged docs in the indexed count so the UI reflects total items
             # currently in the vector store, not just newly indexed ones.
             indexed_total = docs_count + unchanged_count
-            written_state = self.index_meta_update(index_name, final_state, succeeded_chunks_count, update_force=True,
+            written_state = self.index_meta_update(index_name, final_state, succeeded_chunks_count,
                                                    error=message if status is not IndexingStatus.OK else None,
                                                    skipped=skipped_data, docs_count=indexed_total, report=report)
             self._emit_index_event(index_name,
@@ -1077,7 +1084,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         stats=self.get_indexing_stats(),
                     )
                     self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
-                                           update_force=True, error=msg, report=error_report)
+                                           error=msg, report=error_report)
             except Exception as ie:
                 logger.error(f"Failed to update index meta status to FAILED for index '{index_name}': {ie}")
                 msg = f"{msg}; additionally failed to update index meta status to FAILED: {ie}"
@@ -1143,14 +1150,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run = self._index_run
         stop_signal = threading.Event()
 
+        def _tick():
+            try:
+                self.vector_adapter.heartbeat_index_run(
+                    self, index_name, run.run_id, run.meta_id, run.chunks_written
+                )
+            except Exception as exc:
+                logger.warning(f"Index run heartbeat failed for '{index_name}': {exc}")
+
+        # Seeded before the first wait: `run_chunks` does not survive the
+        # platform's run-start reset, and until the key exists the list view has
+        # nothing to render but the previous run's counts.
+        _tick()
+
         def _tick_forever():
             while not stop_signal.wait(INDEX_RUN_HEARTBEAT_INTERVAL):
                 if run.finalized:
                     return
-                try:
-                    self.vector_adapter.heartbeat_index_run(self, index_name, run.run_id, run.meta_id)
-                except Exception as exc:
-                    logger.warning(f"Index run heartbeat failed for '{index_name}': {exc}")
+                _tick()
 
         run.heartbeat_stop = stop_signal
         run.heartbeat_thread = threading.Thread(
@@ -1231,7 +1248,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             stats=self.get_indexing_stats(),
         )
         self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, 0,
-                               update_force=True, error=message, report=report)
+                               error=message, report=report)
         self._emit_index_event(index_name, error=message,
                                state=IndexerKeywords.INDEX_META_FAILED.value)
         return {"status": IndexingStatus.ERROR.value, "message": message, "report": report}
@@ -1346,6 +1363,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             try:
                 inserted_ids = add_documents(vectorstore=self.vectorstore, documents=chunk)
                 self._log_tool_event(f"{len(chunk)} documents have been indexed. Continuing...")
+                if run is not None:
+                    # Counted here rather than at queue time so the number the UI
+                    # renders is chunks that actually landed, not chunks buffered.
+                    run.chunks_written += len(chunk)
                 if staging:
                     self._record_flushed_chunk(run, chunk_keys, inserted_ids)
             except Exception as exc:
@@ -1453,10 +1474,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         run.counted_doc_keys.add(counted_key)
             else:
                 self._track_document_failed(_doc_name, base_doc)
-            try:
-                self.index_meta_update(index_name, IndexerKeywords.INDEX_META_IN_PROGRESS.value, result["count"], update_force=False)
-            except Exception as exc:  # best-effort, do not break indexing
-                logger.warning(f"Failed to update index meta during indexing process for index '{index_name}': {exc}")
 
         workers = getattr(self, "_index_workers", 1) or 1
 
@@ -2341,18 +2358,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._index_meta_config: Dict[str, Any] = {}
         self._index_meta_config["previous_runs"] = self._count_completed_runs(metadata)
 
-    def index_meta_update(self, index_name: str, state: str, result: int, update_force: bool = True, interval: Optional[float] = None, error: Optional[str] = None, skipped: Optional[Dict] = None, docs_count: Optional[int] = None, report: Optional[Dict] = None):
-        """Update `index_meta` document with optional time-based throttling.
+    def index_meta_update(self, index_name: str, state: str, result: int, error: Optional[str] = None,
+                          skipped: Optional[Dict] = None, docs_count: Optional[int] = None,
+                          report: Optional[Dict] = None):
+        """Patch the SDK-owned keys of the `index_meta` document.
+
+        Mid-run progress no longer comes through here — it rides the run
+        heartbeat, which reports a moving chunk count without an embedding call
+        and without rewriting keys the platform owns.
 
         Args:
             index_name: Index name to update meta for.
             state: New state value for the `index_meta` record.
             result: Number of processed documents to store in the `updated` field.
-            update_force: If `True`, perform the update unconditionally, ignoring throttling.
-                          If `False`, perform the update only when the effective time interval has passed.
-            interval: Optional custom interval (in seconds) for this call when `update_force` is `False`.
-                      If `None`, falls back to the value stored in `self._index_meta_config["update_interval"]`
-                      if present, otherwise uses `INDEX_META_UPDATE_INTERVAL`.
             error: Optional error message to record when the state represents a failed index.
             skipped: Optional dictionary containing skipped items data from indexing stats.
             report: Optional canonical indexing report for this run. When present and not an
@@ -2360,33 +2378,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     never contradict the breakdown rendered next to them.
         """
         self._ensure_vectorstore_initialized()
-        if not hasattr(self, "_index_meta_last_update_time"):
-            self._index_meta_last_update_time: Dict[str, float] = {}
-
-        if not update_force:
-            # Resolve effective interval:
-            # 1\) explicit arg
-            # 2\) value from `_index_meta_config`
-            # 3\) default constant
-            cfg_interval = None
-            if hasattr(self, "_index_meta_config"):
-                cfg_interval = self._index_meta_config.get("update_interval")
-
-            eff_interval = (
-                interval
-                if interval is not None
-                else (cfg_interval if cfg_interval is not None else INDEX_META_UPDATE_INTERVAL)
-            )
-
-            last_time = self._index_meta_last_update_time.get(index_name)
-            now = time.time()
-            if last_time is not None and (now - last_time) < eff_interval:
-                return None
-            self._index_meta_last_update_time[index_name] = now
-        else:
-            # For forced updates, always refresh last update time
-            self._index_meta_last_update_time[index_name] = time.time()
-
         index_meta_raw = super().get_index_meta(index_name)
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         #
@@ -2394,13 +2385,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             metadata = copy.deepcopy(index_meta_raw.get("metadata", {}))
             # indexed_chunks = number of chunks stored in vector store
             metadata["indexed_chunks"] = self.get_indexed_count(index_name)
-            if update_force:
-                metadata["updated"] = result
-            else:
-                # Mid-run progress must not overwrite the retained index's
-                # `updated` — the run's own running chunk count lives under a
-                # key no reader treats as the index size.
-                metadata["run_chunks"] = result
+            metadata["updated"] = result
             # Promote a successful completion to 'scheduled_reindex' when the run was
             # triggered by the platform scheduler AND the index had already been built
             # before. At this point the history still carries the current run as
@@ -2464,10 +2449,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     metadata["indexed"] = docs_count if docs_count is not None else items_processed - total_skipped
             elif report is None:
                 # Only a report-less TERMINAL success may equate the doc count
-                # with the chunk count; on the throttled mid-run path this
-                # overwrote the retained index's `indexed` long before any
-                # terminal write could preserve it.
-                if update_force and state in COMPLETED_INDEX_STATES:
+                # with the chunk count.
+                if state in COMPLETED_INDEX_STATES:
                     metadata["indexed"] = metadata["indexed_chunks"]
             else:
                 # A failed run leaves both counts alone: the store still holds and
@@ -2487,8 +2470,25 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 history = [metadata]
             #
             metadata["history"] = json.dumps(history)
-            index_meta_doc = Document(page_content=index_meta_raw.get("content", ""), metadata=metadata)
-            add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta_raw.get("id")])
+            if getattr(self.vector_adapter, "supports_run_staging", False):
+                # `history`, `report` and `skipped` go over as the JSON STRINGS built
+                # above. Core reads them back with an unguarded `.strip()`, and a
+                # native JSONB value there raises inside its run-start reset, which
+                # the platform answers by killing the dispatched task.
+                patch = {key: metadata[key] for key in SDK_OWNED_META_KEYS if key in metadata}
+                run = getattr(self, "_index_run", None)
+                matched = self.vector_adapter.update_index_meta_keys(
+                    self, index_meta_raw.get("id"), run.run_id if run is not None else None, patch,
+                )
+                if not matched:
+                    logger.warning(
+                        f"index_meta patch for '{index_name}' matched no row: the index was "
+                        f"removed, or this run was cancelled and must not revert that."
+                    )
+            else:
+                # No SQL layer to patch through; keep the full-row upsert.
+                index_meta_doc = Document(page_content=index_meta_raw.get("content", ""), metadata=metadata)
+                add_documents(vectorstore=self.vectorstore, documents=[index_meta_doc], ids=[index_meta_raw.get("id")])
             return state
         return None
 

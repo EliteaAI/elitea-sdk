@@ -22,7 +22,7 @@ Usage:
 import logging
 from typing import Tuple
 
-from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, OperationalError
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -43,6 +43,19 @@ def _is_deterministic_db_error(exception: BaseException) -> bool:
 
 def _is_recycled_db_connection(exception: BaseException) -> bool:
     return isinstance(exception, DBAPIError) and exception.connection_invalidated
+
+
+def is_transient_db_error(exception: BaseException) -> bool:
+    """Retriable failures of a small, self-contained SQL write.
+
+    Deliberately does NOT fall back to substring matching the way
+    ``is_server_error_retriable`` does: a rendered statement carries its bound
+    parameters, and an index_meta patch legitimately contains values like
+    ``"indexed": 500``, which that matcher would read as a retriable 5xx.
+    """
+    if _is_deterministic_db_error(exception):
+        return False
+    return isinstance(exception, OperationalError) or _is_recycled_db_connection(exception)
 
 
 def is_server_error_retriable(exception: BaseException) -> bool:

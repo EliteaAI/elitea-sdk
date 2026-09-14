@@ -1,9 +1,22 @@
+import json
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, List
-from logging import getLogger
+from logging import WARNING, getLogger
+
+from sqlalchemy import cast, exists, func, literal, update
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_fixed,
+)
 
 from ...runtime.utils.utils import IndexerKeywords
+from ..utils.retry import is_transient_db_error
 
 logger = getLogger(__name__)
 
@@ -13,6 +26,18 @@ PROMOTE_DELETE_BATCH_SIZE = 50000
 # a single index run without ever excluding a strand: whatever it leaves behind
 # is still a candidate for the next sweep.
 STRANDED_RECLAIM_RUN_LIMIT = 50
+
+
+def _merge_cmetadata(embedding_store, patch: Dict[str, Any]):
+    """`cmetadata || patch` — a shallow merge that leaves untouched keys alone.
+
+    The full-row upsert this replaces rewrote the whole column from a snapshot
+    read seconds earlier, so any key the platform wrote in between was silently
+    reverted.
+    """
+    return func.coalesce(
+        embedding_store.cmetadata, cast(literal("{}"), JSONB)
+    ).op("||", return_type=JSONB)(cast(literal(json.dumps(patch)), JSONB))
 
 
 class VectorStoreAdapter(ABC):
@@ -97,7 +122,12 @@ class VectorStoreAdapter(ABC):
         raise NotImplementedError("Run staging is not supported by this adapter")
 
     def heartbeat_index_run(self, vectorstore_wrapper, index_name: str, run_id: str,
-                            meta_id: Optional[str]) -> None:
+                            meta_id: Optional[str], chunks_written: Optional[int] = None) -> None:
+        raise NotImplementedError("Run staging is not supported by this adapter")
+
+    def update_index_meta_keys(self, vectorstore_wrapper, meta_id: str,
+                               run_id: Optional[str], patch: Dict[str, Any]) -> int:
+        """Merge SDK-owned keys into the meta row's cmetadata. Returns rows matched."""
         raise NotImplementedError("Run staging is not supported by this adapter")
 
     def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
@@ -489,11 +519,7 @@ class PGVectorAdapter(VectorStoreAdapter):
             }
 
     def heartbeat_index_run(self, vectorstore_wrapper, index_name: str, run_id: str,
-                            meta_id: Optional[str]) -> None:
-        import json as json_module
-        from sqlalchemy import cast, exists, func, literal, update
-        from sqlalchemy.dialects.postgresql import JSONB, array
-        from sqlalchemy.orm import Session
+                            meta_id: Optional[str], chunks_written: Optional[int] = None) -> None:
         from ...runtime.tools.index_runs_model import (
             IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_PENDING, live_run_where,
         )
@@ -516,6 +542,12 @@ class PGVectorAdapter(VectorStoreAdapter):
             session.commit()
         if meta_id is None:
             return
+        # The tick carries the run's chunk count so liveness and progress cost one
+        # write: nothing else reports a running index moving, and the throttled
+        # full-row meta write this replaced froze the count at the first document.
+        patch = {"updated_on": now}
+        if chunks_written is not None:
+            patch["run_chunks"] = chunks_written
         with Session(store.session_maker.bind) as session:
             # The EXISTS(pending own row) guard makes a tick queued behind
             # promote's meta lock a 0-row no-op after promote commits.
@@ -525,15 +557,48 @@ class PGVectorAdapter(VectorStoreAdapter):
                     store.EmbeddingStore.id == meta_id,
                     exists().where(IndexRun.run_id == run_id, live_run_where()),
                 )
-                .values(
-                    cmetadata=func.jsonb_set(
-                        func.coalesce(store.EmbeddingStore.cmetadata, cast(literal("{}"), JSONB)),
-                        array(["updated_on"]),
-                        cast(literal(json_module.dumps(now)), JSONB),
-                    )
-                )
+                .values(cmetadata=_merge_cmetadata(store.EmbeddingStore, patch))
             )
             session.commit()
+
+    @retry(
+        retry=retry_if_exception(is_transient_db_error),
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(2),
+        before_sleep=before_sleep_log(logger, WARNING),
+        reraise=True,
+    )
+    def update_index_meta_keys(self, vectorstore_wrapper, meta_id: str,
+                               run_id: Optional[str], patch: Dict[str, Any]) -> int:
+        """Merge SDK-owned keys into the meta row's cmetadata. Returns rows matched.
+
+        Embed-free by design: the terminal write runs AFTER promote_run, so an
+        embedding call here fails over a corpus that is already published and
+        searchable, and the FAILED write that follows fails the same way.
+        """
+        from ...runtime.tools.index_runs_model import IndexRun, RUN_STATUS_CANCELLED
+
+        store = vectorstore_wrapper.vectorstore
+        # NOT the heartbeat's live_run_where(): by the time the terminal write
+        # lands the run row is `promoted`, so a pending-only guard would drop
+        # every terminal write. Blocking only `cancelled` keeps a committed Stop
+        # from being reverted to in_progress with no worker behind it.
+        conditions = [store.EmbeddingStore.id == meta_id]
+        if run_id is not None:
+            conditions.append(
+                ~exists().where(
+                    IndexRun.run_id == run_id,
+                    IndexRun.status == RUN_STATUS_CANCELLED,
+                )
+            )
+        with Session(store.session_maker.bind) as session:
+            result = session.execute(
+                update(store.EmbeddingStore)
+                .where(*conditions)
+                .values(cmetadata=_merge_cmetadata(store.EmbeddingStore, patch))
+            )
+            session.commit()
+            return result.rowcount
 
     def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
                                stale_before: float) -> List[str]:

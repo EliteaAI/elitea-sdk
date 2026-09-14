@@ -34,6 +34,7 @@ from elitea_sdk.tools.base_indexer_toolkit import (
     IDLESS_STAGING_KEY,
     IndexRunRefusedError,
     IndexingStatus,
+    SDK_OWNED_META_KEYS,
     TASK_DISCONNECTED_TIMEOUT_DEFAULT,
     _IndexRunState,
     render_report_text,
@@ -317,6 +318,8 @@ class FakeStagingAdapter:
         self.register_result = (True, None)
         self.promote_outcome = "promoted"
         self.calls = []
+        self.heartbeat_chunks = []
+        self.patches = []
         self.pending = []
         self.sweeps = []
 
@@ -332,8 +335,22 @@ class FakeStagingAdapter:
         self.sweeps.append((index_name, stale_before))
         return []
 
-    def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id):
+    def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id, chunks_written=None):
         self.calls.append("heartbeat")
+        self.heartbeat_chunks.append(chunks_written)
+
+    def update_index_meta_keys(self, wrapper, meta_id, run_id, patch):
+        # Mirrors the real merge: only the patched keys change, everything else on
+        # the row survives. Replacing the dict here would hide exactly the bug the
+        # keyed write exists to fix.
+        stored = wrapper._stored_meta
+        if stored is None:
+            return 0
+        self.patches.append(patch)
+        merged = {**stored.get("metadata", {}), **patch}
+        wrapper.written.append(merged)
+        object.__setattr__(wrapper, "_stored_meta", {**stored, "metadata": merged})
+        return 1
 
     def promote_run(self, wrapper, index_name, run_id, superseded_ids, orphan_ids, damaged_ids):
         self.calls.append("promote")
@@ -670,24 +687,44 @@ class TestForeignLiveRunSkip:
 
 
 class TestCountHonesty:
-    def test_throttled_update_writes_run_chunks_not_updated(self, staged_toolkit):
+    def test_the_write_patches_sdk_keys_and_leaves_the_platforms_alone(self, staged_toolkit):
+        # Replaces the old throttled-write test: mid-run progress no longer goes
+        # through index_meta_update at all, so the count-honesty guarantee is now
+        # that the terminal write cannot revert a key the platform owns.
         seed_completed_meta(staged_toolkit)
-        staged_toolkit._stored_meta["metadata"]["updated"] = 777
+        staged_toolkit._stored_meta["metadata"]["task_id"] = "platform-task"
+        staged_toolkit._stored_meta["metadata"]["task_disconnected_timeout_sec"] = 60
+
+        staged_toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_COMPLETED.value, 12)
+
+        patch = staged_toolkit.vector_adapter.patches[-1]
+        assert set(patch) <= set(SDK_OWNED_META_KEYS)
+        assert "task_id" not in patch
+        assert "run_chunks" not in patch
+        stored = staged_toolkit._stored_meta["metadata"]
+        assert stored["task_id"] == "platform-task"
+        assert stored["task_disconnected_timeout_sec"] == 60
+
+    def test_history_report_and_skipped_stay_json_strings(self, staged_toolkit):
+        # A native JSONB value for these raises on core's unguarded .strip(),
+        # inside a run-start reset the platform answers by killing the task.
+        seed_completed_meta(staged_toolkit)
 
         staged_toolkit.index_meta_update(
-            "x", IndexerKeywords.INDEX_META_IN_PROGRESS.value, 12, update_force=False
+            "x", IndexerKeywords.INDEX_META_COMPLETED.value, 12,
+            skipped={"items_processed": 1, "total_skipped": 0, "total_fetched": 1},
+            report={"status": "ok", "totals": {"total": 1, "indexed": 1, "unchanged": 0}},
         )
 
-        stored = staged_toolkit.written[-1]
-        assert stored["run_chunks"] == 12
-        assert stored["updated"] == 777
-        assert stored["indexed"] == 191
+        patch = staged_toolkit.vector_adapter.patches[-1]
+        for key in ("history", "report", "skipped"):
+            assert isinstance(patch[key], str), f"{key} must stay a JSON string"
 
     def test_reportless_terminal_success_still_equates_indexed_with_chunks(self, staged_toolkit):
         seed_completed_meta(staged_toolkit)
 
         staged_toolkit.index_meta_update(
-            "x", IndexerKeywords.INDEX_META_COMPLETED.value, 12, update_force=True
+            "x", IndexerKeywords.INDEX_META_COMPLETED.value, 12
         )
 
         assert staged_toolkit.written[-1]["indexed"] == 965
@@ -696,7 +733,7 @@ class TestCountHonesty:
         seed_completed_meta(staged_toolkit)
 
         staged_toolkit.index_meta_update(
-            "x", IndexerKeywords.INDEX_META_FAILED.value, 0, update_force=True, error="boom"
+            "x", IndexerKeywords.INDEX_META_FAILED.value, 0, error="boom"
         )
 
         assert staged_toolkit.written[-1]["indexed"] == 191
