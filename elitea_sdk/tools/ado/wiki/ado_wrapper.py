@@ -1253,9 +1253,12 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
+        wiki_identifier_description = "Wiki identifier to index, e.g., 'ABCProject.wiki'. If not provided, the default wiki identifier from toolkit configuration is used instead."
+        if self.default_wiki_identifier:
+            wiki_identifier_description += f" Default wiki: {self.default_wiki_identifier}"
         return {
             'chunking_tool': (Literal['markdown', ''], Field(description="Name of chunking tool", default='markdown')),
-            "wiki_identifier": (Optional[str], Field(default=None, description="Wiki identifier to index, e.g., 'ABCProject.wiki'. If not provided, uses the default wiki identifier from toolkit configuration.")),
+            "wiki_identifier": (Optional[str], Field(default=None, description=wiki_identifier_description)),
             'path_contains': (Optional[str], Field(
                 default=None,
                 description=(
