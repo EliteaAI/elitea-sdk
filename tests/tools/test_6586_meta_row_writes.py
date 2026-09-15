@@ -36,6 +36,8 @@ from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
 from elitea_sdk.tools.base_indexer_toolkit import (
     BaseIndexerToolkit,
+    INDEX_RUN_HEARTBEAT_INTERVAL,
+    IndexingStatus,
     SDK_OWNED_META_KEYS,
     _IndexRunState,
 )
@@ -201,6 +203,17 @@ class TestTheWriteIsKeyedAndEmbedFree:
         assert matched == 0
 
 
+class TestTheHeartbeatTwinContract:
+    """Core mirrors this interval and multiplies it by five for the display horizon
+    (INDEX_RUN_HEARTBEAT_INTERVAL_SEC / HEARTBEAT_STALE_INTERVALS in
+    utils/application_tools.py). Core pins its own copy; without this the SDK side
+    could move to 120 and a healthy run would read stale after 2.5 ticks, with both
+    suites green."""
+
+    def test_the_interval_matches_the_value_core_mirrors(self):
+        assert INDEX_RUN_HEARTBEAT_INTERVAL == 60.0
+
+
 class TestTheHeartbeatCarriesProgress:
 
     def test_the_tick_patches_updated_on_and_run_chunks(self, sessions):
@@ -215,6 +228,12 @@ class TestTheHeartbeatCarriesProgress:
         assert "run_chunks" in payload
         assert "42" in payload
         assert "updated_on" in payload
+        # Load-bearing absence, not an oversight. The EXISTS(pending) guard is an
+        # uncorrelated subquery, so a tick already queued behind promote's lock still
+        # applies after promote commits. That is only safe while this patch carries
+        # liveness keys and nothing else — adding `state` here resurrects in_progress
+        # over a committed cancel, which is Fault 4 in its original shape.
+        assert "state" not in payload
 
     def test_a_tick_without_a_count_still_refreshes_liveness(self, sessions):
         PGVectorAdapter().heartbeat_index_run(make_wrapper(), "idx", "run-1", "meta-1")
@@ -463,6 +482,71 @@ def break_the_meta_write_after_promote(monkeypatch):
         return original(self, wrapper, meta_id, run_id, patch)
 
     monkeypatch.setattr(FakeStagingAdapter, "update_index_meta_keys", failing)
+
+
+class TestARunCompletesWithTheEmbeddingBackendDown:
+    """#6586's headline acceptance criterion, end to end.
+
+    Two existing tests cover the halves — one proves the terminal write embeds
+    nothing, another proves a healthy run reports completed — but nothing joined
+    them, so the AC as worded rested on the live A/B rather than on the suite.
+
+    The shim fails ONLY index_meta embeds, and only after the first: the fresh-row
+    INSERT has to land or there is no row to patch. It must never touch chunk
+    flushes — a run that loses those ends FAILED on its own and the test passes
+    without ever exercising the path."""
+
+    def _embedding_backend_down(self, toolkit, monkeypatch):
+        meta_embeds = []
+
+        def failing_add_documents(vectorstore=None, documents=None, ids=None):
+            metadata = dict(documents[0].metadata)
+            if metadata.get("type") != IndexerKeywords.INDEX_META_TYPE.value:
+                return ["chunk-row-id"]
+            meta_embeds.append(metadata)
+            if len(meta_embeds) > 1:
+                raise RuntimeError("EL6586_EMBED_DOWN: embedding backend unavailable")
+            object.__setattr__(
+                toolkit, "_stored_meta",
+                {"id": "meta-1", "content": "index_meta_x", "metadata": metadata},
+            )
+            return ["meta-row-id"]
+
+        monkeypatch.setattr(
+            "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
+            failing_add_documents,
+        )
+        return meta_embeds
+
+    def test_the_run_reports_completed_with_its_real_counts(self, toolkit, monkeypatch):
+        meta_embeds = self._embedding_backend_down(toolkit, monkeypatch)
+
+        result = run_index_data(toolkit, monkeypatch)
+
+        assert result["status"] == IndexingStatus.OK.value
+        # Only index_meta_init embedded; the terminal write never asked, which is why
+        # a dead embedding backend can no longer report a promoted corpus as failed.
+        assert len(meta_embeds) == 1
+        assert "promote" in toolkit.vector_adapter.calls
+
+    def test_the_terminal_state_and_counts_reach_the_row(self, toolkit, monkeypatch):
+        self._embedding_backend_down(toolkit, monkeypatch)
+
+        run_index_data(toolkit, monkeypatch)
+
+        patch = toolkit.vector_adapter.patches[-1]
+        assert patch["state"] == IndexerKeywords.INDEX_META_COMPLETED.value
+        assert patch["updated"] == 2
+        assert patch["error"] is None
+
+    def test_no_failure_is_recorded_or_announced(self, toolkit, monkeypatch):
+        self._embedding_backend_down(toolkit, monkeypatch)
+
+        run_index_data(toolkit, monkeypatch)
+
+        failed = IndexerKeywords.INDEX_META_FAILED.value
+        assert [p for p in toolkit.vector_adapter.attempts if p.get("state") == failed] == []
+        assert [e for e in toolkit.emitted if e["state"] == failed] == []
 
 
 class TestAFailedRunIsAlwaysRecordedBeforeItIsAnnounced:
