@@ -23,6 +23,7 @@ Lives outside tests/tools/index/ because CI skips that directory.
 
 from types import SimpleNamespace
 
+import logging
 import time
 
 import pytest
@@ -403,6 +404,10 @@ def sessions_with_row(run_row):
     RecordingSession.next_run_row = run_row
 
 
+def _raise_lock_failure(session, store, index_name):
+    raise RuntimeError("meta lock unavailable")
+
+
 def _promote_adapter():
     adapter = PGVectorAdapter()
     adapter._lock_index_meta_rows = lambda session, store, index_name: ["meta-1"]
@@ -625,6 +630,51 @@ class TestPromoteRefreshesTheHeartbeatItBlocks:
         outcome = _promote_adapter().promote_run(make_wrapper(), "idx", "run-1", [], [], [])
 
         assert outcome == "promoted", "a decorative write must not abort the promote"
+
+    @pytest.mark.parametrize("error,swallowed", [
+        (RuntimeError("EL6586: prepared statement already exists"), True),
+        # Not an Exception: an interrupt must never be absorbed by a write whose only
+        # job is to make a card look fresh.
+        (KeyboardInterrupt(), False),
+    ])
+    def test_only_ordinary_failures_of_the_stamp_are_swallowed(
+        self, orm_sessions, monkeypatch, caplog, error, swallowed
+    ):
+        calls = []
+        real_execute = RecordingSession.execute
+
+        def exploding_first_execute(self, statement):
+            calls.append(statement)
+            if len(calls) == 1:
+                raise error
+            return real_execute(self, statement)
+
+        monkeypatch.setattr(RecordingSession, "execute", exploding_first_execute)
+        sessions_with_row(SimpleNamespace(run_id="run-1", status="pending",
+                                          heartbeat=time.time(), promoted_on=None))
+        adapter = _promote_adapter()
+
+        if swallowed:
+            with caplog.at_level(logging.WARNING):
+                assert adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], []) == "promoted"
+            # Swallowed, not silent — the operator still has to be able to see it.
+            assert "heartbeat" in caplog.text
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], [])
+
+    def test_a_real_promote_failure_still_propagates(self, orm_sessions, monkeypatch):
+        """The sibling half: only the DECORATIVE write is swallowed.
+
+        Widening the guard around promote's own transaction would turn a failed
+        publish into a reported success, which is the opposite of this issue."""
+        adapter = _promote_adapter()
+        adapter._lock_index_meta_rows = _raise_lock_failure
+        sessions_with_row(SimpleNamespace(run_id="run-1", status="pending",
+                                          heartbeat=time.time(), promoted_on=None))
+
+        with pytest.raises(RuntimeError, match="meta lock unavailable"):
+            adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], [])
 
     def test_a_run_row_that_is_gone_does_not_break_promote(self, orm_sessions):
         # The stamp must not turn a missing run row into an AttributeError; promote
