@@ -596,6 +596,82 @@ class TestARunCompletesWithTheEmbeddingBackendDown:
         assert toolkit.vector_adapter.patches[-1]["error"] is None
 
 
+class TestACommittedStopIsNotReportedAsAFailure:
+    """The adapter's `NOT EXISTS(own run cancelled)` guard cannot fire on the path it
+    was written for.
+
+    `discard_run` ACCEPTS a cancelled row and relabels it `discarded`, and
+    `_discard_index_run` runs immediately before every terminal write that is not on
+    the promote path. So by the time the guarded UPDATE is compiled there is no
+    cancelled row left to find, and the FAILED patch lands over the Stop — rewriting
+    the very `state` core's notification fence keys on, which turns a deliberate Stop
+    into an "Indexing failed" alert.
+
+    The surviving record of the Stop is the META row, which core sets in the same
+    transaction as the run row. That is what the terminal write now consults.
+    """
+
+    def _stopped_mid_run(self, toolkit):
+        """Exactly what core's _cancel_index_meta_in_session commits: the meta row goes
+        cancelled and loses its task_id, in the same transaction that takes the run row
+        out of pending."""
+        seed_meta(toolkit, state=IndexerKeywords.INDEX_META_CANCELLED.value)
+        object.__setattr__(
+            toolkit, "_stored_meta",
+            {**toolkit._stored_meta,
+             "metadata": {**toolkit._stored_meta["metadata"], "task_id": None}},
+        )
+
+    def test_the_cancelled_state_survives_the_failure_write(self, toolkit):
+        self._stopped_mid_run(toolkit)
+
+        toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_FAILED.value, 3,
+                                  error="worker raised after the stop")
+
+        assert toolkit._stored_meta["metadata"]["state"] == (
+            IndexerKeywords.INDEX_META_CANCELLED.value)
+
+    def test_no_failed_patch_is_issued_at_all(self, toolkit):
+        self._stopped_mid_run(toolkit)
+        before = len(toolkit.vector_adapter.patches)
+
+        toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_FAILED.value, 3,
+                                  error="worker raised after the stop")
+
+        assert len(toolkit.vector_adapter.patches) == before
+
+    def test_the_caller_is_told_the_state_that_stands(self, toolkit):
+        """index_data emits `written_state or final_state`, so returning the row's own
+        state is what keeps the event off the failed channel too."""
+        self._stopped_mid_run(toolkit)
+
+        written = toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_FAILED.value, 3,
+                                            error="worker raised after the stop")
+
+        assert written == IndexerKeywords.INDEX_META_CANCELLED.value
+
+    def test_an_ordinary_failure_is_still_recorded(self, toolkit):
+        """The refusal must be scoped to a cancelled row, or every genuine failure
+        goes unreported."""
+        seed_meta(toolkit, state=IndexerKeywords.INDEX_META_IN_PROGRESS.value)
+        toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_FAILED.value, 3,
+                                  error="the loader exploded")
+
+        assert toolkit.vector_adapter.patches[-1]["state"] == (
+            IndexerKeywords.INDEX_META_FAILED.value)
+        assert toolkit.vector_adapter.patches[-1]["error"] == "the loader exploded"
+
+    def test_a_completion_is_not_blocked_by_a_cancelled_row(self, toolkit):
+        """Scoped to FAILED: a run that finished its work before the Stop landed still
+        records what it did."""
+        self._stopped_mid_run(toolkit)
+
+        toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_COMPLETED.value, 7)
+
+        assert toolkit.vector_adapter.patches[-1]["state"] == (
+            IndexerKeywords.INDEX_META_COMPLETED.value)
+
+
 class TestAFailedRunCarriesItsReasonOnBothChannels:
     """The sibling of the completed-run class above. Both branches of
     `error=message if status is not IndexingStatus.OK else None` are live code on

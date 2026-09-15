@@ -2386,6 +2386,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         #
         if index_meta_raw:
             metadata = copy.deepcopy(index_meta_raw.get("metadata", {}))
+            # A committed Stop is recorded on THIS row, and that is the only record of
+            # it that survives: the run row's own `cancelled` is relabelled `discarded`
+            # by discard_run, which accepts a cancelled row and runs immediately before
+            # this write on every failure path — so the adapter's cancelled-run guard
+            # cannot see it. Reporting the worker's resulting exception as a failure
+            # would overwrite the state core's notification fence keys on, turning a
+            # deliberate Stop into an "Indexing failed" alert.
+            if (state == IndexerKeywords.INDEX_META_FAILED.value
+                    and metadata.get("state") == IndexerKeywords.INDEX_META_CANCELLED.value):
+                logger.info(
+                    f"Skipping FAILED index_meta write for '{index_name}': the run was cancelled"
+                )
+                return metadata.get("state")
             # indexed_chunks = number of chunks stored in vector store
             metadata["indexed_chunks"] = self.get_indexed_count(index_name)
             metadata["updated"] = result
