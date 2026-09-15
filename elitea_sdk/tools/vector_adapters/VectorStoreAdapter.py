@@ -711,16 +711,29 @@ class PGVectorAdapter(VectorStoreAdapter):
         # lock-order edge. It narrows the window readers see from
         # (interval + promote) to (promote): a promote longer than the display horizon
         # still reads stale, which is a chrome defect, not a control one.
-        with Session(store.session_maker.bind) as session:
-            session.execute(
-                update(IndexRun)
-                .where(
-                    IndexRun.run_id == run_id,
-                    IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+        try:
+            with Session(store.session_maker.bind) as session:
+                session.execute(
+                    update(IndexRun)
+                    .where(
+                        IndexRun.run_id == run_id,
+                        IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                    )
+                    .values(heartbeat=time.time())
                 )
-                .values(heartbeat=time.time())
-            )
-            session.commit()
+                session.commit()
+        except Exception as exc:
+            # Never fatal, exactly as the tick that issues this same statement is not
+            # (_start_run_heartbeat._tick). Raising here happens BEFORE promote sets
+            # run.finalized, so the generic handler's _discard_index_run would pass its
+            # latch and throw away a run whose embedding spend is already paid — over a
+            # write that only affects how fresh the card looks. The statement is also
+            # textually identical to the tick's, so by promote time it is well past
+            # psycopg3's prepare_threshold and carries that collision shape behind a
+            # transaction-pooling PgBouncer. Failure degrades to the previous display
+            # behaviour and nothing else.
+            logger.warning(f"Could not refresh the run heartbeat before promoting "
+                           f"'{index_name}': {exc}")
         with Session(store.session_maker.bind) as session:
             # Universal lock order for promote, discard AND cancel:
             # meta row -> run row -> chunk rows. Any other order deadlocks

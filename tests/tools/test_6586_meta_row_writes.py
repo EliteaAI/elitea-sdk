@@ -601,6 +601,31 @@ class TestPromoteRefreshesTheHeartbeatItBlocks:
         assert "cancelled" in bound
         assert "promoted" not in bound
 
+    def test_a_failing_stamp_never_fails_the_run(self, orm_sessions, monkeypatch):
+        """The stamp is decorative; the run is not.
+
+        It executes before promote sets run.finalized, so a raise here reaches the
+        generic handler with the latch still open, _discard_index_run throws away the
+        rows this run already flushed and paid to embed, and the run reports FAILED —
+        over a write that only affects how fresh the card looks. The tick that issues
+        this same statement two call sites away is already non-fatal."""
+        calls = []
+        real_execute = RecordingSession.execute
+
+        def exploding_first_execute(self, statement):
+            calls.append(statement)
+            if len(calls) == 1:
+                raise RuntimeError("EL6586: prepared statement already exists")
+            return real_execute(self, statement)
+
+        monkeypatch.setattr(RecordingSession, "execute", exploding_first_execute)
+        sessions_with_row(SimpleNamespace(run_id="run-1", status="pending",
+                                          heartbeat=time.time(), promoted_on=None))
+
+        outcome = _promote_adapter().promote_run(make_wrapper(), "idx", "run-1", [], [], [])
+
+        assert outcome == "promoted", "a decorative write must not abort the promote"
+
     def test_a_run_row_that_is_gone_does_not_break_promote(self, orm_sessions):
         # The stamp must not turn a missing run row into an AttributeError; promote
         # still has to reach its own abort outcome.
