@@ -104,6 +104,7 @@ class RecordingSession:
         self.queries = []
         self.filters = []
         self.deletes = []
+        self.statements = []
         self.commits = 0
         self.rollbacks = 0
 
@@ -112,6 +113,13 @@ class RecordingSession:
 
     def __exit__(self, *exc_info):
         return False
+
+    def execute(self, statement):
+        # Recorded, not swallowed: promote stamps the run row's heartbeat in its own
+        # committed transaction before opening the long one, and a double that
+        # silently absorbed that statement would hide it from every assertion here.
+        self.statements.append(statement)
+        return SimpleNamespace(rowcount=1)
 
     def query(self, *entities):
         query = RecordingQuery(self, entities)
@@ -158,6 +166,15 @@ def make_wrapper():
     )
 
 
+def promote_session(sessions):
+    """promote_run opens a SHORT committed transaction first, to stamp the run row's
+    heartbeat before it blocks that row for the length of the promote. Its own
+    transaction is therefore the second one — asserting on the first silently
+    measures the stamp instead, and `commits == 1` passes for the wrong reason."""
+    assert len(sessions.opened) >= 2, "the heartbeat stamp must precede promote's txn"
+    return sessions.opened[1]
+
+
 def make_run_row(status):
     return SimpleNamespace(run_id="run-1", status=status, promoted_on=None)
 
@@ -195,7 +212,7 @@ class TestPromoteAbortsDeleteOwnChunks:
         assert outcome == "aborted-row-deleted"
         assert chunk_deletes == ["run-1"]
         assert run_row.status == RUN_STATUS_DISCARDED
-        assert sessions.opened[0].commits == 1
+        assert promote_session(sessions).commits == 1
 
     def test_row_deleted_abort_cleans_up_even_without_a_run_row(self, monkeypatch, sessions):
         adapter, chunk_deletes, _ = self.setup_adapter(monkeypatch, meta_ids=[])
@@ -246,7 +263,7 @@ class TestPromoteAbortsDeleteOwnChunks:
         outcome = adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], [])
 
         assert outcome == "aborted-not-pending"
-        assert sessions.opened[0].rollbacks == 1
+        assert promote_session(sessions).rollbacks == 1
         assert chunk_deletes == []
         assert stranded == ["run-1"]
 

@@ -48,6 +48,7 @@ class FakeStagingAdapter:
     def __init__(self):
         self.promote_outcome = "promoted"
         self.calls = []
+        self.heartbeat_chunks = []
         self.pending = []
 
     def ensure_index_runs_table(self, wrapper):
@@ -61,8 +62,21 @@ class FakeStagingAdapter:
         self.calls.append("sweep")
         return []
 
-    def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id):
+    def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id, chunks_written=None):
         self.calls.append("heartbeat")
+        self.heartbeat_chunks.append(chunks_written)
+
+    def update_index_meta_keys(self, wrapper, meta_id, run_id, patch):
+        # Mirrors the real merge: only the patched keys change, everything else on
+        # the row survives. Replacing the dict here would hide exactly the bug the
+        # keyed write exists to fix.
+        stored = wrapper._stored_meta
+        if stored is None:
+            return 0
+        merged = {**stored.get("metadata", {}), **patch}
+        wrapper.written.append(merged)
+        object.__setattr__(wrapper, "_stored_meta", {**stored, "metadata": merged})
+        return 1
 
     def promote_run(self, wrapper, index_name, run_id, superseded_ids, orphan_ids, damaged_ids):
         self.calls.append("promote")
