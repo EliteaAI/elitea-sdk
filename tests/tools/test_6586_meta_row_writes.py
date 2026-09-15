@@ -555,23 +555,51 @@ class TestProgressIsSeededAndCounted:
 
 
 class TestPromoteRefreshesTheHeartbeatItBlocks:
-    """promote_run holds the run row FOR UPDATE across every batched delete. The
+    """promote_run holds the run row FOR UPDATE across every batched delete, so the
     worker's own tick blocks on it and then matches zero rows — its predicate is
     status IN (pending, cancelled) and the status has moved by the time the lock
-    lifts. Without a stamp here, every liveness reader sees a heartbeat frozen at
-    the moment promote started, for the whole promote plus one interval."""
+    lifts. Without a stamp, readers see a heartbeat frozen at promote start for the
+    whole promote plus one interval."""
 
-    def test_the_run_row_heartbeat_is_advanced_inside_the_promote_txn(self, orm_sessions):
-        started = time.time() - 600
+    def test_the_stamp_is_committed_before_promote_opens_its_transaction(self, orm_sessions):
+        """The mechanism is transactional, so the assertion has to be too.
+
+        Asserting `run_row.heartbeat > started` on a double would pass for an
+        in-transaction assignment, which no reader can ever see: it is invisible
+        until commit, and that same commit moves the status off `pending`, which
+        every reader filters on. What has to hold is that the stamp lands in its
+        OWN committed transaction, opened and closed before promote's."""
         run_row = SimpleNamespace(run_id="run-1", status="pending",
-                                  heartbeat=started, promoted_on=None)
+                                  heartbeat=time.time() - 600, promoted_on=None)
         sessions_with_row(run_row)
-        adapter = _promote_adapter()
 
-        adapter.promote_run(make_wrapper(), "idx", "run-1", [], [], [])
+        _promote_adapter().promote_run(make_wrapper(), "idx", "run-1", [], [], [])
 
-        assert run_row.heartbeat > started
-        assert run_row.status == "promoted"
+        assert len(orm_sessions) >= 2, "the stamp must not share promote's session"
+        stamp_session, promote_session = orm_sessions[0], orm_sessions[1]
+
+        sql = compile_sql(stamp_session.statements[0])
+        assert sql.startswith("UPDATE elitea_index_runs SET heartbeat=")
+        # Committed on its own, before the session that takes the meta lock.
+        assert stamp_session.commits == 1
+        assert stamp_session.statements, "the first session must carry the stamp"
+        assert promote_session is not stamp_session
+
+    def test_the_stamp_only_touches_a_run_that_is_still_live(self, orm_sessions):
+        run_row = SimpleNamespace(run_id="run-1", status="pending",
+                                  heartbeat=time.time(), promoted_on=None)
+        sessions_with_row(run_row)
+
+        _promote_adapter().promote_run(make_wrapper(), "idx", "run-1", [], [], [])
+
+        # The IN clause binds as one list parameter, so flatten before asserting.
+        bound = []
+        for value in compiled_params(orm_sessions[0].statements[0]).values():
+            bound.extend(value if isinstance(value, (list, tuple)) else [value])
+
+        assert "pending" in bound
+        assert "cancelled" in bound
+        assert "promoted" not in bound
 
     def test_a_run_row_that_is_gone_does_not_break_promote(self, orm_sessions):
         # The stamp must not turn a missing run row into an AttributeError; promote

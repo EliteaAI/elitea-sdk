@@ -703,20 +703,30 @@ class PGVectorAdapter(VectorStoreAdapter):
         )
 
         store = vectorstore_wrapper.vectorstore
+        # Committed BEFORE the long transaction opens, and deliberately not inside it.
+        # An in-transaction stamp is invisible until commit, and that same commit moves
+        # the status off `pending` — which every reader filters on — so no reader ever
+        # observes it. This takes the run row alone with no meta lock held, the same
+        # shape heartbeat_index_run's first transaction already uses, so it adds no
+        # lock-order edge. It narrows the window readers see from
+        # (interval + promote) to (promote): a promote longer than the display horizon
+        # still reads stale, which is a chrome defect, not a control one.
+        with Session(store.session_maker.bind) as session:
+            session.execute(
+                update(IndexRun)
+                .where(
+                    IndexRun.run_id == run_id,
+                    IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                )
+                .values(heartbeat=time.time())
+            )
+            session.commit()
         with Session(store.session_maker.bind) as session:
             # Universal lock order for promote, discard AND cancel:
             # meta row -> run row -> chunk rows. Any other order deadlocks
             # against the other two parties.
             meta_ids = self._lock_index_meta_rows(session, store, index_name)
             run_row = session.get(IndexRun, run_id, with_for_update=True)
-            if run_row is not None:
-                # Promote holds this row FOR UPDATE across every batched delete, so the
-                # worker's own tick blocks here and then matches zero rows — its
-                # predicate is status IN (pending, cancelled) and the status has moved
-                # by the time the lock is released. Liveness readers would see a
-                # heartbeat frozen at the moment promote started. Stamping it here
-                # costs no extra statement: this transaction already writes this row.
-                run_row.heartbeat = time.time()
             if not meta_ids:
                 # Every non-promoted status takes its staged rows along: a run
                 # already swept to DISCARDED is out of reach of both the sweep
