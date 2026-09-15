@@ -575,6 +575,11 @@ class TestARunCompletesWithTheEmbeddingBackendDown:
         # read as the failure reason. The seeded test below cannot see this — it calls
         # index_meta_update directly, where `error` simply defaults to None.
         assert patch["error"] is None
+        # Same ternary, second channel. The worker forwards this event and core
+        # persists it, so announcing the success summary as `error` reports a healthy
+        # index as failed just as effectively as writing it to the row.
+        assert toolkit.emitted[-1] == {"state": IndexerKeywords.INDEX_META_COMPLETED.value,
+                                       "error": None}
 
     def test_a_stale_error_from_the_previous_run_is_cleared(self, toolkit, monkeypatch):
         """Seeded, because a fresh row already carries error: None from init — the
@@ -589,6 +594,63 @@ class TestARunCompletesWithTheEmbeddingBackendDown:
         toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_COMPLETED.value, 5)
 
         assert toolkit.vector_adapter.patches[-1]["error"] is None
+
+
+class TestAFailedRunCarriesItsReasonOnBothChannels:
+    """The sibling of the completed-run class above. Both branches of
+    `error=message if status is not IndexingStatus.OK else None` are live code on
+    every run; testing only the success half leaves an expression whose other half
+    nothing contradicts, on the row write AND on the event.
+
+    The shim fails every CHUNK flush and no index_meta embed, which is the mirror of
+    the class above. `_flush_chunk` swallows the exception into `failed_count`, so the
+    run reaches its terminal write with a non-OK status instead of raising.
+    """
+
+    def _run_with_chunk_writes_down(self, toolkit, monkeypatch, documents=("a", "b")):
+        def failing_add_documents(vectorstore=None, documents=None, ids=None):
+            metadata = dict(documents[0].metadata)
+            if metadata.get("type") == IndexerKeywords.INDEX_META_TYPE.value:
+                object.__setattr__(
+                    toolkit, "_stored_meta",
+                    {"id": "meta-1", "content": "index_meta_x", "metadata": metadata},
+                )
+                return ["meta-row-id"]
+            raise RuntimeError("EL6586_CHUNKS_DOWN: vectorstore write rejected")
+
+        monkeypatch.setattr(
+            "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
+            failing_add_documents,
+        )
+        monkeypatch.setattr(StagingToolkit, "_extend_data", lambda self, docs: docs)
+        monkeypatch.setattr(StagingToolkit, "_collect_dependencies", lambda self, docs: docs)
+        monkeypatch.setattr(
+            StagingToolkit, "_apply_loaders_chunkers",
+            lambda self, docs, chunking_tool=None, chunking_config=None: docs,
+        )
+        monkeypatch.setattr(StagingToolkit, "_clean_metadata", lambda self, docs: docs)
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents(*documents)))
+
+        return toolkit.index_data(index_name="x")
+
+    def test_the_run_really_failed(self, toolkit, monkeypatch):
+        """Positive control: without this the two assertions below would hold on a
+        run that quietly succeeded and reported no reason because there was none."""
+        result = self._run_with_chunk_writes_down(toolkit, monkeypatch)
+
+        assert result["status"] != IndexingStatus.OK.value
+        assert result["message"]
+
+    def test_the_row_write_carries_the_reason(self, toolkit, monkeypatch):
+        result = self._run_with_chunk_writes_down(toolkit, monkeypatch)
+
+        assert toolkit.vector_adapter.patches[-1]["error"] == result["message"]
+
+    def test_the_event_carries_the_reason(self, toolkit, monkeypatch):
+        result = self._run_with_chunk_writes_down(toolkit, monkeypatch)
+
+        assert toolkit.emitted[-1]["error"] == result["message"]
 
 
 class TestAFailedRunIsAlwaysRecordedBeforeItIsAnnounced:
