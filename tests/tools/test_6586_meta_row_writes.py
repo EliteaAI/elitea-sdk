@@ -569,6 +569,12 @@ class TestARunCompletesWithTheEmbeddingBackendDown:
         # mutant the run raises before either assertion is reached.
         assert [p for p in toolkit.vector_adapter.attempts if p.get("state") == failed] == []
         assert [e for e in toolkit.emitted if e["state"] == failed] == []
+        # Pins the CALLER's ternary, not the writer's default: index_data passes the
+        # rendered run summary as `error` on every non-OK status, so dropping the
+        # condition parks a "2 documents indexed" message in the field core and the UI
+        # read as the failure reason. The seeded test below cannot see this — it calls
+        # index_meta_update directly, where `error` simply defaults to None.
+        assert patch["error"] is None
 
     def test_a_stale_error_from_the_previous_run_is_cleared(self, toolkit, monkeypatch):
         """Seeded, because a fresh row already carries error: None from init — the
