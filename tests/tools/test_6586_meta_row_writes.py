@@ -487,24 +487,27 @@ def break_the_meta_write_after_promote(monkeypatch):
 class TestARunCompletesWithTheEmbeddingBackendDown:
     """#6586's headline acceptance criterion, end to end.
 
-    Two existing tests cover the halves — one proves the terminal write embeds
-    nothing, another proves a healthy run reports completed — but nothing joined
-    them, so the AC as worded rested on the live A/B rather than on the suite.
+    The real pipeline runs here rather than a counter stub, so chunk batches
+    actually reach the patched add_documents. That matters twice: the shim's
+    "let chunks through, fail index_meta" split is exercised instead of being
+    unreachable, and the run reaches COMPLETED the way a real one does.
 
-    The shim fails ONLY index_meta embeds, and only after the first: the fresh-row
-    INSERT has to land or there is no row to patch. It must never touch chunk
-    flushes — a run that loses those ends FAILED on its own and the test passes
-    without ever exercising the path."""
+    The shim fails index_meta embeds after the first — the fresh-row INSERT has to
+    land or there is no row to patch. It must never touch chunk flushes: a run that
+    loses those ends FAILED on its own and the assertions below would pass without
+    exercising anything.
+    """
 
-    def _embedding_backend_down(self, toolkit, monkeypatch):
-        meta_embeds = []
+    def _run_with_embeddings_down(self, toolkit, monkeypatch, documents=("a", "b")):
+        seen = SimpleNamespace(meta=[], chunks=[])
 
         def failing_add_documents(vectorstore=None, documents=None, ids=None):
             metadata = dict(documents[0].metadata)
             if metadata.get("type") != IndexerKeywords.INDEX_META_TYPE.value:
-                return ["chunk-row-id"]
-            meta_embeds.append(metadata)
-            if len(meta_embeds) > 1:
+                seen.chunks.append(len(documents))
+                return [f"chunk-{n}" for n in range(len(documents))]
+            seen.meta.append(metadata)
+            if len(seen.meta) > 1:
                 raise RuntimeError("EL6586_EMBED_DOWN: embedding backend unavailable")
             object.__setattr__(
                 toolkit, "_stored_meta",
@@ -516,37 +519,70 @@ class TestARunCompletesWithTheEmbeddingBackendDown:
             "elitea_sdk.runtime.langchain.interfaces.llm_processor.add_documents",
             failing_add_documents,
         )
-        return meta_embeds
+        # The real _save_index_generator, with only the fetch/chunk stages stubbed.
+        monkeypatch.setattr(StagingToolkit, "_extend_data", lambda self, docs: docs)
+        monkeypatch.setattr(StagingToolkit, "_collect_dependencies", lambda self, docs: docs)
+        monkeypatch.setattr(
+            StagingToolkit, "_apply_loaders_chunkers",
+            lambda self, docs, chunking_tool=None, chunking_config=None: docs,
+        )
+        monkeypatch.setattr(StagingToolkit, "_clean_metadata", lambda self, docs: docs)
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents(*documents)))
+
+        result = toolkit.index_data(index_name="x")
+        return result, seen
 
     def test_the_run_reports_completed_with_its_real_counts(self, toolkit, monkeypatch):
-        meta_embeds = self._embedding_backend_down(toolkit, monkeypatch)
-
-        result = run_index_data(toolkit, monkeypatch)
+        result, seen = self._run_with_embeddings_down(toolkit, monkeypatch)
 
         assert result["status"] == IndexingStatus.OK.value
-        # Only index_meta_init embedded; the terminal write never asked, which is why
-        # a dead embedding backend can no longer report a promoted corpus as failed.
-        assert len(meta_embeds) == 1
+        # The shim was armed and the chunk half really ran: had it fired on chunks the
+        # run would have ended FAILED and this assertion would pass for the wrong reason.
+        assert sum(seen.chunks) == 2
+        # Only index_meta_init embedded. The terminal write never asked, which is why a
+        # dead embedding backend can no longer report a promoted corpus as failed.
+        assert len(seen.meta) == 1
         assert "promote" in toolkit.vector_adapter.calls
 
-    def test_the_terminal_state_and_counts_reach_the_row(self, toolkit, monkeypatch):
-        self._embedding_backend_down(toolkit, monkeypatch)
+    def test_a_second_meta_embed_would_have_raised(self, toolkit, monkeypatch):
+        """Positive control: the shim is live, not inert."""
+        _, seen = self._run_with_embeddings_down(toolkit, monkeypatch)
+        from elitea_sdk.runtime.langchain.interfaces import llm_processor
 
-        run_index_data(toolkit, monkeypatch)
+        assert seen.meta, "the shim never saw the init embed"
+        with pytest.raises(RuntimeError, match="EL6586_EMBED_DOWN"):
+            llm_processor.add_documents(
+                documents=[Document(page_content="index_meta_x",
+                                    metadata={"type": IndexerKeywords.INDEX_META_TYPE.value})]
+            )
+
+    def test_the_terminal_state_and_counts_reach_the_row(self, toolkit, monkeypatch):
+        self._run_with_embeddings_down(toolkit, monkeypatch)
 
         patch = toolkit.vector_adapter.patches[-1]
+        failed = IndexerKeywords.INDEX_META_FAILED.value
         assert patch["state"] == IndexerKeywords.INDEX_META_COMPLETED.value
         assert patch["updated"] == 2
-        assert patch["error"] is None
-
-    def test_no_failure_is_recorded_or_announced(self, toolkit, monkeypatch):
-        self._embedding_backend_down(toolkit, monkeypatch)
-
-        run_index_data(toolkit, monkeypatch)
-
-        failed = IndexerKeywords.INDEX_META_FAILED.value
+        # Folded in from a test that could never observe these being false: on the
+        # green path both are empty by construction, and under the terminal-write
+        # mutant the run raises before either assertion is reached.
         assert [p for p in toolkit.vector_adapter.attempts if p.get("state") == failed] == []
         assert [e for e in toolkit.emitted if e["state"] == failed] == []
+
+    def test_a_stale_error_from_the_previous_run_is_cleared(self, toolkit, monkeypatch):
+        """Seeded, because a fresh row already carries error: None from init — the
+        assertion passes without the success branch clearing anything."""
+        self._run_with_embeddings_down(toolkit, monkeypatch)
+        object.__setattr__(
+            toolkit, "_stored_meta",
+            {**toolkit._stored_meta,
+             "metadata": {**toolkit._stored_meta["metadata"], "error": "previous failure"}},
+        )
+
+        toolkit.index_meta_update("x", IndexerKeywords.INDEX_META_COMPLETED.value, 5)
+
+        assert toolkit.vector_adapter.patches[-1]["error"] is None
 
 
 class TestAFailedRunIsAlwaysRecordedBeforeItIsAnnounced:
