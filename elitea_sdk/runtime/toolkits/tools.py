@@ -15,7 +15,13 @@ from .application import ApplicationToolkit
 from .artifact import ArtifactToolkit
 from .vectorstore import VectorStoreToolkit
 from .mcp import McpToolkit
-from .mcp_config import McpConfigToolkit, get_mcp_config_toolkit_schemas, get_mcp_server_config, load_mcp_servers_config
+from .mcp_config import (
+    McpConfigToolkit,
+    get_all_mcp_server_configs,
+    get_mcp_config_toolkit_schemas,
+    get_mcp_server_config,
+    load_mcp_servers_config,
+)
 from ..tools.mcp_server_tool import McpServerTool
 from ..tools.sandbox import SandboxToolkit
 from ..tools.data_analysis import DataAnalysisToolkit
@@ -107,6 +113,20 @@ def _infer_server_name(tool: dict, settings: dict) -> str:
     return server_name
 
 
+def _lookup_mcp_server_config(server_name: Optional[str]) -> Dict[str, Any]:
+    """Resolve an admin-defined MCP server definition, tolerating case differences in the name."""
+    if not server_name:
+        return {}
+    config = get_mcp_server_config(server_name)
+    if config:
+        return config
+    lowered = str(server_name).lower()
+    for candidate_name, candidate in (get_all_mcp_server_configs() or {}).items():
+        if candidate_name.lower() == lowered:
+            return candidate or {}
+    return {}
+
+
 def _infer_proxy_tool_names(tool: dict, settings: dict) -> List[str]:
     # Always one proxy stub per unauthenticated server.
     # Expanding to N stubs (one per selected_tool) blows past the LLM tool limit and is
@@ -123,10 +143,21 @@ def _infer_proxy_tool_names(tool: dict, settings: dict) -> List[str]:
     return [f"mcp_authorize_{_safe_tool_name(str(fallback_label))}"]
 
 
-def _build_provided_settings(settings: dict) -> Optional[Dict[str, Any]]:
-    """Build a masked provided_settings dict from toolkit settings containing OAuth client credentials."""
+def _build_provided_settings(settings: dict, tool: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    """Build a masked provided_settings dict of OAuth client credentials for the auth prompt."""
     _client_id = settings.get('client_id')
     _client_secret = settings.get('client_secret')
+    _scopes = settings.get('scopes') or settings.get('scope')
+    if not _client_id and not _client_secret:
+        # Config-defined servers keep credentials in the admin server definition rather than
+        # in toolkit settings. Without this the browser sees no client_id and falls back to
+        # dynamic registration, authorizing against a throwaway client.
+        _definition = _lookup_mcp_server_config(
+            settings.get('server_name') or (_infer_server_name(tool, settings) if tool else '')
+        )
+        _client_id = _definition.get('client_id')
+        _client_secret = _definition.get('client_secret')
+        _scopes = _scopes or _definition.get('scopes') or _definition.get('scope')
     if not _client_id and not _client_secret:
         return None
     _ps: Dict[str, Any] = {}
@@ -139,7 +170,6 @@ def _build_provided_settings(settings: dict) -> Optional[Dict[str, Any]]:
             else str(_client_secret)
         )
         _ps['mcp_client_secret'] = mask_secret(_sv)
-    _scopes = settings.get('scopes')
     if _scopes:
         _ps['scopes'] = _scopes
     return _ps or None
@@ -351,7 +381,7 @@ def _annotate_mcp_auth_error(auth_err: Any, tool: dict) -> None:
         if _tid is not None:
             auth_err.toolkit_id = _tid
     if not getattr(auth_err, 'provided_settings', None):
-        _ps = _build_provided_settings(tool.get('settings') or {})
+        _ps = _build_provided_settings(tool.get('settings') or {}, tool)
         if _ps:
             auth_err.provided_settings = _ps
 
@@ -398,15 +428,7 @@ def _build_deferred_mcp_auth_tools(
             if not server_name and not _is_http_url(server_url):
                 server_name = server_url  # treat the symbolic name itself as server_name
             if server_name:
-                config = get_mcp_server_config(server_name) or {}
-                # Case-insensitive fallback
-                if not config:
-                    _all = load_mcp_servers_config()
-                    _lower = server_name.lower()
-                    for _k, _v in _all.items():
-                        if _k.lower() == _lower:
-                            config = _v
-                            break
+                config = _lookup_mcp_server_config(server_name)
                 for _url_key in ("url", "server_url", "base_url", "authorization_server_url", "auth_url"):
                     _candidate = config.get(_url_key)
                     if _is_http_url(_candidate):
@@ -818,7 +840,7 @@ def _make_mcp_auth_control_tool(
                         if _tid is not None:
                             exc.toolkit_id = _tid
                     if not getattr(exc, 'provided_settings', None):
-                        _ps = _build_provided_settings(_tc_settings)
+                        _ps = _build_provided_settings(_tc_settings, _tc)
                         if _ps:
                             exc.provided_settings = _ps
                     break
