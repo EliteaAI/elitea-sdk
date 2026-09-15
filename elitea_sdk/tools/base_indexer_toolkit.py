@@ -674,10 +674,9 @@ def _render_category_lines(category: Dict[str, Any], item_labels: Dict[str, str]
 
 
 DEFAULT_CUT_OFF = 0.1
-# The keys the SDK owns on the index_meta row. Everything else on that row —
-# task_id, conversation_id, index_configuration, task_disconnected_timeout_sec —
-# belongs to the platform, and a full-row rewrite from a stale snapshot silently
-# reverted whatever it had written in between.
+# The keys the SDK owns on the index_meta row. Everything else — task_id,
+# conversation_id, index_configuration, task_disconnected_timeout_sec — belongs to the
+# platform, and a full-row rewrite from a stale snapshot reverted it.
 SDK_OWNED_META_KEYS = (
     "indexed_chunks", "updated", "state", "updated_on",
     "error", "report", "skipped", "total", "indexed", "history",
@@ -941,11 +940,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # the previous run's counts into this run's report.
             self._indexing_stats = IndexingStats()
             empty_loader = False
-            # The heartbeat deliberately outlives the document loop: promote_run
-            # runs after it and holds the meta row for seconds to minutes on a
-            # large corpus. Stopping here left a healthy run with a frozen
-            # heartbeat and a still-pending run row, which every liveness reader
-            # is entitled to call dead. The run-scope stop is in the finally below.
+            # The heartbeat outlives the document loop on purpose: promote_run runs
+            # after it and holds the meta row for seconds to minutes on a large corpus,
+            # and a frozen heartbeat there reads as dead. Stopped in the finally below.
             documents = self._base_loader(**kwargs)
             documents = list(documents) # consume/exhaust generator to count items
             documents_count = len(documents)
@@ -1093,9 +1090,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._emit_index_event(index_name, error=msg, state=IndexerKeywords.INDEX_META_FAILED.value)
             raise e
         finally:
-            # Backstop for every exit: the handlers above stop it first so their
-            # ordering is unchanged, and this covers the success path, the
-            # empty-loader return and the promote-abort returns.
+            # Backstop for every exit; the handlers above stop it first, so their
+            # ordering is unchanged.
             self._stop_run_heartbeat()
 
     def _staging_active(self) -> bool:

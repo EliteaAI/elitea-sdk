@@ -46,12 +46,10 @@ def _is_recycled_db_connection(exception: BaseException) -> bool:
 
 
 # Prepared-plan failures behind a transaction-pooling PgBouncer. psycopg3 auto-prepares
-# at prepare_threshold=5 and the SDK passes no connect_args, so a fully parameterised
-# statement gets server-prepared and can collide. All three recover on retry, and they
-# land on classes that LOOK deterministic: 42P05/26000 on ProgrammingError, 0A000 on
-# NotSupportedError (whose only psycopg3 member is this one transient code). A bare
-# class allow-list therefore silently refuses to retry the most likely transient
-# failure of a pooled write. See tests/tools/utils/test_6587_*.
+# at prepare_threshold=5 and the SDK passes no connect_args, so a parameterised statement
+# gets server-prepared and can collide. All three recover on retry, but they land on
+# classes that LOOK deterministic — 42P05/26000 on ProgrammingError, 0A000 on
+# NotSupportedError — so classify on SQLSTATE, never on the exception class.
 _TRANSIENT_SQLSTATES = ("42P05", "26000", "0A000")
 
 

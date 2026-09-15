@@ -703,14 +703,11 @@ class PGVectorAdapter(VectorStoreAdapter):
         )
 
         store = vectorstore_wrapper.vectorstore
-        # Committed BEFORE the long transaction opens, and deliberately not inside it.
-        # An in-transaction stamp is invisible until commit, and that same commit moves
-        # the status off `pending` — which every reader filters on — so no reader ever
-        # observes it. This takes the run row alone with no meta lock held, the same
-        # shape heartbeat_index_run's first transaction already uses, so it adds no
-        # lock-order edge. It narrows the window readers see from
-        # (interval + promote) to (promote): a promote longer than the display horizon
-        # still reads stale, which is a chrome defect, not a control one.
+        # Committed BEFORE the long transaction opens, never inside it: an in-transaction
+        # stamp is invisible until commit, and that same commit moves the status off
+        # `pending`, which every reader filters on, so no reader would observe it. Takes
+        # the run row alone with no meta lock held, the same shape heartbeat_index_run's
+        # first transaction uses, so it adds no lock-order edge.
         try:
             with Session(store.session_maker.bind) as session:
                 session.execute(
@@ -723,15 +720,10 @@ class PGVectorAdapter(VectorStoreAdapter):
                 )
                 session.commit()
         except Exception as exc:
-            # Never fatal, exactly as the tick that issues this same statement is not
-            # (_start_run_heartbeat._tick). Raising here happens BEFORE promote sets
-            # run.finalized, so the generic handler's _discard_index_run would pass its
-            # latch and throw away a run whose embedding spend is already paid — over a
-            # write that only affects how fresh the card looks. The statement is also
-            # textually identical to the tick's, so by promote time it is well past
-            # psycopg3's prepare_threshold and carries that collision shape behind a
-            # transaction-pooling PgBouncer. Failure degrades to the previous display
-            # behaviour and nothing else.
+            # Never fatal: this runs BEFORE promote sets run.finalized, so raising would
+            # let the generic handler's _discard_index_run pass its latch and throw away a
+            # run whose embedding spend is already paid — over a write that only affects
+            # how fresh the card looks.
             logger.warning(f"Could not refresh the run heartbeat before promoting "
                            f"'{index_name}': {exc}")
         with Session(store.session_maker.bind) as session:
