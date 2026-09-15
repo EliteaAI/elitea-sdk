@@ -940,9 +940,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # the previous run's counts into this run's report.
             self._indexing_stats = IndexingStats()
             empty_loader = False
-            # The heartbeat outlives the document loop on purpose: promote_run runs
-            # after it and holds the meta row for seconds to minutes on a large corpus,
-            # and a frozen heartbeat there reads as dead. Stopped in the finally below.
+            # The heartbeat outlives the document loop so the phases between it and the
+            # terminal write keep reporting. It does NOT cover promote itself: promote
+            # takes the meta row and the run row FOR UPDATE before its delete loop, and
+            # both heartbeat statements target exactly those rows, so the tick blocks
+            # until promote commits — parking one pooled connection for its duration.
+            # Freshness ACROSS promote comes from the committed stamp taken before it,
+            # and is worth one horizon. Stopped in the finally below.
             documents = self._base_loader(**kwargs)
             documents = list(documents) # consume/exhaust generator to count items
             documents_count = len(documents)
