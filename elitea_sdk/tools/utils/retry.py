@@ -22,7 +22,7 @@ Usage:
 import logging
 from typing import Tuple
 
-from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, OperationalError
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -43,6 +43,38 @@ def _is_deterministic_db_error(exception: BaseException) -> bool:
 
 def _is_recycled_db_connection(exception: BaseException) -> bool:
     return isinstance(exception, DBAPIError) and exception.connection_invalidated
+
+
+# Prepared-plan failures behind a transaction-pooling PgBouncer. psycopg3 auto-prepares
+# at prepare_threshold=5 and the SDK passes no connect_args, so a parameterised statement
+# gets server-prepared and can collide. All three recover on retry, but they land on
+# classes that LOOK deterministic — 42P05/26000 on ProgrammingError, 0A000 on
+# NotSupportedError — so classify on SQLSTATE, never on the exception class.
+_TRANSIENT_SQLSTATES = ("42P05", "26000", "0A000")
+
+
+def _sqlstate(exception: BaseException):
+    orig = getattr(exception, "orig", None)
+    return getattr(orig, "sqlstate", None) or getattr(
+        getattr(orig, "diag", None), "sqlstate", None
+    )
+
+
+def is_transient_db_error(exception: BaseException) -> bool:
+    """Retriable failures of a small, self-contained SQL write.
+
+    Deliberately does NOT fall back to substring matching the way
+    ``is_server_error_retriable`` does: a rendered statement carries its bound
+    parameters, and an index_meta patch legitimately contains values like
+    ``"indexed": 500``, which that matcher would read as a retriable 5xx. The
+    SQLSTATE tail below is what replaces that fallback — explicit codes, so a new
+    transient class has to be added deliberately rather than matched by accident.
+    """
+    if _is_deterministic_db_error(exception):
+        return False
+    if isinstance(exception, OperationalError) or _is_recycled_db_connection(exception):
+        return True
+    return _sqlstate(exception) in _TRANSIENT_SQLSTATES
 
 
 def is_server_error_retriable(exception: BaseException) -> bool:

@@ -49,6 +49,10 @@ class IndexerKeywords(Enum):
     INDEX_META_TYPE = 'index_meta'
     INDEX_META_CREATED = 'created'
     INDEX_META_IN_PROGRESS = 'in_progress'
+    # Written by the platform's Stop, never by the SDK. Named here because the
+    # terminal write must recognise it: a committed Stop is the only surviving
+    # record that a run was cancelled rather than failed.
+    INDEX_META_CANCELLED = 'cancelled'
     INDEX_META_COMPLETED = 'completed'
     INDEX_META_FAILED = 'failed'
     INDEX_META_PARTLY_OK = 'partly_indexed'
