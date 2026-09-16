@@ -86,6 +86,10 @@ from langchain_community.tools.github.prompt import (
 
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION
 
+GITHUB_DOCUMENTED_GET_LIMIT_PER_SECOND = 15
+GITHUB_INDEXER_REQUESTS_PER_SECOND = 10
+GITHUB_SECONDS_BETWEEN_REQUESTS = 1 / GITHUB_INDEXER_REQUESTS_PER_SECOND
+
 
 class GitHubClient(BaseModel):
     """Client for interacting with the GitHub REST API."""
@@ -194,13 +198,16 @@ class GitHubClient(BaseModel):
 
             # Create GitHub client
             if auth is None:
-                return Github(base_url=self.github_base_url)
+                return Github(base_url=self.github_base_url,
+                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
             elif auth_config.github_app_id and auth_config.github_app_private_key:
-                gi = GithubIntegration(base_url=self.github_base_url, auth=auth)
+                gi = GithubIntegration(base_url=self.github_base_url, auth=auth,
+                                       seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
                 installation = gi.get_installations()[0]
                 return installation.get_github_for_installation()
             else:
-                return Github(base_url=self.github_base_url, auth=auth)
+                return Github(base_url=self.github_base_url, auth=auth,
+                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
 
         # Get shared client from registry (or create new one)
         registry = get_client_registry()
