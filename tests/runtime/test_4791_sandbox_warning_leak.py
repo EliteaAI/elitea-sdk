@@ -78,7 +78,7 @@ class TestSandboxPyToolWarningLeak:
         ), patch.object(
             type(tool), '_initialize_sandbox', return_value=None, create=True
         ):
-            return asyncio.get_event_loop().run_until_complete(
+            return asyncio.run(
                 tool._arun("<code>")
             )
 
@@ -214,7 +214,7 @@ class TestLangchainSandboxAsyncWarningLeak:
             stderr=WARNING_STDERR,
         )
         tool = self._make_tool(fake_result)
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             tool._arun("<code>")
         )
 
@@ -232,7 +232,7 @@ class TestLangchainSandboxAsyncWarningLeak:
             stderr=error_msg,
         )
         tool = self._make_tool(fake_result)
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             tool._arun("<code>")
         )
 
@@ -247,7 +247,7 @@ class TestLangchainSandboxAsyncWarningLeak:
             stderr=None,
         )
         tool = self._make_tool(fake_result)
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             tool._arun("<code>")
         )
 
