@@ -201,6 +201,20 @@ def test_index_data_takes_the_repository_argument(mock_git_client_cls):
     assert "repository_id" not in _schema_of(wrapper, "search_index").model_fields
 
 
+def test_toolkit_config_schema_previews_the_repository_argument_as_optional():
+    from elitea_sdk.tools.ado.repos import AzureDevOpsReposToolkit
+
+    # The preview is built from an unconfigured wrapper, so it cannot claim the argument is
+    # required - that only holds for a toolkit saved without any repository.
+    args_schemas = AzureDevOpsReposToolkit.toolkit_config_schema().model_json_schema()[
+        "properties"
+    ]["selected_tools"]["args_schemas"]
+
+    for tool_name in ("read_file", "index_data"):
+        schema = args_schemas[tool_name]
+        assert "repository_id" not in schema.get("required", []), tool_name
+
+
 def test_toolkit_config_schema_accepts_a_legacy_string_repository():
     from elitea_sdk.tools.ado.repos import AzureDevOpsReposToolkit
 

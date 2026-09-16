@@ -674,14 +674,27 @@ class ReposApiWrapper(CodeIndexerToolkit):
                     Field(default=None, description=f"Target repository. Optional - {default_hint}."),
                 )
             }
+        if not self.project:
+            # toolkit_config_schema() previews these arguments from an unvalidated instance that
+            # knows neither the project nor the repositories, so it must not claim requiredness.
+            return {
+                "repository_id": (
+                    Optional[str],
+                    Field(
+                        default=None,
+                        description="Target repository ID or name. Defaults to the first "
+                                    "repository of the toolkit, and is required when the toolkit "
+                                    "configures none.",
+                    ),
+                )
+            }
         return {
             "repository_id": (
                 str,
                 Field(
-                    description="Target repository ID or name"
-                                + (f" in project '{self.project}'" if self.project else "")
-                                + ". Required because this toolkit has no configured "
-                                  "repositories - use 'list_repositories' to discover them.",
+                    description=f"Target repository ID or name in project '{self.project}'. "
+                                "Required because this toolkit has no configured repositories - "
+                                "use 'list_repositories' to discover them.",
                 ),
             )
         }
