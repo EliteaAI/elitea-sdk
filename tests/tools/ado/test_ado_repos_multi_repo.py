@@ -83,19 +83,20 @@ def test_single_repository_keeps_the_per_call_argument_optional(mock_git_client_
 
 
 @patch("elitea_sdk.tools.ado.repos.repos_wrapper.GitClient")
-def test_multiple_repositories_require_and_constrain_the_argument(mock_git_client_cls):
+def test_multiple_repositories_default_to_the_first_and_constrain_the_argument(mock_git_client_cls):
     mock_git_client_cls.return_value = _make_git_client()
 
     wrapper = ReposApiWrapper(**_base_kwargs(repository_id=["alpha", "beta"]))
     schema = _schema_of(wrapper, "read_file").model_json_schema()
 
-    assert "repository_id" in schema["required"]
-    assert schema["properties"]["repository_id"]["enum"] == ["alpha", "beta"]
-    # Nothing is bound until a call names its repository
+    assert "repository_id" not in schema.get("required", [])
+    assert schema["properties"]["repository_id"]["anyOf"][0]["enum"] == ["alpha", "beta"]
+    # Nothing is bound until a call happens
     assert wrapper.repository_id is None
 
-    with pytest.raises(ToolException, match="configured with multiple repositories"):
-        wrapper.run("list_branches_in_repo")
+    # An omitted argument keeps working for toolkits that gained a second repository
+    wrapper.run("list_branches_in_repo")
+    assert wrapper._repo_state["alpha"]["searchable_name"] == "alpha"
 
     with pytest.raises(ToolException, match="not available in this toolkit"):
         wrapper.run("list_branches_in_repo", repository_id="gamma")
@@ -194,8 +195,8 @@ def test_index_data_takes_the_repository_argument(mock_git_client_cls):
     wrapper = ReposApiWrapper(**_base_kwargs(repository_id=["alpha", "beta"]))
     schema = _schema_of(wrapper, "index_data").model_json_schema()
 
-    assert "repository_id" in schema["required"]
-    assert schema["properties"]["repository_id"]["enum"] == ["alpha", "beta"]
+    assert "repository_id" not in schema.get("required", [])
+    assert schema["properties"]["repository_id"]["anyOf"][0]["enum"] == ["alpha", "beta"]
     # Searching stays repository agnostic: one index per repository is the contract
     assert "repository_id" not in _schema_of(wrapper, "search_index").model_fields
 

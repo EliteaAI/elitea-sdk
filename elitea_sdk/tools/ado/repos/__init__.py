@@ -55,8 +55,8 @@ class AzureDevOpsReposToolkit(BaseToolkit):
                 default_factory=list,
                 title="Repositories",
                 description="ADO repository IDs or names. Leave empty to allow any repository of "
-                            "the project. With a single repository the tools target it implicitly; "
-                            "with several, each tool call must name the repository to use.",
+                            "the project. Tools target the first repository unless a tool call "
+                            "names another one of the configured repositories.",
             )),
             base_branch=(Optional[str], Field(default="main", title="Base branch", description="ADO base branch (e.g., main)")),
             active_branch=(Optional[str], Field(default="main", title="Active branch", description="ADO active branch (e.g., main)")),
@@ -132,8 +132,11 @@ class AzureDevOpsReposToolkit(BaseToolkit):
         azure_devops_repos_wrapper = ReposApiWrapper(**wrapper_payload)
         available_tools = azure_devops_repos_wrapper.get_available_tools()
         instance_info = f"\nADO instance: {azure_devops_repos_wrapper.organization_url}/{azure_devops_repos_wrapper.project}"
-        if azure_devops_repos_wrapper.repositories:
-            instance_info += f"\nRepositories: {', '.join(azure_devops_repos_wrapper.repositories)}"
+        repositories = azure_devops_repos_wrapper.repositories
+        if repositories:
+            instance_info += f"\nRepositories: {', '.join(repositories)}"
+            if len(repositories) > 1:
+                instance_info += f" (default: {repositories[0]})"
         tools = []
         for tool in available_tools:
             if selected_tools:

@@ -616,13 +616,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
         """Point the wrapper at the repository a single tool call targets."""
         configured = self.repositories or []
         if not repository_id:
-            if len(configured) == 1:
+            if configured:
                 repository_id = configured[0]
-            elif configured:
-                raise ToolException(
-                    "Parameter 'repository_id' is required: this toolkit is configured with "
-                    f"multiple repositories ({', '.join(configured)})."
-                )
             else:
                 raise ToolException(
                     "Parameter 'repository_id' is required: this toolkit is not configured with "
@@ -664,27 +659,19 @@ class ReposApiWrapper(CodeIndexerToolkit):
             ) = previous
 
     def _repo_arg(self) -> Dict[str, tuple]:
-        """The per-call repository argument, required unless a single repo is configured."""
+        """The per-call repository argument, required only when no repository is configured."""
         configured = list(self.repositories or [])
-        if len(configured) == 1:
+        if configured:
+            default_hint = (
+                f"defaults to the only configured repository '{configured[0]}'"
+                if len(configured) == 1
+                else f"defaults to '{configured[0]}', so name a repository explicitly to work "
+                     f"on any of the others ({', '.join(configured[1:])})"
+            )
             return {
                 "repository_id": (
                     Optional[Literal[tuple(configured)]],
-                    Field(
-                        default=None,
-                        description="Target repository. Optional - defaults to the only "
-                                    f"configured repository '{configured[0]}'.",
-                    ),
-                )
-            }
-        if configured:
-            return {
-                "repository_id": (
-                    Literal[tuple(configured)],
-                    Field(
-                        description="Target repository. Required because this toolkit is "
-                                    "configured with multiple repositories.",
-                    ),
+                    Field(default=None, description=f"Target repository. Optional - {default_hint}."),
                 )
             }
         return {
