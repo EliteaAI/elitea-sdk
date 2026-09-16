@@ -1,3 +1,4 @@
+import contextvars
 import copy
 import json
 import logging
@@ -7,7 +8,8 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, Optional, List, Dict, Generator, Set, Tuple
+from queue import Full, Queue
+from typing import Any, Callable, ClassVar, Optional, List, Dict, Generator, Set, Tuple, Union
 from uuid import uuid4
 
 from langchain_core.callbacks import dispatch_custom_event
@@ -519,6 +521,10 @@ def render_grouped_errors(error_groups: Dict[str, Dict[str, None]]) -> List[str]
     return rendered
 
 
+def _resolve_base_total(base_total) -> Optional[int]:
+    return base_total() if callable(base_total) else base_total
+
+
 def _sample_skipped_payload(skipped: Any, sample_size: int = REPORT_ITEMS_SAMPLE_SIZE) -> Any:
     """Cut every name list in an IndexingStats.to_dict() payload down to a sample.
 
@@ -726,6 +732,106 @@ class _IndexRunState:
     # parallel path (the executor wraps the pipeline, not the flush).
     chunks_written: int = 0
 
+
+_LOADER_PREFETCH_SENTINEL = object()
+_LOADER_PREFETCH_STOP_CHECK_INTERVAL_SECONDS = 0.5
+_LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS = 5.0
+
+
+class _LoaderPrefetch:
+    """Drives a base-document loader on one producer thread so the fetch overlaps the embed."""
+
+    def __init__(self, documents, depth: int, run_label: str):
+        self._source = iter(documents)
+        self._queue: "Queue[Any]" = Queue(maxsize=max(1, depth))
+        self._stop = threading.Event()
+        self._error: Optional[BaseException] = None
+        self._head: List[Any] = []
+        self._produced = 0
+        self._exhausted = False
+        self._caller_context = contextvars.copy_context()
+        self._thread = threading.Thread(
+            target=self._caller_context.run,
+            args=(self._produce,),
+            name=f"index-loader-{run_label}",
+            daemon=True,
+        )
+
+    def __enter__(self) -> "_LoaderPrefetch":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def _put(self, item) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=_LOADER_PREFETCH_STOP_CHECK_INTERVAL_SECONDS)
+                return True
+            except Full:
+                continue
+        return False
+
+    def _produce(self):
+        try:
+            for document in self._source:
+                if not self._put(document):
+                    return
+                self._produced += 1
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self._put(_LOADER_PREFETCH_SENTINEL)
+
+    def has_documents(self) -> bool:
+        """Block for the first document, re-raising a loader that died producing it."""
+        if self._head:
+            return True
+        if self._exhausted:
+            return False
+        item = self._queue.get()
+        if item is _LOADER_PREFETCH_SENTINEL:
+            self._exhausted = True
+            self._reraise()
+            return False
+        self._head.append(item)
+        return True
+
+    def documents(self) -> Generator[Any, None, None]:
+        if self._head:
+            yield self._head.pop()
+        while not self._exhausted:
+            item = self._queue.get()
+            if item is _LOADER_PREFETCH_SENTINEL:
+                self._exhausted = True
+                break
+            yield item
+        self._reraise()
+
+    def total(self) -> Optional[int]:
+        return self._produced if self._exhausted else None
+
+    @property
+    def produced_count(self) -> int:
+        return self._produced
+
+    def _reraise(self):
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise error
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=_LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS)
+        if self._thread.is_alive():
+            logger.warning(
+                "Base-document loader thread did not stop within "
+                f"{_LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS}s; leaving it to the daemon exit."
+            )
+
+
 class IndexTools(str, Enum):
     """Enum for index-related tool names."""
     INDEX_DATA = "index_data"
@@ -752,6 +858,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     # When true the document count comes from the stats, not from the chunk count.
     loader_yields_chunks: ClassVar[bool] = False
+
+    loader_prefetch_depth: ClassVar[int] = 64
 
     # Orphan deletion (removing docs absent from the source) is the sole delete
     # built on absence evidence, so it only ever runs for toolkits that positively
@@ -947,21 +1055,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # until promote commits — parking one pooled connection for its duration.
             # Freshness ACROSS promote comes from the committed stamp taken before it,
             # and is worth one horizon. Stopped in the finally below.
-            documents = self._base_loader(**kwargs)
-            documents = list(documents) # consume/exhaust generator to count items
-            documents_count = len(documents)
-            self._stamp_loader_stats(documents_count)
-            # A loader that soft-fails to zero documents over a previously
-            # built index must never publish or rewrite counts.
-            empty_loader = documents_count == 0 and self._has_previous_index_run()
-            if not empty_loader:
-                documents = (doc for doc in documents)
-                self._log_tool_event(f"Base documents were pre-loaded. "
-                                     f"Search for possible document duplicates and remove them from the indexing list...")
-                documents = self._reduce_duplicates(documents, index_name)
-                self._log_tool_event(f"Duplicates were removed. "
-                                     f"Processing documents to collect dependencies and prepare them for indexing...")
-                self._save_index_generator(documents, documents_count, chunking_tool, chunking_config, index_name=index_name, result=result)
+            with _LoaderPrefetch(self._base_loader(**kwargs),
+                                 self.loader_prefetch_depth,
+                                 self._index_run.run_id) as stream:
+                empty_loader = not stream.has_documents() and self._has_previous_index_run()
+                if not empty_loader:
+                    self._log_tool_event(f"Base documents are streaming in. "
+                                         f"Search for possible document duplicates and remove them from the indexing list...")
+                    documents = self._reduce_duplicates(stream.documents(), index_name)
+                    self._log_tool_event(f"Duplicates were removed. "
+                                         f"Processing documents to collect dependencies and prepare them for indexing...")
+                    self._save_index_generator(documents, stream.total, chunking_tool, chunking_config, index_name=index_name, result=result)
+                self._stamp_loader_stats(stream.produced_count)
             if empty_loader:
                 return self._finalize_empty_loader_run(index_name)
             #
@@ -1352,9 +1457,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             )
         return orphan_ids, orphan_doc_count
 
-    def _save_index_generator(self, base_documents: Generator[Document, None, None], base_total: int, chunking_tool, chunking_config, result, index_name: Optional[str] = None):
+    def _save_index_generator(self, base_documents: Generator[Document, None, None],
+                              base_total: Union[int, Callable[[], Optional[int]], None],
+                              chunking_tool, chunking_config, result, index_name: Optional[str] = None):
         self._ensure_vectorstore_initialized()
-        self._log_tool_event(f"Base documents are ready for indexing. {base_total} base documents in total to index.")
+        known_total = _resolve_base_total(base_total)
+        if known_total is None:
+            self._log_tool_event("Base documents are streaming in from the loader.")
+        else:
+            self._log_tool_event(f"Base documents are ready for indexing. {known_total} base documents in total to index.")
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         #
         pg_vector_add_docs_chunk: list = []
@@ -1469,7 +1580,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     _flush_chunk(pg_vector_add_docs_chunk)
                     pg_vector_add_docs_chunk.clear()
 
-            msg = f"Indexed document #{base_doc_counter} '{_doc_name}' out of {base_total} (with {dependent_docs_counter} chunks)."
+            running_total = _resolve_base_total(base_total)
+            msg = (f"Indexed document #{base_doc_counter} '{_doc_name}' out of "
+                   f"{running_total if running_total is not None else '?'} "
+                   f"(with {dependent_docs_counter} chunks).")
             logger.debug(msg)
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
@@ -1729,19 +1843,20 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         candidates.discard('unknown')
         if not candidates:
             return False
-        for skip_set in (
-            stats.files_skipped_whitelist,
-            stats.files_skipped_blacklist,
-            stats.files_skipped_read_error,
-            stats.files_skipped_empty,
-            stats.files_unsupported_extension,
-            stats.documents_skipped_error,
-            stats.documents_skipped_filtered,
-            stats.runtime_skipped_extension,
-            stats.runtime_skipped_error,
-        ):
-            if candidates & skip_set:
-                return True
+        with _STATS_COUNTER_LOCK:
+            for skip_set in (
+                stats.files_skipped_whitelist,
+                stats.files_skipped_blacklist,
+                stats.files_skipped_read_error,
+                stats.files_skipped_empty,
+                stats.files_unsupported_extension,
+                stats.documents_skipped_error,
+                stats.documents_skipped_filtered,
+                stats.runtime_skipped_extension,
+                stats.runtime_skipped_error,
+            ):
+                if candidates & skip_set:
+                    return True
         return False
 
     def _collect_dependencies(self, documents: Generator[Document, None, None]):
