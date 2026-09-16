@@ -536,6 +536,14 @@ class EliteAClient:
         Returns:
             An instance of ChatOpenAI or ChatAnthropic configured with the provided parameters.
         """
+        selection = model_config.get('selection') or {}
+        if selection.get('mode') == 'auto':
+            if model_name:
+                raise ValueError('Auto conflicts with an explicit model')
+            if model_config.get('routing_surface') == 'pipeline':
+                raise ValueError('Auto is not available for Pipelines')
+            from .routing import AutoChatModel
+            return AutoChatModel(owner=self, settings=deepcopy(model_config))
         if not model_name:
             raise ValueError("Model name must be provided")
 
@@ -626,19 +634,22 @@ class EliteAClient:
                     # budget. A provider/model maximum already includes all
                     # output, so padding that Default value would exceed it.
                     budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
-                    if has_custom_output_limit:
+                    if has_custom_output_limit and not model_config.get("routing_total_output_cap"):
                         target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
                 else:
                     target_kwargs['temperature'] = 1
                     budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
                     target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": budget}
-                    if has_custom_output_limit:
+                    if has_custom_output_limit and not model_config.get("routing_total_output_cap"):
                         target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
                     
             # Add http_client if provided
             if "http_client" in model_config:
                 target_kwargs["http_client"] = model_config["http_client"]
             
+            if model_config.get('routing_pin'):
+                target_kwargs['default_headers']['X-Elitea-Routing-Pin'] = model_config['routing_pin']
+                target_kwargs['default_headers']['X-Elitea-Routing-Invocation'] = model_config['routing_invocation_id']
             llm = ChatAnthropic(**target_kwargs)
         else:
             # ChatOpenAI configuration
@@ -685,6 +696,9 @@ class EliteAClient:
             if use_responses_api:
                 target_kwargs["use_responses_api"] = True
 
+            if model_config.get('routing_pin'):
+                target_kwargs.setdefault('default_headers', {})['X-Elitea-Routing-Pin'] = model_config['routing_pin']
+                target_kwargs['default_headers']['X-Elitea-Routing-Invocation'] = model_config['routing_invocation_id']
             llm = ChatOpenAI(**target_kwargs)
         # Stamp the openai-compatible signal on the client so downstream nodes
         # (LLMNode block-continuation + structured-output routing) can tell a
@@ -1011,7 +1025,8 @@ class EliteAClient:
                     independent_parallel_hitl: bool = True,
                     parallel_hitl_max_concurrency: int = 8,
                     user_declined_mcp_servers: Optional[list] = None,
-                    project_context: Optional[dict] = None):
+                    project_context: Optional[dict] = None,
+                    routing_instructions: Optional[str] = None):
         if tools is None:
             tools = []
         if chat_history is None:
@@ -1038,12 +1053,15 @@ class EliteAClient:
             if openai_compatible is None:
                 openai_compatible = data['llm_settings'].get('openai_compatible', False)
             llm = self.get_llm(
-                model_name=data['llm_settings']['model_name'],
+                model_name=data['llm_settings'].get('model_name'),
                 model_config={
+                    **({"routing_instructions": routing_instructions} if routing_instructions is not None else {}),
+                    "selection": data["llm_settings"].get("selection"),
+                    "routing_surface": "pipeline" if data.get("agent_type") == "pipeline" else "agent",
                     "max_tokens": max_tokens,
                     "max_output_tokens": data['llm_settings'].get('max_output_tokens'),
                     "reasoning_effort": data['llm_settings'].get('reasoning_effort'),
-                    "temperature": data['llm_settings']['temperature'],
+                    "temperature": data['llm_settings'].get('temperature'),
                     "model_project_id": data['llm_settings'].get('model_project_id'),
                     "openai_compatible": openai_compatible,
                 }
@@ -1052,6 +1070,15 @@ class EliteAClient:
         if not app_type:
             app_type = data.get("agent_type", "agent")
         app_type = normalize_app_type(app_type)
+        saved_llm = data.get('llm_settings') or {}
+        if (not saved_llm.get('model_name') and (saved_llm.get('selection') or {}).get('mode') != 'auto'
+                and getattr(llm, '_llm_type', None) == 'elitea-auto'):
+            from ..exceptions import AutoRoutingChildModelRequired
+            raise AutoRoutingChildModelRequired()
+        if app_type == APP_TYPE_PIPELINE:
+            from .routing import AutoChatModel
+            if isinstance(llm, AutoChatModel):
+                raise ValueError('Pipelines require their own explicit model; Auto is unavailable')
 
         # Auto-create middleware based on internal_tools configuration
         # This bridges the UI's internal_tools toggles to the middleware system

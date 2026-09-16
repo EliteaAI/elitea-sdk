@@ -1906,6 +1906,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             # Application reads this same dict back for get_state and HITL resume.
             config.setdefault("configurable", {})["thread_id"] = str(uuid4())
         thread_id = config.get("configurable", {}).get("thread_id")
+        config['configurable']['elitea_routing_graph_owner'] = {
+            'thread_id': thread_id,
+            'checkpoint_ns': config['configurable'].get('checkpoint_ns', ''),
+        }
+        # A delegated graph must never borrow the parent's task projection.
+        config['configurable'].pop('elitea_routing_task_projection', None)
 
         # Check if checkpoint exists early for chat_history handling
         checkpoint_exists = self.checkpointer and self.checkpointer.get_tuple(config)
@@ -1946,6 +1952,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
             # TODO: add handler after we add 2+ inputs (filterByType, etc.)
             if isinstance(current_message, HumanMessage):
+                from ..clients.routing import capture_routing_task
+                capture_routing_task(current_message, config)
                 current_content = current_message.content
                 if isinstance(current_content, list):
                     # Extract text parts and keep non-text parts (images, etc.)
@@ -3415,6 +3423,14 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 tc_args = tc.get('args', {}) if isinstance(tc.get('args'), dict) else {}
                 if tc_name == tool_name and args_match_normalized(tc_args, target_args):
                     return msg_dict
+            # ask_user normalizes option defaults and adds question IDs before
+            # persisting its interrupt. The original Auto message still owns
+            # the signed run binding. Preserve it for the existing unique-name
+            # resume matcher instead of synthesizing an unbound tool call.
+            same_name = [tc for tc in tool_calls if isinstance(tc, dict)
+                         and tc.get('name') == tool_name]
+            if tool_name == 'ask_user' and len(same_name) == 1 and (data.get('response_metadata') or {}).get('elitea_routing'):
+                return msg_dict
             # Stop walking past the last AIMessage; earlier AIs are not relevant.
             return None
         return None

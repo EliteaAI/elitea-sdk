@@ -357,6 +357,9 @@ class LLMNode(BaseTool):
         routing in ``__get_struct_output_model`` keep the supported provider
         matrix functional, so the previous local recovery is dead code.
         """
+        if getattr(self.client, '_llm_type', None) == 'elitea-auto':
+            config = {**config, 'configurable': {**(config.get('configurable') or {}),
+                'elitea_routing_output_schema': struct_model.model_json_schema()}}
         initial_completion = llm_client.invoke(
             prepare_messages_for_model(messages), config=config,
         )
@@ -637,7 +640,8 @@ class LLMNode(BaseTool):
                     content = initial_completion.content
                     fallback_content = content if isinstance(content, str) else str(content)
 
-            result['messages'] = self._strip_system_messages(messages + [AIMessage(content=fallback_content)])
+            result['messages'] = self._strip_system_messages(messages + [AIMessage(content=fallback_content, response_metadata={
+                'elitea_routing': initial_completion.response_metadata['elitea_routing']} if isinstance(initial_completion, AIMessage) and initial_completion.response_metadata.get('elitea_routing') else {})])
 
         return result
 
@@ -1084,6 +1088,15 @@ class LLMNode(BaseTool):
         Returns:
             Updated state with LLM response
         """
+        routing_sink = None
+        routing_scope = None
+        if getattr(self.client, '_llm_type', None) == 'elitea-auto':
+            from ..clients.routing import routing_scope_id
+            routing_scope = routing_scope_id(config)
+            routing_sink = {}
+            config = {**(config or {}), 'configurable': {**((config or {}).get('configurable') or {}),
+                'elitea_routing_checkpoint': (state.get('_auto_routing') or {}).get(routing_scope) if isinstance(state, dict) else None,
+                'elitea_routing_sink': routing_sink}}
         middleware_mgr = self.middleware_manager
         middleware_updates = []
         original_state = None
@@ -1106,6 +1119,10 @@ class LLMNode(BaseTool):
             budget_error = budget_exceeded_from(e)
             if budget_error is not None:
                 raise budget_error from e
+            if routing_scope is not None:
+                # Admission/transport failure is not an assistant answer. Let
+                # the Worker's existing error event/card retain traceback and retry.
+                raise
             model_info = getattr(self.client, 'model_name', None) or getattr(self.client, 'model', 'unknown')
             logger.error(f"Error in LLM Node: {format_exc()}")
             logger.error(f"Model being used: {model_info}")
@@ -1118,6 +1135,8 @@ class LLMNode(BaseTool):
             middleware_mgr.run_after_model(final_state, config or {})
             result['context_info'] = middleware_mgr.get_context_info()
 
+        if routing_sink and routing_scope and isinstance(result, dict):
+            result['_auto_routing'] = {routing_scope: routing_sink['binding']}
         return result
 
     def _invoke_llm_internal(
@@ -1299,10 +1318,14 @@ class LLMNode(BaseTool):
                     *_chat_history,
                 ]
             else:
+                task_kwargs = {}
+                if getattr(self.client, '_llm_type', None) == 'elitea-auto':
+                    from ..clients.routing import routing_task_kwargs
+                    task_kwargs = routing_task_kwargs(config)
                 messages = [
                     *_system_msgs,
                     *_chat_history,
-                    HumanMessage(content=task_content),
+                    HumanMessage(content=task_content, additional_kwargs=task_kwargs),
                 ]
                 # Remove pre-last item if last two messages are same type and content
                 if len(messages) >= 2 and type(messages[-1]) == type(messages[-2]) and messages[-1].content == messages[
@@ -1740,7 +1763,11 @@ class LLMNode(BaseTool):
             completion=completion,
             config=config,
         )
-        logger.info(f"Initial completion: {completion}")
+        if getattr(self.client, '_llm_type', None) == 'elitea-auto':
+            # The Auto metadata contains signed checkpoint/pin tokens.
+            logger.info("Initial Auto completion: tool_calls=%s", len(completion.tool_calls or []))
+        else:
+            logger.info(f"Initial completion: {completion}")
 
         # Handle both tool-calling and regular responses
         if hasattr(completion, 'tool_calls') and completion.tool_calls:
@@ -1864,6 +1891,13 @@ class LLMNode(BaseTool):
         # Build the AI message with both thinking and text
         # Store thinking in additional_kwargs for potential future use
         ai_message_kwargs = {'content': text_content}
+        if getattr(self.client, '_llm_type', None) == 'elitea-auto':
+            # Preserve early-clarification diagnostics as well as generated
+            # model bindings through the node's visible-text projection.
+            ai_message_kwargs['response_metadata'] = {
+                key: value for key, value in completion.response_metadata.items()
+                if key in {'elitea_routing', 'elitea_routing_trace'}
+            }
         if thinking:
             ai_message_kwargs['additional_kwargs'] = {'thinking': thinking}
         # Re-rendering the content must not drop what the provider reported about
@@ -4374,6 +4408,9 @@ class LLMNode(BaseTool):
                 if budget_error is not None:
                     _PENDING_TOOL_MESSAGES.set([])
                     raise budget_error from e
+                if getattr(self.client, '_llm_type', None) == 'elitea-auto':
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise
                 error_str = str(e).lower()
                 
                 # Check for thinking model message format errors

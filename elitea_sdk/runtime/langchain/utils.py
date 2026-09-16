@@ -493,6 +493,8 @@ def create_state(data: Optional[dict] = None):
     types_dict["state_types"] = dict
     # Add context_info for context management tracking (unified format with summarization)
     state_dict["context_info"] = Optional[dict]
+    # Scoped Auto bindings survive message compaction without a new database.
+    state_dict["_auto_routing"] = Annotated[dict, _parallel_tasks_reducer]
     # Persist HITL (sensitive-tool) approve/reject decisions across checkpoint
     # resumes so that blocked tools stay excluded and an audit trail is kept.
     # Uses a custom reducer: list → append, None → clear.
