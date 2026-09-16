@@ -7,7 +7,8 @@ from contextlib import suppress
 from datetime import datetime
 from enum import Enum
 from json import dumps
-from typing import ClassVar, List, Union, Optional, Any, Dict
+from os import environ
+from typing import ClassVar, List, Literal, Union, Optional, Any, Dict
 
 from azure.devops.v7_0.git.git_client import GitClient
 from azure.devops.v7_0.git.models import (
@@ -37,6 +38,7 @@ from ..utils import (
     generate_diff,
     get_content_from_generator,
 )
+from ...base_indexer_toolkit import IndexTools
 from ...code_indexer_toolkit import CodeIndexerToolkit
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
@@ -85,6 +87,67 @@ def _relabel_guidance_offset_limit(result: Any) -> Any:
         ),
     }
     return result
+
+
+def normalize_repositories(value: Any) -> List[str]:
+    """Coerce a toolkit `repository_id` setting into a de-duplicated list of names.
+
+    Configurations stored before multi-repo support hold a single string.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    repositories = []
+    for item in value:
+        item = str(item).strip()
+        if item and item not in repositories:
+            repositories.append(item)
+    return repositories
+
+
+def _resolve_repository(
+        client: GitClient, project: str, repository_id: str, base_branch: str, active_branch: str
+) -> Dict[str, Optional[str]]:
+    """Verify access to a repository and resolve its usable base/active branches."""
+    repository = client.get_repository(repository_id, project=project)
+
+    def branch_exists(branch_name):
+        try:
+            branch = client.get_branch(
+                repository_id=repository_id, name=branch_name, project=project
+            )
+            return branch is not None
+        except Exception:
+            return False
+
+    base_branch_exists = bool(base_branch) and branch_exists(base_branch)
+    active_branch_exists = bool(active_branch) and branch_exists(active_branch)
+
+    if not base_branch_exists and not active_branch_exists:
+        raise ToolException(
+            f"Neither the base branch '{base_branch}' nor the active branch "
+            f"'{active_branch}' exist in repository '{repository_id}'. "
+            "Please check the branch names in the toolkit configuration."
+        )
+    if not base_branch_exists:
+        logger.warning(
+            f"The base branch '{base_branch}' does not exist in repository "
+            f"'{repository_id}'; falling back to active branch '{active_branch}'."
+        )
+        base_branch = active_branch
+    if not active_branch_exists:
+        logger.warning(
+            f"The active branch '{active_branch}' does not exist in repository "
+            f"'{repository_id}'; falling back to base branch '{base_branch}'."
+        )
+        active_branch = base_branch
+
+    return {
+        "searchable_name": getattr(repository, "name", None) or repository_id,
+        "base_branch": base_branch,
+        "active_branch": active_branch,
+    }
 
 
 class GitChange:
@@ -407,7 +470,10 @@ class ReposApiWrapper(CodeIndexerToolkit):
     project: Optional[str] = None
     token: Optional[SecretStr] = None
 
-    # Repository-specific fields (toolkit level)
+    # Repositories configured on the toolkit; empty means any repository in the project
+    repositories: List[str] = []
+
+    # Repository currently bound to the call in flight, plus its resolved branches
     repository_id: Optional[str] = None
     searchable_repository_name: Optional[str] = None
     base_branch: Optional[str] = None
@@ -430,6 +496,22 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
     _search_client_instance: Optional[Any] = PrivateAttr(default=None)
 
+    # Per-repository resolved state: {searchable_name, base_branch, active_branch}
+    _repo_state: Dict[str, Dict[str, Optional[str]]] = PrivateAttr(default_factory=dict)
+    # Branches as configured on the toolkit, before any per-repository fallback
+    _configured_base_branch: Optional[str] = PrivateAttr(default=None)
+    _configured_active_branch: Optional[str] = PrivateAttr(default=None)
+
+    # Tools that operate on the project or the vector store rather than on a repository
+    _repo_agnostic_tools: ClassVar[set] = {
+        "list_repositories",
+        IndexTools.LIST_INDEXES.value,
+        IndexTools.SEARCH_INDEX.value,
+        IndexTools.STEPBACK_SEARCH_INDEX.value,
+        IndexTools.STEPBACK_SUMMARY_INDEX.value,
+        IndexTools.REMOVE_INDEX.value,
+    }
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -444,57 +526,40 @@ class ReposApiWrapper(CodeIndexerToolkit):
         token = get_from_dict_or_env(values, ["token"], "ADO_TOKEN", default=None)
 
         # Get repository-specific values
-        repository_id = get_from_dict_or_env(values, ["repository_id"], "ADO_REPOSITORY_ID", default=None)
+        # Read the repositories straight from the payload: get_from_dict_or_env() stringifies
+        # lists and raises when neither the payload nor the environment holds a value
+        repositories = normalize_repositories(
+            values.get("repositories")
+            or values.get("repository_id")
+            or environ.get("ADO_REPOSITORY_ID")
+        )
         base_branch = get_from_dict_or_env(values, ["base_branch"], "ADO_BASE_BRANCH", default="main")
         active_branch = get_from_dict_or_env(values, ["active_branch"], "ADO_ACTIVE_BRANCH", default="main")
 
-        if not organization_url or not project or not repository_id:
+        if not organization_url or not project:
             raise ToolException(
-                "Parameters: organization_url, project, and repository_id are required."
+                "Parameters: organization_url and project are required."
             )
 
         credentials = BasicAuthentication("", token)
 
+        # A single configured repository is bound and validated up front so that
+        # misconfiguration surfaces at toolkit creation. With several (or zero)
+        # repositories the target is only known per call, so validation is deferred.
+        repository_id = repositories[0] if len(repositories) == 1 else None
+
         try:
             # Initialize ADO Git client
             ado_client = GitClient(base_url=organization_url, creds=credentials)
-            # Verify access to repository
-            repository = ado_client.get_repository(repository_id, project=project)
-
-            # Store client instance
             values["ado_client_instance"] = ado_client
-            values["searchable_repository_name"] = getattr(repository, "name", None) or repository_id
 
-            def branch_exists(branch_name):
-                try:
-                    branch = ado_client.get_branch(
-                        repository_id=repository_id, name=branch_name, project=project
-                    )
-                    return branch is not None
-                except Exception:
-                    return False
-
-            base_branch_exists = bool(base_branch) and branch_exists(base_branch)
-            active_branch_exists = bool(active_branch) and branch_exists(active_branch)
-
-            if not base_branch_exists and not active_branch_exists:
-                raise ToolException(
-                    f"Neither the base branch '{base_branch}' nor the active branch "
-                    f"'{active_branch}' exist in repository '{repository_id}'. "
-                    "Please check the branch names in the toolkit configuration."
+            if repository_id:
+                resolved = _resolve_repository(
+                    ado_client, project, repository_id, base_branch, active_branch
                 )
-            if not base_branch_exists:
-                logger.warning(
-                    f"The base branch '{base_branch}' does not exist in repository "
-                    f"'{repository_id}'; falling back to active branch '{active_branch}'."
-                )
-                base_branch = active_branch
-            if not active_branch_exists:
-                logger.warning(
-                    f"The active branch '{active_branch}' does not exist in repository "
-                    f"'{repository_id}'; falling back to base branch '{base_branch}'."
-                )
-                active_branch = base_branch
+                values["searchable_repository_name"] = resolved["searchable_name"]
+                base_branch = resolved["base_branch"]
+                active_branch = resolved["active_branch"]
 
         except Exception as e:
             if isinstance(e, ToolException):
@@ -505,17 +570,178 @@ class ReposApiWrapper(CodeIndexerToolkit):
         values["organization_url"] = organization_url
         values["project"] = project
         values["token"] = token
+        values["repositories"] = repositories
         values["repository_id"] = repository_id
         values["base_branch"] = base_branch
         values["active_branch"] = active_branch
 
         return super().validate_toolkit(values)
 
+    @model_validator(mode="after")
+    def capture_configured_branches(self):
+        """Remember the configured branches; binding overwrites the effective ones."""
+        if self._configured_base_branch is None:
+            self._configured_base_branch = self.base_branch
+        if self._configured_active_branch is None:
+            self._configured_active_branch = self.active_branch
+        if self.repository_id and self.repository_id not in self._repo_state:
+            self._repo_state[self.repository_id] = {
+                "searchable_name": self.searchable_repository_name or self.repository_id,
+                "base_branch": self.base_branch,
+                "active_branch": self.active_branch,
+            }
+        return self
+
+    def _ensure_repo_state(self, repository_id: str) -> Dict[str, Optional[str]]:
+        """Resolve (and cache) the searchable name and usable branches of a repository."""
+        state = self._repo_state.get(repository_id)
+        if state is not None:
+            return state
+        try:
+            state = _resolve_repository(
+                self._client,
+                self.project,
+                repository_id,
+                self._configured_base_branch,
+                self._configured_active_branch,
+            )
+        except ToolException:
+            raise
+        except Exception as e:
+            raise ToolException(f"Failed to access repository '{repository_id}': {e}")
+        self._repo_state[repository_id] = state
+        return state
+
+    def _bind_repository(self, repository_id: Optional[str]) -> None:
+        """Point the wrapper at the repository a single tool call targets."""
+        configured = self.repositories or []
+        if not repository_id:
+            if len(configured) == 1:
+                repository_id = configured[0]
+            elif configured:
+                raise ToolException(
+                    "Parameter 'repository_id' is required: this toolkit is configured with "
+                    f"multiple repositories ({', '.join(configured)})."
+                )
+            else:
+                raise ToolException(
+                    "Parameter 'repository_id' is required: this toolkit is not configured with "
+                    "any repository. Use 'list_repositories' to discover the repositories of "
+                    f"project '{self.project}'."
+                )
+        elif configured and repository_id not in configured:
+            raise ToolException(
+                f"Repository '{repository_id}' is not available in this toolkit. "
+                f"Configured repositories: {', '.join(configured)}."
+            )
+
+        state = self._ensure_repo_state(repository_id)
+        self.repository_id = repository_id
+        self.searchable_repository_name = state["searchable_name"]
+        self.base_branch = state["base_branch"]
+        self.active_branch = state["active_branch"]
+
+    def run(self, mode: str, *args: Any, **kwargs: Any):
+        repository_id = kwargs.pop("repository_id", None)
+        if mode in self._repo_agnostic_tools:
+            return super().run(mode, *args, **kwargs)
+
+        previous = (
+            self.repository_id,
+            self.searchable_repository_name,
+            self.base_branch,
+            self.active_branch,
+        )
+        self._bind_repository(repository_id)
+        try:
+            return super().run(mode, *args, **kwargs)
+        finally:
+            (
+                self.repository_id,
+                self.searchable_repository_name,
+                self.base_branch,
+                self.active_branch,
+            ) = previous
+
+    def _repo_arg(self) -> Dict[str, tuple]:
+        """The per-call repository argument, required unless a single repo is configured."""
+        configured = list(self.repositories or [])
+        if len(configured) == 1:
+            return {
+                "repository_id": (
+                    Optional[Literal[tuple(configured)]],
+                    Field(
+                        default=None,
+                        description="Target repository. Optional - defaults to the only "
+                                    f"configured repository '{configured[0]}'.",
+                    ),
+                )
+            }
+        if configured:
+            return {
+                "repository_id": (
+                    Literal[tuple(configured)],
+                    Field(
+                        description="Target repository. Required because this toolkit is "
+                                    "configured with multiple repositories.",
+                    ),
+                )
+            }
+        return {
+            "repository_id": (
+                str,
+                Field(
+                    description="Target repository ID or name"
+                                + (f" in project '{self.project}'" if self.project else "")
+                                + ". Required because this toolkit has no configured "
+                                  "repositories - use 'list_repositories' to discover them.",
+                ),
+            )
+        }
+
+    def _with_repo(self, args_schema):
+        """Extend a tool args schema with the per-call repository argument."""
+        return create_model(args_schema.__name__, __base__=args_schema, **self._repo_arg())
+
+    def _index_tool_params(self):
+        return {**super()._index_tool_params(), **self._repo_arg()}
+
     # Expose ADO Git client via property
     @property
     def _client(self) -> GitClient:
         """Access to ADO Git client methods"""
         return self.ado_client_instance
+
+    @tool_group('read')
+    def list_repositories(self) -> str:
+        """
+        Lists the repositories this toolkit can operate on, with their default branch.
+
+        Use it to find the value for the `repository_id` argument of the other tools.
+
+        Returns:
+            str: JSON array of repositories (name, id, default_branch).
+        """
+        try:
+            repositories = self._client.get_repositories(project=self.project)
+        except Exception as e:
+            msg = f"Error during attempt to fetch the list of repositories: {str(e)}"
+            logger.error(msg)
+            raise ToolException(msg)
+
+        configured = set(self.repositories or [])
+        payload = [
+            {
+                "name": repository.name,
+                "id": repository.id,
+                "default_branch": (getattr(repository, "default_branch", None) or "").replace(
+                    "refs/heads/", ""
+                ),
+            }
+            for repository in repositories
+            if not configured or repository.name in configured or repository.id in configured
+        ]
+        return dumps(payload)
 
     def _get_commits(self, file_path: str, branch: str, top: int = None) -> List[GitCommitRef]:
         """
@@ -614,6 +840,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
         ]
         if branch_name in current_branches:
             self.active_branch = branch_name
+            # Survive the per-call rebinding of the active repository
+            self._repo_state[self.repository_id]["active_branch"] = branch_name
             return f"Switched to branch `{branch_name}`"
         else:
             msg = (
@@ -1746,99 +1974,105 @@ class ReposApiWrapper(CodeIndexerToolkit):
         """Return a list of available tools."""
         return [
             {
+                "ref": self.list_repositories,
+                "name": "list_repositories",
+                "description": self.list_repositories.__doc__,
+                "args_schema": ArgsSchema.NoInput.value,
+            },
+            {
                 "ref": self.list_branches_in_repo,
                 "name": "list_branches_in_repo",
                 "description": self.list_branches_in_repo.__doc__,
-                "args_schema": ArgsSchema.NoInput.value,
+                "args_schema": self._with_repo(ArgsSchema.NoInput.value),
             },
             {
                 "ref": self.set_active_branch,
                 "name": "set_active_branch",
                 "description": self.set_active_branch.__doc__,
-                "args_schema": ArgsSchema.BranchName.value,
+                "args_schema": self._with_repo(ArgsSchema.BranchName.value),
             },
             {
                 "ref": self.list_files,
                 "name": "list_files",
                 "description": self.list_files.__doc__,
-                "args_schema": ArgsSchema.ListFilesModel.value,
+                "args_schema": self._with_repo(ArgsSchema.ListFilesModel.value),
             },
             {
                 "ref": self.list_open_pull_requests,
                 "name": "list_open_pull_requests",
                 "description": self.list_open_pull_requests.__doc__,
-                "args_schema": ArgsSchema.NoInput.value,
+                "args_schema": self._with_repo(ArgsSchema.NoInput.value),
             },
             {
                 "ref": self.get_pull_request,
                 "name": "get_pull_request",
                 "description": self.get_pull_request.__doc__,
-                "args_schema": ArgsSchema.GetPR.value,
+                "args_schema": self._with_repo(ArgsSchema.GetPR.value),
             },
             {
                 "ref": self.list_pull_request_diffs,
                 "name": "list_pull_request_files",
                 "description": self.list_pull_request_diffs.__doc__,
-                "args_schema": ArgsSchema.GetPR.value,
+                "args_schema": self._with_repo(ArgsSchema.GetPR.value),
             },
             {
                 "ref": self.create_branch,
                 "name": "create_branch",
                 "description": self.create_branch.__doc__,
-                "args_schema": ArgsSchema.BranchName.value,
+                "args_schema": self._with_repo(ArgsSchema.BranchName.value),
             },
             {
                 "ref": self.read_file,
                 "name": "read_file",
                 "description": self.read_file.__doc__,
-                "args_schema": ArgsSchema.ReadFile.value,
+                "args_schema": self._with_repo(ArgsSchema.ReadFile.value),
             },
             {
                 "ref": self.create_file,
                 "name": "create_file",
                 "description": self.create_file.__doc__,
-                "args_schema": ArgsSchema.CreateFile.value,
+                "args_schema": self._with_repo(ArgsSchema.CreateFile.value),
             },
             {
                 "ref": self.update_file,
                 "name": "update_file",
                 "description": EDIT_FILE_DESCRIPTION,
-                "args_schema": ArgsSchema.UpdateFile.value,
+                "args_schema": self._with_repo(ArgsSchema.UpdateFile.value),
             },
             {
                 "ref": self.delete_file,
                 "name": "delete_file",
                 "description": self.delete_file.__doc__,
-                "args_schema": ArgsSchema.DeleteFile.value,
+                "args_schema": self._with_repo(ArgsSchema.DeleteFile.value),
             },
             {
                 "ref": self.get_work_items,
                 "name": "get_work_items",
                 "description": self.get_work_items.__doc__,
-                "args_schema": ArgsSchema.GetWorkItems.value,
+                "args_schema": self._with_repo(ArgsSchema.GetWorkItems.value),
             },
             {
                 "ref": self.comment_on_pull_request,
                 "name": "comment_on_pull_request",
                 "description": self.comment_on_pull_request.__doc__,
-                "args_schema": ArgsSchema.CommentOnPullRequest.value,
+                "args_schema": self._with_repo(ArgsSchema.CommentOnPullRequest.value),
             },
             {
                 "ref": self.create_pr,
                 "name": "create_pull_request",
                 "description": self.create_pr.__doc__,
-                "args_schema": ArgsSchema.CreatePullRequest.value,
+                "args_schema": self._with_repo(ArgsSchema.CreatePullRequest.value),
             },
             {
                 "ref": self.get_commits,
                 "name": "get_commits",
                 "description": self.get_commits.__doc__,
-                "args_schema": ArgsSchema.GetCommits.value,
+                "args_schema": self._with_repo(ArgsSchema.GetCommits.value),
             },
             {
                 "ref": self.search_code,
                 "name": "search_code",
                 "description": self.search_code.__doc__,
-                "args_schema": ArgsSchema.SearchCode.value,
+                "args_schema": self._with_repo(ArgsSchema.SearchCode.value),
             },
         ]
