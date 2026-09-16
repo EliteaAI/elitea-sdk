@@ -54,9 +54,11 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             repository_id=(Annotated[List[str], BeforeValidator(normalize_repositories)], Field(
                 default_factory=list,
                 title="Repositories",
-                description="ADO repository IDs or names. Leave empty to allow any repository of "
-                            "the project. Tools target the first repository unless a tool call "
-                            "names another one of the configured repositories.",
+                description="One or several repositories of the project, as IDs or names "
+                            "separated by commas (for example: my-service, my-service-tests). "
+                            "The agent can target any of them in a single tool call and uses the "
+                            "first one when a call does not name a repository. Leave the field "
+                            "empty to allow every repository of the project.",
             )),
             base_branch=(Optional[str], Field(default="main", title="Base branch", description="ADO base branch (e.g., main)")),
             active_branch=(Optional[str], Field(default="main", title="Active branch", description="ADO active branch (e.g., main)")),
