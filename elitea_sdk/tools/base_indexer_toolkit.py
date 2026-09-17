@@ -8,7 +8,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 from typing import Any, Callable, ClassVar, Optional, List, Dict, Generator, Set, Tuple, Union
 from uuid import uuid4
 
@@ -116,6 +116,8 @@ class IndexingStats:
     # Common counters
     items_processed: int = 0
     total_fetched: int = 0  # All items from source before any filtering
+    items_withdrawn: int = 0
+    items_counted_by_loader: bool = False
 
     # For code toolkits (files) - Use sets to deduplicate entries
     files_skipped_whitelist: Set[str] = field(default_factory=set)
@@ -144,9 +146,25 @@ class IndexingStats:
     dependent_items_unsupported: Set[str] = field(default_factory=set)
     dependent_items_empty: Set[str] = field(default_factory=set)
 
+    @property
+    def total_skipped(self) -> int:
+        """Top-level items set aside, counted without building the name lists to_dict does."""
+        return (
+            len(self.files_skipped_whitelist) +
+            len(self.files_skipped_blacklist) +
+            len(self.files_skipped_read_error) +
+            len(self.files_skipped_empty) +
+            len(self.files_unsupported_extension) +
+            len(self.documents_skipped_error) +
+            len(self.documents_skipped_filtered) +
+            len(self.runtime_skipped_extension) +
+            len(self.runtime_skipped_error)
+        )
+
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
         # Calculate counts for each category
+        total_skipped = self.total_skipped
         files_skipped_count = (
             len(self.files_skipped_whitelist) +
             len(self.files_skipped_blacklist) +
@@ -162,8 +180,6 @@ class IndexingStats:
             len(self.runtime_skipped_extension) +
             len(self.runtime_skipped_error)
         )
-        # total_skipped only includes top-level items, not dependent items
-        total_skipped = files_skipped_count + documents_skipped_count + runtime_skipped_count
         dependent_items_count = len(self.dependent_items_skipped)
 
         return {
@@ -733,6 +749,10 @@ class _IndexRunState:
     chunks_written: int = 0
 
 
+_ACTIVE_INDEXING_STATS: "contextvars.ContextVar[Optional[IndexingStats]]" = contextvars.ContextVar(
+    "elitea_active_indexing_stats", default=None
+)
+
 _LOADER_PREFETCH_SENTINEL = object()
 _LOADER_PREFETCH_STOP_CHECK_INTERVAL_SECONDS = 0.5
 _LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS = 5.0
@@ -741,8 +761,9 @@ _LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS = 5.0
 class _LoaderPrefetch:
     """Drives a base-document loader on one producer thread so the fetch overlaps the embed."""
 
-    def __init__(self, documents, depth: int, run_label: str):
+    def __init__(self, documents, depth: int, run_label: str, run_stats=None):
         self._source = iter(documents)
+        self._run_stats = run_stats
         self._queue: "Queue[Any]" = Queue(maxsize=max(1, depth))
         self._stop = threading.Event()
         self._error: Optional[BaseException] = None
@@ -765,6 +786,17 @@ class _LoaderPrefetch:
         self.close()
         return False
 
+    def _next_item(self):
+        while True:
+            try:
+                return self._queue.get(timeout=_LOADER_PREFETCH_STOP_CHECK_INTERVAL_SECONDS)
+            except Empty:
+                if not self._thread.is_alive():
+                    try:
+                        return self._queue.get_nowait()
+                    except Empty:
+                        return _LOADER_PREFETCH_SENTINEL
+
     def _put(self, item) -> bool:
         while not self._stop.is_set():
             try:
@@ -775,6 +807,8 @@ class _LoaderPrefetch:
         return False
 
     def _produce(self):
+        if self._run_stats is not None:
+            _ACTIVE_INDEXING_STATS.set(self._run_stats)
         try:
             for document in self._source:
                 if not self._put(document):
@@ -791,7 +825,7 @@ class _LoaderPrefetch:
             return True
         if self._exhausted:
             return False
-        item = self._queue.get()
+        item = self._next_item()
         if item is _LOADER_PREFETCH_SENTINEL:
             self._exhausted = True
             self._reraise()
@@ -803,7 +837,7 @@ class _LoaderPrefetch:
         if self._head:
             yield self._head.pop()
         while not self._exhausted:
-            item = self._queue.get()
+            item = self._next_item()
             if item is _LOADER_PREFETCH_SENTINEL:
                 self._exhausted = True
                 break
@@ -827,7 +861,7 @@ class _LoaderPrefetch:
         self._thread.join(timeout=_LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS)
         if self._thread.is_alive():
             logger.warning(
-                "Base-document loader thread did not stop within "
+                f"Base-document loader thread did not stop within "
                 f"{_LOADER_PREFETCH_JOIN_TIMEOUT_SECONDS}s; leaving it to the daemon exit."
             )
 
@@ -920,8 +954,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         yield from ()
 
     def get_indexing_stats(self) -> Optional[IndexingStats]:
-        """Get the indexing statistics from the current or last indexing run."""
-        return getattr(self, '_indexing_stats', None)
+        """The statistics of the run owning this thread, else the wrapper's current run.
+
+        A thread the loader spawns for itself has no context of its own, so it silently
+        falls back to the wrapper's current run -- possibly a later one -- and must do
+        I/O only.
+        """
+        return _ACTIVE_INDEXING_STATS.get(None) or getattr(self, '_indexing_stats', None)
 
     def get_indexing_stats_summary(self) -> str:
         """Get a human-readable summary of skipped items."""
@@ -929,17 +968,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return stats.get_summary() if stats else ""
 
     def _init_indexing_stats(self) -> IndexingStats:
-        self._indexing_stats = IndexingStats()
-        return self._indexing_stats
+        stats = IndexingStats()
+        self._indexing_stats = stats
+        if _ACTIVE_INDEXING_STATS.get(None) is not None:
+            _ACTIVE_INDEXING_STATS.set(stats)
+        return stats
 
     def _track_document_unchanged(self, doc_identifier: str):
         """Kept apart from documents_skipped_* so the report can tell "nothing to do"
         from "something went wrong". Lives on the base because _reduce_duplicates does:
         code toolkits skip unchanged documents through that same path.
         """
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.documents_already_indexed.add(doc_identifier)
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        stats.documents_already_indexed.add(doc_identifier)
 
     def _track_document_failed(self, doc_name: str, base_doc: Optional[Document] = None):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
@@ -949,6 +990,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if doc_name in stats.documents_skipped_error:
                 return
             stats.documents_skipped_error.add(doc_name)
+            stats.items_withdrawn += 1
             stats.items_processed = max(stats.items_processed - 1, 0)
 
     def _track_dependent_parse_failure(self, item_name: str, reason: str):
@@ -963,6 +1005,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if doc_name in skip_set:
                 return
             skip_set.add(doc_name)
+            stats.items_withdrawn += 1
             stats.items_processed = max(stats.items_processed - 1, 0)
 
     def _track_document_damaged(self, doc_name: str):
@@ -980,12 +1023,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         stats = self.get_indexing_stats()
         if stats is None:
             return
-        stats.items_processed = stats.items_processed or documents_count
+        loader_counts_in_its_own_unit = (
+            self.loader_yields_chunks or stats.items_counted_by_loader or stats.items_processed
+        )
+        if not loader_counts_in_its_own_unit:
+            stats.items_processed = max(documents_count - stats.items_withdrawn, 0)
         # Counting only yielded documents would break the documented invariant as soon as
         # a loader skips items before yielding: the chip would read "179 / 179" next to a
         # report listing twelve skips.
         stats.total_fetched = stats.total_fetched or (
-            stats.items_processed + stats.to_dict()["total_skipped"]
+            stats.items_processed + stats.total_skipped
         )
 
     def _process_document(self, base_document: Document) -> Generator[Document, None, None]:
@@ -1055,17 +1102,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # until promote commits — parking one pooled connection for its duration.
             # Freshness ACROSS promote comes from the committed stamp taken before it,
             # and is worth one horizon. Stopped in the finally below.
-            with _LoaderPrefetch(self._base_loader(**kwargs),
-                                 self.loader_prefetch_depth,
-                                 self._index_run.run_id) as stream:
-                empty_loader = not stream.has_documents() and self._has_previous_index_run()
-                if not empty_loader:
-                    self._log_tool_event(f"Base documents are streaming in. "
-                                         f"Search for possible document duplicates and remove them from the indexing list...")
-                    documents = self._reduce_duplicates(stream.documents(), index_name)
-                    self._log_tool_event(f"Duplicates were removed. "
-                                         f"Processing documents to collect dependencies and prepare them for indexing...")
-                    self._save_index_generator(documents, stream.total, chunking_tool, chunking_config, index_name=index_name, result=result)
+            stream = _LoaderPrefetch(self._base_loader(**kwargs),
+                                     self.loader_prefetch_depth,
+                                     self._index_run.run_id,
+                                     run_stats=self.get_indexing_stats())
+            try:
+                with stream:
+                    empty_loader = not stream.has_documents() and self._has_previous_index_run()
+                    if not empty_loader:
+                        self._log_tool_event(f"Base documents are streaming in. "
+                                             f"Search for possible document duplicates and remove them from the indexing list...")
+                        documents = self._reduce_duplicates(stream.documents(), index_name)
+                        self._log_tool_event(f"Duplicates were removed. "
+                                             f"Processing documents to collect dependencies and prepare them for indexing...")
+                        self._save_index_generator(documents, stream.total, chunking_tool, chunking_config, index_name=index_name, result=result)
+            finally:
                 self._stamp_loader_stats(stream.produced_count)
             if empty_loader:
                 return self._finalize_empty_loader_run(index_name)
@@ -1581,8 +1632,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     pg_vector_add_docs_chunk.clear()
 
             running_total = _resolve_base_total(base_total)
-            msg = (f"Indexed document #{base_doc_counter} '{_doc_name}' out of "
-                   f"{running_total if running_total is not None else '?'} "
+            out_of = f" out of {running_total}" if running_total is not None else ""
+            msg = (f"Indexed document #{base_doc_counter} '{_doc_name}'{out_of} "
                    f"(with {dependent_docs_counter} chunks).")
             logger.debug(msg)
             self._log_tool_event(msg)
@@ -1828,7 +1879,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         path already recorded the document, and the outer per-base-doc fallback in
         ``_save_index_generator`` would otherwise add it again to a different category.
         """
-        stats = getattr(self, '_indexing_stats', None)
+        stats = self.get_indexing_stats()
         if stats is None:
             return False
         meta = base_doc.metadata or {}
@@ -1843,20 +1894,19 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         candidates.discard('unknown')
         if not candidates:
             return False
-        with _STATS_COUNTER_LOCK:
-            for skip_set in (
-                stats.files_skipped_whitelist,
-                stats.files_skipped_blacklist,
-                stats.files_skipped_read_error,
-                stats.files_skipped_empty,
-                stats.files_unsupported_extension,
-                stats.documents_skipped_error,
-                stats.documents_skipped_filtered,
-                stats.runtime_skipped_extension,
-                stats.runtime_skipped_error,
-            ):
-                if candidates & skip_set:
-                    return True
+        for skip_set in (
+            stats.files_skipped_whitelist,
+            stats.files_skipped_blacklist,
+            stats.files_skipped_read_error,
+            stats.files_skipped_empty,
+            stats.files_unsupported_extension,
+            stats.documents_skipped_error,
+            stats.documents_skipped_filtered,
+            stats.runtime_skipped_extension,
+            stats.runtime_skipped_error,
+        ):
+            if candidates & skip_set:
+                return True
         return False
 
     def _collect_dependencies(self, documents: Generator[Document, None, None]):

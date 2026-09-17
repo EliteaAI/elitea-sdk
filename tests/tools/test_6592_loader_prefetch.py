@@ -14,18 +14,14 @@
 
 """Guards the loader/writer overlap in ``index_data`` (#6592).
 
-The source fetch and the embed used to run strictly back to back, because the loader was
-materialised with ``list()`` before the first chunk was flushed. Re-broken by anything
-that drains the loader eagerly again, lets a zero-document loader reach dedup, reads
-``_index_workers`` before the loader has published it, drops the loader's progress
-events, or leaks the producer thread. Lives outside tests/tools/index/ because CI skips
-that directory.
+Lives outside tests/tools/index/ because CI skips that directory.
 """
 
 import contextvars
 import json
 import threading
 import time
+from queue import Empty, Queue
 
 import pytest
 from langchain_core.documents import Document
@@ -33,7 +29,9 @@ from langchain_core.documents import Document
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
 from elitea_sdk.tools.code_indexer_toolkit import CodeIndexerToolkit
+from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from elitea_sdk.tools.base_indexer_toolkit import (
+    _ACTIVE_INDEXING_STATS,
     BaseIndexerToolkit,
     IndexingStats,
     _LoaderPrefetch,
@@ -212,8 +210,7 @@ class TestTheLoaderRunsWhileTheWriterFlushes:
 
 
 class TestAZeroDocumentLoaderNeverReachesDedup:
-    """An empty stream in _reduce_duplicates leaves seen_keys empty, which nominates
-    every previously indexed document as an orphan."""
+    """An empty stream nominates every previously indexed document as an orphan."""
 
     def test_dedup_is_not_entered(self, monkeypatch):
         toolkit = build_toolkit(monkeypatch)
@@ -257,8 +254,7 @@ class TestAZeroDocumentLoaderNeverReachesDedup:
 
 
 class TestLoaderPublishedStateIsVisibleToTheWriter:
-    """ADO loaders assign self._index_workers inside the generator body, and the writer
-    reads it before pulling any document."""
+    """Loaders publish state before their first yield; the writer reads it before pulling."""
 
     def test_index_workers_set_before_the_first_yield_is_read_by_the_writer(self, monkeypatch):
         toolkit = build_toolkit(monkeypatch)
@@ -375,8 +371,7 @@ class TestLoaderStatsAreStampedAfterTheDrain:
 
 
 class TestTheCodeLoaderCounterSurvivesConcurrentDecrements:
-    """code_indexer_toolkit assigned items_processed absolutely. Once the loader and the
-    writer run at the same time, that assignment erases the writer's decrements."""
+    """An absolute assignment by the loader erases the writer's concurrent decrements."""
 
     def _code_toolkit(self, files):
         toolkit = CodeIndexerToolkit.model_construct()
@@ -408,8 +403,7 @@ class TestTheCodeLoaderCounterSurvivesConcurrentDecrements:
 
 
 class TestLoaderProgressEventsStillReachTheRun:
-    """_log_tool_event dispatches through a ContextVar that a bare thread does not
-    inherit, so the loader's progress would vanish from the UI."""
+    """Progress dispatches through a ContextVar a bare thread does not inherit."""
 
     def test_the_run_context_is_carried_onto_the_producer_thread(self, monkeypatch):
         probe = contextvars.ContextVar("elitea_test_run_probe", default=None)
@@ -462,3 +456,248 @@ class TestLoaderPrefetchDirectly:
         with _LoaderPrefetch(iter(()), 8, "unit") as stream:
             assert stream.has_documents() is False
             assert list(stream.documents()) == []
+
+
+class TestLoaderStatsSurviveTheWriter:
+    """Streaming interleaves the stamp with the writer's failure decrements."""
+
+    def _toolkit_with_a_failing_document(self, monkeypatch, failing_id):
+        toolkit = build_toolkit(monkeypatch)
+        monkeypatch.setattr(PrefetchToolkit, "_base_loader",
+                            lambda self, **kw: iter(docs("d0", "d1", "d2")))
+        monkeypatch.setattr(PrefetchToolkit, "_reduce_duplicates", lambda self, d, n: d)
+        original = BaseIndexerToolkit._save_index_generator
+
+        def save_then_fail_one(self, base_documents, base_total, *a, **kw):
+            outcome = original(self, base_documents, base_total, *a, **kw)
+            self._track_document_failed(failing_id)
+            return outcome
+
+        monkeypatch.setattr(PrefetchToolkit, "_save_index_generator", save_then_fail_one)
+        return toolkit
+
+    def test_a_failed_document_is_not_counted_as_processed(self, monkeypatch):
+        toolkit = self._toolkit_with_a_failing_document(monkeypatch, "d1")
+        toolkit.index_data(index_name="x")
+        assert toolkit.get_indexing_stats().items_processed == 2
+
+    def test_the_fetched_total_does_not_exceed_what_the_loader_yielded(self, monkeypatch):
+        toolkit = self._toolkit_with_a_failing_document(monkeypatch, "d1")
+        toolkit.index_data(index_name="x")
+        assert toolkit.get_indexing_stats().total_fetched == 3
+
+    def test_a_writer_failure_still_reports_what_the_loader_fetched(self, monkeypatch):
+        toolkit = build_toolkit(monkeypatch)
+        monkeypatch.setattr(PrefetchToolkit, "_base_loader",
+                            lambda self, **kw: iter(docs("d0", "d1", "d2")))
+        monkeypatch.setattr(PrefetchToolkit, "_reduce_duplicates", lambda self, d, n: d)
+
+        def explode_after_draining_the_loader(self, base_documents, base_total, *a, **kw):
+            list(base_documents)
+            raise RuntimeError("writer blew up")
+
+        monkeypatch.setattr(PrefetchToolkit, "_save_index_generator",
+                            explode_after_draining_the_loader)
+
+        with pytest.raises(RuntimeError, match="writer blew up"):
+            toolkit.index_data(index_name="x")
+
+        stats = toolkit.get_indexing_stats()
+        assert (stats.items_processed, stats.total_fetched) == (3, 3)
+
+
+class TestProgressStillNamesATotalOrOmitsIt:
+    def test_no_document_line_renders_a_placeholder_total(self, monkeypatch):
+        toolkit = build_toolkit(monkeypatch)
+        logged = []
+        monkeypatch.setattr(PrefetchToolkit, "_log_tool_event",
+                            lambda self, message, *a, **kw: logged.append(message))
+        monkeypatch.setattr(PrefetchToolkit, "_base_loader",
+                            lambda self, **kw: iter(docs("d0", "d1")))
+        monkeypatch.setattr(PrefetchToolkit, "_reduce_duplicates", lambda self, d, n: d)
+
+        toolkit.index_data(index_name="x")
+
+        indexed_lines = [m for m in logged if m.startswith("Indexed document")]
+        assert indexed_lines
+        assert not any("out of ?" in m or "out of None" in m for m in indexed_lines), indexed_lines
+        assert indexed_lines[0].startswith("Indexed document #1 ")
+
+
+class ChunkYieldingToolkit(PrefetchToolkit):
+    """Mirrors CodeIndexerToolkit: one yield per chunk, and it counts files itself."""
+    loader_yields_chunks = True
+
+    def key_fn(self, document: Document):
+        return document.metadata.get("filename")
+
+
+CHUNKS_PER_FILE = 10
+
+
+def chunk_loader(self, **kwargs):
+    for name in ("f0.py", "f1.py", "f2.py"):
+        self._indexing_stats.items_processed += 1
+        for chunk in range(CHUNKS_PER_FILE):
+            yield Document(page_content=f"{name}#{chunk}",
+                           metadata={"filename": name, "id": name, "updated_on": "1"})
+
+
+class TestAChunkYieldingLoaderKeepsItsOwnCount:
+    """The fallback counts yields, which for a chunk-yielding loader are not source files."""
+
+    def test_a_fully_failed_run_reports_nothing_indexed(self, monkeypatch):
+        toolkit = build_toolkit(monkeypatch, toolkit_cls=ChunkYieldingToolkit)
+        monkeypatch.setattr(ChunkYieldingToolkit, "_base_loader", chunk_loader)
+        monkeypatch.setattr(ChunkYieldingToolkit, "_reduce_duplicates", lambda self, d, n: d)
+        original = BaseIndexerToolkit._save_index_generator
+
+        def save_then_fail_every_file(self, base_documents, base_total, *a, **kw):
+            outcome = original(self, base_documents, base_total, *a, **kw)
+            for name in ("f0.py", "f1.py", "f2.py"):
+                self._track_document_failed(name)
+            return outcome
+
+        monkeypatch.setattr(ChunkYieldingToolkit, "_save_index_generator", save_then_fail_every_file)
+
+        toolkit.index_data(index_name="x")
+        stats = toolkit.get_indexing_stats()
+
+        assert stats.items_processed == 0, "failed files came back as indexed chunks"
+        assert stats.total_fetched == 3, "the fetched total is counting chunks, not files"
+
+
+class TestADeadProducerDoesNotStrandQueuedDocuments:
+    def test_everything_already_queued_is_delivered(self):
+        """Queue.get releases its mutex as Empty propagates, opening a window to exit in."""
+        class RaisesEmptyOnceWhileFull(Queue):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._already_raised = False
+
+            def get(self, block=True, timeout=None):
+                if not self._already_raised and self.qsize() > 0:
+                    self._already_raised = True
+                    raise Empty
+                return super().get(block, timeout)
+
+        stream = _LoaderPrefetch(iter(["a", "b", "c"]), 8, "race")
+        with stream:
+            stream._thread.join(timeout=BARRIER_TIMEOUT)
+            racing = RaisesEmptyOnceWhileFull()
+            while True:
+                try:
+                    racing.put_nowait(stream._queue.get_nowait())
+                except Empty:
+                    break
+            stream._queue = racing
+            assert list(stream.documents()) == ["a", "b", "c"]
+
+
+class TestTheStampRunsAfterTheProducerIsSettled:
+    def test_a_loader_dying_in_its_prologue_still_reports_what_it_skipped(self, monkeypatch):
+        """The peek raises before the writer is reached, outside a writer-scoped stamp."""
+        toolkit = build_toolkit(monkeypatch)
+
+        def dies_after_recording_a_skip(self, **kwargs):
+            self._indexing_stats.documents_skipped_filtered.add("filtered-before-the-failure")
+            raise RuntimeError("prologue died")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(PrefetchToolkit, "_base_loader", dies_after_recording_a_skip)
+
+        with pytest.raises(RuntimeError, match="prologue died"):
+            toolkit.index_data(index_name="x")
+
+        assert toolkit.get_indexing_stats().total_fetched == 1
+
+
+class TestALoaderCountingInItsOwnUnitKeepsItsCount:
+    """A loader counting source items may yield several documents for each."""
+
+    def test_a_multi_document_loader_is_not_recounted_from_its_yields(self, monkeypatch):
+        toolkit = build_toolkit(monkeypatch)
+        pages = ("p0", "p1", "p2")
+        documents_per_page = 3
+
+        def paged_loader(self, **kwargs):
+            for page in pages:
+                self._track_processed_item()
+                for part in range(documents_per_page):
+                    yield Document(page_content=f"{page}-{part}",
+                                   metadata={"id": f"{page}-{part}", "updated_on": "1"})
+
+        monkeypatch.setattr(PrefetchToolkit, "_track_processed_item",
+                            NonCodeIndexerToolkit._track_processed_item, raising=False)
+        monkeypatch.setattr(PrefetchToolkit, "_base_loader", paged_loader)
+        monkeypatch.setattr(PrefetchToolkit, "_reduce_duplicates", lambda self, d, n: d)
+        original = BaseIndexerToolkit._save_index_generator
+
+        def save_then_fail_every_page(self, base_documents, base_total, *a, **kw):
+            outcome = original(self, base_documents, base_total, *a, **kw)
+            for page in pages:
+                self._track_document_failed(page)
+            return outcome
+
+        monkeypatch.setattr(PrefetchToolkit, "_save_index_generator", save_then_fail_every_page)
+
+        toolkit.index_data(index_name="x")
+
+        assert toolkit.get_indexing_stats().items_processed == 0, (
+            "the loader's source-item count was replaced by its document yield count"
+        )
+
+
+class TestAnAbandonedProducerCannotReachTheNextRun:
+    """A straggler writes to the stats object its own run started with."""
+
+    def test_a_straggler_writes_to_its_own_runs_stats_not_the_next_runs(self, monkeypatch):
+        toolkit = build_toolkit(monkeypatch)
+        monkeypatch.setattr(PrefetchToolkit, "_base_loader", lambda self, **kw: iter(docs("d0")))
+        monkeypatch.setattr(PrefetchToolkit, "_reduce_duplicates", lambda self, d, n: d)
+        toolkit.index_data(index_name="x")
+        first_run_stats = toolkit.get_indexing_stats()
+
+        released = threading.Event()
+        recorded = threading.Event()
+
+        def a_producer_that_outlives_its_run(self, **kwargs):
+            yield Document(page_content="stale", metadata={"id": "stale", "updated_on": "1"})
+            released.wait(BARRIER_TIMEOUT)
+            self._track_skipped_document("written-after-the-run-ended", reason="filtered")
+            recorded.set()
+
+        monkeypatch.setattr(PrefetchToolkit, "_track_skipped_document",
+                            NonCodeIndexerToolkit._track_skipped_document, raising=False)
+        straggler = _LoaderPrefetch(a_producer_that_outlives_its_run(toolkit),
+                                    8, "stale-run", run_stats=first_run_stats)
+        straggler.__enter__()
+        straggler.has_documents()
+
+        toolkit.index_data(index_name="x")
+        second_run_stats = toolkit.get_indexing_stats()
+        assert second_run_stats is not first_run_stats
+
+        released.set()
+        assert recorded.wait(BARRIER_TIMEOUT), "the straggler never got to write"
+        straggler.close()
+
+        assert "written-after-the-run-ended" in first_run_stats.documents_skipped_filtered
+        assert "written-after-the-run-ended" not in second_run_stats.documents_skipped_filtered
+
+
+class TestTheSkipGuardReadsTheSameStatsAsItsCaller:
+    """The duplicate guard must resolve stats the same way its caller does."""
+
+    def test_the_guard_sees_the_stats_bound_to_this_thread(self, monkeypatch):
+        toolkit = build_toolkit(monkeypatch)
+        object.__setattr__(toolkit, "_indexing_stats", IndexingStats())
+        bound = IndexingStats()
+        bound.documents_skipped_error.add("already-recorded.py")
+        document = Document(page_content="x", metadata={"id": "already-recorded.py"})
+
+        token = _ACTIVE_INDEXING_STATS.set(bound)
+        try:
+            assert toolkit._is_base_doc_tracked_as_skipped(document) is True
+        finally:
+            _ACTIVE_INDEXING_STATS.reset(token)

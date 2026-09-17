@@ -1405,10 +1405,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     seen.add(endpoint.id)
                     work_item_ids.append(endpoint.id)
 
-        # Fetch work item details concurrently — each get_work_item is an
-        # independent REST call, so this is a straight I/O win. Yield in the
-        # order of `work_item_ids` so downstream _reduce_duplicates + stats
-        # stay deterministic. State mutation stays on the main thread.
         max_workers = max(1, self._index_workers)
         if max_workers <= 1 or len(work_item_ids) <= 1:
             for wi_id in work_item_ids:

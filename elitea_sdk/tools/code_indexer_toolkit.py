@@ -127,11 +127,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             CONFIG_EXTENSIONS | TEXT_EXTENSIONS
         )
 
-        # Initialize or reset indexing stats
-        if not hasattr(self, '_indexing_stats'):
-            self._indexing_stats = IndexingStats()
-        else:
-            self._indexing_stats = IndexingStats()
+        self._init_indexing_stats()
 
         _files = self.__handle_get_files("", self.__get_branch(branch))
 
@@ -158,7 +154,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             """Yields raw Documents without chunking - pure generator, no pre-filtering."""
             processed = 0
             total_files = 0
-            stats = self._indexing_stats
+            stats = self.get_indexing_stats()
 
             for file in _files:
                 total_files += 1
@@ -243,7 +239,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
             dropped = yielded_files - chunked_files
             if dropped:
-                stats = self._indexing_stats
+                stats = self.get_indexing_stats()
                 stats.files_skipped_empty.update(dropped)
                 # Counted at load time, so the invariant needs them back out.
                 with _STATS_COUNTER_LOCK:

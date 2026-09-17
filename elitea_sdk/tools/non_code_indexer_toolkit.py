@@ -4,7 +4,7 @@ from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
-from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit, IndexingStats
+from elitea_sdk.tools.base_indexer_toolkit import _STATS_COUNTER_LOCK, BaseIndexerToolkit, IndexingStats
 
 logger = logging.getLogger(__name__)
 
@@ -93,25 +93,23 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
 
     def _track_skipped_document(self, doc_id: str, reason: str = "error"):
         """Track a skipped document during indexing."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
         if reason == "filtered":
-            self._indexing_stats.documents_skipped_filtered.add(doc_id)
+            stats.documents_skipped_filtered.add(doc_id)
         else:
-            self._indexing_stats.documents_skipped_error.add(doc_id)
+            stats.documents_skipped_error.add(doc_id)
 
     def _track_runtime_skipped(self, item_name: str, reason: str = "extension"):
         """Track a top-level item skipped at runtime. For attachments and other
         child items use _track_skipped_attachment instead, so they are not counted
         alongside the documents they belong to."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
         if reason == "filtered":
-            self._indexing_stats.documents_skipped_filtered.add(item_name)
+            stats.documents_skipped_filtered.add(item_name)
         elif reason == "extension":
-            self._indexing_stats.runtime_skipped_extension.add(item_name)
+            stats.runtime_skipped_extension.add(item_name)
         else:
-            self._indexing_stats.runtime_skipped_error.add(item_name)
+            stats.runtime_skipped_error.add(item_name)
 
     def _track_skipped_attachment(self, attachment_name: str, reason: str = "filtered"):
         """Track an attachment left out of a page/issue that was itself indexed.
@@ -126,40 +124,37 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
                     'empty' when it held no indexable content,
                     anything else for a genuine failure.
         """
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
         if reason == "filtered":
-            self._indexing_stats.dependent_items_filtered.add(attachment_name)
+            stats.dependent_items_filtered.add(attachment_name)
         elif reason in ("unsupported", "extension"):
-            self._indexing_stats.dependent_items_unsupported.add(attachment_name)
+            stats.dependent_items_unsupported.add(attachment_name)
         elif reason == "empty":
-            self._indexing_stats.dependent_items_empty.add(attachment_name)
+            stats.dependent_items_empty.add(attachment_name)
         else:
-            self._indexing_stats.dependent_items_skipped.add(attachment_name)
+            stats.dependent_items_skipped.add(attachment_name)
 
     def _track_skipped_file_unsupported(self, file_name: str):
         """Track a file skipped due to unsupported extension."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.files_unsupported_extension.add(file_name)
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        stats.files_unsupported_extension.add(file_name)
 
     def _track_skipped_file_read_error(self, file_name: str):
         """Track a file skipped due to read error."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.files_skipped_read_error.add(file_name)
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        stats.files_skipped_read_error.add(file_name)
 
     def _track_skipped_file_empty(self, file_name: str):
         """Track a file skipped due to empty content."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.files_skipped_empty.add(file_name)
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        stats.files_skipped_empty.add(file_name)
 
     def _track_processed_item(self):
         """Increment the count of processed items."""
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.items_processed += 1
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        with _STATS_COUNTER_LOCK:
+            stats.items_counted_by_loader = True
+            stats.items_processed += 1
 
     def _track_dependent_item_skipped(self, item_name: str):
         """
@@ -169,6 +164,5 @@ class NonCodeIndexerToolkit(BaseIndexerToolkit):
         in a Confluence page where the parent document was still indexed successfully.
         These are tracked separately from top-level skipped items.
         """
-        if not hasattr(self, '_indexing_stats'):
-            self._init_indexing_stats()
-        self._indexing_stats.dependent_items_skipped.add(item_name)
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        stats.dependent_items_skipped.add(item_name)
