@@ -578,6 +578,14 @@ class EliteAClient:
         use_responses_api = any(
             tag in model_name for tag in worker_config.get("use_responses_api_for", [])
         )
+        routing_transport = model_config.get('routing_transport') if model_config.get('routing_pin') else None
+        if routing_transport:
+            actual_transport = 'anthropic_messages' if is_anthropic else 'chat_completions'
+            if routing_transport != actual_transport:
+                raise ValueError('Auto model transport differs from its measured contract')
+            # A measured Chat Completions preset must not be switched by a
+            # worker-wide preference. Manual and older bindings keep their path.
+            use_responses_api = False
         # Models needing the reasoning param nested in the request body instead of a
         # top-level reasoning_effort string (e.g. Bedrock-hosted OpenAI models).
         reasoning_in_body = any(
@@ -695,6 +703,8 @@ class EliteAClient:
 
             if use_responses_api:
                 target_kwargs["use_responses_api"] = True
+            elif routing_transport == 'chat_completions':
+                target_kwargs["use_responses_api"] = False
 
             if model_config.get('routing_pin'):
                 target_kwargs.setdefault('default_headers', {})['X-Elitea-Routing-Pin'] = model_config['routing_pin']

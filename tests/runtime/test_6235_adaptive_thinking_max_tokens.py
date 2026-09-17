@@ -94,6 +94,41 @@ class TestAdaptiveThinkingMaxTokensPadding:
 
 
 class TestAutoTotalOutputAllowance:
+    def test_measured_chat_transport_overrides_worker_preference_only_for_auto(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+        worker = SimpleNamespace(descriptor=SimpleNamespace(config={'use_responses_api_for': ['terra']}))
+        monkeypatch.setitem(sys.modules, 'tools', SimpleNamespace(this=SimpleNamespace(for_module=lambda _: worker)))
+        client = _make_client()
+        with patch('elitea_sdk.runtime.clients.client.ChatOpenAI') as native:
+            client.get_llm('global.openai.gpt-5.6-terra', {'max_tokens': 32000,
+                'routing_transport': 'chat_completions', 'routing_pin': 'signed-fixture',
+                'routing_invocation_id': 'a'*64})
+            assert native.call_args.kwargs['use_responses_api'] is False
+            assert native.call_args.kwargs['max_tokens'] == 32000
+            client.get_llm('global.openai.gpt-5.6-terra', {'max_tokens': 32000})
+            assert native.call_args.kwargs['use_responses_api'] is True
+
+    @pytest.mark.parametrize('name', ['eu.anthropic.claude-opus-5', 'eu.anthropic.claude-opus-4-8', 'eu.anthropic.claude-opus-4-7'])
+    def test_native_default_contract_does_not_invent_effort_or_pad_output(self, name):
+        client = _make_client()
+        with patch('elitea_sdk.runtime.clients.client.ChatAnthropic') as native:
+            client.get_llm(name, {'max_tokens': 32000, 'reasoning_effort': None,
+                'routing_transport': 'anthropic_messages', 'routing_total_output_cap': True,
+                'routing_pin': 'signed-fixture', 'routing_invocation_id': 'a'*64})
+        assert native.call_args.kwargs['max_tokens'] == 32000
+        assert 'thinking' not in native.call_args.kwargs
+        assert 'effort' not in native.call_args.kwargs
+
+    def test_native_calibration_contract_rejects_compatible_reinterpretation(self):
+        client = _make_client()
+        with patch('elitea_sdk.runtime.clients.client.ChatOpenAI') as native:
+            with pytest.raises(ValueError, match='measured contract'):
+                client.get_llm('eu.anthropic.claude-opus-5', {'max_tokens': 32000,
+                    'openai_compatible': True, 'routing_transport': 'anthropic_messages',
+                    'routing_pin': 'signed-fixture', 'routing_invocation_id': 'a'*64})
+        native.assert_not_called()
+
     @pytest.mark.parametrize('name', ['global.anthropic.claude-sonnet-5', 'eu.anthropic.claude-opus-5', 'claude-3-5-sonnet-20241022'])
     def test_auto_total_cap_not_padded_twice_and_pin_constructs_native_headers(self, name):
         client = _make_client()
