@@ -871,7 +871,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 self._stamp_loader_stats(documents_count)
                 # A loader that soft-fails to zero documents over a previously
                 # built index must never publish or rewrite counts.
-                empty_loader = documents_count == 0 and self._has_previous_index_run()
+                empty_loader = (documents_count == 0
+                                and not self._loader_confirmed_empty_source()
+                                and self._has_previous_index_run())
                 if not empty_loader:
                     documents = (doc for doc in documents)
                     self._log_tool_event(f"Base documents were pre-loaded. "
@@ -2103,6 +2105,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """Return True when the current indexing run was triggered by the platform scheduler."""
         initiator = self._resolve_initiator()
         return initiator is not None and initiator.lower() == "schedule"
+
+    def _attest_loader_completion(self):
+        """Record that the loader enumerated the whole source, not a partial page."""
+        run = getattr(self, "_index_run", None)
+        if run is not None:
+            run.loader_attested = True
+
+    def _loader_confirmed_empty_source(self) -> bool:
+        run = getattr(self, "_index_run", None)
+        return bool(self.loader_attests_completion and run is not None and run.loader_attested)
 
     def _has_previous_index_run(self) -> bool:
         """True when this index was already built before the current run started."""
