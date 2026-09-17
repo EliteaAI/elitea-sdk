@@ -148,6 +148,71 @@ def test_direct_sharepoint_toolkit_node_defers_auth_until_execution(monkeypatch)
     assert exc_info.value.server_url == SHAREPOINT_URL
 
 
+def test_direct_sharepoint_toolkit_node_does_not_fall_back_to_same_named_tool(monkeypatch):
+    """A direct node must keep toolkit identity when another toolkit has the same tool."""
+
+    _patch_sharepoint_auth_loader(monkeypatch)
+    context = McpContext(pipeline_node_toolkit_names={"sharepoint"})
+    tools = runtime_tools.get_tools(
+        [_sharepoint_tool_config()],
+        elitea_client=SimpleNamespace(get_mcp_toolkits=lambda: []),
+        mcp_context=context,
+    )
+    ado_calls = []
+
+    def ado_get_lists() -> str:
+        ado_calls.append(True)
+        return "ADO lists"
+
+    tools.insert(
+        0,
+        StructuredTool.from_function(
+            func=ado_get_lists,
+            name="get_lists",
+            description="List ADO items",
+            metadata={
+                "tool_name": "get_lists",
+                "toolkit_name": "ado",
+                "toolkit_type": "ado",
+            },
+        ),
+    )
+    schema = yaml.safe_dump(
+        {
+            "name": "sharepoint-tool-name-collision",
+            "state": {"messages": {"type": "list"}},
+            "nodes": [
+                {
+                    "id": "SharePointNode",
+                    "type": "toolkit",
+                    "toolkit_name": "sharepoint",
+                    "tool": "get_lists",
+                    "transition": "END",
+                },
+            ],
+            "entry_point": "SharePointNode",
+        },
+        default_flow_style=False,
+    )
+
+    graph = create_graph(
+        client=None,
+        yaml_schema=schema,
+        tools=tools,
+        memory=MemorySaver(),
+    )
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="run the pipeline")]},
+        config={"configurable": {"thread_id": "issue-6636-toolkit-collision"}},
+    )
+
+    assert ado_calls == []
+    assert result["execution_finished"] is False
+    assert result["hitl_interrupt"]["guardrail_type"] == "mcp_auth"
+    assert result["hitl_interrupt"]["toolkit_name"] == "sharepoint"
+    assert result["hitl_interrupt"]["tool_name"] == "get_lists"
+
+
 def test_declined_direct_sharepoint_toolkit_marks_clean_pipeline_stop(monkeypatch):
     """After Skip, a direct Toolkit node must terminate gently without ToolException."""
 
