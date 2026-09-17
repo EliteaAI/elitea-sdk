@@ -229,7 +229,7 @@ class Artifact:
                     'type': 'folder'
                 })
         
-        return {"total": len(files), "rows": files}
+        return {"total": len(files), "rows": files, "truncated": bool(result.get('isTruncated'))}
 
     def append(self, artifact_name: str, additional_data: Any, bucket_name: str = None, create_if_missing: bool = True) -> dict:
         """Append data to existing file or create new. Returns dict with filepath or error."""
