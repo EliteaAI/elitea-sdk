@@ -59,6 +59,38 @@ def cfg(thread='child-one', run='run-one'):
     return {'configurable': {'thread_id': thread, 'checkpoint_ns': 'agent', 'elitea_routing_run_id': run}}
 
 
+@pytest.mark.parametrize('cap', [None, -1, 2048, 32000])
+def test_output_allowance_preserves_explicit_limit_and_defers_unspecified(cap):
+    auto, native, requests = model()
+    auto.settings['max_tokens'] = cap
+    auto.invoke([HumanMessage(content='task')], cfg())
+    if cap in (None, -1):
+        assert 'output_cap' not in requests[0]
+    else:
+        assert requests[0]['output_cap'] == cap
+
+
+def test_measured_output_allowance_from_gateway_reaches_native_client():
+    auto, native, requests = model()
+    original = auto.owner._request
+
+    def resolve(*args, **kwargs):
+        response = original(*args, **kwargs)
+        binding = response.json()
+        binding['config']['max_tokens'] = 32000
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: binding)
+
+    auto.owner._request = resolve
+    task = HumanMessage(content='task')
+    first = auto.invoke([task], cfg())
+    assert auto.owner.get_llm.call_args.args[1]['max_tokens'] == 32000
+    first.response_metadata[m.PIN]['expires_at'] = 0
+    auto.invoke([task, first, ToolMessage(content='value', tool_call_id='call1')], cfg())
+    assert requests[-1]['prior_pin'] == 'signed-fixture'
+    assert 'output_cap' not in requests[-1]
+    assert auto.owner.get_llm.call_args.args[1]['max_tokens'] == 32000
+
+
 def test_native_tool_cycle_reuses_checkpoint_pin_and_exact_blocks():
     auto, native, requests = model()
     task = HumanMessage(content='Read the fixture', id='task1')

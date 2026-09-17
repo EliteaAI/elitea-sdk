@@ -164,8 +164,9 @@ class AutoChatModel(BaseChatModel):
                 prior_observation = {**observation(previous), 'message_index': len(projection(messages[:previous_index]))}
             tools = [convert_to_openai_tool(tool) for tool in self.routing_tools]
             cap = self.settings.get('max_tokens')
-            if cap in (None, -1):
-                cap = 8000
+            # Unspecified output belongs to the selected measured contract.
+            # Sending a synthetic 8k limit would exclude 32k-only presets.
+            output_limit = {} if cap in (None, -1) else {'output_cap': cap}
             from elitea_sdk.runtime.clients.routing_context import instruction_view, retrieval_sources
             context = {'active_instructions': dict(instruction_view(self.active_instructions)),
                        'retrieval_options': retrieval_sources(self.routing_tools, str(latest.content))}
@@ -176,7 +177,7 @@ class AutoChatModel(BaseChatModel):
             response = self.owner._request('post', f'{self.owner.base_url}/llm/v1/auto-routing/resolve',
                 headers={**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)},
                 json={'selection': self.settings['selection'], 'surface': self.settings.get('routing_surface', 'agent'),
-                      'messages': projection(messages), 'tools': tools, 'output_cap': cap,
+                      'messages': projection(messages), 'tools': tools, **output_limit,
                       'generation_input_bytes': len(json.dumps(
                           {'messages': [message.model_dump(mode='json') for message in messages],
                            'tools': tools, 'output_schema': output_schema}, ensure_ascii=False).encode()) + 64*len(messages),
