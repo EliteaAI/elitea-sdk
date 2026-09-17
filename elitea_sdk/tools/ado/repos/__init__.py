@@ -1,7 +1,7 @@
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
 from langchain_core.tools import BaseTool, BaseToolkit
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, BeforeValidator, Field, create_model
 
 import requests
 
@@ -10,7 +10,7 @@ from ....configurations.ado import AdoConfiguration
 from ....configurations.pgvector import PgVectorConfiguration
 from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...base.tool import BaseAction
-from .repos_wrapper import ReposApiWrapper
+from .repos_wrapper import ReposApiWrapper, normalize_repositories
 from ...utils import check_connection_response
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
@@ -22,7 +22,7 @@ def get_toolkit(tool) -> BaseToolkit:
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
         project=tool['settings']['project'],
-        repository_id=tool['settings']['repository_id'],
+        repository_id=tool['settings'].get('repository_id'),
         limit=tool['settings'].get('limit', 5),
         base_branch=tool['settings'].get('base_branch', "main"),
         active_branch=tool['settings'].get('active_branch', "main"),
@@ -50,7 +50,16 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), default=None,
                                                        json_schema_extra={'configuration_types': ['ado']})),
             project=(str, Field(description="ADO project name")),
-            repository_id=(str, Field(description="ADO repository ID or name")),
+            # BeforeValidator keeps configurations saved as a single string valid
+            repository_id=(Annotated[List[str], BeforeValidator(normalize_repositories)], Field(
+                default_factory=list,
+                title="Repositories",
+                description="One or several repositories of the project, as IDs or names "
+                            "separated by commas (for example: my-service, my-service-tests). "
+                            "The agent can target any of them in a single tool call and uses the "
+                            "first one when a call does not name a repository. Leave the field "
+                            "empty to allow every repository of the project.",
+            )),
             base_branch=(Optional[str], Field(default="main", title="Base branch", description="ADO base branch (e.g., main)")),
             active_branch=(Optional[str], Field(default="main", title="Active branch", description="ADO active branch (e.g., main)")),
 
@@ -95,8 +104,10 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             if not project:
                 raise ValueError("ADO project is required")
             token = ado_config.token.get_secret_value() if ado_config.token else ""
+            # Without a configured repository the project repository list still proves access
+            repository_path = f'/{self.repository_id[0]}' if self.repository_id else ''
             response = requests.get(
-                f'{ado_config.organization_url}/{project}/_apis/git/repositories/{self.repository_id}?api-version=7.0',
+                f'{ado_config.organization_url}/{project}/_apis/git/repositories{repository_path}?api-version=7.0',
                 headers={'Authorization': f'Bearer {token}'},
                 timeout=5
             )
@@ -122,12 +133,18 @@ class AzureDevOpsReposToolkit(BaseToolkit):
         }
         azure_devops_repos_wrapper = ReposApiWrapper(**wrapper_payload)
         available_tools = azure_devops_repos_wrapper.get_available_tools()
+        instance_info = f"\nADO instance: {azure_devops_repos_wrapper.organization_url}/{azure_devops_repos_wrapper.project}"
+        repositories = azure_devops_repos_wrapper.repositories
+        if repositories:
+            instance_info += f"\nRepositories: {', '.join(repositories)}"
+            if len(repositories) > 1:
+                instance_info += f" (default: {repositories[0]})"
         tools = []
         for tool in available_tools:
             if selected_tools:
                 if tool["name"] not in selected_tools:
                     continue
-            description = tool["description"] + f"\nADO instance: {azure_devops_repos_wrapper.organization_url}/{azure_devops_repos_wrapper.project}"
+            description = tool["description"] + instance_info
             if toolkit_name:
                 description = f"{description}\nToolkit: {toolkit_name}"
             description = description[:1000]
