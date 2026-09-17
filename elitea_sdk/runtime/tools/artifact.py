@@ -4,7 +4,7 @@ import json
 import logging
 import mimetypes
 import re
-from typing import Any, Callable, Optional, Generator, List
+from typing import ClassVar, Any, Callable, Optional, Generator, List
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
@@ -74,6 +74,7 @@ SKIP_SIZE_CHECK_DEPRECATION_MSG = (
 
 class ArtifactWrapper(NonCodeIndexerToolkit):
     index_item_labels = ('file', 'files')
+    loader_attests_completion: ClassVar[bool] = True
     bucket: str
     max_single_read_size: int = DEFAULT_MAX_OUTPUT_CHARS
     artifact: Optional[Any] = None
@@ -310,7 +311,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
     @tool_group('read')
     def list_files(self, bucket_name=None, folder: str = None, recursive: bool = False,
                    include: List[str] = None, skip: List[str] = None,
-                   on_file_skipped: Optional[Callable[[str], None]] = None):
+                   on_file_skipped: Optional[Callable[[str], None]] = None,
+                   strict: bool = False):
         """List files in the artifact bucket with S3 download links.
 
         Args:
@@ -328,6 +330,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                   Note: Patterns are case-insensitive. [, ], and ? are glob metacharacters.
             on_file_skipped: Called with the key of every file excluded by the
                   patterns, so indexing can report what it left out.
+            strict: Raise when the bucket could not be listed, instead of
+                  returning the empty listing an existing empty bucket gives.
         
         Returns:
             Dict with 'total' and 'rows'; an empty listing when the folder does
@@ -349,7 +353,10 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         result = self.artifact.list(bucket_name=bucket, prefix=prefix, delimiter=delimiter)
         
         if 'error' in result:
-            # Return empty list for non-existent folder/bucket
+            if strict:
+                raise ToolException(
+                    f"Could not list the contents of bucket '{bucket}': {result['error']}"
+                )
             return {"total": 0, "rows": []}
         
         # Apply include/skip pattern filtering
@@ -904,16 +911,22 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
 
         try:
             # Filtering happens in list_files via include/skip params
-            all_files = self.list_files(
+            listing = self.list_files(
                 self.bucket,
                 folder=folder,
                 recursive=True,
                 include=include_extensions,
                 skip=skip_extensions,
-                on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered")
-            )['rows']
+                on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered"),
+                strict=True,
+            )
+            all_files = listing['rows']
         except Exception as e:
             raise ToolException(f"Unable to extract files: {e}")
+
+        enumerated_the_whole_bucket = not listing.get('truncated') and not folder
+        if enumerated_the_whole_bucket:
+            self._attest_loader_completion()
 
         self._log_tool_event(message=f"Found {len(all_files)} files after filtering", tool_name="loader")
 
