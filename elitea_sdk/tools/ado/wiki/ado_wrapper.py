@@ -894,11 +894,6 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )
             return page, resp.page.content
 
-        # Bounded, in-order producer/consumer. We keep at most `parallelism`
-        # fetches in flight and always yield in the order pages were emitted by
-        # _iter_wiki_pages, so _reduce_duplicates + stats stay deterministic.
-        # State mutation (`_indexing_stats`, `_track_*`, `yield`) all runs on
-        # the main thread; workers only do HTTP + return bytes.
         executor = ThreadPoolExecutor(
             max_workers=self._index_workers,
             thread_name_prefix="ado-wiki-fetch",
@@ -914,7 +909,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     return False
                 # Filter-first: don't spend an HTTP GET on pages that path_contains excludes.
                 if needle and needle not in page.path.lower().replace("-", " "):
-                    self._indexing_stats.total_fetched += 1
+                    self.get_indexing_stats().total_fetched += 1
                     logger.debug(
                         f"[ADO wiki index] Page #{page_idx} skipped by path_contains filter: "
                         f"'{page.path}' (id={page.id})"
@@ -935,7 +930,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 page_idx, page_path, page_id, fut = futures_queue.pop(0)
                 # Submit next before waiting so the pool stays saturated.
                 _submit_next()
-                self._indexing_stats.total_fetched += 1
+                self.get_indexing_stats().total_fetched += 1
                 logger.debug(f"[ADO wiki index] Loading page #{page_idx}: '{page_path}' (id={page_id})")
                 try:
                     page, raw_content = fut.result()
