@@ -30,7 +30,7 @@ from .utils import (
     propagate_the_input_mapping,
     safe_format,
 )
-from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META
+from ..utils.constants import TOOLKIT_NAME_META
 from ..tools.function import (
     FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
 )
@@ -1041,8 +1041,8 @@ def find_tool_by_name_or_metadata(tools: list, tool_name: str, toolkit_name: Opt
     Find a tool by name or by matching metadata (toolkit_name + tool_name).
 
     For toolkit nodes with toolkit_name specified, this function checks:
-    1. Metadata match first (toolkit_name + tool_name) - PRIORITY when toolkit_name is provided
-    2. Direct tool name match (backward compatibility fallback)
+    1. Exact metadata match (toolkit_name + tool_name)
+    2. A unique unscoped legacy tool with the requested name
 
     For toolkit nodes without toolkit_name, or other node types:
     1. Direct tool name match
@@ -1055,27 +1055,16 @@ def find_tool_by_name_or_metadata(tools: list, tool_name: str, toolkit_name: Opt
     Returns:
         The matching tool or None if not found
     """
-    # When toolkit_name is specified, prioritize metadata matching
     if toolkit_name:
-        for tool in tools:
-            # Check metadata match first
-            if hasattr(tool, 'metadata') and tool.metadata:
-                metadata_toolkit_name = tool.metadata.get(TOOLKIT_NAME_META)
-                metadata_tool_name = tool.metadata.get(TOOL_NAME_META)
+        selected, _ = select_tools_for_binding(
+            tools,
+            {toolkit_name: [tool_name]},
+        )
+        return selected[0] if selected else None
 
-                # Match if both toolkit_name and tool_name in metadata match
-                if metadata_toolkit_name == toolkit_name and metadata_tool_name == tool_name:
-                    return tool
-
-        # Fallback to direct name match for backward compatibility
-        for tool in tools:
-            if tool.name == tool_name:
-                return tool
-    else:
-        # No toolkit_name specified, use direct name match only
-        for tool in tools:
-            if tool.name == tool_name:
-                return tool
+    for tool in tools:
+        if tool.name == tool_name:
+            return tool
 
     return None
 
