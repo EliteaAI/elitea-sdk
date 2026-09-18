@@ -87,3 +87,19 @@ class TestTheListingIdentity:
         wrapper = _wrapper(items=[folder, _blob("/a.py", "sha-a")])
 
         assert wrapper._get_files_with_identity() == {"/a.py": "sha-a"}
+
+
+class TestRepositoryScoping:
+
+    def test_the_content_cache_is_scoped_to_its_repository(self):
+        alpha = _wrapper(repository_id="alpha-id")
+        beta = _wrapper(repository_id="beta-id")
+
+        assert alpha._file_cache_key("/src/main.py", "main") \
+            != beta._file_cache_key("/src/main.py", "main")
+
+    def test_the_same_repository_and_branch_share_one_cache_entry(self):
+        wrapper = _wrapper(repository_id="alpha-id")
+
+        assert wrapper._file_cache_key("/src/main.py", "main") \
+            == wrapper._file_cache_key("/src/main.py", "main")

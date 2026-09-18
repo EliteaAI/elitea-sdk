@@ -489,9 +489,6 @@ class ReposApiWrapper(CodeIndexerToolkit):
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
     edit_file = BaseCodeToolApiWrapper.edit_file
 
-    # In-memory cache for file content to avoid redundant API calls.
-    # Keyed by (file_path, branch) for branch-based reads and
-    # (path, commit_id) for commit-based reads in get_file_content.
     _file_content_cache: Dict[tuple, str] = PrivateAttr(default_factory=dict)
 
     _search_client_instance: Optional[Any] = PrivateAttr(default=None)
@@ -1122,8 +1119,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
             version_descriptor=version_descriptor
         ))
 
+    def _file_cache_key(self, file_path: str, version: str) -> tuple:
+        return (self.repository_id, file_path, version)
+
     def get_file_content(self, commit_id, path):
-        cache_key = (path, commit_id)
+        cache_key = self._file_cache_key(path, commit_id)
         cached = self._file_content_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -1278,7 +1278,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 push=push, repository_id=self.repository_id, project=self.project
             )
             # Invalidate cached content for this file on this branch
-            self._file_content_cache.pop((file_path, self.active_branch), None)
+            self._file_content_cache.pop(self._file_cache_key(file_path, self.active_branch), None)
             return f"Created file {file_path}"
         except Exception as e:
             msg = f"Unable to create file due to error:\n{str(e)}"
@@ -1316,7 +1316,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
 
         try:
-            cache_key = (file_path, self.active_branch)
+            cache_key = self._file_cache_key(file_path, self.active_branch)
             decoded_content = self._file_content_cache.get(cache_key)
 
             if decoded_content is None:
@@ -1418,7 +1418,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
             self._client.create_push(push=push, repository_id=self.repository_id, project=self.project)
             # Invalidate cached content for this file on this branch
-            self._file_content_cache.pop((file_path, branch), None)
+            self._file_content_cache.pop(self._file_cache_key(file_path, branch), None)
             return f"Updated file {file_path}"
         except ToolException:
             # Re-raise known tool exceptions
@@ -1498,7 +1498,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 push=push, repository_id=self.repository_id, project=self.project
             )
             # Invalidate cached content for this file on this branch
-            self._file_content_cache.pop((file_path, branch_name), None)
+            self._file_content_cache.pop(self._file_cache_key(file_path, branch_name), None)
             return "Deleted file " + file_path
         except Exception as e:
             msg = f"Unable to delete file due to error:\n{str(e)}"
