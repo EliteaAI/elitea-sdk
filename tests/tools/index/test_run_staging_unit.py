@@ -507,6 +507,40 @@ class TestIndexDataPromoteOutcomes:
         assert staged_toolkit.written[-1]["state"] == IndexerKeywords.INDEX_META_PARTLY_OK.value
         assert "promote" in staged_toolkit.vector_adapter.calls
 
+    def test_an_attesting_loader_may_empty_the_index(self, staged_toolkit, monkeypatch):
+        """A loader that confirmed it enumerated the whole source makes zero items a
+        fact about the source, so the reindex publishes it instead of refusing forever."""
+        seed_completed_meta(staged_toolkit)
+        monkeypatch.setattr(type(staged_toolkit), "loader_attests_completion", True, raising=False)
+
+        def attesting_empty_loader(self, **kwargs):
+            self._attest_loader_completion()
+            return iter(())
+
+        monkeypatch.setattr(StagingToolkit, "_base_loader", attesting_empty_loader)
+        monkeypatch.setattr(
+            StagingToolkit, "_save_index_generator",
+            lambda self, docs, total, ct, cc, result, index_name=None: result.update(
+                count=len(list(docs)), docs_count=0
+            ),
+        )
+
+        outcome = staged_toolkit.index_data(index_name="x")
+
+        assert outcome["status"] != IndexingStatus.ERROR.value
+        assert "no content" not in outcome["message"]
+        assert "promote" in staged_toolkit.vector_adapter.calls
+
+    def test_a_silent_loader_still_gets_refused(self, staged_toolkit, monkeypatch):
+        """Without attestation an empty result is still ambiguous and must not publish."""
+        seed_completed_meta(staged_toolkit)
+        monkeypatch.setattr(type(staged_toolkit), "loader_attests_completion", False, raising=False)
+
+        outcome = run_index_data(staged_toolkit, monkeypatch, documents=[])
+
+        assert outcome["status"] == IndexingStatus.ERROR.value
+        assert "discard" in staged_toolkit.vector_adapter.calls
+
     def test_empty_loader_over_previous_index_fails_without_promoting(self, staged_toolkit, monkeypatch):
         seed_completed_meta(staged_toolkit)
 
