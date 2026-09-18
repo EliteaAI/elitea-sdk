@@ -95,6 +95,10 @@ NESTED_OUTPUT_CONTINUATION_ANCHOR_MAX_CHARS = 160
 NESTED_OUTPUT_CONTINUATION_MIN_OVERLAP_CHARS = 8
 NESTED_OUTPUT_CLOSURE_MAX_TOKENS = 128
 NESTED_OUTPUT_INVALID_SEAM_RETRY_LIMIT = 1
+# Fallback token budget for the always-on pre-invoke context guard (issue #5915)
+# below, used only when no SummarizationMiddleware is wired in (so no
+# max_context_tokens is available to derive a tighter budget from).
+PRE_INVOKE_CONTEXT_SAFETY_MAX_TOKENS = 100_000
 NESTED_REASONING_ONLY_CONTINUATION_PROMPT = (
     "The previous model attempt reached its output-token limit during internal "
     "reasoning before producing visible output. Produce the visible answer now. "
@@ -911,6 +915,86 @@ class LLMNode(BaseTool):
         except Exception as e:
             # Non-fatal: the turn-end consumed list is the authoritative signal.
             logger.debug(f"Failed to dispatch injection ack for {injection_id}: {e}")
+
+    def _enforce_pre_invoke_context_budget(self, new_messages: List) -> List:
+        """Pre-invoke safety net (issue #5915): truncate the oldest large tool
+        results BEFORE the next ``llm_client.invoke`` call inside the
+        tool-calling loop, instead of waiting for the provider to reject an
+        oversized request.
+
+        ``SummarizationMiddleware.before_model`` only runs once per top-level
+        ``LLMNode.invoke()`` — never mid tool-calling-loop — and explicitly
+        skips tool-related turns (``_is_tool_related_message``), so a single
+        assistant turn with enough parallel tool calls can blow the context
+        window before the middleware ever gets a chance to run. The existing
+        reactive handler further down only fires after the provider has
+        already rejected the call, and only truncates the single most-recent
+        ``ToolMessage`` — insufficient when several large results accumulated
+        at once. This check always runs (not gated behind
+        ``enable_summarization``) and truncates from the oldest tool result
+        forward until back under budget, so newer/relevant tool output is
+        preserved.
+        """
+        from langchain_core.messages import ToolMessage
+        from ..middleware.summarization.middleware import _count_tokens_image_aware
+
+        budget = PRE_INVOKE_CONTEXT_SAFETY_MAX_TOKENS
+        middleware_mgr = self.middleware_manager
+        if middleware_mgr is not None:
+            for mw in getattr(middleware_mgr, '_middleware', []):
+                trigger = getattr(mw, 'trigger', None)
+                if isinstance(trigger, tuple) and len(trigger) == 2 and trigger[0] == 'tokens' and trigger[1]:
+                    budget = min(budget, trigger[1])
+                    break
+
+        per_msg_tokens = [_count_tokens_image_aware([m]) for m in new_messages]
+        total_tokens = sum(per_msg_tokens)
+        if total_tokens <= budget:
+            return new_messages
+
+        logger.warning(
+            "Pre-invoke context guard: ~%d tokens exceeds budget %d before "
+            "LLM re-invoke; truncating oldest tool result(s)",
+            total_tokens, budget,
+        )
+
+        # Never touch the most recent messages — they carry the tool calls
+        # the model just made and are what it needs to keep reasoning.
+        preserve_recent = 4
+        protected_start = max(0, len(new_messages) - preserve_recent)
+
+        truncated_count = 0
+        for i in range(protected_start):
+            if total_tokens <= budget:
+                break
+            msg = new_messages[i]
+            if not isinstance(msg, ToolMessage):
+                continue
+            if isinstance(msg.content, str) and len(msg.content) <= 200:
+                continue
+
+            truncated_msg = ToolMessage(
+                content=(
+                    "⚠️ TOOL OUTPUT REMOVED - pre-invoke context guard\n\n"
+                    "This older tool result was dropped to keep the conversation "
+                    "within the context window. Re-run the tool call if this "
+                    "data is still needed."
+                ),
+                tool_call_id=getattr(msg, 'tool_call_id', 'unknown'),
+            )
+            new_messages[i] = truncated_msg
+            new_tokens = _count_tokens_image_aware([truncated_msg])
+            total_tokens += new_tokens - per_msg_tokens[i]
+            per_msg_tokens[i] = new_tokens
+            truncated_count += 1
+
+        if truncated_count:
+            logger.info(
+                "Pre-invoke context guard: truncated %d oldest tool result(s); "
+                "~%d tokens remaining (budget %d)",
+                truncated_count, total_tokens, budget,
+            )
+        return new_messages
 
     @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
@@ -4299,6 +4383,7 @@ class LLMNode(BaseTool):
                         len(new_messages) - len(sanitized_messages),
                     )
                 new_messages = sanitized_messages
+                new_messages = self._enforce_pre_invoke_context_budget(new_messages)
 
                 # Re-invoke with the SAME full toolset — including any sensitive
                 # tool the user just declined. The block is invocation-scoped
