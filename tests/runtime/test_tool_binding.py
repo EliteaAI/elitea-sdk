@@ -130,8 +130,20 @@ def test_toolkit_scoped_selection_does_not_substitute_another_toolkit():
     assert missing == []
 
 
-def test_toolkit_scoped_selection_accepts_unique_legacy_separator_alias():
-    github = _tool("GitHubTools", "github", "get_file", "github file")
+@pytest.mark.parametrize(
+    "configured_toolkit_name",
+    ["GitHubTools", "GitHub Tools"],
+    ids=["current-name", "display-name-with-spaces"],
+)
+def test_toolkit_scoped_selection_accepts_unique_legacy_separator_alias(
+    configured_toolkit_name,
+):
+    github = _tool(
+        configured_toolkit_name,
+        "github",
+        "get_file",
+        "github file",
+    )
     ado = _tool("AdoTools", "ado", "get_file", "ado file")
 
     selected, missing = select_tools_for_binding(

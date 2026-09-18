@@ -204,8 +204,13 @@ def test_auth_proxy_prefers_exact_name_over_legacy_alias():
     [
         ("sharepoint", "sharepoint"),
         ("SharePointTools", "SharePoint_Tools"),
+        ("SharePoint Tools", "SharePoint_Tools"),
     ],
-    ids=["current-name", "legacy-separator-name"],
+    ids=[
+        "current-name",
+        "legacy-separator-name",
+        "display-spaces-persisted-as-underscores",
+    ],
 )
 def test_direct_sharepoint_toolkit_node_does_not_fall_back_to_same_named_tool(
     monkeypatch,
