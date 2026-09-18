@@ -489,9 +489,6 @@ class ReposApiWrapper(CodeIndexerToolkit):
     _excluded_file_operations: ClassVar[set] = {'edit_file'}
     edit_file = BaseCodeToolApiWrapper.edit_file
 
-    # In-memory cache for file content to avoid redundant API calls.
-    # Keyed by (file_path, branch) for branch-based reads and
-    # (path, commit_id) for commit-based reads in get_file_content.
     _file_content_cache: Dict[tuple, str] = PrivateAttr(default_factory=dict)
 
     _search_client_instance: Optional[Any] = PrivateAttr(default=None)
@@ -796,8 +793,25 @@ class ReposApiWrapper(CodeIndexerToolkit):
         Returns:
             List[str]: List of file paths
         """
+        return list(self._get_files_with_identity(path, branch, recursion_level))
+
+    def _get_files_with_identity(
+            self,
+            path: str = "",
+            branch: str = None,
+            recursion_level: str = "Full",
+    ) -> Dict[str, str]:
+        """Map every file in a repository path and branch to its git blob object id.
+
+        Args:
+            path (str): Path within the repository to list files from
+            branch (str): Branch to get files from. Defaults to base_branch if None.
+            recursion_level (str): OneLevel - includes immediate children, Full - includes all items, None - no recursion
+
+        Returns:
+            Dict[str, str]: File path to git blob object id
+        """
         branch = branch if branch else self.base_branch
-        files: List[str] = []
         try:
             version_descriptor = GitVersionDescriptor(
                 version=branch, version_type="branch"
@@ -814,12 +828,12 @@ class ReposApiWrapper(CodeIndexerToolkit):
             msg = f"Failed to fetch files from directory due to an error: {str(e)}"
             logger.error(msg)
             raise ToolException(msg)
-        files = []
+        blob_object_ids_by_path = {}
         while items:
             item = items.pop(0)
             if item.git_object_type == "blob":
-                files.append(item.path)
-        return files # Changed to return list directly instead of str
+                blob_object_ids_by_path[item.path] = item.object_id
+        return blob_object_ids_by_path
 
     @tool_group('write')
     def set_active_branch(self, branch_name: str) -> str:
@@ -1105,8 +1119,11 @@ class ReposApiWrapper(CodeIndexerToolkit):
             version_descriptor=version_descriptor
         ))
 
+    def _file_cache_key(self, file_path: str, version: str) -> tuple:
+        return (self.repository_id, file_path, version)
+
     def get_file_content(self, commit_id, path):
-        cache_key = (path, commit_id)
+        cache_key = self._file_cache_key(path, commit_id)
         cached = self._file_content_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -1261,7 +1278,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 push=push, repository_id=self.repository_id, project=self.project
             )
             # Invalidate cached content for this file on this branch
-            self._file_content_cache.pop((file_path, self.active_branch), None)
+            self._file_content_cache.pop(self._file_cache_key(file_path, self.active_branch), None)
             return f"Created file {file_path}"
         except Exception as e:
             msg = f"Unable to create file due to error:\n{str(e)}"
@@ -1299,7 +1316,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
 
         try:
-            cache_key = (file_path, self.active_branch)
+            cache_key = self._file_cache_key(file_path, self.active_branch)
             decoded_content = self._file_content_cache.get(cache_key)
 
             if decoded_content is None:
@@ -1401,7 +1418,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
             self._client.create_push(push=push, repository_id=self.repository_id, project=self.project)
             # Invalidate cached content for this file on this branch
-            self._file_content_cache.pop((file_path, branch), None)
+            self._file_content_cache.pop(self._file_cache_key(file_path, branch), None)
             return f"Updated file {file_path}"
         except ToolException:
             # Re-raise known tool exceptions
@@ -1481,7 +1498,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 push=push, repository_id=self.repository_id, project=self.project
             )
             # Invalidate cached content for this file on this branch
-            self._file_content_cache.pop((file_path, branch_name), None)
+            self._file_content_cache.pop(self._file_cache_key(file_path, branch_name), None)
             return "Deleted file " + file_path
         except Exception as e:
             msg = f"Unable to delete file due to error:\n{str(e)}"

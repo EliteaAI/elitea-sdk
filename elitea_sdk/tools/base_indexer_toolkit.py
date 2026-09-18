@@ -26,9 +26,12 @@ from .index_params import (
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
 from .utils.tool_groups import tool_group, with_tool_groups
 from .utils.serialization import serialize_tool_result
-from .vector_adapters.VectorStoreAdapter import VectorStoreAdapterFactory
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
 from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
+from .vector_adapters.VectorStoreAdapter import (
+    IDENTITY_STAMP_BATCH_SIZE,
+    VectorStoreAdapterFactory,
+)
 from ..runtime.utils.utils import IndexerKeywords
 
 logger = logging.getLogger(__name__)
@@ -537,6 +540,12 @@ def render_grouped_errors(error_groups: Dict[str, Dict[str, None]]) -> List[str]
     return rendered
 
 
+def indexed_rows_of(entry: Dict[str, Any]):
+    return zip(entry.get('ids') or [],
+               entry.get('commit_hashes') or [],
+               entry.get('blob_shas') or [])
+
+
 def _resolve_base_total(base_total) -> Optional[int]:
     return base_total() if callable(base_total) else base_total
 
@@ -739,6 +748,11 @@ class _IndexRunState:
     doc_names: Dict[str, str] = field(default_factory=dict)
     counted_doc_keys: Set[str] = field(default_factory=set)
     seen_keys: Set[str] = field(default_factory=set)
+    preskipped_keys: Set[str] = field(default_factory=set)
+    unchanged_skip_enabled: bool = False
+    indexed_data: Optional[Dict[str, Dict[str, Any]]] = None
+    identity_backfill: Dict[str, str] = field(default_factory=dict)
+    identity_backfill_visited_keys: Set[str] = field(default_factory=set)
     orphan_candidate_ids: List[str] = field(default_factory=list)
     orphan_candidate_doc_count: int = 0
     heartbeat_stop: Optional[threading.Event] = None
@@ -894,6 +908,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     loader_yields_chunks: ClassVar[bool] = False
 
     loader_prefetch_depth: ClassVar[int] = 64
+
+    loader_skips_unchanged_by_identity: ClassVar[bool] = False
 
     # Orphan deletion (removing docs absent from the source) is the sole delete
     # built on absence evidence, so it only ever runs for toolkits that positively
@@ -1102,22 +1118,32 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # until promote commits — parking one pooled connection for its duration.
             # Freshness ACROSS promote comes from the committed stamp taken before it,
             # and is worth one horizon. Stopped in the finally below.
+            self._index_run.unchanged_skip_enabled = (
+                self.loader_skips_unchanged_by_identity
+                and not (staging and self._index_run.clean_index)
+            )
             stream = _LoaderPrefetch(self._base_loader(**kwargs),
                                      self.loader_prefetch_depth,
                                      self._index_run.run_id,
                                      run_stats=self.get_indexing_stats())
             try:
                 with stream:
-                    empty_loader = not stream.has_documents() and self._has_previous_index_run()
+                    empty_loader = (not stream.has_documents()
+                                    and not self._index_run.preskipped_keys
+                                    and self._has_previous_index_run())
                     if not empty_loader:
                         self._log_tool_event(f"Base documents are streaming in. "
                                              f"Search for possible document duplicates and remove them from the indexing list...")
-                        documents = self._reduce_duplicates(stream.documents(), index_name)
+                        reuse_fetched_corpus = ({"indexed_data": self._index_run.indexed_data}
+                                                if self._index_run.indexed_data is not None else {})
+                        documents = self._reduce_duplicates(stream.documents(), index_name,
+                                                            **reuse_fetched_corpus)
                         self._log_tool_event(f"Duplicates were removed. "
                                              f"Processing documents to collect dependencies and prepare them for indexing...")
                         self._save_index_generator(documents, stream.total, chunking_tool, chunking_config, index_name=index_name, result=result)
             finally:
                 self._stamp_loader_stats(stream.produced_count)
+                self._index_run.indexed_data = None
             if empty_loader:
                 return self._finalize_empty_loader_run(index_name)
             #
@@ -2033,22 +2059,75 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 document.metadata.pop(key, None)
             yield document
 
+    def _read_indexed_data_once(self, index_name: str) -> Dict[str, Dict[str, Any]]:
+        run = getattr(self, "_index_run", None)
+        if run is None:
+            return self._get_indexed_data(index_name)
+        if run.indexed_data is None:
+            run.indexed_data = self._get_indexed_data(index_name)
+        return run.indexed_data
+
+    @staticmethod
+    def _every_row_carries(entry: Dict[str, Any], identity: str) -> bool:
+        stored = entry.get('blob_shas') or []
+        return bool(stored) and all(row_identity == identity for row_identity in stored)
+
+    def _collect_unchanged_identities(self, indexed_data: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        identities = {}
+        for key, entry in indexed_data.items():
+            stored = entry.get('blob_shas') or []
+            unanimous = stored[0] if stored else None
+            if unanimous and all(identity == unanimous for identity in stored):
+                identities[key] = unanimous
+        return identities
+
+    def _note_identity_backfill(self, document: Document, entry: Dict[str, Any]):
+        return
+
+    def _flush_identity_backfill(self, only_when_full: bool = False):
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.identity_backfill:
+            return
+        if only_when_full and len(run.identity_backfill) < IDENTITY_STAMP_BATCH_SIZE:
+            return
+        try:
+            self.vector_adapter.stamp_code_identity(self, run.identity_backfill)
+        except Exception as e:
+            logger.error(
+                f"Could not stamp the content identity onto already indexed rows, so the "
+                f"unchanged-file skip stays disarmed for this index: {e}"
+            )
+        finally:
+            run.identity_backfill = {}
+
+    def _adopt_preskipped_keys(self):
+        run = getattr(self, "_index_run", None)
+        if run is None:
+            return
+        for key in run.preskipped_keys:
+            run.seen_keys.add(key)
+            self._track_document_unchanged(key)
+
     def _reduce_duplicates(
             self,
             documents: Generator[Any, None, None],
             index_name: str,
-            log_msg: str = "Verification of documents to index started"
+            log_msg: str = "Verification of documents to index started",
+            *,
+            indexed_data: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> Generator[Document, None, None]:
         """Generic duplicate reduction logic for documents."""
         self._ensure_vectorstore_initialized()
         self._log_tool_event(log_msg, tool_name="index_documents")
-        indexed_data = self._get_indexed_data(index_name)
+        if indexed_data is None:
+            indexed_data = self._get_indexed_data(index_name)
         indexed_keys = set(indexed_data.keys())
         run = getattr(self, "_index_run", None)
         staging = self._staging_active()
         if not indexed_keys:
             self._log_tool_event("Vectorstore is empty, indexing all incoming documents", tool_name="index_documents")
             yield from documents
+            self._adopt_preskipped_keys()
             return
 
         docs_to_remove = set()
@@ -2064,6 +2143,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 run.seen_keys.add(key)
             if key in indexed_keys and index_name == indexed_data[key]['metadata'].get('collection'):
                 if skip_unchanged and self.compare_fn(document, indexed_data[key]):
+                    self._note_identity_backfill(document, indexed_data[key])
+                    self._flush_identity_backfill(only_when_full=True)
                     if hasattr(self, '_track_document_unchanged'):
                         self._track_document_unchanged(
                             document.metadata.get('path')
@@ -2085,6 +2166,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     docs_to_remove.update(removal_ids)
             else:
                 yield document
+
+        self._adopt_preskipped_keys()
+        self._flush_identity_backfill()
 
         if staging:
             run.orphan_candidate_ids, run.orphan_candidate_doc_count = (

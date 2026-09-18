@@ -302,6 +302,10 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         gitlab_files = self._get_all_files(path, recursive, branch)
         return [file['path'] for file in gitlab_files if file['type'] == 'blob']
 
+    def _get_files_with_identity(self, path: str = None, branch: str = None) -> Optional[Dict[str, str]]:
+        gitlab_files = self._get_all_files(path, True, branch)
+        return {file['path']: file['id'] for file in gitlab_files if file['type'] == 'blob'}
+
     def _file_commit_hash(self, file_path: str, branch: str):
         """
         Get the commit hash of a file in a specific branch.

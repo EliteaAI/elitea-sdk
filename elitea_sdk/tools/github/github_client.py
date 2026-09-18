@@ -241,9 +241,6 @@ class GitHubClient(BaseModel):
         """
         Get all files in a directory recursively using Git Trees API.
 
-        This optimized implementation fetches the entire file tree in a single API call
-        instead of making one API call per directory (which was extremely slow for large repos).
-
         Args:
             directory_path: Path to the directory (empty string for root)
             ref: Branch or commit reference
@@ -251,6 +248,24 @@ class GitHubClient(BaseModel):
 
         Returns:
             List of file paths
+        """
+        blob_shas_by_path = self._get_files_with_identity(directory_path, ref, repo_name)
+        if isinstance(blob_shas_by_path, str):
+            return blob_shas_by_path
+        return list(blob_shas_by_path)
+
+    def _get_files_with_identity(self, directory_path: str, ref: str,
+                                 repo_name: Optional[str] = None) -> Dict[str, str]:
+        """
+        Map every file in a directory to its git blob SHA using one Git Trees API call.
+
+        Args:
+            directory_path: Path to the directory (empty string for root)
+            ref: Branch or commit reference
+            repo_name: Optional repository name to override default
+
+        Returns:
+            Dict of file path to git blob SHA
         """
         from github import GithubException
 
@@ -278,15 +293,15 @@ class GitHubClient(BaseModel):
             dir_prefix = directory_path.strip("/") + "/" if directory_path.strip("/") else ""
 
             # Filter to files only (blob = file, tree = directory)
-            files = []
+            files = {}
             for item in tree.tree:
                 if item.type == "blob":
                     # If directory_path specified, filter by prefix
                     if dir_prefix:
                         if item.path.startswith(dir_prefix):
-                            files.append(item.path)
+                            files[item.path] = item.sha
                     else:
-                        files.append(item.path)
+                        files[item.path] = item.sha
 
             # Check if tree was truncated (>100k files)
             # Use getattr for compatibility with different PyGithub versions

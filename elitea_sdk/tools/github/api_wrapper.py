@@ -142,6 +142,13 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
         # Use the GitHub client's method to get files
         return self.github_client_instance._get_files(path, branch or self.active_branch)
 
+    def _get_files_with_identity(self, path: str = "", branch: str = None):
+        if not self.github_client_instance:
+            raise ValueError("GitHub client not initialized")
+
+        return self.github_client_instance._get_files_with_identity(
+            path, branch or self.active_branch)
+
     def _file_commit_hash(self, file_path: str, branch: str):
         """Get the commit hash of a file in the GitHub repository."""
         if not self.github_client_instance:

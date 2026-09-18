@@ -11,12 +11,17 @@ CIL_CHK  — chunked flag and chunking_config forwarding
 All tests are pure unit tests: no network, no vectorstore, no DB.
 """
 
+import hashlib
 from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.documents import Document
 
-from elitea_sdk.tools.code_indexer_toolkit import CodeIndexerToolkit
+from elitea_sdk.tools.code_indexer_toolkit import (
+    PROGRESS_EVENTS_MAXIMUM_STEP,
+    CodeIndexerToolkit,
+    progress_step_at,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -350,3 +355,277 @@ class TestCIL_CHK_ChunkingConfig:
         assert len(docs_small) > len(docs_default), (
             "Custom max_tokens=5 should produce more chunks than default max_tokens=1024"
         )
+
+
+# ---------------------------------------------------------------------------
+# CIL_ID — Provider-supplied content identity (#6645)
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONTENT = "default content"
+
+
+def git_blob_sha(content):
+    body = content.encode("utf-8")
+    return hashlib.sha1(b"blob %d\0" % len(body) + body).hexdigest()
+
+
+def stored(blob_sha):
+    return {"metadata": {"collection": "x"}, "commit_hashes": ["h"],
+            "blob_shas": [blob_sha], "ids": ["row-1"]}
+
+
+def make_identity_toolkit(identities, indexed=None, contents=None) -> CodeIndexerToolkit:
+    """Toolkit whose listing carries a blob SHA per file."""
+    tk = make_toolkit(list(identities), contents=contents)
+    tk._get_files_with_identity = MagicMock(return_value=identities)
+    tk._get_indexed_data = MagicMock(return_value=indexed or {})
+    return tk
+
+
+def identity_load(toolkit, **kwargs):
+    preskipped = set()
+    docs = list(toolkit.loader(index_name="x", preskipped_keys=preskipped, **kwargs))
+    return docs, preskipped
+
+
+class TestCIL_ID_ListingIdentity:
+
+    def test_ID01_one_listing_call_serves_both_paths(self):
+        tk = make_identity_toolkit({"a.py": "sha-a", "b.py": "sha-b"})
+        docs = load(tk, chunked=False)
+        tk._get_files.assert_not_called()
+        assert {d.metadata["filename"] for d in docs} == {"a.py", "b.py"}
+
+    def test_ID02_an_identity_matching_the_bytes_read_is_stamped(self):
+        tk = make_identity_toolkit({"a.py": "8823529375b6c3a81c816ff25e94d88e4b66e2e2"})
+        docs = load(tk, chunked=False)
+        assert docs[0].metadata["blob_sha"] == "8823529375b6c3a81c816ff25e94d88e4b66e2e2"
+
+    def test_ID02b_an_identity_that_does_not_describe_the_bytes_read_is_not_stamped(self):
+        tk = make_identity_toolkit({"a.py": "sha-the-listing-claimed"})
+        docs = load(tk, chunked=False)
+        assert "blob_sha" not in docs[0].metadata
+
+    def test_ID03_no_identity_hook_falls_back_to_the_plain_listing(self):
+        tk = make_toolkit(["a.py", "b.py"])
+        docs = load(tk, chunked=False)
+        tk._get_files.assert_called_once()
+        assert {d.metadata["filename"] for d in docs} == {"a.py", "b.py"}
+        assert all("blob_sha" not in d.metadata for d in docs)
+
+    def test_ID04_an_error_string_is_not_iterated_and_is_not_refetched(self):
+        tk = make_toolkit(["a.py"])
+        tk._get_files_with_identity = MagicMock(return_value="Error: status code 403, forbidden")
+        with pytest.raises(ValueError):
+            load(tk, chunked=False)
+        tk._get_files.assert_not_called()
+
+    def test_ID05_a_raising_hook_surfaces_instead_of_relisting(self):
+        tk = make_toolkit(["a.py"])
+        tk._get_files_with_identity = MagicMock(side_effect=RuntimeError("tree unavailable"))
+        with pytest.raises(RuntimeError, match="tree unavailable"):
+            load(tk, chunked=False)
+        tk._get_files.assert_not_called()
+
+    def test_ID06_a_partially_typed_map_keeps_the_paths_but_drops_the_identity(self):
+        tk = make_toolkit(["a.py", "b.py"])
+        tk._get_files_with_identity = MagicMock(return_value={"a.py": "sha-a", "b.py": None})
+        docs = load(tk, chunked=False)
+        tk._get_files.assert_not_called()
+        assert {d.metadata["filename"] for d in docs} == {"a.py", "b.py"}
+        assert all("blob_sha" not in d.metadata for d in docs)
+
+
+class TestCIL_ID_UnchangedSkip:
+
+    def test_ID07_a_matching_identity_is_never_read(self):
+        tk = make_identity_toolkit({"a.py": "sha-a", "b.py": "sha-b"},
+                                   indexed={"a.py": stored("sha-a")},
+                                   contents={"b.py": "def beta():\n    return 1\n"})
+        docs, preskipped = identity_load(tk)
+        assert tk._read_file.call_count == 1
+        assert preskipped == {"a.py"}
+        assert {d.metadata["filename"] for d in docs} == {"b.py"}
+
+    def test_ID08_a_stale_identity_is_read(self):
+        tk = make_identity_toolkit({"a.py": "sha-new"}, indexed={"a.py": stored("sha-old")})
+        _, preskipped = identity_load(tk)
+        assert tk._read_file.call_count == 1
+        assert preskipped == set()
+
+    def test_ID09_a_blacklisted_file_is_excluded_not_preskipped(self):
+        tk = make_identity_toolkit({"a.py": "sha-a", "skip_me.py": "sha-s"},
+                                   indexed={"a.py": stored("sha-a"),
+                                            "skip_me.py": stored("sha-s")})
+        _, preskipped = identity_load(tk, blacklist=["*skip_me*"])
+        assert preskipped == {"a.py"}
+        assert tk._indexing_stats.files_skipped_blacklist == {"skip_me.py"}
+
+    def test_ID10_a_whitelist_filtered_file_is_excluded_not_preskipped(self):
+        tk = make_identity_toolkit({"a.py": "sha-a", "notes.md": "sha-n"},
+                                   indexed={"a.py": stored("sha-a"),
+                                            "notes.md": stored("sha-n")})
+        _, preskipped = identity_load(tk, whitelist=["*.py"])
+        assert preskipped == {"a.py"}
+        assert tk._indexing_stats.files_skipped_whitelist == {"notes.md"}
+
+    def test_ID11_the_raw_loader_never_arms_the_skip(self):
+        tk = make_identity_toolkit({"a.py": "sha-a"}, indexed={"a.py": stored("sha-a")})
+        docs, preskipped = identity_load(tk, chunked=False)
+        assert preskipped == set()
+        assert [d.metadata["filename"] for d in docs] == ["a.py"]
+
+    def test_ID12_without_an_index_name_every_file_is_read(self):
+        tk = make_identity_toolkit({"a.py": "sha-a"}, indexed={"a.py": stored("sha-a")})
+        list(tk.loader(preskipped_keys=set()))
+        assert tk._read_file.call_count == 1
+
+    def test_ID13_without_a_preskip_sink_every_file_is_read(self):
+        tk = make_identity_toolkit({"a.py": "sha-a"}, indexed={"a.py": stored("sha-a")})
+        list(tk.loader(index_name="x"))
+        assert tk._read_file.call_count == 1
+
+    def test_ID14_a_row_with_no_stored_identity_is_read(self):
+        entry = stored("sha-a")
+        entry["blob_shas"] = [None]
+        tk = make_identity_toolkit({"a.py": "sha-a"}, indexed={"a.py": entry})
+        _, preskipped = identity_load(tk)
+        assert tk._read_file.call_count == 1
+        assert preskipped == set()
+
+
+class TestCIL_ID_ProgressSurvivesTheSkip:
+    """The better the skip works the fewer files are read, so progress must come from
+    files considered, not files downloaded - otherwise the success case looks like a hang."""
+
+    def _progress_events(self, toolkit):
+        return [call.kwargs.get("message") for call in toolkit._log_tool_event.call_args_list
+                if call.kwargs.get("tool_name") == "loader"]
+
+    def test_ID15_an_all_unchanged_pass_still_reports_progress(self):
+        identities = {f"f{n}.py": f"sha-{n}" for n in range(12)}
+        indexed = {name: stored(sha) for name, sha in identities.items()}
+        tk = make_identity_toolkit(identities, indexed=indexed)
+
+        identity_load(tk)
+
+        assert tk._read_file.call_count == 0
+        assert "10 files processed" in self._progress_events(tk)
+
+    def test_ID16_the_tenth_considered_file_reports_even_when_it_is_a_skip(self):
+        identities = {f"f{n}.py": f"sha-{n}" for n in range(12)}
+        indexed = {name: stored(sha) for name, sha in list(identities.items())[:10]}
+        tk = make_identity_toolkit(
+            identities, indexed=indexed,
+            contents={name: "def beta():\n    return 1\n" for name in identities})
+
+        identity_load(tk)
+
+        assert tk._read_file.call_count == 2
+        assert "10 files processed" in self._progress_events(tk)
+
+    def test_ID17_the_closing_line_does_not_claim_undownloaded_files(self):
+        identities = {f"f{n}.py": f"sha-{n}" for n in range(3)}
+        indexed = {name: stored(sha) for name, sha in identities.items()}
+        tk = make_identity_toolkit(identities, indexed=indexed)
+
+        identity_load(tk)
+
+        assert "3 files processed, 0 downloaded" in self._progress_events(tk)
+
+    def test_ID18_the_event_rate_is_bounded_on_a_large_repository(self):
+        identities = {f"f{n}.py": f"sha-{n}" for n in range(5000)}
+        indexed = {name: stored(sha) for name, sha in identities.items()}
+        tk = make_identity_toolkit(identities, indexed=indexed)
+
+        identity_load(tk)
+
+        progress_lines = [event for event in self._progress_events(tk)
+                          if event and event.endswith("files processed")]
+        assert len(progress_lines) <= 100
+
+
+class TestCIL_ID_TheStampedIdentityDescribesTheBytesIndexed:
+    """The listing and the per-file read are separate calls against a moving branch, so a
+    push between them would otherwise store an identity for content never indexed - and a
+    revert back to the listed tree would then pin the wrong content forever."""
+
+    def test_ID19_a_push_between_listing_and_read_leaves_no_identity(self):
+        listed = "0000000000000000000000000000000000000000"
+        tk = make_identity_toolkit({"a.py": listed},
+                                   contents={"a.py": "def pushed_after_the_listing():\n    pass\n"})
+
+        docs = load(tk, chunked=False)
+
+        assert "blob_sha" not in docs[0].metadata
+
+    def test_ID20_one_unusable_entry_does_not_disarm_the_whole_listing(self):
+        identities = {name: git_blob_sha(DEFAULT_CONTENT) for name in ["a.py", "b.py"]}
+        identities["c.py"] = None
+        indexed = {name: stored(sha) for name, sha in identities.items() if sha}
+        tk = make_identity_toolkit(identities)
+        tk._get_indexed_data = MagicMock(return_value=indexed)
+
+        _, preskipped = identity_load(tk)
+
+        assert preskipped == {"a.py", "b.py"}
+        assert tk._read_file.call_count == 1
+
+
+class TestCIL_ID_TheClosingCountIsHonest:
+
+    def _progress_events(self, toolkit):
+        return [call.kwargs.get("message") for call in toolkit._log_tool_event.call_args_list
+                if call.kwargs.get("tool_name") == "loader"]
+
+    def test_ID21_a_request_that_failed_still_counts_as_downloaded(self):
+        tk = make_toolkit(["a.py", "b.py"], contents={"a.py": OSError("boom"), "b.py": ""})
+
+        load(tk, chunked=False)
+
+        assert "0 files processed, 2 downloaded" in self._progress_events(tk)
+
+    def test_ID22_progress_still_reports_under_a_narrow_filter(self):
+        listing = {f"vendor/v{n}.js": f"sha-v{n}" for n in range(2000)}
+        listing.update({f"src/s{n}.py": f"sha-s{n}" for n in range(30)})
+        tk = make_identity_toolkit(listing)
+
+        load(tk, whitelist=["*.py"], chunked=False)
+
+        assert "10 files processed" in self._progress_events(tk)
+
+
+class TestCIL_ID_TheBannerNeverGoesQuietForLong:
+    """Decade scaling alone would leave a first run silent for ten thousand consecutive
+    downloads, which is the apparent hang the progress events exist to prevent."""
+
+    def _progress_counts(self, toolkit):
+        events = [call.kwargs.get("message") for call in toolkit._log_tool_event.call_args_list
+                  if call.kwargs.get("tool_name") == "loader"]
+        return [int(event.split()[0]) for event in events
+                if event and event.endswith("files processed")]
+
+    def test_ID23_no_gap_exceeds_the_maximum_step(self):
+        tk = make_toolkit([f"f{n}.py" for n in range(25000)])
+
+        load(tk, chunked=False)
+
+        counts = self._progress_counts(tk)
+        gaps = [later - earlier for earlier, later in zip(counts, counts[1:])]
+        assert counts and max(gaps) <= PROGRESS_EVENTS_MAXIMUM_STEP
+
+    def test_ID24_the_first_report_still_lands_early(self):
+        tk = make_toolkit([f"f{n}.py" for n in range(25000)])
+
+        load(tk, chunked=False)
+
+        assert self._progress_counts(tk)[0] == 10
+
+
+class TestCIL_ID_TheProgressStepScalesByDecade:
+
+    def test_ID25_the_step_grows_only_once_a_decade_is_complete(self):
+        assert progress_step_at(99) == 10
+        assert progress_step_at(100) == 100
+        assert progress_step_at(999) == 100
+        assert progress_step_at(1000) == PROGRESS_EVENTS_MAXIMUM_STEP
