@@ -582,7 +582,9 @@ class Assistant:
                 f"Client was created with client setting: temperature - {self.client._get_model_default_parameters}")
         except Exception:
             logger.info(
-                f"Client was created with client setting: temperature - {self.client.temperature} : {self.client.max_tokens}")
+                "Client created: type=%s temperature=%s max_tokens=%s",
+                type(self.client).__name__, getattr(self.client, 'temperature', None),
+                getattr(self.client, 'max_tokens', None))
 
     def _configure_store(self, memory_tool: dict | None) -> None:
         """
@@ -794,6 +796,8 @@ class Assistant:
         # Resolve Jinja2 variables in prompt instructions
         # Variables from data['variables'] (via get_app_version_details API) and system variables are processed here
         prompt_instructions = self._resolve_jinja2_variables(self.prompt)
+        if getattr(self.client, "_llm_type", None) == "elitea-auto":
+            self.client = self.client.with_active_instructions(prompt_instructions)
         if prompt_instructions != self.prompt:
             logger.info(f"Jinja2 variables resolved in prompt (changed from {len(self.prompt)} to {len(prompt_instructions)} chars)")
 
@@ -976,6 +980,8 @@ class Assistant:
 
         # Resolve prompt
         prompt_instructions = self._resolve_jinja2_variables(self.prompt)
+        if getattr(self.client, "_llm_type", None) == "elitea-auto":
+            self.client = self.client.with_active_instructions(prompt_instructions)
 
         # Stable internal name for the main agent (the default_active_agent).
         # Not "parent" or "coordinator" — just another peer in the swarm.
