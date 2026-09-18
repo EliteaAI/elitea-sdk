@@ -12,6 +12,7 @@ from langchain_core.tools import BaseTool
 from pydantic import Field
 
 from ..utils.constants import TOOLKIT_NAME_META, TOOLKIT_TYPE_META, TOOL_NAME_META
+from ..utils.toolkit_identity import toolkit_identity_key
 
 
 MAX_PROVIDER_TOOL_NAME_LENGTH = 128
@@ -117,6 +118,27 @@ def select_tools_for_binding(
                 if len(matches) > 1:
                     raise ValueError(
                         "Multiple tools match qualified identity "
+                        f"'{toolkit_name}:{requested_name}'"
+                    )
+
+                # Older pipelines persisted spaces as underscores while current
+                # toolkit metadata strips them. Accept that naming drift only
+                # when it identifies one scoped toolkit tool unambiguously.
+                legacy_toolkit_key = toolkit_identity_key(toolkit_name)
+                legacy_matches = [
+                    tool
+                    for tool in available
+                    if legacy_toolkit_key
+                    and toolkit_identity_key(get_tool_identity(tool).toolkit_name)
+                    == legacy_toolkit_key
+                    and get_tool_identity(tool).tool_name == requested_name
+                ]
+                if len(legacy_matches) == 1:
+                    add(legacy_matches[0])
+                    continue
+                if len(legacy_matches) > 1:
+                    raise ValueError(
+                        "Multiple tools match legacy qualified identity "
                         f"'{toolkit_name}:{requested_name}'"
                     )
 

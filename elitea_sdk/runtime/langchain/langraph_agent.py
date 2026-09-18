@@ -48,6 +48,7 @@ from ..tools.loop_output import LoopToolNode
 from ..tools.tool import ToolNode
 from ..tools.lazy_tools import ToolRegistry
 from ..tools.tool_binding import select_tools_for_binding
+from ..utils.toolkit_identity import toolkit_names_match
 from ..utils.evaluate import EvaluateTemplate
 from ..utils.utils import clean_string
 from ..tools.router import RouterNode
@@ -1073,18 +1074,40 @@ def find_mcp_auth_proxy(tools: list, toolkit_name: Optional[str]) -> Optional[Ba
     """Find a deferred auth gateway for an unavailable direct Toolkit node."""
     if not toolkit_name:
         return None
-    normalized = str(toolkit_name).strip().lower()
+    exact_matches = []
+    exact_identities = set()
+    legacy_matches = []
+    legacy_identities = set()
+    requested_name = str(toolkit_name).strip().lower()
     for tool in tools:
         metadata = getattr(tool, 'metadata', None) or {}
         candidate_names = {
-            str(metadata.get(TOOLKIT_NAME_META) or '').strip().lower(),
-            str(metadata.get('toolkit_type') or '').strip().lower(),
+            metadata.get(TOOLKIT_NAME_META),
+            metadata.get('toolkit_type'),
         }
-        if normalized in candidate_names and str(getattr(tool, 'name', '')).startswith(
-            'mcp_authorize_'
+        identity = (
+            metadata.get('toolkit_id'),
+            metadata.get(TOOLKIT_NAME_META),
+            metadata.get('toolkit_type'),
+        )
+        is_auth_proxy = str(getattr(tool, 'name', '')).startswith('mcp_authorize_')
+        if (
+            is_auth_proxy
+            and requested_name in {
+                str(candidate or '').strip().lower()
+                for candidate in candidate_names
+            }
         ):
-            return tool
-    return None
+            exact_matches.append(tool)
+            exact_identities.add(identity)
+        elif is_auth_proxy and any(
+            toolkit_names_match(toolkit_name, candidate) for candidate in candidate_names
+        ):
+            legacy_matches.append(tool)
+            legacy_identities.add(identity)
+    if exact_matches:
+        return exact_matches[0] if len(exact_identities) == 1 else None
+    return legacy_matches[0] if len(legacy_identities) == 1 else None
 
 
 def create_graph(
@@ -1236,7 +1259,10 @@ def create_graph(
                         if (
                             node_type in ('mcp', 'toolkit')
                             and skipped_pipeline_toolkit_names
-                            and toolkit_name in skipped_pipeline_toolkit_names
+                            and any(
+                                toolkit_names_match(toolkit_name, skipped_name)
+                                for skipped_name in skipped_pipeline_toolkit_names
+                            )
                         ):
                             _output_vars = node.get('output', [])
                             lg_builder.add_node(
