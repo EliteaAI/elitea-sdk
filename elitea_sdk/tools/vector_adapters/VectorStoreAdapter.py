@@ -23,6 +23,7 @@ logger = getLogger(__name__)
 IDENTITY_STAMP_BATCH_SIZE = 500
 EMPTY_JSONB = text("'{}'::jsonb")
 BLOB_SHA_JSONB_PATH = text("'{blob_sha}'::text[]")
+RUN_ID_JSONB_PATH = text("'{%s}'::text[]" % IndexerKeywords.RUN_ID.value)
 
 PROMOTE_DELETE_BATCH_SIZE = 50000
 # Caps how many strands one sweep reclaims. The candidate read returns only
@@ -112,14 +113,38 @@ class VectorStoreAdapter(ABC):
         pass
 
     @abstractmethod
-    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str) -> str:
-        """Delete a run's staged rows and terminal its run row."""
+    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                    retain_chunks: bool = False) -> str:
+        """Delete a run's staged rows and terminal its run row. With retain_chunks the
+        rows are kept, invisible, for a later run to adopt (#5261)."""
         pass
 
     def get_pending_run_ids(self, vectorstore_wrapper, index_name: str,
                             include_cancelled: bool = True) -> List[str]:
         """Run ids whose rows must stay invisible to every read path."""
         return []
+
+    def claim_adoptable_run(self, vectorstore_wrapper, index_name: str,
+                            stale_before: float,
+                            max_chunks: Optional[int] = None) -> Optional[str]:
+        """Park an interrupted run's row so its rows survive the sweep and stop blocking
+        registration, and name it for adoption (#5261)."""
+        return None
+
+    def adopt_run_chunks(self, vectorstore_wrapper, index_name: str,
+                         source_run_id: str, target_run_id: str) -> int:
+        """Move a parked run's staged rows onto the live run."""
+        return 0
+
+    def drop_run_chunks(self, vectorstore_wrapper, run_id: str) -> None:
+        """Delete a run's staged rows outright."""
+        return None
+
+    def read_run_staged_digests(self, vectorstore_wrapper, run_id: str,
+                                digest_of, cap: int):
+        """Index this run's staged rows by content digest so identical chunks can reuse
+        them instead of being embedded again. Returns (digests, row_pks, truncated)."""
+        return {}, set(), False
 
     def ensure_index_runs_table(self, vectorstore_wrapper) -> None:
         raise NotImplementedError("Run staging is not supported by this adapter")
@@ -139,7 +164,8 @@ class VectorStoreAdapter(ABC):
         raise NotImplementedError("Run staging is not supported by this adapter")
 
     def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
-                               stale_before: float) -> List[str]:
+                               stale_before: float,
+                               except_run_id: Optional[str] = None) -> List[str]:
         raise NotImplementedError("Run staging is not supported by this adapter")
 
 
@@ -678,7 +704,9 @@ class PGVectorAdapter(VectorStoreAdapter):
             return result.rowcount
 
     def sweep_stale_index_runs(self, vectorstore_wrapper, index_name: str,
-                               stale_before: float) -> List[str]:
+                               stale_before: float,
+                               except_run_id: Optional[str] = None) -> List[str]:
+        from sqlalchemy import true
         from sqlalchemy.orm import Session
         from ...runtime.tools.index_runs_model import (
             IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED, RUN_STATUS_PENDING,
@@ -693,6 +721,7 @@ class PGVectorAdapter(VectorStoreAdapter):
                     IndexRun.collection == index_name,
                     IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
                     IndexRun.heartbeat < stale_before,
+                    IndexRun.run_id != except_run_id if except_run_id else true(),
                 ).all()
             ]
         reclaimed_run_ids = []
@@ -721,6 +750,147 @@ class PGVectorAdapter(VectorStoreAdapter):
                 session.commit()
                 reclaimed_run_ids.append(candidate_run_id)
         return reclaimed_run_ids
+
+    def claim_adoptable_run(self, vectorstore_wrapper, index_name: str,
+                            stale_before: float,
+                            max_chunks: Optional[int] = None) -> Optional[str]:
+        from ...runtime.tools.index_runs_model import (
+            IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_PENDING, is_degradable_run_lookup_error,
+        )
+
+        store = vectorstore_wrapper.vectorstore
+        try:
+            with Session(store.session_maker.bind) as session:
+                candidate = session.query(IndexRun.run_id, IndexRun.status).filter(
+                    IndexRun.collection == index_name,
+                    IndexRun.status.in_((RUN_STATUS_PENDING, RUN_STATUS_CANCELLED)),
+                    # A drained run has nothing to adopt, and claiming it would exclude it
+                    # from this run's sweep for no gain — every later run would claim it
+                    # again and keep it out of reach of the reclaim that should retire it.
+                    self._run_chunks_exist_clause(store, IndexRun.run_id),
+                ).order_by(IndexRun.started_on.desc()).limit(1).first()
+        except Exception as lookup_failure:
+            if not is_degradable_run_lookup_error(lookup_failure):
+                raise
+            return None
+        if candidate is None:
+            return None
+        candidate_run_id, candidate_status = candidate
+        with Session(store.session_maker.bind) as session:
+            run_row = session.get(IndexRun, candidate_run_id, with_for_update=True)
+            if run_row is None or run_row.status not in (RUN_STATUS_PENDING, RUN_STATUS_CANCELLED):
+                session.rollback()
+                return None
+            if run_row.status == RUN_STATUS_PENDING and run_row.heartbeat >= stale_before:
+                # A pending row that is still heartbeating belongs to a live worker, and
+                # registration is what refuses that case. Parking it would hide a running
+                # corpus from its own owner.
+                session.rollback()
+                return None
+            if max_chunks is not None and self._run_chunks_exceed(
+                    session, store, candidate_run_id, max_chunks):
+                # Claiming it would exclude it from this run's sweep, and adoption would
+                # then decline it anyway — leaving the largest runs pinned out of reach of
+                # the reclaim that should retire them. Leave it for the sweep.
+                session.rollback()
+                return None
+            if run_row.status == RUN_STATUS_PENDING:
+                # 'cancelled' is the only status that is both hidden from every read path
+                # and outside live_run_where(), so parking here keeps the rows invisible
+                # while releasing the slot the next registration needs.
+                run_row.status = RUN_STATUS_CANCELLED
+            session.commit()
+            return candidate_run_id
+
+    def adopt_run_chunks(self, vectorstore_wrapper, index_name: str,
+                         source_run_id: str, target_run_id: str) -> int:
+        from ...runtime.tools.index_runs_model import IndexRun, RUN_STATUS_CANCELLED
+
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            self._lock_index_meta_rows(session, store, index_name)
+            run_row = session.get(IndexRun, source_run_id, with_for_update=True)
+            if run_row is None or run_row.status != RUN_STATUS_CANCELLED:
+                session.rollback()
+                return 0
+            adopted = self._restamp_run_chunks(session, store, source_run_id, target_run_id)
+            # The parked row stays 'cancelled'. A Stop is best-effort — core skips
+            # stop_task when it cannot corroborate the id — so a surviving worker may
+            # still write under this id, and 'cancelled' is what keeps those writes
+            # hidden until its heartbeat stops and the sweep retires it.
+            session.commit()
+            return adopted
+
+    def _run_chunks_exceed(self, session, store, run_id: str, limit: int) -> bool:
+        # Bounded: stops at limit+1 rows rather than counting a corpus that may be
+        # millions of rows, and it runs under the index meta row's lock.
+        bounded = session.query(store.EmbeddingStore.id).filter(
+            store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
+            self._non_index_meta_clause(store),
+        ).limit(limit + 1).subquery()
+        return (session.query(func.count()).select_from(bounded).scalar() or 0) > limit
+
+    def drop_run_chunks(self, vectorstore_wrapper, run_id: str) -> None:
+        # Deliberately not _discard_stranded_run_chunks: that one is best-effort by
+        # contract for abort branches that publish nothing. Here the rows are live under
+        # the current run's id, so a delete that quietly failed would let promote publish
+        # them beside the copies this run embeds. The caller needs the exception.
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            self._delete_run_chunks(session, store, run_id)
+            session.commit()
+
+    def read_run_staged_digests(self, vectorstore_wrapper, run_id: str,
+                                digest_of, cap: int):
+        store = vectorstore_wrapper.vectorstore
+        digests: Dict[bytes, List[str]] = {}
+        row_pks: set = set()
+        truncated = False
+        # The text is hashed by the server so a corpus never crosses the wire just to be
+        # compared, and each row's metadata is folded into a digest and dropped rather
+        # than accumulated.
+        text_digest = func.encode(
+            func.sha256(func.convert_to(
+                func.coalesce(store.EmbeddingStore.document, literal("")), literal("UTF8")
+            )),
+            literal("hex"),
+        )
+        with Session(store.session_maker.bind) as session:
+            rows = session.query(
+                store.EmbeddingStore.id,
+                text_digest,
+                store.EmbeddingStore.cmetadata,
+            ).filter(
+                store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
+                self._non_index_meta_clause(store),
+            ).yield_per(1000)
+            for row_pk, row_text_digest, row_metadata in rows:
+                if len(row_pks) >= cap:
+                    truncated = True
+                    break
+                key = str(row_pk)
+                digests.setdefault(digest_of(row_text_digest, row_metadata), []).append(key)
+                row_pks.add(key)
+        return digests, row_pks, truncated
+
+    def _restamp_run_chunks(self, session, store, source_run_id: str, target_run_id: str) -> int:
+        # Same predicate as _delete_runs_chunks, for the same reasons: containment so the
+        # jsonb_path_ops GIN serves it, no `collection` conjunct because multi-index rows
+        # carry an appended "a;b", and the type conjunct shields the meta row.
+        return session.query(store.EmbeddingStore).filter(
+            store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: source_run_id}),
+            self._non_index_meta_clause(store),
+        ).update(
+            {
+                store.EmbeddingStore.cmetadata: func.jsonb_set(
+                    func.coalesce(store.EmbeddingStore.cmetadata, EMPTY_JSONB),
+                    RUN_ID_JSONB_PATH,
+                    func.to_jsonb(cast(literal(target_run_id), Text)),
+                    True,
+                )
+            },
+            synchronize_session=False,
+        )
 
     def _reclaim_discarded_run_chunks(self, store, index_name: str) -> None:
         from sqlalchemy.orm import Session
@@ -835,7 +1005,8 @@ class PGVectorAdapter(VectorStoreAdapter):
             session.commit()
             return "promoted"
 
-    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str) -> str:
+    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                    retain_chunks: bool = False) -> str:
         from sqlalchemy.orm import Session
         from ...runtime.tools.index_runs_model import (
             IndexRun, RUN_STATUS_CANCELLED, RUN_STATUS_DISCARDED, RUN_STATUS_PENDING,
@@ -852,6 +1023,13 @@ class PGVectorAdapter(VectorStoreAdapter):
                 if not already_promoted:
                     self._discard_stranded_run_chunks(store, run_id)
                 return "noop"
+            if retain_chunks:
+                # 'cancelled' is the only terminal status the read filter still hides, so
+                # it is what keeps a retained generation invisible until a later run adopts
+                # it or the stale sweep reclaims it. 'discarded' would publish it.
+                run_row.status = RUN_STATUS_CANCELLED
+                session.commit()
+                return "retained"
             # The flip is committed WITH the delete, never ahead of it: 'discarded' sits
             # outside both the read filter's and the sweep's status set, so a row flipped
             # over chunks that survived turns them into permanently visible phantoms. A
@@ -1117,7 +1295,8 @@ class ChromaAdapter(VectorStoreAdapter):
                        "guarantee does not extend to Chroma")
         return "promoted"
 
-    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str) -> str:
+    def discard_run(self, vectorstore_wrapper, index_name: str, run_id: str,
+                    retain_chunks: bool = False) -> str:
         logger.warning("discard_run is a no-op for Chroma: the preserve-on-failure "
                        "guarantee does not extend to Chroma")
         return "noop"
