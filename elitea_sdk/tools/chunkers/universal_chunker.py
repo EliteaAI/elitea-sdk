@@ -117,6 +117,7 @@ def _code_chunker_from_documents(
                 'file_name': doc.metadata.get('file_path', doc.metadata.get('filename', 'unknown')),
                 'file_content': doc.page_content,
                 'commit_hash': doc.metadata.get('commit_hash', ''),
+                'blob_sha': doc.metadata.get('blob_sha', ''),
             }
     
     # parse_code_files_for_db returns chunks with proper metadata

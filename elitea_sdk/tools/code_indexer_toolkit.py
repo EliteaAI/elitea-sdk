@@ -2,20 +2,37 @@ import ast
 import fnmatch
 import json
 import logging
-from typing import Optional, List, Generator
+from typing import Dict, Optional, List, Generator, Set
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 from pydantic import Field
 
-from elitea_sdk.tools.base_indexer_toolkit import _STATS_COUNTER_LOCK, BaseIndexerToolkit, IndexingStats
+from elitea_sdk.tools.base_indexer_toolkit import (
+    _STATS_COUNTER_LOCK,
+    BaseIndexerToolkit,
+    IndexingStats,
+    indexed_rows_of,
+)
 
 logger = logging.getLogger(__name__)
+
+PROGRESS_EVENTS_PER_DECADE = 10
+PROGRESS_EVENTS_MINIMUM_STEP = 10
+PROGRESS_EVENTS_MAXIMUM_STEP = 1000
+
+
+def progress_step_at(processed: int) -> int:
+    step = PROGRESS_EVENTS_MINIMUM_STEP
+    while processed >= step * PROGRESS_EVENTS_PER_DECADE:
+        step *= PROGRESS_EVENTS_PER_DECADE
+    return min(step, PROGRESS_EVENTS_MAXIMUM_STEP)
 
 
 class CodeIndexerToolkit(BaseIndexerToolkit):
     index_item_labels = ('file', 'files')
     loader_yields_chunks = True
+    loader_skips_unchanged_by_identity = True
 
     def _get_indexed_data(self, index_name: str):
         self._ensure_vectorstore_initialized()
@@ -36,6 +53,25 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
     def remove_ids_fn(self, idx_data, key: str):
         return idx_data[key]['ids']
 
+    def _get_files_with_identity(self, path: str, branch: str) -> Optional[Dict[str, str]]:
+        return None
+
+    def _note_identity_backfill(self, document: Document, entry):
+        run = getattr(self, "_index_run", None)
+        identity = document.metadata.get('blob_sha')
+        if run is None or not identity:
+            return
+        key = document.metadata.get('filename')
+        if key in run.identity_backfill_visited_keys:
+            return
+        run.identity_backfill_visited_keys.add(key)
+        if self._every_row_carries(entry, identity):
+            return
+        content_hash = document.metadata.get('commit_hash')
+        for row_id, row_content_hash, row_identity in indexed_rows_of(entry):
+            if row_content_hash == content_hash and row_identity != identity:
+                run.identity_backfill[str(row_id)] = identity
+
     def _base_loader(
             self,
             branch: Optional[str] = None,
@@ -45,12 +81,15 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             skip_unsupported_extensions: bool = True,
             **kwargs) -> Generator[Document, None, None]:
         """Index repository files in the vector store using code parsing."""
+        run = getattr(self, "_index_run", None)
         yield from self.loader(
             branch=branch,
             whitelist=whitelist,
             blacklist=blacklist,
             chunking_config=chunking_config,
-            skip_unsupported_extensions=skip_unsupported_extensions
+            skip_unsupported_extensions=skip_unsupported_extensions,
+            index_name=kwargs.get("index_name") if getattr(run, "unchanged_skip_enabled", False) else None,
+            preskipped_keys=getattr(run, "preskipped_keys", None),
         )
 
     def _extend_data(self, documents: Generator[Document, None, None]):
@@ -79,7 +118,9 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                blacklist: Optional[List[str]] = None,
                chunked: bool = True,
                chunking_config: Optional[dict] = None,
-               skip_unsupported_extensions: bool = True) -> Generator[Document, None, None]:
+               skip_unsupported_extensions: bool = True,
+               index_name: Optional[str] = None,
+               preskipped_keys: Optional[Set[str]] = None) -> Generator[Document, None, None]:
         """
         Generates Documents from files in a branch, respecting whitelist and blacklist patterns.
 
@@ -129,7 +170,35 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
         self._init_indexing_stats()
 
-        _files = self.__handle_get_files("", self.__get_branch(branch))
+        listing = self.__list_files("", self.__get_branch(branch))
+        file_identities = listing if isinstance(listing, dict) else None
+        _files = list(file_identities) if file_identities is not None \
+            else self.__handle_get_files("", self.__get_branch(branch), listing)
+
+        identity_skip_is_armed = bool(chunked and index_name and file_identities
+                                      and preskipped_keys is not None)
+        unchanged_identities = None
+
+        def identity_confirmed_by(file_path: str, content: str) -> Optional[str]:
+            listed = file_identities.get(file_path) if file_identities else None
+            if not listed:
+                return None
+            body = content.encode("utf-8")
+            git_blob = hashlib.sha1(b"blob %d\0" % len(body) + body,
+                                    usedforsecurity=False).hexdigest()
+            return listed if git_blob == listed else None
+
+        def is_unchanged_since_last_index(file_path: str) -> bool:
+            nonlocal unchanged_identities
+            if not identity_skip_is_armed:
+                return False
+            identity = file_identities.get(file_path)
+            if not identity:
+                return False
+            if unchanged_identities is None:
+                unchanged_identities = self._collect_unchanged_identities(
+                    self._read_indexed_data_once(index_name))
+            return unchanged_identities.get(file_path) == identity
 
         def is_whitelisted(file_path: str) -> bool:
             if whitelist:
@@ -156,6 +225,17 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             total_files = 0
             stats = self.get_indexing_stats()
 
+            downloaded = 0
+
+            def count_processed_file():
+                nonlocal processed
+                processed += 1
+                with _STATS_COUNTER_LOCK:
+                    stats.items_processed += 1
+                if processed % progress_step_at(processed) == 0:
+                    self._log_tool_event(message=f"{processed} files processed",
+                                         tool_name="loader")
+
             for file in _files:
                 total_files += 1
                 stats.total_fetched = total_files
@@ -174,6 +254,12 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                     stats.files_unsupported_extension.add(file)
                     continue
 
+                if is_unchanged_since_last_index(file):
+                    preskipped_keys.add(file)
+                    count_processed_file()
+                    continue
+
+                downloaded += 1
                 try:
                     file_content = self._read_file(file, self.__get_branch(branch))
                 except Exception as e:
@@ -195,25 +281,24 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
                 # Hash the file content for uniqueness tracking
                 file_hash = hashlib.sha256(file_content.encode("utf-8")).hexdigest()
-                processed += 1
-                with _STATS_COUNTER_LOCK:
-                    stats.items_processed += 1
+                count_processed_file()
                 yielded_files.add(file)
 
-                yield Document(
-                    page_content=file_content,
-                    metadata={
-                        'file_path': file,
-                        'filename': file,
-                        'source': file,
-                        'commit_hash': file_hash,
-                    }
-                )
+                metadata = {
+                    'file_path': file,
+                    'filename': file,
+                    'source': file,
+                    'commit_hash': file_hash,
+                }
+                blob_sha = identity_confirmed_by(file, file_content)
+                if blob_sha:
+                    metadata['blob_sha'] = blob_sha
 
-                if processed % 10 == 0:
-                    self._log_tool_event(message=f"{processed} files processed", tool_name="loader")
+                yield Document(page_content=file_content, metadata=metadata)
 
-            self._log_tool_event(message=f"{processed} files loaded", tool_name="loader")
+            self._log_tool_event(
+                message=f"{processed} files processed, {downloaded} downloaded",
+                tool_name="loader")
 
             # Log skipped files summary
             summary = stats.get_summary()
@@ -250,12 +335,23 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
         return chunked_document_generator()
 
-    def __handle_get_files(self, path: str, branch: str):
+    def __list_files(self, path: str, branch: str):
+        listing = self._get_files_with_identity(path=path, branch=branch)
+        if not isinstance(listing, dict):
+            return listing
+        if not all(isinstance(file_path, str) for file_path in listing):
+            return list(listing)
+        return {
+            file_path: identity if isinstance(identity, str) else ""
+            for file_path, identity in listing.items()
+        }
+
+    def __handle_get_files(self, path: str, branch: str, prefetched=None):
         """
         Handles the retrieval of files from a specific path and branch.
         This method should be implemented in subclasses to provide the actual file retrieval logic.
         """
-        _files = self._get_files(path=path, branch=branch)
+        _files = prefetched if prefetched is not None else self._get_files(path=path, branch=branch)
         if isinstance(_files, str):
             try:
                 # Attempt to convert the string to a list using ast.literal_eval

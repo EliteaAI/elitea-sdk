@@ -69,6 +69,9 @@ def parse_code_files_for_db(
                 commit_hash = data.get("commit_hash")
                 if commit_hash is not None:
                     metadata["commit_hash"] = commit_hash
+                blob_sha = data.get("blob_sha")
+                if blob_sha:
+                    metadata["blob_sha"] = blob_sha
                 chunk_id += 1
                 metadata["chunk_id"] = chunk_id
                 document = Document(
@@ -109,6 +112,9 @@ def parse_code_files_for_db(
                         commit_hash = data.get("commit_hash")
                         if commit_hash is not None:
                             metadata["commit_hash"] = commit_hash
+                        blob_sha = data.get("blob_sha")
+                        if blob_sha:
+                            metadata["blob_sha"] = blob_sha
                         chunk_id += 1
                         metadata["chunk_id"] = chunk_id
                         document = Document(

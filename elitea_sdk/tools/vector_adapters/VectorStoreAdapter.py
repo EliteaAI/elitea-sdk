@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, List
 from logging import WARNING, getLogger
 
-from sqlalchemy import cast, exists, func, literal, update
+from sqlalchemy import String, Text, cast, column, exists, func, literal, text, update, values
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 from tenacity import (
@@ -19,6 +19,10 @@ from ...runtime.utils.utils import IndexerKeywords
 from ..utils.retry import is_transient_db_error
 
 logger = getLogger(__name__)
+
+IDENTITY_STAMP_BATCH_SIZE = 500
+EMPTY_JSONB = text("'{}'::jsonb")
+BLOB_SHA_JSONB_PATH = text("'{blob_sha}'::text[]")
 
 PROMOTE_DELETE_BATCH_SIZE = 50000
 # Caps how many strands one sweep reclaims. The candidate read returns only
@@ -90,6 +94,10 @@ class VectorStoreAdapter(ABC):
     def add_to_collection(self, vectorstore_wrapper, entry_id, new_collection_value):
         """Add a new collection name to the metadata"""
         pass
+
+    def stamp_code_identity(self, vectorstore_wrapper, identity_by_row_id: Dict[str, str]) -> int:
+        """Write blob_sha onto already indexed rows that predate it"""
+        return 0
 
     @abstractmethod
     def get_index_meta(self, vectorstore_wrapper, index_name: str) -> List[Dict[str, Any]]:
@@ -345,16 +353,18 @@ class PGVectorAdapter(VectorStoreAdapter):
             for db_id, meta in docs:
                 filename = meta.get('filename')
                 commit_hash = meta.get('commit_hash')
+                blob_sha = meta.get('blob_sha')
                 if not filename:
                     continue
                 if filename not in result:
                     result[filename] = {
                         'metadata': meta,
                         'commit_hashes': [],
+                        'blob_shas': [],
                         'ids': []
                     }
-                if commit_hash is not None:
-                    result[filename]['commit_hashes'].append(commit_hash)
+                result[filename]['commit_hashes'].append(commit_hash)
+                result[filename]['blob_shas'].append(blob_sha)
                 result[filename]['ids'].append(db_id)
         except Exception as e:
             # Same polarity as get_indexed_data: a failed read that reports an
@@ -364,6 +374,69 @@ class PGVectorAdapter(VectorStoreAdapter):
                 raise
             logger.warning(f"No embedding table to read indexed code data from: {str(e)}. Continuing with empty index.")
         return result
+
+    @retry(
+        retry=retry_if_exception(is_transient_db_error),
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(2),
+        before_sleep=before_sleep_log(logger, WARNING),
+        reraise=True,
+    )
+    def _stamp_one_batch(self, store, batch: List[tuple]) -> int:
+        stamps = values(
+            column("row_id", String), column("identity", String),
+            name="stamps",
+        ).data(batch)
+        statement = (
+            update(store.EmbeddingStore)
+            .where(store.EmbeddingStore.id == stamps.c.row_id)
+            .values(
+                cmetadata=func.jsonb_set(
+                    func.coalesce(store.EmbeddingStore.cmetadata, EMPTY_JSONB),
+                    BLOB_SHA_JSONB_PATH,
+                    func.to_jsonb(cast(stamps.c.identity, Text)),
+                    True,
+                )
+            )
+            .execution_options(synchronize_session=False)
+        )
+        session = Session(store.session_maker.bind)
+        try:
+            written = session.execute(statement).rowcount
+            session.commit()
+            return written
+        finally:
+            try:
+                session.close()
+            except Exception as cleanup_failure:
+                logger.warning(
+                    f"Could not close the session that stamped a batch of content "
+                    f"identities: {cleanup_failure}"
+                )
+
+    def stamp_code_identity(self, vectorstore_wrapper, identity_by_row_id: Dict[str, str]) -> int:
+        """Write blob_sha onto already indexed rows that predate it."""
+        if not identity_by_row_id:
+            return 0
+
+        store = vectorstore_wrapper.vectorstore
+        pairs = list(identity_by_row_id.items())
+        stamped = 0
+        failed_batches = 0
+        for start in range(0, len(pairs), IDENTITY_STAMP_BATCH_SIZE):
+            batch = pairs[start:start + IDENTITY_STAMP_BATCH_SIZE]
+            try:
+                stamped += self._stamp_one_batch(store, batch)
+            except Exception as e:
+                failed_batches += 1
+                logger.warning(f"Could not stamp a batch of content identities: {e}")
+        if failed_batches:
+            logger.error(
+                f"{failed_batches} batches of content identities were not stamped; the "
+                f"unchanged-file skip stays disarmed for the files they cover"
+            )
+        logger.info(f"Stamped a content identity onto {stamped} already indexed rows")
+        return stamped
 
     def add_to_collection(self, vectorstore_wrapper, entry_id, new_collection_value):
         """Add a new collection name to the `collection` key in the `metadata` column."""

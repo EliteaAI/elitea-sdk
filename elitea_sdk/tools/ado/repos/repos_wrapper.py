@@ -796,8 +796,25 @@ class ReposApiWrapper(CodeIndexerToolkit):
         Returns:
             List[str]: List of file paths
         """
+        return list(self._get_files_with_identity(path, branch, recursion_level))
+
+    def _get_files_with_identity(
+            self,
+            path: str = "",
+            branch: str = None,
+            recursion_level: str = "Full",
+    ) -> Dict[str, str]:
+        """Map every file in a repository path and branch to its git blob object id.
+
+        Args:
+            path (str): Path within the repository to list files from
+            branch (str): Branch to get files from. Defaults to base_branch if None.
+            recursion_level (str): OneLevel - includes immediate children, Full - includes all items, None - no recursion
+
+        Returns:
+            Dict[str, str]: File path to git blob object id
+        """
         branch = branch if branch else self.base_branch
-        files: List[str] = []
         try:
             version_descriptor = GitVersionDescriptor(
                 version=branch, version_type="branch"
@@ -814,12 +831,12 @@ class ReposApiWrapper(CodeIndexerToolkit):
             msg = f"Failed to fetch files from directory due to an error: {str(e)}"
             logger.error(msg)
             raise ToolException(msg)
-        files = []
+        blob_object_ids_by_path = {}
         while items:
             item = items.pop(0)
             if item.git_object_type == "blob":
-                files.append(item.path)
-        return files # Changed to return list directly instead of str
+                blob_object_ids_by_path[item.path] = item.object_id
+        return blob_object_ids_by_path
 
     @tool_group('write')
     def set_active_branch(self, branch_name: str) -> str:
