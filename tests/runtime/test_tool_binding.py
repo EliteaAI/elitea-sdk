@@ -1,3 +1,4 @@
+import pytest
 import yaml
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
@@ -127,6 +128,42 @@ def test_toolkit_scoped_selection_does_not_substitute_another_toolkit():
 
     assert selected == [configurations]
     assert missing == []
+
+
+def test_toolkit_scoped_selection_accepts_unique_legacy_separator_alias():
+    github = _tool("GitHubTools", "github", "get_file", "github file")
+    ado = _tool("AdoTools", "ado", "get_file", "ado file")
+
+    selected, missing = select_tools_for_binding(
+        [ado, github],
+        {"GitHub_Tools": ["get_file"]},
+    )
+
+    assert selected == [github]
+    assert missing == []
+
+
+def test_toolkit_scoped_selection_rejects_ambiguous_legacy_separator_alias():
+    first = _tool("GitHubTools", "github", "get_file", "first")
+    second = _tool("GitHub__Tools", "github", "get_file", "second")
+
+    with pytest.raises(ValueError, match="Multiple tools match legacy qualified identity"):
+        select_tools_for_binding(
+            [first, second],
+            {"GitHub_Tools": ["get_file"]},
+        )
+
+
+def test_toolkit_scoped_selection_preserves_valid_hyphen_identity():
+    github = _tool("GitHub-Tools", "github", "get_file", "github file")
+
+    selected, missing = select_tools_for_binding(
+        [github],
+        {"GitHub_Tools": ["get_file"]},
+    )
+
+    assert selected == []
+    assert missing == ["GitHub_Tools:get_file"]
 
 
 def test_legacy_name_list_keeps_all_matching_toolkit_operations():

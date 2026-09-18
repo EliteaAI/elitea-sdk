@@ -10,7 +10,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 
 import elitea_sdk.tools as elitea_tools_mod
-from elitea_sdk.runtime.langchain.langraph_agent import create_graph
+from elitea_sdk.runtime.langchain.langraph_agent import create_graph, find_mcp_auth_proxy
 from elitea_sdk.runtime.toolkits import tools as runtime_tools
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired, McpContext
 
@@ -148,13 +148,76 @@ def test_direct_sharepoint_toolkit_node_defers_auth_until_execution(monkeypatch)
     assert exc_info.value.server_url == SHAREPOINT_URL
 
 
-def test_direct_sharepoint_toolkit_node_does_not_fall_back_to_same_named_tool(monkeypatch):
+def test_legacy_name_resolves_multiple_auth_gateways_from_one_toolkit():
+    proxies = [
+        StructuredTool.from_function(
+            func=lambda: "authorize",
+            name=name,
+            description="Authorize GitHub",
+            metadata={
+                "toolkit_name": "GitHubTools",
+                "toolkit_type": "github",
+            },
+        )
+        for name in ("mcp_authorize_get_file", "mcp_authorize_list_files")
+    ]
+
+    assert find_mcp_auth_proxy(proxies, "GitHub_Tools") is proxies[0]
+
+
+def test_legacy_name_does_not_choose_between_ambiguous_auth_toolkits():
+    proxies = [
+        StructuredTool.from_function(
+            func=lambda: "authorize",
+            name=f"mcp_authorize_{index}",
+            description="Authorize GitHub",
+            metadata={
+                "toolkit_name": toolkit_name,
+                "toolkit_type": "github",
+            },
+        )
+        for index, toolkit_name in enumerate(("GitHubTools", "GitHub__Tools"))
+    ]
+
+    assert find_mcp_auth_proxy(proxies, "GitHub_Tools") is None
+
+
+def test_auth_proxy_prefers_exact_name_over_legacy_alias():
+    proxies = [
+        StructuredTool.from_function(
+            func=lambda: "authorize",
+            name=f"mcp_authorize_{index}",
+            description="Authorize GitHub",
+            metadata={
+                "toolkit_name": toolkit_name,
+                "toolkit_type": "github",
+            },
+        )
+        for index, toolkit_name in enumerate(("GitHubTools", "GitHub_Tools"))
+    ]
+
+    assert find_mcp_auth_proxy(proxies, "GitHub_Tools") is proxies[1]
+
+
+@pytest.mark.parametrize(
+    ("configured_toolkit_name", "node_toolkit_name"),
+    [
+        ("sharepoint", "sharepoint"),
+        ("SharePointTools", "SharePoint_Tools"),
+    ],
+    ids=["current-name", "legacy-separator-name"],
+)
+def test_direct_sharepoint_toolkit_node_does_not_fall_back_to_same_named_tool(
+    monkeypatch,
+    configured_toolkit_name,
+    node_toolkit_name,
+):
     """A direct node must keep toolkit identity when another toolkit has the same tool."""
 
     _patch_sharepoint_auth_loader(monkeypatch)
-    context = McpContext(pipeline_node_toolkit_names={"sharepoint"})
+    context = McpContext(pipeline_node_toolkit_names={node_toolkit_name})
     tools = runtime_tools.get_tools(
-        [_sharepoint_tool_config()],
+        [_sharepoint_tool_config(toolkit_name=configured_toolkit_name)],
         elitea_client=SimpleNamespace(get_mcp_toolkits=lambda: []),
         mcp_context=context,
     )
@@ -185,7 +248,7 @@ def test_direct_sharepoint_toolkit_node_does_not_fall_back_to_same_named_tool(mo
                 {
                     "id": "SharePointNode",
                     "type": "toolkit",
-                    "toolkit_name": "sharepoint",
+                    "toolkit_name": node_toolkit_name,
                     "tool": "get_lists",
                     "transition": "END",
                 },
@@ -209,7 +272,7 @@ def test_direct_sharepoint_toolkit_node_does_not_fall_back_to_same_named_tool(mo
     assert ado_calls == []
     assert result["execution_finished"] is False
     assert result["hitl_interrupt"]["guardrail_type"] == "mcp_auth"
-    assert result["hitl_interrupt"]["toolkit_name"] == "sharepoint"
+    assert result["hitl_interrupt"]["toolkit_name"] == node_toolkit_name
     assert result["hitl_interrupt"]["tool_name"] == "get_lists"
 
 

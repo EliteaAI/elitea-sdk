@@ -40,6 +40,7 @@ from ..utils.mcp_oauth import (
 )
 from ...tools.utils import clean_string
 from ..utils.utils import safe_config_summary, mask_secret
+from ..utils.toolkit_identity import toolkit_names_match
 from elitea_sdk.tools import _inject_toolkit_id, _inject_display_metadata, _patch_tool_invoke
 
 # Human-readable display names for all internal tools.
@@ -60,6 +61,30 @@ from .security import is_toolkit_blocked, is_tool_blocked, get_blocked_tools_for
 
 
 logger = logging.getLogger(__name__)
+
+
+def _find_pipeline_toolkit_name(
+    configured_names: Optional[set],
+    *runtime_names: Any,
+) -> Optional[str]:
+    """Resolve a current toolkit name to one persisted pipeline identity."""
+    if not configured_names:
+        return None
+
+    for runtime_name in runtime_names:
+        for configured_name in configured_names:
+            if runtime_name == configured_name:
+                return configured_name
+
+    matches = {
+        configured_name
+        for configured_name in configured_names
+        if any(
+            toolkit_names_match(configured_name, runtime_name)
+            for runtime_name in runtime_names
+        )
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 # --- Application-tool recursion guard (issue #5680) ---
@@ -1266,12 +1291,15 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     if _should_skip:
                         logger.info("[MCP Auth] Skipping ignored/declined MCP server — injecting declined proxy")
                         _tname = tool.get('toolkit_name') or url
+                        _pipeline_tname = _find_pipeline_toolkit_name(
+                            pipeline_node_toolkit_names,
+                            _tname,
+                        )
                         if (
                             skipped_pipeline_toolkit_names is not None
-                            and pipeline_node_toolkit_names is not None
-                            and _tname in pipeline_node_toolkit_names
+                            and _pipeline_tname is not None
                         ):
-                            skipped_pipeline_toolkit_names.add(_tname)
+                            skipped_pipeline_toolkit_names.add(_pipeline_tname)
                         _fake_auth_err = McpAuthorizationRequired(
                             message="MCP server skipped by user",
                             server_url=canonical_url or url,
@@ -1394,8 +1422,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             tools.extend(mcp_tools)
                             continue
                     _is_pipeline_node = (
-                        pipeline_node_toolkit_names is not None
-                        and (resolved_toolkit_name in pipeline_node_toolkit_names)
+                        _find_pipeline_toolkit_name(
+                            pipeline_node_toolkit_names,
+                            resolved_toolkit_name,
+                        )
+                        is not None
                     )
                     mcp_tools = _build_deferred_mcp_auth_tools(
                         tool,
@@ -1479,12 +1510,15 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         if _skip:
                             logger.info("[MCP Auth] Skipping ignored/declined pre-configured MCP server — injecting declined proxy")
                             _tname = tool.get('toolkit_name') or server_name
+                            _pipeline_tname = _find_pipeline_toolkit_name(
+                                pipeline_node_toolkit_names,
+                                _tname,
+                            )
                             if (
                                 skipped_pipeline_toolkit_names is not None
-                                and pipeline_node_toolkit_names is not None
-                                and _tname in pipeline_node_toolkit_names
+                                and _pipeline_tname is not None
                             ):
-                                skipped_pipeline_toolkit_names.add(_tname)
+                                skipped_pipeline_toolkit_names.add(_pipeline_tname)
                             _fake_skip_url = _server_url or server_name
                             _fake_auth_err = McpAuthorizationRequired(
                                 message="MCP server skipped by user",
@@ -1565,8 +1599,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                             tools.extend(toolkit_tools)
                             continue
                     _is_pipeline_node = (
-                        pipeline_node_toolkit_names is not None
-                        and toolkit_name in pipeline_node_toolkit_names
+                        _find_pipeline_toolkit_name(
+                            pipeline_node_toolkit_names,
+                            toolkit_name,
+                        )
+                        is not None
                     )
                     toolkit_tools = _build_deferred_mcp_auth_tools(
                         tool,
@@ -1657,12 +1694,9 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 str(_u_tool.get("type") or "").lower(),
             }
             _toolkit_aliases.discard("")
-            _pipeline_toolkit_name = next(
-                (
-                    name for name in (pipeline_node_toolkit_names or set())
-                    if str(name).lower() in _toolkit_aliases
-                ),
-                None,
+            _pipeline_toolkit_name = _find_pipeline_toolkit_name(
+                pipeline_node_toolkit_names,
+                *_toolkit_aliases,
             )
             _direct_pipeline_was_skipped = False
             if _pipeline_toolkit_name:
