@@ -586,6 +586,21 @@ class EliteAClient:
             # A measured Chat Completions preset must not be switched by a
             # worker-wide preference. Manual and older bindings keep their path.
             use_responses_api = False
+        routing_reasoning_fields = None
+        if model_config.get('routing_pin') and 'routing_reasoning_fields' in model_config:
+            effort = model_config.get('reasoning_effort')
+            if routing_transport not in {'chat_completions', 'anthropic_messages'} or effort not in (None, 'low', 'medium', 'high'):
+                raise ValueError('Invalid Auto measured reasoning contract')
+            expected_fields = {}
+            if effort is not None:
+                expected_fields = ({'reasoning': {'effort': effort}}
+                    if routing_transport == 'chat_completions' else {
+                        'thinking': {'type': 'adaptive', 'display': 'summarized'},
+                        'output_config': {'effort': effort},
+                    })
+            routing_reasoning_fields = model_config['routing_reasoning_fields']
+            if not isinstance(routing_reasoning_fields, dict) or routing_reasoning_fields != expected_fields:
+                raise ValueError('Auto reasoning fields differ from its measured contract')
         # Models needing the reasoning param nested in the request body instead of a
         # top-level reasoning_effort string (e.g. Bedrock-hosted OpenAI models).
         reasoning_in_body = any(
@@ -622,7 +637,13 @@ class EliteAClient:
                 },
             }
             
-            if model_config.get("reasoning_effort"):
+            if routing_reasoning_fields is not None:
+                if routing_reasoning_fields:
+                    target_kwargs['thinking'] = deepcopy(routing_reasoning_fields['thinking'])
+                    # ChatAnthropic serializes this as output_config.effort.
+                    target_kwargs['effort'] = routing_reasoning_fields['output_config']['effort']
+                # Measured max_tokens already includes reasoning and visible output.
+            elif model_config.get("reasoning_effort"):
                 effort = model_config["reasoning_effort"].lower()
                 # Opus 4.7+ only supports adaptive thinking (not "enabled").
                 # display="summarized" is required so the API returns the
@@ -680,7 +701,12 @@ class EliteAClient:
                 target_kwargs["default_headers"] = dict(extra_headers)
 
             reasoning_effort = model_config.get("reasoning_effort")
-            if reasoning_effort:
+            if routing_reasoning_fields is not None:
+                if routing_reasoning_fields:
+                    # Preserve the measured wire envelope even when worker-wide
+                    # defaults prefer another reasoning API representation.
+                    target_kwargs['extra_body'] = deepcopy(routing_reasoning_fields)
+            elif reasoning_effort:
                 if use_responses_api:
                     # Responses API path (OpenAI native): use reasoning dict to enable
                     # extended thinking summaries and content_blocks

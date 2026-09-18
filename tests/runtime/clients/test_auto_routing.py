@@ -91,6 +91,44 @@ def test_measured_output_allowance_from_gateway_reaches_native_client():
     assert auto.owner.get_llm.call_args.args[1]['max_tokens'] == 32000
 
 
+@pytest.mark.parametrize('transport,fields', [
+    ('chat_completions', {'reasoning': {'effort': 'high'}}),
+    ('anthropic_messages', {'thinking': {'type': 'adaptive', 'display': 'summarized'},
+                            'output_config': {'effort': 'high'}}),
+])
+def test_measured_effort_binding_survives_tool_cycle_and_pin_renewal(transport, fields):
+    auto, native, requests = model()
+    original = auto.owner._request
+
+    def resolve(*args, **kwargs):
+        response = original(*args, **kwargs)
+        binding = response.json()
+        binding['config'].update(max_tokens=32000, reasoning_effort='high',
+                                 routing_transport=transport, routing_reasoning_fields=fields,
+                                 routing_total_output_cap=True)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: binding)
+
+    auto.owner._request = resolve
+    task = HumanMessage(content='task')
+    first = auto.invoke([task], cfg())
+    binding = first.response_metadata[m.PIN]
+    history = [task, first, ToolMessage(content='value', tool_call_id='call1')]
+    reloaded = m.AutoChatModel(owner=auto.owner, settings=auto.settings)
+    reloaded.invoke(history, cfg())
+    assert len(requests) == 1
+    assert auto.owner.get_llm.call_args.args[1]['routing_reasoning_fields'] == fields
+    binding['expires_at'] = 0
+    reloaded.invoke(history, cfg())
+    assert len(requests) == 2
+    assert requests[-1]['prior_pin'] == binding['pin']
+    assert requests[-1]['invocation_id'] == binding['invocation_id']
+    config = auto.owner.get_llm.call_args.args[1]
+    assert config['routing_transport'] == transport
+    assert config['reasoning_effort'] == 'high'
+    assert config['routing_reasoning_fields'] == fields
+    assert config['max_tokens'] == 32000
+
+
 def test_native_tool_cycle_reuses_checkpoint_pin_and_exact_blocks():
     auto, native, requests = model()
     task = HumanMessage(content='Read the fixture', id='task1')
