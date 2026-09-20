@@ -306,6 +306,48 @@ class TestPromoteAbortsDeleteOwnChunks:
         assert adapter.discard_run(make_wrapper(), "idx", "run-1") == "noop"
         assert stranded == []
 
+    def test_retained_discard_keeps_the_chunks(self, monkeypatch, sessions):
+        """#5261. Mutation: drop the retain_chunks branch."""
+        adapter, chunk_deletes, stranded = self.setup_adapter(monkeypatch, meta_ids=["meta-1"])
+        run_row = make_run_row(RUN_STATUS_PENDING)
+        sessions.run_rows.append(run_row)
+
+        outcome = adapter.discard_run(make_wrapper(), "idx", "run-1", retain_chunks=True)
+
+        assert outcome == "retained"
+        assert chunk_deletes == []
+        assert stranded == []
+
+    def test_a_retained_run_stays_inside_the_read_filters_hidden_statuses(self, monkeypatch, sessions):
+        """The read filter hides 'pending' and 'cancelled' only, so a retained generation
+        parked under 'discarded' would be published to search. Mutation: use
+        RUN_STATUS_DISCARDED in the retain branch."""
+        adapter, _, _ = self.setup_adapter(monkeypatch, meta_ids=["meta-1"])
+        run_row = make_run_row(RUN_STATUS_PENDING)
+        sessions.run_rows.append(run_row)
+
+        adapter.discard_run(make_wrapper(), "idx", "run-1", retain_chunks=True)
+
+        assert run_row.status == RUN_STATUS_CANCELLED
+        assert run_row.status != RUN_STATUS_DISCARDED
+
+    def test_retention_defaults_off_so_discard_still_deletes(self, monkeypatch, sessions):
+        adapter, chunk_deletes, _ = self.setup_adapter(monkeypatch, meta_ids=["meta-1"])
+        run_row = make_run_row(RUN_STATUS_PENDING)
+        sessions.run_rows.append(run_row)
+
+        assert adapter.discard_run(make_wrapper(), "idx", "run-1") == "discarded"
+        assert chunk_deletes == ["run-1"]
+        assert run_row.status == RUN_STATUS_DISCARDED
+
+    def test_retention_does_not_revive_a_promoted_run(self, monkeypatch, sessions):
+        adapter, chunk_deletes, stranded = self.setup_adapter(monkeypatch, meta_ids=["meta-1"])
+        sessions.run_rows.append(make_run_row(RUN_STATUS_PROMOTED))
+
+        assert adapter.discard_run(make_wrapper(), "idx", "run-1", retain_chunks=True) == "noop"
+        assert chunk_deletes == []
+        assert stranded == []
+
     def test_stranded_cleanup_runs_in_its_own_committed_transaction(self, monkeypatch, sessions):
         adapter = PGVectorAdapter()
         deleted = []

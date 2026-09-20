@@ -330,7 +330,7 @@ class FakeStagingAdapter:
         self.calls.append("register")
         return self.register_result
 
-    def sweep_stale_index_runs(self, wrapper, index_name, stale_before):
+    def sweep_stale_index_runs(self, wrapper, index_name, stale_before, except_run_id=None):
         self.calls.append("sweep")
         self.sweeps.append((index_name, stale_before))
         return []
@@ -615,8 +615,8 @@ class TestFreshIndexReclaim:
         adapter.register_result = (False, {"run_id": "dead", "heartbeat": 1.0, "started_on": 1.0})
         original_sweep = adapter.sweep_stale_index_runs
 
-        def reclaiming_sweep(wrapper, index_name, stale_before):
-            original_sweep(wrapper, index_name, stale_before)
+        def reclaiming_sweep(wrapper, index_name, stale_before, except_run_id=None):
+            original_sweep(wrapper, index_name, stale_before, except_run_id)
             adapter.register_result = (True, None)
             return ["dead"]
 

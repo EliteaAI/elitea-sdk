@@ -64,7 +64,7 @@ class FakeStagingAdapter:
     def register_index_run(self, wrapper, index_name, run_id, task_id=None, meta_lock_id=None):
         return (True, None)
 
-    def sweep_stale_index_runs(self, wrapper, index_name, stale_before):
+    def sweep_stale_index_runs(self, wrapper, index_name, stale_before, except_run_id=None):
         return []
 
     def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id, chunks_written=None):

@@ -8,6 +8,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 from queue import Empty, Full, Queue
 from typing import Any, Callable, ClassVar, Optional, List, Dict, Generator, Set, Tuple, Union
 from uuid import uuid4
@@ -722,6 +723,36 @@ INDEX_RUN_HEARTBEAT_INTERVAL = 60.0
 IDLESS_STAGING_KEY = "None"
 
 
+def stored_metadata_form(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Metadata as `add_documents` will store it, minus the run id it stamps.
+
+    The coercions mirror llm_processor.add_documents, which flattens lists and dicts in
+    place on its way to add_texts. Predicting the stored form is what lets a candidate
+    chunk be compared against a row that was written by an earlier process.
+    """
+    stored = {}
+    for key, value in metadata.items():
+        if key == IndexerKeywords.RUN_ID.value:
+            continue
+        if isinstance(value, list):
+            stored[key] = "; ".join(str(item) for item in value)
+        elif isinstance(value, dict):
+            stored[key] = json.dumps(value)
+        else:
+            stored[key] = value
+    return stored
+
+
+def chunk_digest(text_digest: str, metadata: Dict[str, Any]) -> bytes:
+    payload = json.dumps(stored_metadata_form(metadata), sort_keys=True, default=str)
+    return sha256(f"{text_digest}\0{payload}".encode("utf-8")).digest()
+
+
+def candidate_chunk_digest(document: Document) -> bytes:
+    text_digest = sha256((document.page_content or "").encode("utf-8")).hexdigest()
+    return chunk_digest(text_digest, document.metadata)
+
+
 class IndexRunRefusedError(ToolException):
     """Refusal to start an indexing run while another one owns the index.
 
@@ -753,6 +784,11 @@ class _IndexRunState:
     indexed_data: Optional[Dict[str, Dict[str, Any]]] = None
     identity_backfill: Dict[str, str] = field(default_factory=dict)
     identity_backfill_visited_keys: Set[str] = field(default_factory=set)
+    adopted_from_run_id: Optional[str] = None
+    adopted_chunk_count: int = 0
+    adoptable_chunks: Dict[str, List[str]] = field(default_factory=dict)
+    adopted_row_pks: Set[str] = field(default_factory=set)
+    reused_row_pks: Set[str] = field(default_factory=set)
     orphan_candidate_ids: List[str] = field(default_factory=list)
     orphan_candidate_doc_count: int = 0
     heartbeat_stop: Optional[threading.Event] = None
@@ -918,6 +954,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     # otherwise mass-delete the difference under a green banner. Opt in only
     # after a reviewed paging-loop audit.
     loader_attests_completion: ClassVar[bool] = False
+
+    adoption_enabled: ClassVar[bool] = True
+
+    adoption_max_chunks: ClassVar[int] = 200_000
 
     connection_string: Optional[SecretStr] = None
     collection_name: Optional[str] = None
@@ -1101,6 +1141,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 self._clean_index(index_name)
             #
             self.index_meta_init(index_name, kwargs)
+            self._load_adopted_chunk_digests()
             if staging:
                 self._start_run_heartbeat(index_name)
             self._emit_index_event(index_name)
@@ -1331,6 +1372,116 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "to finish or stop it before starting a new one."
         )
 
+    def _adoption_is_available(self) -> bool:
+        run = getattr(self, "_index_run", None)
+        return bool(
+            self.adoption_enabled
+            and self._staging_active()
+            and run is not None
+            and not run.clean_index
+        )
+
+    def _claim_adoptable_run(self, index_name: str, stale_before: float) -> Optional[str]:
+        if not self._adoption_is_available():
+            return None
+        try:
+            return self.vector_adapter.claim_adoptable_run(
+                self, index_name, stale_before, self.adoption_max_chunks
+            )
+        except Exception as claim_failure:
+            logger.warning(
+                f"Could not claim an interrupted run of '{index_name}' for adoption, so this "
+                f"run starts from scratch: {claim_failure}"
+            )
+            return None
+
+    def _adopt_claimed_run(self, index_name: str, claimed_run_id: Optional[str]) -> None:
+        if not claimed_run_id:
+            return
+        run = self._index_run
+        try:
+            adopted = self.vector_adapter.adopt_run_chunks(
+                self, index_name, claimed_run_id, run.run_id
+            )
+        except Exception as adoption_failure:
+            # The parked row keeps its rows and its hidden status, so a later run can retry.
+            logger.warning(
+                f"Could not adopt the staged rows of run '{claimed_run_id}', so this run "
+                f"re-indexes them: {adoption_failure}"
+            )
+            return
+        if adopted:
+            run.adopted_from_run_id = claimed_run_id
+            run.adopted_chunk_count = adopted
+            logger.info(
+                f"Adopted {adopted} staged rows from the interrupted run '{claimed_run_id}'"
+            )
+
+    def _load_adopted_chunk_digests(self) -> None:
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.adopted_from_run_id:
+            return
+        try:
+            digests, row_pks, truncated = self.vector_adapter.read_run_staged_digests(
+                self, run.run_id, chunk_digest, self.adoption_max_chunks
+            )
+        except Exception as read_failure:
+            logger.warning(
+                f"Could not index the adopted rows for reuse, so they are dropped and "
+                f"re-indexed: {read_failure}"
+            )
+            self._release_adopted_rows()
+            return
+        if truncated:
+            logger.warning(
+                f"The adopted run holds more than {self.adoption_max_chunks} rows, so they "
+                f"are dropped and re-indexed; raise adoption_max_chunks to reuse at this size"
+            )
+            self._release_adopted_rows()
+            return
+        run.adoptable_chunks = digests
+        run.adopted_row_pks = row_pks
+        # A silently empty reuse map is indistinguishable from a working one: the run
+        # still succeeds, just at full cost. This line is the only signal that the
+        # digests were prepared at all.
+        logger.info(f"Indexed {len(row_pks)} adopted rows for reuse")
+
+    def _release_adopted_rows(self) -> None:
+        """Delete the adopted rows when this run cannot reuse them.
+
+        They already carry this run's id, so promote would publish them beside the copies
+        this run is about to embed. Nothing else can reach them: dedup reads through the
+        pending-run filter, and the supersede set is built from the reuse map that is
+        empty here. This runs before the first flush, so every row carrying the run id is
+        an adopted one.
+        """
+        run = self._index_run
+        try:
+            self.vector_adapter.drop_run_chunks(self, run.run_id)
+        except Exception as drop_failure:
+            logger.error(
+                f"Could not drop the adopted rows of run '{run.run_id}'; the run is "
+                f"abandoned rather than risk publishing them twice: {drop_failure}"
+            )
+            raise
+        run.adopted_from_run_id = None
+        run.adopted_chunk_count = 0
+        run.adoptable_chunks = {}
+        run.adopted_row_pks = set()
+
+    def _claim_adopted_row(self, document: Document) -> Optional[str]:
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.adoptable_chunks:
+            return None
+        candidates = run.adoptable_chunks.get(candidate_chunk_digest(document))
+        if not candidates:
+            return None
+        # Popped, never peeked: N identical chunks must consume N distinct rows, or the
+        # unclaimed duplicates survive promote as copies.
+        row_pk = candidates.pop()
+        run.reused_row_pks.add(row_pk)
+        return row_pk
+
     def _read_disconnected_timeout(self, metadata: Dict[str, Any]) -> float:
         try:
             timeout = float(metadata.get("task_disconnected_timeout_sec"))
@@ -1389,6 +1540,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             for doc_key in damaged_doc_keys
             for row_pk in run.recorded_row_pks.get(doc_key, [])
         ]
+        # An adopted row this run did not reuse describes content the run did not produce:
+        # a document the source reverted, deleted, or re-chunked. It carries this run's id,
+        # so promote would publish it unless it is superseded here. This one rule is what
+        # keeps a resumed run's generation identical to a clean run's.
+        superseded_ids.extend(run.adopted_row_pks - run.reused_row_pks)
         orphan_ids = (
             run.orphan_candidate_ids
             if self.loader_attests_completion and run.loader_attested
@@ -1654,6 +1810,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     if chunk_key != IDLESS_STAGING_KEY:
                         run.pending_chunk_counts[chunk_key] = run.pending_chunk_counts.get(chunk_key, 0) + 1
                         run.doc_names.setdefault(chunk_key, _doc_name)
+                    adopted_row_pk = self._claim_adopted_row(doc)
+                    if adopted_row_pk is not None:
+                        # The row this run would have written is already committed under
+                        # this run's id, so it counts as flushed without an embedding call.
+                        run.chunks_written += 1
+                        if chunk_key != IDLESS_STAGING_KEY:
+                            run.recorded_row_pks.setdefault(chunk_key, []).append(adopted_row_pk)
+                            run.pending_chunk_counts[chunk_key] -= 1
+                        dependent_docs_counter += 1
+                        continue
                 pg_vector_add_docs_chunk.append(doc)
                 dependent_docs_counter += 1
                 if len(pg_vector_add_docs_chunk) >= self.max_docs_per_add:
@@ -2531,10 +2697,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # timeout since there is no meta row to read one from: a pending
                 # row can outlive its meta row (crash before the row is written,
                 # or an index removal) and would otherwise refuse this name for good.
+                stale_before = time.time() - run.disconnected_timeout
+                claimed_run_id = self._claim_adoptable_run(index_name, stale_before)
                 self.vector_adapter.sweep_stale_index_runs(
-                    self, index_name, time.time() - run.disconnected_timeout
+                    self, index_name, stale_before, except_run_id=claimed_run_id
                 )
                 self._register_index_run(index_name, task_id=None, meta_lock_id=None)
+                self._adopt_claimed_run(index_name, claimed_run_id)
             created_on = time.time()
             metadata = {
                 "collection": index_name,
@@ -2577,14 +2746,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # registration BEFORE the reset write below — a REFUSED run must
                 # never rewrite the live run's created_on/history, which core's
                 # Stop and task-id corroborations key on.
+                # Adoption claims the interrupted run before the sweep can reclaim it, and
+                # re-stamps its rows only after registration: until the live run row
+                # exists, rows carrying its id would match no pending run and so would be
+                # visible to every reader.
+                stale_before = time.time() - run.disconnected_timeout
+                claimed_run_id = self._claim_adoptable_run(index_name, stale_before)
                 self.vector_adapter.sweep_stale_index_runs(
-                    self, index_name, time.time() - run.disconnected_timeout
+                    self, index_name, stale_before, except_run_id=claimed_run_id
                 )
                 self._register_index_run(
                     index_name,
                     task_id=metadata.get("task_id"),
                     meta_lock_id=index_meta.get("id"),
                 )
+                self._adopt_claimed_run(index_name, claimed_run_id)
             metadata["initiator"] = initiator
             metadata["reindex"] = self._count_completed_runs(metadata) > 0
             previous_state = metadata.get("state")
