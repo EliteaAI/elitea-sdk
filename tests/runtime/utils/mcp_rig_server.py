@@ -131,7 +131,7 @@ def build_rig_app(login_port: int) -> Starlette:
         Mount("/sse-messages/", app=sse_transport.handle_post_message),
         Route("/big401/mcp", endpoint=oversized_header_challenge, methods=["GET", "POST"]),
         Route("/.well-known/oauth-protected-resource/big401/mcp", endpoint=oversized_header_resource_metadata),
-        Route("/as/.well-known/oauth-authorization-server", endpoint=authorization_server_metadata),
+        Route("/.well-known/oauth-authorization-server/as", endpoint=authorization_server_metadata),
         Route("/moved/mcp", endpoint=moved_permanently, methods=["GET", "POST"]),
         Route("/sso/mcp", endpoint=cross_origin_login_redirect(login_port), methods=["GET", "POST"]),
         Route("/html/mcp", endpoint=html_login_page, methods=["GET", "POST"]),
