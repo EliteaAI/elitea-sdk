@@ -19,7 +19,6 @@ from ..utils.mcp_oauth import (
     McpAuthorizationRequired,
     canonical_resource,
     extract_resource_metadata_url,
-    fetch_resource_metadata_async,
     infer_authorization_servers_from_realm,
 )
 # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient

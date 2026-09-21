@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+import httpx
 import requests
 from langchain_core.tools import ToolException
 
@@ -182,6 +183,40 @@ class McpContext:
     reraise_on_auth_required: bool = field(default=False)
 
 
+SSO_REDIRECT_PREFIX = "The MCP server redirected the request"
+HTML_LOGIN_PAGE_PREFIX = "The MCP server returned an HTML page"
+RETIRED_ENDPOINT_PREFIX = "The MCP endpoint "
+CURATED_MCP_MESSAGE_PREFIXES = (SSO_REDIRECT_PREFIX, HTML_LOGIN_PAGE_PREFIX, RETIRED_ENDPOINT_PREFIX)
+
+
+class McpEndpointError(ValueError):
+    pass
+
+
+def sso_redirect_message(status: int, location: str) -> str:
+    return (
+        f"{SSO_REDIRECT_PREFIX} ({status}) to {urlparse(location).netloc or 'another location'}. "
+        "This usually means the endpoint is behind an SSO/login proxy that does not return a proper "
+        "authentication challenge. Please verify the server URL and authentication in the toolkit settings."
+    )
+
+
+def html_login_page_message() -> str:
+    return (
+        f"{HTML_LOGIN_PAGE_PREFIX} instead of an MCP/JSON response. This usually means the endpoint "
+        "is behind an SSO/login proxy. Please verify the server URL and authentication in the toolkit settings."
+    )
+
+
+def retired_endpoint_message(url: str, replacement_url: Optional[str]) -> str:
+    advice = f"Try {replacement_url} instead." if replacement_url else "Please verify the server URL in the toolkit settings."
+    return f"{RETIRED_ENDPOINT_PREFIX}{url} has been retired or is no longer available. {advice}"
+
+
+def is_curated_mcp_message(exception: Exception) -> bool:
+    return isinstance(exception, McpEndpointError) or str(exception).startswith(CURATED_MCP_MESSAGE_PREFIXES)
+
+
 class McpAuthorizationRequired(ToolException):
     """Raised when an MCP server requires OAuth authorization before use."""
 
@@ -353,16 +388,11 @@ def fetch_resource_metadata(resource_metadata_url: str, timeout: int = 10) -> Op
 async def fetch_resource_metadata_async(resource_metadata_url: str, session=None, timeout: int = 10) -> Optional[Dict[str, Any]]:
     """Async variant for fetching protected resource metadata."""
     try:
-        import aiohttp
-
-        client_timeout = aiohttp.ClientTimeout(total=timeout)
         if session:
-            async with session.get(resource_metadata_url, timeout=client_timeout) as resp:
-                text = await resp.text()
+            text = (await session.get(resource_metadata_url, timeout=timeout)).text
         else:
-            async with aiohttp.ClientSession(timeout=client_timeout) as local_session:
-                async with local_session.get(resource_metadata_url) as resp:
-                    text = await resp.text()
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as local_session:
+                text = (await local_session.get(resource_metadata_url)).text
 
         try:
             return json.loads(text)
@@ -548,6 +578,9 @@ def extract_user_friendly_mcp_error(exception: Exception, headers: Optional[Dict
     # Check if it's an MCP authorization exception
     if isinstance(exception, McpAuthorizationRequired):
         return "MCP server requires authorization. Please authenticate to continue."
+
+    if is_curated_mcp_message(exception):
+        return str(exception)
 
     # Convert to string and lowercase once for consistent checking
     error_msg = str(exception)
