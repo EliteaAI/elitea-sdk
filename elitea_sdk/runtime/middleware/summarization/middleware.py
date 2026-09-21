@@ -122,6 +122,8 @@ from langchain.agents.middleware.summarization import (
     _DEFAULT_MESSAGES_TO_KEEP,
 )
 
+from .accounting import ContextAccountant, ContextMeasurement, empty_token_info
+
 
 class SummarizationMiddleware(LangChainSummarizationMiddleware):
     """
@@ -147,6 +149,9 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         conversation_id: Optional[str] = None,
         callbacks: Optional[Dict[str, Callable]] = None,
         summarization_enabled: bool = True,
+        exact_token_counter: Optional[Callable] = None,
+        provider_aware_counting: bool = True,
+        count_overhead_in_trigger: bool = False,
         **kwargs
     ):
         # Use DEFAULT_SUMMARY_PROMPT when None or empty string is passed
@@ -169,6 +174,25 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         self._last_fitting_count = 0
         self.summarization_enabled = summarization_enabled
 
+        # Hidden prompt prefix (system content + bound tool schemas). The LLM node
+        # assembles it and reports it here; the middleware cannot see it on its own.
+        self._system_tokens = 0
+        self._tool_schema_tokens = 0
+        self._overhead_tokens = 0
+        # The reported number is the whole request. Letting the prefix move the
+        # trigger too makes summarization fire earlier at an unchanged
+        # max_context_tokens, so that half stays opt-in.
+        self.count_overhead_in_trigger = count_overhead_in_trigger
+
+        # Single counting path for the trigger, the cutoff loop and the reported
+        # number. token_counter stays the approximate floor source.
+        self.accountant = ContextAccountant(
+            self.token_counter,
+            model=model,
+            tokenizer=exact_token_counter,
+            provider_aware=provider_aware_counting,
+        )
+
         logger.debug(
             f"SummarizationMiddleware initialized "
             f"(trigger={self.trigger}, keep={self.keep}, summarization_enabled={self.summarization_enabled})"
@@ -177,6 +201,40 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
     def get_tools(self) -> List[BaseTool]:
         """No tools - operates on state directly."""
         return []
+
+    def set_prompt_overhead(
+        self,
+        *,
+        system_content=None,
+        tools=None,
+        system_tokens: Optional[int] = None,
+        tool_schema_tokens: Optional[int] = None,
+        overhead_tokens: int = 0,
+    ) -> None:
+        """Record the hidden prompt prefix for this turn.
+
+        Callers pass the raw ``system_content`` / bound ``tools`` and the
+        accountant counts them, or pass pre-counted totals directly.
+        """
+        try:
+            if system_tokens is None:
+                system_tokens = self.accountant.count_content(system_content)
+            if tool_schema_tokens is None:
+                tool_schema_tokens = self.accountant.count_tool_schemas(tools)
+            self._system_tokens = max(0, int(system_tokens or 0))
+            self._tool_schema_tokens = max(0, int(tool_schema_tokens or 0))
+            self._overhead_tokens = max(0, int(overhead_tokens or 0))
+        except Exception as e:
+            logger.warning(f"Failed to record prompt overhead: {e}")
+
+    @property
+    def prompt_overhead(self) -> Dict[str, int]:
+        """Prefix token counts fed into every measurement."""
+        return {
+            'system_tokens': self._system_tokens,
+            'tool_schema_tokens': self._tool_schema_tokens,
+            'overhead_tokens': self._overhead_tokens,
+        }
 
     def get_system_prompt(self) -> str:
         """No system prompt modification needed."""
@@ -225,6 +283,23 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
 
         return False
 
+    @staticmethod
+    def _context_info(
+        message_count: int,
+        *,
+        summarized: bool = False,
+        measurement: Optional[ContextMeasurement] = None,
+        **extra
+    ) -> Dict[str, Any]:
+        """Assemble last_context_info: legacy keys plus the token breakdown."""
+        token_info = measurement.as_context_info() if measurement else empty_token_info()
+        return {
+            'message_count': message_count,
+            'summarized': summarized,
+            **token_info,
+            **extra,
+        }
+
     def _find_last_summary_index(self, messages: list) -> int:
         """
         Find the index of the most recent summary message.
@@ -247,7 +322,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         preserved_msgs = messages[-preserved_count:]
         pre_preserved = messages[:-preserved_count]
 
-        preserved_tokens = self.token_counter(preserved_msgs)
+        preserved_tokens = self.accountant.count(preserved_msgs)
 
         trigger_limit = self.trigger[1] if self.trigger and self.trigger[0] == "tokens" else None
         if trigger_limit is None:
@@ -259,7 +334,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         fitting_count = 0
         tokens_so_far = 0
         for msg in reversed(pre_preserved):
-            msg_tokens = self.token_counter([msg])
+            msg_tokens = self.accountant.count([msg])
             if tokens_so_far + msg_tokens <= remaining_budget:
                 fitting_count += 1
                 tokens_so_far += msg_tokens
@@ -289,16 +364,12 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         # from state['messages'], but it WILL be sent to LLM as part of the context.
         # We need to include it for accurate trigger threshold comparison.
         current_input = state.get('input')
-        _input_token_bonus = 0
+        pending_input = []
         if current_input and isinstance(current_input, str) and current_input.strip():
-            _input_token_bonus = self.token_counter([HumanMessage(content=current_input)])
+            pending_input = [HumanMessage(content=current_input)]
 
         if not messages:
-            self.last_context_info = {
-                'message_count': 0,
-                'token_count': 0,
-                'summarized': False,
-            }
+            self.last_context_info = self._context_info(0)
             return None
 
         self._ensure_message_ids(messages)
@@ -307,11 +378,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
 
         if not non_system_messages:
-            self.last_context_info = {
-                'message_count': 0,
-                'token_count': 0,
-                'summarized': False,
-            }
+            self.last_context_info = self._context_info(0)
             return None
 
         # Find existing summary - only process messages AFTER it
@@ -329,31 +396,38 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
 
         if not messages_since_summary:
             # Only summary exists, nothing new to process
-            self.last_context_info = {
-                'message_count': 1 if existing_summary else 0,
-                'token_count': self.token_counter([existing_summary]) if existing_summary else 0,
-                'summarized': False,
-            }
+            self.last_context_info = self._context_info(
+                1 if existing_summary else 0,
+                measurement=self.accountant.measure(
+                    [existing_summary], prefer_provider=False, **self.prompt_overhead
+                ) if existing_summary else None,
+            )
             return None
 
-        # Full token count (including tool messages) for trigger decision
-        total_tokens = self.token_counter(messages_since_summary)
-        effective_tokens = total_tokens + _input_token_bonus
-
-        # User-facing counts: exclude tool-related messages (AI with tool_calls, ToolMessage)
-        # These are internal to tool execution and not user-visible conversation turns
+        # User-facing messages: exclude tool-related ones (AI with tool_calls,
+        # ToolMessage) — internal to tool execution, not user-visible turns.
         user_facing_messages = [
             m for m in messages_since_summary
             if not _is_tool_related_message(m)
         ]
-        user_facing_tokens = self.token_counter(user_facing_messages) + _input_token_bonus
 
-        # Track context info with user-facing counts only
-        self.last_context_info = {
-            'message_count': len(user_facing_messages) + (1 if existing_summary else 0),
-            'token_count': user_facing_tokens,
-            'summarized': False,
-        }
+        # One measurement drives both the reported number and the trigger:
+        # everything that reaches the model, tool traffic included.
+        measurement = self.accountant.measure(
+            messages_since_summary,
+            user_facing_messages=user_facing_messages,
+            extra_messages=pending_input,
+            prefer_provider=False,
+            **self.prompt_overhead,
+        )
+        effective_tokens = (
+            measurement.total if self.count_overhead_in_trigger else measurement.history_tokens
+        )
+
+        self.last_context_info = self._context_info(
+            len(user_facing_messages) + (1 if existing_summary else 0),
+            measurement=measurement,
+        )
 
         # Skip summarization trigger when in the middle of a tool-call loop.
         # If the last message is a ToolMessage or an AIMessage with tool_calls,
@@ -394,18 +468,23 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
 
         # User-facing counts for preserved messages (exclude tool internals)
         preserved_user_facing = [m for m in preserved_messages if not _is_tool_related_message(m)]
-        preserved_tokens = self.token_counter(preserved_user_facing) if preserved_user_facing else 0
+        preserved_measurement = self.accountant.measure(
+            preserved_messages,
+            user_facing_messages=preserved_user_facing,
+            prefer_provider=False,
+            **self.prompt_overhead,
+        )
 
         # Update context_info with post-summarization state (unified format)
-        self.last_context_info = {
-            'message_count': len(preserved_user_facing),
-            'token_count': preserved_tokens,
-            'summarized': True,
-            'summarized_count': len(messages_to_summarize),
-            'preserved_count': len(preserved_messages),
-            'fitting_count': self._last_fitting_count,
-            'summary_content': summary,
-        }
+        self.last_context_info = self._context_info(
+            len(preserved_user_facing),
+            summarized=True,
+            measurement=preserved_measurement,
+            summarized_count=len(messages_to_summarize),
+            preserved_count=len(preserved_messages),
+            fitting_count=self._last_fitting_count,
+            summary_content=summary,
+        )
 
         # Fire 'summarized' callback (EliteA-specific)
         self._fire_callback('summarized', self.last_context_info)
@@ -433,55 +512,51 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         """
         messages = state.get('messages', [])
         if not messages:
-            self.last_context_info = {
-                'message_count': 0,
-                'token_count': 0,
-                'summarized': False,
-            }
+            self.last_context_info = self._context_info(0)
             return None
 
-        # Only count user-facing messages: exclude system, remove ops, summaries,
-        # and tool-related messages (ToolMessage + AIMessage with tool_calls).
-        # Tool messages are internal to tool execution loops and should not
-        # inflate the reported message/token counts.
-        countable_messages = [
+        # Everything that occupies the context window: exclude system messages
+        # (counted separately as overhead), remove ops and summaries.
+        in_context_messages = [
             m for m in messages
             if not isinstance(m, SystemMessage)
             and not isinstance(m, RemoveMessage)
             and not self._is_summary_message(m)
-            and not _is_tool_related_message(m)
+        ]
+
+        # message_count and token_count_user_facing stay user-facing: tool
+        # messages are internal to tool execution loops.
+        countable_messages = [
+            m for m in in_context_messages
+            if not _is_tool_related_message(m)
         ]
 
         if not countable_messages:
-            self.last_context_info = {
-                'message_count': 0,
-                'token_count': 0,
-                'summarized': False,
-            }
+            self.last_context_info = self._context_info(0)
             return None
 
-        total_tokens = self.token_counter(countable_messages)
+        measurement = self.accountant.measure(
+            in_context_messages,
+            user_facing_messages=countable_messages,
+            **self.prompt_overhead,
+        )
 
         # Preserve 'summarized' flag from before_model if it was set
         was_summarized = self.last_context_info.get('summarized', False) if self.last_context_info else False
 
-        # Update context_info with FINAL state
-        updated_info = {
-            'message_count': len(countable_messages),
-            'token_count': total_tokens,
-            'summarized': was_summarized,
-        }
-
-        # Preserve summarization stats if they exist
+        carried = {}
         if was_summarized and self.last_context_info:
-            if 'summarized_count' in self.last_context_info:
-                updated_info['summarized_count'] = self.last_context_info['summarized_count']
-            if 'preserved_count' in self.last_context_info:
-                updated_info['preserved_count'] = self.last_context_info['preserved_count']
-            if 'summary_content' in self.last_context_info:
-                updated_info['summary_content'] = self.last_context_info['summary_content']
+            for key in ('summarized_count', 'preserved_count', 'summary_content'):
+                if key in self.last_context_info:
+                    carried[key] = self.last_context_info[key]
 
-        self.last_context_info = updated_info
+        # Update context_info with FINAL state
+        self.last_context_info = self._context_info(
+            len(countable_messages),
+            summarized=was_summarized,
+            measurement=measurement,
+            **carried,
+        )
 
         return None  # No state updates needed
 
