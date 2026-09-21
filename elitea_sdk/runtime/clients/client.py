@@ -2150,13 +2150,13 @@ class EliteAClient:
         import time
         # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient
         from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
-        from ..utils.mcp_oauth import canonical_resource
+        from ..utils.mcp_oauth import canonical_resource, normalize_mcp_url
 
         toolkit_name = toolkit_config.get('toolkit_name', 'unknown')
         settings = toolkit_config.get('settings', {})
 
         # Extract connection parameters
-        url = settings.get('url')
+        url = normalize_mcp_url(settings.get('url'))
         if not url:
             return {
                 "success": False,

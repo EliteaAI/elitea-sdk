@@ -29,6 +29,7 @@ from elitea_sdk.runtime.utils.mcp_adapter import UnifiedMcpClient
 from elitea_sdk.runtime.toolkits import mcp as mcp_toolkit
 from elitea_sdk.runtime.toolkits.mcp import McpToolkit, _drain_and_close_loop
 from elitea_sdk.runtime.models.mcp_models import McpConnectionConfig
+from tests.runtime.utils.mcp_probe_transport import patch_probe_transport, respond
 
 
 def _run(coro):
@@ -41,67 +42,13 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------------------
-# Fake aiohttp plumbing for the pre-flight check
-# ---------------------------------------------------------------------------
-
-
-class _FakeResponse:
-    def __init__(self, status, headers):
-        self.status = status
-        self.headers = headers
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _FakePost:
-    def __init__(self, response):
-        self._response = response
-
-    async def __aenter__(self):
-        return self._response
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _FakeClientSession:
-    def __init__(self, response):
-        self._response = response
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    def post(self, *args, **kwargs):
-        return _FakePost(self._response)
-
-
-def _patch_aiohttp_response(monkeypatch, response):
-    import aiohttp
-
-    def _factory(*args, **kwargs):
-        return _FakeClientSession(response)
-
-    monkeypatch.setattr(aiohttp, "ClientSession", _factory)
-
-
-# ---------------------------------------------------------------------------
 # 1. Pre-flight fast-fail on redirect / HTML login page
 # ---------------------------------------------------------------------------
 
 
 def test_preflight_fast_fails_on_sso_redirect(monkeypatch):
     """A 302 to a login page must fail fast, not be followed into an HTML page."""
-    _patch_aiohttp_response(
-        monkeypatch,
-        _FakeResponse(302, {"Location": "https://login.example.test/sso"}),
-    )
+    patch_probe_transport(monkeypatch, respond(302, {"Location": "https://login.example.test/sso"}))
     client = UnifiedMcpClient(url="https://mcp.example.test/mcp")
 
     with pytest.raises(ValueError, match="redirected"):
@@ -110,10 +57,7 @@ def test_preflight_fast_fails_on_sso_redirect(monkeypatch):
 
 def test_preflight_fast_fails_on_html_login_page(monkeypatch):
     """A 200 that serves text/html (login proxy) must fail fast, not hang."""
-    _patch_aiohttp_response(
-        monkeypatch,
-        _FakeResponse(200, {"Content-Type": "text/html; charset=utf-8"}),
-    )
+    patch_probe_transport(monkeypatch, respond(200, {"Content-Type": "text/html; charset=utf-8"}))
     client = UnifiedMcpClient(url="https://mcp.example.test/mcp")
 
     with pytest.raises(ValueError, match="HTML"):

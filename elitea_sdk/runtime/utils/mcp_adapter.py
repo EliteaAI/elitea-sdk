@@ -24,14 +24,39 @@ import logging
 import uuid
 from datetime import timedelta
 
+import httpx
+
+from .mcp_oauth import McpAuthorizationRequired
 from .mcp_response_limit import (
     McpResponseTooLargeError,
     SizeTrip,
     build_httpx_client_factory,
 )
+from .mcp_transport_negotiation import (
+    AUTO,
+    LEGACY_SSE,
+    STREAMABLE_HTTP,
+    TransportDecision,
+    TransportNegotiator,
+    shares_scheme_and_host,
+    transport_from_url_suffix,
+)
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+NEGOTIABLE_TRANSPORTS = frozenset({AUTO, LEGACY_SSE, STREAMABLE_HTTP, "http"})
+METADATA_TIMEOUT_SECONDS = 30
+
+
+def find_unauthorized_response(error: BaseException) -> Optional[httpx.Response]:
+    if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 401:
+        return error.response
+    for inner in getattr(error, "exceptions", None) or ():
+        found = find_unauthorized_response(inner)
+        if found is not None:
+            return found
+    return None
 
 
 def _resolve_response_limit():
@@ -110,6 +135,7 @@ class UnifiedMcpClient:
         self._size_trip = SizeTrip()
         self._initialized = False
         self._detected_transport = None
+        self._resolved_url = None
 
         logger.info(f"[Unified MCP] Created client for {url} (transport={transport}, ssl_verify={ssl_verify})")
 
@@ -155,13 +181,9 @@ class UnifiedMcpClient:
                 "Please check the URL in your toolkit settings."
             )
 
-        # Detect transport if auto
-        detected_transport = self._detect_transport()
-
-        # For HTTP-based transports, do a pre-flight 401 check
-        # This catches OAuth requirements before langchain-mcp-adapters wraps the error
-        if detected_transport in ['streamable_http', 'sse', 'http']:
-            await self._preflight_auth_check()
+        decision = await self._preflight_auth_check() if self.transport in NEGOTIABLE_TRANSPORTS else None
+        detected_transport = decision.transport if decision else self._detect_transport()
+        self._resolved_url = decision.url if decision else self.url
 
         # Build server config for langchain-mcp-adapters
         # Note: SSL verification is handled via httpx_client_factory in _build_server_config
@@ -201,6 +223,9 @@ class UnifiedMcpClient:
             ) from e
         except BaseException as e:
             self._raise_if_size_tripped()
+            unauthorized = find_unauthorized_response(e)
+            if unauthorized is not None and not self.configured_auth:
+                await self._handle_401_response(unauthorized)
             # langchain-mcp-adapters uses asyncio.TaskGroup internally, which wraps
             # exceptions in ExceptionGroup. Unwrap it so callers see the real error.
             if hasattr(e, 'exceptions') and e.exceptions:
@@ -234,22 +259,9 @@ class UnifiedMcpClient:
 
         Mimics the logic from custom McpClient._auto_detect_and_connect.
         """
-        if self.transport != "auto":
+        if self.transport != AUTO:
             return self.transport
-
-        # If URL ends with /sse, use SSE transport
-        if self.url.rstrip('/').endswith('/sse'):
-            logger.debug("[Unified MCP] URL ends with /sse, using SSE transport")
-            return "sse"
-
-        # Default to streamable_http for HTTP URLs.
-        # URL scheme is already validated in _connect(), so the fallback below is unreachable
-        # for auto-detected transport — kept for defensive completeness only.
-        if self.url.startswith('http://') or self.url.startswith('https://'):
-            return "streamable_http"
-
-        # Fallback (unreachable when called from _connect() — scheme validated upstream)
-        return "streamable_http"
+        return transport_from_url_suffix(self.url)
 
     def _build_server_config(self, transport: str) -> Dict[str, Any]:
         """
@@ -262,7 +274,7 @@ class UnifiedMcpClient:
         }
 
         if transport in ['streamable_http', 'sse', 'http']:
-            config['url'] = self.url
+            config['url'] = self._resolved_url or self.url
             if self.headers:
                 config['headers'] = self.headers
             # Bound the MCP session's request/response wait. mcp's ClientSession
@@ -307,169 +319,45 @@ class UnifiedMcpClient:
         if self._size_trip.tripped:
             raise McpResponseTooLargeError(self._size_trip.message(self.tool_name))
 
-    async def _preflight_auth_check(self):
-        """
-        Pre-flight check for authentication requirements.
-
-        Makes a test initialize request to the MCP server BEFORE attempting
-        to connect with langchain-mcp-adapters. This allows us to catch 401
-        responses and extract OAuth metadata from the raw HTTP response.
-
-        Raises:
-            McpAuthorizationRequired: If server returns 401 with OAuth metadata
-        """
-        import aiohttp
-        import ssl
-        from ..utils.mcp_oauth import McpAuthorizationRequired
-
-        # Configure SSL context based on ssl_verify setting
-        ssl_context = None
-        if not self.ssl_verify:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            logger.warning("[Unified MCP] SSL verification disabled for preflight check")
-
+    async def _preflight_auth_check(self) -> Optional[TransportDecision]:
+        negotiator = TransportNegotiator(
+            url=self.url,
+            headers=self.headers,
+            ssl_verify=self.ssl_verify,
+            configured_auth=self.configured_auth,
+            requested_transport=self.transport,
+            on_unauthorized=self._handle_401_response,
+        )
         try:
-            # Create connector with SSL settings
-            connector = aiohttp.TCPConnector(ssl=ssl_context) if not self.ssl_verify else None
-            # Make a test request to check for 401
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10),
-                connector=connector
-            ) as session:
-                headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                    **self.headers
-                }
-
-                # Try to make a simple initialize request
-                init_request = {
-                    "jsonrpc": "2.0",
-                    "id": str(uuid.uuid4()),
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "ELITEA MCP Client",
-                            "version": "1.0.0"
-                        }
-                    }
-                }
-
-                # allow_redirects=False: an OIDC/forward-auth proxy answers an
-                # unauthenticated MCP POST with a 3xx redirect to a login page
-                # instead of a proper 401 challenge. If we follow it we land on a
-                # 200 HTML login page, which the real MCP client cannot parse and
-                # which makes initialize() hang. Surface the redirect as an error.
-                async with session.post(
-                    self.url, json=init_request, headers=headers, allow_redirects=False
-                ) as response:
-                    if 300 <= response.status < 400:
-                        location = response.headers.get('Location', '')
-                        logger.warning(
-                            f"[Unified MCP] Server returned redirect ({response.status}) "
-                            f"to {location!r}: {self.url}"
-                        )
-                        raise ValueError(
-                            f"The MCP server redirected the request ({response.status}). "
-                            "This usually means the endpoint is behind an SSO/login proxy "
-                            "that is not returning a proper 401 authentication challenge. "
-                            "Please verify the server URL and authentication in the toolkit settings."
-                        )
-                    if response.status == 401:
-                        # Extract OAuth metadata and raise McpAuthorizationRequired
-                        try:
-                            await self._handle_401_response(response)
-                        except Exception as handle_ex:
-                            logger.error(f"[Unified MCP] _handle_401_response raised: {type(handle_ex).__name__}: {handle_ex}")
-                            raise
-                    elif response.status == 400 and self.configured_auth:
-                        # Some MCP servers (e.g. GitHub Copilot) return 400 for an invalid/malformed
-                        # token instead of 401. When the user configured a static auth token and we
-                        # get 400, treat it as a credential problem so the user gets a clear message.
-                        logger.warning(
-                            f"[Unified MCP] Server returned 400 with configured auth token - "
-                            f"likely invalid or malformed token"
-                        )
-                        raise ValueError(
-                            "The MCP server rejected the request (400 Bad Request). "
-                            "Your API token may be invalid or malformed. "
-                            "Please check the credentials in the toolkit settings."
-                        )
-                    elif response.status == 404:
-                        # MCP endpoint not found - wrong URL
-                        logger.warning(f"[Unified MCP] MCP endpoint not found (404): {self.url}")
-                        raise ValueError(
-                            f"MCP server endpoint not found (404). "
-                            f"Please verify the server URL is correct: {self.url}"
-                        )
-                    elif response.status == 403:
-                        # Forbidden - authentication succeeded but authorization failed
-                        logger.warning(f"[Unified MCP] Access forbidden (403): {self.url}")
-                        raise ValueError(
-                            "Access forbidden (403). Your credentials are valid but you don't have "
-                            "permission to access this MCP server. Please check with your administrator."
-                        )
-                    elif response.status == 500:
-                        # Internal server error
-                        logger.warning(f"[Unified MCP] MCP server error (500): {self.url}")
-                        raise ValueError(
-                            "The MCP server encountered an internal error (500). "
-                            "Please try again later or contact the server administrator."
-                        )
-                    elif response.status == 502 or response.status == 503:
-                        # Bad gateway or service unavailable
-                        logger.warning(f"[Unified MCP] MCP server unavailable ({response.status}): {self.url}")
-                        raise ValueError(
-                            f"The MCP server is unavailable ({response.status}). "
-                            "It may be down for maintenance. Please try again later."
-                        )
-                    elif response.status >= 400:
-                        # Other HTTP errors
-                        logger.warning(f"[Unified MCP] MCP server error ({response.status}): {self.url}")
-                        raise ValueError(
-                            f"The MCP server returned an error ({response.status}). "
-                            "Please verify the server URL and try again."
-                        )
-                    else:
-                        # 2xx but not a valid MCP response. A login proxy may serve an
-                        # HTML page with 200 OK; the real MCP client would treat this as
-                        # an "unexpected content type", drop the error, and hang. Detect
-                        # the HTML content-type here and fail fast instead.
-                        content_type = response.headers.get('Content-Type', '').lower()
-                        if 'text/html' in content_type:
-                            logger.warning(
-                                f"[Unified MCP] Server returned HTML ({content_type}) with "
-                                f"status {response.status} instead of an MCP response: {self.url}"
-                            )
-                            raise ValueError(
-                                "The MCP server returned an HTML page instead of an MCP/JSON "
-                                "response. This usually means the endpoint is behind an SSO/login "
-                                "proxy. Please verify the server URL and authentication in the "
-                                "toolkit settings."
-                            )
-                    # Not a 401/400 auth error, auth check passed (or server will handle auth differently)
-
+            return await negotiator.negotiate()
         except (McpAuthorizationRequired, ValueError):
-            # Re-raise auth-related exceptions and HTTP errors so callers can handle them properly:
-            # - McpAuthorizationRequired: triggers the OAuth flow
-            # - ValueError: HTTP errors (404, 403, 500, etc.) or invalid credentials
             raise
-        except Exception as e:
-            # If pre-flight check fails for OTHER reasons (network, DNS, timeout), log but don't block
-            # Let langchain-mcp-adapters try and it will fail with proper error
-            logger.warning(f"[Unified MCP] Pre-flight check failed (non-HTTP error): {type(e).__name__}: {e}")
-            # Only network/DNS errors are ignored - langchain-mcp-adapters will handle them
+        except Exception as error:  # pylint: disable=W0718
+            logger.warning(f"[Unified MCP] Transport negotiation for {self.url} failed "
+                           f"({type(error).__name__}: {error}); falling back to the URL suffix")
+            return None
+
+    def _metadata_client(self, metadata_url: str) -> httpx.AsyncClient:
+        verify_certificate = self.ssl_verify or not shares_scheme_and_host(self.url, metadata_url)
+        factory = build_httpx_client_factory(verify_certificate, None, SizeTrip())
+        client = factory(timeout=httpx.Timeout(METADATA_TIMEOUT_SECONDS))
+        if not verify_certificate:
+            client.event_hooks["request"].append(self._refuse_unverified_hop_off_the_configured_host)
+        return client
+
+    async def _refuse_unverified_hop_off_the_configured_host(self, request: httpx.Request) -> None:
+        if not shares_scheme_and_host(self.url, str(request.url)):
+            raise httpx.RequestError(
+                f"Refusing to leave {self.url} without certificate verification: {request.url}",
+                request=request,
+            )
 
     async def _handle_401_response(self, response):
         """
         Handle 401 Unauthorized response by extracting OAuth metadata and raising exception.
 
         Args:
-            response: aiohttp.ClientResponse with 401 status
+            response: HTTP response with 401 status (anything exposing ``headers``)
 
         Raises:
             ValueError: When configured_auth=True (DB-configured credentials are invalid)
@@ -547,9 +435,7 @@ class UnifiedMcpClient:
         # Fall back to resource_metadata if authorization_uri didn't work
         if not metadata:
             if resource_metadata_url:
-                # Create a new session for fetching resource metadata
-                import aiohttp
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with self._metadata_client(resource_metadata_url) as session:
                     metadata = await fetch_resource_metadata_async(
                         resource_metadata_url,
                         session=session,

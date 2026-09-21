@@ -342,7 +342,6 @@ def test_real_transport_surfaces_size_error_and_fetches_the_body_once(monkeypatc
             timeout=10,
             tool_name='big_tool',
         )
-        # The pre-flight check uses aiohttp against the real network; not under test here.
         monkeypatch.setattr(client, '_preflight_auth_check', lambda: asyncio.sleep(0))
         async with client:
             await client.call_tool('big_tool', {})
