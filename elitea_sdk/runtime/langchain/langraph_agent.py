@@ -85,6 +85,36 @@ _CONTENT_BLOCK_KEYS = {
 }
 
 
+def _usage_metadata_from_context_info(context_info: Any) -> Optional[dict]:
+    """Rebuild a usage_metadata dict from the token breakdown an LLM node reported.
+
+    The full-conversation recount replaces the turn's AIMessage with a plain
+    content placeholder, which would strip the provider's own numbers. The
+    breakdown already carries them, so hand them back in usage_metadata's shape.
+    """
+    if not isinstance(context_info, dict):
+        return None
+    input_tokens = context_info.get('provider_input_tokens')
+    output_tokens = context_info.get('provider_output_tokens')
+    if input_tokens is None and output_tokens is None:
+        return None
+    input_tokens = int(input_tokens or 0)
+    output_tokens = int(output_tokens or 0)
+    usage = {
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens,
+        'total_tokens': input_tokens + output_tokens,
+    }
+    details = {}
+    for key, dest in (('cache_read_tokens', 'cache_read'),
+                      ('cache_creation_tokens', 'cache_creation')):
+        if context_info.get(key) is not None:
+            details[dest] = int(context_info[key])
+    if details:
+        usage['input_token_details'] = details
+    return usage
+
+
 def _is_content_block(block) -> bool:
     """A message content block, as opposed to a record that merely lives in a list."""
     if isinstance(block, str):
@@ -2764,10 +2794,18 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 elif isinstance(user_input, list) and user_input:
                     # Multimodal content list
                     msgs_for_recount.append(HumanMessage(content=user_input))
-            # Add response message placeholder (the assistant's reply for this turn)
+            # Add response message placeholder (the assistant's reply for this turn).
+            # The placeholder must carry the usage the provider reported for this
+            # same turn: it is the only AIMessage the recount sees, and without it
+            # the accountant loses the provider total and falls back to estimating.
             output_content = result_with_state.get('output', '')
             if output_content and isinstance(output_content, str):
-                msgs_for_recount.append(AIMessage(content=output_content))
+                msgs_for_recount.append(AIMessage(
+                    content=output_content,
+                    usage_metadata=_usage_metadata_from_context_info(
+                        result_with_state.get('context_info')
+                    ),
+                ))
             # Run after_model to recalculate context_info from full conversation
             _mw_manager.run_after_model({'messages': msgs_for_recount}, config or {})
             recalculated = _mw_manager.get_context_info()

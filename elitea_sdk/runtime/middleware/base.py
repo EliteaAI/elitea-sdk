@@ -363,16 +363,23 @@ class MiddlewareManager:
         Get current context info (always available, not just after summarization).
 
         Returns:
-            Dict with message_count, token_count, summarized (always present)
+            Dict with message_count, token_count, summarized and the token
+            breakdown keys (always present)
         """
         for mw in self._middleware:
             if hasattr(mw, 'last_context_info') and mw.last_context_info:
                 return mw.last_context_info
 
+        try:
+            from .summarization.accounting import empty_token_info
+            token_info = empty_token_info()
+        except ImportError:
+            token_info = {'token_count': 0}
+
         return {
             'message_count': 0,
-            'token_count': 0,
             'summarized': False,
+            **token_info,
         }
 
     @staticmethod

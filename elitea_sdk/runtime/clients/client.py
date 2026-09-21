@@ -897,6 +897,7 @@ class EliteAClient:
                 conversation_id=conversation_id,
                 callbacks=callbacks if callbacks else None,
                 summarization_enabled=enable_summarization,
+                count_overhead_in_trigger=context_settings.get('count_overhead_in_trigger', False),
             )
             middleware_list.append(summarization_middleware)
         except Exception as e:

@@ -912,6 +912,26 @@ class LLMNode(BaseTool):
             # Non-fatal: the turn-end consumed list is the authoritative signal.
             logger.debug(f"Failed to dispatch injection ack for {injection_id}: {e}")
 
+    def _report_prompt_overhead(self, messages: List, bound_tools: List) -> None:
+        """Tell the summarization middleware what the hidden prefix costs."""
+        middleware_mgr = self.middleware_manager
+        if middleware_mgr is None:
+            return
+
+        system_content = next(
+            (m.content for m in (messages or []) if isinstance(m, SystemMessage)),
+            None,
+        )
+
+        for mw in getattr(middleware_mgr, '_middleware', []):
+            setter = getattr(mw, 'set_prompt_overhead', None)
+            if setter is None:
+                continue
+            try:
+                setter(system_content=system_content, tools=bound_tools)
+            except Exception as e:
+                logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
+
     @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
         """Remove AI tool calls that lack matching tool results immediately after.
@@ -1376,6 +1396,8 @@ class LLMNode(BaseTool):
             bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
         )
 
+        bound_tools = []
+
         if should_bind_tools:
             filtered_tools = (
                 prebuilt_filtered_tools if prebuilt_filtered_tools is not None
@@ -1388,9 +1410,14 @@ class LLMNode(BaseTool):
                     len(binding_plan.provider_tools),
                     [tool.name for tool in binding_plan.provider_tools],
                 )
+                bound_tools = binding_plan.provider_tools
                 llm_client = self.client.bind_tools(binding_plan.provider_tools)
             else:
                 logger.warning("No tools to bind to LLM")
+
+        # The system prompt and the tool schemas occupy the context window on every
+        # request but are hidden from the middleware, which only sees message history.
+        self._report_prompt_overhead(messages, bound_tools)
 
         if self.structured_output and self.output_variables:
             # Handle structured output
@@ -1839,6 +1866,13 @@ class LLMNode(BaseTool):
         ai_message_kwargs = {'content': text_content}
         if thinking:
             ai_message_kwargs['additional_kwargs'] = {'thinking': thinking}
+        # Re-rendering the content must not drop what the provider reported about
+        # this same turn: usage_metadata is the only record of the real prompt and
+        # completion sizes, and the context accountant reads it back off the state.
+        for attr in ('usage_metadata', 'response_metadata', 'id'):
+            value = getattr(completion, attr, None)
+            if value:
+                ai_message_kwargs[attr] = value
         ai_message = AIMessage(**ai_message_kwargs)
 
         # Try to extract JSON if output variables are specified (but exclude 'messages' which is handled separately)
