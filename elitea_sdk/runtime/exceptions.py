@@ -1,3 +1,15 @@
+class AutoRoutingChildModelRequired(ValueError):
+    """An embedded child cannot implicitly inherit an unresolved Auto client."""
+
+    error_code = "auto_child_model_required"
+
+    def __init__(self):
+        super().__init__(
+            "This agent has no effective model after default resolution. Restore its project "
+            "default or save a valid model or Auto before running it."
+        )
+
+
 class PipelineConfigurationError(Exception):
     """Raised when pipeline configuration is invalid.
 
