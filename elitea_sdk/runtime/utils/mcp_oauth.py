@@ -12,6 +12,8 @@ from langchain_core.tools import ToolException
 logger = logging.getLogger(__name__)
 
 MCP_AUTH_DECISION_TYPE = "mcp_auth_decision"
+OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN = "oauth-authorization-server"
+OPENID_CONFIGURATION_WELL_KNOWN = "openid-configuration"
 
 
 def _is_http_url(value: Optional[str]) -> bool:
@@ -328,21 +330,81 @@ def fetch_oauth_authorization_server_metadata(url: str, timeout: int = 10, extra
         # If direct fetch failed, don't try other endpoints
         return None
     
-    # Otherwise, try extra endpoints first, then standard discovery endpoints
-    discovery_endpoints = list(extra_endpoints or []) + [
-        f"{url}/.well-known/oauth-authorization-server",
-        f"{url}/.well-known/openid-configuration",
-    ]
-    
-    for endpoint in discovery_endpoints:
-        try:
-            resp = requests.get(endpoint, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as exc:
-            logger.debug(f"Failed to fetch OAuth metadata from {endpoint}: {exc}")
+    for endpoint in extra_endpoints or []:
+        document = _fetch_json_document(endpoint, timeout)
+        if document is not None:
+            return document
+
+    fetched_documents: Dict[str, Optional[Dict[str, Any]]] = {}
+    for endpoint in authorization_server_metadata_urls(url):
+        document = _fetch_json_document_once(endpoint, timeout, fetched_documents)
+        if document is None:
             continue
-    
+        if _is_issued_by(document, url):
+            return document
+        logger.debug(f"Ignoring OAuth metadata from {endpoint}: issuer {document.get('issuer')!r} does not match {url!r}")
+
+    return _find_legacy_appended_document(url, timeout, fetched_documents)
+
+
+def legacy_appended_metadata_urls(issuer: str) -> list:
+    stripped = issuer.rstrip("/")
+    return [
+        f"{stripped}/.well-known/{OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN}",
+        f"{stripped}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}",
+    ]
+
+
+def _find_legacy_appended_document(
+    issuer: str, timeout: int, fetched_documents: Dict[str, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    for endpoint in legacy_appended_metadata_urls(issuer):
+        document = _fetch_json_document_once(endpoint, timeout, fetched_documents)
+        if document is not None:
+            logger.debug(f"Using OAuth metadata from {endpoint} with issuer {document.get('issuer')!r} for {issuer!r}")
+            return document
+    return None
+
+
+def _fetch_json_document_once(
+    endpoint: str, timeout: int, fetched_documents: Dict[str, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    if endpoint not in fetched_documents:
+        fetched_documents[endpoint] = _fetch_json_document(endpoint, timeout)
+    return fetched_documents[endpoint]
+
+
+def authorization_server_metadata_urls(issuer: str) -> list:
+    parsed = urlparse(issuer.rstrip("/"))
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path
+    if not path:
+        return [
+            f"{origin}/.well-known/{OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN}",
+            f"{origin}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}",
+        ]
+    return [
+        f"{origin}/.well-known/{OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN}{path}",
+        f"{origin}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}{path}",
+        f"{origin}{path}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}",
+    ]
+
+
+def _is_issued_by(document: Dict[str, Any], issuer: str) -> bool:
+    document_issuer = document.get("issuer")
+    if not isinstance(document_issuer, str):
+        return False
+    return document_issuer.rstrip("/") == issuer.rstrip("/")
+
+
+def _fetch_json_document(endpoint: str, timeout: int) -> Optional[Dict[str, Any]]:
+    try:
+        resp = requests.get(endpoint, timeout=timeout)
+        if resp.status_code == 200:
+            document = resp.json()
+            return document if isinstance(document, dict) else None
+    except Exception as exc:
+        logger.debug(f"Failed to fetch OAuth metadata from {endpoint}: {exc}")
     return None
 
 
