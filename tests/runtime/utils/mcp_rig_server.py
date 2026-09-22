@@ -26,12 +26,58 @@ ECHO_TOOL = types.Tool(
 )
 
 
-def build_mcp_server() -> Server:
-    server = Server("elitea-6688-rig")
+SCHEMA_TOOLS = [
+    types.Tool(name="echo_ref", description="Local $ref into $defs", inputSchema={
+        "type": "object",
+        "$defs": {"Filter": {"type": "object", "properties": {
+            "state": {"type": "string", "enum": ["open", "closed"]}, "limit": {"type": "integer"}}, "required": ["state"]}},
+        "properties": {"filter": {"$ref": "#/$defs/Filter"}},
+        "required": ["filter"],
+    }),
+    types.Tool(name="echo_ref_network", description="$ref to a network URI", inputSchema={
+        "type": "object",
+        "properties": {"doc": {"$ref": "https://schemas.example.com/doc.json", "description": "A document"}},
+    }),
+    types.Tool(name="echo_const", description="const", inputSchema={
+        "type": "object", "properties": {"mode": {"const": "fast"}}, "required": ["mode"],
+    }),
+    types.Tool(name="echo_int_enum", description="integer enum", inputSchema={
+        "type": "object", "properties": {"level": {"type": "integer", "enum": [1, 2, 3]}}, "required": ["level"],
+    }),
+    types.Tool(name="echo_type_array", description="type array without null", inputSchema={
+        "type": "object", "properties": {"id": {"type": ["string", "integer"]}}, "required": ["id"],
+    }),
+    types.Tool(name="echo_constraints", description="numeric, string and array bounds", inputSchema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 64},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10},
+        },
+        "additionalProperties": False,
+    }),
+    types.Tool(name="echo_additional_properties", description="accepts undeclared arguments", inputSchema={
+        "type": "object", "properties": {"q": {"type": "string"}}, "additionalProperties": True,
+    }),
+    types.Tool(name="echo_all_of", description="allOf", inputSchema={
+        "type": "object",
+        "properties": {"opts": {"allOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}},
+            {"type": "object", "properties": {"b": {"type": "integer"}}},
+        ]}},
+    }),
+    types.Tool(name="echo_brackets", description="property name invalid for LLM providers", inputSchema={
+        "type": "object", "properties": {"fname[]": {"type": "array", "items": {"type": "string"}}}, "required": ["fname[]"],
+    }),
+]
+
+
+def build_mcp_server(name: str = "elitea-6688-rig", tools: list = (ECHO_TOOL,)) -> Server:
+    server = Server(name)
 
     @server.list_tools()
     async def list_tools():
-        return [ECHO_TOOL]
+        return list(tools)
 
     @server.call_tool(validate_input=False)
     async def call_tool(name, arguments):
@@ -112,19 +158,26 @@ async def rejects_token(request: Request) -> Response:
 def build_rig_app(login_port: int) -> Starlette:
     server = build_mcp_server()
     manager = StreamableHTTPSessionManager(app=server, stateless=False)
+    schema_manager = StreamableHTTPSessionManager(
+        app=build_mcp_server("elitea-6690-schemas", SCHEMA_TOOLS), stateless=False
+    )
     events_transport = SseServerTransport("/events-messages/")
     sse_transport = SseServerTransport("/sse-messages/")
 
     async def streamable(scope, receive, send):
         await manager.handle_request(scope, receive, send)
 
+    async def schema_streamable(scope, receive, send):
+        await schema_manager.handle_request(scope, receive, send)
+
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        async with manager.run():
+        async with manager.run(), schema_manager.run():
             yield
 
     return Starlette(routes=[
         Mount("/mcp", app=streamable),
+        Mount("/schemas/mcp", app=schema_streamable),
         Route("/events", endpoint=legacy_sse_endpoint(server, events_transport), methods=["GET"]),
         Mount("/events-messages/", app=events_transport.handle_post_message),
         Route("/sse", endpoint=legacy_sse_endpoint(server, sse_transport), methods=["GET"]),

@@ -42,6 +42,18 @@ in case your key is "chat_history" value should be a list of messages with roles
 Tool won't have access to conversation so all keys and values need to be actual and independent.
 Answer must be JSON only extractable by JSON.LOADS."""
 
+    def _structured_output_schema(self):
+        # Every field is required (defaults cut) and chat_history is dropped, for
+        # application as a tool. A dict args_schema (MCP tools) comes back as a dict.
+        args_schema = self.tool.args_schema
+        if isinstance(args_schema, dict):
+            properties = {name: prop for name, prop in (args_schema.get("properties") or {}).items()
+                          if name != 'chat_history'}
+            return {**args_schema, "title": "NewModel", "properties": properties, "required": list(properties)}
+        fields = {name: (field.annotation, ...) for name, field
+                  in args_schema.model_fields.items() if name != 'chat_history'}
+        return create_model('NewModel', **fields)
+
     def invoke(
             self,
             state: Union[str, dict, ToolCall],
@@ -77,14 +89,9 @@ Answer must be JSON only extractable by JSON.LOADS."""
             ))
         ]
         if self.structured_output:
-            # cut defaults from schema and remove chat_history for application as a tool
-            fields = {name: (field.annotation, ...) for name, field
-                      in self.tool.args_schema.model_fields.items() if name != 'chat_history'}
-            input_schema = create_model('NewModel', **fields)
-
-            llm = self.client.with_structured_output(input_schema)
+            llm = self.client.with_structured_output(self._structured_output_schema())
             completion = llm.invoke(input_, config=config)
-            result = completion.model_dump()
+            result = completion if isinstance(completion, dict) else completion.model_dump()
         else:
             input_[-1].content += self.unstructured_output
             completion = self.client.invoke(input_, config=config)

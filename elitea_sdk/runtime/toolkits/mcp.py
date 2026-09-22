@@ -13,6 +13,7 @@ from langchain_core.tools import BaseToolkit, BaseTool
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from ..tools.mcp_server_tool import McpServerTool
+from ..tools.mcp_input_schema import build_mcp_args_schema
 from ..tools.mcp_remote_tool import McpRemoteTool
 from ..tools.mcp_inspect_tool import McpInspectTool
 from ..models.mcp_models import McpConnectionConfig
@@ -786,9 +787,7 @@ class McpToolkit(BaseToolkit):
             return McpRemoteTool(
                 name=tool_name,
                 description=description,
-                args_schema=McpServerTool.create_pydantic_model_from_schema(
-                    tool_dict.get("inputSchema", {})
-                ),
+                **build_mcp_args_schema(tool_dict.get("inputSchema", {}), tool_name),
                 client=client,
                 server=toolkit_name,
                 server_url=connection_config.url,
@@ -902,7 +901,7 @@ class McpToolkit(BaseToolkit):
             return McpServerTool(
                 name=tool_name,
                 description=description,
-                args_schema=McpServerTool.create_pydantic_model_from_schema(tool_metadata.input_schema),
+                **build_mcp_args_schema(tool_metadata.input_schema, tool_name),
                 client=client,
                 server=tool_metadata.server,
                 tool_timeout_sec=timeout,
@@ -938,9 +937,7 @@ class McpToolkit(BaseToolkit):
             return McpServerTool(
                 name=tool_name,
                 description=description,
-                args_schema=McpServerTool.create_pydantic_model_from_schema(
-                    available_tool.get("inputSchema", {})
-                ),
+                **build_mcp_args_schema(available_tool.get("inputSchema", {}), tool_name),
                 client=client,
                 server=toolkit_name,
                 tool_timeout_sec=timeout,
