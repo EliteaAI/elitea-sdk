@@ -42,6 +42,7 @@ from ..exceptions import budget_exceeded_from
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from pydantic import BaseModel, Field
 
+from ..utils.toolkit_utils import get_args_json_schema
 from ..utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 from ...tools.utils.serialization import serialize_tool_result
 
@@ -329,14 +330,10 @@ class ToolRegistry:
             'description': tool.description or '',
         }
 
-        # Extract parameters schema
-        if hasattr(tool, 'args_schema') and tool.args_schema:
-            try:
-                schema['parameters'] = tool.args_schema.model_json_schema()
-            except Exception as e:
-                logger.debug(f"Could not extract schema for {tool_name}: {e}")
-                schema['parameters'] = {}
-        else:
+        try:
+            schema['parameters'] = get_args_json_schema(tool)
+        except Exception as e:
+            logger.debug(f"Could not extract schema for {tool_name}: {e}")
             schema['parameters'] = {}
 
         return schema

@@ -175,3 +175,15 @@ def get_tool_names(tools: List[Any]) -> List[str]:
             tool_names.append(str(tool))
     
     return tool_names
+
+
+def get_args_json_schema(tool: Any) -> Dict[str, Any]:
+    """The JSON Schema of a tool's arguments, whether its args_schema is a model or a raw dict (MCP tools)."""
+    args_schema = getattr(tool, "args_schema", None)
+    if not args_schema:
+        return {}
+    if isinstance(args_schema, dict):
+        return args_schema
+    if hasattr(args_schema, "model_json_schema"):
+        return args_schema.model_json_schema()
+    return args_schema.schema()

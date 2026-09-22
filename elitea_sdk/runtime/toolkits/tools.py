@@ -23,6 +23,7 @@ from .mcp_config import (
     load_mcp_servers_config,
 )
 from ..tools.mcp_server_tool import McpServerTool
+from ..tools.mcp_input_schema import build_mcp_args_schema
 from ..tools.sandbox import SandboxToolkit
 from ..tools.data_analysis import DataAnalysisToolkit
 # Import community tools
@@ -1920,9 +1921,7 @@ def _init_single_mcp_tool(server_toolkit_name, toolkit_name, available_tool, eli
         tool = McpServerTool(
             name=tool_name,
             description=description,
-            args_schema=McpServerTool.create_pydantic_model_from_schema(
-                available_tool.get("inputSchema", {})
-            ),
+            **build_mcp_args_schema(available_tool.get("inputSchema", {}), tool_name),
             client=elitea,
             server=server_toolkit_name,
             tool_timeout_sec=toolkit_settings.get("timeout", 90)
