@@ -2214,7 +2214,14 @@ class EliteAClient:
         import time
         # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient
         from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
-        from ..utils.mcp_oauth import canonical_resource, normalize_mcp_url
+        from ..utils.mcp_oauth import (
+            as_header_mapping,
+            canonical_resource,
+            drop_unusable_authorization,
+            has_authorization_on_the_wire,
+            merge_oauth_authorization,
+            normalize_mcp_url,
+        )
 
         toolkit_name = toolkit_config.get('toolkit_name', 'unknown')
         settings = toolkit_config.get('settings', {})
@@ -2231,15 +2238,9 @@ class EliteAClient:
             }
 
         headers = settings.get('headers') or {}
-
-        # Capture whether the DB-configured headers contain an Authorization header,
-        # before any OAuth token is merged in. Used to distinguish "bad static token"
-        # (should raise ValueError) from "OAuth token needed" (should raise McpAuthorizationRequired).
-        configured_auth = any(k.lower() == 'authorization' for k in headers)
-
         session_id = settings.get('session_id')
+        access_token = None
 
-        # Apply OAuth token if available
         if mcp_tokens and url:
             canonical_url = canonical_resource(url)
             token_data = mcp_tokens.get(canonical_url)
@@ -2252,10 +2253,14 @@ class EliteAClient:
                     # Backward compatibility: plain token string
                     access_token = token_data
 
-                if access_token:
-                    headers = dict(headers)  # Copy to avoid mutating original
-                    headers.setdefault('Authorization', f'Bearer {access_token}')
-                    logger.info(f"[MCP Auth Check] Applied OAuth token for {canonical_url}")
+        # Same precedence as Load Tools and the agent run: a configured credential wins,
+        # an unresolved template yields to the token or is not sent at all.
+        headers, oauth_token_injected = merge_oauth_authorization(as_header_mapping(headers), access_token)
+        if oauth_token_injected:
+            logger.info(f"[MCP Auth Check] Applied OAuth token for {canonical_resource(url)}")
+        else:
+            headers = drop_unusable_authorization(headers)
+        configured_auth = has_authorization_on_the_wire(headers, oauth_token_injected)
 
         logger.info(f"Testing MCP connection to '{toolkit_name}' at {url}")
 

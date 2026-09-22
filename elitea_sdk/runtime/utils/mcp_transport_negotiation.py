@@ -9,6 +9,7 @@ import httpx
 from httpx_sse import EventSource
 
 from .mcp_oauth import (
+    GITHUB_BAD_TOKEN_MESSAGE,
     McpEndpointError,
     html_login_page_message,
     retired_endpoint_message,
@@ -31,11 +32,6 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 LEGACY_SSE_SUFFIX = "/sse"
 CURRENT_TRANSPORT_SUFFIX = "/mcp"
 PROBE_PROTOCOL_VERSION = "2024-11-05"
-GITHUB_BAD_TOKEN_MESSAGE = (
-    "The MCP server rejected the request (400 Bad Request). "
-    "Your API token may be invalid or malformed. "
-    "Please check the credentials in the toolkit settings."
-)
 
 UnauthorizedHandler = Callable[[httpx.Response], Awaitable[None]]
 
