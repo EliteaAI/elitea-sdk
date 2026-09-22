@@ -13,7 +13,6 @@ from typing import Any
 from json.encoder import encode_basestring_ascii
 from urllib.parse import unquote
 
-from langchain_core.utils.json_schema import dereference_refs
 from pydantic import TypeAdapter, ValidationError
 
 logger = getLogger(__name__)
@@ -42,6 +41,11 @@ _DIGITS_PER_BIT = math.log10(2)
 _FLOAT_SPELLINGS = {math.inf: "Infinity", -math.inf: "-Infinity"}
 # Pydantic's lax scalar validators, i.e. the conversions the Pydantic args_schema
 # applied before #6690, e.g. "5" -> 5 and "true" -> True.
+# Real schemas nest under 20 levels. LangChain's binder spends about two stack
+# frames per level, so this leaves room for a deep caller stack.
+_MAX_BINDABLE_DEPTH = 100
+# Deeper than any real tool's arguments; bounds the walk over model-supplied values.
+_MAX_CONFORM_DEPTH = 32
 _SCALAR_VALIDATORS = {"integer": TypeAdapter(int), "number": TypeAdapter(float), "boolean": TypeAdapter(bool)}
 
 
@@ -72,7 +76,7 @@ def build_mcp_args_schema(input_schema: Any, tool_name: str = "") -> dict[str, A
             {keyword: value for keyword, value in document.items() if keyword not in _DEFINITION_KEYWORDS}
         )
     except (_ExpansionBudgetExceeded, RecursionError) as error:
-        _warn_binding_untyped(tool_name, error)
+        _warn_binding_untyped(tool_name, f"{type(error).__name__}: {error}")
         schema = _flat_schema(document)
     schema.setdefault("type", "object")
     properties = schema.get("properties")
@@ -89,20 +93,55 @@ def build_mcp_args_schema(input_schema: Any, tool_name: str = "") -> dict[str, A
 
 def conform_mcp_arguments(schema: dict, arguments: dict) -> dict:
     """Convert string arguments to the scalar type their parameter declares, and drop
-    arguments the schema forbids (``additionalProperties: false``).
+    arguments the schema forbids (``additionalProperties: false``), at any depth.
 
     A dict args_schema is not validated by LangChain, and pipeline input mappings
     render every value as a string, so without this "5" reaches a server that
-    declared an integer.
+    declared an integer. The Pydantic args_schema this replaced converted nested
+    values too.
     """
-    properties = schema.get("properties") or {}
-    if schema.get("additionalProperties") is False:
-        arguments = {name: value for name, value in arguments.items() if name in properties}
-    return {name: _coerce_scalar(properties.get(name), value) for name, value in arguments.items()}
+    return _conform(schema, arguments, depth=0)
 
 
-def _coerce_scalar(prop: Any, value: Any) -> Any:
-    validator = _SCALAR_VALIDATORS.get(_declared_scalar_type(prop)) if isinstance(value, str) else None
+def _conform(schema: Any, value: Any, depth: int) -> Any:
+    if depth > _MAX_CONFORM_DEPTH or not isinstance(schema, dict):
+        return value
+    if isinstance(value, str):
+        return _coerce_scalar(schema, value)
+    branch = _branch_for(schema, value)
+    if branch is not None:
+        # The keywords beside anyOf/oneOf and the matched branch both apply.
+        parent = {keyword: item for keyword, item in schema.items() if keyword not in ("anyOf", "oneOf")}
+        return _conform(branch, _conform(parent, value, depth), depth + 1)
+    if isinstance(value, list):
+        items = schema.get("items")
+        return [_conform(items, item, depth + 1) for item in value] if isinstance(items, dict) else value
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return value
+        if schema.get("additionalProperties") is False:
+            value = {name: item for name, item in value.items() if name in properties}
+        return {name: _conform(properties.get(name), item, depth + 1) for name, item in value.items()}
+    return value
+
+
+def _branch_for(schema: dict, value: Any) -> dict | None:
+    """The one anyOf/oneOf branch that can hold ``value``'s JSON kind, if exactly one can."""
+    kind = "array" if isinstance(value, list) else "object"
+    matching = [alternative for alternative in _alternatives(schema) if alternative.get("type") == kind]
+    return matching[0] if len(matching) == 1 else None
+
+
+def _alternatives(schema: dict) -> list[dict]:
+    for keyword in ("anyOf", "oneOf"):
+        if isinstance(schema.get(keyword), list):
+            return [alternative for alternative in schema[keyword] if isinstance(alternative, dict)]
+    return []
+
+
+def _coerce_scalar(prop: dict, value: str) -> Any:
+    validator = _SCALAR_VALIDATORS.get(_declared_scalar_type(prop))
     if validator is None:
         return value
     try:
@@ -111,14 +150,10 @@ def _coerce_scalar(prop: Any, value: Any) -> Any:
         return value
 
 
-def _declared_scalar_type(prop: Any) -> Any:
-    if not isinstance(prop, dict):
-        return None
+def _declared_scalar_type(prop: dict) -> Any:
     declared = prop.get("type")
     types = list(declared) if isinstance(declared, list) else [declared]
-    for alternative in prop.get("anyOf") or prop.get("oneOf") or ():
-        if isinstance(alternative, dict):
-            types.append(alternative.get("type"))
+    types.extend(alternative.get("type") for alternative in _alternatives(prop))
     non_null = {declared_type for declared_type in types if isinstance(declared_type, str) and declared_type != "null"}
     return non_null.pop() if len(non_null) == 1 else None
 
@@ -183,7 +218,10 @@ class _RefInliner:
         for keyword, value in node.items():
             if keyword in _DATA_KEYWORDS:
                 self._spend(_json_size(value))
-                inlined[keyword] = value
+                # LangChain's binder expands a "$ref" even inside literal data,
+                # with no limit and on every bind, so such a literal is dropped.
+                if not _contains_ref_key(value):
+                    inlined[keyword] = value
             elif keyword in _NAMED_SUBSCHEMA_KEYWORDS and isinstance(value, dict):
                 self._spend(_shallow_json_size(value))
                 inlined[keyword] = {name: self.inline(sub) for name, sub in value.items()}
@@ -275,23 +313,51 @@ def _resolve_pointer(document: dict, ref: str) -> Any:
 
 
 def _bindable(schema: dict, tool_name: str) -> dict:
-    # LangChain still walks the whole schema when binding, including literal
-    # instance data and nested property names, and raises on a "$ref" key it
-    # finds there. Run its resolver now so a schema that would fail degrades
-    # only this tool, instead of failing the bind for the agent.
-    try:
-        dereference_refs(schema)
+    # LangChain's binder recurses through the whole schema, literal values
+    # included, and tries to resolve any "$ref" key it meets. Inlining leaves one
+    # only under a property literally named "$ref", and a server can nest deeper
+    # than the binder's stack allows. Either failure would break the bind of every
+    # tool on the agent, so this tool binds untyped instead.
+    reason = _unbindable_reason(schema)
+    if reason is None:
         return schema
-    except Exception as error:
-        _warn_binding_untyped(tool_name, error)
-        return _flat_schema(schema)
+    _warn_binding_untyped(tool_name, reason)
+    return _flat_schema(schema)
 
 
-def _warn_binding_untyped(tool_name: str, error: BaseException) -> None:
+def _unbindable_reason(schema: dict) -> str | None:
+    pending = [(schema, 0)]
+    while pending:
+        node, depth = pending.pop()
+        if depth > _MAX_BINDABLE_DEPTH:
+            return f"it nests deeper than {_MAX_BINDABLE_DEPTH} levels"
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return 'a "$ref" key remains after inlining'
+            pending.extend((value, depth + 1) for value in node.values())
+        elif isinstance(node, list):
+            pending.extend((item, depth + 1) for item in node)
+    return None
+
+
+def _contains_ref_key(node: Any) -> bool:
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            if "$ref" in current:
+                return True
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
+def _warn_binding_untyped(tool_name: str, reason: str) -> None:
     logger.warning(
-        "MCP tool '%s' declares an input schema that cannot be bound as declared (%s: %s); "
+        "MCP tool '%s' declares an input schema that cannot be bound as declared (%s); "
         "binding its parameters untyped",
-        tool_name, type(error).__name__, error,
+        tool_name, reason,
     )
 
 

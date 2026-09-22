@@ -445,3 +445,184 @@ def test_a_schema_larger_than_the_allowance_stays_typed_when_nothing_expands():
     assert len(json.dumps(declared)) > mcp_input_schema._EXPANSION_ALLOWANCE_CHARS
 
     assert bound_parameters(build_remote_tool("regions", declared)) == declared
+
+
+def literal_ref_chain(keyword, depth):
+    properties = {
+        f"p{index}": {"type": "object", keyword: {"a": {"$ref": f"#/properties/p{index + 1}/{keyword}"},
+                                                 "b": {"$ref": f"#/properties/p{index + 1}/{keyword}"}}}
+        for index in range(depth)
+    }
+    properties[f"p{depth}"] = {"type": "string", keyword: "x"}
+    return {"type": "object", "properties": properties}
+
+
+@pytest.mark.parametrize("keyword", ["default", "examples", "const", "enum"])
+def test_a_literal_holding_a_ref_is_dropped_instead_of_expanding_at_every_bind(keyword):
+    declared = literal_ref_chain(keyword, depth=19)
+
+    bound = bound_parameters(build_remote_tool("literal_refs", declared))
+
+    assert bound["properties"]["p0"] == {"type": "object"}
+    assert bound["properties"]["p19"] == {"type": "string", keyword: "x"}
+    assert len(json.dumps(bound)) < len(json.dumps(declared))
+
+
+def test_many_literals_referencing_one_large_definition_are_dropped():
+    declared = {
+        "type": "object",
+        "$defs": {"Big": {"type": "string", "enum": [f"value{index}" for index in range(20_000)]}},
+        "properties": {f"p{index}": {"type": "string", "default": {"$ref": "#/$defs/Big"}} for index in range(1000)},
+    }
+
+    bound = bound_parameters(build_remote_tool("shared_literal", declared))
+
+    assert bound["properties"] == {f"p{index}": {"type": "string"} for index in range(1000)}
+
+
+def test_a_nested_property_named_ref_binds_the_tool_untyped():
+    declared = {"type": "object", "properties": {"outer": {
+        "type": "object", "description": "outer", "properties": {"$ref": {"type": "string"}},
+    }}}
+
+    assert bound_parameters(build_remote_tool("ref_named", declared)) == {
+        "type": "object", "properties": {"outer": {"type": "object", "description": "outer"}},
+    }
+
+
+NESTED_SCHEMA = {"type": "object", "properties": {
+    "ids": {"type": "array", "items": {"type": "integer"}},
+    "filter": {"type": "object", "additionalProperties": False, "properties": {
+        "limit": {"type": "integer"}, "open": {"type": "boolean"},
+    }},
+    "either": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "string"}]},
+    "broken_union": {"anyOf": 5},
+}}
+
+
+@pytest.mark.parametrize("arguments, expected", [
+    ({"ids": ["1", "2"]}, {"ids": [1, 2]}),
+    ({"filter": {"limit": "5", "open": "true"}}, {"filter": {"limit": 5, "open": True}}),
+    ({"filter": {"limit": "5", "invented": 1}}, {"filter": {"limit": 5}}),
+    ({"either": ["1.5"]}, {"either": [1.5]}),
+    ({"either": "1.5"}, {"either": "1.5"}),
+    ({"ids": ["one"]}, {"ids": ["one"]}),
+    ({"broken_union": "x"}, {"broken_union": "x"}),
+], ids=["array_items", "nested_properties", "nested_closed_object", "matching_union_branch",
+        "string_allowed_by_union", "unconvertible_left_as_is", "non_list_anyof"])
+def test_nested_string_arguments_are_converted_to_the_declared_type(arguments, expected):
+    assert conform_mcp_arguments(NESTED_SCHEMA, arguments) == expected
+
+
+def test_conversion_stops_below_the_depth_limit():
+    schema, value = {"type": "integer"}, "5"
+    for _ in range(40):
+        schema, value = {"type": "object", "properties": {"n": schema}}, {"n": value}
+
+    converted = conform_mcp_arguments(schema, value)
+
+    for _ in range(40):
+        converted = converted["n"]
+    assert converted == "5"
+
+
+def test_nested_string_arguments_reach_the_server_converted(rig_tools):
+    result = rig_tools["echo_ref"].invoke({"filter": {"state": "open", "limit": "5"}})
+
+    assert received_arguments(result) == {"filter": {"state": "open", "limit": 5}}
+
+
+def nested_properties(levels):
+    node = {"type": "string"}
+    for _ in range(levels):
+        node = {"type": "object", "properties": {"child": node}}
+    return {"type": "object", "properties": {"root": node}, "required": ["root"]}
+
+
+def nested_literal(levels, container):
+    value = "leaf"
+    for _ in range(levels):
+        value = {"k": value} if container is dict else [value]
+    return {"type": "object", "properties": {"root": {"type": "object", "default": value}}, "required": ["root"]}
+
+
+DEEPER_THAN_THE_BINDER_ALLOWS = {
+    "nested_properties": nested_properties(300),
+    "nested_default_dicts": nested_literal(500, dict),
+    "nested_default_lists": nested_literal(2000, list),
+}
+
+
+@pytest.mark.parametrize("declared", DEEPER_THAN_THE_BINDER_ALLOWS.values(), ids=DEEPER_THAN_THE_BINDER_ALLOWS)
+def test_a_schema_too_deep_to_bind_degrades_only_its_own_tool(declared):
+    deep = build_remote_tool("deep", declared)
+    typed = build_remote_tool("typed", SCHEMA_TOOLS_BY_NAME["echo_constraints"])
+
+    bound = [bound_parameters(tool) for tool in (deep, typed)]
+
+    assert bound == [
+        {"type": "object", "properties": {"root": {"type": "object"}}, "required": ["root"]},
+        SCHEMA_TOOLS_BY_NAME["echo_constraints"],
+    ]
+
+
+def test_a_schema_at_the_depth_limit_binds_typed_under_a_deep_caller_stack():
+    declared = nested_properties(45)
+
+    def bind_under(frames):
+        return bind_under(frames - 1) if frames else bound_parameters(build_remote_tool("deep", declared))
+
+    assert bind_under(300) == declared
+
+
+def test_a_dropped_literal_still_counts_against_the_size_budget():
+    large_literal_with_ref = {"type": "object", "default": {"$ref": "#/nowhere", "items": list(range(20_000))}}
+
+    bound = build_mcp_args_schema(ref_chain(length=10, branches=2, last=large_literal_with_ref))["args_schema"]
+
+    assert bound == UNTYPED_ROOT
+
+
+def test_an_ambiguous_union_leaves_the_argument_unchanged():
+    schema = {"type": "object", "properties": {"either": {"anyOf": [
+        {"type": "object", "additionalProperties": False, "properties": {"a": {"type": "integer"}}},
+        {"type": "object", "properties": {"b": {"type": "integer"}}},
+    ]}}}
+
+    assert conform_mcp_arguments(schema, {"either": {"a": "1", "b": "2"}}) == {"either": {"a": "1", "b": "2"}}
+
+
+CLOSED_OBJECT_OR_NULL = {
+    "type": "object", "additionalProperties": False, "properties": {"limit": {"type": "integer"}},
+    "anyOf": [{"type": "object", "required": ["limit"]}, {"type": "null"}],
+}
+
+
+@pytest.mark.parametrize("schema, arguments, expected", [
+    (CLOSED_OBJECT_OR_NULL, {"limit": "5", "junk": 1}, {"limit": 5}),
+    ({"type": "object", "properties": {"f": CLOSED_OBJECT_OR_NULL}}, {"f": {"limit": "5", "junk": 1}}, {"f": {"limit": 5}}),
+    ({"type": "object", "properties": {"f": {
+        "type": "object", "properties": {"limit": {"type": "integer"}},
+        "anyOf": [{"type": "object", "properties": {"open": {"type": "boolean"}}}, {"type": "null"}],
+    }}}, {"f": {"limit": "5", "open": "true"}}, {"f": {"limit": 5, "open": True}}),
+], ids=["top_level", "nested", "branch_adds_properties"])
+def test_a_matched_union_branch_keeps_its_parents_keywords(schema, arguments, expected):
+    assert conform_mcp_arguments(schema, arguments) == expected
+
+
+NULL_BRANCH = {"type": "null"}
+
+
+@pytest.mark.parametrize("schema, arguments, expected", [
+    ({"type": "object", "properties": {"limit": {"type": "integer"}},
+      "anyOf": [{"type": "object", "properties": {"limit": {"minimum": 1}}}, NULL_BRANCH]},
+     {"limit": "5"}, {"limit": 5}),
+    ({"type": "object", "properties": {"a": {"type": "integer"}},
+      "anyOf": [{"type": "object", "properties": 5}, NULL_BRANCH]},
+     {"a": "1"}, {"a": 1}),
+    ({"type": "object", "additionalProperties": False, "properties": {"a": {"type": "integer"}},
+      "anyOf": [{"type": "object", "additionalProperties": True, "properties": {"b": {"type": "integer"}}}, NULL_BRANCH]},
+     {"a": "1", "b": "2", "c": 3}, {"a": 1}),
+], ids=["branch_redeclares_property_untyped", "malformed_branch_properties", "branch_opens_closed_parent"])
+def test_the_parent_and_the_matched_branch_both_apply(schema, arguments, expected):
+    assert conform_mcp_arguments(schema, arguments) == expected
