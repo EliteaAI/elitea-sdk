@@ -247,6 +247,29 @@ def test_completed_response_observation_is_scoped_and_provider_finish_normalized
     assert calls[-1]['observation']['usage']['prompt_tokens_details']['cached_tokens'] == 80
 
 
+@pytest.mark.parametrize('details,expected', [({},{}),({'cache_read':None},{}),
+    ({'cache_read':0},{'cached_tokens':0}),({'cache_read':True},{}),
+    ({'cache_creation':80},{'cache_creation_tokens':80})])
+def test_cache_usage_distinguishes_unknown_from_measured_zero(details,expected):
+    msg=AIMessage(content='answer').model_copy(update={'usage_metadata':{'input_tokens':100,'output_tokens':1,
+                 'total_tokens':101,'input_token_details':details}})
+    assert m.observation(msg)['usage']['prompt_tokens_details']==expected
+
+
+@pytest.mark.parametrize('asynchronous',[False,True])
+def test_cache_receipt_records_start_before_model_execution(asynchronous,monkeypatch):
+    auto,native,calls=model()
+    clock=[1000]
+    monkeypatch.setattr(m.time,'time',lambda:clock[0])
+    def slow(*args,**kwargs):
+        clock[0]=1300
+        return AIMessage(content='answer')
+    native.invoke=slow
+    result=asyncio.run(auto.ainvoke([HumanMessage(content='task')],cfg())) if asynchronous else auto.invoke([HumanMessage(content='task')],cfg())
+    receipt=result.response_metadata[m.PIN]['last_response']
+    assert receipt['request_started_at']==1000 and receipt['completed_at']==1300
+
+
 def test_synthetic_human_and_harder_live_steer_keep_whole_run_binding():
     auto, native, calls = model();task = HumanMessage(content='task')
     first = auto.invoke([task], cfg())

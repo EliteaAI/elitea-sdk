@@ -90,14 +90,20 @@ def observation(message):
     finish = finish if finish in {'stop', 'tool_calls', 'length', 'content_filter', 'refusal', 'pause_turn'} else None
     def counter(value):
         return value if type(value) is int and 0 <= value <= 1_000_000_000 else 0
+    # Missing provider cache usage is unknown, never a measured miss. Preserve
+    # explicit zero so real misses still contribute to calibration/forecasting.
+    cache_details = {}
+    for source, target in (('cache_read', 'cached_tokens'), ('cache_creation', 'cache_creation_tokens')):
+        value = details.get(source)
+        if type(value) is int and 0 <= value <= 1_000_000_000:
+            cache_details[target] = value
     model = message.response_metadata.get('model_name') or message.response_metadata.get('model')
     return {'message_digest': hashlib.sha256(json.dumps({k: row.get(k) for k in
         ('role', 'content', 'tool_calls', 'tool_call_id')}, sort_keys=True, ensure_ascii=False,
         separators=(',', ':')).encode()).hexdigest(), 'finish_reason': finish,
         'returned_model': model[:256] if isinstance(model, str) else None,
         'usage': {'prompt_tokens': counter(usage.get('input_tokens')), 'completion_tokens': counter(usage.get('output_tokens')),
-                  'prompt_tokens_details': {'cached_tokens': counter(details.get('cache_read')),
-                                            'cache_creation_tokens': counter(details.get('cache_creation'))}}}
+                  'prompt_tokens_details': cache_details}}
 
 
 class AutoChatModel(BaseChatModel):
@@ -248,12 +254,13 @@ class AutoChatModel(BaseChatModel):
         return message.model_copy(update={'response_metadata': metadata})
 
     @staticmethod
-    def _remember_response(message, binding, config):
+    def _remember_response(message, binding, config, request_started_at=None):
         if message is None or binding.get('action') == 'clarify':
             return
         # Advisory receipt only, never billing or an admission credential.
         binding['last_response'] = {**observation(message), 'scope_id': binding['scope_id'],
-                                    'invocation_id': binding['invocation_id'], 'completed_at': time.time()}
+                                    'invocation_id': binding['invocation_id'], 'completed_at': time.time(),
+                                    'request_started_at': request_started_at}
         sink = ((config or {}).get('configurable') or {}).get('elitea_routing_sink')
         if sink is not None:
             sink['binding'] = copy.deepcopy(binding)
@@ -264,8 +271,9 @@ class AutoChatModel(BaseChatModel):
         if native is not None:
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
+        started_at = time.time()
         response = AIMessage(content=binding['text']) if native is None else native.invoke(messages, config, stop=stop, **kwargs)
-        self._remember_response(response, binding, config)
+        self._remember_response(response, binding, config, started_at)
         return self._stamp(response, binding)
 
     async def ainvoke(self, input, config=None, *, stop=None, **kwargs):
@@ -274,8 +282,9 @@ class AutoChatModel(BaseChatModel):
         if native is not None:
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
+        started_at = time.time()
         response = AIMessage(content=binding['text']) if native is None else await native.ainvoke(messages, config, stop=stop, **kwargs)
-        self._remember_response(response, binding, config)
+        self._remember_response(response, binding, config, started_at)
         return self._stamp(response, binding)
 
     def stream(self, input, config=None, *, stop=None, **kwargs):
@@ -287,10 +296,11 @@ class AutoChatModel(BaseChatModel):
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
             complete = None
+            started_at = time.time()
             for chunk in native.stream(messages, config, stop=stop, **kwargs):
                 complete = chunk if complete is None else complete + chunk
                 yield chunk
-            self._remember_response(complete, binding, config)
+            self._remember_response(complete, binding, config, started_at)
         yield AIMessageChunk(content='', response_metadata=self._binding_metadata(binding))
 
     async def astream(self, input, config=None, *, stop=None, **kwargs):
@@ -302,10 +312,11 @@ class AutoChatModel(BaseChatModel):
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
             complete = None
+            started_at = time.time()
             async for chunk in native.astream(messages, config, stop=stop, **kwargs):
                 complete = chunk if complete is None else complete + chunk
                 yield chunk
-            self._remember_response(complete, binding, config)
+            self._remember_response(complete, binding, config, started_at)
         yield AIMessageChunk(content='', response_metadata=self._binding_metadata(binding))
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -343,12 +354,12 @@ class AutoChatModel(BaseChatModel):
             self._admit_native(provider, messages, binding)
             return runnable, messages, binding
 
-        def finish(result, binding, config):
+        def finish(result, binding, config, started_at):
             if result.get('parsing_error') is not None and not include_raw:
                 raise result['parsing_error']
             if result.get('raw') is not None:
                 if result.get('parsing_error') is None:
-                    self._remember_response(result['raw'], binding, config)
+                    self._remember_response(result['raw'], binding, config, started_at)
                 result = {**result, 'raw': self._stamp(result['raw'], binding)}
             if include_raw:
                 return result
@@ -356,10 +367,12 @@ class AutoChatModel(BaseChatModel):
 
         def invoke(value, config=None):
             runnable, messages, binding = prepare(value, config)
-            return finish(runnable.invoke(messages, config), binding, config)
+            started_at = time.time()
+            return finish(runnable.invoke(messages, config), binding, config, started_at)
 
         async def ainvoke(value, config=None):
             runnable, messages, binding = await asyncio.to_thread(prepare, value, config)
-            return finish(await runnable.ainvoke(messages, config), binding, config)
+            started_at = time.time()
+            return finish(await runnable.ainvoke(messages, config), binding, config, started_at)
 
         return RunnableLambda(invoke, ainvoke)
