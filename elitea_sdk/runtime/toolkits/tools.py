@@ -33,10 +33,14 @@ from ..utils.mcp_oauth import (
     canonical_resource,
     McpAuthorizationRequired,
     McpContext,
+    as_header_mapping,
     build_mcp_auth_decision_result,
     _is_http_url,
     mcp_alternate_resource,
     has_active_mcp_token,
+    drop_unusable_authorization,
+    has_configured_authorization,
+    merge_oauth_authorization,
     normalize_mcp_url,
 )
 from ...tools.utils import clean_string
@@ -1364,16 +1368,15 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 else:
                     access_token = None
                     
-                if access_token:
-                    merged_headers = dict(headers) if headers else {}
-                    merged_headers.setdefault('Authorization', f'Bearer {access_token}')
-                    settings['headers'] = merged_headers
-                    # If Authorization was NOT already in the DB-configured headers, the token
-                    # we just injected came from the OAuth flow (mcp_tokens), not from a static
-                    # credential.  Signal this so a 401 re-triggers OAuth instead of a ValueError.
-                    if not any(k.lower() == 'authorization' for k in (headers or {})):
-                        settings['_oauth_token_injected'] = True
+                merged_headers, oauth_token_injected = merge_oauth_authorization(
+                    as_header_mapping(headers), access_token
+                )
+                if oauth_token_injected:
+                    settings['_oauth_token_injected'] = True
                     logger.debug("[MCP Auth] Added Authorization header for MCP server")
+                else:
+                    merged_headers = drop_unusable_authorization(merged_headers)
+                settings['headers'] = merged_headers
                     
                 # Pass session_id to MCP toolkit if available
                 if session_id:
@@ -1390,7 +1393,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     _annotate_mcp_auth_error(auth_err, tool)
                     family_token = (
                         None
-                        if any(str(key).lower() == "authorization" for key in (headers or {}))
+                        if has_configured_authorization(headers)
                         else _find_compatible_mcp_family_token(mcp_tokens, auth_err)
                     )
                     if family_token:
@@ -1400,10 +1403,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         # are available during this turn and no auth guard reaches the
                         # user. A rejected token falls through to the normal guard.
                         family_settings = dict(settings)
-                        family_headers = dict(headers) if headers else {}
-                        family_headers["Authorization"] = f"Bearer {family_token['access_token']}"
+                        family_headers, family_token_injected = merge_oauth_authorization(
+                            as_header_mapping(headers), family_token['access_token']
+                        )
                         family_settings["headers"] = family_headers
-                        family_settings["_oauth_token_injected"] = True
+                        family_settings["_oauth_token_injected"] = family_token_injected
                         try:
                             mcp_tools = McpToolkit.get_toolkit(
                                 toolkit_name=resolved_toolkit_name,

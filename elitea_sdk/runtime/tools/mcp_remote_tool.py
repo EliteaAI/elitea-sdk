@@ -51,6 +51,10 @@ class McpRemoteTool(McpServerTool):
     prompt_name: Optional[str] = None  # Original prompt name if this is a prompt
     session_id: Optional[str] = Field(default=None, description="MCP session ID for stateful SSE servers")
     ssl_verify: bool = Field(default=True, description="Whether to verify SSL certificates")
+    configured_auth: bool = Field(
+        default=False,
+        description="Authorization header is an operator-configured credential, so a 401 is a bad credential, not an OAuth prompt",
+    )
     
     def model_post_init(self, __context: Any) -> None:
         """Update metadata with session info after model initialization."""
@@ -152,6 +156,7 @@ class McpRemoteTool(McpServerTool):
                 headers=headers,
                 timeout=self.tool_timeout_sec,
                 ssl_verify=self.ssl_verify,
+                configured_auth=self.configured_auth,
                 tool_name=self.name,
                 toolkit_type=(self.metadata or {}).get("toolkit_type"),
                 toolkit_name=(self.metadata or {}).get("toolkit_name"),

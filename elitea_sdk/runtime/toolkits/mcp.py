@@ -7,6 +7,7 @@ Following MCP specification: https://modelcontextprotocol.io/specification/2025-
 import logging
 import re
 import asyncio
+import uuid
 from typing import List, Optional, Any, Dict, Literal, ClassVar, Union
 
 from langchain_core.tools import BaseToolkit, BaseTool
@@ -19,7 +20,14 @@ from ..tools.mcp_inspect_tool import McpInspectTool
 from ..models.mcp_models import McpConnectionConfig
 # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient
 from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
+from ..utils.mcp_discovery_cache import (
+    clamp_cache_ttl,
+    read_cached_discovery,
+    resolve_discovery_cache_key,
+    write_cached_discovery,
+)
 from ..utils.mcp_oauth import (
+    has_authorization_on_the_wire,
     McpAuthorizationRequired,
     mcp_alternate_resource,
     canonical_resource,
@@ -240,14 +248,26 @@ class McpToolkit(BaseToolkit):
                 bool,
                 Field(
                     default=True,
-                    description="Enable caching of tool schemas and responses"
+                    description="Reuse the discovered tool list across runs",
+                    json_schema_extra={
+                        'tooltip': (
+                            'When enabled, tool discovery is skipped for runs within the '
+                            'Cache TTL window. Load Tools always refreshes from the server.'
+                        )
+                    }
                 )
             ),
             cache_ttl=(
                 Union[int, str],
                 Field(
                     default=300,
-                    description="Cache TTL in seconds (60-3600)"
+                    description="Cache TTL in seconds (0 disables; otherwise 60-3600)",
+                    json_schema_extra={
+                        'tooltip': (
+                            'How long the discovered tool list is reused. '
+                            '0 disables caching; other values are clamped to 60-3600.'
+                        )
+                    }
                 )
             ),
             ssl_verify=(
@@ -338,7 +358,7 @@ class McpToolkit(BaseToolkit):
 
         # Convert numeric parameters that may come as strings from UI
         timeout = safe_int(timeout, 60)
-        cache_ttl = safe_int(cache_ttl, 300)
+        cache_ttl = clamp_cache_ttl(cache_ttl)
         max_tool_description_length = safe_int(max_tool_description_length, 0)
         if max_tool_description_length < 0:
             logger.warning(
@@ -402,6 +422,8 @@ class McpToolkit(BaseToolkit):
             ssl_verify=ssl_verify,
             oauth_token_injected=oauth_token_injected,
             max_tool_description_length=max_tool_description_length,
+            enable_caching=bool(enable_caching),
+            cache_ttl=cache_ttl,
         )
 
         return toolkit
@@ -418,24 +440,25 @@ class McpToolkit(BaseToolkit):
         ssl_verify: bool = True,
         oauth_token_injected: bool = False,
         max_tool_description_length: int = 0,
+        enable_caching: bool = False,
+        cache_ttl: int = 0,
     ) -> List[BaseTool]:
         """
-        Create tools from a single MCP server. Always performs live discovery when connection config is provided.
+        Create tools from a single MCP server, from the discovery cache when one is registered.
         """
         tools = []
 
         # First, try direct HTTP discovery since we have valid connection config
         try:
-            logger.info(f"Discovering tools from MCP toolkit '{toolkit_name}' at {connection_config.url}")
-
-            # Use synchronous HTTP discovery for toolkit initialization
-            tool_metadata_list, session_id = cls._discover_tools_sync(
+            tool_metadata_list, session_id = cls._resolve_tool_metadata(
                 toolkit_name=toolkit_name,
                 toolkit_type=toolkit_type,
                 connection_config=connection_config,
                 timeout=timeout,
                 ssl_verify=ssl_verify,
                 oauth_token_injected=oauth_token_injected,
+                enable_caching=enable_caching,
+                cache_ttl=cache_ttl,
             )
 
             # Filter tools if specific ones are selected
@@ -450,7 +473,8 @@ class McpToolkit(BaseToolkit):
             # Use session_id from frontend (passed via connection_config)
             if session_id:
                 logger.info(f"[MCP Session] Using session_id from frontend: {session_id}")
-            
+
+            configured_auth = has_authorization_on_the_wire(connection_config.headers, oauth_token_injected)
             for tool_metadata in tool_metadata_list:
                 server_tool = cls._create_tool_from_dict(
                     tool_dict=tool_metadata,
@@ -462,6 +486,7 @@ class McpToolkit(BaseToolkit):
                     session_id=session_id,  # Use session from discovery
                     ssl_verify=ssl_verify,  # Pass SSL verification setting
                     max_tool_description_length=max_tool_description_length,
+                    configured_auth=configured_auth,
                 )
 
                 if server_tool:
@@ -509,6 +534,45 @@ class McpToolkit(BaseToolkit):
             logger.warning(f"MCP toolkit '{toolkit_name}' has no tools - discovery may have failed")
 
         return tools
+
+    @classmethod
+    def _resolve_tool_metadata(
+        cls,
+        toolkit_name: str,
+        toolkit_type: str,
+        connection_config: McpConnectionConfig,
+        timeout: int,
+        ssl_verify: bool,
+        oauth_token_injected: bool,
+        enable_caching: bool,
+        cache_ttl: int,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """Serve the unfiltered discovery result from the cache when allowed, else discover live."""
+        use_cache = enable_caching and cache_ttl > 0
+        cache_key = None
+        if use_cache:
+            cache_key = resolve_discovery_cache_key(
+                connection_config.url, connection_config.headers, connection_config.ssl_verify
+            )
+            cached_tools = read_cached_discovery(cache_key)
+            if cached_tools is not None:
+                logger.info(
+                    f"MCP toolkit '{toolkit_name}': {len(cached_tools)} tools served from discovery cache"
+                )
+                return cached_tools, connection_config.session_id or str(uuid.uuid4())
+
+        logger.info(f"Discovering tools from MCP toolkit '{toolkit_name}' at {connection_config.url}")
+        tool_metadata_list, session_id = cls._discover_tools_sync(
+            toolkit_name=toolkit_name,
+            toolkit_type=toolkit_type,
+            connection_config=connection_config,
+            timeout=timeout,
+            ssl_verify=ssl_verify,
+            oauth_token_injected=oauth_token_injected,
+        )
+        if use_cache:
+            write_cached_discovery(cache_key, tool_metadata_list, cache_ttl)
+        return tool_metadata_list, session_id
 
     @classmethod
     def _discover_tools_sync(
@@ -667,7 +731,6 @@ class McpToolkit(BaseToolkit):
         # Generate temporary session_id if not provided (for OAuth flow)
         # The real session_id should come from frontend after OAuth completes
         if not session_id:
-            import uuid
             session_id = str(uuid.uuid4())
             logger.info(f"[MCP SSE] Generated temporary session_id for OAuth: {session_id}")
 
@@ -682,9 +745,7 @@ class McpToolkit(BaseToolkit):
         # If the token was injected from the OAuth flow (not a static DB credential),
         # force configured_auth=False so that a 401 re-triggers the OAuth flow instead
         # of raising a plain ValueError.
-        configured_auth = any(k.lower() == 'authorization' for k in headers)
-        if oauth_token_injected:
-            configured_auth = False
+        configured_auth = has_authorization_on_the_wire(headers, oauth_token_injected)
 
         # Create unified MCP client (auto-detects SSE vs Streamable HTTP)
         client = McpClient(
@@ -765,6 +826,7 @@ class McpToolkit(BaseToolkit):
         session_id: Optional[str] = None,
         ssl_verify: bool = True,
         max_tool_description_length: int = 0,
+        configured_auth: bool = False,
     ) -> Optional[BaseTool]:
         """Create a BaseTool from a tool/prompt dictionary (from direct HTTP discovery)."""
         try:
@@ -798,6 +860,7 @@ class McpToolkit(BaseToolkit):
                 original_tool_name=tool_name,  # Store original name for MCP server invocation
                 session_id=session_id,  # Pass session ID for stateful SSE servers
                 ssl_verify=ssl_verify,  # Pass SSL verification setting
+                configured_auth=configured_auth,
                 metadata={"toolkit_name": toolkit_name, "toolkit_type": toolkit_type}
             )
         except Exception as e:
@@ -1045,7 +1108,7 @@ def get_tools(tool_config: dict, elitea_client, llm=None, memory_store=None) -> 
         timeout=safe_int(settings.get('timeout'), 60),
         selected_tools=settings.get('selected_tools', []),
         enable_caching=settings.get('enable_caching', True),
-        cache_ttl=safe_int(settings.get('cache_ttl'), 300),
+        cache_ttl=settings.get('cache_ttl', 300),
         ssl_verify=settings.get('ssl_verify', True),
         max_tool_description_length=safe_int(
             settings.get('max_tool_description_length'), 0

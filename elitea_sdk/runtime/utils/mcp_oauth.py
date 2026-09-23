@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -188,7 +188,22 @@ class McpContext:
 SSO_REDIRECT_PREFIX = "The MCP server redirected the request"
 HTML_LOGIN_PAGE_PREFIX = "The MCP server returned an HTML page"
 RETIRED_ENDPOINT_PREFIX = "The MCP endpoint "
-CURATED_MCP_MESSAGE_PREFIXES = (SSO_REDIRECT_PREFIX, HTML_LOGIN_PAGE_PREFIX, RETIRED_ENDPOINT_PREFIX)
+INVALID_CONFIGURED_CREDENTIALS_MESSAGE = (
+    "Authorization credentials are invalid. "
+    "Please check the credentials in the toolkit settings."
+)
+GITHUB_BAD_TOKEN_MESSAGE = (
+    "The MCP server rejected the request (400 Bad Request). "
+    "Your API token may be invalid or malformed. "
+    "Please check the credentials in the toolkit settings."
+)
+CURATED_MCP_MESSAGE_PREFIXES = (
+    SSO_REDIRECT_PREFIX,
+    HTML_LOGIN_PAGE_PREFIX,
+    RETIRED_ENDPOINT_PREFIX,
+    INVALID_CONFIGURED_CREDENTIALS_MESSAGE,
+    GITHUB_BAD_TOKEN_MESSAGE,
+)
 
 
 class McpEndpointError(ValueError):
@@ -466,6 +481,104 @@ async def fetch_resource_metadata_async(resource_metadata_url: str, session=None
         return None
 
 
+def find_authorization_header(headers: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(headers, dict):
+        return None
+    for key in headers:
+        if isinstance(key, str) and key.lower() == "authorization":
+            return key
+    return None
+
+
+AUTHORIZATION_SCHEMES = frozenset({"bearer", "basic", "token"})
+# A `{param}` from a prebuilt server definition that nobody filled in is not a credential.
+# A `{{secret.name}}` the platform failed to resolve is different: the operator did configure
+# a credential, so it stays configured and its 401 reports the settings problem instead of
+# handing the toolkit to an OAuth identity. Anything else, braces included, is a credential
+# as typed.
+MCP_PARAM_PLACEHOLDER = re.compile(r'(?<!\{)\{(\w+)\}(?!\})')
+
+
+def as_header_mapping(headers: Any) -> Any:
+    """The platform stores toolkit headers as a mapping or as the JSON string
+    ``McpToolkit.get_toolkit`` parses, so credential decisions have to see both alike.
+    A value that is neither is returned untouched, leaving the typed error to the caller
+    that documents it."""
+    if isinstance(headers, str) and headers.strip():
+        try:
+            parsed = json.loads(headers)
+        except ValueError:
+            return headers
+        return parsed if isinstance(parsed, dict) else headers
+    return headers
+
+
+def is_unresolved_mcp_placeholder(value: Any) -> bool:
+    return isinstance(value, str) and bool(MCP_PARAM_PLACEHOLDER.search(value))
+
+
+def is_blank_credential(value: Any) -> bool:
+    parts = str(value or "").split()
+    return not parts or (len(parts) == 1 and parts[0].lower() in AUTHORIZATION_SCHEMES)
+
+
+def is_configured_credential(value: Any) -> bool:
+    return not is_unresolved_mcp_placeholder(value) and not is_blank_credential(value)
+
+
+def has_configured_authorization(headers: Optional[Dict[str, Any]]) -> bool:
+    key = find_authorization_header(headers)
+    return key is not None and is_configured_credential(headers[key])
+
+
+def has_authorization_on_the_wire(headers: Optional[Dict[str, Any]], oauth_token_injected: bool) -> bool:
+    """Whatever Authorization value is sent came from the toolkit settings, so a 401 is a
+    credentials problem to report, not an OAuth flow to start."""
+    return find_authorization_header(headers) is not None and not oauth_token_injected
+
+
+def drop_unusable_authorization(headers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """An Authorization value that is not a credential — an unresolved ``{template}`` or a
+    blank such as ``"Bearer "`` — must not go on the wire when no token replaced it: the
+    server then answers with a clean challenge that can open the login, instead of a
+    literal-value 401 that reads as invalid credentials."""
+    if headers is not None and not isinstance(headers, dict):
+        return headers
+    kept = dict(headers) if headers else {}
+    key = find_authorization_header(kept)
+    if key is not None and not is_configured_credential(kept[key]):
+        kept.pop(key)
+    return kept
+
+
+def merge_oauth_authorization(
+    headers: Optional[Dict[str, Any]], access_token: Optional[str], token_type: str = "Bearer"
+) -> Tuple[Dict[str, Any], bool]:
+    """Return the headers to send and whether the OAuth token is among them.
+
+    A configured Authorization header is the identity the operator chose, so it wins
+    over an OAuth token (same rule as the runtime path and #6418). An Authorization
+    value still holding an unresolved ``{placeholder}``, or one a blank field reduced to
+    a bare scheme such as ``"Bearer "``, is not a credential and is replaced.
+
+    A value that is no mapping at all is handed back untouched, so the parser that
+    documents it — ``McpToolkit.get_toolkit`` — still raises its own typed error.
+    """
+    if headers is not None and not isinstance(headers, dict):
+        return headers, False
+    merged = dict(headers) if headers else {}
+    if not access_token:
+        return merged, False
+    configured_key = find_authorization_header(merged)
+    if configured_key is not None and is_configured_credential(merged[configured_key]):
+        logger.info("[MCP Auth] Keeping the configured Authorization header; ignoring the OAuth token")
+        return merged, False
+    if configured_key is not None:
+        merged.pop(configured_key)
+    merged["Authorization"] = f"{token_type} {access_token}"
+    return merged, True
+
+
 def canonical_resource(server_url: str) -> str:
     """Produce a canonical resource identifier for the MCP server."""
     parsed = urlparse(server_url)
@@ -515,7 +628,7 @@ def substitute_mcp_placeholders(value: Any, user_config: Dict[str, Any]) -> Any:
             return placeholder
 
         # Substitute {param} patterns, skipping {{ }} double-brace patterns
-        result = re.sub(r'(?<!\{)\{(\w+)\}(?!\})', param_replacer, value)
+        result = MCP_PARAM_PLACEHOLDER.sub(param_replacer, value)
 
         if result != original_value:
             logger.debug(f"[MCP] Placeholder substitution applied for value with {len(original_value)} chars")

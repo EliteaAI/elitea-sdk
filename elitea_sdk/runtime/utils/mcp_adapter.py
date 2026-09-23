@@ -26,7 +26,12 @@ from datetime import timedelta
 
 import httpx
 
-from .mcp_oauth import McpAuthorizationRequired
+from .mcp_discovery_cache import retire_cached_discovery
+from .mcp_oauth import (
+    GITHUB_BAD_TOKEN_MESSAGE,
+    INVALID_CONFIGURED_CREDENTIALS_MESSAGE,
+    McpAuthorizationRequired,
+)
 from .mcp_response_limit import (
     McpResponseTooLargeError,
     SizeTrip,
@@ -236,17 +241,10 @@ class UnifiedMcpClient:
                 if self.configured_auth and any(
                     kw in inner_str for kw in ['401', 'unauthorized', 'forbidden', '403', 'authentication']
                 ):
-                    raise ValueError(
-                        "Authorization credentials are invalid. "
-                        "Please check the credentials in the toolkit settings."
-                    ) from inner
+                    raise ValueError(INVALID_CONFIGURED_CREDENTIALS_MESSAGE) from inner
                 # Some servers (e.g. GitHub Copilot) return 400 for an invalid/malformed token.
                 if self.configured_auth and '400' in inner_str and 'bad request' in inner_str:
-                    raise ValueError(
-                        "The MCP server rejected the request (400 Bad Request). "
-                        "Your API token may be invalid or malformed. "
-                        "Please check the credentials in the toolkit settings."
-                    ) from inner
+                    raise ValueError(GITHUB_BAD_TOKEN_MESSAGE) from inner
                 raise inner from e
             raise
 
@@ -374,6 +372,11 @@ class UnifiedMcpClient:
         )
 
         auth_header = response.headers.get('WWW-Authenticate', '')
+        # The tool list cached under this credential is dead with it; the next run must
+        # discover live so a bad token is met at construction, where the deferred-auth path
+        # lives, instead of at a tool call. Other credentials' entries for the server stay:
+        # a first-login challenge from a user with no token is normal traffic, not an error.
+        retire_cached_discovery(self.url, self.headers, self.ssl_verify)
 
         # If Authorization was configured in the toolkit's database settings, the credentials
         # are wrong — never start an OAuth flow, just report the error so the user can fix them.
