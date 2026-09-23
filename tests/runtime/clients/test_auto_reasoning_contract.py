@@ -43,7 +43,8 @@ def contract(name, effort):
 
 @pytest.mark.parametrize('name', OPENAI_MODELS + ANTHROPIC_MODELS)
 @pytest.mark.parametrize('effort', [None, 'low', 'medium', 'high'])
-def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
+@pytest.mark.parametrize('output_mode', ['measured', 'provider_default', 'explicit'])
+def test_exact_measured_reasoning_reaches_http_body(name, effort, output_mode, monkeypatch):
     # Worker preferences deliberately conflict with the measured Chat Completions path.
     worker = SimpleNamespace(descriptor=SimpleNamespace(config={
         'use_responses_api_for': ['gpt-5.6'], 'reasoning_in_body_for': []}))
@@ -63,6 +64,9 @@ def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
         return httpx.Response(200, json=result)
 
     settings = contract(name, effort)
+    settings.update(routing_output_mode=output_mode, max_output_tokens=65536)
+    if output_mode == 'explicit':
+        settings['max_tokens'] = 48000
     original = deepcopy(settings)
     cls = ChatAnthropic if is_native else ChatOpenAI
     symbol = 'ChatAnthropic' if is_native else 'ChatOpenAI'
@@ -77,7 +81,10 @@ def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
     body = json.loads(requests[0].content)
     actual = {key: body[key] for key in ('thinking', 'output_config', 'reasoning', 'reasoning_effort') if key in body}
     assert actual == settings['routing_reasoning_fields']
-    assert body.get('max_tokens', body.get('max_completion_tokens')) == 32000
+    expected = (65536 if is_native else None) if output_mode == 'provider_default' else settings['max_tokens']
+    assert body.get('max_tokens', body.get('max_completion_tokens')) == expected
+    if expected is None:
+        assert not {'max_tokens', 'max_completion_tokens', 'max_output_tokens'} & body.keys()
     assert requests[0].url.path.endswith('/messages' if is_native else '/chat/completions')
     assert requests[0].headers['X-Elitea-Routing-Pin'] == 'signed-fixture'
     assert requests[0].headers['X-Elitea-Routing-Invocation'] == 'a'*64

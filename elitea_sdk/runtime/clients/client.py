@@ -610,6 +610,10 @@ class EliteAClient:
         # Default means no Elitea-defined custom output cap. Optional provider
         # fields are omitted; required APIs resolve the configured model maximum.
         llm_max_tokens = model_config.get("max_tokens", None)
+        if model_config.get('routing_pin') and model_config.get('routing_output_mode') == 'provider_default':
+            # The signed max_tokens is an admission bound, not a custom limit.
+            # Required native APIs below use configured model capability data.
+            llm_max_tokens = None
         has_custom_output_limit = llm_max_tokens not in (None, -1)
         if not has_custom_output_limit:
             llm_max_tokens = None

@@ -178,8 +178,7 @@ class AutoChatModel(BaseChatModel):
                 prior_observation = {**observation(previous), 'message_index': len(projection(messages[:previous_index]))}
             tools = [convert_to_openai_tool(tool) for tool in self.routing_tools]
             cap = self.settings.get('max_tokens')
-            # Unspecified output belongs to the selected measured contract.
-            # Sending a synthetic 8k limit would exclude 32k-only presets.
+            # Unspecified output belongs to the selected provider's default.
             output_limit = {} if cap in (None, -1) else {'output_cap': cap}
             from elitea_sdk.runtime.clients.routing_context import instruction_view, retrieval_sources
             context = {'active_instructions': dict(instruction_view(self.active_instructions)),
@@ -249,7 +248,10 @@ class AutoChatModel(BaseChatModel):
             from openai.lib._parsing import type_to_response_format_param
             payload['response_format'] = type_to_response_format_param(payload['response_format'])
         size = len(json.dumps(payload, ensure_ascii=False).encode()) + 64*len(messages)
-        if size + binding['config']['max_tokens'] > binding['config']['context_window']:
+        optional = (binding['config'].get('routing_output_mode') == 'provider_default'
+                    and not binding['config'].get('routing_output_required', False))
+        reserve = 0 if optional else binding['config']['max_tokens']
+        if size + reserve > binding['config']['context_window']:
             raise ValueError('Auto native request exceeds the conservative context allowance')
 
     @staticmethod
