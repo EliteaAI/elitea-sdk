@@ -249,7 +249,16 @@ def test_completed_response_observation_is_scoped_and_provider_finish_normalized
 
 @pytest.mark.parametrize('details,expected', [({},{}),({'cache_read':None},{}),
     ({'cache_read':0},{'cached_tokens':0}),({'cache_read':True},{}),
-    ({'cache_creation':80},{'cache_creation_tokens':80})])
+    ({'cache_creation':80},{'cache_creation_tokens':80}),
+    ({'cache_creation':0,'ephemeral_5m_input_tokens':70,'ephemeral_1h_input_tokens':10},
+     {'cache_creation_tokens':80}),
+    ({'cache_creation':80,'ephemeral_5m_input_tokens':70,'ephemeral_1h_input_tokens':10},
+     {'cache_creation_tokens':80}),
+    ({'ephemeral_5m_input_tokens':0,'ephemeral_1h_input_tokens':0},{'cache_creation_tokens':0}),
+    ({'cache_creation':80,'ephemeral_5m_input_tokens':0,'ephemeral_1h_input_tokens':0},
+     {'cache_creation_tokens':80}),
+    ({'ephemeral_5m_input_tokens':70,'ephemeral_1h_input_tokens':None},{}),
+    ({'ephemeral_5m_input_tokens':True,'ephemeral_1h_input_tokens':0},{})])
 def test_cache_usage_distinguishes_unknown_from_measured_zero(details,expected):
     msg=AIMessage(content='answer').model_copy(update={'usage_metadata':{'input_tokens':100,'output_tokens':1,
                  'total_tokens':101,'input_token_details':details}})

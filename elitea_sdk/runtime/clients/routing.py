@@ -97,6 +97,14 @@ def observation(message):
         value = details.get(source)
         if type(value) is int and 0 <= value <= 1_000_000_000:
             cache_details[target] = value
+    # Recent LangChain Anthropic versions zero the generic write counter when
+    # they expose disjoint TTL buckets. Use their sum, never add it twice.
+    write_buckets = [details.get(name) for name in
+                     ('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens')]
+    if all(type(value) is int and 0 <= value <= 1_000_000_000 for value in write_buckets):
+        total_write = sum(write_buckets)
+        if total_write <= 1_000_000_000 and (total_write or 'cache_creation_tokens' not in cache_details):
+            cache_details['cache_creation_tokens'] = total_write
     model = message.response_metadata.get('model_name') or message.response_metadata.get('model')
     return {'message_digest': hashlib.sha256(json.dumps({k: row.get(k) for k in
         ('role', 'content', 'tool_calls', 'tool_call_id')}, sort_keys=True, ensure_ascii=False,
