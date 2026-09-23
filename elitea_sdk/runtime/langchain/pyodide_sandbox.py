@@ -222,12 +222,15 @@ class PyodideSandbox(BasePyodideSandbox):
                 stderr=f"Failed to encode code as UTF-8: {e}",
             )
 
+        spawn_start = time.time()
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        spawn_s = time.time() - spawn_start
+        sandbox_timings = None
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -238,6 +241,7 @@ class PyodideSandbox(BasePyodideSandbox):
 
             if stdout:
                 full_result = json.loads(stdout)
+                sandbox_timings = full_result.get("timings")
                 stdout = full_result.get("stdout", None)
                 stderr = full_result.get("stderr", None)
                 result = full_result.get("result", None)
@@ -260,6 +264,10 @@ class PyodideSandbox(BasePyodideSandbox):
             pass
 
         end_time = time.time()
+        logger.debug(
+            "[sandbox-timing] deno run: total=%.3fs spawn=%.3fs status=%s code_bytes=%d in_sandbox=%s",
+            end_time - start_time, spawn_s, status, len(code_bytes), sandbox_timings,
+        )
 
         return CodeExecutionResult(
             status=status,

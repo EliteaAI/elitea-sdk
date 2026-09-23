@@ -28,6 +28,7 @@ from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
+from .sandbox import CLIENT_ALIAS_LINE
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
 
 logger = logging.getLogger(__name__)
@@ -123,9 +124,9 @@ import zlib
 compressed_state = base64.b64decode('{encoded}')
 state_json = zlib.decompress(compressed_state).decode('utf-8')
 elitea_state = json.loads(state_json)
-# copies for backwards compatibility with old code that references alita_state and alita_client directly
+# copies for backwards compatibility with old code that references the legacy alita_* names
 alita_state = elitea_state.copy()
-alita_client = elitea_client
+{CLIENT_ALIAS_LINE}
 '''
         return pyodide_predata
 
