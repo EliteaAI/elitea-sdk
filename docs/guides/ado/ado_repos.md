@@ -88,6 +88,18 @@ Search for `retry` under src/services and return the next 5 matches after the fi
 ```
 Resolves to `retry path:src/services` with `top=5`, `skip=5`.
 
+**Prompt 4**
+```
+Search for `retry` in any `utils` folder under src.
+```
+Resolves to `retry` with `path=src/**/utils`.
+
+A literal `path` (no `*` or `?`) matches that folder's whole subtree by whole folder
+names, so `test` does not match `testcode`. A `path` containing `*` or `?` is sent as an
+inline `path:` filter instead: `*` and `**` both match across folders, `src/**/utils` needs
+at least one folder between `src` and `utils`. The query is bracketed first, so the glob
+scopes every `OR`/`NOT` clause, and it is ANDed with any `path:` already in the query.
+
 #### Payload limits
 
 The tool is deliberately bounded so results stay safe to feed back into an LLM:
