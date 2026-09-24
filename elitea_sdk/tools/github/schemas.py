@@ -94,6 +94,11 @@ DeleteFile = create_model(
 GetIssue = create_model(
     "GetIssue",
     issue_number=(int, Field(description="The issue number as a int, e.g. `42`")),
+    comments_offset=(Optional[int], Field(
+        default=0,
+        description="How many comments to skip before the returned window. Use the value named in a previous response's comments_note to read the rest of a long thread.",
+        ge=0
+    )),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
 )
 
