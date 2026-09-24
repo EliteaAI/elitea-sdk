@@ -936,6 +936,25 @@ class LLMNode(BaseTool):
             except Exception as e:
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
 
+    def _enforce_context_floor(self, messages: List, llm_client=None, *, start: int = 0):
+        """Drop the oldest tool results of this turn if the request won't fit (#5915).
+
+        The hard floor under the configurable context management: it runs on every
+        follow-up model call regardless of ``enable_summarization`` or the
+        conversation's ``enabled`` switch, because a request that cannot be sent
+        is a failure rather than a preference. ``start`` keeps it off everything
+        before the current turn's captured messages.
+        """
+        try:
+            from ..context_floor import compact_tool_results, resolve_floor_tokens
+            compact_tool_results(
+                messages,
+                floor_tokens=resolve_floor_tokens(llm_client, self.middleware_manager),
+                start=start,
+            )
+        except Exception as e:
+            logger.debug(f"Context floor check skipped: {e}")
+
     @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
         """Remove AI tool calls that lack matching tool results immediately after.
@@ -4368,6 +4387,16 @@ class LLMNode(BaseTool):
                     )
                 new_messages = sanitized_messages
 
+                # Keep this turn inside the context window before we send it.
+                # N tool results appended inside one turn can overflow the model
+                # on their own, and the summarization middleware cannot help here
+                # — it ran once before the loop and skips tool-related state to
+                # avoid splitting tool pairs (#5915). Always on: this bounds a
+                # request we are about to build, it is not a context preference.
+                self._enforce_context_floor(
+                    new_messages, llm_client, start=_pending_capture_start,
+                )
+
                 # Re-invoke with the SAME full toolset — including any sensitive
                 # tool the user just declined. The block is invocation-scoped
                 # (per-call independent approval, #5303), so the tool stays bound
@@ -4436,8 +4465,12 @@ class LLMNode(BaseTool):
                     'rate limit'
                 ])
                 
-                # Check for context window / token limit errors
-                is_context_error = any(indicator in error_str for indicator in [
+                # Check for context window / token limit errors. Typed first,
+                # prose second — the substring list stays for proxies and SDKs
+                # that only raise a generic error.
+                from ..context_floor import is_context_overflow
+                is_context_error = is_context_overflow(e) or any(
+                    indicator in error_str for indicator in [
                     'context window', 'context_window', 'token limit', 'too long',
                     'maximum context length', 'input is too long', 'exceeds the limit',
                     'contextwindowexceedederror', 'max_tokens', 'content too large'
@@ -4582,6 +4615,19 @@ class LLMNode(BaseTool):
                         new_messages[last_tool_msg_idx] = truncated_msg
                         
                         logger.info(f"Truncated large tool result from '{last_tool_name}' and retrying LLM call")
+
+                        # Truncating only the newest result is not enough when it
+                        # is the *sum* of this turn's results that overflowed
+                        # (#5915): shrink the older ones too, or the retry hits
+                        # the same wall and the turn is lost.
+                        if is_context_error:
+                            try:
+                                from ..context_floor import shrink_after_overflow
+                                shrink_after_overflow(
+                                    new_messages, start=_pending_capture_start,
+                                )
+                            except Exception as shrink_error:
+                                logger.debug(f"Post-overflow shrink skipped: {shrink_error}")
 
                         # CRITICAL FIX: Call LLM again with truncated message to get fresh completion
                         # This prevents duplicate tool_call_ids that occur when we continue with

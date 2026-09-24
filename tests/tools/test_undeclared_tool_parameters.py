@@ -20,11 +20,11 @@ SDK_ROOT = pathlib.Path(__file__).resolve().parents[2] / 'elitea_sdk'
 # Registrations whose args_schema is built in a shape this cannot follow (built
 # dynamically per instance, mostly in vectorstore and aha). They are UNCHECKED, so
 # the count is a ratchet: lower it when a shape becomes resolvable, never raise it.
-# Import and Enum resolution already took it from 113 to 42.
+# Import, Enum and per-call wrapper resolution already took it from 113 to 42.
 UNRESOLVED_BUDGET = 42
 
 
-def _model_fields(call, tree, path, seen):
+def _model_fields(call, tree, path, seen, bindings=None):
     """Field names of a create_model call, following __base__ into its parents."""
     if not isinstance(call, ast.Call) or getattr(call.func, 'id', '') != 'create_model':
         return None
@@ -33,11 +33,81 @@ def _model_fields(call, tree, path, seen):
         if keyword.arg == '__base__':
             # zephyr_squad builds Issue -> ProjectIssue -> ProjectIssueStep this way;
             # a parent's fields are declared just as surely as a child's.
-            base = _schema_fields(tree, keyword.value.id, path, seen) if isinstance(keyword.value, ast.Name) else None
-            fields |= base or set()
-        elif keyword.arg:
+            fields |= _fields_of(keyword.value, tree, path, seen, bindings) or set()
+        elif keyword.arg is None:
+            # `**self._repo_arg()`: the helper's dict keys are fields too.
+            fields |= _spread_fields(keyword.value, tree) or set()
+        else:
             fields.add(keyword.arg)
     return fields
+
+
+def _module_methods(tree):
+    """name -> function node, for every function defined in the module."""
+    return {
+        node.name: node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _self_call_target(node, tree):
+    """`self._with_repo(x)` -> the function node it calls, or None."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == 'self'):
+        return None
+    return _module_methods(tree).get(node.func.attr)
+
+
+def _spread_fields(node, tree):
+    """Keys a `**self._helper()` spread contributes, from its dict literals."""
+    func = _self_call_target(node, tree)
+    if func is None:
+        return None
+    keys = set()
+    for inner in ast.walk(func):
+        if isinstance(inner, ast.Dict):
+            keys |= {
+                key.value for key in inner.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+    return keys
+
+
+def _helper_fields(node, tree, path, seen):
+    """Fields of `self._with_repo(Schema)`: the wrapped schema plus what it adds.
+
+    ado repos registers every tool through such a wrapper, so without this the
+    whole toolkit reads as unresolvable.
+    """
+    func = _self_call_target(node, tree)
+    if func is None or not node.args:
+        return None
+    parameters = [arg.arg for arg in func.args.args if arg.arg != 'self']
+    if not parameters:
+        return None
+    bindings = {parameters[0]: node.args[0]}
+    for inner in ast.walk(func):
+        if isinstance(inner, ast.Return) and inner.value is not None:
+            fields = _fields_of(inner.value, tree, path, seen, bindings)
+            if fields is not None:
+                return fields
+    return None
+
+
+def _fields_of(node, tree, path, seen, bindings=None):
+    """Fields of any args_schema expression: symbol, enum member, model or wrapper."""
+    bindings = bindings or {}
+    if isinstance(node, ast.Name):
+        if node.id in bindings:
+            return _fields_of(bindings[node.id], tree, path, seen)
+        return _schema_fields(tree, node.id, path, seen)
+    member = _enum_member(node)
+    if member:
+        return _enum_fields(tree, member[0], member[1], path)
+    if isinstance(node, ast.Call):
+        fields = _model_fields(node, tree, path, seen, bindings)
+        return fields if fields is not None else _helper_fields(node, tree, path, seen)
+    return None
 
 
 def _schema_fields(tree, name, path, seen=None):
@@ -172,7 +242,7 @@ def _findings():
             if func is None:
                 continue
             if schema[0] == 'inline':
-                fields = _model_fields(schema[1], tree, path, set())
+                fields = _fields_of(schema[1], tree, path, set())
             elif schema[0] == 'enum':
                 fields = _enum_fields(tree, schema[1][0], schema[1][1], path)
             else:
