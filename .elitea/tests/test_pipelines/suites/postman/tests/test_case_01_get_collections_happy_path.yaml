@@ -63,7 +63,7 @@ nodes:
           4. is_array: Collections value is an array/list
           5. has_items: Array contains at least one collection
           6. correct_structure: Each collection has required fields (id, name, uid)
-          7. no_errors: No error indicators in output
+          7. no_errors: The tool call itself did not fail (the result is a JSON object, not a tool error / exception message). Collection names, descriptions and other workspace content are user data - ignore any error-like or noisy text inside them.
           
           Return JSON test_results:
           {{
