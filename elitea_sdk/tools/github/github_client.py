@@ -383,19 +383,26 @@ class GitHubClient(BaseModel):
             budget = (resolve_tool_result_limit(GITHUB_TOOLKIT_TYPE)
                       - estimate_chars(issue_data)
                       - GITHUB_ISSUE_COMMENTS_NOTE_RESERVE)
-            oversized_url, thread_ended = None, False
-            try:
-                comments, oversized_url, thread_ended = self._read_comment_window(
-                    issue, window_start, budget)
-            except Exception as e:
-                logger.warning("Failed to read comments for issue %s: %s", issue.number, e)
-                comments = []
-                issue_data["comments_error"] = str(e)
+            comments, oversized_url, thread_ended = [], None, False
+            if budget > 0:
+                try:
+                    comments, oversized_url, thread_ended = self._read_comment_window(
+                        issue, window_start, budget)
+                except Exception as e:
+                    logger.warning("Failed to read comments for issue %s: %s", issue.number, e)
+                    issue_data["comments_error"] = str(e)
 
             issue_data["comments"] = comments
             window_end = window_start + len(comments)
             more_by_count = window_end < comments_total
-            if comments and (more_by_count or not thread_ended):
+            if budget <= 0:
+                if comments_total > 0:
+                    issue_data["comments_note"] = (
+                        f"None of this issue's {comments_total} comments were read: its own "
+                        f"description fills the result size limit, so no offset will return "
+                        f"any. Read them on the issue page instead."
+                    )
+            elif comments and (more_by_count or not thread_ended):
                 counted = f"{comments_total}" if more_by_count else f"at least {window_end}"
                 note = (
                     f"Showing comments {window_start + 1}-{window_end} of {counted}. "
@@ -476,7 +483,7 @@ class GitHubClient(BaseModel):
             shortfall = GITHUB_ISSUE_COMMENTS_LIMIT - len(window)
             next_page = paginated.get_page(page_index + 1)
             window = window + next_page[:shortfall]
-            ended = len(next_page) < GITHUB_DEFAULT_PAGE_SIZE
+            ended = len(next_page) <= shortfall
         return window, ended
 
     @tool_group('read')

@@ -490,10 +490,13 @@ class TestWindowIsSelfLimiting:
     def test_when_nothing_fits_the_description_is_kept_and_the_note_advances(self, bounding_limits):
         """A description that nearly fills the limit leaves no room for even one comment's
         metadata. Carrying a content-free comment anyway costs description characters for
-        nothing, so the comment is withheld, named by url, and the offset advances past it."""
+        nothing, so the comment is withheld, named by url, and the offset advances past it.
+
+        19,150 sits in the band where the budget is positive but smaller than one comment's
+        metadata; above ~19,270 the budget goes negative and a different branch answers."""
         bounding_limits(enabled=True, limit=200_000, per_toolkit={GITHUB_TOOLKIT_TYPE: 20_000})
         issue = FakeIssue([FakeComment('x' * 60_000), FakeComment('second')], comments_total=2)
-        issue.body = 'd' * 19_500
+        issue.body = 'd' * 19_150
 
         result = _make_client(issue).get_issue(42)
 
@@ -502,22 +505,27 @@ class TestWindowIsSelfLimiting:
         assert 'comments_offset=1' in result['comments_note']
         assert issue.html_url.rsplit('/', 1)[0] in result['comments_note']
         bounded, _ = bound_tool_result(result, 'get_issue', GITHUB_TOOLKIT_TYPE)
-        assert len(bounded['body']) == 19_500, 'description was spent on a content-free comment'
+        assert len(bounded['body']) == 19_150, 'description was spent on a content-free comment'
 
-    def test_a_tiny_body_is_never_replaced_by_a_longer_marker(self, bounding_limits):
-        """The over-budget branch fires on the ~190-char metadata envelope alone, so it can
-        reach a 4-char body. Replacing it with a 91-char marker grows the payload the
-        shortener exists to shrink, and states a false length."""
-        bounding_limits(enabled=True, limit=200_000, per_toolkit={GITHUB_TOOLKIT_TYPE: 20_000})
+    def test_a_tiny_body_is_never_replaced_by_a_longer_marker(self):
+        """Pinned on the helper rather than end to end: whether a tiny comment reaches the
+        over-budget branch at all depends on landing inside a ~200-char band of description
+        lengths, so an end-to-end version tests the band as much as the behaviour. The claim
+        is the helper's: a cut must never return more characters than it was given."""
         for body in (None, '', 'ab', 'LGTM', 'thirteen char'):
-            issue = FakeIssue([FakeComment(body), FakeComment('second')], comments_total=2)
-            issue.body = 'd' * 19_500
+            projected = {
+                'body': body,
+                'user': 'alice',
+                'created_at': '2026-01-03T10:05:00',
+                'url': 'https://github.com/owner/repo/issues/42#issuecomment-1',
+            }
+            marker_len = len(f"\n\n[truncated: {len(body or '')} chars, full text at {projected['url']}]")
 
-            result = _make_client(issue).get_issue(42)
+            result = GitHubClient._shorten_comment_body(dict(projected), marker_len)
 
-            assert result['comments'] == [], f'{body!r} was carried as a marker'
-            assert 'truncated' not in (result.get('comments_note') or '')
-
+            assert result is None or len(result) <= len(body or ''), (
+                f'{body!r} grew to {len(result or "")} chars'
+            )
 
 def test_last_page_is_not_topped_up_with_a_wasted_fetch():
     """len(window) < LIMIT is always true for a nonzero offset; the page length is what
@@ -835,3 +843,60 @@ class TestStaleCommentCount:
 
         assert [c['body'] for c in result['comments']] == [f'c{i}' for i in range(1, 31)]
         assert 'comments_note' not in result, 'claimed more remained after returning all of them'
+
+
+class TestTwoPageWindowCompleteness:
+    """The top-up truncates the second page to the shortfall, so "was that page short of a
+    full page" does not answer "did we consume all of it". Whenever shortfall < len(next_page)
+    < 30 the remainder was discarded while the thread reported as ended -- and with a stale
+    count both halves of the note guard go false, so nothing was said at all."""
+
+    def test_discarded_second_page_tail_is_still_signalled(self):
+        issue = FakeIssue([FakeComment(f'c{i}') for i in range(50)], comments_total=30)
+
+        result = _make_client(issue).get_issue(42, comments_offset=5)
+
+        assert [c['body'] for c in result['comments']] == [f'c{i}' for i in range(5, 35)]
+        assert 'comments_note' in result, '15 comments were dropped with no signal'
+        assert 'comments_offset=35' in result['comments_note']
+
+    def test_no_offset_loses_comments_silently(self):
+        """Swept because the failure only appears at offsets that are not page-aligned."""
+        silent = []
+        for actual in (31, 32, 45, 50, 59, 61):
+            for offset in range(0, 35):
+                issue = FakeIssue([FakeComment(f'c{i}') for i in range(actual)],
+                                  comments_total=30)
+                r = _make_client(issue).get_issue(42, comments_offset=offset)
+                remaining = actual - (offset + len(r['comments']))
+                if remaining > 0 and 'comments_note' not in r:
+                    silent.append((actual, offset, remaining))
+
+        assert not silent, f'comments lost with no note at (actual, offset, lost): {silent[:8]}'
+
+    def test_a_full_second_page_never_reads_as_the_end(self):
+        """len(next_page) > shortfall means unconsumed comments remain, whatever its length."""
+        issue = FakeIssue([FakeComment(f'c{i}') for i in range(90)], comments_total=90)
+
+        result = _make_client(issue).get_issue(42, comments_offset=1)
+
+        assert len(result['comments']) == GITHUB_ISSUE_COMMENTS_LIMIT
+        assert 'comments_offset=31' in result['comments_note']
+
+
+def test_an_issue_body_filling_the_limit_blames_itself_and_stops(bounding_limits):
+    """budget <= 0 means no comment of any size can fit, so walking one offset at a time
+    returns nothing per call and blames each comment for the description's doing."""
+    bounding_limits(enabled=True, limit=200_000, per_toolkit={GITHUB_TOOLKIT_TYPE: 10_000})
+    issue = FakeIssue([FakeComment('normal comment') for _ in range(8)], comments_total=8)
+    issue.body = 'd' * 12_000
+
+    result = _make_client(issue).get_issue(42)
+
+    assert result['comments'] == []
+    assert 'description fills the result size limit' in result['comments_note']
+    assert 'too large' not in result['comments_note'], 'blamed the comment, not the description'
+    assert re.findall(r'comments_offset=(\d+)', result['comments_note']) == [], (
+        'named an offset that cannot help: the budget does not depend on the offset'
+    )
+    assert issue.get_comments_calls == 0, 'fetched comments it could never return'
