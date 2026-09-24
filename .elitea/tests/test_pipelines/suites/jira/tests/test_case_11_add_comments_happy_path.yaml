@@ -65,8 +65,9 @@ nodes:
           Tool Result: {tool_result}
 
           Perform the following checks:
-          1. Confirm the tool executed successfully (result is not empty or null).
-          2. Verify result indicates comment was added successfully.
+          1. Confirm the tool executed successfully (result is not null and is not an error message).
+          2. Verify result indicates comment was added successfully (e.g. "Comment <ID> is added for issue <KEY>").
+          3. If the result contains a Jira browse URL, verify it is well-formed: "<host>/browse/<KEY>" with a "/" before "browse".
 
           Return a JSON object named test_results with the following structure:
 

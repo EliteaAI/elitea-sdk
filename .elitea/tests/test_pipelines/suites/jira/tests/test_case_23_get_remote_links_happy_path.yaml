@@ -57,8 +57,9 @@ nodes:
           Tool Result: {tool_result}
 
           Perform the following checks:
-          1. Confirm the tool executed successfully (result is not empty or null).
-          2. Result should contain remote links information or empty list.
+          1. Confirm the tool executed successfully (result is not null and is not an error message).
+          2. The tool returns a JSON list of remote links. An empty list [] is VALID (the issue has no remote links) and is a PASS.
+          3. If the list is non-empty, verify each item is an object describing a remote link (e.g. has 'id' and 'object' fields).
 
           Return a JSON object named test_results with the following structure:
 
