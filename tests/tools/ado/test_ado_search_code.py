@@ -132,6 +132,84 @@ def test_branch_and_path_filters_are_opt_in():
     request = wrapper._search_client_instance.last_request
     assert request.filters["Branch"] == ["release/2.0"]
     assert request.filters["Path"] == ["/src"]
+    assert request.search_text == "q"
+
+
+@pytest.mark.parametrize(
+    "path,expected_token",
+    [
+        ("/testcode/**", "path:testcode/**"),
+        ("src/**/utils", "path:src/**/utils"),
+        ("src/*/utils", "path:src/*/utils"),
+        ("src/util?", "path:src/util?"),
+    ],
+)
+def test_glob_path_is_sent_as_an_inline_token_not_a_facet(path, expected_token):
+    wrapper = _make_ado(FakeResponse())
+
+    wrapper.search_code("retry", path=path)
+
+    request = wrapper._search_client_instance.last_request
+    assert request.search_text == f"(retry) {expected_token}"
+    assert "Path" not in request.filters
+
+
+@pytest.mark.parametrize("query", ["retry OR backoff", "retry NOT legacy"])
+def test_glob_path_scopes_the_whole_boolean_query(query):
+    wrapper = _make_ado(FakeResponse())
+
+    wrapper.search_code(query, path="src/**/clients")
+
+    assert wrapper._search_client_instance.last_request.search_text == f"({query}) path:src/**/clients"
+
+
+def test_glob_path_leading_slash_is_stripped():
+    wrapper = _make_ado(FakeResponse())
+
+    wrapper.search_code("retry", path="//src/**/utils")
+
+    assert wrapper._search_client_instance.last_request.search_text == "(retry) path:src/**/utils"
+
+
+def test_glob_path_with_whitespace_is_quoted():
+    wrapper = _make_ado(FakeResponse())
+
+    wrapper.search_code("retry", path="/my folder/**")
+
+    assert wrapper._search_client_instance.last_request.search_text == '(retry) path:"my folder/**"'
+
+
+def test_inline_path_already_in_query_is_kept_alongside_glob():
+    wrapper = _make_ado(FakeResponse())
+
+    wrapper.search_code("retry path:src/a/**", path="src/**/utils")
+
+    assert (
+        wrapper._search_client_instance.last_request.search_text
+        == "(retry path:src/a/**) path:src/**/utils"
+    )
+
+
+def test_search_failure_reports_the_effective_search_text():
+    class ExplodingSearchClient:
+        def fetch_code_search_results(self, request, project=None):
+            raise RuntimeError("boom")
+
+    wrapper = _make_ado(FakeResponse())
+    wrapper._search_client_instance = ExplodingSearchClient()
+
+    with pytest.raises(ToolException, match=r"'\(retry\) path:src/\*\*/utils'"):
+        wrapper.search_code("retry", path="src/**/utils")
+
+
+def test_path_schema_documents_glob_support():
+    tools = ReposApiWrapper.model_construct().get_available_tools()
+    search_code_schema = next(tool for tool in tools if tool["name"] == "search_code")["args_schema"]
+
+    description = search_code_schema.model_fields["path"].description
+
+    assert "**" in description
+    assert "src/**/utils" in description
 
 
 @pytest.mark.parametrize(
