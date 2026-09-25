@@ -7,7 +7,7 @@ description: |
   Expected Behavior:
   - Tool executes successfully
   - Returns PR object with expected fields
-  - Contains PR #10 details with title 'PR FOR AI TEST'
+  - Contains PR #12 details with title 'PR FOR AI TEST'
 
 toolkits:
   - id: ${ADO_REPOS_TOOLKIT_ID}
@@ -24,6 +24,8 @@ state:
     type: list
     value: ["pull_request_id", "title", "description", "commits", "comments", "source_branch", "target_branch"]
   tool_result:
+    type: str
+  trimmed_result:
     type: str
   test_results:
     type: dict
@@ -43,12 +45,43 @@ nodes:
     structured_output: true
     tool: get_pull_request
     toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
+    transition: trim_pull_request
+
+  - id: trim_pull_request
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+
+        raw = elitea_state.get('tool_result', '')
+        if isinstance(raw, str):
+            data = json.loads(raw)
+        else:
+            data = raw
+
+        if isinstance(data, list) and data:
+            candidate = data[0]
+        else:
+            candidate = data
+
+        trimmed = {}
+        if isinstance(candidate, dict):
+            for key in ["pull_request_id", "title", "description", "commits", "comments", "source_branch", "target_branch"]:
+                trimmed[key] = candidate.get(key)
+
+        {"trimmed_result": json.dumps(trimmed)}
+    input:
+      - tool_result
+    output:
+      - trimmed_result
+    structured_output: true
     transition: validate_results
 
   - id: validate_results
     type: llm
     input:
-      - tool_result
+      - trimmed_result
       - pull_request_id
       - expected_title
       - expected_fields
@@ -64,7 +97,7 @@ nodes:
         value: |
           Analyze the output from the 'get_pull_request' tool.
 
-          Tool Result: {tool_result}
+          Tool Result: {trimmed_result}
           Expected PR ID: {pull_request_id}
           Expected Title: {expected_title}
           Expected Fields: {expected_fields}

@@ -40,7 +40,7 @@ nodes:
       - tool_result
     structured_output: true
     tool: comment_on_pull_request
-    toolkit_name: ado-repos-testing
+    toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
     transition: get_pr_details
   - id: get_pr_details
     type: toolkit
@@ -54,7 +54,7 @@ nodes:
       - pr_details
     structured_output: true
     tool: get_pull_request
-    toolkit_name: ado-repos-testing
+    toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
     transition: validate_comment
   - id: validate_comment
     type: llm

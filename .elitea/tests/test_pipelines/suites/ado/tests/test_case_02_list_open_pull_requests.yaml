@@ -11,6 +11,8 @@ state:
     value: ${ADO_REPOSITORY_ID}
   tool_result:
     type: str
+  trimmed_result:
+    type: str
   test_results:
     type: dict
 
@@ -29,12 +31,41 @@ nodes:
     structured_output: true
     tool: list_open_pull_requests
     toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
+    transition: trim_pr_results
+
+  - id: trim_pr_results
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+
+        raw = elitea_state.get('tool_result', '')
+        if isinstance(raw, str):
+            data = json.loads(raw)
+        else:
+            data = raw
+
+        summary = []
+        for pr in (data or [])[:50]:
+            if isinstance(pr, dict):
+                summary.append({
+                    "pull_request_id": pr.get("pull_request_id"),
+                    "title": pr.get("title")
+                })
+
+        {"trimmed_result": json.dumps(summary)}
+    input:
+      - tool_result
+    output:
+      - trimmed_result
+    structured_output: true
     transition: validate_prs
 
   - id: validate_prs
     type: llm
     input:
-      - tool_result
+      - trimmed_result
     input_mapping:
       chat_history:
         type: fixed
@@ -48,7 +79,7 @@ nodes:
       task:
         type: fstring
         value: |
-          Tool output from 'list_open_pull_requests': {tool_result}
+          Tool output from 'list_open_pull_requests': {trimmed_result}
 
           Scan the output above and answer these questions:
           1. Is there at least 1 PR? (pr_count >= 1)

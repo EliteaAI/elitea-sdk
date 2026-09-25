@@ -83,7 +83,7 @@ nodes:
       - create_result
     structured_output: true
     tool: modify_wiki_page
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: extract_page_id
   - id: extract_page_id
     type: code
@@ -128,7 +128,7 @@ nodes:
       - tool_result
     structured_output: true
     tool: delete_page_by_id
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: validate_deletion
   - id: validate_deletion
     type: llm

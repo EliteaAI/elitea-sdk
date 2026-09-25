@@ -88,7 +88,7 @@ nodes:
       - create_result
     structured_output: true
     tool: modify_wiki_page
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: verify_page_created
   - id: verify_page_created
     type: code
@@ -139,7 +139,7 @@ nodes:
       - tool_result
     structured_output: true
     tool: rename_wiki_page
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: cleanup_wiki_page
   - id: cleanup_wiki_page
     type: toolkit
@@ -161,7 +161,7 @@ nodes:
       - cleanup_result
     structured_output: true
     tool: delete_page_by_path
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: validate_rename_result
   - id: validate_rename_result
     type: llm
