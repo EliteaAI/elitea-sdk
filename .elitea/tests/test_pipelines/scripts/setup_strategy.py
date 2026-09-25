@@ -19,6 +19,30 @@ if TYPE_CHECKING:
     from setup import SetupContext
 
 
+_SECRET_KEY_PARTS = (
+    "token", "secret", "password", "passwd", "api_key", "apikey", "private_key",
+    "credential", "connection_string", "cookie", "session",
+)
+_SECRET_KEYS = {"key", "pat", "auth", "authorization"}
+
+
+def _is_secret_key(key: Any) -> bool:
+    k = str(key).lower()
+    return k in _SECRET_KEYS or any(part in k for part in _SECRET_KEY_PARTS)
+
+
+def _redact(value: Any) -> Any:
+    """Return a copy of a config structure with secret-looking values masked, for logging."""
+    if isinstance(value, dict):
+        return {
+            k: ("***" if _is_secret_key(k) and v not in (None, "") else _redact(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return type(value)(_redact(v) for v in value)
+    return value
+
+
 class SetupStrategy(ABC):
     """
     Abstract base class for setup execution strategies.
@@ -248,7 +272,7 @@ class LocalSetupStrategy(SetupStrategy):
         logger.info(f"[LOCAL DEBUG] Built settings for {toolkit_type}: {list(settings.keys())}")
         config_key = f"{toolkit_type}_configuration"
         if config_key in settings:
-            logger.info(f"[LOCAL DEBUG] {config_key} content: {settings[config_key]}")
+            logger.info(f"[LOCAL DEBUG] {config_key} content: {_redact(settings[config_key])}")
         
         tool_config = {
             "id": toolkit_id,
@@ -258,7 +282,7 @@ class LocalSetupStrategy(SetupStrategy):
             "settings": settings,
         }
         
-        logger.info(f"[LOCAL DEBUG] Final tool_config being passed to get_tools: {tool_config}")
+        logger.info(f"[LOCAL DEBUG] Final tool_config being passed to get_tools: {_redact(tool_config)}")
         
         try:
             from elitea_sdk.runtime.toolkits.tools import get_tools
@@ -363,7 +387,7 @@ class LocalSetupStrategy(SetupStrategy):
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"[MERGE DEBUG] toolkit_type: {toolkit_type}, config_key: {config_key}")
-        logger.info(f"[MERGE DEBUG] toolkit_config: {toolkit_config}")
+        logger.info(f"[MERGE DEBUG] toolkit_config: {_redact(toolkit_config)}")
         logger.info(f"[MERGE DEBUG] _configuration_data keys: {list(self._configuration_data.keys())}")
 
         # Support both 'elitea_title' (pipeline.yaml) and legacy 'alita_title' (config files)
@@ -376,8 +400,8 @@ class LocalSetupStrategy(SetupStrategy):
             stored_data = self._configuration_data[_title_value]
             logger.info(f"[LOCAL DEBUG] Found title: {_title_value}")
             logger.info(f"[LOCAL DEBUG] Stored data keys: {list(stored_data.keys())}")
-            logger.info(f"[LOCAL DEBUG] Stored data: {stored_data}")
-            logger.info(f"[LOCAL DEBUG] toolkit_config BEFORE merge: {toolkit_config}")
+            logger.info(f"[LOCAL DEBUG] Stored data: {_redact(stored_data)}")
+            logger.info(f"[LOCAL DEBUG] toolkit_config BEFORE merge: {_redact(toolkit_config)}")
             # Merge stored configuration data (credentials) into toolkit_config
             # When a title key is present, stored data takes PRECEDENCE over config file values
             # This allows credentials to come from the configuration step while keeping
@@ -389,7 +413,7 @@ class LocalSetupStrategy(SetupStrategy):
                 # Always overwrite with stored credentials when title key is used
                 toolkit_config[key] = value
                 logger.info(f"[LOCAL DEBUG] Merged {key} into toolkit_config (overwrite)")
-            logger.info(f"[LOCAL DEBUG] toolkit_config AFTER merge: {toolkit_config}")
+            logger.info(f"[LOCAL DEBUG] toolkit_config AFTER merge: {_redact(toolkit_config)}")
 
         # Programmatically populate toolkit_configuration from environment variables using Pydantic model
         try:
@@ -725,7 +749,7 @@ class LocalSetupStrategy(SetupStrategy):
         logger.info(f"[CONFIG DEBUG] config_type: {config_type}")
         logger.info(f"[CONFIG DEBUG] elitea_title: {elitea_title}")
         logger.info(f"[CONFIG DEBUG] data keys: {list(data.keys())}")
-        logger.info(f"[CONFIG DEBUG] data content: {data}")
+        logger.info(f"[CONFIG DEBUG] data content: {_redact(data)}")
         
         if not config_type:
             ctx.log("[LOCAL] No config_type provided", "warning")
@@ -748,7 +772,7 @@ class LocalSetupStrategy(SetupStrategy):
         # DEBUG: Verify storage
         import logging
         logger = logging.getLogger(__name__)
-        logger.info(f"[CONFIG DEBUG] Stored in _configuration_data['{elitea_title}']: {self._configuration_data[elitea_title]}")
+        logger.info(f"[CONFIG DEBUG] Stored in _configuration_data['{elitea_title}']: {_redact(self._configuration_data[elitea_title])}")
         
         ctx.log(f"[LOCAL] Registered configuration '{elitea_title}' of type '{config_type}'", "success")
         
