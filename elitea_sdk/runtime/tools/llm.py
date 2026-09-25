@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 from traceback import format_exc
@@ -49,17 +50,21 @@ TOOL_EXECUTION_TIMEOUT_ENV = 'ELITEA_TOOL_EXECUTION_TIMEOUT'
 
 
 _NO_LIMIT = object()
+_INVALID = object()
 
 
 def _parse_timeout(value: Any) -> Any:
-    """Seconds as float, _NO_LIMIT for None/0/negative/'none', or the raw value if unparsable."""
+    """Seconds as float, _NO_LIMIT for None/0/negative/inf/'none', or _INVALID if unparsable."""
     if value is None or (isinstance(value, str) and value.strip().lower() in ('', 'none', 'null')):
         return _NO_LIMIT
     try:
         seconds = float(value)
     except (TypeError, ValueError):
-        return value
-    return seconds if seconds > 0 else _NO_LIMIT
+        return _INVALID
+    # thread.join() rejects nan and inf; nan is garbage, inf means wait forever.
+    if math.isnan(seconds):
+        return _INVALID
+    return seconds if 0 < seconds < math.inf else _NO_LIMIT
 
 
 def default_tool_execution_timeout() -> Optional[float]:

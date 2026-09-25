@@ -91,6 +91,9 @@ def test_default_is_900_without_env():
     ('none', None),
     ('', None),
     ('garbage', DEFAULT_TOOL_EXECUTION_TIMEOUT),
+    ('inf', None),
+    ('Infinity', None),
+    ('nan', DEFAULT_TOOL_EXECUTION_TIMEOUT),
 ])
 def test_env_overrides_default(monkeypatch, raw, expected):
     monkeypatch.setenv(TOOL_EXECUTION_TIMEOUT_ENV, raw)
@@ -104,6 +107,10 @@ def test_env_overrides_default(monkeypatch, raw, expected):
     (-5, None),
     (30, 30.0),
     ('45', 45.0),
+    (float('inf'), None),
+    ('-inf', None),
+    (float('nan'), DEFAULT_TOOL_EXECUTION_TIMEOUT),
+    ('NaN', DEFAULT_TOOL_EXECUTION_TIMEOUT),
 ])
 def test_normalize(value, expected):
     assert normalize_tool_execution_timeout(value) == expected
@@ -124,6 +131,13 @@ def test_nested_loop_is_cut_at_configured_timeout():
 @pytest.mark.parametrize('timeout', [None, 0])
 def test_nested_loop_without_limit_runs_to_completion(timeout):
     result = _invoke_inside_running_loop(_node(tool_execution_timeout=timeout))
+    assert result['messages'][-1].content == 'final answer'
+
+
+@pytest.mark.parametrize('raw', ['inf', 'nan'])
+def test_nested_loop_survives_non_finite_env(monkeypatch, raw):
+    monkeypatch.setenv(TOOL_EXECUTION_TIMEOUT_ENV, raw)
+    result = _invoke_inside_running_loop(_node())
     assert result['messages'][-1].content == 'final answer'
 
 
