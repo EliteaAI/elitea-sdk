@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import os
 import re
 from traceback import format_exc
 from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING, cast
@@ -42,6 +43,58 @@ from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 
 _STANDARD_CONTENT_TYPES = {"text", "image", "image_url", "document", "search_result"}
+
+DEFAULT_TOOL_EXECUTION_TIMEOUT = 900
+TOOL_EXECUTION_TIMEOUT_ENV = 'ELITEA_TOOL_EXECUTION_TIMEOUT'
+
+
+_NO_LIMIT = object()
+
+
+def _parse_timeout(value: Any) -> Any:
+    """Seconds as float, _NO_LIMIT for None/0/negative/'none', or the raw value if unparsable."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in ('', 'none', 'null')):
+        return _NO_LIMIT
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return value
+    return seconds if seconds > 0 else _NO_LIMIT
+
+
+def default_tool_execution_timeout() -> Optional[float]:
+    """Deployment-wide default, overridable via ELITEA_TOOL_EXECUTION_TIMEOUT.
+
+    Nested agents run their tool loop in a worker thread bounded by this value,
+    so it caps how long a sub-agent with its own tools may run end to end.
+    None, 0 and negative values mean "no limit".
+    """
+    raw = os.environ.get(TOOL_EXECUTION_TIMEOUT_ENV)
+    if raw is None:
+        return DEFAULT_TOOL_EXECUTION_TIMEOUT
+    parsed = _parse_timeout(raw)
+    if parsed is _NO_LIMIT:
+        return None
+    if isinstance(parsed, float):
+        return parsed
+    logging.getLogger(__name__).warning("Invalid %s=%r, using %ss", TOOL_EXECUTION_TIMEOUT_ENV,
+                                        raw, DEFAULT_TOOL_EXECUTION_TIMEOUT)
+    return DEFAULT_TOOL_EXECUTION_TIMEOUT
+
+
+def normalize_tool_execution_timeout(value: Any) -> Optional[float]:
+    """Seconds to wait for a threaded tool loop, or None for no limit.
+
+    An unparsable value falls back to the deployment default rather than
+    silently disabling the guard.
+    """
+    parsed = _parse_timeout(value)
+    if parsed is _NO_LIMIT:
+        return None
+    if isinstance(parsed, float):
+        return parsed
+    logging.getLogger(__name__).warning("Invalid tool_execution_timeout %r, using default", value)
+    return default_tool_execution_timeout()
 
 
 def is_structured_tool_content(result: Any) -> bool:
@@ -180,7 +233,11 @@ class LLMNode(BaseTool):
     available_tools: Optional[List[BaseTool]] = Field(default=None, description='Available tools for binding')
     tool_names: Optional[List[str]] = Field(default=None, description='Specific tool names to filter')
     steps_limit: Optional[int] = Field(default=25, description='Maximum steps for tool execution')
-    tool_execution_timeout: Optional[int] = Field(default=900, description='Timeout (seconds) for tool execution. Default is 15 minutes.')
+    tool_execution_timeout: Optional[float] = Field(
+        default_factory=default_tool_execution_timeout,
+        description='Timeout (seconds) for the tool-calling loop when it runs in a worker thread '
+                    '(e.g. a nested agent). None or 0 means no limit. Defaults to '
+                    f'{TOOL_EXECUTION_TIMEOUT_ENV} or {DEFAULT_TOOL_EXECUTION_TIMEOUT}s.')
 
     # Lazy tools mode - reduces token usage by not binding all tools upfront
     lazy_tools_mode: Optional[bool] = Field(
@@ -2915,11 +2972,13 @@ class LLMNode(BaseTool):
                     logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
 
             thread.start()
-            thread.join(timeout=self.tool_execution_timeout)  # 15 minute timeout for safety
+            timeout = normalize_tool_execution_timeout(self.tool_execution_timeout)
+            thread.join(timeout=timeout)
 
             if thread.is_alive():
-                logger.error("Async operation timed out after 5 minutes")
-                raise TimeoutError("Async operation in thread timed out")
+                logger.error("Async operation in node '%s' timed out after %ss "
+                             "(tool_execution_timeout)", self.name, timeout)
+                raise TimeoutError(f"Async operation in thread timed out after {timeout}s")
 
             # Re-raise exception if one occurred
             if exception_container:
@@ -2986,11 +3045,13 @@ class LLMNode(BaseTool):
                         logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
 
                 thread.start()
-                thread.join(timeout=self.tool_execution_timeout)
+                timeout = normalize_tool_execution_timeout(self.tool_execution_timeout)
+                thread.join(timeout=timeout)
 
                 if thread.is_alive():
-                    logger.error("Async operation timed out after 15 minutes")
-                    raise TimeoutError("Async operation in thread timed out")
+                    logger.error("Async operation in node '%s' timed out after %ss "
+                                 "(tool_execution_timeout)", self.name, timeout)
+                    raise TimeoutError(f"Async operation in thread timed out after {timeout}s")
 
                 if exception_container:
                     raise exception_container[0]
