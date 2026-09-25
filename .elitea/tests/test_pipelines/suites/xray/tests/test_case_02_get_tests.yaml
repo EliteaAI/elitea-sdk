@@ -25,7 +25,7 @@ state:
     type: str
   expected_success_indicators:
     type: list
-    value: ["issueId", "jira", "testType"]
+    value: ["Extracted tests", "issueId", "jira"]
   error_indicators:
     type: list
     value: ["Unable to get tests", "Tool execution error", "failed to", "exception occurred"]
@@ -75,11 +75,13 @@ nodes:
 
           This is a POSITIVE test - we expect successful test retrieval.
 
+          IMPORTANT: The tool may return a raw JSON array of test objects rather than a human phrase like "Extracted tests". A JSON array with one or more objects containing fields such as issueId or jira counts as successful extraction.
+
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Tool ran without throwing an exception
           2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears in test content like summaries or descriptions.
-          3. has_extracted_tests: Response is a JSON list of test objects (the tool returns the list directly, there is no "Extracted tests" header). An empty list [] is VALID - no tests matched the JQL.
-          4. has_test_data: If the list is non-empty, its items contain test details (issueId, jira fields). Pass this check for an empty list.
+          3. has_extracted_tests: Response contains a non-empty list or array of tests, or indicates retrieved tests with count
+          4. has_test_data: Response contains test details (issueId, jira fields)
 
           Return JSON test_results:
           {{
@@ -88,7 +90,7 @@ nodes:
             "no_errors": boolean,
             "has_extracted_tests": boolean,
             "has_test_data": boolean,
-            "tests_count": integer (number of items in the list, 0 for an empty list),
+            "tests_count": integer (number of tests found, or 0 if none),
             "success_indicator_found": "which indicator was found or 'none'",
             "error_indicator_found": "which error indicator was found or 'none'",
             "error": string | null

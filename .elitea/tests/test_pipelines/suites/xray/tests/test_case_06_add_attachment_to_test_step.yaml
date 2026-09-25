@@ -119,27 +119,27 @@ nodes:
       value: |
         import json
         import re
-
-        # create_test returns {"message": ..., "test": {"data": {"createTest": {"test": {...}}}}}
-        result = elitea_state.get("create_result", "")
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except (ValueError, TypeError):
-                pass
-
+        
+        # Extract step ID from creation result
+        raw_result = elitea_state.get("create_result", "")
         step_id = ""
-        if isinstance(result, dict):
-            test = (((result.get("test") or {}).get("data") or {}).get("createTest") or {}).get("test") or {}
-            steps = test.get("steps") or []
-            if steps:
-                step_id = steps[0].get("id") or ""
-        if not step_id:
-            # fall back to a UUID anywhere in the text form
-            match = re.search(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", str(result))
-            if match:
-                step_id = match.group(0)
-
+        
+        try:
+            if isinstance(raw_result, dict):
+                test_obj = raw_result.get("test", {}).get("data", {}).get("createTest", {}).get("test", {})
+                steps = test_obj.get("steps", [])
+                if steps and isinstance(steps[0], dict):
+                    step_id = steps[0].get("id", "") or ""
+            else:
+                result_str = raw_result if isinstance(raw_result, str) else json.dumps(raw_result)
+                step_id_match = re.search(r"'id':\s*'([a-f0-9\-]{36})'", result_str)
+                if not step_id_match:
+                    step_id_match = re.search(r'"id":\s*"([a-f0-9\-]{36})"', result_str)
+                if step_id_match:
+                    step_id = step_id_match.group(1)
+        except Exception:
+            pass
+        
         {"step_id": step_id}
     input:
       - create_result

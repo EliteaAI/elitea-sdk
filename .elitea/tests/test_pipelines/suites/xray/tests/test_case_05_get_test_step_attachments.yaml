@@ -82,23 +82,19 @@ nodes:
       value: |
         import json
         import re
-        # graphql_result is small (1 test only) - safe to pass through state.
-        # execute_graphql returns a dict: {"data": {"getTests": {"results": [{"issueId": ...}]}}}
-        result = elitea_state.get("graphql_result", "")
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except (ValueError, TypeError):
-                pass
+        # graphql_result may arrive as dict or string
+        raw_result = elitea_state.get("graphql_result", "")
         test_issue_id = "not_found"
         try:
-            if isinstance(result, dict):
-                data = result.get("data", result)
-                results = (data.get("getTests") or {}).get("results") or []
-                if results and results[0].get("issueId"):
-                    test_issue_id = str(results[0]["issueId"])
-            if test_issue_id == "not_found":
-                m = re.search(r"""['"]issueId['"]:\s*['"]?(\d+)""", str(result))
+            if isinstance(raw_result, dict):
+                results = raw_result.get("data", {}).get("getTests", {}).get("results", [])
+                if results and isinstance(results[0], dict):
+                    test_issue_id = str(results[0].get("issueId", "not_found"))
+            else:
+                result_str = raw_result if isinstance(raw_result, str) else json.dumps(raw_result)
+                m = re.search(r"'issueId':\s*'?(\d+)'?", result_str)
+                if not m:
+                    m = re.search(r'"issueId":\s*"?(\d+)"?', result_str)
                 if m:
                     test_issue_id = m.group(1)
         except Exception:
