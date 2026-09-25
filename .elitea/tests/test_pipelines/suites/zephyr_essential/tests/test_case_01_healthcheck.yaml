@@ -22,6 +22,8 @@ state:
     value: ["api_error", "connection_error", "timeout_error", "failed", "exception", "down", "unavailable"]
   healthcheck_result:
     type: str
+  healthcheck_analysis:
+    type: str
   test_results:
     type: dict
 
@@ -34,12 +36,39 @@ nodes:
     structured_output: false
     tool: healthcheck
     toolkit_name: ${ZEPHYR_ESSENTIAL_TOOLKIT_NAME}
+    transition: analyze_healthcheck
+
+  # The healthcheck API returns an empty body on success (HTTP 200/204), which the LLM
+  # validator tends to read as "result not provided". Classify the output deterministically.
+  - id: analyze_healthcheck
+    type: code
+    code:
+      type: fixed
+      value: |
+        raw = elitea_state.get("healthcheck_result")
+        text = "" if raw is None else str(raw).strip()
+        lowered = text.lower()
+        errors = [e for e in elitea_state.get("error_indicators", []) if e in lowered]
+        if not text:
+            analysis = "Tool returned an empty response (HTTP 200/204 with no body) - this means the API is healthy. No error indicators present."
+        elif errors:
+            analysis = "Tool output contains error indicators " + str(errors) + ": " + text[:500]
+        else:
+            analysis = "Tool returned a non-empty response without error indicators: " + text[:500]
+        {"healthcheck_analysis": analysis}
+    input:
+      - healthcheck_result
+      - error_indicators
+    output:
+      - healthcheck_analysis
+    structured_output: true
     transition: validate_results
 
   - id: validate_results
     type: llm
     input:
       - healthcheck_result
+      - healthcheck_analysis
       - expected_success_indicators
       - error_indicators
     input_mapping:
@@ -55,6 +84,7 @@ nodes:
           Analyze the output from the 'healthcheck' tool execution.
 
           Healthcheck Result: {healthcheck_result}
+          Healthcheck Analysis (deterministic pre-check, trust it): {healthcheck_analysis}
           Expected Success Indicators: {expected_success_indicators}
           Error Indicators: {error_indicators}
 

@@ -156,7 +156,7 @@ class VectorStoreWrapper(BaseToolApiWrapper):
     @classmethod
     def validate_toolkit(cls, values):
         from ..langchain.interfaces.llm_processor import get_embeddings, get_vectorstore
-        logger.debug(f"Validating toolkit: {values}")
+        logger.debug(f"Validating toolkit, keys: {sorted(values.keys()) if isinstance(values, dict) else type(values).__name__}")
         if not values.get('vectorstore_type'):
             raise ValueError("Vectorstore type is required.")
         if not values.get('embedding_model'):
@@ -178,7 +178,7 @@ class VectorStoreWrapper(BaseToolApiWrapper):
         )
         # Initialize the new vector adapter
         values['vector_adapter'] = VectorStoreAdapterFactory.create_adapter(values['vectorstore_type'])
-        logger.debug(f"Vectorstore wrapper initialized: {values}")
+        logger.debug(f"Vectorstore wrapper initialized, keys: {sorted(values.keys())}")
         return values
 
     def _init_pg_helper(self, language='english'):

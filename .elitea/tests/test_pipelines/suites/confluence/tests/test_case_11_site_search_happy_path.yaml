@@ -8,7 +8,7 @@ description: |
   Expected Behavior:
   - Tool executes successfully without errors.
   - Returns one or more page entries with `page_id`, `page_title`, `page_url`, and `preview` fields.
-  - Results are formatted as string with entries separated by '---'.
+  - Results are returned as a JSON list of page objects.
 
 toolkits:
   - id: ${CONFLUENCE_TOOLKIT_ID}
@@ -62,7 +62,7 @@ nodes:
           Perform the following checks:
           1. Confirm the tool executed successfully (result is not empty or an error message starting with "Unable to find").
           2. Verify the output contains page data with fields 'page_id', 'page_title', 'page_url', and 'preview'.
-          3. Check that results are formatted as string with entries separated by '---'.
+          3. Check that results are a JSON list of one or more objects (one object per page).
 
           Return a JSON object named test_results with the following structure:
 

@@ -3,7 +3,7 @@
   "toolkit_name": "AT",
   "cloud": true,
   "limit": 5,
-  "space": "AT",
+  "space_key": "AT",
   "selected_tools": [
     "create_page",
     "create_pages",

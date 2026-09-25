@@ -151,7 +151,7 @@ class VectorStoreWrapperBase(BaseToolApiWrapper):
     @classmethod
     def validate_toolkit(cls, values):
         from ..langchain.interfaces.llm_processor import get_vectorstore
-        logger.debug(f"Validating toolkit: {values}")
+        logger.debug(f"Validating toolkit, keys: {sorted(values.keys()) if isinstance(values, dict) else type(values).__name__}")
         values["dataset"] = values.get('collection_name')
 
         if values.get('elitea') and values.get('embedding_model'):

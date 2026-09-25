@@ -163,7 +163,7 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         client_id = values['client_id']
         client_secret = values['client_secret']
         # Authenticate to get the token
-        values['base_url'] = values.get('base_url', '') or cls._default_base_url.default
+        values['base_url'] = (values.get('base_url', '') or cls._default_base_url.default).rstrip('/')
         auth_url = f"{values['base_url']}/api/v1/authenticate"
         auth_data = {
             "client_id": client_id,
