@@ -78,7 +78,7 @@ nodes:
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Tool ran without throwing an exception
           2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears in test content like summaries or descriptions.
-          3. has_extracted_tests: Response indicates "Extracted tests" with count
+          3. has_extracted_tests: Response contains a non-empty list of tests or explicit extracted test records
           4. has_test_data: Response contains test details (issueId, jira fields)
 
           Return JSON test_results:
@@ -86,7 +86,7 @@ nodes:
             "test_passed": boolean (true only if ALL criteria pass),
             "tool_executed": boolean,
             "no_errors": boolean,
-            "has_extracted_tests": boolean,
+            "has_extracted_tests": boolean (true when output contains one or more test objects, even if phrase "Extracted tests" is absent),
             "has_test_data": boolean,
             "tests_count": integer (number of tests found, or 0 if none),
             "success_indicator_found": "which indicator was found or 'none'",
