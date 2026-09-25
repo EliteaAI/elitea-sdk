@@ -16,7 +16,7 @@ toolkits:
 state:
   pull_request_id:
     type: str
-    value: "10"
+    value: "12"
   expected_title:
     type: str
     value: "PR FOR AI TEST"

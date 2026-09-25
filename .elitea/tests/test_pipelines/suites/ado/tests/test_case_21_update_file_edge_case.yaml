@@ -25,7 +25,7 @@ state:
     value: "Test: Attempt to update non-existent file"
   branch_name:
     type: str
-    value: "EliteaTest"
+    value: "${ADO_BASE_BRANCH}"
   expected_error_indicators:
     type: list
     value: ["File not found", "not found", "does not exist", "error", "Error"]
@@ -87,10 +87,13 @@ nodes:
           Validation Criteria:
           1. tool_executed: Tool ran without crashing (got some result)
           2. file_not_found_detected: Output contains error indicator OR success=false OR operation failed
-          3. no_unhandled_exception: Output does NOT contain 'unhandled', 'traceback', 'stack trace'
+          3. no_unhandled_exception: The failure is a reported tool error about the missing file, not a crash
+             for an unrelated reason (e.g. TypeError, KeyError, AttributeError, connection error)
 
           Note: Tool may return error in various formats (error field, success=false, exception message).
           Any indication that the operation failed due to missing file should pass.
+          A "Tool 'update_file' failed ... ToolException ... File not found / TF401174" report is the
+          EXPECTED outcome, even if it includes a traceback - that is NOT an unhandled exception.
 
           Return a JSON object with structure:
           {{

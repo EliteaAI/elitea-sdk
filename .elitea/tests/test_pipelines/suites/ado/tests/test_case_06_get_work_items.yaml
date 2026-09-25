@@ -11,7 +11,7 @@ state:
     value: ${ADO_REPOSITORY_ID}
   pull_request_id:
     type: str
-    value: "10"
+    value: "12"
   tool_result:
     type: list
   test_results:

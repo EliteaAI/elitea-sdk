@@ -20,7 +20,7 @@ state:
     type: str
   branch_name:
     type: str
-    value: "EliteaTest"
+    value: "${ADO_BASE_BRANCH}"
   expected_error_indicators:
     type: list
     value: ["already exists", "exists", "duplicate", "error", "failed", "conflict"]

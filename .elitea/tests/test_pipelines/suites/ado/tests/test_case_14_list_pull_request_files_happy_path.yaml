@@ -16,7 +16,7 @@ toolkits:
 state:
   pull_request_id:
     type: str
-    value: "10"
+    value: "12"
   expected_file_fields:
     type: list
     value: ["path", "diff"]
@@ -67,7 +67,7 @@ nodes:
           Validation Criteria (ALL must pass):
           1. tool_executed: Result is not empty/null and no exception was thrown
           2. returns_list: Output contains a list/array structure of files
-          3. has_file_count: At least 1 file is returned (PR 10 should have changes)
+          3. has_file_count: At least 1 file is returned (the test PR should have changes)
           4. files_have_required_fields: Each file entry has 'path' and 'diff' fields (do NOT check for changeType)
           5. no_error: Output does NOT contain 'error', 'failed', 'exception'
 

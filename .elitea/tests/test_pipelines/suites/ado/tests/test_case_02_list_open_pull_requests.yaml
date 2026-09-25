@@ -53,7 +53,7 @@ nodes:
           Scan the output above and answer these questions:
           1. Is there at least 1 PR? (pr_count >= 1)
           2. Does any PR have title exactly 'PR FOR AI TEST'?
-          3. Does any PR have pull_request_id exactly 10?
+          3. Does any PR have pull_request_id exactly 12?
 
           Return ONLY this compact JSON (no explanation, no echoing data):
           {{"test_passed": <true if all 3 yes>, "tool_executed": true, "open_pr_count": <integer>, "title_check": <bool>, "id_check": <bool>, "error": null}}

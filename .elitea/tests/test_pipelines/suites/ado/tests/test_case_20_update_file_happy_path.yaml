@@ -22,7 +22,7 @@ state:
     type: str
   branch_name:
     type: str
-    value: "EliteaTest"
+    value: "${ADO_BASE_BRANCH}"
   success_indicators:
     type: list
     value: ["Updated", "updated"]
