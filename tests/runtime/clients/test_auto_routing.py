@@ -59,6 +59,45 @@ def cfg(thread='child-one', run='run-one'):
     return {'configurable': {'thread_id': thread, 'checkpoint_ns': 'agent', 'elitea_routing_run_id': run}}
 
 
+def test_generation_size_ignores_diagnostics_without_reducing_generation_content():
+    messages = [SystemMessage(content='Full constructor instructions',
+                              additional_kwargs={'elitea_routing_content': ''}),
+                HumanMessage(content='Task'), AIMessage(content='Prior answer')]
+    original = m.generation_input_bytes(messages)
+    messages[-1].response_metadata.update(elitea_routing={'trace': 'x' * 200000}, model_name='private')
+    messages[-1].usage_metadata = dict(input_tokens=10000, output_tokens=2000, total_tokens=12000)
+    messages[-1].additional_kwargs['parsed'] = {'result': 'y' * 20000}
+    assert m.generation_input_bytes(messages) == original
+    assert m.generation_input_bytes(messages[1:]) < original
+    messages[-1].content += 'More provider-visible context'
+    assert m.generation_input_bytes(messages) > original
+
+
+def test_generation_size_keeps_native_blocks_tools_and_output_schema():
+    messages = [HumanMessage(content='Read the source'),
+                AIMessage(content=[{'type': 'thinking', 'thinking': 'opaque', 'signature': 'signed'}],
+                          tool_calls=[dict(id='read1', name='read_file', args={'path': 'a.py'})]),
+                ToolMessage(content='source code', tool_call_id='read1')]
+    original = m.generation_input_bytes(messages)
+    assert m.generation_input_bytes(messages, [{'type': 'function', 'function': {'name': 'read'}}]) > original
+    assert m.generation_input_bytes(messages, output_schema={'type': 'object'}) > original
+    messages[1].content[0]['signature'] += 'signed' * 40
+    assert m.generation_input_bytes(messages) > original
+    with_tools = m.generation_input_bytes(messages)
+    messages[1].tool_calls[0]['args']['path'] += '/directory' * 40
+    assert m.generation_input_bytes(messages) > with_tools
+
+
+def test_materialize_sizes_the_same_effective_schema_it_sends():
+    auto, native, requests = model()
+    config = cfg()
+    config['configurable']['elitea_routing_output_schema'] = {'type': 'object', 'properties': {'x': {'type': 'string'}}}
+    messages = [HumanMessage(content='Return x')]
+    auto.invoke(messages, config)
+    assert requests[0]['generation_input_bytes'] == m.generation_input_bytes(
+        messages, [], requests[0]['output_schema'])
+
+
 @pytest.mark.parametrize('cap', [None, -1, 2048, 32000])
 def test_output_allowance_preserves_explicit_limit_and_defers_unspecified(cap):
     auto, native, requests = model()

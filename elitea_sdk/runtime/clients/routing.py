@@ -19,6 +19,38 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 PIN = 'elitea_routing'
 
 
+def generation_input_bytes(messages, tools=None, output_schema=None):
+    """Transport-neutral payload estimate, excluding local message diagnostics.
+
+    This is a byte proxy, not a tokenizer or exact native serialization. Keep
+    generation content (including constructor instructions and opaque provider
+    blocks) rather than the classifier's reduced text projection. Response/usage
+    metadata and routing checkpoints are never part of the provider input.
+    """
+    rows = []
+    for message in messages:
+        role = ('user' if isinstance(message, HumanMessage) else
+                'tool' if isinstance(message, ToolMessage) else
+                'system' if isinstance(message, SystemMessage) else 'assistant')
+        row = {'role': role, 'content': message.content}
+        if message.name:
+            row['name'] = message.name
+        if isinstance(message, ToolMessage):
+            row['tool_call_id'] = message.tool_call_id
+        calls = getattr(message, 'tool_calls', None)
+        if calls:
+            row['tool_calls'] = [dict(id=c['id'], type='function', function={
+                'name': c['name'], 'arguments': json.dumps(c['args'], ensure_ascii=False)}) for c in calls]
+        # These are native message fields. Other additional kwargs can contain
+        # constructor task projections, parsed outputs or internal graph state.
+        for key in ('function_call', 'tool_calls', 'reasoning_content'):
+            if key not in row and key in message.additional_kwargs:
+                row[key] = message.additional_kwargs[key]
+        rows.append(row)
+    return len(json.dumps({'messages': rows, 'tools': tools or [],
+                           'output_schema': output_schema}, ensure_ascii=False).encode()) + 64 * len(rows)
+
+
 def projection(messages):
     result = []
     for message in messages:
@@ -187,15 +219,14 @@ class AutoChatModel(BaseChatModel):
             if not issuer:
                 context['retrieval_options'] = []
             context_token = issuer(context=context, tools=tools, scope_id=scope_id, invocation_id=invocation_id) if issuer and binding is None and context['retrieval_options'] else None
+            effective_schema = output_schema or configurable.get('elitea_routing_output_schema')
             response = self.owner._request('post', f'{self.owner.base_url}/llm/v1/auto-routing/resolve',
                 headers={**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)},
                 json={'selection': self.settings['selection'], 'surface': self.settings.get('routing_surface', 'agent'),
                       'messages': projection(messages), 'tools': tools, **output_limit,
-                      'generation_input_bytes': len(json.dumps(
-                          {'messages': [message.model_dump(mode='json') for message in messages],
-                           'tools': tools, 'output_schema': output_schema}, ensure_ascii=False).encode()) + 64*len(messages),
+                      'generation_input_bytes': generation_input_bytes(messages, tools, effective_schema),
                       'runtime_context': context, 'runtime_context_token': context_token,
-                      'output_schema': output_schema or configurable.get('elitea_routing_output_schema'),
+                      'output_schema': effective_schema,
                       'invocation_id': invocation_id, 'scope_id': scope_id,
                       'state_token': previous_binding.get('state_token') if previous_binding else None,
                       'observation': prior_observation,
