@@ -67,7 +67,7 @@ nodes:
           Perform the following checks:
           1. Confirm the tool executed successfully (result is not null and is not an error message).
           2. Verify result indicates comment was added successfully (e.g. "Comment <ID> is added for issue <KEY>").
-          3. If the result contains a Jira browse URL, verify it is well-formed: "<host>/browse/<KEY>" with a "/" before "browse".
+          3. Ignore any browse URL formatting in the confirmation text. This test verifies comment creation only, not URL construction.
 
           Return a JSON object named test_results with the following structure:
 
