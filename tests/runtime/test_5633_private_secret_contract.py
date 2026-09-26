@@ -120,3 +120,11 @@ def test_a_none_default_is_honored_rather_than_treated_as_absent():
     value, _request = _call(_FakeResponse(403, {'error': 'not_shared'}), default=None)
 
     assert value is None
+
+
+def test_not_shared_message_also_covers_a_missing_secret():
+    """The endpoint answers not_shared for a missing secret too, so the message must say so."""
+    with pytest.raises(PrivateSecretNotShared) as raised:
+        _call(_FakeResponse(403, {'error': 'not_shared'}), secret_name='AQA_TOKEN')
+
+    assert 'is not shared or does not exist' in str(raised.value)

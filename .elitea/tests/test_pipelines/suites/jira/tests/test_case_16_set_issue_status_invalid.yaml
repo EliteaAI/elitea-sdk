@@ -73,30 +73,19 @@ nodes:
 
           Perform the following checks:
           1. Confirm the tool executed (result is not empty or null).
-          2. Examine any error message for specific meaning. Valid error patterns for invalid status transitions include:
+          2. Confirm the tool reported an error (it must NOT report that the status was updated successfully).
+          3. Confirm the error is about the invalid status/transition itself. Valid error patterns include:
+             - status is not available for the issue (e.g. "Status 'X' is not available for issue KEY")
              - invalid status or transition requested
              - transition not allowed or not available
              - status does not exist for this issue type
              - http error codes 400 (bad request) or 404 (not found)
-          3. Determine if the error is about the invalid status/transition itself. Errors like "transition not allowed" are expected and correct. System errors unrelated to the status validation are failures.
+             Errors unrelated to status validation (authentication, connection, issue not found) are failures.
 
           Return a JSON object named test_results with the following structure:
 
           {{
-            "test_passed": boolean,          - Empty or null result
-
-          Return a JSON object named test_results with the following structure:
-
-          {{
-            "test_passed": boolean (TRUE if error occurred as expected),
-            "summary": "Brief description of outcome",
-            "error": "Error details if failed, null if passed"
-          }}
-
-          Return a JSON object named test_results with the following structure:
-
-          {{
-            "test_passed": boolean,
+            "test_passed": boolean (TRUE if the tool returned an error about the invalid status),
             "summary": "Brief description of outcome",
             "error": "Error details if failed, null if passed"
           }}

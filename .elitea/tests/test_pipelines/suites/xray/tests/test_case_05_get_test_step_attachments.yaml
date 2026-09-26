@@ -80,33 +80,27 @@ nodes:
     code:
       type: fixed
       value: |
-        import re
         import json
-        # graphql_result is small (1 test only) - safe to pass through state
-        result_raw = elitea_state.get("graphql_result", "")
+        import re
+        # graphql_result is small (1 test only) - safe to pass through state.
+        # execute_graphql returns a dict: {"data": {"getTests": {"results": [{"issueId": ...}]}}}
+        result = elitea_state.get("graphql_result", "")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (ValueError, TypeError):
+                pass
         test_issue_id = "not_found"
         try:
-            if isinstance(result_raw, dict):
-                results = (((result_raw.get("data") or {}).get("getTests") or {}).get("results") or [])
-                if results and isinstance(results[0], dict):
-                    issue_id = results[0].get("issueId")
-                    if issue_id:
-                        test_issue_id = str(issue_id)
-            else:
-                result_str = str(result_raw)
-                try:
-                    parsed = json.loads(result_str)
-                    results = (((parsed.get("data") or {}).get("getTests") or {}).get("results") or [])
-                    if results and isinstance(results[0], dict):
-                        issue_id = results[0].get("issueId")
-                        if issue_id:
-                            test_issue_id = str(issue_id)
-                except Exception:
-                    m = re.search(r"'issueId':\s*'?(\d+)'?", result_str)
-                    if not m:
-                        m = re.search(r'"issueId":\s*"?(\d+)"?', result_str)
-                    if m:
-                        test_issue_id = m.group(1)
+            if isinstance(result, dict):
+                data = result.get("data", result)
+                results = (data.get("getTests") or {}).get("results") or []
+                if results and results[0].get("issueId"):
+                    test_issue_id = str(results[0]["issueId"])
+            if test_issue_id == "not_found":
+                m = re.search(r"""['"]issueId['"]:\s*['"]?(\d+)""", str(result))
+                if m:
+                    test_issue_id = m.group(1)
         except Exception:
             pass
         {"test_issue_id": test_issue_id}

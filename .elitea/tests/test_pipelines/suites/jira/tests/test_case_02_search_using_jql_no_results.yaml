@@ -3,11 +3,11 @@ priority: High
 description: |
   Verify `search_using_jql` tool handles empty search results gracefully.
 
-  Objective: Ensure tool returns appropriate message when no issues match JQL.
+  Objective: Ensure tool returns an empty result (not an error) when no issues match JQL.
 
   Expected Behavior:
   - Tool executes without errors.
-  - Returns "No Jira issues found" message when no results match query.
+  - Returns an empty JSON list [] (or a "No Jira issues found" message) when no results match query.
 
 toolkits:
   - id: ${JIRA_TOOLKIT_ID}
@@ -57,8 +57,10 @@ nodes:
           Tool Result: {tool_result}
 
           Perform the following checks:
-          1. Confirm the tool executed successfully (result is not empty or null).
-          2. Verify result contains "No Jira issues found" for empty search results.
+          1. Confirm the tool executed successfully (result is not null and is not an error message).
+          2. Verify the result represents "no issues found": either an empty JSON list [] or a "No Jira issues found" message.
+             An empty list [] is the expected output and is a PASS.
+          3. Fail if the result contains any Jira issue records.
 
           Return a JSON object named test_results with the following structure:
 

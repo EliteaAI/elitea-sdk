@@ -96,7 +96,7 @@ nodes:
       - tool_result
     structured_output: true
     tool: create_issue_on_project
-    toolkit_name: testing
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_create
   - id: validate_create
     type: llm
@@ -162,7 +162,7 @@ nodes:
       - search_result
     structured_output: true
     tool: search_project_issues
-    toolkit_name: testing
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_search
   - id: validate_search
     type: llm
@@ -231,7 +231,7 @@ nodes:
       - list_result
     structured_output: true
     tool: list_project_issues
-    toolkit_name: testing
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_list
   - id: validate_list
     type: llm
@@ -336,7 +336,7 @@ nodes:
       - update_result
     structured_output: true
     tool: update_issue_on_project
-    toolkit_name: testing
+    toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_update
   - id: validate_update
     type: llm
