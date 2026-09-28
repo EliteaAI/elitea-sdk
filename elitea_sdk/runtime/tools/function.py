@@ -438,14 +438,6 @@ alita_state = elitea_state.copy()
         """The typed outcome of the call that produced ``result``."""
         tool_name = getattr(self.tool, 'name', None)
         toolkit_type = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_type')
-        if result.get(PIPELINE_BLOCKED_KEY):
-            # A decline or an auth skip is a deliberate user choice, not a failure.
-            return ToolOutcome(
-                status=ToolResultStatus.BLOCKED,
-                message=str(result[PIPELINE_BLOCKED_KEY]),
-                tool_name=tool_name,
-                toolkit_type=toolkit_type,
-            )
         if sink:
             return sink[-1]
         return ToolOutcome(
@@ -457,7 +449,8 @@ alita_state = elitea_state.copy()
 
     def _with_outcome(self, result: Any, sink: list) -> Any:
         """Add the outcome keys. Purely additive — declared output variables are untouched."""
-        if not isinstance(result, dict):
+        # A blocked node routes the graph to END, so no later node could ever read an outcome.
+        if not isinstance(result, dict) or result.get(PIPELINE_BLOCKED_KEY):
             return result
         payload = self._outcome_for(result, sink).model_dump(mode='json')
         # message is LLM-facing prose already living on the message channel; routing only
@@ -625,8 +618,7 @@ alita_state = elitea_state.copy()
                 # Isolated in its own try: a malformed child payload must not be misread by
                 # the outer `except Exception` as THIS node's own call having failed.
                 child_outcome = tool_result.get(LAST_TOOL_OUTCOME_KEY)
-                if isinstance(child_outcome, dict) and child_outcome.get('status') in (
-                        ToolResultStatus.ERROR.value, ToolResultStatus.BLOCKED.value):
+                if isinstance(child_outcome, dict) and child_outcome.get('status') == ToolResultStatus.ERROR.value:
                     try:
                         record_outcome(ToolOutcome(**child_outcome))
                     except Exception:

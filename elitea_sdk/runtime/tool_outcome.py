@@ -17,7 +17,6 @@ class ToolResultStatus(str, Enum):
     SUCCESS = "success"
     ERROR = "error"
     TRUNCATED = "truncated"
-    BLOCKED = "blocked"
 
 
 class ToolErrorClass(str, Enum):

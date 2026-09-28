@@ -5,9 +5,9 @@ status="success" — the one field on the wire that exists to mark a failed tool
 said the call succeeded. Each test drives the real loop to the site that builds the
 message, rather than asserting on a constructor in isolation.
 
-status is Literal["success", "error"], so ToolResultStatus.BLOCKED and TRUNCATED
-cannot be expressed in it; those two sites deliberately stay "success" and the AST
-test at the bottom pins that decision.
+status is Literal["success", "error"], so a declined sensitive tool and a TRUNCATED
+result cannot be expressed in it; those two sites deliberately stay "success" and the
+AST test at the bottom pins that decision.
 """
 
 import asyncio

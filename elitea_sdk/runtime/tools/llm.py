@@ -4234,8 +4234,7 @@ class LLMNode(BaseTool):
                                     **blocked_payload,
                                     'message': self._build_blocked_tool_guidance(blocked_payload),
                                 }
-                            # status stays 'success': a declined sensitive action is not
-                            # a tool failure, and status cannot carry ToolOutcome BLOCKED.
+                            # status stays 'success': a declined sensitive action is not a tool failure.
                             tool_message = ToolMessage(
                                 content=json.dumps(
                                     blocked_payload,
