@@ -116,6 +116,18 @@ def test_normalize(value, expected):
     assert normalize_tool_execution_timeout(value) == expected
 
 
+@pytest.mark.parametrize('value, expected', [
+    ('abc', DEFAULT_TOOL_EXECUTION_TIMEOUT),
+    ('nan', DEFAULT_TOOL_EXECUTION_TIMEOUT),
+    ('inf', None),
+    ('0', None),
+    ('120', 120.0),
+])
+def test_node_construction_normalizes_raw_value(value, expected):
+    # Pipeline YAML and agent meta hand the raw value to the constructor.
+    assert LLMNode(client=None, tool_execution_timeout=value).tool_execution_timeout == expected
+
+
 # --- behaviour in the nested (running-loop) path --------------------------
 
 def test_nested_loop_is_cut_at_configured_timeout():
@@ -204,3 +216,9 @@ def test_built_agent_node_uses_env_default(monkeypatch):
 def test_built_agent_node_meta_beats_env(monkeypatch):
     monkeypatch.setenv(TOOL_EXECUTION_TIMEOUT_ENV, '1234')
     assert _built_agent_llm_node({'tool_execution_timeout': None}).tool_execution_timeout is None
+
+
+@pytest.mark.parametrize('value', ['abc', 'nan'])
+def test_built_agent_node_with_bad_meta_falls_back_to_default(value):
+    assert _built_agent_llm_node({'tool_execution_timeout': value}).tool_execution_timeout == \
+        DEFAULT_TOOL_EXECUTION_TIMEOUT

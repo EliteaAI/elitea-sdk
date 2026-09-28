@@ -16,7 +16,7 @@ from langchain_core.tools import BaseTool, ToolException
 from langchain_core.callbacks import dispatch_custom_event
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt as _langgraph_interrupt
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 try:
     from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD as _SCRATCHPAD_KEY
@@ -243,6 +243,13 @@ class LLMNode(BaseTool):
         description='Timeout (seconds) for the tool-calling loop when it runs in a worker thread '
                     '(e.g. a nested agent). None or 0 means no limit. Defaults to '
                     f'{TOOL_EXECUTION_TIMEOUT_ENV} or {DEFAULT_TOOL_EXECUTION_TIMEOUT}s.')
+
+    @field_validator('tool_execution_timeout', mode='before')
+    @classmethod
+    def _coerce_tool_execution_timeout(cls, value: Any) -> Optional[float]:
+        # Agent meta and pipeline YAML pass the raw value; a bad one degrades to the
+        # default here instead of failing node construction.
+        return normalize_tool_execution_timeout(value)
 
     # Lazy tools mode - reduces token usage by not binding all tools upfront
     lazy_tools_mode: Optional[bool] = Field(
@@ -2901,6 +2908,15 @@ class LLMNode(BaseTool):
             return current_completion
         return self._completion_with_text(current_completion, accumulated_text)
     
+    def _join_with_timeout(self, thread: "threading.Thread") -> None:
+        """Wait for a worker thread, bounded by tool_execution_timeout."""
+        timeout = normalize_tool_execution_timeout(self.tool_execution_timeout)
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            logger.error("Async operation in node '%s' timed out after %ss "
+                         "(tool_execution_timeout)", self.name, timeout)
+            raise TimeoutError(f"Async operation in thread timed out after {timeout}s")
+
     def _run_async_in_sync_context(self, coro):
         """Run async coroutine from sync context.
 
@@ -2977,13 +2993,7 @@ class LLMNode(BaseTool):
                     logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
 
             thread.start()
-            timeout = normalize_tool_execution_timeout(self.tool_execution_timeout)
-            thread.join(timeout=timeout)
-
-            if thread.is_alive():
-                logger.error("Async operation in node '%s' timed out after %ss "
-                             "(tool_execution_timeout)", self.name, timeout)
-                raise TimeoutError(f"Async operation in thread timed out after {timeout}s")
+            self._join_with_timeout(thread)
 
             # Re-raise exception if one occurred
             if exception_container:
@@ -3050,13 +3060,7 @@ class LLMNode(BaseTool):
                         logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
 
                 thread.start()
-                timeout = normalize_tool_execution_timeout(self.tool_execution_timeout)
-                thread.join(timeout=timeout)
-
-                if thread.is_alive():
-                    logger.error("Async operation in node '%s' timed out after %ss "
-                                 "(tool_execution_timeout)", self.name, timeout)
-                    raise TimeoutError(f"Async operation in thread timed out after {timeout}s")
+                self._join_with_timeout(thread)
 
                 if exception_container:
                     raise exception_container[0]
