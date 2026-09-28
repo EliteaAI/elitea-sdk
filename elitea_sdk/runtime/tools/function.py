@@ -449,8 +449,11 @@ alita_state = elitea_state.copy()
 
     def _with_outcome(self, result: Any, sink: list) -> Any:
         """Add the outcome keys. Purely additive — declared output variables are untouched."""
-        # A blocked node routes the graph to END, so no later node could ever read an outcome.
-        if not isinstance(result, dict) or result.get(PIPELINE_BLOCKED_KEY):
+        if not isinstance(result, dict):
+            return result
+        if result.get(PIPELINE_BLOCKED_KEY):
+            # Blocked stop has no outcome: clear the stale last one, keep history of nodes that ran.
+            result[LAST_TOOL_OUTCOME_KEY] = None
             return result
         payload = self._outcome_for(result, sink).model_dump(mode='json')
         # message is LLM-facing prose already living on the message channel; routing only

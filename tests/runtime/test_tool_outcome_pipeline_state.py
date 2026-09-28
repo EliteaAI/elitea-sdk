@@ -356,19 +356,25 @@ BLOCKED_PAYLOAD = (
 
 
 class TestBlockedWritesNoOutcome:
-    """A declined sensitive tool (or a skipped MCP auth) stops the pipeline: the graph
-    routes straight to END on _pipeline_blocked, so no later node can ever read an
-    outcome. We therefore write no outcome keys at all rather than invent a status
-    for it — and, crucially, must not fall through to recording the decline as SUCCESS.
+    """A declined sensitive tool (or a skipped MCP auth) stops the pipeline, so there is
+    no outcome to report for it. Contract: last_tool_outcome is explicitly CLEARED (so a
+    prior node's outcome does not masquerade as the blocked node's), tool_outcomes gets
+    no entry for the blocked node but keeps the history of nodes that actually ran.
+    It must never fall through to recording the decline as SUCCESS.
     """
 
-    def test_declined_tool_writes_no_outcome_keys(self):
+    def test_declined_tool_clears_last_outcome(self):
         node = _node(_tool(lambda issue_number: BLOCKED_PAYLOAD))
         result = _run(node)
 
         assert result[PIPELINE_BLOCKED_KEY]
+        assert LAST_TOOL_OUTCOME_KEY in result and result[LAST_TOOL_OUTCOME_KEY] is None
+
+    def test_declined_tool_adds_no_tool_outcomes_entry(self):
+        node = _node(_tool(lambda issue_number: BLOCKED_PAYLOAD))
+        result = _run(node)
+
         assert TOOL_OUTCOMES_KEY not in result
-        assert LAST_TOOL_OUTCOME_KEY not in result
 
     def test_declined_tool_output_variables_still_nulled(self):
         node = _node(_tool(lambda issue_number: BLOCKED_PAYLOAD))
@@ -376,7 +382,7 @@ class TestBlockedWritesNoOutcome:
 
         assert result["issue"] is None
 
-    def test_mcp_auth_skip_writes_no_outcome_keys(self):
+    def test_mcp_auth_skip_clears_last_outcome(self):
         node = _node(_tool(lambda issue_number: "x"))
         skipped = node._build_mcp_auth_skipped_termination(
             {"tool_name": "update_issue", "toolkit_name": "jira"}
@@ -384,8 +390,16 @@ class TestBlockedWritesNoOutcome:
         result = node._with_outcome(skipped, [])
 
         assert result[PIPELINE_BLOCKED_KEY]
+        assert result[LAST_TOOL_OUTCOME_KEY] is None
         assert TOOL_OUTCOMES_KEY not in result
-        assert LAST_TOOL_OUTCOME_KEY not in result
+
+    def test_graph_level_mcp_auth_skip_node_clears_last_outcome(self):
+        from elitea_sdk.runtime.langchain.langraph_agent import _make_mcp_auth_skip_node
+
+        result = _make_mcp_auth_skip_node("n", "jira", ["issue"])({})
+
+        assert result[PIPELINE_BLOCKED_KEY]
+        assert result[LAST_TOOL_OUTCOME_KEY] is None
 
     def test_status_enum_has_no_blocked_member(self):
         assert "blocked" not in {s.value for s in ToolResultStatus}
@@ -562,59 +576,115 @@ class TestPipelineRouting:
 # ─── A blocked tool inside a nested child pipeline stops the parent ──
 
 
-def _two_node_pipeline(name, tool, input_mapping=None):
-    call = {"id": "call", "type": "toolkit", "toolkit_name": "tk", "tool": tool,
-            "input": ["messages"], "output": ["res"], "transition": "after"}
-    if input_mapping:
-        call["input_mapping"] = input_mapping
-    return yaml.dump({
-        "name": name,
-        "state": {"input": {"type": "str"}, "messages": {"type": "list"},
-                  "res": {"type": "str"}, "landed": {"type": "str"}},
-        "entry_point": "call",
-        "nodes": [
-            call,
-            {"id": "after", "type": "state_modifier", "input": ["messages"],
-             "output": ["landed"], "template": "after-ran", "transition": "END"},
-        ],
-    })
+def _chain_pipeline(name, tools, input_mapping=None):
+    """Linear pipeline: one toolkit node per tool in order, then a marker node."""
+    ids = [f"n{i}" for i in range(len(tools))]
+    nodes = []
+    for i, tool in enumerate(tools):
+        node = {"id": ids[i], "type": "toolkit", "toolkit_name": "tk", "tool": tool,
+                "input": ["messages"], "output": [f"res{i}"],
+                "transition": ids[i + 1] if i + 1 < len(tools) else "after"}
+        if input_mapping and tool in input_mapping:
+            node["input_mapping"] = input_mapping[tool]
+        nodes.append(node)
+    nodes.append({"id": "after", "type": "state_modifier", "input": ["messages"],
+                  "output": ["landed"], "template": "after-ran", "transition": "END"})
+    state = {"input": {"type": "str"}, "messages": {"type": "list"}, "landed": {"type": "str"}}
+    state.update({f"res{i}": {"type": "str"} for i in range(len(tools))})
+    return yaml.dump({"name": name, "state": state, "entry_point": ids[0], "nodes": nodes})
+
+
+def _plain_tool(name, func):
+    return StructuredTool.from_function(
+        func=func, name=name, description="d",
+        metadata={"toolkit_type": "jira", "toolkit_name": "tk", "tool_name": name},
+    )
+
+
+def _ok_then_blocked_graph(ok_func=lambda: "fine"):
+    return create_graph(
+        client=_FakeLLM(),
+        yaml_schema=_chain_pipeline("ok-then-blocked", ["get_issue", "update_issue"]),
+        tools=[_plain_tool("get_issue", ok_func), _plain_tool("update_issue", lambda: BLOCKED_PAYLOAD)],
+        memory=MemorySaver(),
+    )
+
+
+def _invoke(graph, thread_id):
+    return graph.invoke({"messages": [HumanMessage(content="go")]},
+                        config={"configurable": {"thread_id": thread_id}})
+
+
+class TestBlockedAfterNormalTool:
+    """Review-found case: node A runs, node B is then blocked. last_tool_outcome is a
+    persistent state channel, so without an explicit clear the final state would still
+    report A's outcome as 'last' even though the pipeline stopped on B."""
+
+    def test_prior_success_is_not_reported_as_last_outcome(self):
+        result = _invoke(_ok_then_blocked_graph(), "ok-then-blocked")
+
+        assert result["_pipeline_blocked"]
+        assert result.get("last_tool_outcome") is None
+        assert not result.get("landed")
+
+    def test_prior_error_is_not_reported_as_last_outcome(self):
+        graph = _ok_then_blocked_graph(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        result = _invoke(graph, "err-then-blocked")
+
+        assert result["_pipeline_blocked"]
+        assert result.get("last_tool_outcome") is None
+
+    def test_history_keeps_the_node_that_ran_and_omits_the_blocked_one(self):
+        result = _invoke(_ok_then_blocked_graph(), "history")
+
+        assert set(result["tool_outcomes"]) == {"n0"}
+        assert result["tool_outcomes"]["n0"]["status"] == "success"
 
 
 class TestNestedBlockedStopsParent:
-    """Why dropping the blocked outcome is safe for nested pipelines too: the child's
-    _pipeline_blocked flag propagates to the parent through the Application state
-    hand-off, so the parent routes to END as well. No parent node runs after the
-    child, so there is nothing that could have routed on a relayed 'blocked' status.
-    """
+    """Nested pipelines: the child's _pipeline_blocked flag propagates to the parent
+    through the Application state hand-off, so the parent routes to END too. The child's
+    own outcome keys are never propagated, so the parent's last_tool_outcome must be
+    cleared by the parent's own node — including when the parent already ran a tool."""
 
-    def test_parent_downstream_node_does_not_run(self):
+    def _app(self, child):
         from elitea_sdk.runtime.tools.application import Application
 
-        blocked_tool = StructuredTool.from_function(
-            func=lambda: BLOCKED_PAYLOAD, name="update_issue", description="d",
-            metadata={"toolkit_type": "jira", "toolkit_name": "tk", "tool_name": "update_issue"},
-        )
-        child = create_graph(client=_FakeLLM(), yaml_schema=_two_node_pipeline("child", "update_issue"),
-                             tools=[blocked_tool], memory=MemorySaver())
-        app = Application(
+        return Application(
             name="child_app", description="child", application=child, client=None, is_subgraph=True,
             metadata={"toolkit_type": "application", "toolkit_name": "tk", "tool_name": "child_app"},
         )
-        parent = create_graph(
+
+    def _parent(self, parent_tools, child):
+        tools = [self._app(child) if t == "child_app" else _plain_tool(t, lambda: "fine")
+                 for t in parent_tools]
+        return create_graph(
             client=_FakeLLM(),
-            yaml_schema=_two_node_pipeline(
-                "parent", "child_app", {"task": {"type": "fixed", "value": "go"}}),
-            tools=[app], memory=MemorySaver(),
+            yaml_schema=_chain_pipeline(
+                "parent", parent_tools, {"child_app": {"task": {"type": "fixed", "value": "go"}}}),
+            tools=tools, memory=MemorySaver(),
         )
 
-        result = parent.invoke(
-            {"messages": [HumanMessage(content="go")]},
-            config={"configurable": {"thread_id": "nested-blocked"}},
+    def test_parent_downstream_node_does_not_run(self):
+        child = create_graph(
+            client=_FakeLLM(), yaml_schema=_chain_pipeline("child", ["update_issue"]),
+            tools=[_plain_tool("update_issue", lambda: BLOCKED_PAYLOAD)], memory=MemorySaver(),
         )
+        result = _invoke(self._parent(["child_app"], child), "nested-blocked")
 
         assert result["_pipeline_blocked"]
         assert not result.get("landed")
-        assert not (result.get("last_tool_outcome") or {})
+        assert result.get("last_tool_outcome") is None
+
+    def test_parent_tool_then_child_with_tool_then_block(self):
+        # Both levels run a normal tool before the block — the stale-outcome shape.
+        child = _ok_then_blocked_graph()
+        result = _invoke(self._parent(["get_issue", "child_app"], child), "nested-ok-then-blocked")
+
+        assert result["_pipeline_blocked"]
+        assert not result.get("landed")
+        assert result.get("last_tool_outcome") is None
+        assert set(result["tool_outcomes"]) == {"n0"}
 
 
 # ─── Stale outcome must not leak into the next turn ──────────────────

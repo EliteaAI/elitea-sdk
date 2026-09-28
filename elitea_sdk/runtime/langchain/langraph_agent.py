@@ -1059,6 +1059,7 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
         result = {
             "messages": [{"role": "assistant", "content": message}],
             PIPELINE_BLOCKED_KEY: message,
+            LAST_TOOL_OUTCOME_KEY: None,
         }
         for var in output_vars:
             if var != "messages":
