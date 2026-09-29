@@ -168,11 +168,15 @@ nodes:
 
           This is a POSITIVE test - we expect successful web link creation.
 
+          IMPORTANT: The create_test_case_web_link tool may return only a numeric link ID and self URL.
+          Treat the operation as successful when the response contains a non-empty ID and no error indicators.
+          Do NOT require literal words like "link", "url", or "created" inside success_indicator_found if ID is present.
+
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Both tools ran and returned results
           2. no_errors: Output does NOT contain any error indicators
           3. testcase_created: Test case was created successfully
-          4. link_created: Web link was created successfully
+          4. link_created: Web link was created successfully when link_result contains a non-empty ID
           5. has_link_id: Link response contains ID
 
           Return JSON test_results:
@@ -184,7 +188,7 @@ nodes:
             "link_created": boolean,
             "has_link_id": boolean,
             "link_id": "id from response or 'none'",
-            "success_indicator_found": "which indicator was found or 'none'",
+            "success_indicator_found": "id if present, otherwise matching success indicator or 'none'",
             "error_indicator_found": "which error indicator was found or 'none'",
             "error": string | null
           }}
