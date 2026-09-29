@@ -197,7 +197,7 @@ nodes:
           This is a POSITIVE test - we expect successful request creation and retrieval.
           
           Validation Criteria (ALL must pass for test_passed=true):
-          1. folder_created: Folder was created successfully in the default collection
+          1. folder_created: Folder was created successfully
           2. request_created: Request was created successfully
           3. request_retrieved: get_request_by_path returned request details
           4. correct_name: Request name matches expected
