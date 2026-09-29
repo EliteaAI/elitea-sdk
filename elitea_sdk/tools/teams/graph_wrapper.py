@@ -18,12 +18,14 @@ needs ChannelMessage.Read.All (admin consent) and is intentionally not supported
 from __future__ import annotations
 
 import difflib
+import functools
 import html as html_lib
 import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import requests
 from langchain_core.tools import ToolException
@@ -54,6 +56,32 @@ class _GraphError(ToolException):
     def __init__(self, message: str, status: Optional[int] = None):
         super().__init__(message)
         self.status = status
+        if status == 404:
+            # Read by runtime.tool_outcome so a missing resource is classed as INPUT, not unclassified.
+            self.provider_error_category = "resource_not_found"
+
+
+def _tool_errors(action: str) -> Callable:
+    """Turn any unexpected failure of a tool method into a ToolException naming the action."""
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except ToolException:
+                raise
+            except Exception as e:
+                log.error("%s failed: %s", func.__name__, e)
+                raise ToolException(f"Failed to {action}: {e}") from e
+        return wrapper
+    return decorator
+
+
+def _not_found(message: str) -> ToolException:
+    """A ToolException flagged as a missing resource (see runtime.tool_outcome)."""
+    exc = ToolException(message)
+    exc.provider_error_category = "resource_not_found"
+    return exc
 
 
 class _Bound(NamedTuple):
@@ -192,7 +220,7 @@ def _pick_by_name(items: List[dict], name: str, kind: str, name_key: str = "disp
         # in the agent context and in the error-rewrite prompt.
         similar = _suggest(name, [i.get(name_key) or "" for i in items])
         did_you_mean = f" Did you mean: {'; '.join(similar)}?" if similar else ""
-        raise ToolException(f"{kind} '{name}' not found.{did_you_mean}{not_found_hint}")
+        raise _not_found(f"{kind} '{name}' not found.{did_you_mean}{not_found_hint}")
     ids = ", ".join(i.get("id") for i in matches)
     raise ToolException(f"{kind} name '{name}' is ambiguous; use one of these IDs instead: {ids}")
 
@@ -285,10 +313,20 @@ class TeamsGraphWrapper:
 
         api_message = TeamsConfiguration._extract_api_error_message(resp)
         log.error("Graph API HTTP %s for %s: %s", resp.status_code, resp.url, api_message)
+        api_message = str(api_message).rstrip(". ")
+        where = ""
         hint = ""
         if resp.status_code == 403:
             hint = " Check that the Teams configuration scopes include the permission this tool needs."
-        raise _GraphError(f"Microsoft Graph returned HTTP {resp.status_code}: {api_message}.{hint}", resp.status_code)
+        elif resp.status_code == 404:
+            path = urlparse(resp.url or "").path
+            if path:
+                where = f" (resource: {path})"
+            hint = (" The resource does not exist or is not visible to the signed-in user; "
+                    "do not retry with the same ID, look it up with list_teams / list_channels / list_chats.")
+        raise _GraphError(
+            f"Microsoft Graph returned HTTP {resp.status_code}: {api_message}{where}.{hint}", resp.status_code
+        )
 
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
@@ -413,12 +451,12 @@ class TeamsGraphWrapper:
             user = self._get(f"{_GRAPH_BASE}/users/{ident}", params=select)
         except _GraphError as exc:
             if exc.status not in (400, 404) or "@" not in ident:
-                raise ToolException(f"User '{ident}' not found: {exc}")
+                raise _not_found(f"User '{ident}' not found: {exc}")
             # Primary SMTP address can differ from the UPN
             found = self._get(f"{_GRAPH_BASE}/users",
                               params={**select, "$filter": f"mail eq {_odata_str(ident)}"}).get("value", [])
             if not found:
-                raise ToolException(f"User '{ident}' not found in the directory")
+                raise _not_found(f"User '{ident}' not found in the directory")
             user = found[0]
         return self._remember_user(user, ident)
 
@@ -564,7 +602,7 @@ class TeamsGraphWrapper:
         if after_message_id:
             anchor = load_anchor(after_message_id)
             if not anchor or not _created(anchor):
-                raise ToolException(f"Message '{after_message_id}' not found; pass since instead.")
+                raise _not_found(f"Message '{after_message_id}' not found; pass since instead.")
             candidates.append(_Bound(_created(anchor), True, {after_message_id}))
         if not candidates:
             return _Bound(None, False, set())
@@ -650,6 +688,7 @@ class TeamsGraphWrapper:
     #  Discovery                                                           #
     # ------------------------------------------------------------------ #
 
+    @_tool_errors("list teams")
     def list_teams(self, name_contains: Optional[str] = None) -> List[Dict[str, Any]]:
         teams, _ = self._collect(f"{_GRAPH_BASE}/me/joinedTeams", params={"$select": "id,displayName,description"})
         needle = (name_contains or "").strip().lower()
@@ -658,6 +697,7 @@ class TeamsGraphWrapper:
             for t in teams if needle in (t.get("displayName") or "").lower()
         ]
 
+    @_tool_errors("list channels")
     def list_channels(self, team: str) -> Dict[str, Any]:
         team_id = self._resolve_team(team)
         channels = self._get(f"{_GRAPH_BASE}/teams/{team_id}/channels",
@@ -670,6 +710,7 @@ class TeamsGraphWrapper:
             ],
         }
 
+    @_tool_errors("list chats")
     def list_chats(
         self,
         chat_type: Optional[str] = None,
@@ -767,6 +808,7 @@ class TeamsGraphWrapper:
     #  Reading chats                                                       #
     # ------------------------------------------------------------------ #
 
+    @_tool_errors("find chat messages")
     def find_chat_messages(
         self,
         chat: str,
@@ -825,6 +867,7 @@ class TeamsGraphWrapper:
     #  Search                                                              #
     # ------------------------------------------------------------------ #
 
+    @_tool_errors("search Teams messages")
     def search_teams_messages(
         self,
         query: Optional[str] = None,
@@ -937,6 +980,7 @@ class TeamsGraphWrapper:
             payload["topic"] = topic
         return self._post(f"{_GRAPH_BASE}/chats", payload)
 
+    @_tool_errors("send chat message")
     def send_chat_message(
         self,
         message: str,
@@ -992,6 +1036,7 @@ class TeamsGraphWrapper:
         }
         return {k: v for k, v in result.items() if v is not None}
 
+    @_tool_errors("send channel message")
     def send_channel_message(
         self,
         team: str,

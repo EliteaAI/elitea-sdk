@@ -410,3 +410,31 @@ class TestToolkit:
 
         assert "teams" in AVAILABLE_CONFIGURATIONS
         assert "teams" in AVAILABLE_TOOLS
+
+
+class TestErrorContract:
+    def test_404_names_resource_and_is_flagged_not_found(self, graph, wrapper):
+        graph.on("GET", f"{G}/me/joinedTeams", _resp(404, {"error": {"message": "Team gone."}}))
+        with pytest.raises(ToolException) as exc:
+            wrapper.list_teams()
+        text = str(exc.value)
+        assert "HTTP 404: Team gone (resource: /stub)." in text
+        assert ".." not in text
+        assert "do not retry with the same ID" in text
+        from elitea_sdk.runtime.tool_outcome import ToolErrorClass, classify_tool_error
+        assert classify_tool_error(exc.value) is ToolErrorClass.INPUT
+
+    def test_unexpected_exception_becomes_tool_exception(self, graph, wrapper):
+        import requests
+        graph.on("GET", f"{G}/me/joinedTeams", _resp())
+        with patch("requests.request", side_effect=requests.ConnectionError("Connection refused")):
+            with pytest.raises(ToolException, match="Failed to list teams: Connection refused") as exc:
+                wrapper.list_teams()
+        from elitea_sdk.runtime.tool_outcome import ToolErrorClass, classify_tool_error
+        assert classify_tool_error(exc.value) is ToolErrorClass.INFRASTRUCTURE
+
+    def test_existing_tool_exception_is_not_double_wrapped(self, graph, wrapper):
+        graph.on("GET", f"{G}/me/joinedTeams", _resp(401, {"error": {"message": "expired"}}))
+        with pytest.raises(ToolException) as exc:
+            wrapper.list_teams()
+        assert not str(exc.value).startswith("Failed to")

@@ -344,3 +344,30 @@ class TestGraphErrorMessages:
             with pytest.raises(requests.HTTPError) as exc:
                 wrapper._get(f"{GRAPH}/messages/x")
         assert exc.value.response is resp
+
+
+class TestNotFoundContract:
+    def _not_found(self, url):
+        resp = _resp(404, {"error": {"code": "ErrorItemNotFound", "message": "Item gone."}})
+        resp.url = url
+        resp.reason = "Not Found"
+        return resp
+
+    def test_404_gets_hint_and_is_flagged_not_found(self, wrapper):
+        resp = self._not_found(f"{GRAPH}/messages/x")
+        with patch("requests.get", return_value=resp):
+            with pytest.raises(ToolException) as exc:
+                wrapper.get_message("x")
+        text = str(exc.value)
+        assert "HTTP 404: Item gone." in text
+        assert ".." not in text
+        assert "list_messages / list_folders" in text
+        from elitea_sdk.runtime.tool_outcome import ToolErrorClass, classify_tool_error
+        assert classify_tool_error(exc.value) is ToolErrorClass.INPUT
+
+    def test_mail_folder_404_keeps_folder_hint(self, wrapper):
+        resp = self._not_found(f"{GRAPH}/mailFolders/nope/messages")
+        with patch("requests.get", return_value=resp):
+            with pytest.raises(ToolException) as exc:
+                wrapper.list_messages(folder="nope")
+        assert "pass a folder ID from list_folders" in str(exc.value)
