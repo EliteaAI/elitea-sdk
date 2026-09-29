@@ -142,7 +142,7 @@ nodes:
       - create_result
     structured_output: false
     tool: create_test
-    toolkit_name: xray-testing
+    toolkit_name: ${XRAY_TOOLKIT_NAME}
     transition: validate_results
   - id: validate_results
     type: llm

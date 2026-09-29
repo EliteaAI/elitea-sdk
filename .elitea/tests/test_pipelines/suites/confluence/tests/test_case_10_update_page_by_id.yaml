@@ -219,6 +219,7 @@ nodes:
     input:
       - delete_result
       - test_results
+      - create_result
     input_mapping:
       chat_history:
         type: fixed
@@ -231,16 +232,18 @@ nodes:
         value: |
           Analyze the complete workflow results. Keep response under 300 tokens.
 
+          Create Result: {create_result}
           Delete Result: {delete_result}
           Validation Results: {test_results}
 
           Checks:
-          1. Page deleted successfully (delete result contains success/deleted message).
-          2. Update was successful (validation_results.update_successful is true).
-          3. Content was verified (validation_results.content_updated is true).
+          1. Page was created successfully (create result contains created message or page details).
+          2. Page deleted successfully (delete result contains success/deleted message).
+          3. Update was successful (validation_results.update_successful is true).
+          4. Content was verified (validation_results.content_updated is true).
 
           Return ONLY this JSON (no markdown, no extra text):
-          {{"test_passed": boolean, "tool_executed": true, "page_created": true, "page_updated": boolean, "content_verified": boolean, "page_deleted": boolean, "failed_checks": []}}
+          {{"test_passed": boolean, "tool_executed": true, "page_created": boolean, "page_updated": boolean, "content_verified": boolean, "page_deleted": boolean, "failed_checks": []}}
     model: gpt-4o
     output:
       - test_results
