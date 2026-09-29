@@ -76,17 +76,9 @@ def main(
     from .tools.vector import VectorAdapter
     from .tools.utils import (
         replace_source,
-        download_nltk,
         preload_unstructured_nlp_model,
         LockedIterator,
     )
-    #
-    log.info("Checking NLTK")
-    #
-    try:
-        download_nltk("./nltk_data", force=False)
-    except Exception as e:
-        print_log("Failed to download nltk data", str(e))
     #
     log.info("Checking Unstructured NLP model")
     #
