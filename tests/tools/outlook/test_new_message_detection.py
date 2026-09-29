@@ -308,3 +308,39 @@ class TestToolRegistration:
         with patch.object(OutlookGraphWrapper, "find_new_messages", return_value={"count": 0}) as find:
             assert api.run("find_new_messages", senders=["a@example.com"]) == {"count": 0}
         assert find.call_args.kwargs["senders"] == ["a@example.com"]
+
+
+class TestGraphErrorMessages:
+    """#6821: the agent must see what Graph said, and how to fix a bad folder name."""
+
+    def _error_resp(self, status, code, message, url):
+        resp = _resp(status=status, json_body={"error": {"code": code, "message": message}})
+        resp.url = url
+        resp.reason = "Bad Request"
+        return resp
+
+    def test_display_name_folder_gets_actionable_message(self, wrapper):
+        resp = self._error_resp(400, "ErrorInvalidIdMalformed", "Id is malformed.",
+                                f"{GRAPH}/mailFolders/Alita Support/messages")
+        with patch("requests.get", return_value=resp):
+            with pytest.raises(ToolException) as exc:
+                wrapper.list_messages(folder="Alita Support")
+        text = str(exc.value)
+        assert "HTTP 400: Id is malformed." in text
+        assert "list_folders" in text
+
+    def test_other_errors_carry_graph_message_without_folder_hint(self, wrapper):
+        resp = self._error_resp(400, "ErrorInvalidRequest", "Bad KQL.", f"{GRAPH}/messages")
+        with patch("requests.get", return_value=resp):
+            with pytest.raises(ToolException) as exc:
+                wrapper.list_messages(folder="all", search="x")
+        text = str(exc.value)
+        assert "HTTP 400: Bad KQL." in text
+        assert "list_folders" not in text
+
+    def test_http_error_keeps_response_for_callers(self, wrapper):
+        resp = self._error_resp(404, "ErrorItemNotFound", "Not found.", f"{GRAPH}/messages/x")
+        with patch("requests.get", return_value=resp):
+            with pytest.raises(requests.HTTPError) as exc:
+                wrapper._get(f"{GRAPH}/messages/x")
+        assert exc.value.response is resp
