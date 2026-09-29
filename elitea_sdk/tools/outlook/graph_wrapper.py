@@ -284,9 +284,17 @@ class OutlookGraphWrapper:
         ):
             hint = (" The mail folder was not found: pass a folder ID from list_folders "
                     "or a well-known name (inbox, sentitems, drafts, deleteditems, archive, junkemail).")
-        raise requests.HTTPError(
+        elif resp.status_code == 404:
+            hint = (" The item does not exist or is not visible to the signed-in user; "
+                    "do not retry with the same ID, look it up with list_messages / list_folders.")
+        api_message = str(api_message).rstrip(". ")
+        exc = requests.HTTPError(
             f"Microsoft Graph returned HTTP {resp.status_code}: {api_message}.{hint}", response=resp
         )
+        if resp.status_code == 404:
+            # Read by runtime.tool_outcome so a missing item is classed as INPUT, not unclassified.
+            exc.provider_error_category = "resource_not_found"
+        raise exc
 
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
@@ -433,10 +441,12 @@ class OutlookGraphWrapper:
             return self._get(url, params={"$select": "id,conversationId,subject,receivedDateTime,sentDateTime"})
         except requests.HTTPError as e:
             if _status_of(e) == 404:
-                raise ToolException(
+                not_found = ToolException(
                     f"Message '{message_id}' not found (deleted, or the ID is not an immutable ID "
                     f"and the message was moved).{not_found_hint}"
                 )
+                not_found.provider_error_category = "resource_not_found"
+                raise not_found
             raise
 
     def _resolve_bound(self, since: Optional[str], after_message_id: Optional[str]) -> _Bound:
