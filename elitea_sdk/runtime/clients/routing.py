@@ -137,6 +137,28 @@ def observation(message):
         total_write = sum(write_buckets)
         if total_write <= 1_000_000_000 and (total_write or 'cache_creation_tokens' not in cache_details):
             cache_details['cache_creation_tokens'] = total_write
+    # OpenAI-compatible gateways can report native cache counters that
+    # LangChain retains only in token_usage. Reconcile explicit observations;
+    # missing fields stay unknown and contradictory sources cannot price a hit.
+    raw = message.response_metadata.get('token_usage') or {}
+    raw = raw if isinstance(raw, dict) else {}
+    raw_details = raw.get('prompt_tokens_details') or {}
+    raw_details = raw_details if isinstance(raw_details, dict) else {}
+    for target, native, alternate in (
+            ('cached_tokens', 'cache_read_input_tokens', None),
+            ('cache_creation_tokens', 'cache_creation_input_tokens', 'cache_write_tokens')):
+        values = [cache_details.get(target), raw.get(native), raw_details.get(target)]
+        if alternate:
+            values.append(raw_details.get(alternate))
+        values = [value for value in values if value is not None]
+        if values and all(type(value) is int and 0 <= value <= 1_000_000_000 for value in values) and len(set(values)) == 1:
+            cache_details[target] = values[0]
+        else:
+            cache_details.pop(target, None)
+    total_input = usage.get('input_tokens')
+    if (type(total_input) is int and total_input >= 0
+            and sum(cache_details.values()) > total_input):
+        cache_details.clear()
     model = message.response_metadata.get('model_name') or message.response_metadata.get('model')
     return {'message_digest': hashlib.sha256(json.dumps({k: row.get(k) for k in
         ('role', 'content', 'tool_calls', 'tool_call_id')}, sort_keys=True, ensure_ascii=False,

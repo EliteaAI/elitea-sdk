@@ -304,6 +304,40 @@ def test_cache_usage_distinguishes_unknown_from_measured_zero(details,expected):
     assert m.observation(msg)['usage']['prompt_tokens_details']==expected
 
 
+def test_native_gateway_write_counter_survives_langchain_normalization():
+    # R23 native Luna receipt: LangChain dropped only the normalized write
+    # field, while both explicit native fields remained in token_usage.
+    msg = AIMessage(content='CACHE_OK',
+        usage_metadata={'input_tokens':15336, 'output_tokens':6, 'total_tokens':15342,
+                        'input_token_details':{'cache_read':0}},
+        response_metadata={'token_usage':{
+            'prompt_tokens':15336, 'cache_creation_input_tokens':15334,
+            'cache_read_input_tokens':0,
+            'prompt_tokens_details':{'cached_tokens':0, 'cache_creation_tokens':15334}}})
+    assert m.observation(msg)['usage']['prompt_tokens_details'] == {
+        'cached_tokens':0, 'cache_creation_tokens':15334}
+
+
+@pytest.mark.parametrize('details,raw,expected',[
+    ({}, {}, {}),
+    ({}, {'cache_creation_input_tokens':0}, {'cache_creation_tokens':0}),
+    ({}, {'prompt_tokens_details':{'cache_write_tokens':80}}, {'cache_creation_tokens':80}),
+    ({'cache_creation':70}, {'cache_creation_input_tokens':80}, {}),
+    ({}, {'cache_creation_input_tokens':80, 'prompt_tokens_details':{'cache_creation_tokens':70}}, {}),
+    ({}, {'cache_creation_input_tokens':True}, {}),
+    ({}, {'cache_read_input_tokens':-1}, {}),
+    ({}, {'cache_creation_input_tokens':1_000_000_001}, {}),
+    ({'cache_read':80}, {'cache_creation_input_tokens':30}, {}),
+    ({'cache_read':80}, {'cache_creation_input_tokens':20}, {'cached_tokens':80,'cache_creation_tokens':20}),
+    ({'cache_read':80}, {'cache_creation_input_tokens':'20'}, {'cached_tokens':80}),
+])
+def test_native_cache_counters_reject_conflicts_and_impossible_buckets(details,raw,expected):
+    msg=AIMessage(content='answer').model_copy(update={
+        'usage_metadata':{'input_tokens':100,'output_tokens':1,'total_tokens':101,'input_token_details':details},
+        'response_metadata':{'token_usage':raw}})
+    assert m.observation(msg)['usage']['prompt_tokens_details'] == expected
+
+
 @pytest.mark.parametrize('asynchronous',[False,True])
 def test_cache_receipt_records_start_before_model_execution(asynchronous,monkeypatch):
     auto,native,calls=model()
