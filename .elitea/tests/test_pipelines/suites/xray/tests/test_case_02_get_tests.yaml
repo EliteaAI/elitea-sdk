@@ -78,7 +78,7 @@ nodes:
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Tool ran without throwing an exception
           2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears in test content like summaries or descriptions.
-          3. has_extracted_tests: Response indicates "Extracted tests" with count
+          3. has_extracted_tests: Response contains a list/array of extracted tests or explicit count information
           4. has_test_data: Response contains test details (issueId, jira fields)
 
           Return JSON test_results:
@@ -93,6 +93,8 @@ nodes:
             "error_indicator_found": "which error indicator was found or 'none'",
             "error": string | null
           }}
+
+          Treat a JSON array of test objects as a valid successful response even if it does not literally say "Extracted tests".
 
           Return ONLY the JSON object.
     model: ${DEFAULT_LLM_MODEL}

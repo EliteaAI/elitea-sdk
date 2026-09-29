@@ -117,25 +117,27 @@ nodes:
     code:
       type: fixed
       value: |
+        import json
         import re
         
         # Extract step ID from creation result
-        result_str = elitea_state.get("create_result", "")
+        raw_result = elitea_state.get("create_result", "")
+        result_str = json.dumps(raw_result) if isinstance(raw_result, (dict, list)) else str(raw_result)
         step_id = ""
         
         # Look for step id (UUID format)
-        step_id_match = re.search(r"'id':\s*'([a-f0-9\-]{36})'", result_str)
+        step_id_match = re.search(r'"id":\s*"([a-f0-9\-]{36})"', result_str)
         if not step_id_match:
-            step_id_match = re.search(r'"id":\s*"([a-f0-9\-]{36})"', result_str)
+            step_id_match = re.search(r"'id':\s*'([a-f0-9\-]{36})'", result_str)
         if step_id_match:
             step_id = step_id_match.group(1)
         
-        step_id
+        {"step_id": step_id}
     input:
       - create_result
     output:
       - step_id
-    structured_output: false
+    structured_output: true
     transition: prepare_attachment
 
   - id: prepare_attachment
