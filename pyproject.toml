@@ -31,7 +31,7 @@ dependencies = [
     "aiohttp>=3.9.0",
     # Pylon 1.2.25 preloads typing-extensions 4.15.0. AnyIO 4.15+ requires
     # typing-extensions 4.16 and fails before isolated plugin paths can override it.
-    "anyio==4.14.0",
+    "anyio==4.14.2",
 ]
 
 [[project.authors]]
@@ -133,7 +133,7 @@ tools = [
     "zephyr-python-api==0.1.0",
     "azure-devops==7.1.0b4",
     "azure-core==1.38.0",
-    "azure-identity==1.16.0",
+    "azure-identity==1.16.1",
     "azure-keyvault-keys==4.9.0",
     "azure-keyvault-secrets==4.8.0",
     "azure-mgmt-core==1.4.0",
