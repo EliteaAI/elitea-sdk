@@ -21,6 +21,7 @@ def discover_mcp_tools(
     timeout: int = 60,
     session_id: Optional[str] = None,
     ssl_verify: bool = True,
+    configured_auth: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Discover available tools from a remote MCP server.
@@ -34,6 +35,8 @@ def discover_mcp_tools(
         headers: Optional HTTP headers for authentication
         timeout: Request timeout in seconds (default: 60)
         session_id: Optional session ID for stateful connections
+        configured_auth: True when the Authorization header is an operator-configured
+            credential, so a 401 reports invalid credentials instead of starting OAuth
         
     Returns:
         List of tool definitions, each containing:
@@ -58,7 +61,7 @@ def discover_mcp_tools(
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(
-                _discover_tools_async(url, headers, timeout, session_id, ssl_verify)
+                _discover_tools_async(url, headers, timeout, session_id, ssl_verify, configured_auth)
             )
         finally:
             loop.close()
@@ -76,7 +79,7 @@ def discover_mcp_tools(
                 tools_list = future.result()
         else:
             tools_list = asyncio.run(
-                _discover_tools_async(url, headers, timeout, session_id, ssl_verify)
+                _discover_tools_async(url, headers, timeout, session_id, ssl_verify, configured_auth)
             )
         logger.info(f"[MCP Discovery] Successfully discovered {len(tools_list)} tools from {url}")
         return tools_list
@@ -97,6 +100,7 @@ async def _discover_tools_async(
     timeout: int,
     session_id: Optional[str],
     ssl_verify: bool = True,
+    configured_auth: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Async implementation of tool discovery using unified MCP client.
@@ -109,7 +113,8 @@ async def _discover_tools_async(
         session_id=session_id,
         headers=headers,
         timeout=timeout,
-        ssl_verify=ssl_verify
+        ssl_verify=ssl_verify,
+        configured_auth=configured_auth,
     )
     
     async with client:
@@ -139,10 +144,11 @@ async def discover_mcp_tools_async(
     timeout: int = 60,
     session_id: Optional[str] = None,
     ssl_verify: bool = True,
+    configured_auth: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Async version of discover_mcp_tools.
 
     See discover_mcp_tools for full documentation.
     """
-    return await _discover_tools_async(url, headers, timeout, session_id, ssl_verify)
+    return await _discover_tools_async(url, headers, timeout, session_id, ssl_verify, configured_auth)

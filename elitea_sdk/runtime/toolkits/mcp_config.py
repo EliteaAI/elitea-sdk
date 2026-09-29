@@ -49,7 +49,13 @@ from langchain_core.tools import BaseToolkit, BaseTool, ToolException
 from pydantic import BaseModel, Field
 
 from ..utils.mcp_oauth import substitute_mcp_placeholders
-from ..utils.mcp_oauth import canonical_resource, mcp_alternate_resource, normalize_mcp_url
+from ..utils.mcp_oauth import (
+    canonical_resource,
+    drop_unusable_authorization,
+    mcp_alternate_resource,
+    merge_oauth_authorization,
+    normalize_mcp_url,
+)
 from ..utils.failure_signals import mcp_is_error, log_shadow_failure
 
 logger = logging.getLogger(__name__)
@@ -725,6 +731,8 @@ class McpConfigToolkit(BaseToolkit):
                     break
 
         session_id = None
+        access_token = None
+        token_type = 'Bearer'
         if token_data:
             access_token = token_data.get('access_token') if isinstance(token_data, dict) else None
             # Also handle case where token_data is just the token string itself
@@ -734,10 +742,7 @@ class McpConfigToolkit(BaseToolkit):
             # Extract session_id for session-based auth (e.g. Atlassian MCP)
             session_id = token_data.get('session_id') if isinstance(token_data, dict) else None
 
-            if access_token:
-                if headers is None:
-                    headers = {}
-                headers['Authorization'] = f"{token_type} {access_token}"
+        headers, oauth_token_injected = merge_oauth_authorization(headers, access_token, token_type)
 
         # Internal Elitea MCP servers authenticate with the caller's personal token. When the
         # server definition carries no Authorization header template to substitute into, fall
@@ -750,14 +755,8 @@ class McpConfigToolkit(BaseToolkit):
             if headers is None:
                 headers = {}
             headers['Authorization'] = f"Bearer {personal_token}"
-        elif not personal_token and isinstance(headers, dict):
-            # No token to substitute: drop an Authorization header still holding an unresolved
-            # {placeholder} so the server returns a clean auth error instead of a literal-token 401.
-            for key in list(headers):
-                value = headers[key]
-                if (isinstance(key, str) and key.lower() == 'authorization'
-                        and isinstance(value, str) and '{' in value and '}' in value):
-                    headers.pop(key)
+        if not oauth_token_injected:
+            headers = drop_unusable_authorization(headers)
 
         # Normalize deprecated Atlassian /v1/sse URL to /v1/mcp/authv2 for the actual connection
         connection_url = normalize_mcp_url(url)
@@ -776,6 +775,12 @@ class McpConfigToolkit(BaseToolkit):
             toolkit_type=toolkit_type or f"mcp_{server_name}",
             client=client,
             session_id=session_id,
+            # Prebuilt toolkits have no Cache TTL control in their forms, so caching on this
+            # path is opt-in only. Auto-injected internal Elitea toolkits are `type: 'mcp'` and
+            # never reach here: they cache for their baked TTL (followups.md, internal-MCP work).
+            enable_caching=user_config.get('enable_caching', server_config.get('enable_caching', False)),
+            cache_ttl=user_config.get('cache_ttl', server_config.get('cache_ttl', 300)),
+            _oauth_token_injected=oauth_token_injected,
         )
 
         tools = mcp_toolkit.get_tools()

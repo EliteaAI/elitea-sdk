@@ -43,6 +43,22 @@ labels: bug, urgent
 assignees: user123
 """
 
+GET_ISSUE_PROMPT = """
+Fetch an issue with its comment thread. The issue number must be an integer.
+
+Returns the issue fields plus `comments_total` and `comments`: at most {comments_limit}
+comments (fewer when they are long), each with body, user, created_at and url.
+
+`comments_note` appears only when comments beyond that window remain. It names the
+`comments_offset` that reads the next ones, and sometimes a second offset that skips
+ahead toward the end of the thread.
+
+No note means you already have the whole thread. Never page a busy issue from the start:
+hundreds of comments will outlast your turns, and the resolution is usually at the end,
+so take the skip-ahead offset when one is offered. Stop once the comments answer you.
+"""
+
+
 UPDATE_ISSUE_PROMPT = """
 Tool allows you to update an existing issue in a GitHub repository. **IMPORTANT**: Input MUST follow 
 these rules:

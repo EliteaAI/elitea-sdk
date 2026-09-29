@@ -663,7 +663,7 @@ def get_additional_fields(issue, additional_fields):
 
 def process_issue(jira_base_url, issue, payload_params: Dict[str, Any] = None):
     issue_key = issue.get('key')
-    jira_link = f"{jira_base_url}/browse/{issue_key}"
+    jira_link = f"{jira_base_url.rstrip('/')}/browse/{issue_key}"
 
     parsed_issue = {
         "key": issue_key,
@@ -865,7 +865,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             project_info = issue_fields.get("project") or {}
             project_id = project_info.get("id") or ""
 
-            issue_url = f"{self._client.url}browse/{key}" if key else self._client.url
+            issue_url = f"{self._client.url.rstrip('/')}/browse/{key}" if key else self._client.url
 
             assignee_info = issue_fields.get("assignee") or {}
             assignee = assignee_info.get("displayName") or "None"
@@ -887,7 +887,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                     rel_issues = {
                         "type": rel_type,
                         "key": rel_key,
-                        "url": f"{self._client.url}browse/{rel_key}",
+                        "url": f"{self._client.url.rstrip('/')}/browse/{rel_key}",
                     }
 
             parsed_issue = {
@@ -1033,7 +1033,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             # used in case linkage via `update` is required
             update = dict(params["update"]) if (params.get("update")) is not None else None
             issue = client.create_issue(fields=dict(params["fields"]), update=update)
-            issue_url = f"{client.url}browse/{issue['key']}"
+            issue_url = f"{client.url.rstrip('/')}/browse/{issue['key']}"
             logger.info(f"issue is created: {issue}")
             self._add_default_labels(issue_key=issue['key'])
             return {
@@ -1055,21 +1055,28 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             self.set_issue_status_validate(issue_key, status_name)
             fields = normalize_and_parse_issue_json(mandatory_fields_json)
             # prepare field block
-            fields_data = dict(fields["update"]) if (fields.get("update")) is not None else None
+            fields_data = dict(fields["fields"]) if (fields.get("fields")) is not None else None
             # prepare update block
             update = dict(fields["update"]) if (fields.get("update")) is not None else None
+            # the client posts a null transition id for an unknown status, so fail early with a clear message
+            transitions = client.get_issue_transitions(issue_key)
+            if not any(status_name.lower() == str(t.get("to", "")).lower() for t in transitions):
+                available = ", ".join(sorted({str(t.get("to")) for t in transitions})) or "none"
+                raise ToolException(
+                    f"Status '{status_name}' is not available for issue {issue_key}. "
+                    f"Available target statuses: {available}.")
             client.set_issue_status(issue_key=issue_key, status_name=status_name, fields=fields_data,
                                           update=update)
             logger.info(f"issue is updated: {issue_key} with status {status_name}")
-            issue_url = f"{client.url}browse/{issue_key}"
+            issue_url = f"{client.url.rstrip('/')}/browse/{issue_key}"
             self._add_default_labels(issue_key=issue_key)
             return f"Done. Status for issue {issue_key} was updated successfully. You can view it at {issue_url}."
         except ToolException as e:
             raise ToolException(e)
         except Exception:
             stacktrace = format_exc()
-            logger.error(f"Error creating Jira issue: {stacktrace}")
-            raise ToolException(f"Error creating Jira issue: {stacktrace}")
+            logger.error(f"Error setting Jira issue status: {stacktrace}")
+            raise ToolException(f"Error setting Jira issue status: {stacktrace}")
 
     def _update_issue(self, client: Jira, issue_json: str):
         """ Update an issue in Jira.
@@ -1162,7 +1169,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 comment = {"content": [{"content": [{"text": comment,"type": "text"}],"type": "paragraph"}],"type": "doc","version": 1}
             response = client.issue_add_comment(issue_key, comment)
             comment_id = response.get('id', 'unknown') if response else 'unknown'
-            issue_url = f"{client.url}browse/{issue_key}"
+            issue_url = f"{client.url.rstrip('/')}/browse/{issue_key}"
             output = f"Done. Comment {comment_id} is added for issue {issue_key}. You can view it at {issue_url}"
             logger.info(output)
             self._add_default_labels(issue_key=issue_key)
@@ -1407,7 +1414,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             # Update comment
             client.issue_edit_comment(issue_key, comment_id, new_body)
 
-            issue_url = f"{client.url}browse/{issue_key}"
+            issue_url = f"{client.url.rstrip('/')}/browse/{issue_key}"
             file_type = "image" if mime_type.startswith('image/') else "video" if mime_type.startswith('video/') else "file"
             return (
                 f"File '{uploaded_filename}' uploaded and added to {issue_key} comment {comment_id} as {file_type}. "
@@ -2324,7 +2331,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                                        IndexerKeywords.CONTENT_FILE_NAME.value: attachment['filename'],
                                        'id': attachment_id,
                                        'issue_key': issue_key,
-                                       'source': f"{self.base_url}/browse/{issue_key}",
+                                       'source': f"{self.base_url.rstrip('/')}/browse/{issue_key}",
                                        'filename': attachment['filename'],
                                        'created': attachment.get('created'),
                                        'mimeType': attachment.get('mimeType'),
@@ -2346,7 +2353,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                                        IndexerKeywords.CONTENT_FILE_NAME.value: "comment.md",
                                        'id': comment.get('id'),
                                        'issue_key': issue_key,
-                                       'source': f"{self.base_url}/browse/{issue_key}",
+                                       'source': f"{self.base_url.rstrip('/')}/browse/{issue_key}",
                                        'created': comment.get('created'),
                                        'author': comment.get('author'),
                                        IndexerKeywords.PARENT.value: base_document.metadata.get('id', None),
@@ -2467,7 +2474,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             metadata = {
                 "id": issue["id"],
                 "issue_key": issue["key"],
-                "source": f"{self.base_url}/browse/{issue['key']}",
+                "source": f"{self.base_url.rstrip('/')}/browse/{issue['key']}",
                 "author": issue["fields"].get("reporter", {}).get("emailAddress") if issue["fields"].get("reporter") else None,
                 "status": issue["fields"].get("status", {}).get("name") if issue["fields"].get("status") else None,
                 "updated_on": issue["fields"].get("updated"),

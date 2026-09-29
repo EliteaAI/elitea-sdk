@@ -28,6 +28,7 @@ from typing import Any, Optional, Union
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
+from .sandbox import CLIENT_ALIAS_LINE
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
 
 logger = logging.getLogger(__name__)
@@ -123,9 +124,9 @@ import zlib
 compressed_state = base64.b64decode('{encoded}')
 state_json = zlib.decompress(compressed_state).decode('utf-8')
 elitea_state = json.loads(state_json)
-# copies for backwards compatibility with old code that references alita_state and alita_client directly
+# copies for backwards compatibility with old code that references the legacy alita_* names
 alita_state = elitea_state.copy()
-alita_client = elitea_client
+{CLIENT_ALIAS_LINE}
 '''
         return pyodide_predata
 
@@ -437,14 +438,6 @@ alita_client = elitea_client
         """The typed outcome of the call that produced ``result``."""
         tool_name = getattr(self.tool, 'name', None)
         toolkit_type = (getattr(self.tool, 'metadata', None) or {}).get('toolkit_type')
-        if result.get(PIPELINE_BLOCKED_KEY):
-            # A decline or an auth skip is a deliberate user choice, not a failure.
-            return ToolOutcome(
-                status=ToolResultStatus.BLOCKED,
-                message=str(result[PIPELINE_BLOCKED_KEY]),
-                tool_name=tool_name,
-                toolkit_type=toolkit_type,
-            )
         if sink:
             return sink[-1]
         return ToolOutcome(
@@ -457,6 +450,10 @@ alita_client = elitea_client
     def _with_outcome(self, result: Any, sink: list) -> Any:
         """Add the outcome keys. Purely additive — declared output variables are untouched."""
         if not isinstance(result, dict):
+            return result
+        if result.get(PIPELINE_BLOCKED_KEY):
+            # Blocked stop has no outcome: clear the stale last one, keep history of nodes that ran.
+            result[LAST_TOOL_OUTCOME_KEY] = None
             return result
         payload = self._outcome_for(result, sink).model_dump(mode='json')
         # message is LLM-facing prose already living on the message channel; routing only
@@ -624,8 +621,7 @@ alita_client = elitea_client
                 # Isolated in its own try: a malformed child payload must not be misread by
                 # the outer `except Exception` as THIS node's own call having failed.
                 child_outcome = tool_result.get(LAST_TOOL_OUTCOME_KEY)
-                if isinstance(child_outcome, dict) and child_outcome.get('status') in (
-                        ToolResultStatus.ERROR.value, ToolResultStatus.BLOCKED.value):
+                if isinstance(child_outcome, dict) and child_outcome.get('status') == ToolResultStatus.ERROR.value:
                     try:
                         record_outcome(ToolOutcome(**child_outcome))
                     except Exception:

@@ -44,7 +44,7 @@ setup:
         confluence_configuration:
           private: false
           elitea_title: ${CONFLUENCE_SECRET_NAME:confluence}
-        space: ${CONFLUENCE_SPACE:AT}
+        space_key: ${CONFLUENCE_SPACE:AT}
         cloud: true
       # Name for the toolkit on platform
       toolkit_name: ${CONFLUENCE_TOOLKIT_NAME:confluence-testing}

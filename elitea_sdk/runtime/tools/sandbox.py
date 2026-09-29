@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import re
 import subprocess
 import os
+import time
 from typing import Any, Type, Optional, Dict, List, Literal, Union
 from copy import deepcopy
 from pathlib import Path
@@ -14,6 +16,34 @@ from pydantic.fields import FieldInfo
 from ..exceptions import SandboxAdmissionRefused
 
 logger = logging.getLogger(__name__)
+
+# The full SandboxClient preamble imports requests + chardet, which Pyodide has to
+# micropip-install and import on every run (~0.7s). Only pay that when the code can
+# reach those names; otherwise inject just the cheap stdlib names the preamble has
+# always leaked into user code, so code relying on them keeps working.
+_FULL_PREAMBLE_NAMES = re.compile(
+    r"\b(elitea_client|alita_client|SandboxClient|SandboxArtifact|ApiDetailsRequestError"
+    r"|requests|chardet)\b"
+)
+# Emitted by the code-node state preamble on every run, so it must not count as usage.
+CLIENT_ALIAS_LINE = "alita_client = elitea_client"
+_LIGHT_PREAMBLE = (
+    "import logging\n"
+    "import re\n"
+    "from pathlib import Path\n"
+    "from typing import Dict, Optional, Any, Union\n"
+    "from urllib.parse import quote, urlparse\n"
+    "logger = logging.getLogger(__name__)\n"
+    "elitea_client = None\n"
+)
+
+
+_COMMENT_LINE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+
+
+def _code_needs_sandbox_client(code: str) -> bool:
+    code = _COMMENT_LINE.sub("", code.replace(CLIENT_ALIAS_LINE, ""))
+    return bool(_FULL_PREAMBLE_NAMES.search(code))
 
 name = "pyodide"
 
@@ -312,8 +342,9 @@ class PyodideSandboxTool(BaseTool):
         """Prepare input for PyodideSandboxTool by injecting state and elitea_client into the code block."""
         pyodide_predata = ""
 
-        # Add elitea_client if available
-        if self.elitea_client:
+        if self.elitea_client and not _code_needs_sandbox_client(code):
+            pyodide_predata = _LIGHT_PREAMBLE
+        elif self.elitea_client:
             try:
                 # Get the directory of the current file and construct the path to sandbox_client.py
                 current_dir = Path(__file__).parent
@@ -425,6 +456,7 @@ class PyodideSandboxTool(BaseTool):
         """
         Execute Python code in the Pyodide sandbox
         """
+        arun_start = time.perf_counter()
         try:
             # Resolve limits defensively: instances built via Pydantic
             # model_construct() (or any path that bypasses __init__) won't have
@@ -471,14 +503,18 @@ class PyodideSandboxTool(BaseTool):
                             "out_of_memory",
                         )
             # --- End admission gate ----------------------------------------------
+            gate_s = time.perf_counter() - arun_start
 
+            init_start = time.perf_counter()
             if self._sandbox is None:
                 self._initialize_sandbox()
+            init_s = time.perf_counter() - init_start
 
             # Prepare code with state and client injection
             # This is needed when _arun is called directly via ainvoke()
             prepared_code = self._prepare_pyodide_input(code)
 
+            exec_start = time.perf_counter()
             # Execute the code with session state if available, bounded by the
             # configured per-execution timeout and WASM memory cap.
             result = await self._sandbox.execute(
@@ -493,6 +529,11 @@ class PyodideSandboxTool(BaseTool):
                 # no-TLS-override behavior instead of raising KeyError.
                 root_ca_path=limits.get("root_ca_path"),
                 insecure_tls_domains=limits.get("allowed_pyodide_domains"),
+            )
+            logger.debug(
+                "[sandbox-timing] tool _arun: total=%.3fs admission_gate=%.3fs init=%.3fs execute=%.3fs remote=%s",
+                time.perf_counter() - arun_start, gate_s, init_s,
+                time.perf_counter() - exec_start, _using_remote,
             )
 
             # Update session state for stateful execution

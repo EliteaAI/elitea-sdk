@@ -68,8 +68,10 @@ nodes:
           Tool Result: {tool_result}
 
           Perform the following checks:
-          1. Confirm the tool executed successfully (result is not empty or null).
+          1. Confirm the tool executed successfully (result is not null and is not an error message).
           2. Verify result indicates label modification was successful.
+             The tool does not echo the labels back: a message like "Issue <KEY> has been updated successfully"
+             for the target issue IS confirmation that the labels were added, and is a PASS.
 
           Return a JSON object named test_results with the following structure:
 

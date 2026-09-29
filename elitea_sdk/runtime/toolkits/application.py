@@ -192,8 +192,10 @@ class ApplicationToolkit(BaseToolkit):
         # Embedded sub-agents intentionally have null llm_settings; fall back to caller's LLM.
         llm_settings = version_details.get('llm_settings') or {}
         _model_name = llm_settings.get('model_name')
-        if _model_name:
+        if _model_name or (llm_settings.get("selection") or {}).get("mode") == "auto":
             model_settings = {
+                "selection": llm_settings.get("selection"),
+                "routing_surface": "pipeline" if version_details.get("agent_type") == "pipeline" else "agent",
                 "max_tokens": llm_settings.get('max_tokens'),
                 "max_output_tokens": llm_settings.get('max_output_tokens'),
                 "reasoning_effort": llm_settings.get('reasoning_effort'),

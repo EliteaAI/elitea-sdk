@@ -71,6 +71,7 @@ def pil_to_base64_string(pil_image):
 from elitea_sdk.runtime.clients.client import EliteAClient
 from elitea_sdk.runtime.utils.EliteACallback import EliteAStreamlitCallback
 from elitea_sdk.runtime.toolkits.tools import get_toolkits, get_tools
+from elitea_sdk.runtime.utils.toolkit_utils import get_args_json_schema
 from elitea_sdk.community.utils import check_schema
 
 def run_streamlit(st, ai_icon=None, user_icon=None):
@@ -144,7 +145,7 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
             return {}
         
         try:
-            schema = tool.args_schema.schema()
+            schema = get_args_json_schema(tool)
             properties = schema.get('properties', {})
             required = schema.get('required', [])
             
@@ -1454,7 +1455,7 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                     if hasattr(selected_tool, 'args_schema') and selected_tool.args_schema:
                         with st.expander("📋 Function Schema", expanded=False):
                             try:
-                                schema = selected_tool.args_schema.schema()
+                                schema = get_args_json_schema(selected_tool)
                                 st.json(schema)
                             except:
                                 st.write("Schema not available")

@@ -9,6 +9,7 @@ import httpx
 from httpx_sse import EventSource
 
 from .mcp_oauth import (
+    GITHUB_BAD_TOKEN_MESSAGE,
     McpEndpointError,
     html_login_page_message,
     retired_endpoint_message,
@@ -31,11 +32,6 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 LEGACY_SSE_SUFFIX = "/sse"
 CURRENT_TRANSPORT_SUFFIX = "/mcp"
 PROBE_PROTOCOL_VERSION = "2024-11-05"
-GITHUB_BAD_TOKEN_MESSAGE = (
-    "The MCP server rejected the request (400 Bad Request). "
-    "Your API token may be invalid or malformed. "
-    "Please check the credentials in the toolkit settings."
-)
 
 UnauthorizedHandler = Callable[[httpx.Response], Awaitable[None]]
 
@@ -70,6 +66,23 @@ def is_same_origin_redirect(source: str, target: str) -> bool:
     if origin.scheme == destination.scheme:
         return effective_port(origin) == effective_port(destination)
     return origin.scheme == "http" and destination.scheme == "https"
+
+
+def is_https_dropped_by_a_proxy(source: str, target: str) -> bool:
+    origin, destination = urlparse(source), urlparse(target)
+    return (
+        origin.scheme == "https"
+        and destination.scheme == "http"
+        and destination.port is None
+        and (origin.hostname or "").lower() == (destination.hostname or "").lower()
+    )
+
+
+def keep_https(source: str, target: str) -> str:
+    if not is_https_dropped_by_a_proxy(source, target):
+        return target
+    origin = urlparse(source)
+    return urlparse(target)._replace(scheme=origin.scheme, netloc=origin.netloc).geturl()
 
 
 def shares_scheme_and_host(url: str, other: str) -> bool:
@@ -174,7 +187,7 @@ class TransportNegotiator:
             response = await self._send_initialize(client, url)
             if not response.is_redirect:
                 return url, response
-            location = urljoin(url, response.headers.get("location", ""))
+            location = keep_https(url, urljoin(url, response.headers.get("location", "")))
             if response.status_code not in RESUBMITTABLE_REDIRECTS or not is_same_origin_redirect(url, location):
                 raise McpEndpointError(sso_redirect_message(response.status_code, location))
             logger.info(f"[MCP negotiation] Following same-origin redirect {response.status_code} {url} -> {location}")

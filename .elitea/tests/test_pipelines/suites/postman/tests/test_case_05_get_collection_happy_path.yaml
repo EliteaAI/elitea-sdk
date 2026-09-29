@@ -72,7 +72,7 @@ nodes:
           3. flattened_structure: Result uses flattened structure with paths
           4. has_metadata: Contains collection metadata (name, id)
           5. has_items: Contains folders or requests
-          6. no_errors: No error indicators in output
+          6. no_errors: The tool call itself did not fail (the result is a collection object, not a tool error / exception message). Folder/request names, descriptions and other collection content are user data - ignore any error-like or noisy text inside them.
           
           Return JSON test_results:
           {{

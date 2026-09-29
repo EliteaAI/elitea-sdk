@@ -13,10 +13,6 @@ from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 
 logger = logging.getLogger(__name__)
 
-# Names reserved for system use — populated automatically by the SDK runtime.
-# Users may not create, rename, or delete variables with these names.
-RESERVED_SYSTEM_STATE_VARS: frozenset = frozenset({'tool_outcomes', 'last_tool_outcome'})
-
 # Max chars of a tool result rendered into the INFO summary line. The full body
 # is never logged at INFO — a tool (esp. MCP) can return megabytes and flood logs.
 TOOL_RESULT_PREVIEW_CHARS = 500
@@ -474,12 +470,6 @@ def create_state(data: Optional[dict] = None):
     types_dict = {}
     if not data:
         data = {'messages': 'list[str]'}
-    conflicting = set(data.keys()) & RESERVED_SYSTEM_STATE_VARS
-    if conflicting:
-        raise ValueError(
-            f"State variable names {sorted(conflicting)} are reserved for system use "
-            f"and cannot be defined by the user."
-        )
     for key, value in data.items():
         # support of old & new UI
         value = value['type'] if isinstance(value, dict) else value
@@ -493,6 +483,8 @@ def create_state(data: Optional[dict] = None):
     types_dict["state_types"] = dict
     # Add context_info for context management tracking (unified format with summarization)
     state_dict["context_info"] = Optional[dict]
+    # Scoped Auto bindings survive message compaction without a new database.
+    state_dict["_auto_routing"] = Annotated[dict, _parallel_tasks_reducer]
     # Persist HITL (sensitive-tool) approve/reject decisions across checkpoint
     # resumes so that blocked tools stay excluded and an audit trail is kept.
     # Uses a custom reducer: list → append, None → clear.

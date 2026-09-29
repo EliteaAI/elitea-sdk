@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -12,6 +12,8 @@ from langchain_core.tools import ToolException
 logger = logging.getLogger(__name__)
 
 MCP_AUTH_DECISION_TYPE = "mcp_auth_decision"
+OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN = "oauth-authorization-server"
+OPENID_CONFIGURATION_WELL_KNOWN = "openid-configuration"
 
 
 def _is_http_url(value: Optional[str]) -> bool:
@@ -186,7 +188,22 @@ class McpContext:
 SSO_REDIRECT_PREFIX = "The MCP server redirected the request"
 HTML_LOGIN_PAGE_PREFIX = "The MCP server returned an HTML page"
 RETIRED_ENDPOINT_PREFIX = "The MCP endpoint "
-CURATED_MCP_MESSAGE_PREFIXES = (SSO_REDIRECT_PREFIX, HTML_LOGIN_PAGE_PREFIX, RETIRED_ENDPOINT_PREFIX)
+INVALID_CONFIGURED_CREDENTIALS_MESSAGE = (
+    "Authorization credentials are invalid. "
+    "Please check the credentials in the toolkit settings."
+)
+GITHUB_BAD_TOKEN_MESSAGE = (
+    "The MCP server rejected the request (400 Bad Request). "
+    "Your API token may be invalid or malformed. "
+    "Please check the credentials in the toolkit settings."
+)
+CURATED_MCP_MESSAGE_PREFIXES = (
+    SSO_REDIRECT_PREFIX,
+    HTML_LOGIN_PAGE_PREFIX,
+    RETIRED_ENDPOINT_PREFIX,
+    INVALID_CONFIGURED_CREDENTIALS_MESSAGE,
+    GITHUB_BAD_TOKEN_MESSAGE,
+)
 
 
 class McpEndpointError(ValueError):
@@ -328,21 +345,81 @@ def fetch_oauth_authorization_server_metadata(url: str, timeout: int = 10, extra
         # If direct fetch failed, don't try other endpoints
         return None
     
-    # Otherwise, try extra endpoints first, then standard discovery endpoints
-    discovery_endpoints = list(extra_endpoints or []) + [
-        f"{url}/.well-known/oauth-authorization-server",
-        f"{url}/.well-known/openid-configuration",
-    ]
-    
-    for endpoint in discovery_endpoints:
-        try:
-            resp = requests.get(endpoint, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as exc:
-            logger.debug(f"Failed to fetch OAuth metadata from {endpoint}: {exc}")
+    for endpoint in extra_endpoints or []:
+        document = _fetch_json_document(endpoint, timeout)
+        if document is not None:
+            return document
+
+    fetched_documents: Dict[str, Optional[Dict[str, Any]]] = {}
+    for endpoint in authorization_server_metadata_urls(url):
+        document = _fetch_json_document_once(endpoint, timeout, fetched_documents)
+        if document is None:
             continue
-    
+        if _is_issued_by(document, url):
+            return document
+        logger.debug(f"Ignoring OAuth metadata from {endpoint}: issuer {document.get('issuer')!r} does not match {url!r}")
+
+    return _find_legacy_appended_document(url, timeout, fetched_documents)
+
+
+def legacy_appended_metadata_urls(issuer: str) -> list:
+    stripped = issuer.rstrip("/")
+    return [
+        f"{stripped}/.well-known/{OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN}",
+        f"{stripped}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}",
+    ]
+
+
+def _find_legacy_appended_document(
+    issuer: str, timeout: int, fetched_documents: Dict[str, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    for endpoint in legacy_appended_metadata_urls(issuer):
+        document = _fetch_json_document_once(endpoint, timeout, fetched_documents)
+        if document is not None:
+            logger.debug(f"Using OAuth metadata from {endpoint} with issuer {document.get('issuer')!r} for {issuer!r}")
+            return document
+    return None
+
+
+def _fetch_json_document_once(
+    endpoint: str, timeout: int, fetched_documents: Dict[str, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    if endpoint not in fetched_documents:
+        fetched_documents[endpoint] = _fetch_json_document(endpoint, timeout)
+    return fetched_documents[endpoint]
+
+
+def authorization_server_metadata_urls(issuer: str) -> list:
+    parsed = urlparse(issuer.rstrip("/"))
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path
+    if not path:
+        return [
+            f"{origin}/.well-known/{OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN}",
+            f"{origin}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}",
+        ]
+    return [
+        f"{origin}/.well-known/{OAUTH_AUTHORIZATION_SERVER_WELL_KNOWN}{path}",
+        f"{origin}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}{path}",
+        f"{origin}{path}/.well-known/{OPENID_CONFIGURATION_WELL_KNOWN}",
+    ]
+
+
+def _is_issued_by(document: Dict[str, Any], issuer: str) -> bool:
+    document_issuer = document.get("issuer")
+    if not isinstance(document_issuer, str):
+        return False
+    return document_issuer.rstrip("/") == issuer.rstrip("/")
+
+
+def _fetch_json_document(endpoint: str, timeout: int) -> Optional[Dict[str, Any]]:
+    try:
+        resp = requests.get(endpoint, timeout=timeout)
+        if resp.status_code == 200:
+            document = resp.json()
+            return document if isinstance(document, dict) else None
+    except Exception as exc:
+        logger.debug(f"Failed to fetch OAuth metadata from {endpoint}: {exc}")
     return None
 
 
@@ -404,6 +481,104 @@ async def fetch_resource_metadata_async(resource_metadata_url: str, session=None
         return None
 
 
+def find_authorization_header(headers: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(headers, dict):
+        return None
+    for key in headers:
+        if isinstance(key, str) and key.lower() == "authorization":
+            return key
+    return None
+
+
+AUTHORIZATION_SCHEMES = frozenset({"bearer", "basic", "token"})
+# A `{param}` from a prebuilt server definition that nobody filled in is not a credential.
+# A `{{secret.name}}` the platform failed to resolve is different: the operator did configure
+# a credential, so it stays configured and its 401 reports the settings problem instead of
+# handing the toolkit to an OAuth identity. Anything else, braces included, is a credential
+# as typed.
+MCP_PARAM_PLACEHOLDER = re.compile(r'(?<!\{)\{(\w+)\}(?!\})')
+
+
+def as_header_mapping(headers: Any) -> Any:
+    """The platform stores toolkit headers as a mapping or as the JSON string
+    ``McpToolkit.get_toolkit`` parses, so credential decisions have to see both alike.
+    A value that is neither is returned untouched, leaving the typed error to the caller
+    that documents it."""
+    if isinstance(headers, str) and headers.strip():
+        try:
+            parsed = json.loads(headers)
+        except ValueError:
+            return headers
+        return parsed if isinstance(parsed, dict) else headers
+    return headers
+
+
+def is_unresolved_mcp_placeholder(value: Any) -> bool:
+    return isinstance(value, str) and bool(MCP_PARAM_PLACEHOLDER.search(value))
+
+
+def is_blank_credential(value: Any) -> bool:
+    parts = str(value or "").split()
+    return not parts or (len(parts) == 1 and parts[0].lower() in AUTHORIZATION_SCHEMES)
+
+
+def is_configured_credential(value: Any) -> bool:
+    return not is_unresolved_mcp_placeholder(value) and not is_blank_credential(value)
+
+
+def has_configured_authorization(headers: Optional[Dict[str, Any]]) -> bool:
+    key = find_authorization_header(headers)
+    return key is not None and is_configured_credential(headers[key])
+
+
+def has_authorization_on_the_wire(headers: Optional[Dict[str, Any]], oauth_token_injected: bool) -> bool:
+    """Whatever Authorization value is sent came from the toolkit settings, so a 401 is a
+    credentials problem to report, not an OAuth flow to start."""
+    return find_authorization_header(headers) is not None and not oauth_token_injected
+
+
+def drop_unusable_authorization(headers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """An Authorization value that is not a credential — an unresolved ``{template}`` or a
+    blank such as ``"Bearer "`` — must not go on the wire when no token replaced it: the
+    server then answers with a clean challenge that can open the login, instead of a
+    literal-value 401 that reads as invalid credentials."""
+    if headers is not None and not isinstance(headers, dict):
+        return headers
+    kept = dict(headers) if headers else {}
+    key = find_authorization_header(kept)
+    if key is not None and not is_configured_credential(kept[key]):
+        kept.pop(key)
+    return kept
+
+
+def merge_oauth_authorization(
+    headers: Optional[Dict[str, Any]], access_token: Optional[str], token_type: str = "Bearer"
+) -> Tuple[Dict[str, Any], bool]:
+    """Return the headers to send and whether the OAuth token is among them.
+
+    A configured Authorization header is the identity the operator chose, so it wins
+    over an OAuth token (same rule as the runtime path and #6418). An Authorization
+    value still holding an unresolved ``{placeholder}``, or one a blank field reduced to
+    a bare scheme such as ``"Bearer "``, is not a credential and is replaced.
+
+    A value that is no mapping at all is handed back untouched, so the parser that
+    documents it — ``McpToolkit.get_toolkit`` — still raises its own typed error.
+    """
+    if headers is not None and not isinstance(headers, dict):
+        return headers, False
+    merged = dict(headers) if headers else {}
+    if not access_token:
+        return merged, False
+    configured_key = find_authorization_header(merged)
+    if configured_key is not None and is_configured_credential(merged[configured_key]):
+        logger.info("[MCP Auth] Keeping the configured Authorization header; ignoring the OAuth token")
+        return merged, False
+    if configured_key is not None:
+        merged.pop(configured_key)
+    merged["Authorization"] = f"{token_type} {access_token}"
+    return merged, True
+
+
 def canonical_resource(server_url: str) -> str:
     """Produce a canonical resource identifier for the MCP server."""
     parsed = urlparse(server_url)
@@ -453,7 +628,7 @@ def substitute_mcp_placeholders(value: Any, user_config: Dict[str, Any]) -> Any:
             return placeholder
 
         # Substitute {param} patterns, skipping {{ }} double-brace patterns
-        result = re.sub(r'(?<!\{)\{(\w+)\}(?!\})', param_replacer, value)
+        result = MCP_PARAM_PLACEHOLDER.sub(param_replacer, value)
 
         if result != original_value:
             logger.debug(f"[MCP] Placeholder substitution applied for value with {len(original_value)} chars")

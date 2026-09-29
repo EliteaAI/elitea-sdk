@@ -3,16 +3,17 @@
 MCP tool schemas may contain property names (e.g. "fname[]") that violate
 Anthropic's tool schema property-name pattern (^[a-zA-Z0-9_.-]{1,64}$),
 causing all downstream API calls to fail with a 400 error. Property names
-must be sanitized when building the pydantic args_schema, while the
+must be sanitized when building the args_schema, while the
 original name is still used when the tool is actually invoked against the
 MCP server.
 """
 import pytest
 
-from elitea_sdk.runtime.tools.mcp_server_tool import (
-    McpServerTool,
+from elitea_sdk.runtime.tools.mcp_input_schema import (
+    build_mcp_args_schema,
     sanitize_property_name,
 )
+from elitea_sdk.runtime.tools.mcp_server_tool import McpServerTool
 
 
 def test_sanitize_property_name_strips_invalid_chars():
@@ -34,7 +35,7 @@ def test_sanitize_property_name_truncates_to_64_chars():
     assert set(result) <= set("a")
 
 
-def test_create_pydantic_model_sanitizes_invalid_property_names():
+def test_args_schema_sanitizes_invalid_property_names():
     schema = {
         "type": "object",
         "properties": {
@@ -46,13 +47,9 @@ def test_create_pydantic_model_sanitizes_invalid_property_names():
         },
         "required": ["fname[]"],
     }
-    model = McpServerTool.create_pydantic_model_from_schema(schema, "ArgsSchema")
+    fields = build_mcp_args_schema(schema)
 
-    # The sanitized field name is used in the pydantic model / JSON schema.
-    assert "fname" in model.model_fields
-    assert "fname[]" not in model.model_fields
-
-    json_schema = model.model_json_schema()
+    json_schema = fields["args_schema"]
     assert "fname" in json_schema["properties"]
     assert "fname[]" not in json_schema["properties"]
     import re
@@ -61,10 +58,11 @@ def test_create_pydantic_model_sanitizes_invalid_property_names():
         assert re.match(r"^[a-zA-Z0-9_.-]{1,64}$", prop_name), prop_name
 
     # Mapping from sanitized -> original name is retained for the tool call.
-    assert model.__property_name_map__ == {"fname": "fname[]"}
+    assert json_schema["required"] == ["fname"]
+    assert fields["property_name_map"] == {"fname": "fname[]"}
 
 
-def test_create_pydantic_model_leaves_valid_property_names_untouched():
+def test_args_schema_leaves_valid_property_names_untouched():
     schema = {
         "type": "object",
         "properties": {
@@ -72,9 +70,9 @@ def test_create_pydantic_model_leaves_valid_property_names_untouched():
         },
         "required": [],
     }
-    model = McpServerTool.create_pydantic_model_from_schema(schema, "ArgsSchema")
-    assert "valid_name" in model.model_fields
-    assert model.__property_name_map__ == {}
+    fields = build_mcp_args_schema(schema)
+    assert fields["args_schema"] == schema
+    assert fields["property_name_map"] == {}
 
 
 class _FakeClient:
@@ -98,13 +96,12 @@ def test_run_translates_sanitized_names_back_to_original():
         },
         "required": ["fname[]"],
     }
-    args_schema = McpServerTool.create_pydantic_model_from_schema(schema, "ArgsSchema")
 
     client = _FakeClient()
     tool = McpServerTool(
         name="delete_artifacts_artifacts",
         description="Delete artifacts",
-        args_schema=args_schema,
+        **build_mcp_args_schema(schema),
         client=client,
         server="test-server",
     )
@@ -126,13 +123,12 @@ def test_run_without_sanitized_properties_is_unaffected():
         "properties": {"query": {"type": "string"}},
         "required": ["query"],
     }
-    args_schema = McpServerTool.create_pydantic_model_from_schema(schema, "ArgsSchema")
 
     client = _FakeClient()
     tool = McpServerTool(
         name="search",
         description="Search",
-        args_schema=args_schema,
+        **build_mcp_args_schema(schema),
         client=client,
         server="test-server",
     )

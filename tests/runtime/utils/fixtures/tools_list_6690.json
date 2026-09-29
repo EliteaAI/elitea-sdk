@@ -1,0 +1,312 @@
+{
+  "deepwiki": {
+    "url": "https://mcp.deepwiki.com/mcp",
+    "probed_at": "2026-09-18T18:33:31Z",
+    "tools": [
+      {
+        "name": "ask_question",
+        "inputSchema": {
+          "properties": {
+            "repoName": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "description": "GitHub repository or list of repositories (max 10) in owner/repo format."
+            },
+            "question": {
+              "description": "The question to ask about the repository.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repoName",
+            "question"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "read_wiki_contents",
+        "inputSchema": {
+          "properties": {
+            "repoName": {
+              "description": "GitHub repository in owner/repo format (e.g. \"facebook/react\").",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repoName"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "read_wiki_structure",
+        "inputSchema": {
+          "properties": {
+            "repoName": {
+              "description": "GitHub repository in owner/repo format (e.g. \"facebook/react\").",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repoName"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  },
+  "exa": {
+    "url": "https://mcp.exa.ai/mcp",
+    "probed_at": "2026-09-18T18:34:01Z",
+    "tools": [
+      {
+        "name": "web_search_exa",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Natural language search query. Should be a semantically rich description of the ideal page, not just keywords. Optionally include category:<type> (company, people) to focus results \u2014 e.g. 'category:people John Doe software engineer'."
+            },
+            "numResults": {
+              "type": "number",
+              "description": "Number of search results to return (default: 10)."
+            },
+            "objective": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "description": "Goal for this search turn; say which documents should rank first, which should be excluded, and what specific facts or figures to pull from them."
+            }
+          },
+          "required": [
+            "query",
+            "objective"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name": "web_fetch_exa",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "urls": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "URLs to read. Batch multiple URLs in one call."
+            },
+            "maxCharacters": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Maximum characters to extract per page (default: 3000)"
+            }
+          },
+          "required": [
+            "urls"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        }
+      }
+    ]
+  },
+  "huggingface": {
+    "url": "https://huggingface.co/mcp",
+    "probed_at": "2026-09-18T18:33:47Z",
+    "tools": [
+      {
+        "name": "hf_whoami",
+        "inputSchema": {
+          "type": "object",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {}
+        }
+      },
+      {
+        "name": "hub_repo_search",
+        "inputSchema": {
+          "type": "object",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "query": {
+              "description": "Search term. Leave blank and specify sort + limit to browse trending or recent repositories.",
+              "type": "string"
+            },
+            "repo_types": {
+              "default": [
+                "model",
+                "dataset"
+              ],
+              "description": "Repository types to search. Defaults to [\"model\", \"dataset\"]. space uses keyword search via /api/spaces.",
+              "minItems": 1,
+              "maxItems": 3,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "model",
+                  "dataset",
+                  "space"
+                ]
+              }
+            },
+            "author": {
+              "description": "Organization or user namespace to filter by (e.g. 'google', 'meta-llama', 'huggingface').",
+              "type": "string"
+            },
+            "filters": {
+              "description": "Optional hub filter tags. Applied to each selected repo type (e.g. [\"text-generation\"], [\"language:en\"], [\"mcp-server\"]).",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "sort": {
+              "description": "Sort order (descending): trendingScore, downloads, likes, createdAt, lastModified",
+              "type": "string",
+              "enum": [
+                "trendingScore",
+                "downloads",
+                "likes",
+                "createdAt",
+                "lastModified"
+              ]
+            },
+            "limit": {
+              "default": 20,
+              "description": "Maximum number of results to return per selected repo type",
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        }
+      },
+      {
+        "name": "hub_repo_details",
+        "inputSchema": {
+          "type": "object",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "repo_ids": {
+              "minItems": 1,
+              "maxItems": 10,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Repo IDs for (models|dataset/space) - usually in author/name format (e.g. openai/gpt-oss-120b)"
+            },
+            "repo_type": {
+              "description": "Specify lookup type; otherwise auto-detects",
+              "type": "string",
+              "enum": [
+                "model",
+                "dataset",
+                "space"
+              ]
+            },
+            "operations": {
+              "description": "Details to return. Defaults to [\"overview\"]. For datasets, prefer [\"overview\", \"dataset_structure\"] first; then call [\"dataset_preview\"] with config and split.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "overview",
+                  "dataset_structure",
+                  "dataset_preview"
+                ]
+              }
+            },
+            "config": {
+              "description": "Dataset Viewer config. Required for dataset_preview when the dataset has multiple config/split options. Discover via dataset_structure.",
+              "type": "string"
+            },
+            "split": {
+              "description": "Dataset Viewer split. Required for dataset_preview when the dataset has multiple config/split options. Discover via dataset_structure.",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Row offset for dataset_preview. Defaults to 0.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "limit": {
+              "description": "Row count for dataset_preview. Defaults to 5 and is clamped to 1-100.",
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "repo_ids"
+          ]
+        }
+      },
+      {
+        "name": "hf_fs",
+        "inputSchema": {
+          "type": "object",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "operations": {
+              "minItems": 1,
+              "maxItems": 30,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "cmd": {
+                    "type": "string",
+                    "enum": [
+                      "ls",
+                      "cat",
+                      "attach",
+                      "stat",
+                      "find",
+                      "search"
+                    ],
+                    "description": "Command to execute."
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Command arguments. First item must be an hf:// URI, not a local path or bare filename. One argument per array item. search discovers resources, not repository contents; use root/owner discovery scopes, find for file discovery, or cat for a known text file. --tag and --kind require exactly hf://spaces; the only valid --kind value is mcp."
+                  }
+                },
+                "required": [
+                  "cmd",
+                  "args"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "operations"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}

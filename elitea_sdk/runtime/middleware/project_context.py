@@ -25,6 +25,7 @@ class ReadProjectContextTool(BaseTool):
     args_schema: type[BaseModel] = ReadProjectContextInput
     context_content: str = Field(exclude=True)
     revision: str = Field(exclude=True)
+    activation_description: str = Field(default="", exclude=True)
     metadata: dict = Field(default_factory=lambda: {
         "toolkit_type": "internal",
         "toolkit_name": "project_context",
@@ -80,6 +81,7 @@ class ProjectContextMiddleware(Middleware):
             self._tool = ReadProjectContextTool(
                 context_content=self.content,
                 revision=self.revision,
+                activation_description=self.activation_description,
                 description=(
                     "Load the current Project Context before answering when the user's request "
                     f"matches this activation description: {self.activation_description} "
