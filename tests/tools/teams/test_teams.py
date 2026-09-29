@@ -152,6 +152,36 @@ class TestResolution:
         assert wrapper._resolve_chat(CHAT) == CHAT
 
 
+    def test_unknown_chat_suggests_near_matches_only(self, graph, wrapper):
+        topics = [f"Unrelated meeting {i}" for i in range(40)] + ["Release crew", "8:orgid:fe7044f0"]
+        graph.on("GET", f"{G}/me/chats", _resp(json_body={"value": [
+            {"id": f"19:c{i}@thread.v2", "chatType": "group", "topic": t} for i, t in enumerate(topics)]}))
+        with pytest.raises(ToolException) as exc:
+            wrapper._resolve_chat("Relase crew")
+        text = str(exc.value)
+        assert text.startswith("Chat 'Relase crew' not found. Did you mean: Release crew?")
+        assert "list_chats" in text and "email" in text
+        assert "Unrelated meeting" not in text and "8:orgid" not in text
+
+    def test_unknown_chat_without_near_match_gives_next_step(self, graph, wrapper):
+        graph.on("GET", f"{G}/me/chats", _resp(json_body={"value": [
+            {"id": CHAT, "chatType": "group", "topic": "Release crew"}]}))
+        with pytest.raises(ToolException) as exc:
+            wrapper._resolve_chat("asdasdas")
+        assert str(exc.value) == (
+            "Chat 'asdasdas' not found. Use list_chats to find it, or pass the chat ID; "
+            "for a 1:1 chat pass the person's email."
+        )
+
+    def test_unknown_team_and_channel_point_to_their_list_tools(self, graph, wrapper):
+        graph.on("GET", f"{G}/me/joinedTeams", _resp(json_body={"value": [{"id": TEAM, "displayName": "Eng"}]}))
+        graph.on("GET", f"{G}/teams/{TEAM}/channels",
+                 _resp(json_body={"value": [{"id": CHANNEL, "displayName": "General"}]}))
+        with pytest.raises(ToolException, match="list_teams"):
+            wrapper._resolve_team("nonexistent-team-xyz")
+        with pytest.raises(ToolException, match="Did you mean: General\\?.*list_channels"):
+            wrapper._resolve_channel(TEAM, "Genral")
+
 class TestFindChatMessages:
     def _setup(self, graph, messages, read_at=None):
         info = {"id": CHAT, "chatType": "group", "topic": "Release crew"}

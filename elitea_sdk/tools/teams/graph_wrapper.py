@@ -17,6 +17,7 @@ needs ChannelMessage.Read.All (admin consent) and is intentionally not supported
 """
 from __future__ import annotations
 
+import difflib
 import html as html_lib
 import logging
 import re
@@ -163,15 +164,35 @@ def _newest(messages: List[dict]) -> Optional[dict]:
     return max(dated, key=_created, default=None)
 
 
-def _pick_by_name(items: List[dict], name: str, kind: str, name_key: str = "displayName") -> dict:
+_MAX_SUGGESTIONS = 5
+
+
+def _suggest(name: str, candidates: List[str]) -> List[str]:
+    """The known names closest to `name`; a mistyped name is what we can help with.
+
+    Meeting chats can carry a raw ID as their topic - never a useful suggestion.
+    """
+    by_lower = {}
+    for candidate in candidates:
+        if candidate and not _is_thread_id(candidate):
+            by_lower.setdefault(candidate.strip().lower(), candidate.strip())
+    close = difflib.get_close_matches(name.strip().lower(), list(by_lower), n=_MAX_SUGGESTIONS, cutoff=0.5)
+    return [by_lower[c] for c in close]
+
+
+def _pick_by_name(items: List[dict], name: str, kind: str, name_key: str = "displayName",
+                  not_found_hint: str = "") -> dict:
     """Pick one item by case-insensitive exact name, raising a helpful error otherwise."""
     wanted = name.strip().lower()
     matches = [i for i in items if (i.get(name_key) or "").strip().lower() == wanted]
     if len(matches) == 1:
         return matches[0]
     if not matches:
-        known = ", ".join(sorted({i.get(name_key) or "" for i in items if i.get(name_key)})[:30])
-        raise ToolException(f"{kind} '{name}' not found. Known: {known or 'none'}")
+        # Only near matches: the full list is unbounded, mostly unrelated, and ends up
+        # in the agent context and in the error-rewrite prompt.
+        similar = _suggest(name, [i.get(name_key) or "" for i in items])
+        did_you_mean = f" Did you mean: {'; '.join(similar)}?" if similar else ""
+        raise ToolException(f"{kind} '{name}' not found.{did_you_mean}{not_found_hint}")
     ids = ", ".join(i.get("id") for i in matches)
     raise ToolException(f"{kind} name '{name}' is ambiguous; use one of these IDs instead: {ids}")
 
@@ -409,7 +430,8 @@ class TeamsGraphWrapper:
             return team
         if team.lower() not in self._team_ids:
             teams, _ = self._collect(f"{_GRAPH_BASE}/me/joinedTeams", params={"$select": "id,displayName"})
-            self._team_ids[team.lower()] = _pick_by_name(teams, team, "Team")["id"]
+            self._team_ids[team.lower()] = _pick_by_name(
+                teams, team, "Team", not_found_hint=" Use list_teams to find it, or pass the team ID.")["id"]
         return self._team_ids[team.lower()]
 
     def _resolve_channel(self, team_id: str, channel: str) -> str:
@@ -422,7 +444,9 @@ class TeamsGraphWrapper:
         if key not in self._channel_ids:
             channels = self._get(f"{_GRAPH_BASE}/teams/{team_id}/channels",
                                  params={"$select": "id,displayName"}).get("value", [])
-            self._channel_ids[key] = _pick_by_name(channels, channel, "Channel")["id"]
+            self._channel_ids[key] = _pick_by_name(
+                channels, channel, "Channel",
+                not_found_hint=" Use list_channels to find it, or pass the channel ID.")["id"]
         return self._channel_ids[key]
 
     def _iter_chats(self, expand_members: bool = False) -> Iterator[dict]:
@@ -471,7 +495,10 @@ class TeamsGraphWrapper:
                 raise ToolException(f"No 1:1 chat with '{chat}' found. Use send_chat_message to start one.")
             return found["id"]
         chats = [c for c in self._iter_chats() if c.get("topic")]
-        return _pick_by_name(chats, chat, "Chat", name_key="topic")["id"]
+        return _pick_by_name(
+            chats, chat, "Chat", name_key="topic",
+            not_found_hint=" Use list_chats to find it, or pass the chat ID; for a 1:1 chat pass the person's email.",
+        )["id"]
 
     # ------------------------------------------------------------------ #
     #  Formatting / matching                                               #

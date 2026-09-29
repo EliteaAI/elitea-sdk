@@ -38,6 +38,9 @@ _WELL_KNOWN_FOLDERS = {
     "outbox", "clutter", "conversationhistory", "msgfolderroot", "scheduled",
 }
 
+# Graph's answer to a mailFolders/{x} lookup where x is neither an ID nor a well-known name
+_FOLDER_NOT_FOUND_CODES = {"ErrorInvalidIdMalformed", "ErrorItemNotFound", "ErrorFolderNotFound"}
+
 _LIST_FIELDS = ("id,conversationId,subject,from,toRecipients,ccRecipients,"
                 "receivedDateTime,isRead,bodyPreview,hasAttachments")
 _SUMMARY_FIELDS = ("id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,"
@@ -257,7 +260,10 @@ class OutlookGraphWrapper:
         raise auth_error
 
     def _raise_with_body(self, resp: requests.Response) -> None:
-        """Raise with response body included in error message."""
+        """Raise an HTTPError whose message carries Graph's own error text.
+
+        Stays an HTTPError with .response set: callers branch on the status and body.
+        """
         if resp.ok:
             return
         if resp.status_code == 401:
@@ -267,7 +273,20 @@ class OutlookGraphWrapper:
         except Exception:
             body = resp.text
         log.error("Graph API HTTP %s for %s: %s", resp.status_code, resp.url, body)
-        resp.raise_for_status()
+        error = body.get("error") if isinstance(body, dict) else None
+        error = error if isinstance(error, dict) else {}
+        api_message = error.get("message") or resp.reason or "request failed"
+        hint = ""
+        # mailFolders/{x} takes only an ID or a well-known name; a display name comes
+        # back as a bare "Id is malformed", which gives the agent nothing to act on.
+        if "/mailFolders/" in (resp.url or "") and (
+            resp.status_code == 404 or error.get("code") in _FOLDER_NOT_FOUND_CODES
+        ):
+            hint = (" The mail folder was not found: pass a folder ID from list_folders "
+                    "or a well-known name (inbox, sentitems, drafts, deleteditems, archive, junkemail).")
+        raise requests.HTTPError(
+            f"Microsoft Graph returned HTTP {resp.status_code}: {api_message}.{hint}", response=resp
+        )
 
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
