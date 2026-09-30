@@ -366,8 +366,9 @@ class TestNotFoundContract:
         assert classify_tool_error(exc.value) is ToolErrorClass.INPUT
 
     def test_mail_folder_404_keeps_folder_hint(self, wrapper):
-        resp = self._not_found(f"{GRAPH}/mailFolders/nope/messages")
+        stale_id = "AAMkAD" + "x" * 60
+        resp = self._not_found(f"{GRAPH}/mailFolders/{stale_id}/messages")
         with patch("requests.get", return_value=resp):
             with pytest.raises(ToolException) as exc:
-                wrapper.list_messages(folder="nope")
-        assert "pass a folder ID from list_folders" in str(exc.value)
+                wrapper.list_messages(folder=stale_id)
+        assert "pass a folder ID or path from list_folders" in str(exc.value)

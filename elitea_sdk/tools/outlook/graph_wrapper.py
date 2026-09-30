@@ -33,6 +33,7 @@ _MAX_SCAN = 1000
 _ANY_DATE_FILTER = "receivedDateTime ge 1900-01-01T00:00:00Z"
 
 _ALL_FOLDERS = {"all", "*"}
+_FOLDER_SORTS = {"path": None, "unread": "unreadItemCount", "total": "totalItemCount"}
 _WELL_KNOWN_FOLDERS = {
     "inbox", "sentitems", "drafts", "deleteditems", "archive", "junkemail",
     "outbox", "clutter", "conversationhistory", "msgfolderroot", "scheduled",
@@ -216,6 +217,7 @@ class OutlookGraphWrapper:
         self._toolkit_id = toolkit_id
         self._toolkit_name = toolkit_name
         self._folder_ids: Dict[str, str] = {}
+        self._resolved_folders: Dict[str, Tuple[str, str]] = {}
 
     @property
     def _user_path(self) -> str:
@@ -282,7 +284,7 @@ class OutlookGraphWrapper:
         if "/mailFolders/" in (resp.url or "") and (
             resp.status_code == 404 or error.get("code") in _FOLDER_NOT_FOUND_CODES
         ):
-            hint = (" The mail folder was not found: pass a folder ID from list_folders "
+            hint = (" The mail folder was not found: pass a folder ID or path from list_folders "
                     "or a well-known name (inbox, sentitems, drafts, deleteditems, archive, junkemail).")
         elif resp.status_code == 404:
             hint = (" The item does not exist or is not visible to the signed-in user; "
@@ -396,7 +398,7 @@ class OutlookGraphWrapper:
     def _messages_url(self, folder: Optional[str]) -> str:
         if _is_all_folders(folder):
             return f"{_GRAPH_BASE}{self._user_path}/messages"
-        return f"{_GRAPH_BASE}{self._user_path}/mailFolders/{folder}/messages"
+        return f"{_GRAPH_BASE}{self._user_path}/mailFolders/{self._resolve_folder(folder)}/messages"
 
     def _query_messages(
         self,
@@ -574,7 +576,7 @@ class OutlookGraphWrapper:
             folder_info = None
             if not _is_all_folders(folder):
                 folder_info = self._get(
-                    f"{_GRAPH_BASE}{self._user_path}/mailFolders/{folder}",
+                    f"{_GRAPH_BASE}{self._user_path}/mailFolders/{self._resolve_folder(folder)}",
                     params={"$select": "id,displayName,unreadItemCount,totalItemCount"},
                 )
 
@@ -1012,26 +1014,173 @@ class OutlookGraphWrapper:
             log.error("mark_as_read failed: %s", e)
             raise ToolException(f"Failed to update message: {e}")
 
-    def list_folders(self) -> List[Dict[str, Any]]:
-        """List all top-level mail folders.
+    _FOLDER_SELECT = "id,displayName,parentFolderId,childFolderCount,totalItemCount,unreadItemCount"
 
-        Returns:
-            List of folder objects with id, displayName, totalItemCount, unreadItemCount
+    def _walk_folders(
+        self, root_url: str, root_path: str = "", max_depth: Optional[int] = None
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Breadth-first walk below root_url; returns (folders, scan_capped).
+
+        max_depth=1 lists direct children only. Each folder with children costs one
+        request, so a shallow depth is the main way to keep big mailboxes cheap.
         """
-        try:
-            url = f"{_GRAPH_BASE}{self._user_path}/mailFolders"
-            params = {"$top": _PAGE_SIZE, "$select": "id,displayName,totalItemCount,unreadItemCount"}
-            folders, _ = self._collect(url, params, _MAX_SCAN)
-
-            return [
-                {
+        base = f"{_GRAPH_BASE}{self._user_path}/mailFolders"
+        result: List[Dict[str, Any]] = []
+        queue: List[Tuple[str, str, int]] = [(root_url, root_path, 1)]
+        capped = False
+        while queue:
+            if len(result) >= _MAX_SCAN:
+                capped = True
+                break
+            url, parent_path, level = queue.pop(0)
+            params = {"$top": _PAGE_SIZE, "$select": self._FOLDER_SELECT}
+            folders, has_more = self._collect(url, params, _MAX_SCAN - len(result))
+            capped = capped or has_more
+            for f in folders:
+                name = f.get("displayName") or ""
+                path = f"{parent_path}/{name}" if parent_path else name
+                result.append({
                     "id": f.get("id"),
                     "displayName": f.get("displayName"),
+                    "path": path,
+                    "parentFolderId": f.get("parentFolderId"),
+                    "childFolderCount": f.get("childFolderCount"),
                     "totalItemCount": f.get("totalItemCount"),
                     "unreadItemCount": f.get("unreadItemCount"),
-                }
-                for f in folders
-            ]
+                })
+                if f.get("childFolderCount") and (max_depth is None or level < max_depth):
+                    queue.append((f"{base}/{f.get('id')}/childFolders", path, level + 1))
+        return result, capped
+
+    @staticmethod
+    def _is_folder_ref(folder: str) -> bool:
+        """True for values Graph accepts as-is: 'all', a well-known name or an ID."""
+        return _is_all_folders(folder) or folder.lower() in _WELL_KNOWN_FOLDERS or len(folder) >= 40
+
+    def _folder_path(self, folder_id: str) -> str:
+        """Full path of a folder given by ID or well-known name, climbing parentFolderId."""
+        root_id = self._folder_id("msgfolderroot")
+        parts: List[str] = []
+        current = folder_id
+        for _ in range(32):
+            node = self._get(f"{_GRAPH_BASE}{self._user_path}/mailFolders/{current}",
+                             params={"$select": "id,displayName,parentFolderId"})
+            parts.insert(0, node.get("displayName") or "")
+            parent = node.get("parentFolderId")
+            if not parent or parent == root_id:
+                break
+            current = parent
+        return "/".join(parts)
+
+    def _find_folder(self, folder: str) -> Tuple[str, str]:
+        """Resolve a folder path or display name to (id, canonical path).
+
+        A path ("Inbox/Projects/2026") is followed one level at a time, so it costs one
+        request per segment. A bare name that is not a top-level folder falls back to
+        a full walk and must match exactly one folder.
+        """
+        key = folder.strip().strip("/").lower()
+        if key in self._resolved_folders:
+            return self._resolved_folders[key]
+        base = f"{_GRAPH_BASE}{self._user_path}/mailFolders"
+        not_found = ToolException(f"Folder '{folder}' not found. Use list_folders to see available folders.")
+        segments = [seg for seg in key.split("/") if seg]
+        if not segments:
+            raise not_found
+
+        url, path, found = base, "", None
+        for seg in segments:
+            level, _ = self._collect(url, {"$top": _PAGE_SIZE, "$select": self._FOLDER_SELECT}, _MAX_SCAN)
+            found = next((f for f in level if (f.get("displayName") or "").lower() == seg), None)
+            if not found:
+                break
+            path = f"{path}/{found['displayName']}" if path else found["displayName"]
+            url = f"{base}/{found['id']}/childFolders"
+
+        if found:
+            resolved = (found["id"], path)
+        elif len(segments) == 1:
+            matches, _ = self._walk_folders(base)
+            matches = [f for f in matches if (f["displayName"] or "").lower() == key]
+            if not matches:
+                raise not_found
+            if len(matches) > 1:
+                paths = ", ".join(f"'{f['path']}'" for f in matches)
+                raise ToolException(f"Folder name '{folder}' is ambiguous; use the full path or ID. Matches: {paths}")
+            resolved = (matches[0]["id"], matches[0]["path"])
+        else:
+            raise not_found
+        self._resolved_folders[key] = resolved
+        return resolved
+
+    def _resolve_folder(self, folder: str) -> str:
+        """Turn a folder path or display name into a Graph folder ID.
+
+        "all", well-known names and IDs pass through untouched.
+        """
+        if self._is_folder_ref(folder):
+            return folder.lower() if folder.lower() in _WELL_KNOWN_FOLDERS else folder
+        return self._find_folder(folder)[0]
+
+    def list_folders(
+        self,
+        parent: Optional[str] = None,
+        depth: Optional[int] = None,
+        name_contains: Optional[str] = None,
+        sort_by: str = "path",
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """List mail folders including nested subfolders.
+
+        Args:
+            parent: Only list folders below this one (path, display name, ID or well-known name)
+            depth: How many levels below the start to include; 1 = direct children only
+            name_contains: Case-insensitive text the folder path must contain
+            sort_by: "path" (alphabetical tree order), "unread" or "total" (largest first)
+            limit: Maximum number of folders to return
+
+        Returns:
+            {"folders": [...], "total": matching folders found, "truncated": bool, "hint": only when truncated}.
+            Each folder has id, displayName, path, parentFolderId, childFolderCount,
+            totalItemCount, unreadItemCount.
+        """
+        try:
+            if sort_by not in _FOLDER_SORTS:
+                raise ToolException(f"Invalid sort_by '{sort_by}'. Use one of: {', '.join(_FOLDER_SORTS)}.")
+
+            base = f"{_GRAPH_BASE}{self._user_path}/mailFolders"
+            if parent and not _is_all_folders(parent):
+                if self._is_folder_ref(parent):
+                    parent_id = self._resolve_folder(parent)
+                    parent_path = self._folder_path(parent_id)
+                else:
+                    parent_id, parent_path = self._find_folder(parent)
+                root_url = f"{base}/{parent_id}/childFolders"
+            else:
+                root_url, parent_path = base, ""
+
+            folders, capped = self._walk_folders(root_url, parent_path, depth)
+
+            if name_contains and name_contains.strip():
+                needle = name_contains.strip().lower()
+                folders = [f for f in folders if needle in (f["path"] or "").lower()]
+
+            if sort_by == "path":
+                folders.sort(key=lambda f: (f["path"] or "").lower())
+            else:
+                field = _FOLDER_SORTS[sort_by]
+                folders.sort(key=lambda f: (-(f.get(field) or 0), (f["path"] or "").lower()))
+
+            total = len(folders)
+            truncated = total > limit or capped
+            response: Dict[str, Any] = {"folders": folders[:limit], "total": total, "truncated": truncated}
+            if truncated:
+                more = f"more than {_MAX_SCAN} folders exist, only the first {_MAX_SCAN} were scanned; " if capped else ""
+                response["hint"] = (
+                    f"Showing {min(limit, total)} of {total} matching folders; {more}"
+                    "narrow with parent, depth or name_contains, or raise limit."
+                )
+            return response
         except ToolException:
             raise
         except Exception as e:
@@ -1043,27 +1192,13 @@ class OutlookGraphWrapper:
 
         Args:
             message_id: ID of the message to move
-            destination_folder: Destination folder: well-known name (e.g. deleteditems), display name or ID
+            destination_folder: Destination folder: well-known name (e.g. deleteditems), folder path, display name or ID
 
         Returns:
             Updated message object
         """
         try:
-            folder_id = destination_folder
-            if destination_folder.lower() in _WELL_KNOWN_FOLDERS:
-                # Graph accepts well-known folder names as destinationId
-                folder_id = destination_folder.lower()
-            else:
-                folders = self.list_folders()
-                match = next(
-                    (f for f in folders if (f["displayName"] or "").lower() == destination_folder.lower()),
-                    None
-                )
-                if match:
-                    folder_id = match["id"]
-                elif len(destination_folder) < 40:
-                    # Too short to be a Graph folder ID, so it was meant as a display name
-                    raise ToolException(f"Folder '{destination_folder}' not found")
+            folder_id = self._resolve_folder(destination_folder)
 
             url = f"{_GRAPH_BASE}{self._user_path}/messages/{message_id}/move"
             payload = {"destinationId": folder_id}
