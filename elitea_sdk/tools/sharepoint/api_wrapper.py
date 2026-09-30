@@ -1280,6 +1280,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     )
                 except Exception as e:
                     logging.error("Failed while parsing OneNote page '%s': %s", page_id, e)
+                    self._track_download_failure(document)
                 yield document
 
             # ── SharePoint file ───────────────────────────────────────
@@ -1299,6 +1300,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                             document.metadata[IndexerKeywords.CONTENT_FILE_NAME.value] = file_name
                     except Exception as e:
                         logging.error("Failed while loading file content '%s': %s", file_path, e)
+                        self._track_download_failure(document)
                 yield document
 
     @staticmethod

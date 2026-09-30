@@ -165,6 +165,10 @@ class IndexingStats:
             len(self.runtime_skipped_error)
         )
 
+    @property
+    def explicitly_failed_documents(self) -> Set[str]:
+        return self.files_skipped_read_error | self.runtime_skipped_error
+
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
         # Calculate counts for each category
@@ -778,6 +782,7 @@ class _IndexRunState:
     pipeline_failed_keys: Set[str] = field(default_factory=set)
     doc_names: Dict[str, str] = field(default_factory=dict)
     counted_doc_keys: Set[str] = field(default_factory=set)
+    explicitly_failed_keys: Set[str] = field(default_factory=set)
     seen_keys: Set[str] = field(default_factory=set)
     preskipped_keys: Set[str] = field(default_factory=set)
     unchanged_skip_enabled: bool = False
@@ -1064,6 +1069,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             stats.items_withdrawn += 1
             stats.items_processed = max(stats.items_processed - 1, 0)
 
+    def _track_download_failure(self, base_doc: Document):
+        self._track_explicit_base_failure(
+            base_doc, self._extract_doc_name(base_doc.metadata), 'files_skipped_read_error')
+
+    def _track_explicit_base_failure(self, base_doc: Document, doc_name: str, skip_set_name: str):
+        self._track_base_parse_failure(doc_name, skip_set_name)
+        run = getattr(self, '_index_run', None)
+        failed_key = str(self.key_fn(base_doc))
+        if run is not None and failed_key != IDLESS_STAGING_KEY:
+            run.explicitly_failed_keys.add(failed_key)
+
     def _track_document_damaged(self, doc_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
         stats.documents_skipped_error.add(doc_name)
@@ -1224,7 +1240,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # them would render the damaged docs as retained content.
                 docs_count = max(docs_count - len(run.counted_doc_keys & flush_damaged_keys), 0)
 
-            lost_documents = bool(damaged_doc_keys) or result.get("failed_docs", 0) > 0
+            lost_documents = (bool(damaged_doc_keys)
+                              or result.get("failed_docs", 0) > 0
+                              or bool(stats and stats.explicitly_failed_documents))
             nothing_survived = docs_count + unchanged_count <= 0
 
             # Chunk counts drive the state only — never the user-facing summary.
@@ -1833,14 +1851,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             logger.debug(msg)
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
-            if dependent_docs_counter > 0:
+            if dependent_docs_counter == 0:
+                self._track_document_failed(_doc_name, base_doc)
+            elif not self._is_base_doc_explicitly_failed(base_doc):
                 result["docs_count"] += 1
                 if staging:
                     counted_key = str(self.key_fn(base_doc))
                     if counted_key != IDLESS_STAGING_KEY:
                         run.counted_doc_keys.add(counted_key)
-            else:
-                self._track_document_failed(_doc_name, base_doc)
 
         workers = getattr(self, "_index_workers", 1) or 1
 
@@ -1925,7 +1943,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['embedding'] = self.embeddings
         chunking_config['llm'] = self.llm
 
-        def _filter_parsing_errors(docs_generator, source_name: str, dependent: bool = False):
+        def _filter_parsing_errors(docs_generator, source_document: Document, source_name: str,
+                                   dependent: bool = False):
             for doc in docs_generator:
                 if doc.page_content and doc.page_content.startswith("Unsupported extension for file"):
                     if dependent:
@@ -1936,10 +1955,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 if doc.page_content and doc.page_content.startswith("Error during content parsing for file"):
                     if dependent:
                         self._track_dependent_parse_failure(source_name, reason="error")
-                    elif hasattr(self, '_track_runtime_skipped'):
-                        self._track_base_parse_failure(source_name, 'runtime_skipped_error')
-                    elif hasattr(self, '_track_skipped_document'):
-                        self._track_document_failed(source_name)
+                    else:
+                        self._track_explicit_base_failure(source_document, source_name, 'runtime_skipped_error')
                     continue
                 if not doc.page_content or not doc.page_content.strip():
                     if dependent:
@@ -1966,7 +1983,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         content=content,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
-                    source_name=source_name, dependent=dependent
+                    source_document=document, source_name=source_name, dependent=dependent
                 ))
             if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
@@ -1996,7 +2013,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         content=content_in_bytes,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
-                    source_name=source_name, dependent=dependent
+                    source_document=document, source_name=source_name, dependent=dependent
                 ))
             if chunking_tool:
                 # apply default chunker from toolkit config. No parsing.
@@ -2103,6 +2120,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if candidates & skip_set:
                 return True
         return False
+
+    def _is_base_doc_explicitly_failed(self, base_doc: Document) -> bool:
+        run = getattr(self, '_index_run', None)
+        return run is not None and str(self.key_fn(base_doc)) in run.explicitly_failed_keys
 
     def _collect_dependencies(self, documents: Generator[Document, None, None]):
         # Parallelism opt-in: subclasses (e.g. AzureDevOpsApiWrapper) set
