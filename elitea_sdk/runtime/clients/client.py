@@ -35,6 +35,24 @@ from ...configurations import get_class_configurations
 
 logger = logging.getLogger(__name__)
 
+THINKING_BUDGET_TOKENS = {"low": 2048, "medium": 4096, "high": 9092}
+# Name tokens that predate the stored thinking_type field; consulted only while a
+# model row still has that field null (#6819). Delete once every row carries it.
+ADAPTIVE_ONLY_NAME_TOKENS = ("opus-4-7", "opus_4_7", "opus-4.7",
+                             "opus-4-8", "opus_4_8", "opus-4.8",
+                             "sonnet-5", "sonnet_5",
+                             "opus-5", "opus_5")
+
+
+def resolve_thinking_type(model_name: str, configured: Optional[str]) -> str:
+    """The Anthropic thinking mode to send: the model row's field, else the legacy name tuple."""
+    if configured in ("adaptive", "enabled", "always_on"):
+        return configured
+    model_name_lower = (model_name or "").lower()
+    if any(token in model_name_lower for token in ADAPTIVE_ONLY_NAME_TOKENS):
+        return "adaptive"
+    return "enabled"
+
 
 # Canonical app_type values
 APP_TYPE_AGENT = "agent"      # Standard LangGraph react agent with tools
@@ -645,33 +663,21 @@ class EliteAClient:
                 # Measured max_tokens already includes reasoning and visible output.
             elif model_config.get("reasoning_effort"):
                 effort = model_config["reasoning_effort"].lower()
-                # Opus 4.7+ only supports adaptive thinking (not "enabled").
-                # display="summarized" is required so the API returns the
-                # thinking text alongside the signature; without it the
-                # default is "omitted" (signature only), and re-sending such
-                # a thinking block on the next tool-loop iteration is
-                # rejected by Anthropic/Bedrock with
-                # "messages.X.content.Y.thinking.thinking: Field required".
-                _adaptive_only = ("opus-4-7", "opus_4_7", "opus-4.7",
-                                  "opus-4-8", "opus_4_8", "opus-4.8",
-                                  "sonnet-5", "sonnet_5",
-                                  "opus-5", "opus_5")
-                if any(p in model_name_lower for p in _adaptive_only):
+                budget = THINKING_BUDGET_TOKENS.get(effort, 4096)
+                if resolve_thinking_type(model_name, model_config.get("thinking_type")) == "enabled":
+                    target_kwargs['temperature'] = 1
+                    target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": budget}
+                else:
+                    # display="summarized" makes the API return the thinking text with its
+                    # signature; the default "omitted" block is rejected when re-sent on the
+                    # next tool-loop iteration ("thinking.thinking: Field required").
                     target_kwargs['thinking'] = {"type": "adaptive", "display": "summarized"}
                     target_kwargs['effort'] = effort
-                    # Adaptive thinking counts toward a custom visible-output
-                    # budget. A provider/model maximum already includes all
-                    # output, so padding that Default value would exceed it.
-                    budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
-                    if has_custom_output_limit and not model_config.get("routing_total_output_cap"):
-                        target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
-                else:
-                    target_kwargs['temperature'] = 1
-                    budget = {"low": 2048, "medium": 4096, "high": 9092}.get(effort, 4096)
-                    target_kwargs['thinking'] = {"type": "enabled", "budget_tokens": budget}
-                    if has_custom_output_limit and not model_config.get("routing_total_output_cap"):
-                        target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
-                    
+                # Thinking counts toward a custom visible-output budget. A provider/model
+                # maximum already includes all output, so padding that Default value would exceed it.
+                if has_custom_output_limit and not model_config.get("routing_total_output_cap"):
+                    target_kwargs["max_tokens"] = budget + target_kwargs["max_tokens"]
+
             # Add http_client if provided
             if "http_client" in model_config:
                 target_kwargs["http_client"] = model_config["http_client"]
