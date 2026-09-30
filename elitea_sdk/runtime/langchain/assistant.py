@@ -348,6 +348,10 @@ class Assistant:
         self.parallel_hitl_max_concurrency = parallel_hitl_max_concurrency
         self.persona = persona
         self.max_iterations = data.get('meta', {}).get('step_limit', 25)
+        # Bounds the agent's tool loop when it runs threaded (i.e. as a nested agent).
+        # Absent -> deployment default (ELITEA_TOOL_EXECUTION_TIMEOUT or 900s); None/0 -> no limit.
+        self.tool_execution_timeout_override = 'tool_execution_timeout' in data.get('meta', {})
+        self.tool_execution_timeout = data.get('meta', {}).get('tool_execution_timeout')
         self.is_subgraph = is_subgraph  # Store is_subgraph flag
 
         # Current participant ID - used for self-filtering in tools
@@ -845,6 +849,8 @@ class Assistant:
                     }
                 },
                 'step_limit': self.max_iterations,
+                **({'tool_execution_timeout': self.tool_execution_timeout}
+                   if self.tool_execution_timeout_override else {}),
                 'input': ['messages'],
                 'output': ['messages'],
                 'transition': 'END'
