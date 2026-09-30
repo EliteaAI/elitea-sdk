@@ -169,9 +169,22 @@ class OutlookApiWrapper(BaseModel):
             is_read=is_read,
         )
 
-    def list_folders(self) -> List[Dict[str, Any]]:
-        """List all mail folders."""
-        return self._ensure_backend().list_folders()
+    def list_folders(
+        self,
+        parent: Optional[str] = None,
+        depth: Optional[int] = None,
+        name_contains: Optional[str] = None,
+        sort_by: str = "path",
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """List mail folders including nested subfolders."""
+        return self._ensure_backend().list_folders(
+            parent=parent,
+            depth=depth,
+            name_contains=name_contains,
+            sort_by=sort_by,
+            limit=limit,
+        )
 
     def move_message(self, message_id: str, destination_folder: str) -> Dict[str, Any]:
         """Move a message to another folder."""
@@ -325,7 +338,10 @@ class OutlookApiWrapper(BaseModel):
             },
             {
                 "name": "list_folders",
-                "description": "List all mail folders in the mailbox",
+                "description": (
+                    "List mail folders including nested subfolders (path and ID for each). Returns 20 by default; "
+                    "use parent, depth, name_contains, sort_by and limit to narrow or page through large mailboxes"
+                ),
                 "args_schema": ListFolders,
                 "ref": self.list_folders,
             },

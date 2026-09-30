@@ -1,12 +1,12 @@
 """Pydantic models for Outlook toolkit input schemas."""
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import Field, create_model
 
 
 ListMessages = create_model(
     "ListMessages",
-    folder=(str, Field(default="inbox", description="Mail folder name (inbox, sentitems, drafts, etc.) or 'all' for the whole mailbox")),
+    folder=(str, Field(default="inbox", description="Well-known name (inbox, sentitems, drafts, etc.), folder path such as 'Inbox/Projects', folder ID from list_folders, or 'all' for the whole mailbox")),
     limit=(int, Field(default=50, ge=1, le=1000, description="Maximum number of messages to return")),
     unread_only=(bool, Field(default=False, description="Only return unread messages")),
     search=(Optional[str], Field(default=None, description="KQL search query to filter messages")),
@@ -43,13 +43,18 @@ MarkAsRead = create_model(
 
 ListFolders = create_model(
     "ListFolders",
-    __doc__="List all mail folders in the mailbox",
+    __doc__="List mail folders including nested subfolders",
+    parent=(Optional[str], Field(default=None, description="Only list folders below this one: folder path such as 'Inbox/Projects', display name, folder ID or well-known name. Default: the whole mailbox")),
+    depth=(Optional[int], Field(default=None, ge=1, description="How many levels below the start to include; 1 = direct children only. Default: all levels")),
+    name_contains=(Optional[str], Field(default=None, description="Case-insensitive text the folder path must contain")),
+    sort_by=(Literal["path", "unread", "total"], Field(default="path", description="'path' = alphabetical tree order; 'unread' or 'total' = folders with the most unread/total messages first")),
+    limit=(int, Field(default=20, ge=1, le=1000, description="Maximum number of folders to return. The response says when results were truncated")),
 )
 
 MoveMessage = create_model(
     "MoveMessage",
     message_id=(str, Field(description="The unique identifier of the message to move")),
-    destination_folder=(str, Field(description="Destination folder name or ID")),
+    destination_folder=(str, Field(description="Destination folder: well-known name, folder path such as 'Inbox/Projects', or folder ID")),
 )
 
 DeleteMessage = create_model(
@@ -65,7 +70,7 @@ SearchMessages = create_model(
         "'received>=2026-09-01 budget'. Dates in KQL have day precision only; for exact "
         "'new since' checks use find_new_messages instead."
     ))),
-    folder=(str, Field(default="inbox", description="Folder to search in, or 'all' for the whole mailbox")),
+    folder=(str, Field(default="inbox", description="Folder to search in: well-known name, folder path such as 'Inbox/Projects', folder ID, or 'all' for the whole mailbox")),
     limit=(int, Field(default=25, ge=1, le=1000, description="Maximum results to return")),
 )
 
@@ -83,7 +88,7 @@ _RECIPIENTS_DESCRIPTION = "Recipient or distribution list email addresses to mat
 
 CheckNewMessages = create_model(
     "CheckNewMessages",
-    folder=(str, Field(default="inbox", description="Folder name (inbox, sentitems, etc.) or 'all' for the whole mailbox")),
+    folder=(str, Field(default="inbox", description="Well-known name (inbox, sentitems, etc.), folder path such as 'Inbox/Projects', folder ID, or 'all' for the whole mailbox")),
     since=(Optional[str], Field(default=None, description=_SINCE_DESCRIPTION + " If since and after_message_id are omitted, 'new' means unread.")),
     after_message_id=(Optional[str], Field(default=None, description=_AFTER_MESSAGE_ID_DESCRIPTION)),
     senders=(Optional[List[str]], Field(default=None, description=_SENDERS_DESCRIPTION)),
@@ -92,7 +97,7 @@ CheckNewMessages = create_model(
 
 FindNewMessages = create_model(
     "FindNewMessages",
-    folder=(str, Field(default="inbox", description="Folder name (inbox, sentitems, etc.) or 'all' for the whole mailbox")),
+    folder=(str, Field(default="inbox", description="Well-known name (inbox, sentitems, etc.), folder path such as 'Inbox/Projects', folder ID, or 'all' for the whole mailbox")),
     since=(Optional[str], Field(default=None, description=_SINCE_DESCRIPTION)),
     after_message_id=(Optional[str], Field(default=None, description=_AFTER_MESSAGE_ID_DESCRIPTION)),
     senders=(Optional[List[str]], Field(default=None, description=_SENDERS_DESCRIPTION)),
