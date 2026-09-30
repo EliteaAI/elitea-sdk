@@ -956,6 +956,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 # get_content_bytes returns dict with 'error' key on failure
                 if isinstance(page_content, dict) and 'error' in page_content:
                     logging.error(f"Failed to download file '{artifact_key}': {page_content['error']}")
+                    self._track_download_failure(document)
                     yield document
                     continue
                 document.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = page_content
@@ -963,6 +964,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 yield document
             except Exception as e:
                 logging.error(f"Failed while parsing the file '{document.metadata.get('key', document.metadata['name'])}': {e}")
+                self._track_download_failure(document)
                 yield document
 
     @staticmethod
