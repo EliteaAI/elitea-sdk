@@ -1271,6 +1271,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             )
             if staging and final_state != IndexerKeywords.INDEX_META_FAILED.value:
                 self._append_retained_orphan_warning(report)
+                self._append_resumed_run_note(report)
             message = render_report_text(report)
 
             if staging:
@@ -1672,6 +1673,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _mark_batch_damaged(run: _IndexRunState, chunk_keys: List[str]):
         run.damaged_keys.update(
             chunk_key for chunk_key in set(chunk_keys) if chunk_key != IDLESS_STAGING_KEY
+        )
+
+    def _append_resumed_run_note(self, report: Dict[str, Any]):
+        """Report reuse to the user.
+
+        Adoption is invisible everywhere else: retained rows are excluded from
+        indexed_chunks while they are hidden, and a resumed run's counts are identical
+        to a clean run's. Without this line the only way to tell a resume happened is to
+        time the run.
+        """
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.reused_row_pks:
+            return
+        reused = len(run.reused_row_pks)
+        chunks = "chunk was" if reused == 1 else "chunks were"
+        report.setdefault("warnings", []).append(
+            f"Resumed the interrupted run: {reused} {chunks} reused instead of being "
+            f"embedded again."
         )
 
     def _append_retained_orphan_warning(self, report: Dict[str, Any]):

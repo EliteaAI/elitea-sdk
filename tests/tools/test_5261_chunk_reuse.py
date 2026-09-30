@@ -21,11 +21,13 @@ from elitea_sdk.tools.base_indexer_toolkit import (
     _IndexRunState,
     candidate_chunk_digest,
     chunk_digest,
+    render_report_text,
     stored_metadata_form,
 )
 from tests.tools.test_6586_meta_row_writes import (  # noqa: F401  (fixtures)
     FakeStagingAdapter,
     StagingToolkit,
+    make_documents,
     sessions,
     toolkit,
 )
@@ -245,3 +247,103 @@ class TestTheReuseMapIsOnlyBuiltWhenItIsSafe:
 
         assert run.adoptable_chunks == {b"d": ["pk-1"]}
         assert run.adopted_row_pks == {"pk-1"}
+
+
+class TestTheUserCanSeeThatAResumeHappened:
+    """Adoption is invisible in every other surface: retained rows are excluded from
+    indexed_chunks while hidden, and a resumed run's counts match a clean run's. The
+    report line is the only signal a UI-only tester has."""
+
+    def test_a_resumed_run_reports_how_many_chunks_were_reused(self, run_state):
+        """Mutation: drop the _append_resumed_run_note call."""
+        toolkit, run = run_state
+        run.reused_row_pks = {"pk-1", "pk-2", "pk-3"}
+        report = {}
+
+        toolkit._append_resumed_run_note(report)
+
+        assert any("3 chunks were reused" in w for w in report["warnings"])
+
+    def test_a_clean_run_reports_nothing_extra(self, run_state):
+        toolkit, _ = run_state
+        report = {}
+
+        toolkit._append_resumed_run_note(report)
+
+        assert report == {}
+
+    def test_the_note_survives_into_the_user_visible_text(self, run_state):
+        toolkit, run = run_state
+        run.reused_row_pks = {"pk-1"}
+        report = {"status": "ok", "totals": {}}
+
+        toolkit._append_resumed_run_note(report)
+
+        assert "1 chunk was reused" in render_report_text(report)
+
+    def test_a_real_run_carries_the_note_into_its_report(self, run_state, monkeypatch):
+        """Pins the call site, not the helper: asserting on _append_resumed_run_note
+        directly passes even when index_data never calls it.
+        Mutation: drop the _append_resumed_run_note(report) line from index_data."""
+        toolkit, _ = run_state
+
+        def save(self, base_documents, base_total, chunking_tool, chunking_config,
+                 result, index_name=None):
+            for _ in base_documents:
+                result["count"] += 2
+                result["docs_count"] += 1
+            self._index_run.reused_row_pks = {"pk-1", "pk-2"}
+
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents("a")))
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator", save)
+
+        outcome = toolkit.index_data(index_name="x")
+
+        assert any("2 chunks were reused" in w
+                   for w in outcome["report"].get("warnings", []))
+        assert "2 chunks were reused" in outcome["message"]
+
+    def test_a_real_run_without_reuse_carries_no_note(self, run_state, monkeypatch):
+        toolkit, _ = run_state
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents("a")))
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator",
+                            lambda self, *a, **kw: None)
+
+        outcome = toolkit.index_data(index_name="x")
+
+        assert not any("reused" in w for w in outcome["report"].get("warnings", []))
+
+    def test_a_single_reused_chunk_reads_as_one_chunk(self, run_state):
+        toolkit, run = run_state
+        run.reused_row_pks = {"pk-1"}
+        report = {}
+
+        toolkit._append_resumed_run_note(report)
+
+        assert any("1 chunk was reused" in w for w in report["warnings"])
+
+    def test_a_failed_run_never_claims_rows_were_reused(self, run_state, monkeypatch):
+        """A FAILED run is discarded, which deletes the reused rows along with the rest.
+        Claiming the reuse there is the banner-lying class of #6588/#6620, and it is the
+        very signal a reporter would use to confirm the fix.
+        Mutation: move _append_resumed_run_note back outside the non-FAILED guard."""
+        toolkit, _ = run_state
+
+        def save(self, base_documents, base_total, chunking_tool, chunking_config,
+                 result, index_name=None):
+            for _ in base_documents:
+                result["count"] += 2
+                result["failed_count"] += 2
+            self._index_run.reused_row_pks = {"pk-1", "pk-2"}
+
+        monkeypatch.setattr(StagingToolkit, "_base_loader",
+                            lambda self, **kw: iter(make_documents("a")))
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator", save)
+
+        outcome = toolkit.index_data(index_name="x")
+
+        assert outcome["status"] == "error"
+        assert not any("reused" in w for w in outcome["report"].get("warnings", []))
+        assert "reused" not in outcome["message"]
