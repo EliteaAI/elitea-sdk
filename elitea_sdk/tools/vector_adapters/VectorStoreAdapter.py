@@ -146,6 +146,11 @@ class VectorStoreAdapter(ABC):
         them instead of being embedded again. Returns (digests, row_pks, truncated)."""
         return {}, set(), False
 
+    def read_run_complete_files(self, vectorstore_wrapper, run_id: str) -> Dict[str, tuple]:
+        """Index this run's staged rows by source file, keeping only the files whose rows
+        prove the whole file is already stored. Returns {filename: (identity, row_pks)}."""
+        return {}
+
     def ensure_index_runs_table(self, vectorstore_wrapper) -> None:
         raise NotImplementedError("Run staging is not supported by this adapter")
 
@@ -872,6 +877,49 @@ class PGVectorAdapter(VectorStoreAdapter):
                 digests.setdefault(digest_of(row_text_digest, row_metadata), []).append(key)
                 row_pks.add(key)
         return digests, row_pks, truncated
+
+    def read_run_complete_files(self, vectorstore_wrapper, run_id: str) -> Dict[str, tuple]:
+        store = vectorstore_wrapper.vectorstore
+        staged: Dict[str, Dict[str, Any]] = {}
+        with Session(store.session_maker.bind) as session:
+            rows = session.query(
+                store.EmbeddingStore.id,
+                store.EmbeddingStore.cmetadata,
+            ).filter(
+                store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
+                self._non_index_meta_clause(store),
+            ).yield_per(1000)
+            for row_pk, row_metadata in rows:
+                self._collect_staged_file_row(staged, row_pk, row_metadata or {})
+        return {
+            filename: (self._only(file["identities"]), file["row_pks"])
+            for filename, file in staged.items()
+            if self._file_is_whole(file)
+        }
+
+    @staticmethod
+    def _only(values):
+        return next(iter(values))
+
+    @staticmethod
+    def _collect_staged_file_row(staged: Dict[str, Dict[str, Any]], row_pk,
+                                 row_metadata: Dict[str, Any]) -> None:
+        filename = row_metadata.get("filename")
+        if not filename:
+            return
+        file = staged.setdefault(
+            filename, {"identities": set(), "totals": set(), "row_pks": []})
+        file["identities"].add(row_metadata.get("blob_sha"))
+        file["totals"].add(row_metadata.get("chunk_total"))
+        file["row_pks"].append(str(row_pk))
+
+    def _file_is_whole(self, file: Dict[str, Any]) -> bool:
+        if len(file["identities"]) != 1 or len(file["totals"]) != 1:
+            return False
+        identity, total = self._only(file["identities"]), self._only(file["totals"])
+        if not identity or not isinstance(total, int):
+            return False
+        return len(file["row_pks"]) == total
 
     def _restamp_run_chunks(self, session, store, source_run_id: str, target_run_id: str) -> int:
         # Same predicate as _delete_runs_chunks, for the same reasons: containment so the

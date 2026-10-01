@@ -200,6 +200,12 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                     self._read_indexed_data_once(index_name))
             return unchanged_identities.get(file_path) == identity
 
+        def is_already_held_by_this_run(file_path: str) -> bool:
+            if not identity_skip_is_armed:
+                return False
+            identity = file_identities.get(file_path)
+            return bool(identity) and self.resumable_file_identity(file_path) == identity
+
         def is_whitelisted(file_path: str) -> bool:
             if whitelist:
                 return (any(fnmatch.fnmatch(file_path, pattern) for pattern in whitelist)
@@ -252,6 +258,15 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 # Check for supported extensions (only when skip_unsupported_extensions is True)
                 if skip_unsupported_extensions and not has_supported_extension(file):
                     stats.files_unsupported_extension.add(file)
+                    continue
+
+                # Checked before the unchanged map: an interrupted run's own rows are
+                # hidden from the promoted-generation read, so only this branch can see
+                # them, and the file is skipped before a byte of it is downloaded.
+                if is_already_held_by_this_run(file):
+                    self.adopt_resumed_file(file, index_name)
+                    preskipped_keys.add(file)
+                    count_processed_file()
                     continue
 
                 if is_unchanged_since_last_index(file):
