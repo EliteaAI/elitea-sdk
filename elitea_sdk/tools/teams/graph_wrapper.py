@@ -3,13 +3,13 @@
 Uses OAuth tokens obtained via the Azure AD OAuth flow to communicate
 with https://graph.microsoft.com/v1.0 Teams (chat / channel) endpoints.
 
-Required OAuth scopes (delegated):
-    User.Read, User.ReadBasic.All             resolve people by email
-    Chat.Read (or Chat.ReadWrite)             read chats and chat messages
+OAuth scopes (delegated), ticked in the Teams credential:
+    User.ReadBasic.All                        resolve people by email
+    Chat.Read                                 read chats and chat messages
     ChatMessage.Send, Chat.Create             send to people / group chats
     Team.ReadBasic.All, Channel.ReadBasic.All list teams and channels
     ChannelMessage.Send                       post / reply in channels
-    (offline_access for token refresh)
+    (offline_access is always added, for token refresh)
 
 Graph has no delegated "all my chats" message feed, so messages are read per
 chat, or found across Teams with the Search API. Reading channel messages
@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 
 import requests
 from langchain_core.tools import ToolException
+
+from ...configurations.microsoft_graph_scopes import missing_permission_hint
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -51,6 +53,31 @@ _BREAK_RE = re.compile(r"<\s*(?:br\s*/?|/p|/div|/li)\s*>", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 
 log = logging.getLogger(__name__)
+
+
+def _needed_permission(method: Optional[str], url: str) -> Optional[str]:
+    """Microsoft Graph permission a Teams request needs, for the 403 hint."""
+    parts = [p for p in urlparse(url or "").path.lower().split("/") if p]
+    if parts and parts[0] in ("v1.0", "beta"):
+        parts = parts[1:]
+    if not parts:
+        return None
+    sending = (method or "GET").upper() != "GET"
+    if parts[0] == "teams":
+        if "messages" in parts:
+            return "ChannelMessage.Send"
+        return "Channel.ReadBasic.All" if "channels" in parts else "Team.ReadBasic.All"
+    if parts[:2] == ["me", "joinedteams"]:
+        return "Team.ReadBasic.All"
+    if parts[0] == "chats" or parts[:2] == ["me", "chats"]:
+        if sending:
+            return "ChatMessage.Send" if "messages" in parts else "Chat.Create"
+        return "Chat.Read"
+    if parts[0] == "search":
+        return "Chat.Read"
+    if parts[0] in ("users", "me"):
+        return "User.ReadBasic.All"
+    return None
 
 
 class _GraphError(ToolException):
@@ -306,7 +333,7 @@ class TeamsGraphWrapper:
         auth_error.tool_name = None
         raise auth_error
 
-    def _raise_with_body(self, resp: requests.Response) -> None:
+    def _raise_with_body(self, resp: requests.Response, method: Optional[str] = None) -> None:
         """Raise a ToolException carrying Graph's error message."""
         if resp.ok:
             return
@@ -320,7 +347,7 @@ class TeamsGraphWrapper:
         where = ""
         hint = ""
         if resp.status_code == 403:
-            hint = " Check that the Teams configuration scopes include the permission this tool needs."
+            hint = missing_permission_hint(_needed_permission(method, resp.url))
         elif resp.status_code == 404:
             path = urlparse(resp.url or "").path
             if path:
@@ -385,7 +412,7 @@ class TeamsGraphWrapper:
                 log.warning("Teams: Graph throttled (HTTP %s), retrying in %.0fs", resp.status_code, delay)
                 time.sleep(delay)
                 continue
-            self._raise_with_body(resp)
+            self._raise_with_body(resp, method)
             return resp
 
     def _get(self, url: str, params: Optional[dict] = None) -> dict:
