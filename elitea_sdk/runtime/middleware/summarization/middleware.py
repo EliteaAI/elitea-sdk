@@ -123,6 +123,17 @@ from langchain.agents.middleware.summarization import (
 )
 
 from .accounting import ContextAccountant, ContextMeasurement, empty_token_info
+from ...context_floor import KEEP_RECENT_TOOL_RESULTS, compactable_indexes
+
+# Tier 2 of #5915: condensing one tool result inside the tool loop.
+TOOL_RESULT_SUMMARY_PROMPT = (
+    "Condense this tool result so an agent can keep working from it. Keep identifiers, "
+    "numbers, paths, errors and anything the user asked about, and say what was omitted.\n\n"
+    "Tool: {name}\nArguments: {args}\n<result>\n{content}\n</result>"
+)
+# Bounded by the low-tier summarizer's own window, not by the agent model's.
+TOOL_RESULT_SUMMARY_INPUT_CHARS = 128_000
+SUMMARIZED_SENTINEL = '[tool result summarized: context floor]'
 
 
 class SummarizationMiddleware(LangChainSummarizationMiddleware):
@@ -235,6 +246,81 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             'tool_schema_tokens': self._tool_schema_tokens,
             'overhead_tokens': self._overhead_tokens,
         }
+
+    def count_request(self, messages) -> int:
+        """Whole-request tokens: history as the trigger counts it, plus the hidden prefix."""
+        history = [message for message in messages if not isinstance(message, SystemMessage)]
+        return self.accountant.count(history) + sum(self.prompt_overhead.values())
+
+    def summarize_tool_results_mid_loop(
+        self,
+        messages: List[BaseMessage],
+        *,
+        floor_tokens: int,
+        start: int,
+        keep_recent: int = KEEP_RECENT_TOOL_RESULTS,
+    ) -> int:
+        """Condense this turn's oldest tool results in place until the request fits.
+
+        ``before_model`` cannot run inside the tool loop, so this is the only point
+        where summarization can act on a fan-out. Content is edited in place so every
+        ``tool_call_id`` still answers its call. A result whose summary fails, is
+        empty, or is not smaller stays as it is, and the context floor drops it.
+        """
+        total = self.count_request(messages)
+        if not self.summarization_enabled or total <= floor_tokens:
+            return 0
+        candidates = [
+            index for index in compactable_indexes(messages, start)
+            if isinstance(messages[index].content, str)
+            and SUMMARIZED_SENTINEL not in messages[index].content
+        ]
+        call_args = {
+            call.get('id'): call.get('args')
+            for message in messages
+            for call in (getattr(message, 'tool_calls', None) or [])
+        }
+        summarized = 0
+        for index in candidates[:-keep_recent] if keep_recent else candidates:
+            if total <= floor_tokens:
+                break
+            message = messages[index]
+            before = self.accountant.count([message])
+            summary = self._summarize_tool_result(message, call_args.get(message.tool_call_id))
+            if not summary:
+                continue
+            condensed = (
+                f"{SUMMARIZED_SENTINEL}\n(~{before} tokens condensed; call the tool again "
+                f"if you need the exact data)\n\n{summary}"
+            )
+            after = self.accountant.count([ToolMessage(content=condensed, tool_call_id=message.tool_call_id)])
+            if after >= before:
+                continue
+            message.content = condensed
+            total -= before - after
+            summarized += 1
+        if summarized:
+            logger.warning(
+                f"[CONTEXT FLOOR] summarized {summarized} tool result(s) mid-loop "
+                f"to fit {floor_tokens} tokens (~{total} now)"
+            )
+        return summarized
+
+    def _summarize_tool_result(self, message: ToolMessage, args: Any) -> Optional[str]:
+        content = message.content
+        if len(content) > TOOL_RESULT_SUMMARY_INPUT_CHARS:
+            content = (
+                f"{content[:TOOL_RESULT_SUMMARY_INPUT_CHARS]}\n"
+                f"[{len(content) - TOOL_RESULT_SUMMARY_INPUT_CHARS} more characters not shown]"
+            )
+        prompt = TOOL_RESULT_SUMMARY_PROMPT.format(
+            name=getattr(message, 'name', None) or 'unknown', args=args, content=content,
+        )
+        try:
+            return self.model.invoke([HumanMessage(content=prompt)]).text.strip()
+        except Exception as e:
+            logger.warning(f"Mid-loop tool result summary failed, leaving it to the floor: {e}")
+            return None
 
     def get_system_prompt(self) -> str:
         """No system prompt modification needed."""

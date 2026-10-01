@@ -39,6 +39,12 @@ from ..langchain.utils import (
     prepare_messages_for_model,
     propagate_the_input_mapping,
 )
+from ..context_floor import (
+    compact_tool_results,
+    is_context_overflow,
+    resolve_floor_tokens,
+    shrink_after_overflow,
+)
 from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
@@ -1004,6 +1010,36 @@ class LLMNode(BaseTool):
                 setter(system_content=system_content, tools=bound_tools)
             except Exception as e:
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
+
+    def _enforce_context_floor(self, messages: List, llm_client=None, *, start: int = 0):
+        """Keep this turn's request inside the model's window (#5915).
+
+        Tier 2 first: when summarization is enabled, the oldest tool results of the
+        turn are condensed. Tier 1 then drops whatever still does not fit. Tier 1 runs
+        regardless of ``enable_summarization`` or the conversation's ``enabled``
+        switch, because a request that cannot be sent is a failure rather than a
+        preference. ``start`` keeps both off everything before the current turn.
+        """
+        try:
+            floor_tokens = resolve_floor_tokens(llm_client)
+            summarizer = self._context_summarizer()
+            if summarizer is not None:
+                summarizer.summarize_tool_results_mid_loop(messages, floor_tokens=floor_tokens, start=start)
+            compact_tool_results(
+                messages,
+                floor_tokens=floor_tokens,
+                start=start,
+                counter=getattr(summarizer, 'count_request', None),
+            )
+        except Exception as e:
+            logger.debug(f"Context floor check skipped: {e}")
+
+    def _context_summarizer(self):
+        """The summarization middleware, whose counter the floor must share."""
+        for mw in getattr(self.middleware_manager, '_middleware', None) or []:
+            if hasattr(mw, 'summarize_tool_results_mid_loop'):
+                return mw
+        return None
 
     @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
@@ -4437,6 +4473,16 @@ class LLMNode(BaseTool):
                     )
                 new_messages = sanitized_messages
 
+                # Keep this turn inside the context window before we send it.
+                # N tool results appended inside one turn can overflow the model
+                # on their own, and the summarization middleware cannot help here
+                # — it ran once before the loop and skips tool-related state to
+                # avoid splitting tool pairs (#5915). Always on: this bounds a
+                # request we are about to build, it is not a context preference.
+                self._enforce_context_floor(
+                    new_messages, llm_client, start=_pending_capture_start,
+                )
+
                 # Re-invoke with the SAME full toolset — including any sensitive
                 # tool the user just declined. The block is invocation-scoped
                 # (per-call independent approval, #5303), so the tool stays bound
@@ -4505,12 +4551,10 @@ class LLMNode(BaseTool):
                     'rate limit'
                 ])
                 
-                # Check for context window / token limit errors
-                is_context_error = any(indicator in error_str for indicator in [
-                    'context window', 'context_window', 'token limit', 'too long',
-                    'maximum context length', 'input is too long', 'exceeds the limit',
-                    'contextwindowexceedederror', 'max_tokens', 'content too large'
-                ])
+                # Check for context window / token limit errors. Typed first,
+                # prose second — the substring list stays for proxies and SDKs
+                # that only raise a generic error.
+                is_context_error = is_context_overflow(e)
                 
                 # Check for Bedrock/Claude output limit errors (recoverable by truncation)
                 is_output_limit_error = any(indicator in error_str for indicator in [
@@ -4652,36 +4696,49 @@ class LLMNode(BaseTool):
                         
                         logger.info(f"Truncated large tool result from '{last_tool_name}' and retrying LLM call")
 
-                        # CRITICAL FIX: Call LLM again with truncated message to get fresh completion
-                        # This prevents duplicate tool_call_ids that occur when we continue with
-                        # the same current_completion that still has the original tool_calls
-                        try:
-                            current_completion = llm_client.invoke(
-                                prepare_messages_for_model(new_messages), config=config,
-                            )
-                            current_completion = self._continue_nested_output(
-                                messages=new_messages,
-                                completion=current_completion,
-                                config=config,
-                            )
+                        # The first retry is the pre-#5915 behaviour: only the newest result
+                        # is replaced. Older results of this turn are compacted only if the
+                        # provider rejects the request again for its size — harder each
+                        # time — because until then nothing says they are the problem.
+                        shrink_ratios = (None, 0.5, 0.25) if is_context_error and not is_output_limit_error else (None,)
+                        counter = getattr(self._context_summarizer(), 'count_request', None)
+                        retry_error = None
+                        for shrink_ratio in shrink_ratios:
+                            if shrink_ratio is not None and not shrink_after_overflow(
+                                new_messages, start=_pending_capture_start, ratio=shrink_ratio, counter=counter,
+                            ).applied:
+                                break
+                            try:
+                                current_completion = llm_client.invoke(
+                                    prepare_messages_for_model(new_messages), config=config,
+                                )
+                                current_completion = self._continue_nested_output(
+                                    messages=new_messages,
+                                    completion=current_completion,
+                                    config=config,
+                                )
+                                retry_error = None
+                                break
+                            except OutputContinuationExhausted:
+                                _PENDING_TOOL_MESSAGES.set([])
+                                raise
+                            except Exception as err:
+                                retry_error = err
+                                if not is_context_overflow(err):
+                                    break
+
+                        if retry_error is None:
                             normalize_null_tool_call_ids(current_completion)
                             new_messages.append(current_completion)
-
-                            # Continue to process any new tool calls in the fresh completion
                             if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:
                                 logger.info(f"LLM requested {len(current_completion.tool_calls)} more tool calls after truncation")
                                 continue
-                            else:
-                                logger.info("LLM completed after truncation without requesting more tools")
-                                break
-                        except Exception as retry_error:
-                            if isinstance(retry_error, OutputContinuationExhausted):
-                                _PENDING_TOOL_MESSAGES.set([])
-                                raise
-                            logger.error(f"Error retrying LLM after truncation: {retry_error}")
-                            error_msg = f"Failed to retry after truncation: {str(retry_error)}"
-                            new_messages.append(AIMessage(content=error_msg))
+                            logger.info("LLM completed after truncation without requesting more tools")
                             break
+                        logger.error(f"Error retrying LLM after truncation: {retry_error}")
+                        error_msg = f"Failed to retry after truncation: {str(retry_error)}"
+                        new_messages.append(AIMessage(content=error_msg))
+                        break
                     else:
                         # Couldn't find tool message, add error and break
                         if is_output_limit_error:

@@ -94,6 +94,8 @@ nodes:
             "error": string | null
           }}
 
+          Treat a JSON array of test objects as a valid successful response even if it does not literally say "Extracted tests".
+
           Return ONLY the JSON object.
     model: ${DEFAULT_LLM_MODEL}
     output:
