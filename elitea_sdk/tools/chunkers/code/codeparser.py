@@ -12,6 +12,19 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
+def with_chunk_total(file_documents):
+    """Stamp every chunk of one file with how many chunks that file produced.
+
+    Counts only chunks that will reach the store: empty content is dropped on the way in,
+    so counting it would leave the file permanently short of its own total and therefore
+    never resumable. chunk_id is left exactly as it was — it is part of a row's identity.
+    """
+    total = sum(1 for document in file_documents if document.page_content)
+    for document in file_documents:
+        document.metadata["chunk_total"] = total
+    return file_documents
+
+
 def parse_code_files_for_db(
     file_content_generator: Generator[str, None, None],
     config: Optional[Dict[str, Any]] = None
@@ -60,6 +73,7 @@ def parse_code_files_for_db(
         chunk_id = 0
         if programming_language == Language.UNKNOWN:
             documents = TokenTextSplitter(encoding_name="gpt2", chunk_size=unknown_chunk_size, chunk_overlap=unknown_chunk_overlap).split_text(file_content)
+            file_documents = []
             for document in documents:
                 metadata = {
                     "filename": file_name,
@@ -74,11 +88,11 @@ def parse_code_files_for_db(
                     metadata["blob_sha"] = blob_sha
                 chunk_id += 1
                 metadata["chunk_id"] = chunk_id
-                document = Document(
+                file_documents.append(Document(
                     page_content=document,
                     metadata=metadata,
-                )
-                yield document
+                ))
+            yield from with_chunk_total(file_documents)
         else:
             try:
                 langchain_language = get_langchain_language(programming_language)
@@ -93,6 +107,7 @@ def parse_code_files_for_db(
                 treesitterNodes: list[TreesitterMethodNode] = treesitter_parser.parse(
                     file_bytes
                 )
+                file_documents = []
                 for node in treesitterNodes:
                     method_source_code = node.method_source_code
 
@@ -117,11 +132,11 @@ def parse_code_files_for_db(
                             metadata["blob_sha"] = blob_sha
                         chunk_id += 1
                         metadata["chunk_id"] = chunk_id
-                        document = Document(
+                        file_documents.append(Document(
                             page_content=splitted_document,
                             metadata=metadata,
-                        )
-                        yield document
+                        ))
+                yield from with_chunk_total(file_documents)
             except Exception as e:
                 from traceback import format_exc
                 logger.error(f"Error: {format_exc()}")

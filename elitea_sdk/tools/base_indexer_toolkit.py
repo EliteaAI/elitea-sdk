@@ -794,6 +794,9 @@ class _IndexRunState:
     adoptable_chunks: Dict[str, List[str]] = field(default_factory=dict)
     adopted_row_pks: Set[str] = field(default_factory=set)
     reused_row_pks: Set[str] = field(default_factory=set)
+    resumable_files: Dict[str, tuple] = field(default_factory=dict)
+    resumed_files: Set[str] = field(default_factory=set)
+    resumed_chunk_count: int = 0
     orphan_candidate_ids: List[str] = field(default_factory=list)
     orphan_candidate_doc_count: int = 0
     heartbeat_stop: Optional[threading.Event] = None
@@ -1207,6 +1210,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if empty_loader:
                 return self._finalize_empty_loader_run(index_name)
             #
+            result["count"] += self._index_run.resumed_chunk_count
             chunks_count = result["count"]
             failed_chunks_count = result.get("failed_count", 0)
             succeeded_chunks_count = chunks_count - failed_chunks_count
@@ -1271,6 +1275,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             )
             if staging and final_state != IndexerKeywords.INDEX_META_FAILED.value:
                 self._append_retained_orphan_warning(report)
+                self._append_resumed_run_note(report)
             message = render_report_text(report)
 
             if staging:
@@ -1459,6 +1464,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return
         run.adoptable_chunks = digests
         run.adopted_row_pks = row_pks
+        try:
+            run.resumable_files = self.vector_adapter.read_run_complete_files(
+                self, run.run_id
+            )
+        except Exception as read_failure:
+            # Costs the fetch it would have skipped; the chunks are still reusable.
+            logger.warning(
+                f"Could not index the adopted rows by file, so every file is fetched "
+                f"again: {read_failure}"
+            )
+            run.resumable_files = {}
         # A silently empty reuse map is indistinguishable from a working one: the run
         # still succeeds, just at full cost. This line is the only signal that the
         # digests were prepared at all.
@@ -1486,6 +1502,45 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run.adopted_chunk_count = 0
         run.adoptable_chunks = {}
         run.adopted_row_pks = set()
+
+    def resumable_file_identity(self, file_path: str) -> Optional[str]:
+        """The identity of a file this run already holds in full, or None."""
+        run = getattr(self, "_index_run", None)
+        if run is None:
+            return None
+        entry = run.resumable_files.get(file_path)
+        return entry[0] if entry else None
+
+    def adopt_resumed_file(self, file_path: str, index_name: str) -> None:
+        """Claim the rows of a file skipped before it was fetched, and retire the
+        generation those rows replace.
+
+        Skipping means the file reaches neither _consume_pipeline_output nor
+        _reduce_duplicates. The first would claim its rows, without which
+        _assemble_promote_sets supersedes exactly the chunks the skip relied on. The
+        second is the only place that nominates the previous generation's rows for
+        removal, without which promote publishes the old rows beside the new ones.
+        Both have to happen here instead.
+        """
+        run = self._index_run
+        entry = run.resumable_files.get(file_path)
+        if not entry:
+            return
+        run.reused_row_pks.update(entry[1])
+        run.resumed_files.add(file_path)
+        run.resumed_chunk_count += len(entry[1])
+        run.chunks_written += len(entry[1])
+        self._stage_resumed_file_removal(file_path, index_name)
+
+    def _stage_resumed_file_removal(self, file_path: str, index_name: str) -> None:
+        run = self._index_run
+        indexed_data = self._read_indexed_data_once(index_name)
+        previous = indexed_data.get(file_path)
+        if not previous or previous['metadata'].get('collection') != index_name:
+            return
+        run.staged_removal_ids.setdefault(file_path, set()).update(
+            str(removal_id) for removal_id in self.remove_ids_fn(indexed_data, file_path)
+        )
 
     def _claim_adopted_row(self, document: Document) -> Optional[str]:
         run = getattr(self, "_index_run", None)
@@ -1672,6 +1727,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _mark_batch_damaged(run: _IndexRunState, chunk_keys: List[str]):
         run.damaged_keys.update(
             chunk_key for chunk_key in set(chunk_keys) if chunk_key != IDLESS_STAGING_KEY
+        )
+
+    def _append_resumed_run_note(self, report: Dict[str, Any]):
+        """Report reuse to the user.
+
+        Adoption is invisible everywhere else: retained rows are excluded from
+        indexed_chunks while they are hidden, and a resumed run's counts are identical
+        to a clean run's. Without this line the only way to tell a resume happened is to
+        time the run.
+        """
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.reused_row_pks:
+            return
+        reused = len(run.reused_row_pks)
+        chunks = "chunk was" if reused == 1 else "chunks were"
+        report.setdefault("warnings", []).append(
+            f"Resumed the interrupted run: {reused} {chunks} reused instead of being "
+            f"embedded again."
         )
 
     def _append_retained_orphan_warning(self, report: Dict[str, Any]):
@@ -2296,7 +2369,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return
         for key in run.preskipped_keys:
             run.seen_keys.add(key)
-            self._track_document_unchanged(key)
+            if key not in run.resumed_files:
+                self._track_document_unchanged(key)
 
     def _reduce_duplicates(
             self,

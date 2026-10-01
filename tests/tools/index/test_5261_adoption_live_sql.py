@@ -408,3 +408,80 @@ class TestAdoptedRowsStayHiddenThroughout:
         hidden = adapter.get_pending_run_ids(wrapper, "docs")
         assert "new-run" in hidden
         assert "old-run" in hidden
+
+
+class TestCompleteFilesGateTheFetchSkip:
+    """Only a file whose stored rows prove completeness may be skipped before download:
+    one identity, one chunk_total, and a row count equal to that total."""
+
+    def complete(self, schema, engine, run_id="new-run"):
+        return PGVectorAdapter().read_run_complete_files(wrapper_for(schema, engine), run_id)
+
+    def seed_file(self, engine, schema, filename, chunks, total, identity="sha-a",
+                  run_id="new-run"):
+        for index in range(chunks):
+            seed_chunk(engine, schema, f"{filename}-{index}", f"body {index}", {
+                "filename": filename, "blob_sha": identity, "chunk_total": total,
+                "chunk_id": index + 1, "collection": "docs", "_elitea_run_id": run_id,
+            })
+
+    def test_a_whole_file_is_resumable(self, index_schema):
+        schema, engine = index_schema
+        self.seed_file(engine, schema, "a.py", chunks=3, total=3)
+
+        complete = self.complete(schema, engine)
+
+        assert complete["a.py"][0] == "sha-a"
+        assert len(complete["a.py"][1]) == 3
+
+    def test_a_half_flushed_file_is_not_resumable(self, index_schema):
+        """The whole reason the gate is a count. Mutation: compare only the identity."""
+        schema, engine = index_schema
+        self.seed_file(engine, schema, "a.py", chunks=2, total=5)
+
+        assert self.complete(schema, engine) == {}
+
+    def test_a_file_with_no_total_is_not_resumable(self, index_schema):
+        """Rows written before chunk_total existed can never be proven whole."""
+        schema, engine = index_schema
+        for index in range(2):
+            seed_chunk(engine, schema, f"old-{index}", f"body {index}", {
+                "filename": "a.py", "blob_sha": "sha-a", "chunk_id": index + 1,
+                "collection": "docs", "_elitea_run_id": "new-run",
+            })
+
+        assert self.complete(schema, engine) == {}
+
+    def test_a_file_with_disagreeing_identities_is_not_resumable(self, index_schema):
+        schema, engine = index_schema
+        seed_chunk(engine, schema, "a-0", "body 0", {
+            "filename": "a.py", "blob_sha": "sha-a", "chunk_total": 2, "chunk_id": 1,
+            "collection": "docs", "_elitea_run_id": "new-run"})
+        seed_chunk(engine, schema, "a-1", "body 1", {
+            "filename": "a.py", "blob_sha": "sha-b", "chunk_total": 2, "chunk_id": 2,
+            "collection": "docs", "_elitea_run_id": "new-run"})
+
+        assert self.complete(schema, engine) == {}
+
+    def test_another_runs_rows_are_not_offered(self, index_schema):
+        schema, engine = index_schema
+        self.seed_file(engine, schema, "a.py", chunks=2, total=2, run_id="other-run")
+
+        assert self.complete(schema, engine) == {}
+
+    def test_the_meta_row_is_not_offered(self, index_schema):
+        schema, engine = index_schema
+        seed_chunk(engine, schema, "meta-row", "index_meta_docs", {
+            "type": "index_meta", "filename": "x", "blob_sha": "s", "chunk_total": 1,
+            "collection": "docs", "_elitea_run_id": "new-run"})
+
+        assert self.complete(schema, engine) == {}
+
+    def test_whole_and_partial_files_are_separated(self, index_schema):
+        schema, engine = index_schema
+        self.seed_file(engine, schema, "whole.py", chunks=2, total=2)
+        self.seed_file(engine, schema, "partial.py", chunks=1, total=4, identity="sha-b")
+
+        complete = self.complete(schema, engine)
+
+        assert list(complete) == ["whole.py"]
