@@ -24,31 +24,35 @@ valid.
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
+
+from langchain_core.messages import ToolMessage
 
 logger = logging.getLogger(__name__)
 
-# Floor used when neither the model nor the conversation tells us anything
-# better. Generous on purpose: this must never engage during ordinary work, only
-# on the runaway fan-out the issue describes.
-DEFAULT_FLOOR_TOKENS = 200_000
-# A misconfigured tiny ``max_context_tokens`` must not turn the floor into a
-# shredder that empties every tool result of every turn.
+# Ceiling when the model's window is unknown. Any smaller fixed number is wrong
+# for some model: 200k drops results a 1M-window model accepts, yet still misses
+# a 128k overflow. Without a window the floor only bounds the resource cost of a
+# runaway turn; a real overflow is left to the provider's rejection, which the
+# reactive retry in ``LLMNode`` recovers from.
+UNKNOWN_WINDOW_CEILING_TOKENS = 1_000_000
+# A misconfigured tiny window must not turn the floor into a shredder that
+# empties every tool result of every turn.
 MIN_FLOOR_TOKENS = 16_000
-# Headroom over the conversation's configured ``max_context_tokens`` when that is
-# all we know about the window. Without it the floor would engage at exactly the
-# summarization trigger, and since the floor runs inside the tool loop — before
-# the next ``before_model`` — it would shrink the history back under the trigger
-# and the summarizer would never fire again. The floor must sit BENEATH Tier 2,
-# catching only what a single turn blows past, never racing it.
-FLOOR_TRIGGER_HEADROOM = 3.0
 # The most recent tool results are what the model is actually reasoning about,
 # so they are compacted last — and only when nothing older is left to free.
 KEEP_RECENT_TOOL_RESULTS = 2
 # Present in a compacted result: makes compaction idempotent and greppable.
 COMPACTED_SENTINEL = '[tool result dropped: context floor]'
-# Model client attributes that may carry a real input window.
-_WINDOW_ATTRS = ('max_input_tokens', 'context_window', 'max_context_tokens')
+# Model attributes that may carry a real input window. ``_elitea_context_window``
+# is for the platform to stamp from an admin-set model ``context_window``.
+_WINDOW_ATTRS = ('_elitea_context_window', 'max_input_tokens', 'context_window')
+# Substring fallback for proxies and SDKs that raise a generic error.
+_CONTEXT_OVERFLOW_PHRASES = (
+    'context window', 'context_window', 'token limit', 'too long',
+    'maximum context length', 'input is too long', 'exceeds the limit',
+    'contextwindowexceedederror', 'max_tokens', 'content too large',
+)
 
 
 @dataclass
@@ -94,27 +98,18 @@ def _count_tokens_fallback(messages) -> int:
     return total
 
 
-def resolve_floor_tokens(llm_client: Any = None, middleware_manager: Any = None) -> int:
+def resolve_floor_tokens(llm_client: Any = None) -> int:
     """The token ceiling the tool loop is not allowed to build past.
 
-    Prefers a real input window advertised by the model client. Failing that it
-    derives a ceiling from the conversation's ``max_context_tokens`` (read off the
-    summarization trigger) plus ``FLOOR_TRIGGER_HEADROOM`` — a size hint, never an
-    on/off gate and never the threshold itself. Otherwise the default.
+    The model's real input window minus the output it may generate, when the
+    model reports one; otherwise ``UNKNOWN_WINDOW_CEILING_TOKENS``.
     """
-    window = _first_positive_attr(llm_client, _WINDOW_ATTRS)
-    if window is not None:
-        # A window the model actually advertises IS the hard ceiling.
-        return max(MIN_FLOOR_TOKENS, int(window))
-
-    trigger = _trigger_tokens(middleware_manager)
-    if trigger is None:
-        return DEFAULT_FLOOR_TOKENS
-    # A summarization trigger is a preference, not a ceiling: leave room above it
-    # so the configured summarization stays the thing that normally reclaims
-    # context, and cap at the default so a large trigger cannot lift the floor
-    # past what any real window is likely to be.
-    return max(MIN_FLOOR_TOKENS, min(DEFAULT_FLOOR_TOKENS, int(trigger * FLOOR_TRIGGER_HEADROOM)))
+    model = getattr(llm_client, 'bound', llm_client)
+    window = _first_positive_attr(model, _WINDOW_ATTRS) or _profile_tokens(model, 'max_input_tokens')
+    if window is None:
+        return UNKNOWN_WINDOW_CEILING_TOKENS
+    reserved_output = _first_positive_attr(model, ('max_tokens',)) or 0
+    return max(MIN_FLOOR_TOKENS, window - reserved_output)
 
 
 def _first_positive_attr(obj: Any, names) -> Optional[int]:
@@ -130,19 +125,16 @@ def _first_positive_attr(obj: Any, names) -> Optional[int]:
     return None
 
 
-def _trigger_tokens(middleware_manager: Any) -> Optional[int]:
-    """``max_context_tokens`` as configured for this conversation, if any."""
-    for middleware in getattr(middleware_manager, '_middleware', None) or []:
-        trigger = getattr(middleware, 'trigger', None)
-        for entry in (trigger if isinstance(trigger, list) else [trigger]):
-            if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == 'tokens':
-                try:
-                    tokens = int(entry[1])
-                except (TypeError, ValueError):
-                    continue
-                if tokens > 0:
-                    return tokens
-    return None
+def _profile_tokens(model: Any, key: str) -> Optional[int]:
+    """``BaseChatModel.profile`` is keyed by model name, so it is empty for proxy aliases."""
+    profile = getattr(model, 'profile', None)
+    if not isinstance(profile, dict):
+        return None
+    try:
+        value = int(profile.get(key) or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def compact_tool_results(
@@ -151,6 +143,8 @@ def compact_tool_results(
     floor_tokens: int,
     start: int = 0,
     keep_recent: int = KEEP_RECENT_TOOL_RESULTS,
+    counter: Optional[Callable[[List[Any]], int]] = None,
+    require_fit: bool = True,
 ) -> Compaction:
     """Free tool-result content, oldest first, until ``messages`` fits the floor.
 
@@ -161,18 +155,37 @@ def compact_tool_results(
             so prior turns and restored HITL history stay byte-identical.
         keep_recent: how many of the newest tool results to leave alone unless
             freeing everything older still is not enough.
+        counter: token counter for a message list; the summarization trigger's
+            own counter when one is active, so the two never disagree.
+        require_fit: skip compaction when even compacting every result of this
+            turn cannot get under ``floor_tokens``.
 
     Returns:
         A ``Compaction`` describing the pass (``applied`` False when the list
         already fitted, which is the common case).
     """
-    total = count_context_tokens(messages)
+    counter = counter or count_context_tokens
+    total = counter(messages)
     result = Compaction(tokens_before=total, tokens_after=total)
     if total <= floor_tokens:
         return result
 
-    candidates = _compactable_indexes(messages, start)
+    # A note costs ~85 tokens, so compacting a small result grows the request.
+    savings = {
+        index: _compaction_saving(messages[index], counter)
+        for index in compactable_indexes(messages, start)
+    }
+    candidates = [index for index, saving in savings.items() if saving > 0]
     if not candidates:
+        return result
+    if require_fit and total - sum(savings[index] for index in candidates) > floor_tokens:
+        # History this pass may not touch is over the floor on its own. Dropping
+        # this turn's results cannot make the request fit; it only loses them
+        # and sends the model back to re-call the same tools every step.
+        logger.warning(
+            "[CONTEXT FLOOR] %d tokens cannot fit %d by compacting this turn's "
+            "tool results; sending unchanged", total, floor_tokens,
+        )
         return result
 
     # Oldest first, and only reach into the recent tail once everything older is
@@ -183,10 +196,8 @@ def compact_tool_results(
     for index in ordered:
         if total <= floor_tokens:
             break
-        message = messages[index]
-        before = count_context_tokens([message])
-        _compact_in_place(message)
-        total -= max(0, before - count_context_tokens([message]))
+        _compact_in_place(messages[index], counter)
+        total -= savings[index]
         result.compacted += 1
 
     result.tokens_after = total
@@ -199,7 +210,13 @@ def compact_tool_results(
     return result
 
 
-def _compactable_indexes(messages: List[Any], start: int) -> List[int]:
+def _compaction_saving(message: Any, counter: Callable[[List[Any]], int]) -> int:
+    original = counter([message])
+    note = ToolMessage(content=_compaction_note(message, original), tool_call_id='saving')
+    return original - counter([note])
+
+
+def compactable_indexes(messages: List[Any], start: int) -> List[int]:
     """Indexes of this turn's tool results that still hold compactable content."""
     indexes = []
     for index in range(max(0, start), len(messages)):
@@ -220,44 +237,51 @@ def _is_tool_message(message: Any) -> bool:
     )
 
 
-def _compact_in_place(message: Any) -> None:
+def _compaction_note(message: Any, original_tokens: int) -> str:
+    tool_name = getattr(message, 'name', None) or 'unknown'
+    return (
+        f"⚠️ {COMPACTED_SENTINEL}\n\n"
+        f"The result of '{tool_name}' (~{original_tokens} tokens) was dropped to keep this "
+        f"turn inside the model's context window. It is GONE, not summarized — do not "
+        f"answer as if you had read it.\n\n"
+        f"If you still need this data, call the tool again with narrower parameters "
+        f"(a smaller range, a filter, fewer items) so the result fits."
+    )
+
+
+def _compact_in_place(message: Any, counter: Callable[[List[Any]], int] = None) -> None:
     """Replace a tool result with a note the model can act on.
 
     Edited in place: the object stays the one the tool loop and the pending-HITL
     contextvar already hold, and ``tool_call_id``/``status``/``artifact`` keep
     answering the tool call that produced it.
     """
-    tool_name = getattr(message, 'name', None) or 'unknown'
-    original = count_context_tokens([message])
-    note = (
-        f"⚠️ {COMPACTED_SENTINEL}\n\n"
-        f"The result of '{tool_name}' (~{original} tokens) was dropped to keep this "
-        f"turn inside the model's context window. It is GONE, not summarized — do not "
-        f"answer as if you had read it.\n\n"
-        f"If you still need this data, call the tool again with narrower parameters "
-        f"(a smaller range, a filter, fewer items) so the result fits."
-    )
+    note = _compaction_note(message, (counter or count_context_tokens)([message]))
     try:
         message.content = note
     except Exception as exc:  # noqa: BLE001 - never break a turn over a note
-        logger.debug("Could not compact tool result for '%s': %s", tool_name, exc)
+        logger.debug("Could not compact tool result for '%s': %s", getattr(message, 'name', None), exc)
 
 
-def shrink_after_overflow(messages: List[Any], *, start: int = 0, ratio: float = 0.5) -> Compaction:
-    """Free tool-result content after the provider already rejected the request.
+def shrink_after_overflow(
+    messages: List[Any],
+    *,
+    start: int = 0,
+    ratio: float = 0.5,
+    counter: Optional[Callable[[List[Any]], int]] = None,
+) -> Compaction:
+    """Free tool-result content after the provider rejected the request again.
 
-    The floor works off an estimate, so a provider can still say no — the model's
-    real window may be smaller than we assumed, or its tokenizer denser than our
-    heuristic. At that point the estimate has been proven wrong, and the only
-    useful move is to make the request decisively smaller rather than shave the
-    single newest result and retry into the same wall.
-
-    Every tool result of the current turn is fair game here (``keep_recent=0``):
-    the retry is worth more than any one of them, and each compacted result still
-    tells the model what it lost and how to fetch it again.
+    The provider has proven the request too big, so every tool result of the
+    current turn is fair game (``keep_recent=0``) and the pass frees what it can
+    even when ``ratio`` is out of reach (``require_fit=False``).
     """
-    target = int(count_context_tokens(messages) * max(0.1, min(ratio, 0.9)))
-    return compact_tool_results(messages, floor_tokens=target, start=start, keep_recent=0)
+    counter = counter or count_context_tokens
+    target = int(counter(messages) * max(0.1, min(ratio, 0.9)))
+    return compact_tool_results(
+        messages, floor_tokens=target, start=start, keep_recent=0,
+        counter=counter, require_fit=False,
+    )
 
 
 def is_context_overflow(error: BaseException) -> bool:
@@ -275,4 +299,5 @@ def is_context_overflow(error: BaseException) -> bool:
                 continue
             if isinstance(exc_type, type) and isinstance(error, exc_type):
                 return True
-    return False
+    message = str(error).lower()
+    return any(phrase in message for phrase in _CONTEXT_OVERFLOW_PHRASES)
