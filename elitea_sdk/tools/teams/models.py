@@ -19,7 +19,13 @@ _TEXT_CONTAINS = "Only messages whose text contains this substring (case-insensi
 _INCLUDE_OWN = "Include messages sent by the signed-in user"
 _LOOKBACK = "When neither since nor after_message_id is given, how many hours back to look"
 _HTML = "If True, message is HTML (<b>, <i>, <a>, <br>, ...); otherwise plain text"
-_MENTIONS = "People to @mention (emails or user IDs); mentions are prepended to the message"
+_MENTIONS = (
+    "People to @mention, as emails/UPNs or Azure AD user IDs (display names are not accepted). "
+    "Each becomes a real @mention that notifies the person. To place a mention inside the text, write "
+    "@[email] where it should appear, e.g. message='Thanks @[anna@contoso.com], please review by 3pm' "
+    "posts 'Thanks @Anna Kowalski, please review by 3pm'. People in mentions that are not placed inline "
+    "are tagged at the start of the message. Do not type a plain '@name': it is just text and notifies no one"
+)
 _IMPORTANCE = "Message importance"
 _TEAM = "Team ID or exact team display name (see list_teams)"
 _CHANNEL = "Channel ID (19:...@thread.tacv2) or exact channel display name (see list_channels)"

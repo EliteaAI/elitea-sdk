@@ -446,6 +446,27 @@ class TestSendChatMessage:
         assert body["body"] == {"contentType": "html", "content": '<at id="0">Alice</at> Please check &lt;this&gt;'}
         assert body["mentions"][0]["mentioned"]["user"]["id"] == ALICE
 
+    def test_inline_mention_is_placed_in_the_text(self, graph, wrapper):
+        graph.on("POST", f"{G}/chats/{CHAT}/messages", _resp(201, {"id": "m1"}))
+        wrapper.send_chat_message("Thanks @[alice@example.com], see <below>\nbye", chat=CHAT)
+        body = graph.find("POST", f"{G}/chats/{CHAT}/messages")[0]["json"]
+        assert body["body"] == {"contentType": "html",
+                                "content": 'Thanks <at id="0">Alice</at>, see &lt;below&gt;<br>bye'}
+        assert len(body["mentions"]) == 1 and body["mentions"][0]["mentioned"]["user"]["id"] == ALICE
+
+    def test_inline_and_listed_mentions_do_not_duplicate(self, graph, wrapper):
+        graph.on("POST", f"{G}/chats/{CHAT}/messages", _resp(201, {"id": "m1"}))
+        wrapper.send_chat_message("Hi @[alice@example.com]", chat=CHAT, mentions=["alice@example.com"])
+        body = graph.find("POST", f"{G}/chats/{CHAT}/messages")[0]["json"]
+        assert body["body"]["content"] == 'Hi <at id="0">Alice</at>'
+        assert len(body["mentions"]) == 1
+
+    def test_inline_mention_in_html_message(self, graph, wrapper):
+        graph.on("POST", f"{G}/chats/{CHAT}/messages", _resp(201, {"id": "m1"}))
+        wrapper.send_chat_message("<b>Hi</b> @[alice@example.com]!", chat=CHAT, html=True)
+        body = graph.find("POST", f"{G}/chats/{CHAT}/messages")[0]["json"]
+        assert body["body"]["content"] == '<b>Hi</b> <at id="0">Alice</at>!'
+
     def test_requires_chat_or_recipients(self, graph, wrapper):
         with pytest.raises(ToolException, match="chat .* or recipients"):
             wrapper.send_chat_message("Hi")

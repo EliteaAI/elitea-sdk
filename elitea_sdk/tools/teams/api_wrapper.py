@@ -302,7 +302,14 @@ class TeamsApiWrapper(BaseModel):
                 "description": (
                     "Send a Teams chat message to an existing chat, or to people by email: one person uses the "
                     "1:1 chat, several people use the group chat with exactly those members (created if needed). "
-                    "Returns message_id and chat_id; store them to read replies later with find_chat_messages"
+                    "Returns message_id and chat_id; store them to read replies later with find_chat_messages. "
+                    "To @mention people (notifying them) write @[email] in the message where the mention should "
+                    "appear; a plain '@name' notifies no one. People listed in mentions but not placed in the text "
+                    "are tagged at the start. recipients only chooses who the chat goes to and does not notify "
+                    "anyone individually. "
+                    "Example: send_chat_message(chat='19:abc...@thread.v2', message='Thanks @[anna@contoso.com], "
+                    "can you review the release notes by 3pm?') posts 'Thanks @Anna Kowalski, can you review the "
+                    "release notes by 3pm?'"
                 ),
                 "args_schema": SendChatMessage,
                 "ref": self.send_chat_message,
@@ -311,7 +318,12 @@ class TeamsApiWrapper(BaseModel):
                 "name": "send_channel_message",
                 "description": (
                     "Post a message to a Teams channel, or reply to a post with reply_to_message_id. "
-                    "Returns message_id and thread_id; replies can be found later with search_teams_messages"
+                    "Returns message_id and thread_id; replies can be found later with search_teams_messages. "
+                    "To @mention people write @[email] in the message where the mention should appear; a plain "
+                    "'@name' notifies no one. People listed in mentions but not placed in the text are tagged at "
+                    "the start. "
+                    "Example: send_channel_message(team='Engineering', channel='General', message='Release is out, "
+                    "@[anna@contoso.com] please verify') posts 'Release is out, @Anna Kowalski please verify'"
                 ),
                 "args_schema": SendChannelMessage,
                 "ref": self.send_channel_message,
