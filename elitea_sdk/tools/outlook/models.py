@@ -4,18 +4,44 @@ from typing import List, Literal, Optional
 from pydantic import Field, create_model
 
 
+_MAX_RECIPIENTS = (
+    "Maximum To and Cc recipients listed per message (default 5); to_more / cc_more give the number left out"
+)
+_PREVIEW_CHARS = "Maximum characters of each body preview (default 200, Graph provides at most 255)"
+_INCLUDE_IDS = "Include conversationId of each message"
+
+
+def _max_recipients():
+    return (int, Field(default=5, ge=0, le=100, description=_MAX_RECIPIENTS))
+
+
+def _preview_chars():
+    return (int, Field(default=200, ge=1, le=255, description=_PREVIEW_CHARS))
+
+
 ListMessages = create_model(
     "ListMessages",
     folder=(str, Field(default="inbox", description="Well-known name (inbox, sentitems, drafts, etc.), folder path such as 'Inbox/Projects', folder ID from list_folders, or 'all' for the whole mailbox")),
     limit=(int, Field(default=50, ge=1, le=1000, description="Maximum number of messages to return")),
     unread_only=(bool, Field(default=False, description="Only return unread messages")),
     search=(Optional[str], Field(default=None, description="KQL search query to filter messages")),
+    include_preview=(bool, Field(default=True, description="Include a short body preview of each message")),
+    preview_chars=_preview_chars(),
+    max_recipients=_max_recipients(),
+    include_ids=(bool, Field(default=False, description=_INCLUDE_IDS)),
 )
 
 GetMessage = create_model(
     "GetMessage",
     message_id=(str, Field(description="The unique identifier of the message")),
     include_body=(bool, Field(default=True, description="Include message body in response")),
+    body_format=(Literal["text", "html"], Field(default="text", description=(
+        "'text' (default) returns a plain-text body, much smaller than 'html'; use 'html' only when markup matters"
+    ))),
+    max_body_chars=(int, Field(default=8000, ge=0, le=500000, description=(
+        "Maximum characters of the body (default 8000, 0 = no limit). A cut body sets body_truncated and body_total_chars"
+    ))),
+    max_recipients=_max_recipients(),
 )
 
 SendMail = create_model(
@@ -93,6 +119,7 @@ CheckNewMessages = create_model(
     after_message_id=(Optional[str], Field(default=None, description=_AFTER_MESSAGE_ID_DESCRIPTION)),
     senders=(Optional[List[str]], Field(default=None, description=_SENDERS_DESCRIPTION)),
     recipients=(Optional[List[str]], Field(default=None, description=_RECIPIENTS_DESCRIPTION)),
+    latest_limit=(int, Field(default=5, ge=0, le=50, description="How many of the latest messages (id, from, subject, time) to list")),
 )
 
 FindNewMessages = create_model(
@@ -108,6 +135,9 @@ FindNewMessages = create_model(
     ))),
     include_preview=(bool, Field(default=True, description="Include a short body preview of each message")),
     limit=(int, Field(default=25, ge=1, le=1000, description="Maximum messages to return")),
+    preview_chars=_preview_chars(),
+    max_recipients=_max_recipients(),
+    include_ids=(bool, Field(default=False, description=_INCLUDE_IDS)),
 )
 
 GetThreadMessages = create_model(
@@ -121,4 +151,10 @@ GetThreadMessages = create_model(
     only_new=(bool, Field(default=False, description="Return only new messages of the thread")),
     include_body=(bool, Field(default=False, description="Include the new (non-quoted) part of each message body")),
     limit=(int, Field(default=50, ge=1, le=1000, description="Maximum messages to return (newest are kept)")),
+    max_body_chars=(int, Field(default=2000, ge=0, le=500000, description=(
+        "With include_body, maximum characters of each message body (default 2000, 0 = no limit); "
+        "cut bodies are flagged with body_truncated"
+    ))),
+    max_recipients=_max_recipients(),
+    preview_chars=_preview_chars(),
 )

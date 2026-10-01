@@ -43,7 +43,12 @@ _WELL_KNOWN_FOLDERS = {
 _FOLDER_NOT_FOUND_CODES = {"ErrorInvalidIdMalformed", "ErrorItemNotFound", "ErrorFolderNotFound"}
 
 _LIST_FIELDS = ("id,conversationId,subject,from,toRecipients,ccRecipients,"
-                "receivedDateTime,isRead,bodyPreview,hasAttachments")
+                "receivedDateTime,isRead,hasAttachments")
+_DEFAULT_MAX_RECIPIENTS = 5
+_DEFAULT_PREVIEW_CHARS = 200
+_DEFAULT_MAX_BODY_CHARS = 8000
+_DEFAULT_THREAD_BODY_CHARS = 2000
+_DEFAULT_LATEST_LIMIT = 5
 _SUMMARY_FIELDS = ("id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,"
                    "receivedDateTime,isRead,isDraft,hasAttachments")
 _CHECK_FIELDS = "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead"
@@ -156,22 +161,59 @@ def _watermark(bound: _Bound, newest: Optional[dict]) -> Optional[str]:
     return _fmt_dt(max(candidates)) if candidates else None
 
 
-def _format_message(msg: dict) -> Dict[str, Any]:
-    item = {
-        "id": msg.get("id"),
-        "conversationId": msg.get("conversationId"),
-        "subject": msg.get("subject"),
-        "from": (msg.get("from") or {}).get("emailAddress", {}),
-        "to": _email_addresses(msg.get("toRecipients")),
-        "cc": _email_addresses(msg.get("ccRecipients")),
-        "receivedDateTime": msg.get("receivedDateTime"),
-        "isRead": msg.get("isRead"),
-    }
+def _cap_recipients(recipients: Optional[List[dict]], max_recipients: int) -> Tuple[List[dict], int]:
+    """Return (first max_recipients addresses, how many more were cut)."""
+    addresses = _email_addresses(recipients)
+    if len(addresses) <= max_recipients:
+        return addresses, 0
+    return addresses[:max_recipients], len(addresses) - max_recipients
+
+
+def _cap_text(text: Optional[str], max_chars: int) -> Tuple[str, bool]:
+    """Cut text to max_chars (0 = no limit); returns (text, was_cut)."""
+    text = text or ""
+    if not max_chars or len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _format_recipients(item: Dict[str, Any], msg: dict, max_recipients: int) -> None:
+    for key, field in (("to", "toRecipients"), ("cc", "ccRecipients")):
+        shown, more = _cap_recipients(msg.get(field), max_recipients)
+        item[key] = shown
+        if more:
+            item[f"{key}_more"] = more
+
+
+def _format_message(
+    msg: dict,
+    max_recipients: int = _DEFAULT_MAX_RECIPIENTS,
+    preview_chars: int = _DEFAULT_PREVIEW_CHARS,
+    include_ids: bool = False,
+) -> Dict[str, Any]:
+    item: Dict[str, Any] = {"id": msg.get("id")}
+    if include_ids:
+        item["conversationId"] = msg.get("conversationId")
+    item["subject"] = msg.get("subject")
+    item["from"] = (msg.get("from") or {}).get("emailAddress", {})
+    _format_recipients(item, msg, max_recipients)
+    item["receivedDateTime"] = msg.get("receivedDateTime")
+    item["isRead"] = msg.get("isRead")
     if "hasAttachments" in msg:
         item["hasAttachments"] = msg.get("hasAttachments")
     if "bodyPreview" in msg:
-        item["bodyPreview"] = msg.get("bodyPreview")
+        item["bodyPreview"] = (msg.get("bodyPreview") or "")[:preview_chars]
     return item
+
+
+def _brief_message(msg: dict) -> Dict[str, Any]:
+    return {
+        "id": msg.get("id"),
+        "subject": msg.get("subject"),
+        "from": (msg.get("from") or {}).get("emailAddress", {}),
+        "receivedDateTime": msg.get("receivedDateTime"),
+        "isRead": msg.get("isRead"),
+    }
 
 
 class OutlookGraphWrapper:
@@ -520,6 +562,10 @@ class OutlookGraphWrapper:
         limit: int = 50,
         unread_only: bool = False,
         search: Optional[str] = None,
+        include_preview: bool = True,
+        preview_chars: int = _DEFAULT_PREVIEW_CHARS,
+        max_recipients: int = _DEFAULT_MAX_RECIPIENTS,
+        include_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """List messages from a mail folder.
 
@@ -528,27 +574,33 @@ class OutlookGraphWrapper:
             limit: Maximum number of messages to return
             unread_only: Only return unread messages
             search: Optional search query (KQL)
+            include_preview: Include a short body preview of each message
+            preview_chars: Maximum characters of the preview
+            max_recipients: Maximum To and Cc recipients listed per message (to_more / cc_more count the rest)
+            include_ids: Include conversationId of each message
 
         Returns:
-            List of message objects with id, conversationId, subject, from, receivedDateTime, isRead, bodyPreview
+            List of message objects with id, subject, from, to, cc, receivedDateTime, isRead,
+            hasAttachments and (optionally) bodyPreview
         """
         try:
+            select = _LIST_FIELDS + (",bodyPreview" if include_preview else "")
             if search:
                 # Graph does not support $orderby or $filter together with $search on messages;
                 # search results come back ordered by date, unread filtering is applied client-side.
                 escaped = search.replace("\\", "\\\\").replace('"', '\\"')
                 params = {
                     "$top": min(limit, _PAGE_SIZE),
-                    "$select": _LIST_FIELDS,
+                    "$select": select,
                     "$search": f'"{escaped}"',
                 }
                 predicate = (lambda m: m.get("isRead") is False) if unread_only else None
                 messages, _ = self._collect(self._messages_url(folder), params, limit, predicate)
             else:
                 filters = ["isRead eq false"] if unread_only else []
-                messages, _ = self._query_messages(folder, filters, _LIST_FIELDS, limit)
+                messages, _ = self._query_messages(folder, filters, select, limit)
 
-            return [_format_message(msg) for msg in messages]
+            return [_format_message(msg, max_recipients, preview_chars, include_ids) for msg in messages]
         except ToolException:
             raise
         except Exception as e:
@@ -562,6 +614,7 @@ class OutlookGraphWrapper:
         after_message_id: Optional[str] = None,
         senders: Optional[List[str]] = None,
         recipients: Optional[List[str]] = None,
+        latest_limit: int = _DEFAULT_LATEST_LIMIT,
     ) -> Dict[str, Any]:
         """Cheap "is there anything new?" check.
 
@@ -586,7 +639,7 @@ class OutlookGraphWrapper:
             messages, truncated = self._find(
                 folder, bound, senders_set, recipients_set,
                 unread_only=unread_mode, only_new=True, select=_CHECK_FIELDS,
-                limit=5 if counts_from_folder else _MAX_SCAN,
+                limit=max(latest_limit, 1) if counts_from_folder else _MAX_SCAN,
             )
 
             if counts_from_folder:
@@ -598,7 +651,7 @@ class OutlookGraphWrapper:
                 unread_count = sum(1 for m in messages if m.get("isRead") is False)
 
             newest = _newest(messages)
-            latest = sorted(messages, key=_received_key, reverse=True)[:5]
+            latest = sorted(messages, key=_received_key, reverse=True)[:latest_limit]
             latest_id = newest.get("id") if newest else (bound.anchor or {}).get("id")
             return {
                 "has_new": new_count > 0,
@@ -607,7 +660,7 @@ class OutlookGraphWrapper:
                 "folder": folder_info.get("displayName") if folder_info else "all",
                 "folder_unread_count": folder_info.get("unreadItemCount") if folder_info else None,
                 "new_since": _fmt_dt(bound.dt) if bound.dt else None,
-                "latest": [_format_message(m) for m in latest],
+                "latest": [_brief_message(m) for m in latest],
                 "latest_message_id": latest_id,
                 "latest_received_at": newest.get("receivedDateTime") if newest else None,
                 "watermark": _watermark(bound, newest),
@@ -630,6 +683,9 @@ class OutlookGraphWrapper:
         only_new: bool = True,
         include_preview: bool = True,
         limit: int = 25,
+        preview_chars: int = _DEFAULT_PREVIEW_CHARS,
+        max_recipients: int = _DEFAULT_MAX_RECIPIENTS,
+        include_ids: bool = False,
     ) -> Dict[str, Any]:
         """Find messages from people / sent to DLs and flag which of them are new.
 
@@ -643,6 +699,9 @@ class OutlookGraphWrapper:
             only_new: Return only new messages; False returns all matches with an is_new flag
             include_preview: Include bodyPreview (requires Mail.Read)
             limit: Maximum messages to return
+            preview_chars: Maximum characters of each preview
+            max_recipients: Maximum To and Cc recipients listed per message (to_more / cc_more count the rest)
+            include_ids: Include conversationId of each message
         """
         try:
             bound = self._resolve_bound(since, after_message_id)
@@ -657,7 +716,7 @@ class OutlookGraphWrapper:
 
             items = []
             for msg in messages:
-                item = _format_message(msg)
+                item = _format_message(msg, max_recipients, preview_chars, include_ids)
                 # Without a time bound, "new" means unread
                 item["is_new"] = _is_new(bound, msg) if bound.dt else msg.get("isRead") is False
                 if senders_set or recipients_set:
@@ -691,6 +750,9 @@ class OutlookGraphWrapper:
         only_new: bool = False,
         include_body: bool = False,
         limit: int = 50,
+        max_body_chars: int = _DEFAULT_THREAD_BODY_CHARS,
+        max_recipients: int = _DEFAULT_MAX_RECIPIENTS,
+        preview_chars: int = _DEFAULT_PREVIEW_CHARS,
     ) -> Dict[str, Any]:
         """Get all messages of a conversation (all folders), oldest first, flagging new ones.
 
@@ -703,6 +765,10 @@ class OutlookGraphWrapper:
             only_new: Return only new messages
             include_body: Include the unique (non-quoted) part of each message body
             limit: Maximum messages to return (newest are kept)
+            max_body_chars: With include_body, maximum characters of each body (0 = no limit);
+                cut bodies are flagged with body_truncated
+            max_recipients: Maximum To and Cc recipients listed per message (to_more / cc_more count the rest)
+            preview_chars: Maximum characters of each preview (without include_body)
         """
         try:
             if not (message_id or conversation_id or after_message_id):
@@ -736,14 +802,16 @@ class OutlookGraphWrapper:
             mailbox = (self._mailbox or "").lower()
             items = []
             for msg in messages:
-                item = _format_message(msg)
+                item = _format_message(msg, max_recipients, preview_chars)
                 item["isDraft"] = msg.get("isDraft")
                 item["from_me"] = bool(sent_items_id and msg.get("parentFolderId") == sent_items_id) or bool(
                     mailbox and _address(msg.get("from")).lower() == mailbox
                 )
                 item["is_new"] = _is_new(bound, msg) if bound.dt else msg.get("isRead") is False
                 if include_body:
-                    item["body"] = (msg.get("uniqueBody") or {}).get("content", "")
+                    item["body"], cut = _cap_text((msg.get("uniqueBody") or {}).get("content", ""), max_body_chars)
+                    if cut:
+                        item["body_truncated"] = True
                 items.append(item)
 
             new_items = [i for i in items if i["is_new"]]
@@ -775,43 +843,61 @@ class OutlookGraphWrapper:
             log.error("get_thread_messages failed: %s", e)
             raise ToolException(f"Failed to get thread messages: {e}")
 
-    def get_message(self, message_id: str, include_body: bool = True) -> Dict[str, Any]:
+    def get_message(
+        self,
+        message_id: str,
+        include_body: bool = True,
+        body_format: str = "text",
+        max_body_chars: int = _DEFAULT_MAX_BODY_CHARS,
+        max_recipients: int = _DEFAULT_MAX_RECIPIENTS,
+    ) -> Dict[str, Any]:
         """Get a specific message by ID.
 
         Args:
             message_id: The unique message identifier
-            include_body: Whether to include the full message body
+            include_body: Whether to include the message body
+            body_format: "text" (default, far smaller than HTML) or "html"
+            max_body_chars: Maximum characters of the body (0 = no limit); a cut body sets
+                body_truncated and body_total_chars
+            max_recipients: Maximum To and Cc recipients listed (to_more / cc_more count the rest)
 
         Returns:
             Message object with full details
         """
         try:
+            if body_format not in ("text", "html"):
+                raise ToolException(f"Invalid body_format '{body_format}'. Use 'text' or 'html'.")
+
             url = f"{_GRAPH_BASE}{self._user_path}/messages/{message_id}"
             select_fields = ("id,conversationId,subject,from,toRecipients,ccRecipients,"
                              "receivedDateTime,sentDateTime,isRead,importance,hasAttachments")
             if include_body:
                 select_fields += ",body"
             params = {"$select": select_fields}
+            prefer = 'outlook.body-content-type="text"' if include_body and body_format == "text" else None
 
-            data = self._get(url, params=params)
+            data = self._get(url, params=params, prefer=prefer)
 
             result = {
                 "id": data.get("id"),
                 "conversationId": data.get("conversationId"),
                 "subject": data.get("subject"),
                 "from": data.get("from", {}).get("emailAddress", {}),
-                "to": [r.get("emailAddress", {}) for r in data.get("toRecipients", [])],
-                "cc": [r.get("emailAddress", {}) for r in data.get("ccRecipients", [])],
                 "receivedDateTime": data.get("receivedDateTime"),
                 "sentDateTime": data.get("sentDateTime"),
                 "isRead": data.get("isRead"),
                 "importance": data.get("importance"),
                 "hasAttachments": data.get("hasAttachments"),
             }
+            _format_recipients(result, data, max_recipients)
             if include_body:
                 body = data.get("body", {})
-                result["body"] = body.get("content", "")
+                content = body.get("content", "")
+                result["body"], cut = _cap_text(content, max_body_chars)
                 result["bodyContentType"] = body.get("contentType", "text")
+                if cut:
+                    result["body_truncated"] = True
+                    result["body_total_chars"] = len(content)
 
             return result
         except ToolException:
@@ -1043,7 +1129,6 @@ class OutlookGraphWrapper:
                     "id": f.get("id"),
                     "displayName": f.get("displayName"),
                     "path": path,
-                    "parentFolderId": f.get("parentFolderId"),
                     "childFolderCount": f.get("childFolderCount"),
                     "totalItemCount": f.get("totalItemCount"),
                     "unreadItemCount": f.get("unreadItemCount"),
@@ -1141,7 +1226,7 @@ class OutlookGraphWrapper:
 
         Returns:
             {"folders": [...], "total": matching folders found, "truncated": bool, "hint": only when truncated}.
-            Each folder has id, displayName, path, parentFolderId, childFolderCount,
+            Each folder has id, displayName, path, childFolderCount,
             totalItemCount, unreadItemCount.
         """
         try:

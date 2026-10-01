@@ -23,6 +23,11 @@ _MENTIONS = "People to @mention (emails or user IDs); mentions are prepended to 
 _IMPORTANCE = "Message importance"
 _TEAM = "Team ID or exact team display name (see list_teams)"
 _CHANNEL = "Channel ID (19:...@thread.tacv2) or exact channel display name (see list_channels)"
+_INCLUDE_LINKS = "Include web links (webUrl / webLink / attachment contentUrl); omitted by default to save space"
+_TEXT_MAX_CHARS = (
+    "Maximum characters of each message text (default 1000, 0 = up to 4000). "
+    "Cut messages are flagged with text_truncated"
+)
 
 
 ListTeams = create_model(
@@ -33,6 +38,9 @@ ListTeams = create_model(
 ListChannels = create_model(
     "ListChannels",
     team=(str, Field(description=_TEAM)),
+    name_contains=(Optional[str], Field(default=None, description="Only channels whose name contains this text")),
+    limit=(int, Field(default=50, ge=1, le=500, description="Maximum number of channels to return; the response says when results were truncated")),
+    include_links=(bool, Field(default=False, description=_INCLUDE_LINKS)),
 )
 
 ListChats = create_model(
@@ -43,6 +51,16 @@ ListChats = create_model(
     member=(Optional[str], Field(default=None, description="Only chats with this member (email or display name)")),
     unread_only=(bool, Field(default=False, description="Only chats with unread messages")),
     limit=(int, Field(default=50, ge=1, le=500, description="Maximum number of chats to return")),
+    members=(Literal["none", "summary", "all"], Field(default="summary", description=(
+        "How many chat members to list: 'summary' (default) = the first max_members people other than you, "
+        "'all' = every member (can be very large for group/meeting chats), 'none' = only member_count"
+    ))),
+    max_members=(int, Field(default=5, ge=0, le=100, description=(
+        "With members='summary', how many members to list per chat; members_truncated is set when more exist"
+    ))),
+    include_ids=(bool, Field(default=False, description="Include member user IDs and the last message ID")),
+    include_links=(bool, Field(default=False, description=_INCLUDE_LINKS)),
+    last_message_chars=(int, Field(default=300, ge=0, le=4000, description="Maximum characters of each chat's last message preview")),
 )
 
 FindChatMessages = create_model(
@@ -60,6 +78,8 @@ FindChatMessages = create_model(
     include_own=(bool, Field(default=False, description=_INCLUDE_OWN)),
     lookback_hours=(int, Field(default=24, ge=1, le=24 * 90, description=_LOOKBACK)),
     limit=(int, Field(default=50, ge=1, le=500, description="Maximum number of messages to return")),
+    text_max_chars=(int, Field(default=1000, ge=0, le=4000, description=_TEXT_MAX_CHARS)),
+    include_links=(bool, Field(default=False, description=_INCLUDE_LINKS)),
 )
 
 SearchTeamsMessages = create_model(
@@ -71,6 +91,7 @@ SearchTeamsMessages = create_model(
     senders=(Optional[List[str]], Field(default=None, description="Only messages from these people (emails or names)")),
     since=(Optional[str], Field(default=None, description="Only messages created after this ISO 8601 date/time")),
     limit=(int, Field(default=25, ge=1, le=200, description="Maximum number of messages to return")),
+    include_links=(bool, Field(default=False, description=_INCLUDE_LINKS)),
 )
 
 SendChatMessage = create_model(

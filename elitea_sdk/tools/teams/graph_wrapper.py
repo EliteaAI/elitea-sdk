@@ -38,6 +38,9 @@ _MAX_SCAN = 1000
 _MAX_CHAT_SCAN = 500
 _SEARCH_PAGE_SIZE = 25
 _MAX_TEXT = 4000
+_DEFAULT_TEXT_CHARS = 1000
+_DEFAULT_MAX_MEMBERS = 5
+_DEFAULT_LAST_MESSAGE_CHARS = 300
 
 # Throttling (429 / 503) retries, honouring Retry-After up to _MAX_RETRY_AFTER seconds.
 _MAX_RETRIES = 3
@@ -542,28 +545,36 @@ class TeamsGraphWrapper:
     #  Formatting / matching                                               #
     # ------------------------------------------------------------------ #
 
-    def _format_message(self, msg: dict) -> Dict[str, Any]:
+    def _format_message(self, msg: dict, text_max_chars: int = _DEFAULT_TEXT_CHARS,
+                        include_links: bool = False) -> Dict[str, Any]:
         uid = _sender_id(msg)
+        text = _message_text(msg)
+        cap = text_max_chars if text_max_chars > 0 else _MAX_TEXT
+        created = msg.get("createdDateTime")
+        modified = msg.get("lastModifiedDateTime")
+        attachments = []
+        for a in msg.get("attachments") or []:
+            entry = {"name": a.get("name"), "contentType": a.get("contentType")}
+            if include_links:
+                entry["contentUrl"] = a.get("contentUrl")
+            attachments.append({k: v for k, v in entry.items() if v})
         item = {
             "id": msg.get("id"),
             "replyToId": msg.get("replyToId"),
-            "createdDateTime": msg.get("createdDateTime"),
-            "lastModifiedDateTime": msg.get("lastModifiedDateTime"),
+            "createdDateTime": created,
+            "lastModifiedDateTime": modified if modified != created else None,
             "from": {
                 "id": ((msg.get("from") or {}).get("user") or {}).get("id"),
                 "displayName": _sender_name(msg),
                 "email": self._emails_by_id.get(uid),
             },
             "subject": msg.get("subject"),
-            "text": _message_text(msg),
-            "importance": msg.get("importance"),
-            "webUrl": msg.get("webUrl"),
-            "chatId": msg.get("chatId"),
+            "text": text[:cap],
+            "text_truncated": True if len(text) > cap else None,
+            "importance": msg.get("importance") if msg.get("importance") != "normal" else None,
+            "webUrl": msg.get("webUrl") if include_links else None,
             "mentions": [m.get("mentionText") for m in msg.get("mentions") or [] if m.get("mentionText")],
-            "attachments": [
-                {"name": a.get("name"), "contentType": a.get("contentType"), "contentUrl": a.get("contentUrl")}
-                for a in msg.get("attachments") or []
-            ],
+            "attachments": attachments,
         }
         channel = msg.get("channelIdentity") or {}
         if channel.get("channelId"):
@@ -618,6 +629,8 @@ class TeamsGraphWrapper:
         text_contains: Optional[str],
         only_new: bool,
         include_own: bool,
+        text_max_chars: int = _DEFAULT_TEXT_CHARS,
+        include_links: bool = False,
     ) -> Tuple[List[Dict[str, Any]], Optional[dict]]:
         """Filter raw messages; returns (formatted items oldest first, newest scanned message)."""
         me = self._my_id()
@@ -646,7 +659,7 @@ class TeamsGraphWrapper:
                 if needle not in _message_text(msg).lower():
                     continue
                 reasons.append(f"text:{text_contains.strip()}")
-            item = self._format_message(msg)
+            item = self._format_message(msg, text_max_chars, include_links)
             item["is_new"] = is_new
             item["from_me"] = from_me
             if reasons:
@@ -698,17 +711,23 @@ class TeamsGraphWrapper:
         ]
 
     @_tool_errors("list channels")
-    def list_channels(self, team: str) -> Dict[str, Any]:
+    def list_channels(self, team: str, name_contains: Optional[str] = None, limit: int = 50,
+                      include_links: bool = False) -> Dict[str, Any]:
         team_id = self._resolve_team(team)
         channels = self._get(f"{_GRAPH_BASE}/teams/{team_id}/channels",
                              params={"$select": "id,displayName,description,membershipType,webUrl"}).get("value", [])
-        return {
+        needle = (name_contains or "").strip().lower()
+        matched = [c for c in channels if needle in (c.get("displayName") or "").lower()]
+        keys = ("id", "displayName", "description", "membershipType") + (("webUrl",) if include_links else ())
+        result: Dict[str, Any] = {
             "team_id": team_id,
-            "channels": [
-                {k: c.get(k) for k in ("id", "displayName", "description", "membershipType", "webUrl")}
-                for c in channels
-            ],
+            "count": min(len(matched), limit),
+            "channels": [{k: c.get(k) for k in keys if c.get(k)} for c in matched[:limit]],
         }
+        if len(matched) > limit:
+            result["truncated"] = True
+            result["total_matching"] = len(matched)
+        return result
 
     @_tool_errors("list chats")
     def list_chats(
@@ -718,9 +737,17 @@ class TeamsGraphWrapper:
         member: Optional[str] = None,
         unread_only: bool = False,
         limit: int = 50,
+        members: str = "summary",
+        max_members: int = _DEFAULT_MAX_MEMBERS,
+        include_ids: bool = False,
+        include_links: bool = False,
+        last_message_chars: int = _DEFAULT_LAST_MESSAGE_CHARS,
     ) -> Dict[str, Any]:
         url = f"{_GRAPH_BASE}/me/chats"
-        params = {"$top": _PAGE_SIZE, "$expand": "members,lastMessagePreview",
+        filtered = bool(chat_type or topic_contains or member or unread_only)
+        # Graph expands members per chat, so cost scales with page size (~0.4s/chat)
+        page_size = _PAGE_SIZE if filtered else max(1, min(limit, _PAGE_SIZE))
+        params = {"$top": page_size, "$expand": "members,lastMessagePreview",
                   "$orderby": "lastMessagePreview/createdDateTime desc"}
         try:
             pages = self._iter_pages(url, params)
@@ -750,7 +777,8 @@ class TeamsGraphWrapper:
         for page, has_next in _pages():
             for pos, chat in enumerate(page):
                 scanned += 1
-                item = self._format_chat(chat)
+                item = self._format_chat(chat, members, max_members, include_ids, include_links,
+                                         last_message_chars)
                 keep = (
                     (not wanted_type or (chat.get("chatType") or "").lower() == wanted_type)
                     and (not topic_text or topic_text in (chat.get("topic") or "").lower())
@@ -773,35 +801,40 @@ class TeamsGraphWrapper:
                 return True
         return False
 
-    @staticmethod
-    def _format_chat(chat: dict) -> Dict[str, Any]:
+    def _format_chat(self, chat: dict, members: str = "summary", max_members: int = _DEFAULT_MAX_MEMBERS,
+                     include_ids: bool = False, include_links: bool = False,
+                     last_message_chars: int = _DEFAULT_LAST_MESSAGE_CHARS) -> Dict[str, Any]:
         preview = chat.get("lastMessagePreview") or {}
         read_at = (chat.get("viewpoint") or {}).get("lastMessageReadDateTime")
+        all_members = chat.get("members") or []
         item: Dict[str, Any] = {
             "id": chat.get("id"),
             "chatType": chat.get("chatType"),
             "topic": chat.get("topic"),
-            "webUrl": chat.get("webUrl"),
-            "members": [
-                {k: v for k, v in (("displayName", m.get("displayName")), ("email", m.get("email")),
-                                   ("userId", m.get("userId"))) if v}
-                for m in chat.get("members") or []
-            ],
+            "webUrl": chat.get("webUrl") if include_links else None,
+            "member_count": len(all_members),
         }
+        if members != "none":
+            me = self._my_id()
+            others = [m for m in all_members if (m.get("userId") or "").lower() != me]
+            shown = others if members == "all" else others[:max(max_members, 0)]
+            fields = ("displayName", "email") + (("userId",) if include_ids else ())
+            item["members"] = [{k: m.get(k) for k in fields if m.get(k)} for m in shown]
+            if len(shown) < len(others):
+                item["members_truncated"] = True
         if preview:
             body = preview.get("body") or {}
             content = body.get("content") or ""
+            text = _html_to_text(content) if (body.get("contentType") or "").lower() == "html" else content
             item["lastMessage"] = {
-                "id": preview.get("id"),
+                "id": preview.get("id") if include_ids else None,
                 "createdDateTime": preview.get("createdDateTime"),
                 "from": _sender_name(preview),
-                "text": (_html_to_text(content) if (body.get("contentType") or "").lower() == "html"
-                         else content)[:300],
+                "text": text[:last_message_chars],
             }
+            item["lastMessage"] = {k: v for k, v in item["lastMessage"].items() if v}
             if read_at and preview.get("createdDateTime"):
                 item["has_unread"] = _parse_dt(preview["createdDateTime"]) > _parse_dt(read_at)
-        if read_at:
-            item["lastReadDateTime"] = read_at
         return {k: v for k, v in item.items() if v not in (None, "", [])}
 
     # ------------------------------------------------------------------ #
@@ -820,6 +853,8 @@ class TeamsGraphWrapper:
         include_own: bool = False,
         lookback_hours: int = 24,
         limit: int = 50,
+        text_max_chars: int = _DEFAULT_TEXT_CHARS,
+        include_links: bool = False,
     ) -> Dict[str, Any]:
         """Messages of one chat (1:1, group or meeting), oldest first, with is_new per message.
 
@@ -851,7 +886,7 @@ class TeamsGraphWrapper:
         }
         raw, scan_truncated = self._collect(messages_url, params, _MAX_SCAN)
         selected, newest = self._select(raw, window, bound, read_marker, matcher, text_contains,
-                                        only_new, include_own)
+                                        only_new, include_own, text_max_chars, include_links)
         result = {
             "chat_id": chat_id,
             "chat_type": chat_info.get("chatType"),
@@ -874,6 +909,7 @@ class TeamsGraphWrapper:
         senders: Optional[List[str]] = None,
         since: Optional[str] = None,
         limit: int = 25,
+        include_links: bool = False,
     ) -> Dict[str, Any]:
         """KQL search over the signed-in user's Teams chat and channel messages."""
         parts = [query.strip()] if query and query.strip() else []
@@ -907,7 +943,7 @@ class TeamsGraphWrapper:
             more = any(c.get("moreResultsAvailable") for c in containers) and bool(page)
             offset += len(page)
             for hit in page:
-                item = self._format_search_hit(hit)
+                item = self._format_search_hit(hit, include_links)
                 created = item.get("createdDateTime")
                 if since_dt and created and _parse_dt(created) <= since_dt:
                     continue
@@ -915,7 +951,7 @@ class TeamsGraphWrapper:
         return {"query": kql, "count": len(hits[:limit]), "more_available": more, "messages": hits[:limit]}
 
     @staticmethod
-    def _format_search_hit(hit: dict) -> Dict[str, Any]:
+    def _format_search_hit(hit: dict, include_links: bool = False) -> Dict[str, Any]:
         res = hit.get("resource") or {}
         sender = (res.get("from") or {}).get("emailAddress") or {}
         channel = res.get("channelIdentity") or {}
@@ -928,7 +964,7 @@ class TeamsGraphWrapper:
             "from": {k: v for k, v in (("displayName", sender.get("name")), ("email", sender.get("address"))) if v},
             "subject": res.get("subject"),
             "summary": _html_to_text(hit.get("summary") or ""),
-            "webLink": res.get("webLink"),
+            "webLink": res.get("webLink") if include_links else None,
         }
         return {k: v for k, v in item.items() if v not in (None, "", {})}
 
