@@ -106,9 +106,20 @@ class TeamsApiWrapper(BaseModel):
         """List teams the user is a member of."""
         return self._ensure_backend().list_teams(name_contains=name_contains)
 
-    def list_channels(self, team: str) -> Dict[str, Any]:
+    def list_channels(
+        self,
+        team: str,
+        name_contains: Optional[str] = None,
+        limit: int = 50,
+        include_links: bool = False,
+    ) -> Dict[str, Any]:
         """List channels of a team."""
-        return self._ensure_backend().list_channels(team=team)
+        return self._ensure_backend().list_channels(
+            team=team,
+            name_contains=name_contains,
+            limit=limit,
+            include_links=include_links,
+        )
 
     def list_chats(
         self,
@@ -117,6 +128,11 @@ class TeamsApiWrapper(BaseModel):
         member: Optional[str] = None,
         unread_only: bool = False,
         limit: int = 50,
+        members: str = "summary",
+        max_members: int = 5,
+        include_ids: bool = False,
+        include_links: bool = False,
+        last_message_chars: int = 300,
     ) -> Dict[str, Any]:
         """List the user's chats, most recently active first."""
         return self._ensure_backend().list_chats(
@@ -125,6 +141,11 @@ class TeamsApiWrapper(BaseModel):
             member=member,
             unread_only=unread_only,
             limit=limit,
+            members=members,
+            max_members=max_members,
+            include_ids=include_ids,
+            include_links=include_links,
+            last_message_chars=last_message_chars,
         )
 
     def find_chat_messages(
@@ -138,6 +159,8 @@ class TeamsApiWrapper(BaseModel):
         include_own: bool = False,
         lookback_hours: int = 24,
         limit: int = 50,
+        text_max_chars: int = 1000,
+        include_links: bool = False,
     ) -> Dict[str, Any]:
         """Find messages in a chat, optionally from given people, and flag new ones."""
         return self._ensure_backend().find_chat_messages(
@@ -150,6 +173,8 @@ class TeamsApiWrapper(BaseModel):
             include_own=include_own,
             lookback_hours=lookback_hours,
             limit=limit,
+            text_max_chars=text_max_chars,
+            include_links=include_links,
         )
 
     def search_teams_messages(
@@ -158,6 +183,7 @@ class TeamsApiWrapper(BaseModel):
         senders: Optional[List[str]] = None,
         since: Optional[str] = None,
         limit: int = 25,
+        include_links: bool = False,
     ) -> Dict[str, Any]:
         """Search the user's Teams messages across chats and channels."""
         return self._ensure_backend().search_teams_messages(
@@ -165,6 +191,7 @@ class TeamsApiWrapper(BaseModel):
             senders=senders,
             since=since,
             limit=limit,
+            include_links=include_links,
         )
 
     def send_chat_message(
@@ -233,7 +260,7 @@ class TeamsApiWrapper(BaseModel):
             },
             {
                 "name": "list_channels",
-                "description": "List the channels of a team (id, displayName, membershipType)",
+                "description": "List the channels of a team (id, displayName, membershipType). Returns 50 by default; use name_contains and limit to narrow",
                 "args_schema": ListChannels,
                 "ref": self.list_channels,
             },
@@ -241,7 +268,9 @@ class TeamsApiWrapper(BaseModel):
                 "name": "list_chats",
                 "description": (
                     "List the signed-in user's Teams chats (1:1, group and meeting chats), most recently active "
-                    "first, with members, last message preview and has_unread. Filter by type, topic or member"
+                    "first, with member_count, a short members list, last message preview and has_unread. Filter by "
+                    "type, topic or member. Members are compact by default (first 5 others, names only); use "
+                    "members ('none' / 'summary' / 'all'), max_members and include_ids to change that"
                 ),
                 "args_schema": ListChats,
                 "ref": self.list_chats,
@@ -252,7 +281,8 @@ class TeamsApiWrapper(BaseModel):
                     "Read messages of one Teams chat (by chat ID, group chat topic or a person's email for the 1:1 "
                     "chat), optionally only from given people or containing text. Returns messages oldest first "
                     "with is_new and matched_by, plus watermark / latest_message_id to pass as since / "
-                    "after_message_id next time. Without since / after_message_id, new means unread"
+                    "after_message_id next time. Without since / after_message_id, new means unread. Text is cut to "
+                    "text_max_chars (text_truncated is set); links are omitted unless include_links is set"
                 ),
                 "args_schema": FindChatMessages,
                 "ref": self.find_chat_messages,

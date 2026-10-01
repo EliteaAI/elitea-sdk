@@ -114,6 +114,10 @@ class OutlookApiWrapper(BaseModel):
         limit: int = 50,
         unread_only: bool = False,
         search: Optional[str] = None,
+        include_preview: bool = True,
+        preview_chars: int = 200,
+        max_recipients: int = 5,
+        include_ids: bool = False,
     ) -> List[Dict[str, Any]]:
         """List messages from a mail folder."""
         return self._ensure_backend().list_messages(
@@ -121,13 +125,27 @@ class OutlookApiWrapper(BaseModel):
             limit=limit,
             unread_only=unread_only,
             search=search,
+            include_preview=include_preview,
+            preview_chars=preview_chars,
+            max_recipients=max_recipients,
+            include_ids=include_ids,
         )
 
-    def get_message(self, message_id: str, include_body: bool = True) -> Dict[str, Any]:
+    def get_message(
+        self,
+        message_id: str,
+        include_body: bool = True,
+        body_format: str = "text",
+        max_body_chars: int = 8000,
+        max_recipients: int = 5,
+    ) -> Dict[str, Any]:
         """Get a specific message by ID."""
         return self._ensure_backend().get_message(
             message_id=message_id,
             include_body=include_body,
+            body_format=body_format,
+            max_body_chars=max_body_chars,
+            max_recipients=max_recipients,
         )
 
     def send_mail(
@@ -220,6 +238,7 @@ class OutlookApiWrapper(BaseModel):
         after_message_id: Optional[str] = None,
         senders: Optional[List[str]] = None,
         recipients: Optional[List[str]] = None,
+        latest_limit: int = 5,
     ) -> Dict[str, Any]:
         """Check whether new / unread messages are present."""
         return self._ensure_backend().check_new_messages(
@@ -228,6 +247,7 @@ class OutlookApiWrapper(BaseModel):
             after_message_id=after_message_id,
             senders=senders,
             recipients=recipients,
+            latest_limit=latest_limit,
         )
 
     def find_new_messages(
@@ -241,6 +261,9 @@ class OutlookApiWrapper(BaseModel):
         only_new: bool = True,
         include_preview: bool = True,
         limit: int = 25,
+        preview_chars: int = 200,
+        max_recipients: int = 5,
+        include_ids: bool = False,
     ) -> Dict[str, Any]:
         """Find messages from people / DLs and flag which are new."""
         return self._ensure_backend().find_new_messages(
@@ -253,6 +276,9 @@ class OutlookApiWrapper(BaseModel):
             only_new=only_new,
             include_preview=include_preview,
             limit=limit,
+            preview_chars=preview_chars,
+            max_recipients=max_recipients,
+            include_ids=include_ids,
         )
 
     def get_thread_messages(
@@ -264,6 +290,9 @@ class OutlookApiWrapper(BaseModel):
         only_new: bool = False,
         include_body: bool = False,
         limit: int = 50,
+        max_body_chars: int = 2000,
+        max_recipients: int = 5,
+        preview_chars: int = 200,
     ) -> Dict[str, Any]:
         """Get the messages of a conversation and flag new ones."""
         return self._ensure_backend().get_thread_messages(
@@ -274,6 +303,9 @@ class OutlookApiWrapper(BaseModel):
             only_new=only_new,
             include_body=include_body,
             limit=limit,
+            max_body_chars=max_body_chars,
+            max_recipients=max_recipients,
+            preview_chars=preview_chars,
         )
 
     # ------------------------------------------------------------------ #
@@ -305,13 +337,21 @@ class OutlookApiWrapper(BaseModel):
         return [
             {
                 "name": "list_messages",
-                "description": "List email messages from a mail folder (inbox, sentitems, drafts, etc.)",
+                "description": (
+                    "List email messages from a mail folder (inbox, sentitems, drafts, etc.). Compact by default: "
+                    "a 200-char preview and at most 5 To/Cc recipients per message (to_more / cc_more give the "
+                    "rest); use include_preview, preview_chars, max_recipients or include_ids to adjust"
+                ),
                 "args_schema": ListMessages,
                 "ref": self.list_messages,
             },
             {
                 "name": "get_message",
-                "description": "Get a specific email message by its ID with full details",
+                "description": (
+                    "Get a specific email message by its ID. The body is plain text and capped at 8000 characters "
+                    "by default (body_truncated / body_total_chars say when it was cut); use body_format='html', "
+                    "max_body_chars (0 = no limit) or max_recipients to adjust"
+                ),
                 "args_schema": GetMessage,
                 "ref": self.get_message,
             },
@@ -368,7 +408,8 @@ class OutlookApiWrapper(BaseModel):
                 "description": (
                     "Quickly check whether new or unread emails are present, optionally only from given senders "
                     "or sent to given distribution lists. Returns has_new, counts, a few latest messages and a "
-                    "watermark / latest_message_id to pass as since / after_message_id next time"
+                    "watermark / latest_message_id to pass as since / after_message_id next time. The latest messages "
+                    "are brief (id, from, subject, time); use latest_limit to change how many"
                 ),
                 "args_schema": CheckNewMessages,
                 "ref": self.check_new_messages,
@@ -378,7 +419,8 @@ class OutlookApiWrapper(BaseModel):
                 "description": (
                     "Find emails from given people and/or sent to given distribution lists and identify which are "
                     "new (received after since / after_message_id, or unread when neither is given). Each message "
-                    "has is_new and matched_by; the result has a watermark / latest_message_id for the next call"
+                    "has is_new and matched_by; the result has a watermark / latest_message_id for the next call. "
+                    "Previews and recipient lists are capped (preview_chars, max_recipients)"
                 ),
                 "args_schema": FindNewMessages,
                 "ref": self.find_new_messages,
@@ -388,7 +430,8 @@ class OutlookApiWrapper(BaseModel):
                 "description": (
                     "Get all messages of an email thread (conversation) across folders, oldest first, and identify "
                     "new messages in it (after since / after_message_id, or unread). Reports new_replies_count "
-                    "(new messages not sent by the mailbox owner)"
+                    "(new messages not sent by the mailbox owner). With include_body each body is capped at 2000 "
+                    "characters by default (max_body_chars)"
                 ),
                 "args_schema": GetThreadMessages,
                 "ref": self.get_thread_messages,

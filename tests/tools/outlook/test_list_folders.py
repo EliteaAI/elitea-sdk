@@ -64,7 +64,7 @@ def test_defaults_return_wrapper_with_all_levels_sorted_by_path(wrapper):
     ]
     assert result["total"] == 7 and result["truncated"] is False and "hint" not in result
     nested = next(f for f in result["folders"] if f["path"] == "Inbox/Projects/2026")
-    assert nested["id"] == "proj-2026" and nested["parentFolderId"] == "inbox-proj"
+    assert nested["id"] == "proj-2026" and "parentFolderId" not in nested
 
 
 def test_leaf_folders_cost_no_child_request(wrapper):

@@ -268,6 +268,115 @@ class TestFindChatMessages:
         assert [m["id"] for m in result["messages"]] == ["2"]
 
 
+class TestCompactOutput:
+    def _members(self, n):
+        people = [{"userId": ME, "displayName": "Me", "email": "me@example.com"}]
+        people += [{"userId": f"u{i}", "displayName": f"User {i}", "email": f"u{i}@example.com"} for i in range(n)]
+        return people
+
+    def _chats(self, graph, n=30):
+        graph.on("GET", f"{G}/me/chats", _resp(json_body={"value": [{
+            "id": CHAT, "chatType": "meeting", "topic": "All hands", "webUrl": "https://teams.example/chat",
+            "members": self._members(n),
+            "lastMessagePreview": {"id": "m1", "createdDateTime": "2026-09-24T10:00:00Z",
+                                   "from": {"user": {"displayName": "User 1"}},
+                                   "body": {"contentType": "text", "content": "x" * 500}},
+            "viewpoint": {"lastMessageReadDateTime": "2026-09-24T09:00:00Z"},
+        }]}))
+
+    def test_list_chats_requests_only_as_many_chats_as_limit(self, graph, wrapper):
+        self._chats(graph)
+        wrapper.list_chats(limit=5)
+        assert graph.find("GET", f"{G}/me/chats")[0]["params"]["$top"] == 5
+
+    def test_list_chats_caps_page_size_and_pages_fully_when_filtering(self, graph, wrapper):
+        self._chats(graph)
+        wrapper.list_chats(limit=500)
+        assert graph.find("GET", f"{G}/me/chats")[0]["params"]["$top"] == 50
+        graph.calls.clear()
+        self._chats(graph)
+        wrapper.list_chats(limit=5, topic_contains="hands")
+        assert graph.find("GET", f"{G}/me/chats")[0]["params"]["$top"] == 50
+
+    def test_list_chats_default_is_compact(self, graph, wrapper):
+        self._chats(graph)
+        chat = wrapper.list_chats()["chats"][0]
+        assert chat["member_count"] == 31
+        assert [m["displayName"] for m in chat["members"]] == [f"User {i}" for i in range(5)]
+        assert chat["members_truncated"] is True
+        assert all(set(m) == {"displayName", "email"} for m in chat["members"])
+        assert "webUrl" not in chat and "lastReadDateTime" not in chat
+        assert len(chat["lastMessage"]["text"]) == 300
+        assert "id" not in chat["lastMessage"]
+        assert chat["has_unread"] is True
+
+    def test_list_chats_members_all_and_none(self, graph, wrapper):
+        self._chats(graph)
+        everyone = wrapper.list_chats(members="all")["chats"][0]
+        assert len(everyone["members"]) == 30 and "members_truncated" not in everyone  # self excluded
+        no_members = wrapper.list_chats(members="none")["chats"][0]
+        assert "members" not in no_members and no_members["member_count"] == 31
+
+    def test_list_chats_opt_in_ids_links_and_sizes(self, graph, wrapper):
+        self._chats(graph)
+        chat = wrapper.list_chats(max_members=2, include_ids=True, include_links=True,
+                                  last_message_chars=10)["chats"][0]
+        assert chat["members"][0] == {"displayName": "User 0", "email": "u0@example.com", "userId": "u0"}
+        assert len(chat["members"]) == 2
+        assert chat["webUrl"] == "https://teams.example/chat"
+        assert chat["lastMessage"]["id"] == "m1" and len(chat["lastMessage"]["text"]) == 10
+
+    def test_list_chats_member_filter_still_sees_hidden_members(self, graph, wrapper):
+        self._chats(graph)
+        graph.on("GET", f"{G}/users/u25@example.com", _resp(json_body=_user("u25", "u25@example.com", "User 25")))
+        found = wrapper.list_chats(member="u25@example.com")
+        assert found["count"] == 1  # u25 is not in the shown members, but the filter sees everyone
+
+    def test_messages_cap_text_and_drop_noise(self, graph, wrapper):
+        msg = _msg("1", "2026-09-24T10:00:00.000Z", text="y" * 1500)
+        msg.update({"webUrl": "https://teams.example/m", "chatId": CHAT, "importance": "normal",
+                    "attachments": [{"name": "a.pdf", "contentType": "reference", "contentUrl": "https://x/a.pdf"}]})
+        graph.on("GET", f"{G}/chats/{CHAT}", _resp(json_body={"id": CHAT, "chatType": "group"}))
+        graph.on("GET", f"{G}/chats/{CHAT}/messages", _resp(json_body={"value": [msg]}))
+        item = wrapper.find_chat_messages(CHAT, since="2026-09-24T09:00:00Z")["messages"][0]
+        assert len(item["text"]) == 1000 and item["text_truncated"] is True
+        assert not {"webUrl", "chatId", "lastModifiedDateTime", "importance"} & set(item)
+        assert item["attachments"] == [{"name": "a.pdf", "contentType": "reference"}]
+        full = wrapper.find_chat_messages(CHAT, since="2026-09-24T09:00:00Z", text_max_chars=0, include_links=True)
+        item = full["messages"][0]
+        assert len(item["text"]) == 1500 and "text_truncated" not in item
+        assert item["webUrl"] == "https://teams.example/m"
+        assert item["attachments"][0]["contentUrl"] == "https://x/a.pdf"
+
+    def test_text_filter_matches_beyond_the_output_cap(self, graph, wrapper):
+        msg = _msg("1", "2026-09-24T10:00:00.000Z", text="a" * 2000 + " needle")
+        graph.on("GET", f"{G}/chats/{CHAT}", _resp(json_body={"id": CHAT, "chatType": "group"}))
+        graph.on("GET", f"{G}/chats/{CHAT}/messages", _resp(json_body={"value": [msg]}))
+        result = wrapper.find_chat_messages(CHAT, since="2026-09-24T09:00:00Z", text_contains="needle", text_max_chars=50)
+        assert result["count"] == 1 and len(result["messages"][0]["text"]) == 50
+
+    def test_edited_message_keeps_last_modified(self, graph, wrapper):
+        msg = _msg("1", "2026-09-24T10:00:00.000Z", modified="2026-09-24T10:30:00.000Z")
+        graph.on("GET", f"{G}/chats/{CHAT}", _resp(json_body={"id": CHAT, "chatType": "group"}))
+        graph.on("GET", f"{G}/chats/{CHAT}/messages", _resp(json_body={"value": [msg]}))
+        item = wrapper.find_chat_messages(CHAT, since="2026-09-24T09:00:00Z")["messages"][0]
+        assert item["lastModifiedDateTime"] == "2026-09-24T10:30:00.000Z"
+
+    def test_search_hit_link_is_opt_in(self):
+        hit = {"summary": "s", "resource": {"id": "1", "chatId": CHAT, "webLink": "https://teams.example/l"}}
+        assert "webLink" not in TeamsGraphWrapper._format_search_hit(hit)
+        assert TeamsGraphWrapper._format_search_hit(hit, include_links=True)["webLink"] == "https://teams.example/l"
+
+    def test_list_channels_filter_limit_and_links(self, graph, wrapper):
+        graph.on("GET", f"{G}/teams/{TEAM}/channels", _resp(json_body={"value": [
+            {"id": f"19:c{i}@thread.tacv2", "displayName": f"Dev {i}" if i < 4 else f"Ops {i}",
+             "membershipType": "standard", "webUrl": f"https://teams.example/c{i}"} for i in range(6)]}))
+        result = wrapper.list_channels(TEAM, name_contains="dev", limit=3)
+        assert result["count"] == 3 and result["truncated"] is True and result["total_matching"] == 4
+        assert all("webUrl" not in c for c in result["channels"])
+        assert wrapper.list_channels(TEAM, include_links=True)["channels"][0]["webUrl"]
+
+
 class TestSearch:
     def test_builds_kql_and_filters_by_exact_time(self, graph, wrapper):
         hits = [
