@@ -19,6 +19,38 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 PIN = 'elitea_routing'
 
 
+def generation_input_bytes(messages, tools=None, output_schema=None):
+    """Transport-neutral payload estimate, excluding local message diagnostics.
+
+    This is a byte proxy, not a tokenizer or exact native serialization. Keep
+    generation content (including constructor instructions and opaque provider
+    blocks) rather than the classifier's reduced text projection. Response/usage
+    metadata and routing checkpoints are never part of the provider input.
+    """
+    rows = []
+    for message in messages:
+        role = ('user' if isinstance(message, HumanMessage) else
+                'tool' if isinstance(message, ToolMessage) else
+                'system' if isinstance(message, SystemMessage) else 'assistant')
+        row = {'role': role, 'content': message.content}
+        if message.name:
+            row['name'] = message.name
+        if isinstance(message, ToolMessage):
+            row['tool_call_id'] = message.tool_call_id
+        calls = getattr(message, 'tool_calls', None)
+        if calls:
+            row['tool_calls'] = [dict(id=c['id'], type='function', function={
+                'name': c['name'], 'arguments': json.dumps(c['args'], ensure_ascii=False)}) for c in calls]
+        # These are native message fields. Other additional kwargs can contain
+        # constructor task projections, parsed outputs or internal graph state.
+        for key in ('function_call', 'tool_calls', 'reasoning_content'):
+            if key not in row and key in message.additional_kwargs:
+                row[key] = message.additional_kwargs[key]
+        rows.append(row)
+    return len(json.dumps({'messages': rows, 'tools': tools or [],
+                           'output_schema': output_schema}, ensure_ascii=False).encode()) + 64 * len(rows)
+
+
 def projection(messages):
     result = []
     for message in messages:
@@ -90,14 +122,50 @@ def observation(message):
     finish = finish if finish in {'stop', 'tool_calls', 'length', 'content_filter', 'refusal', 'pause_turn'} else None
     def counter(value):
         return value if type(value) is int and 0 <= value <= 1_000_000_000 else 0
+    # Missing provider cache usage is unknown, never a measured miss. Preserve
+    # explicit zero so real misses still contribute to calibration/forecasting.
+    cache_details = {}
+    for source, target in (('cache_read', 'cached_tokens'), ('cache_creation', 'cache_creation_tokens')):
+        value = details.get(source)
+        if type(value) is int and 0 <= value <= 1_000_000_000:
+            cache_details[target] = value
+    # Recent LangChain Anthropic versions zero the generic write counter when
+    # they expose disjoint TTL buckets. Use their sum, never add it twice.
+    write_buckets = [details.get(name) for name in
+                     ('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens')]
+    if all(type(value) is int and 0 <= value <= 1_000_000_000 for value in write_buckets):
+        total_write = sum(write_buckets)
+        if total_write <= 1_000_000_000 and (total_write or 'cache_creation_tokens' not in cache_details):
+            cache_details['cache_creation_tokens'] = total_write
+    # OpenAI-compatible gateways can report native cache counters that
+    # LangChain retains only in token_usage. Reconcile explicit observations;
+    # missing fields stay unknown and contradictory sources cannot price a hit.
+    raw = message.response_metadata.get('token_usage') or {}
+    raw = raw if isinstance(raw, dict) else {}
+    raw_details = raw.get('prompt_tokens_details') or {}
+    raw_details = raw_details if isinstance(raw_details, dict) else {}
+    for target, native, alternate in (
+            ('cached_tokens', 'cache_read_input_tokens', None),
+            ('cache_creation_tokens', 'cache_creation_input_tokens', 'cache_write_tokens')):
+        values = [cache_details.get(target), raw.get(native), raw_details.get(target)]
+        if alternate:
+            values.append(raw_details.get(alternate))
+        values = [value for value in values if value is not None]
+        if values and all(type(value) is int and 0 <= value <= 1_000_000_000 for value in values) and len(set(values)) == 1:
+            cache_details[target] = values[0]
+        else:
+            cache_details.pop(target, None)
+    total_input = usage.get('input_tokens')
+    if (type(total_input) is int and total_input >= 0
+            and sum(cache_details.values()) > total_input):
+        cache_details.clear()
     model = message.response_metadata.get('model_name') or message.response_metadata.get('model')
     return {'message_digest': hashlib.sha256(json.dumps({k: row.get(k) for k in
         ('role', 'content', 'tool_calls', 'tool_call_id')}, sort_keys=True, ensure_ascii=False,
         separators=(',', ':')).encode()).hexdigest(), 'finish_reason': finish,
         'returned_model': model[:256] if isinstance(model, str) else None,
         'usage': {'prompt_tokens': counter(usage.get('input_tokens')), 'completion_tokens': counter(usage.get('output_tokens')),
-                  'prompt_tokens_details': {'cached_tokens': counter(details.get('cache_read')),
-                                            'cache_creation_tokens': counter(details.get('cache_creation'))}}}
+                  'prompt_tokens_details': cache_details}}
 
 
 class AutoChatModel(BaseChatModel):
@@ -164,8 +232,7 @@ class AutoChatModel(BaseChatModel):
                 prior_observation = {**observation(previous), 'message_index': len(projection(messages[:previous_index]))}
             tools = [convert_to_openai_tool(tool) for tool in self.routing_tools]
             cap = self.settings.get('max_tokens')
-            # Unspecified output belongs to the selected measured contract.
-            # Sending a synthetic 8k limit would exclude 32k-only presets.
+            # Unspecified output belongs to the selected provider's default.
             output_limit = {} if cap in (None, -1) else {'output_cap': cap}
             from elitea_sdk.runtime.clients.routing_context import instruction_view, retrieval_sources
             context = {'active_instructions': dict(instruction_view(self.active_instructions)),
@@ -174,15 +241,14 @@ class AutoChatModel(BaseChatModel):
             if not issuer:
                 context['retrieval_options'] = []
             context_token = issuer(context=context, tools=tools, scope_id=scope_id, invocation_id=invocation_id) if issuer and binding is None and context['retrieval_options'] else None
+            effective_schema = output_schema or configurable.get('elitea_routing_output_schema')
             response = self.owner._request('post', f'{self.owner.base_url}/llm/v1/auto-routing/resolve',
                 headers={**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)},
                 json={'selection': self.settings['selection'], 'surface': self.settings.get('routing_surface', 'agent'),
                       'messages': projection(messages), 'tools': tools, **output_limit,
-                      'generation_input_bytes': len(json.dumps(
-                          {'messages': [message.model_dump(mode='json') for message in messages],
-                           'tools': tools, 'output_schema': output_schema}, ensure_ascii=False).encode()) + 64*len(messages),
+                      'generation_input_bytes': generation_input_bytes(messages, tools, effective_schema),
                       'runtime_context': context, 'runtime_context_token': context_token,
-                      'output_schema': output_schema or configurable.get('elitea_routing_output_schema'),
+                      'output_schema': effective_schema,
                       'invocation_id': invocation_id, 'scope_id': scope_id,
                       'state_token': previous_binding.get('state_token') if previous_binding else None,
                       'observation': prior_observation,
@@ -235,7 +301,10 @@ class AutoChatModel(BaseChatModel):
             from openai.lib._parsing import type_to_response_format_param
             payload['response_format'] = type_to_response_format_param(payload['response_format'])
         size = len(json.dumps(payload, ensure_ascii=False).encode()) + 64*len(messages)
-        if size + binding['config']['max_tokens'] > binding['config']['context_window']:
+        optional = (binding['config'].get('routing_output_mode') == 'provider_default'
+                    and not binding['config'].get('routing_output_required', False))
+        reserve = 0 if optional else binding['config']['max_tokens']
+        if size + reserve > binding['config']['context_window']:
             raise ValueError('Auto native request exceeds the conservative context allowance')
 
     @staticmethod
@@ -248,12 +317,13 @@ class AutoChatModel(BaseChatModel):
         return message.model_copy(update={'response_metadata': metadata})
 
     @staticmethod
-    def _remember_response(message, binding, config):
+    def _remember_response(message, binding, config, request_started_at=None):
         if message is None or binding.get('action') == 'clarify':
             return
         # Advisory receipt only, never billing or an admission credential.
         binding['last_response'] = {**observation(message), 'scope_id': binding['scope_id'],
-                                    'invocation_id': binding['invocation_id'], 'completed_at': time.time()}
+                                    'invocation_id': binding['invocation_id'], 'completed_at': time.time(),
+                                    'request_started_at': request_started_at}
         sink = ((config or {}).get('configurable') or {}).get('elitea_routing_sink')
         if sink is not None:
             sink['binding'] = copy.deepcopy(binding)
@@ -264,8 +334,9 @@ class AutoChatModel(BaseChatModel):
         if native is not None:
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
+        started_at = time.time()
         response = AIMessage(content=binding['text']) if native is None else native.invoke(messages, config, stop=stop, **kwargs)
-        self._remember_response(response, binding, config)
+        self._remember_response(response, binding, config, started_at)
         return self._stamp(response, binding)
 
     async def ainvoke(self, input, config=None, *, stop=None, **kwargs):
@@ -274,8 +345,9 @@ class AutoChatModel(BaseChatModel):
         if native is not None:
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
+        started_at = time.time()
         response = AIMessage(content=binding['text']) if native is None else await native.ainvoke(messages, config, stop=stop, **kwargs)
-        self._remember_response(response, binding, config)
+        self._remember_response(response, binding, config, started_at)
         return self._stamp(response, binding)
 
     def stream(self, input, config=None, *, stop=None, **kwargs):
@@ -287,10 +359,11 @@ class AutoChatModel(BaseChatModel):
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
             complete = None
+            started_at = time.time()
             for chunk in native.stream(messages, config, stop=stop, **kwargs):
                 complete = chunk if complete is None else complete + chunk
                 yield chunk
-            self._remember_response(complete, binding, config)
+            self._remember_response(complete, binding, config, started_at)
         yield AIMessageChunk(content='', response_metadata=self._binding_metadata(binding))
 
     async def astream(self, input, config=None, *, stop=None, **kwargs):
@@ -302,10 +375,11 @@ class AutoChatModel(BaseChatModel):
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
             complete = None
+            started_at = time.time()
             async for chunk in native.astream(messages, config, stop=stop, **kwargs):
                 complete = chunk if complete is None else complete + chunk
                 yield chunk
-            self._remember_response(complete, binding, config)
+            self._remember_response(complete, binding, config, started_at)
         yield AIMessageChunk(content='', response_metadata=self._binding_metadata(binding))
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -343,12 +417,12 @@ class AutoChatModel(BaseChatModel):
             self._admit_native(provider, messages, binding)
             return runnable, messages, binding
 
-        def finish(result, binding, config):
+        def finish(result, binding, config, started_at):
             if result.get('parsing_error') is not None and not include_raw:
                 raise result['parsing_error']
             if result.get('raw') is not None:
                 if result.get('parsing_error') is None:
-                    self._remember_response(result['raw'], binding, config)
+                    self._remember_response(result['raw'], binding, config, started_at)
                 result = {**result, 'raw': self._stamp(result['raw'], binding)}
             if include_raw:
                 return result
@@ -356,10 +430,12 @@ class AutoChatModel(BaseChatModel):
 
         def invoke(value, config=None):
             runnable, messages, binding = prepare(value, config)
-            return finish(runnable.invoke(messages, config), binding, config)
+            started_at = time.time()
+            return finish(runnable.invoke(messages, config), binding, config, started_at)
 
         async def ainvoke(value, config=None):
             runnable, messages, binding = await asyncio.to_thread(prepare, value, config)
-            return finish(await runnable.ainvoke(messages, config), binding, config)
+            started_at = time.time()
+            return finish(await runnable.ainvoke(messages, config), binding, config, started_at)
 
         return RunnableLambda(invoke, ainvoke)
