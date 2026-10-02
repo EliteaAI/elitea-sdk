@@ -306,7 +306,7 @@ class TeamsApiWrapper(BaseModel):
                     "To @mention people (notifying them) write @[email] in the message where the mention should "
                     "appear; a plain '@name' notifies no one. People listed in mentions but not placed in the text "
                     "are tagged at the start. recipients only chooses who the chat goes to and does not notify "
-                    "anyone individually. "
+                    "anyone individually. importance='high' adds an Important label, 'urgent' re-notifies the recipient every 2 minutes for 20 minutes; leave it unset for ordinary messages. "
                     "Example: send_chat_message(chat='19:abc...@thread.v2', message='Thanks @[anna@contoso.com], "
                     "can you review the release notes by 3pm?') posts 'Thanks @Anna Kowalski, can you review the "
                     "release notes by 3pm?'"
@@ -321,7 +321,7 @@ class TeamsApiWrapper(BaseModel):
                     "Returns message_id and thread_id; replies can be found later with search_teams_messages. "
                     "To @mention people write @[email] in the message where the mention should appear; a plain "
                     "'@name' notifies no one. People listed in mentions but not placed in the text are tagged at "
-                    "the start. "
+                    "the start. importance='high' adds an Important label; leave it unset for ordinary posts. "
                     "Example: send_channel_message(team='Engineering', channel='General', message='Release is out, "
                     "@[anna@contoso.com] please verify') posts 'Release is out, @Anna Kowalski please verify'"
                 ),
