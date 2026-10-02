@@ -512,7 +512,8 @@ class EliteAClient:
             api_key=self._llm_api_key,
             openai_organization=str(self.project_id),
             request_timeout=self.model_timeout,
-            default_headers=self._llm_cookie_headers or None
+            # Same identity/attribution headers as the chat path, so embedding usage rows are labelled
+            default_headers={**(getattr(self, "api_extra_headers", None) or {}), **self._llm_cookie_headers} or None
         )
 
     def _required_provider_max_tokens(self, model_name: str, model_config: dict) -> int:
