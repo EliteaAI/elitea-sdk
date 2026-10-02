@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from .graph_wrapper import OutlookGraphWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 from .models import (
     ListMessages,
     GetMessage,
@@ -108,6 +109,7 @@ class OutlookApiWrapper(BaseModel):
     #  Tool Methods                                                        #
     # ------------------------------------------------------------------ #
 
+    @tool_group('read')
     def list_messages(
         self,
         folder: str = "inbox",
@@ -131,6 +133,7 @@ class OutlookApiWrapper(BaseModel):
             include_ids=include_ids,
         )
 
+    @tool_group('read')
     def get_message(
         self,
         message_id: str,
@@ -148,6 +151,7 @@ class OutlookApiWrapper(BaseModel):
             max_recipients=max_recipients,
         )
 
+    @tool_group('write')
     def send_mail(
         self,
         to: List[str],
@@ -167,6 +171,7 @@ class OutlookApiWrapper(BaseModel):
             html=html,
         )
 
+    @tool_group('write')
     def reply_to_message(
         self,
         message_id: str,
@@ -180,6 +185,7 @@ class OutlookApiWrapper(BaseModel):
             reply_all=reply_all,
         )
 
+    @tool_group('write')
     def mark_as_read(self, message_id: str, is_read: bool = True) -> str:
         """Mark a message as read or unread."""
         return self._ensure_backend().mark_as_read(
@@ -187,6 +193,7 @@ class OutlookApiWrapper(BaseModel):
             is_read=is_read,
         )
 
+    @tool_group('read')
     def list_folders(
         self,
         parent: Optional[str] = None,
@@ -204,6 +211,7 @@ class OutlookApiWrapper(BaseModel):
             limit=limit,
         )
 
+    @tool_group('write')
     def move_message(self, message_id: str, destination_folder: str) -> Dict[str, Any]:
         """Move a message to another folder."""
         return self._ensure_backend().move_message(
@@ -211,6 +219,7 @@ class OutlookApiWrapper(BaseModel):
             destination_folder=destination_folder,
         )
 
+    @tool_group('delete')
     def delete_message(self, message_id: str, permanent: bool = False) -> str:
         """Delete a message."""
         return self._ensure_backend().delete_message(
@@ -218,6 +227,7 @@ class OutlookApiWrapper(BaseModel):
             permanent=permanent,
         )
 
+    @tool_group('read')
     def search_messages(
         self,
         query: str,
@@ -231,6 +241,7 @@ class OutlookApiWrapper(BaseModel):
             limit=limit,
         )
 
+    @tool_group('read')
     def check_new_messages(
         self,
         folder: str = "inbox",
@@ -250,6 +261,7 @@ class OutlookApiWrapper(BaseModel):
             latest_limit=latest_limit,
         )
 
+    @tool_group('read')
     def find_new_messages(
         self,
         folder: str = "inbox",
@@ -281,6 +293,7 @@ class OutlookApiWrapper(BaseModel):
             include_ids=include_ids,
         )
 
+    @tool_group('read')
     def get_thread_messages(
         self,
         message_id: Optional[str] = None,
@@ -332,6 +345,7 @@ class OutlookApiWrapper(BaseModel):
             raise ValueError(f"Unknown action: {action}")
         return action_map[action](**kwargs)
 
+    @with_tool_groups
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Return list of available tools with their schemas."""
         return [
