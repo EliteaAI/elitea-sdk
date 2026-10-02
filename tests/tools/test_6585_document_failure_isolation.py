@@ -86,7 +86,7 @@ class FakeStagingAdapter:
         self.calls.append("promote")
         return self.promote_outcome
 
-    def discard_run(self, wrapper, index_name, run_id):
+    def discard_run(self, wrapper, index_name, run_id, retain_chunks=False):
         self.calls.append("discard")
         return "discarded"
 

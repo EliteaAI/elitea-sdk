@@ -15,6 +15,7 @@ import hashlib
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.tools import ToolException
 from langchain_core.documents import Document
 
 from elitea_sdk.tools.code_indexer_toolkit import (
@@ -416,7 +417,10 @@ class TestCIL_ID_ListingIdentity:
     def test_ID04_an_error_string_is_not_iterated_and_is_not_refetched(self):
         tk = make_toolkit(["a.py"])
         tk._get_files_with_identity = MagicMock(return_value="Error: status code 403, forbidden")
-        with pytest.raises(ValueError):
+        # ToolException, not ValueError: the listing seam now carries the provider's own
+        # words instead of a fixed sentence. What this test guards — that the string is
+        # not iterated and the listing is not refetched — is unchanged.
+        with pytest.raises(ToolException):
             load(tk, chunked=False)
         tk._get_files.assert_not_called()
 

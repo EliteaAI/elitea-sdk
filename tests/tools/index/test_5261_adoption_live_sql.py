@@ -485,3 +485,69 @@ class TestCompleteFilesGateTheFetchSkip:
         complete = self.complete(schema, engine)
 
         assert list(complete) == ["whole.py"]
+
+
+class TestTheIdOnlyReadIsWhatLetsAdoptionScale:
+    """The supersede fence needs every adopted id; the digest map needs the id AND the
+    content of every row. Reading ids alone is what lets a generation above the digest
+    ceiling still be adopted instead of stranded — so this query has to agree exactly with
+    what the digest read would have returned, meta row excluded.
+    """
+
+    def pks(self, schema, engine, run_id="new-run"):
+        return PGVectorAdapter().read_run_row_pks(wrapper_for(schema, engine), run_id)
+
+    def test_it_returns_every_row_of_the_run(self, index_schema):
+        schema, engine = index_schema
+        for index in range(5):
+            seed_chunk(engine, schema, f"row-{index}", f"body {index}",
+                       {"id": str(index), "collection": "docs", "_elitea_run_id": "new-run"})
+
+        assert self.pks(schema, engine) == {f"row-{i}" for i in range(5)}
+
+    def test_it_agrees_with_the_digest_read(self, index_schema):
+        """Mutation: give the id query a different predicate from the digest query."""
+        schema, engine = index_schema
+        for index in range(4):
+            seed_chunk(engine, schema, f"row-{index}", f"body {index}",
+                       {"id": str(index), "collection": "docs", "_elitea_run_id": "new-run"})
+        adapter, wrapper = PGVectorAdapter(), wrapper_for(schema, engine)
+
+        _, digest_pks, _ = adapter.read_run_staged_digests(
+            wrapper, "new-run", chunk_digest, cap=100)
+
+        assert adapter.read_run_row_pks(wrapper, "new-run") == digest_pks
+
+    def test_another_runs_rows_are_not_returned(self, index_schema):
+        schema, engine = index_schema
+        seed_chunk(engine, schema, "mine", "a", {"id": "1", "_elitea_run_id": "new-run"})
+        seed_chunk(engine, schema, "theirs", "b", {"id": "2", "_elitea_run_id": "other-run"})
+
+        assert self.pks(schema, engine) == {"mine"}
+
+    def test_the_meta_row_is_not_returned(self, index_schema):
+        """Superseding the meta row would delete the index's own bookkeeping."""
+        schema, engine = index_schema
+        seed_chunk(engine, schema, "data", "a", {"id": "1", "_elitea_run_id": "new-run"})
+        seed_chunk(engine, schema, "meta-row", "index_meta_docs",
+                   {"type": "index_meta", "collection": "docs", "_elitea_run_id": "new-run"})
+
+        assert self.pks(schema, engine) == {"data"}
+
+    def test_a_run_with_no_rows_reads_empty(self, index_schema):
+        schema, engine = index_schema
+        assert self.pks(schema, engine) == set()
+
+    def test_it_is_unbounded_where_the_digest_read_is_capped(self, index_schema):
+        """The ceiling belongs to the digest map alone; the fence must cover everything."""
+        schema, engine = index_schema
+        for index in range(12):
+            seed_chunk(engine, schema, f"row-{index}", f"body {index}",
+                       {"id": str(index), "_elitea_run_id": "new-run"})
+        adapter, wrapper = PGVectorAdapter(), wrapper_for(schema, engine)
+
+        _, capped, truncated = adapter.read_run_staged_digests(
+            wrapper, "new-run", chunk_digest, cap=5)
+
+        assert truncated is True and len(capped) == 5
+        assert len(adapter.read_run_row_pks(wrapper, "new-run")) == 12
