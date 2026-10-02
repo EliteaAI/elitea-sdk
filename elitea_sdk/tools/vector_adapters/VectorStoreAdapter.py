@@ -151,6 +151,20 @@ class VectorStoreAdapter(ABC):
         prove the whole file is already stored. Returns {filename: (identity, row_pks)}."""
         return {}
 
+    def read_run_row_pks(self, vectorstore_wrapper, run_id: str) -> set:
+        """Just the row ids of this run's staged rows.
+
+        The supersede fence needs every adopted id; the digest map needs the id AND the
+        content of every row. Reading ids alone is what lets adoption outlive the memory
+        ceiling that chunk-level reuse has to respect.
+
+        Raises rather than returning an empty set: an adapter that reports a truncated
+        digest read but cannot enumerate its rows would leave the fence under-covering, and
+        every adopted row would be published beside its re-indexed copy. The caller treats
+        the failure as a reason to release the rows instead.
+        """
+        raise NotImplementedError("Reading staged row ids is not supported by this adapter")
+
     def ensure_index_runs_table(self, vectorstore_wrapper) -> None:
         raise NotImplementedError("Run staging is not supported by this adapter")
 
@@ -794,9 +808,13 @@ class PGVectorAdapter(VectorStoreAdapter):
                 return None
             if max_chunks is not None and self._run_chunks_exceed(
                     session, store, candidate_run_id, max_chunks):
-                # Claiming it would exclude it from this run's sweep, and adoption would
-                # then decline it anyway — leaving the largest runs pinned out of reach of
-                # the reclaim that should retire them. Leave it for the sweep.
+                # Refused rather than blocking the index for the length of one re-stamp.
+                # The rows are not saved for later either: the sweep deletes them once the
+                # heartbeat ages out, so the caller has to report this as unresumable.
+                logger.info(
+                    f"Not adopting run '{candidate_run_id}' of '{index_name}': it holds more "
+                    f"than {max_chunks} rows, more than one re-stamp should lock the index for"
+                )
                 session.rollback()
                 return None
             if run_row.status == RUN_STATUS_PENDING:
@@ -920,6 +938,15 @@ class PGVectorAdapter(VectorStoreAdapter):
         if not identity or not isinstance(total, int):
             return False
         return len(file["row_pks"]) == total
+
+    def read_run_row_pks(self, vectorstore_wrapper, run_id: str) -> set:
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            rows = session.query(store.EmbeddingStore.id).filter(
+                store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
+                self._non_index_meta_clause(store),
+            ).yield_per(5000)
+            return {str(row_pk) for (row_pk,) in rows}
 
     def _restamp_run_chunks(self, session, store, source_run_id: str, target_run_id: str) -> int:
         # Same predicate as _delete_runs_chunks, for the same reasons: containment so the

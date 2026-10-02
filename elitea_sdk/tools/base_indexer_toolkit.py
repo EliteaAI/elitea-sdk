@@ -16,6 +16,8 @@ from uuid import uuid4
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
+
+from ..runtime.tool_outcome import classify_tool_error, quota_exhausted, retriable_for
 from pydantic import create_model, Field, SecretStr
 
 from .index_params import (
@@ -574,6 +576,8 @@ def build_error_report(
     dependent_labels: Tuple[str, str],
     stats: Optional[IndexingStats] = None,
     indexed_count: int = 0,
+    failure: Optional[BaseException] = None,
+    retriable: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Report for a run that aborted before producing a result.
 
@@ -588,7 +592,27 @@ def build_error_report(
         dependent_labels=dependent_labels,
         errors=[error_message],
     )
+    if failure is not None:
+        report.update(describe_failure_cause(failure))
+    if retriable is not None:
+        # The classifier describes the error; only the caller knows whether THIS run could
+        # make progress on a retry.
+        report["retriable"] = retriable
     return report
+
+
+def describe_failure_cause(failure: BaseException) -> Dict[str, Any]:
+    """Publish what kind of failure this was as fields, so nobody has to match substrings
+    to learn whether waiting could help. Empty when unclassifiable: no label is safer than
+    a wrong one a consumer would branch on.
+    """
+    error_class = classify_tool_error(failure)
+    if error_class is None:
+        return {}
+    return {
+        "error_class": error_class.value,
+        "retriable": retriable_for(error_class),
+    }
 
 
 def _pick_noun(count: int, labels: Dict[str, str]) -> str:
@@ -967,6 +991,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     adoption_max_chunks: ClassVar[int] = 200_000
 
+    # Adoption re-stamps every row in one statement under the index meta lock, which Stop,
+    # discard, cancel and promote all contend for. Measured: 10.2s at 500k rows, 26s at 1M,
+    # minutes beyond. Past this the generation is discarded instead, which loses it — both
+    # outcomes are bad, and this is where blocking the index becomes the worse one.
+    adoption_restamp_max_chunks: ClassVar[int] = 500_000
+
     connection_string: Optional[SecretStr] = None
     collection_name: Optional[str] = None
     elitea: Any = None # Elitea client, if available
@@ -1312,7 +1342,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Do maximum effort at least send custom event for supposed changed status
             self._stop_run_heartbeat()
             msg = str(e)
-            if self._staging_active():
+            # A spent quota refuses the same first files every time, so a corpus larger than
+            # one quota window only finishes if the rows are kept. Parking is worth it only
+            # where a later run would claim them; elsewhere the sweep deletes them anyway, a
+            # window later, with every attempt still calling itself retriable.
+            unresumable = (self._staging_active() and quota_exhausted(e)
+                           and self._unresumable_quota_reason())
+            park_for_resume = (self._staging_active() and quota_exhausted(e)
+                               and not unresumable)
+            resumable_quota = not unresumable
+            if unresumable:
+                msg = (f"{msg}; the progress already made is discarded rather than retried "
+                       f"indefinitely, because {unresumable}. Raise the API quota for this "
+                       f"credential, or narrow the index scope, so a run can finish within "
+                       f"one quota window")
+            if self._staging_active() and not park_for_resume:
                 try:
                     self._discard_index_run(index_name)
                 except Exception as de:
@@ -1334,13 +1378,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         item_labels=self.index_item_labels,
                         dependent_labels=self.index_dependent_labels,
                         stats=self.get_indexing_stats(),
+                        failure=e,
+                        retriable=None if resumable_quota else False,
                     )
                     self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
                                            error=msg, report=error_report)
             except Exception as ie:
                 logger.error(f"Failed to update index meta status to FAILED for index '{index_name}': {ie}")
                 msg = f"{msg}; additionally failed to update index meta status to FAILED: {ie}"
+            if park_for_resume:
+                try:
+                    self._discard_index_run(index_name, retain_for_resume=True)
+                except Exception as de:
+                    logger.error(f"Failed to park staged rows for index '{index_name}': {de}")
             self._emit_index_event(index_name, error=msg, state=IndexerKeywords.INDEX_META_FAILED.value)
+            if unresumable:
+                # An agent sees the exception, not the meta row, so the remedy travels with
+                # it; `from e` keeps the provider error reachable for the classifier.
+                raise ToolException(msg) from e
             raise e
         finally:
             # Backstop for every exit; the handlers above stop it first, so their
@@ -1409,7 +1464,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return None
         try:
             return self.vector_adapter.claim_adoptable_run(
-                self, index_name, stale_before, self.adoption_max_chunks
+                self, index_name, stale_before, self.adoption_restamp_max_chunks
             )
         except Exception as claim_failure:
             logger.warning(
@@ -1456,12 +1511,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._release_adopted_rows()
             return
         if truncated:
-            logger.warning(
-                f"The adopted run holds more than {self.adoption_max_chunks} rows, so they "
-                f"are dropped and re-indexed; raise adoption_max_chunks to reuse at this size"
+            # Dropping these lost the progress, so a corpus needing several quota windows
+            # never converged. The ids alone are cheap enough to keep the fence exact, which
+            # is all file-level resumption needs; only chunk-content reuse is given up.
+            try:
+                row_pks = self.vector_adapter.read_run_row_pks(self, run.run_id)
+            except Exception as read_failure:
+                logger.warning(
+                    f"Could not read the adopted row ids, so they are dropped and "
+                    f"re-indexed: {read_failure}"
+                )
+                self._release_adopted_rows()
+                return
+            logger.info(
+                f"The adopted run holds more than {self.adoption_max_chunks} rows, so "
+                f"{len(row_pks)} are kept by id and only the first are reusable by content"
             )
-            self._release_adopted_rows()
-            return
+        # The digest map may be partial; the id set never is. A chunk the map covers is
+        # reused, anything else superseded — correct either way, and partial reuses more.
         run.adoptable_chunks = digests
         run.adopted_row_pks = row_pks
         try:
@@ -1634,13 +1701,48 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run.finalized = True
         return outcome
 
-    def _discard_index_run(self, index_name: str):
+    def _unresumable_quota_reason(self) -> Optional[str]:
+        """Why a quota failure cannot keep its progress, phrased as something to act on.
+
+        None when it can. Each branch is a case where a later run would not claim the parked
+        rows, so parking them only delays their deletion by one sweep.
+        """
+        run = getattr(self, "_index_run", None)
+        if run is not None and run.clean_index:
+            return ("Clean Index rewrites the whole corpus and never resumes from an "
+                    "interrupted run, so turning it off would let a later run continue")
+        if not self.adoption_enabled:
+            return "resuming interrupted runs is switched off for this index"
+        if not self._generation_fits_the_restamp_bound():
+            return (f"the interrupted generation is larger than this index can re-stamp in "
+                    f"one step, over adoption_restamp_max_chunks="
+                    f"{self.adoption_restamp_max_chunks}")
+        return None
+
+    def _generation_fits_the_restamp_bound(self) -> bool:
+        """Whether a later run's claim would accept this generation, or refuse it for size
+        and leave the sweep to delete it."""
+        run = getattr(self, "_index_run", None)
+        if run is None:
+            return False
+        generation = run.chunks_written + len(run.adopted_row_pks - run.reused_row_pks)
+        if generation <= self.adoption_restamp_max_chunks:
+            return True
+        logger.warning(
+            f"The interrupted generation holds {generation} rows, above "
+            f"adoption_restamp_max_chunks ({self.adoption_restamp_max_chunks}), so no later "
+            f"run could adopt it; the rows are discarded rather than parked to be swept."
+        )
+        return False
+
+    def _discard_index_run(self, index_name: str, retain_for_resume: bool = False):
         run = getattr(self, "_index_run", None)
         # The latch makes promote and discard mutually exclusive: a terminal meta
         # write failing AFTER promote must not delete the corpus just published.
         if run is None or run.finalized:
             return
-        self.vector_adapter.discard_run(self, index_name, run.run_id)
+        self.vector_adapter.discard_run(self, index_name, run.run_id,
+                                        retain_chunks=retain_for_resume)
         run.finalized = True
 
     def _foreign_live_run_exists(self, index_name: str) -> bool:

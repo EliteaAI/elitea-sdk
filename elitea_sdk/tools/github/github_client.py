@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import json
 import re
 import fnmatch
 import zipfile
@@ -14,9 +15,14 @@ logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field, model_validator
 
-from github import Auth, Github, GithubIntegration, Repository
+from github import Auth, Github, GithubIntegration, GithubRetry, Repository
+from github.GithubException import RateLimitExceededException
+from github.Requester import Requester
+from urllib3.exceptions import MaxRetryError
 from github.Consts import DEFAULT_BASE_URL
 from langchain_core.tools import ToolException
+
+from ...runtime.tool_outcome import quota_exhausted
 
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.tool_groups import tool_group, with_tool_groups
@@ -90,10 +96,102 @@ from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION
 GITHUB_DOCUMENTED_GET_LIMIT_PER_SECOND = 15
 GITHUB_INDEXER_REQUESTS_PER_SECOND = 10
 GITHUB_SECONDS_BETWEEN_REQUESTS = 1 / GITHUB_INDEXER_REQUESTS_PER_SECOND
+# PyGithub's default retry sleeps until a primary rate limit resets — 2140s measured on an
+# anonymous credential — so the outage never becomes an exception anything can classify.
+GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS = 60.0
+
+
+def _means_ref_is_absent(error) -> bool:
+    """A 403 or 401 here is about the request, not the ref; blaming the ref hides it."""
+    return getattr(error, "status", None) == 404
 GITHUB_DEFAULT_PAGE_SIZE = 30
 GITHUB_ISSUE_COMMENTS_LIMIT = GITHUB_DEFAULT_PAGE_SIZE
 GITHUB_TOOLKIT_TYPE = 'github'
 GITHUB_ISSUE_COMMENTS_NOTE_RESERVE = 512
+
+
+class BoundedGithubRetry(GithubRetry):
+    """Retries transient failures, but refuses to sleep out a long rate-limit reset.
+
+    PyGithub announces its intended wait by replacing get_backoff_time on the retry it
+    returns, which is why that is what gets inspected. The bound is on the WAIT rather than
+    the retry count, so a brief secondary-rate pause still retries normally.
+    """
+
+    max_rate_limit_sleep_seconds = GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS
+
+    @classmethod
+    def for_reads_only(cls, **kwargs):
+        """Retries only the methods that are safe to repeat.
+
+        PyGithub's allowed_methods includes POST. A GitHub App client previously had
+        retry=None and retried nothing, so inheriting that would newly let a 502 on
+        create_issue or a PR comment produce duplicates.
+        """
+        return cls(allowed_methods=frozenset({"GET", "HEAD", "OPTIONS", "TRACE"}), **kwargs)
+
+    @staticmethod
+    def _intended_wait(retry, response) -> float:
+        """How long urllib3 is about to sleep, from whichever source wins.
+
+        A Retry-After header is honoured instead of the backoff, and leaves
+        get_backoff_time at 0 — so reading only that misses every secondary rate limit.
+        """
+        waits = []
+        for read in (lambda: retry.get_backoff_time(),
+                     lambda: retry.get_retry_after(response)
+                     if getattr(retry, "respect_retry_after_header", False) else None):
+            try:
+                value = read()
+            except Exception:  # pylint: disable=W0703
+                continue
+            if isinstance(value, (int, float)):
+                waits.append(float(value))
+        return max(waits) if waits else 0.0
+
+    def increment(self, method=None, url=None, response=None, error=None,
+                  _pool=None, _stacktrace=None):
+        try:
+            retry = super().increment(method, url, response, error, _pool, _stacktrace)
+        except MaxRetryError:
+            # Retries ran out, and by now the body has been read — so this would otherwise
+            # surface as an untyped 403 and classify as 'policy', asserting a credential
+            # problem that waiting cannot fix. Failing here also pays the wait only once.
+            if response is not None and self._is_rate_limited(response):
+                raise self._long_wait_error(response, url) from None
+            raise
+        if response is None:
+            return retry
+        if not self._is_rate_limited(response):
+            # A 5xx carrying Retry-After is a server asking us to wait, not a quota; capping
+            # it would skip a legitimate wait and report it as a rate limit.
+            return retry
+        intended_wait = self._intended_wait(retry, response)
+        if intended_wait <= self.max_rate_limit_sleep_seconds:
+            return retry
+        raise self._long_wait_error(response, url)
+
+    def _long_wait_error(self, response, url):
+        """The exception PyGithub would have raised had it judged this non-retryable.
+
+        Built from the body where it is still readable, because a 403 is not necessarily a
+        quota and a refusal must not be parked as retriable. super() reads the body only
+        when Retry-After is absent, so on the other branch it survives; otherwise the
+        headers are all that is left.
+        """
+        if "Retry-After" in (response.headers or {}):
+            try:
+                body = json.loads(self.get_content(response, url) or b"{}")
+            except Exception:  # pylint: disable=W0703
+                body = None
+            if isinstance(body, dict) and body:
+                return Requester.createException(response.status, response.headers, body)
+        return RateLimitExceededException(
+            response.status, {"message": "API rate limit exceeded"}, response.headers)
+
+    @staticmethod
+    def _is_rate_limited(response) -> bool:
+        return getattr(response, "status", None) in (403, 429)
 
 
 class GitHubClient(BaseModel):
@@ -204,15 +302,19 @@ class GitHubClient(BaseModel):
             # Create GitHub client
             if auth is None:
                 return Github(base_url=self.github_base_url,
-                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
+                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS,
+                              retry=BoundedGithubRetry(total=10, raise_on_status=False))
             elif auth_config.github_app_id and auth_config.github_app_private_key:
-                gi = GithubIntegration(base_url=self.github_base_url, auth=auth,
-                                       seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
+                gi = GithubIntegration(
+                    base_url=self.github_base_url, auth=auth,
+                    seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS,
+                    retry=BoundedGithubRetry.for_reads_only(total=10, raise_on_status=False))
                 installation = gi.get_installations()[0]
                 return installation.get_github_for_installation()
             else:
                 return Github(base_url=self.github_base_url, auth=auth,
-                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
+                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS,
+                              retry=BoundedGithubRetry(total=10, raise_on_status=False))
 
         # Get shared client from registry (or create new one)
         registry = get_client_registry()
@@ -254,10 +356,12 @@ class GitHubClient(BaseModel):
         Returns:
             List of file paths
         """
-        blob_shas_by_path = self._get_files_with_identity(directory_path, ref, repo_name)
-        if isinstance(blob_shas_by_path, str):
-            return blob_shas_by_path
-        return list(blob_shas_by_path)
+        # Agent tools document "a plaintext report"; the indexer takes the raising path
+        # through the api_wrapper instead.
+        try:
+            return list(self._get_files_with_identity(directory_path, ref, repo_name))
+        except ToolException as e:
+            return f"Error: {e}"
 
     def _get_files_with_identity(self, directory_path: str, ref: str,
                                  repo_name: Optional[str] = None) -> Dict[str, str]:
@@ -288,7 +392,9 @@ class GitHubClient(BaseModel):
                     commit = repo.get_commit(ref)
                     tree_sha = commit.commit.tree.sha
                 except GithubException as e:
-                    return f"Error: Could not resolve ref '{ref}': {e.message}"
+                    if not _means_ref_is_absent(e):
+                        raise
+                    raise ToolException(f"Could not resolve ref '{ref}'") from e
 
             # Fetch entire tree recursively in ONE API call
             # This returns up to 100,000 entries - sufficient for most repos
@@ -318,10 +424,12 @@ class GitHubClient(BaseModel):
 
             return files
 
-        except GithubException as e:
-            return f"Error: status code {e.status}, {e.message}"
+        except ToolException:
+            raise
         except Exception as e:
-            return f"Error fetching files: {str(e)}"
+            # `from e` is load-bearing: classify_tool_error walks __cause__ to reach the
+            # provider's type and status, which is what tells a rate limit from a refusal.
+            raise ToolException(f"Could not list the repository files: {e}") from e
 
     @tool_group('read')
     def get_files_from_directory(self, directory_path: str, repo_name: Optional[str] = None) -> str:
@@ -1786,6 +1894,9 @@ class GitHubClient(BaseModel):
                 
             except Exception as e:
                 last_exception = e
+                if quota_exhausted(e):
+                    # Three attempts inside 1.5s cannot outlast a quota that resets hourly.
+                    raise
                 if attempt < max_retries - 1:
                     # Exponential backoff: 0.5s, 1.0s, 2.0s, ...
                     wait_time = retry_delay * (2 ** attempt)
@@ -1793,8 +1904,11 @@ class GitHubClient(BaseModel):
                     time.sleep(wait_time)
                     continue
         
-        # All retries exhausted
-        raise ToolException(f"File not found `{file_path}` on branch `{branch}` after {max_retries} attempts. Error: {str(last_exception)}")
+        # `from` keeps the provider's type reachable; the old wording called every cause,
+        # including a refusal, a missing file.
+        raise ToolException(
+            f"Could not read `{file_path}` on branch `{branch}` after {max_retries} "
+            f"attempts: {last_exception}") from last_exception
 
     @tool_group('read')
     def read_file(self, file_path: str, branch: Optional[str] = None, repo_name: Optional[str] = None,
@@ -2561,7 +2675,6 @@ class GitHubClient(BaseModel):
             }
             # Remove keys where value could not be retrieved (None due to missing attribute)
             user_data = {k: v for k, v in user_data.items() if v is not None}
-            import json
             return json.dumps(user_data, indent=2)
         except Exception as e:
             raise ToolException(f"Failed to get authenticated user: {str(e)}")
@@ -2688,7 +2801,6 @@ class GitHubClient(BaseModel):
                 "page": page,
                 "per_page": per_page,
             }
-            import json
             return json.dumps(response, indent=2)
 
         except GithubException as e:

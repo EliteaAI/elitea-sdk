@@ -356,7 +356,7 @@ class FakeStagingAdapter:
         self.calls.append("promote")
         return self.promote_outcome
 
-    def discard_run(self, wrapper, index_name, run_id):
+    def discard_run(self, wrapper, index_name, run_id, retain_chunks=False):
         self.calls.append("discard")
         return "discarded"
 
@@ -1003,7 +1003,7 @@ class TestDiscardFailureStillRecordsTheFailure:
     def test_the_failed_state_is_written_and_emitted(self, staged_toolkit, monkeypatch):
         seed_completed_meta(staged_toolkit)
 
-        def failing_discard(wrapper, index_name, run_id):
+        def failing_discard(wrapper, index_name, run_id, retain_chunks=False):
             raise RuntimeError("chunk delete timed out")
 
         monkeypatch.setattr(staged_toolkit.vector_adapter, "discard_run", failing_discard)
@@ -1018,7 +1018,7 @@ class TestDiscardFailureStillRecordsTheFailure:
     def test_the_retained_counts_survive_the_failed_write(self, staged_toolkit, monkeypatch):
         seed_completed_meta(staged_toolkit)
 
-        def failing_discard(wrapper, index_name, run_id):
+        def failing_discard(wrapper, index_name, run_id, retain_chunks=False):
             raise RuntimeError("chunk delete timed out")
 
         monkeypatch.setattr(staged_toolkit.vector_adapter, "discard_run", failing_discard)
