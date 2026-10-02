@@ -141,6 +141,9 @@ def _html_to_text(content: str) -> str:
     return re.sub(r"\s*\n\s*", "\n", text).strip()
 
 
+_INLINE_MENTION = re.compile(r"@\[([^\[\]]+)\]")
+
+
 def _text_to_html(text: str) -> str:
     return html_lib.escape(text or "").replace("\n", "<br>")
 
@@ -976,24 +979,42 @@ class TeamsGraphWrapper:
                          subject: Optional[str] = None, importance: Optional[str] = None) -> dict:
         if not (message or "").strip():
             raise ToolException("message must not be empty")
-        people = [m.strip() for m in mentions or [] if m and m.strip()]
-        content = message if html else (_text_to_html(message) if people else message)
+        listed = [m.strip() for m in mentions or [] if m and m.strip()]
+        parts = _INLINE_MENTION.split(message)  # even index: literal text, odd index: inline mention identifier
+        has_inline = len(parts) > 1
         payload: Dict[str, Any] = {}
-        if people:
-            tags = []
-            mention_items = []
-            for idx, ident in enumerate(people):
+        content = message
+        if listed or has_inline:
+            inline_users = {i: self._resolve_user(part.strip()) for i, part in enumerate(parts) if i % 2}
+            placed = {(u.get("id") or "").lower() for u in inline_users.values()}
+            leading, seen = [], set()
+            for ident in listed:
                 user = self._resolve_user(ident)
-                name = user.get("displayName") or ident
-                tags.append(f'<at id="{idx}">{html_lib.escape(name)}</at>')
+                uid = (user.get("id") or "").lower()
+                if uid not in placed and uid not in seen:
+                    seen.add(uid)
+                    leading.append(user)
+
+            mention_items: List[Dict[str, Any]] = []
+
+            def _tag(user: dict) -> str:
+                name = user.get("displayName") or user.get("mail") or user["id"]
+                idx = len(mention_items)
                 mention_items.append({
                     "id": idx,
                     "mentionText": name,
                     "mentioned": {"user": {"id": user["id"], "displayName": name, "userIdentityType": "aadUser"}},
                 })
-            content = " ".join(tags) + " " + content
+                return f'<at id="{idx}">{html_lib.escape(name)}</at>'
+
+            lead = [_tag(u) for u in leading]
+            body = "".join(
+                _tag(inline_users[i]) if i % 2 else (part if html else _text_to_html(part))
+                for i, part in enumerate(parts)
+            )
+            content = " ".join([*lead, body])
             payload["mentions"] = mention_items
-        payload["body"] = {"contentType": "html" if (html or people) else "text", "content": content}
+        payload["body"] = {"contentType": "html" if (html or listed or has_inline) else "text", "content": content}
         if subject:
             payload["subject"] = subject
         if importance and importance != "normal":
