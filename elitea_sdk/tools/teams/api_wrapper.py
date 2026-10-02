@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from .graph_wrapper import TeamsGraphWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 from .models import (
     ListTeams,
     ListChannels,
@@ -102,10 +103,12 @@ class TeamsApiWrapper(BaseModel):
     #  Tool Methods                                                        #
     # ------------------------------------------------------------------ #
 
+    @tool_group('read')
     def list_teams(self, name_contains: Optional[str] = None) -> List[Dict[str, Any]]:
         """List teams the user is a member of."""
         return self._ensure_backend().list_teams(name_contains=name_contains)
 
+    @tool_group('read')
     def list_channels(
         self,
         team: str,
@@ -121,6 +124,7 @@ class TeamsApiWrapper(BaseModel):
             include_links=include_links,
         )
 
+    @tool_group('read')
     def list_chats(
         self,
         chat_type: Optional[str] = None,
@@ -148,6 +152,7 @@ class TeamsApiWrapper(BaseModel):
             last_message_chars=last_message_chars,
         )
 
+    @tool_group('read')
     def find_chat_messages(
         self,
         chat: str,
@@ -177,6 +182,7 @@ class TeamsApiWrapper(BaseModel):
             include_links=include_links,
         )
 
+    @tool_group('read')
     def search_teams_messages(
         self,
         query: Optional[str] = None,
@@ -194,6 +200,7 @@ class TeamsApiWrapper(BaseModel):
             include_links=include_links,
         )
 
+    @tool_group('write')
     def send_chat_message(
         self,
         message: str,
@@ -215,6 +222,7 @@ class TeamsApiWrapper(BaseModel):
             importance=importance,
         )
 
+    @tool_group('write')
     def send_channel_message(
         self,
         team: str,
@@ -249,6 +257,7 @@ class TeamsApiWrapper(BaseModel):
             raise ValueError(f"Unknown action: {action}")
         return action_map[action](**kwargs)
 
+    @with_tool_groups
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Return list of available tools with their schemas."""
         return [
