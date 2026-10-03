@@ -3,9 +3,12 @@
 Uses OAuth tokens obtained via the Azure AD OAuth flow to communicate
 with https://graph.microsoft.com/v1.0 Mail endpoints.
 
-Required OAuth scopes (delegated):
-    Mail.Read, Mail.ReadWrite, Mail.Send
-    (offline_access for token refresh)
+OAuth scopes (delegated), ticked in the Outlook credential:
+    Mail.Read                         read, search and track messages, list folders
+    Mail.ReadWrite                    mark as read, move, delete; drafts for send / reply IDs
+    Mail.Send                         send_mail, reply_to_message
+    Mail.*.Shared                     the same for a shared mailbox (Mailbox field)
+    (offline_access is always added, for token refresh)
 
 Every request asks Graph for immutable item IDs (``Prefer: IdType="ImmutableId"``),
 so message IDs returned by this wrapper stay valid when a message is moved between
@@ -18,9 +21,12 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import requests
 from langchain_core.tools import ToolException
+
+from ...configurations.microsoft_graph_scopes import missing_permission_hint
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -54,7 +60,25 @@ _SUMMARY_FIELDS = ("id,conversationId,parentFolderId,subject,from,toRecipients,c
 _CHECK_FIELDS = "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead"
 _SENT_FIELDS = "id,conversationId,internetMessageId,subject,toRecipients,sentDateTime"
 
+# Last path segments of Graph actions that send mail; other writes need Mail.ReadWrite.
+_SEND_ACTIONS = {"send", "sendmail", "reply", "replyall", "forward"}
+
 log = logging.getLogger(__name__)
+
+
+def _needed_permission(method: Optional[str], url: str, shared: bool) -> Optional[str]:
+    """Microsoft Graph permission a mail request needs, for the 403 hint."""
+    path = urlparse(url or "").path.rstrip("/")
+    if not path:
+        return None
+    action = path.rsplit("/", 1)[-1].lower()
+    if action in _SEND_ACTIONS:
+        needed = "Mail.Send"
+    elif (method or "GET").upper() == "GET":
+        needed = "Mail.Read"
+    else:
+        needed = "Mail.ReadWrite"
+    return f"{needed}.Shared" if shared else needed
 
 
 class _Bound(NamedTuple):
@@ -303,7 +327,7 @@ class OutlookGraphWrapper:
         auth_error.tool_name = None
         raise auth_error
 
-    def _raise_with_body(self, resp: requests.Response) -> None:
+    def _raise_with_body(self, resp: requests.Response, method: Optional[str] = None) -> None:
         """Raise an HTTPError whose message carries Graph's own error text.
 
         Stays an HTTPError with .response set: callers branch on the status and body.
@@ -331,6 +355,8 @@ class OutlookGraphWrapper:
         elif resp.status_code == 404:
             hint = (" The item does not exist or is not visible to the signed-in user; "
                     "do not retry with the same ID, look it up with list_messages / list_folders.")
+        elif resp.status_code == 403:
+            hint = missing_permission_hint(_needed_permission(method, resp.url, bool(self._mailbox)))
         api_message = str(api_message).rstrip(". ")
         exc = requests.HTTPError(
             f"Microsoft Graph returned HTTP {resp.status_code}: {api_message}.{hint}", response=resp
@@ -372,14 +398,14 @@ class OutlookGraphWrapper:
         resp = requests.get(url, headers=self._auth_headers(prefer=prefer), params=params, timeout=60)
         if resp.status_code == 401 and self._try_refresh_token():
             resp = requests.get(url, headers=self._auth_headers(prefer=prefer), params=params, timeout=60)
-        self._raise_with_body(resp)
+        self._raise_with_body(resp, "GET")
         return resp.json()
 
     def _post(self, url: str, payload: Optional[dict]) -> dict:
         resp = requests.post(url, headers=self._auth_headers(), json=payload, timeout=60)
         if resp.status_code == 401 and self._try_refresh_token():
             resp = requests.post(url, headers=self._auth_headers(), json=payload, timeout=60)
-        self._raise_with_body(resp)
+        self._raise_with_body(resp, "POST")
         if resp.status_code == 202 or resp.status_code == 204:
             return {"status": "success"}
         return resp.json()
@@ -388,14 +414,14 @@ class OutlookGraphWrapper:
         resp = requests.patch(url, headers=self._auth_headers(), json=payload, timeout=60)
         if resp.status_code == 401 and self._try_refresh_token():
             resp = requests.patch(url, headers=self._auth_headers(), json=payload, timeout=60)
-        self._raise_with_body(resp)
+        self._raise_with_body(resp, "PATCH")
         return resp.json()
 
     def _delete(self, url: str) -> None:
         resp = requests.delete(url, headers=self._auth_headers(), timeout=30)
         if resp.status_code == 401 and self._try_refresh_token():
             resp = requests.delete(url, headers=self._auth_headers(), timeout=30)
-        self._raise_with_body(resp)
+        self._raise_with_body(resp, "DELETE")
 
     # ------------------------------------------------------------------ #
     #  Paging / query helpers                                             #
