@@ -2213,13 +2213,29 @@ class LLMNode(BaseTool):
 
         target_tool = hitl_ctx.get('tool_name', '')
         target_args = hitl_ctx.get('tool_args', {}) or {}
-        matching_tc = None
+        completed_call_ids = {
+            message.tool_call_id
+            for message in messages
+            if isinstance(message, ToolMessage) and message.tool_call_id
+        }
+        matching_calls = []
         for tc in (original_ai.tool_calls or []):
             tc_name = tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')
             tc_args = tc.get('args', {}) if isinstance(tc, dict) else getattr(tc, 'args', {})
             if tc_name == target_tool and args_match_normalized(tc_args, target_args):
-                matching_tc = tc
-                break
+                matching_calls.append(tc)
+        # Identical sibling arguments do not identify one logical invocation.
+        # Resume the first matching call without a result. Keep the historical
+        # completed-call path when all matches already have results, so replay
+        # cannot synthesize an extra invocation.
+        matching_tc = next(
+            (
+                tc for tc in matching_calls
+                if (tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', ''))
+                not in completed_call_ids
+            ),
+            matching_calls[0] if matching_calls else None,
+        )
         if matching_tc is None:
             # Fallback: match by tool name only when there's exactly one
             # tool_call with that name.  After JSON round-trip through the
