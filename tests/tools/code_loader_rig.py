@@ -57,8 +57,16 @@ class AttestingIdentityToolkit(IdentityToolkit):
     loader_attests_completion = True
 
 
+class SameSpaceEmbeddings:
+    vector = [1.0, 0.0]
+
+    def embed_documents(self, texts):
+        return [list(self.vector) for _ in texts]
+
+
 class FakeStagingAdapter:
     supports_run_staging = True
+    embedding_samples = [("sample text", SameSpaceEmbeddings.vector)]
 
     def __init__(self):
         self.calls = []
@@ -68,6 +76,9 @@ class FakeStagingAdapter:
 
     def ensure_index_runs_table(self, wrapper):
         pass
+
+    def read_run_embedding_samples(self, wrapper, run_id, limit):
+        return [(text, list(vector)) for text, vector in self.embedding_samples[:limit]]
 
     def register_index_run(self, wrapper, index_name, run_id, task_id=None, meta_lock_id=None):
         return (True, None)
@@ -127,6 +138,7 @@ def build_toolkit(monkeypatch, tree, indexed, toolkit_cls=IdentityToolkit, conte
     object.__setattr__(instance, "toolkit_id", None)
     object.__setattr__(instance, "max_docs_per_add", 100)
     object.__setattr__(instance, "llm", None)
+    object.__setattr__(instance, "embeddings", SameSpaceEmbeddings())
     object.__setattr__(instance, "tree", dict(tree))
     object.__setattr__(instance, "contents", dict(contents or {}))
     object.__setattr__(instance, "reads", [])

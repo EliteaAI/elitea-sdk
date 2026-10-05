@@ -2,6 +2,7 @@ import contextvars
 import copy
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -9,6 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
+from http import HTTPStatus
 from queue import Empty, Full, Queue
 from typing import Any, Callable, ClassVar, Optional, List, Dict, Generator, Set, Tuple, Union
 from uuid import uuid4
@@ -17,7 +19,7 @@ from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 
-from ..runtime.tool_outcome import classify_tool_error, quota_exhausted, retriable_for
+from ..runtime.tool_outcome import ToolErrorClass, classify_tool_error, quota_exhausted, retriable_for
 from pydantic import create_model, Field, SecretStr
 
 from .index_params import (
@@ -27,6 +29,7 @@ from .index_params import (
     build_base_stepback_search_params,
 )
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
+from .utils.retry import is_server_error_retriable, retry_on_server_error
 from .utils.tool_groups import tool_group, with_tool_groups
 from .utils.serialization import serialize_tool_result
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
@@ -781,6 +784,33 @@ def candidate_chunk_digest(document: Document) -> bytes:
     return chunk_digest(text_digest, document.metadata)
 
 
+retry_like_add_documents = retry_on_server_error(
+    max_attempts=5, wait_seconds=(15, 30, 60, 120), log=logger
+)
+
+
+@retry_like_add_documents
+def embed_probe_texts(embeddings, texts: List[str]) -> List[List[float]]:
+    return embeddings.embed_documents(texts)
+
+
+def probe_failure_can_clear(failure: BaseException) -> bool:
+    return (is_server_error_retriable(failure)
+            or getattr(failure, "status_code", None) == HTTPStatus.REQUEST_TIMEOUT
+            or classify_tool_error(failure) is ToolErrorClass.INFRASTRUCTURE)
+
+
+def vectors_agree(stored: List[float], current: List[float], tolerance: float) -> bool:
+    if len(stored) != len(current):
+        return False
+    scale = max(math.hypot(*stored), math.hypot(*current))
+    return scale > 0 and math.dist(stored, current) <= tolerance * scale
+
+
+class AdoptionProbeUnavailable(ToolException):
+    pass
+
+
 class IndexRunRefusedError(ToolException):
     """Refusal to start an indexing run while another one owns the index.
 
@@ -991,6 +1021,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     adoption_max_chunks: ClassVar[int] = 200_000
 
+    adoption_probe_max_relative_distance: ClassVar[float] = 0.1
+    adoption_probe_rows: ClassVar[int] = 3
+
     # Adoption re-stamps every row in one statement under the index meta lock, which Stop,
     # discard, cancel and promote all contend for. Measured: 10.2s at 500k rows, 26s at 1M,
     # minutes beyond. Past this the generation is discarded instead, which loses it — both
@@ -1190,9 +1223,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 self._clean_index(index_name)
             #
             self.index_meta_init(index_name, kwargs)
-            self._load_adopted_chunk_digests()
             if staging:
                 self._start_run_heartbeat(index_name)
+            self._load_adopted_chunk_digests()
             self._emit_index_event(index_name)
             #
             self._log_tool_event(f"Indexing data into collection with suffix '{index_name}'. It can take some time...")
@@ -1346,9 +1379,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # one quota window only finishes if the rows are kept. Parking is worth it only
             # where a later run would claim them; elsewhere the sweep deletes them anyway, a
             # window later, with every attempt still calling itself retriable.
-            unresumable = (self._staging_active() and quota_exhausted(e)
+            parkable = quota_exhausted(e) or isinstance(e, AdoptionProbeUnavailable)
+            unresumable = (self._staging_active() and parkable
                            and self._unresumable_quota_reason())
-            park_for_resume = (self._staging_active() and quota_exhausted(e)
+            park_for_resume = (self._staging_active() and parkable
                                and not unresumable)
             resumable_quota = not unresumable
             if unresumable:
@@ -1499,6 +1533,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run = getattr(self, "_index_run", None)
         if run is None or not run.adopted_from_run_id:
             return
+        if not self._adopted_rows_embed_like_this_run():
+            self._release_adopted_rows()
+            return
         try:
             digests, row_pks, truncated = self.vector_adapter.read_run_staged_digests(
                 self, run.run_id, chunk_digest, self.adoption_max_chunks
@@ -1546,6 +1583,42 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         # still succeeds, just at full cost. This line is the only signal that the
         # digests were prepared at all.
         logger.info(f"Indexed {len(row_pks)} adopted rows for reuse")
+
+    def _adopted_rows_embed_like_this_run(self) -> bool:
+        run = self._index_run
+        try:
+            samples = self.vector_adapter.read_run_embedding_samples(
+                self, run.run_id, self.adoption_probe_rows
+            )
+        except Exception as read_failure:
+            logger.warning(
+                f"Could not read the adopted rows' vectors, so they are dropped and "
+                f"re-embedded: {read_failure}"
+            )
+            return False
+        try:
+            current = embed_probe_texts(self.embeddings, [text for text, _ in samples]) if samples else []
+        except Exception as probe_failure:
+            if probe_failure_can_clear(probe_failure):
+                raise AdoptionProbeUnavailable(
+                    f"Could not reach '{self.embedding_model}' to check the rows adopted from an "
+                    f"interrupted run; they are kept for the next run to check: {probe_failure}"
+                ) from probe_failure
+            logger.warning(
+                f"'{self.embedding_model}' rejected the adoption probe, so the adopted rows are "
+                f"dropped and re-embedded: {probe_failure}"
+            )
+            return False
+        if samples and len(current) == len(samples) and all(
+            vectors_agree(stored, fresh, self.adoption_probe_max_relative_distance)
+            for (_, stored), fresh in zip(samples, current)
+        ):
+            return True
+        logger.warning(
+            f"The adopted rows were not embedded the way '{self.embedding_model}' embeds now, "
+            f"so they are dropped and re-embedded rather than mixed with this run's vectors"
+        )
+        return False
 
     def _release_adopted_rows(self) -> None:
         """Delete the adopted rows when this run cannot reuse them.
