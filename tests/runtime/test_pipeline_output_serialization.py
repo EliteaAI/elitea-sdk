@@ -7,7 +7,10 @@ symptom on a path with no LLM in it.
 
 import json
 
-from elitea_sdk.runtime.langchain.langraph_agent import normalize_message_content
+from elitea_sdk.runtime.langchain.langraph_agent import (
+    extract_terminal_state_output, extract_state_fallback_output,
+    normalize_message_content,
+)
 
 
 def test_dict_output_is_json_not_a_repr():
@@ -55,3 +58,24 @@ def test_search_hits_are_not_concatenated_into_one_string():
 
 def test_bare_text_chunks_still_join():
     assert normalize_message_content([{"text": "a"}, {"text": "b"}]) == "ab"
+
+
+def test_empty_content_list_is_blank_not_a_literal_brackets():
+    # Sonnet returns AIMessage(content=[]) in synthesis turns after tool calls
+    # (#5057). Serializing it gave "[]", which the blank-content skips read as an
+    # answer, so "[]" reached the user and eval scored it as agent output.
+    assert normalize_message_content([]) == ""
+
+
+def test_empty_list_variable_does_not_win_terminal_output():
+    state = {"answer": "the real answer", "matches": []}
+
+    assert extract_terminal_state_output(state, ["answer", "matches"]) == "the real answer"
+
+
+def test_coordination_channels_do_not_become_the_answer():
+    # A react agent whose final reply was blank: only create_state()'s own channels
+    # hold values, and none of them is an answer.
+    state = {"input": "q", "messages": [], "_auto_routing": {}, "parallel_tasks": {},
+             "_pipeline_blocked": None, "context_info": None}
+    assert extract_state_fallback_output(state) is None
