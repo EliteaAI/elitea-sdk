@@ -52,16 +52,12 @@ nodes:
         import random
         import string
 
-        # Generate unique identifiers
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
 
-        # Issue details
         issue_title = f"GH22-Test-{random_id}"
         nl = chr(10)
         issue_body = f"Automated test issue for GH22 Project Issue Workflow.{nl}{nl}**Created:** {timestamp}{nl}**ID:** {random_id}{nl}{nl}This issue will be searched, updated, commented, and closed."
-
-        # Search query to find this specific issue
         search_query = f"GH22-Test-{random_id}"
 
         {"issue_title": issue_title, "issue_body": issue_body, "search_query": search_query}
@@ -99,45 +95,35 @@ nodes:
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_create
   - id: validate_create
-    type: llm
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+        import re
+
+        tool_result = elitea_state.get('tool_result', '')
+        text = tool_result if isinstance(tool_result, str) else json.dumps(tool_result)
+        match = re.search(r"number '\s*(\d+)\s*'|number\s+(\d+)|#(\d+)", text)
+        issue_number = None
+        if match:
+            issue_number = next(group for group in match.groups() if group)
+
+        create_issue_ok = ('created' in text.lower()) and bool(issue_number)
+
+        {
+          "issue_number": issue_number or "",
+          "test_results": {
+            "create_issue_ok": create_issue_ok,
+            "issue_number": issue_number or ""
+          }
+        }
     input:
       - tool_result
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fixed
-        value: You are a quality assurance validator.
-      task:
-        type: fstring
-        value: |
-          Analyze the output from the 'create_issue_on_project' tool.
-
-          Tool Result: {tool_result}
-
-          Perform the following checks:
-
-          1. Confirm the tool executed successfully (result contains success indicators like "created", "issue with number", or similar).
-          2. Extract the issue number from the result (look for patterns like "number 74", "#74", or "number: 74").
-          3. Verify that an issue number was found.
-
-          Return a JSON object named test_results with the following structure:
-
-          {{
-            "create_issue_ok": boolean (true if creation succeeded),
-            "issue_number": string (the extracted issue number, or null if not found)
-          }}
-
-          Return **EXACTLY** **NONNEGOTIATABLE** only the JSON object. Do not use markdown ```json when returning the json. Do not include any explanations, summaries, or additional text.
-    model: gpt-4o
     output:
       - issue_number
       - test_results
     structured_output: true
-    structured_output_dict:
-      issue_number: str
-      test_results: dict
     transition: search_project_issues
   - id: search_project_issues
     type: toolkit
@@ -165,52 +151,52 @@ nodes:
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_search
   - id: validate_search
-    type: llm
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+
+        search_result = elitea_state.get('search_result', '')
+        issue_title = elitea_state.get('issue_title', '')
+        issue_number = elitea_state.get('issue_number', '')
+        previous = elitea_state.get('test_results', {}) or {}
+
+        parsed = search_result
+        if isinstance(search_result, str):
+            try:
+                parsed = json.loads(search_result)
+            except Exception:
+                parsed = {}
+
+        items = parsed.get('items', []) if isinstance(parsed, dict) else []
+        search_ok = isinstance(parsed, dict) and bool(parsed.get('title')) and isinstance(items, list)
+        issue_found = False
+        for item in items:
+            content = item.get('content', {}) if isinstance(item, dict) else {}
+            title = str(content.get('title', ''))
+            number = str(content.get('number', ''))
+            if issue_title == title or (issue_number and issue_number == number):
+                issue_found = True
+                break
+
+        {
+          "test_results": {
+            "create_issue_ok": bool(previous.get('create_issue_ok')),
+            "issue_number": str(previous.get('issue_number', issue_number) or ''),
+            "search_ok": search_ok,
+            "issue_found_in_search": issue_found,
+            "search_items_count": len(items)
+          }
+        }
     input:
       - search_result
       - issue_title
       - issue_number
       - test_results
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fixed
-        value: You are a quality assurance validator.
-      task:
-        type: fstring
-        value: |
-          Analyze the output from the 'search_project_issues' tool.
-
-          Search Result: {search_result}
-          Expected Issue Title: {issue_title}
-          Expected Issue Number: {issue_number}
-          Previous Test Results: {test_results}
-
-          Perform the following checks:
-
-          1. Confirm the search returned results (result is not empty, contains items or data).
-          2. Check if the created issue is found in the search results (look for issue title or number).
-          3. Count how many items were returned.
-
-          Merge with previous test results and return a JSON object named test_results with the following structure:
-
-          {{
-            "create_issue_ok": boolean (from previous results),
-            "issue_number": string (from previous results),
-            "search_ok": boolean (true if search returned results),
-            "issue_found_in_search": boolean (true if our issue was found),
-            "search_items_count": integer
-          }}
-
-          Return **EXACTLY** **NONNEGOTIATABLE** only the JSON object. Do not use markdown ```json when returning the json. Do not include any explanations, summaries, or additional text.
-    model: gpt-4o
     output:
       - test_results
     structured_output: true
-    structured_output_dict:
-      test_results: dict
     transition: list_project_issues
   - id: list_project_issues
     type: toolkit
@@ -234,55 +220,55 @@ nodes:
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_list
   - id: validate_list
-    type: llm
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+
+        list_result = elitea_state.get('list_result', '')
+        issue_title = elitea_state.get('issue_title', '')
+        issue_number = elitea_state.get('issue_number', '')
+        previous = elitea_state.get('test_results', {}) or {}
+
+        parsed = list_result
+        if isinstance(list_result, str):
+            try:
+                parsed = json.loads(list_result)
+            except Exception:
+                parsed = {}
+
+        items = parsed.get('items', []) if isinstance(parsed, dict) else []
+        list_ok = isinstance(parsed, dict) and bool(parsed.get('title')) and isinstance(items, list) and len(items) > 0
+        issue_in_list = False
+        for item in items:
+            content = item.get('content', {}) if isinstance(item, dict) else {}
+            title = str(content.get('title', ''))
+            number = str(content.get('number', ''))
+            if issue_title == title or (issue_number and issue_number == number):
+                issue_in_list = True
+                break
+
+        {
+          "test_results": {
+            "create_issue_ok": bool(previous.get('create_issue_ok')),
+            "issue_number": str(previous.get('issue_number', issue_number) or ''),
+            "search_ok": bool(previous.get('search_ok')),
+            "issue_found_in_search": bool(previous.get('issue_found_in_search')),
+            "search_items_count": int(previous.get('search_items_count', 0) or 0),
+            "list_ok": list_ok,
+            "issue_in_list": issue_in_list,
+            "list_items_count": len(items)
+          }
+        }
     input:
       - list_result
       - issue_title
       - issue_number
       - test_results
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fixed
-        value: You are a quality assurance validator.
-      task:
-        type: fstring
-        value: |
-          Analyze the output from the 'list_project_issues' tool.
-
-          List Result: {list_result}
-          Expected Issue Title: {issue_title}
-          Expected Issue Number: {issue_number}
-          Previous Test Results: {test_results}
-
-          Perform the following checks:
-
-          1. Confirm the list returned results (result contains items or data).
-          2. Check if the created issue appears in the list (look for issue title or number).
-          3. Count how many items were returned.
-
-          Merge with previous test results and return a JSON object named test_results with the following structure:
-
-          {{
-            "create_issue_ok": boolean (from previous),
-            "issue_number": string (from previous),
-            "search_ok": boolean (from previous),
-            "issue_found_in_search": boolean (from previous),
-            "search_items_count": integer (from previous),
-            "list_ok": boolean (true if list returned results),
-            "issue_in_list": boolean (true if our issue was found),
-            "list_items_count": integer
-          }}
-
-          Return **EXACTLY** **NONNEGOTIATABLE** only the JSON object. Do not use markdown ```json when returning the json. Do not include any explanations, summaries, or additional text.
-    model: gpt-4o
     output:
       - test_results
     structured_output: true
-    structured_output_dict:
-      test_results: dict
     transition: prepare_update
   - id: prepare_update
     type: code
@@ -339,60 +325,49 @@ nodes:
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
     transition: validate_update
   - id: validate_update
-    type: llm
+    type: code
+    code:
+      type: fixed
+      value: |
+        import json
+
+        update_result = elitea_state.get('update_result', '')
+        issue_number = elitea_state.get('issue_number', '')
+        issue_title = elitea_state.get('issue_title', '')
+        previous = elitea_state.get('test_results', {}) or {}
+
+        text = update_result if isinstance(update_result, str) else json.dumps(update_result)
+        update_ok = 'updated' in text.lower() or 'success' in text.lower()
+        create_ok = bool(previous.get('create_issue_ok'))
+        search_ok = bool(previous.get('search_ok'))
+        list_ok = bool(previous.get('list_ok'))
+
+        {
+          "test_results": {
+            "test_passed": create_ok and search_ok and list_ok and update_ok,
+            "operations": {
+              "create_issue_on_project": create_ok,
+              "search_project_issues": search_ok,
+              "list_project_issues": list_ok,
+              "update_issue_on_project": update_ok
+            },
+            "details": {
+              "issue_number": str(issue_number or previous.get('issue_number', '')),
+              "issue_title": issue_title,
+              "issue_found_in_search": bool(previous.get('issue_found_in_search')),
+              "issue_in_list": bool(previous.get('issue_in_list')),
+              "search_items_count": int(previous.get('search_items_count', 0) or 0),
+              "list_items_count": int(previous.get('list_items_count', 0) or 0)
+            },
+            "error": None
+          }
+        }
     input:
       - update_result
       - issue_number
       - issue_title
       - test_results
-    input_mapping:
-      chat_history:
-        type: fixed
-        value: []
-      system:
-        type: fixed
-        value: You are a quality assurance validator.
-      task:
-        type: fstring
-        value: |
-          Analyze the output from the 'update_issue_on_project' tool and generate final test results.
-
-          Update Result: {update_result}
-          Issue Number: {issue_number}
-          Issue Title: {issue_title}
-          Previous Test Results: {test_results}
-
-          Perform the following checks:
-
-          1. Confirm the update succeeded (result contains "updated", "success", or similar indicators).
-          2. Calculate overall test_passed: true if create_issue_ok AND update_ok are both true.
-
-          Merge with previous test results and return a JSON object named test_results with the following structure:
-
-          {{
-            "test_passed": boolean (true if core operations passed: create_issue_ok AND update_ok),
-            "operations": {{
-              "create_issue_on_project": boolean (from test_results.create_issue_ok),
-              "search_project_issues": boolean (from test_results.search_ok),
-              "list_project_issues": boolean (from test_results.list_ok),
-              "update_issue_on_project": boolean (true if update succeeded)
-            }},
-            "details": {{
-              "issue_number": string,
-              "issue_title": string,
-              "issue_found_in_search": boolean (from test_results),
-              "issue_in_list": boolean (from test_results),
-              "search_items_count": integer (from test_results),
-              "list_items_count": integer (from test_results)
-            }},
-            "error": string | null
-          }}
-
-          Return **EXACTLY** **NONNEGOTIATABLE** only the JSON object. Do not use markdown ```json when returning the json. Do not include any explanations, summaries, or additional text.
-    model: gpt-4o
     output:
       - test_results
-    structured_output: false
-    structured_output_dict:
-      test_results: dict
+    structured_output: true
     transition: END
