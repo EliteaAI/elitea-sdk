@@ -42,6 +42,12 @@ nodes:
       limit_files:
         type: fixed
         value: 20
+      # private_docs/excel/PROJECTS_23_01_prot.xlsx is password-protected and always fails
+      # to parse, which makes the run 'partly_indexed'. SharePoint filters match file names
+      # only (no path exclusion), so skip the protected workbook by name.
+      skip_extensions:
+        type: fixed
+        value: ["*_prot.xlsx"]
     output:
       - index_result
     structured_output: true
