@@ -35,7 +35,11 @@ class OutlookConfiguration(BaseModel):
     client_secret: SecretStr = Field(description="Azure AD Client Secret")
     mailbox: Optional[str] = Field(
         default=None,
-        description="Mailbox email address. Leave empty to use signed-in user's mailbox (/me)"
+        description=(
+            "Leave empty to use your own mailbox. Set only to open a shared mailbox you have Full Access to "
+            "(needs the Mail.Read.Shared scope, plus Mail.ReadWrite.Shared / Mail.Send.Shared to change or send). "
+            "A distribution list is not a mailbox: its mail is already in your inbox, so leave this empty"
+        )
     )
 
     oauth_discovery_endpoint: Optional[str] = Field(
@@ -56,7 +60,7 @@ class OutlookConfiguration(BaseModel):
         """Test the connection to Microsoft Graph Mail API.
 
         Uses delegated OAuth flow - verifies the access token by calling
-        the /me/mailFolders endpoint.
+        the mailFolders endpoint of the configured mailbox (/me when none is set).
 
         Returns:
             None if connection is successful, error message string otherwise.
@@ -92,7 +96,8 @@ class OutlookConfiguration(BaseModel):
             )
 
         return OutlookConfiguration._call_graph_api(
-            access_token, oauth_discovery_endpoint, scopes, configuration_uuid
+            access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
+            mailbox=(settings.get("mailbox") or "").strip() or None,
         )
 
     @staticmethod
@@ -100,11 +105,13 @@ class OutlookConfiguration(BaseModel):
         access_token: str,
         oauth_discovery_endpoint: str,
         scopes: Optional[List[str]] = None,
-        configuration_uuid: Optional[str] = None
+        configuration_uuid: Optional[str] = None,
+        mailbox: Optional[str] = None,
     ) -> str | None:
         """Health-check access token using Microsoft Graph Mail API."""
         try:
-            graph_url = "https://graph.microsoft.com/v1.0/me/mailFolders?$top=1"
+            user_path = f"users/{mailbox}" if mailbox else "me"
+            graph_url = f"https://graph.microsoft.com/v1.0/{user_path}/mailFolders?$top=1"
             resp = requests.get(
                 graph_url,
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -123,7 +130,13 @@ class OutlookConfiguration(BaseModel):
                     configuration_uuid=configuration_uuid,
                 )
             elif resp.status_code == 403:
+                if mailbox:
+                    return (f"Access to mailbox '{mailbox}' is forbidden - you need Full Access to it "
+                            "and the Mail.Read.Shared scope")
                 return "Access forbidden - token lacks required Microsoft Graph Mail permissions"
+            elif resp.status_code == 404 and mailbox:
+                return (f"'{mailbox}' is not a mailbox you can open. A distribution list or group has no "
+                        "mailbox of its own (its mail arrives in your inbox): leave the mailbox field empty")
             else:
                 return f"Microsoft Graph API request failed with status {resp.status_code}"
 
