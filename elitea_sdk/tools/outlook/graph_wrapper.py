@@ -41,6 +41,9 @@ _WELL_KNOWN_FOLDERS = {
 
 # Graph's answer to a mailFolders/{x} lookup where x is neither an ID nor a well-known name
 _FOLDER_NOT_FOUND_CODES = {"ErrorInvalidIdMalformed", "ErrorItemNotFound", "ErrorFolderNotFound"}
+# Graph's answer when the address behind /users/{mailbox} has no Exchange Online mailbox,
+# e.g. a distribution list or a group put into the credential's mailbox field
+_MAILBOX_NOT_FOUND_CODES = {"MailboxNotEnabledForRESTAPI", "ErrorInvalidUser", "ErrorNonExistentMailbox"}
 
 _LIST_FIELDS = ("id,conversationId,subject,from,toRecipients,ccRecipients,"
                 "receivedDateTime,isRead,hasAttachments")
@@ -321,9 +324,12 @@ class OutlookGraphWrapper:
         error = error if isinstance(error, dict) else {}
         api_message = error.get("message") or resp.reason or "request failed"
         hint = ""
+        if error.get("code") in _MAILBOX_NOT_FOUND_CODES or "mailbox is either inactive" in str(api_message):
+            # Checked first: the URL usually contains /mailFolders/ too, and a folder hint would mislead.
+            hint = self._mailbox_not_found_hint()
         # mailFolders/{x} takes only an ID or a well-known name; a display name comes
         # back as a bare "Id is malformed", which gives the agent nothing to act on.
-        if "/mailFolders/" in (resp.url or "") and (
+        elif "/mailFolders/" in (resp.url or "") and (
             resp.status_code == 404 or error.get("code") in _FOLDER_NOT_FOUND_CODES
         ):
             hint = (" The mail folder was not found: pass a folder ID or path from list_folders "
@@ -339,6 +345,17 @@ class OutlookGraphWrapper:
             # Read by runtime.tool_outcome so a missing item is classed as INPUT, not unclassified.
             exc.provider_error_category = "resource_not_found"
         raise exc
+
+    def _mailbox_not_found_hint(self) -> str:
+        if not self._mailbox:
+            return (" The signed-in user has no Exchange Online mailbox (inactive, soft-deleted or on-premises); "
+                    "do not retry, ask the user to check their Microsoft 365 mailbox.")
+        return (f" '{self._mailbox}' (the mailbox field of the Outlook credentials) is not a mailbox the "
+                "signed-in user can open. A distribution list or Microsoft 365 group has no mailbox of its own: "
+                "its mail arrives in each member's own inbox. Do not retry; tell the user to clear the mailbox "
+                "field to use their own mailbox, then find mail sent to the list with "
+                f"recipients=['{self._mailbox}'] or the search query 'to:{self._mailbox}'. "
+                "A shared mailbox needs Full Access for the user and the Mail.Read.Shared scope.")
 
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
