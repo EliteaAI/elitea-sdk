@@ -43,6 +43,7 @@ from elitea_sdk.tools.base_indexer_toolkit import (
 )
 from elitea_sdk.tools.vector_adapters import VectorStoreAdapter as vsa_module
 from elitea_sdk.tools.vector_adapters.VectorStoreAdapter import PGVectorAdapter
+from tests.tools.code_loader_rig import SameSpaceEmbeddings
 
 _Base = declarative_base()
 
@@ -256,6 +257,7 @@ class StagingToolkit(BaseIndexerToolkit):
 
 class FakeStagingAdapter:
     supports_run_staging = True
+    embedding_samples = [("sample text", SameSpaceEmbeddings.vector)]
 
     def __init__(self):
         self.promote_outcome = "promoted"
@@ -268,6 +270,9 @@ class FakeStagingAdapter:
 
     def ensure_index_runs_table(self, wrapper):
         self.calls.append("ensure")
+
+    def read_run_embedding_samples(self, wrapper, run_id, limit):
+        return [(text, list(vector)) for text, vector in self.embedding_samples[:limit]]
 
     def register_index_run(self, wrapper, index_name, run_id, task_id=None, meta_lock_id=None):
         self.calls.append("register")
@@ -315,6 +320,7 @@ def toolkit(monkeypatch):
     object.__setattr__(instance, "_stored_meta", None)
     object.__setattr__(instance, "toolkit_id", None)
     object.__setattr__(instance, "max_docs_per_add", 100)
+    object.__setattr__(instance, "embeddings", SameSpaceEmbeddings())
     object.__setattr__(instance, "written", [])
     object.__setattr__(instance, "embedded", [])
     object.__setattr__(instance, "emitted", [])

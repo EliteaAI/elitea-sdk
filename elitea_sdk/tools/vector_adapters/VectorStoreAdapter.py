@@ -1,7 +1,7 @@
 import json
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from logging import WARNING, getLogger
 
 from sqlalchemy import String, Text, cast, column, exists, func, literal, text, update, values
@@ -145,6 +145,10 @@ class VectorStoreAdapter(ABC):
         """Index this run's staged rows by content digest so identical chunks can reuse
         them instead of being embedded again. Returns (digests, row_pks, truncated)."""
         return {}, set(), False
+
+    def read_run_embedding_samples(self, vectorstore_wrapper, run_id: str,
+                                   limit: int) -> List[Tuple[str, List[float]]]:
+        return []
 
     def read_run_complete_files(self, vectorstore_wrapper, run_id: str) -> Dict[str, tuple]:
         """Index this run's staged rows by source file, keeping only the files whose rows
@@ -895,6 +899,23 @@ class PGVectorAdapter(VectorStoreAdapter):
                 digests.setdefault(digest_of(row_text_digest, row_metadata), []).append(key)
                 row_pks.add(key)
         return digests, row_pks, truncated
+
+    def read_run_embedding_samples(self, vectorstore_wrapper, run_id: str,
+                                   limit: int) -> List[Tuple[str, List[float]]]:
+        store = vectorstore_wrapper.vectorstore
+        with Session(store.session_maker.bind) as session:
+            rows = session.query(
+                store.EmbeddingStore.document,
+                store.EmbeddingStore.embedding,
+            ).filter(
+                store.EmbeddingStore.cmetadata.contains({IndexerKeywords.RUN_ID.value: run_id}),
+                self._non_index_meta_clause(store),
+            ).limit(limit).all()
+        return [
+            (document, [float(component) for component in embedding])
+            for document, embedding in rows
+            if document and embedding is not None
+        ]
 
     def read_run_complete_files(self, vectorstore_wrapper, run_id: str) -> Dict[str, tuple]:
         store = vectorstore_wrapper.vectorstore
