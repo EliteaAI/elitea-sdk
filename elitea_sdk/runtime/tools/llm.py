@@ -712,8 +712,7 @@ class LLMNode(BaseTool):
 
                 if not fallback_content:
                     # Final fallback to raw content
-                    content = initial_completion.content
-                    fallback_content = content if isinstance(content, str) else str(content)
+                    fallback_content = self._raw_content_fallback(initial_completion.content)
 
             result['messages'] = self._strip_system_messages(messages + [AIMessage(content=fallback_content, response_metadata={
                 'elitea_routing': initial_completion.response_metadata['elitea_routing']} if isinstance(initial_completion, AIMessage) and initial_completion.response_metadata.get('elitea_routing') else {})])
@@ -1954,8 +1953,7 @@ class LLMNode(BaseTool):
                         output_msgs[self.output_variables[0]] = text_content
                     else:
                         # Fallback to raw content
-                        content = current_completion.content
-                        output_msgs[self.output_variables[0]] = content if isinstance(content, str) else str(content)
+                        output_msgs[self.output_variables[0]] = self._raw_content_fallback(current_completion.content)
                 else:
                     output_msgs[self.output_variables[0]] = None
 
@@ -1969,8 +1967,7 @@ class LLMNode(BaseTool):
         # Fallback to string representation if no content extracted
         if not text_content:
             if hasattr(completion, 'content'):
-                content = completion.content
-                text_content = content.strip() if isinstance(content, str) else str(content)
+                text_content = self._raw_content_fallback(completion.content).strip()
             else:
                 text_content = str(completion)
 
@@ -2380,6 +2377,19 @@ class LLMNode(BaseTool):
             )
             return content
         return ''
+
+    @staticmethod
+    def _raw_content_fallback(content: Any) -> str:
+        """String form of content that yielded no text blocks.
+
+        An empty block list (Sonnet's ``AIMessage(content=[])``) carries no answer;
+        ``str([])`` would surface a literal "[]" as the final output.
+        """
+        if isinstance(content, str):
+            return content
+        if not content:
+            return ''
+        return str(content)
 
     @staticmethod
     def _extract_content_from_completion(completion) -> dict:

@@ -144,6 +144,10 @@ def normalize_message_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        # An empty list carries no answer. Serializing it would surface a literal
+        # "[]" that callers' blank-content skips (#5057) no longer recognise.
+        if not content:
+            return ''
         # Filter out thinking blocks, keep only text responses
         text_parts = []
         for block in content:
@@ -181,6 +185,9 @@ _INTERNAL_STATE_KEYS = {
     'hitl_decisions', 'hitl_interrupt',
     ELITEA_RS, PRINTER_NODE_RS,
     TOOL_OUTCOMES_KEY, LAST_TOOL_OUTCOME_KEY,
+    # Coordination channels create_state() adds to every graph. Left out, an agent
+    # whose last reply was blank surfaced their empty dict as the answer "{}".
+    '_auto_routing', 'parallel_tasks', '_pipeline_blocked',
 }
 
 
@@ -2765,7 +2772,16 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if 'messages' not in locals():
             messages = result.get('messages', []) if isinstance(result, dict) else []
 
-        final_output = f"Assistant run has been completed, but output is None.\nAdding last message if any: {messages[-1] if messages else []}" if is_execution_finished and not output else output
+        # A finished run with no answer returns '' rather than a fixed sentence: that text
+        # used to reach chat as the assistant's reply and eval scored it as a real answer.
+        if is_execution_finished and not output:
+            logger.warning(
+                "[OUTPUT] Run finished without an answer; last message: %r",
+                messages[-1] if messages else None,
+            )
+            final_output = ''
+        else:
+            final_output = output
 
         result_with_state = {
             "output": final_output,
