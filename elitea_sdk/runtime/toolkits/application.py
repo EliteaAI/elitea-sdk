@@ -155,9 +155,16 @@ class ApplicationToolkit(BaseToolkit):
                     version_details = public_data.get('version_details', {})
             app_details = public_data
         else:
-            # Use standard endpoints for same-project access
-            app_details = client.get_app_details(application_id)
-            version_details = client.get_app_version_details(application_id, application_version_id)
+            get_prefetched = getattr(client, 'get_prefetched_app', None)
+            prefetched = get_prefetched(application_id, application_version_id) if get_prefetched else None
+            if prefetched:
+                logger.debug(f"[APP_TOOLKIT] prefetched version details hit: {application_id}/{application_version_id}")
+                app_details = {'name': prefetched.get('name'), 'description': prefetched.get('description')}
+                version_details = prefetched['version_details']
+            else:
+                # Use standard endpoints for same-project access
+                app_details = client.get_app_details(application_id)
+                version_details = client.get_app_version_details(application_id, application_version_id)
 
         # Resolve {{secret.xxx}} placeholders in MCP tool settings before passing to the SDK
         _tools = version_details.get('tools')

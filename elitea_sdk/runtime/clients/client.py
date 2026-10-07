@@ -151,6 +151,9 @@ class EliteAClient:
         # (connect, read) — bounds every outbound call below so a stalled
         # endpoint raises instead of parking the worker forever (#6246).
         self.timeout = kwargs.get('timeout', (5, 30))
+        # #6913: sub-agent version details pre-expanded by the platform, keyed "app_id:version_id"
+        self.prefetched_version_details: Dict[str, dict] = {}
+        self._mcp_toolkits_cache = None
         self._session = requests.Session()
         # No PAT: authenticate exactly like the browser does, with the user's session cookie.
         # Scoped to our own host so a redirect elsewhere never carries the cookie along.
@@ -196,8 +199,20 @@ class EliteAClient:
         return response
 
     def get_mcp_toolkits(self):
+        # Static registry; fetched once per client instead of once per nested get_tools call
+        if self._mcp_toolkits_cache is not None:
+            return deepcopy(self._mcp_toolkits_cache)
         data = self._request('get', self.mcp_tools_list, headers=self.headers, verify=False).json()
+        if isinstance(data, list):
+            self._mcp_toolkits_cache = deepcopy(data)
         return data
+
+    def get_prefetched_app(self, application_id: int, application_version_id: int) -> Optional[dict]:
+        """Copy of the pre-expanded {name, description, version_details} entry, or None on a miss."""
+        entry = (self.prefetched_version_details or {}).get(f"{application_id}:{application_version_id}")
+        if not isinstance(entry, dict) or not isinstance(entry.get('version_details'), dict):
+            return None
+        return deepcopy(entry)
 
     def mcp_tool_call(self, params: dict[str, Any]):
         #
