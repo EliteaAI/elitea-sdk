@@ -436,7 +436,7 @@ class LLMNode(BaseTool):
             config = {**config, 'configurable': {**(config.get('configurable') or {}),
                 'elitea_routing_output_schema': struct_model.model_json_schema()}}
         initial_completion = llm_client.invoke(
-            prepare_messages_for_model(messages), config=config,
+            prepare_messages_for_model(messages, model=llm_client), config=config,
         )
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
@@ -480,7 +480,7 @@ class LLMNode(BaseTool):
         try:
             llm = self.__get_struct_output_model(llm_client, struct_model)
             return llm.invoke(
-                prepare_messages_for_model(synth_messages), config=config,
+                prepare_messages_for_model(synth_messages, model=llm_client), config=config,
             )
         except GraphBubbleUp:
             raise
@@ -537,7 +537,7 @@ class LLMNode(BaseTool):
             prompt_messages.append(HumanMessage(content=json_instruction))
 
         completion = llm_client.invoke(
-            prepare_messages_for_model(prompt_messages), config=config,
+            prepare_messages_for_model(prompt_messages, model=llm_client), config=config,
         )
         extracted = self._extract_structured_from_content(completion, struct_model)
         if extracted is not None:
@@ -1054,19 +1054,25 @@ class LLMNode(BaseTool):
             return messages
 
         # Single pass: identify AIMessage indices and collect following ToolMessage ids
-        # For each AIMessage with tool_calls, gather tool_call_ids from ToolMessages
-        # that appear between it and the next AIMessage (or end of list).
+        # Include native tool_use blocks even when parsing produced no tool_calls.
+        # Only the contiguous ToolMessages immediately after this AIMessage count.
         following_tool_ids: dict[int, set[str]] = {}
         current_ai_idx: int | None = None
 
         for i, msg in enumerate(messages):
-            if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
-                current_ai_idx = i
-                following_tool_ids[i] = set()
-            elif isinstance(msg, ToolMessage) and current_ai_idx is not None:
-                tc_id = getattr(msg, 'tool_call_id', None)
-                if tc_id:
-                    following_tool_ids[current_ai_idx].add(tc_id)
+            if isinstance(msg, ToolMessage):
+                if current_ai_idx is not None and msg.tool_call_id:
+                    following_tool_ids[current_ai_idx].add(msg.tool_call_id)
+            else:
+                current_ai_idx = None
+                if isinstance(msg, AIMessage) and (
+                    msg.tool_calls or (isinstance(msg.content, list) and any(
+                        isinstance(block, dict) and block.get('type') == 'tool_use'
+                        for block in msg.content
+                    ))
+                ):
+                    current_ai_idx = i
+                    following_tool_ids[i] = set()
 
         # Early exit if no AIMessages with tool_calls
         if not following_tool_ids:
@@ -1093,6 +1099,12 @@ class LLMNode(BaseTool):
                     valid_tool_calls.append(tc)
                 else:
                     orphaned_ids.add(tc_id)
+            if isinstance(message.content, list):
+                orphaned_ids.update(
+                    block.get('id', '') for block in message.content
+                    if isinstance(block, dict) and block.get('type') == 'tool_use'
+                    and block.get('id') not in valid_result_ids
+                )
 
             # No orphans - keep message as-is
             if not orphaned_ids:
@@ -1104,20 +1116,11 @@ class LLMNode(BaseTool):
             # Filter tool_use blocks from content if it's a list (Anthropic format)
             content = message.content
             if isinstance(content, list):
-                # When no valid tool_calls remain, remove ALL tool_use blocks
-                # Otherwise, remove only orphaned tool_use blocks
-                if valid_tool_calls:
-                    content = [
-                        block for block in content
-                        if not (isinstance(block, dict) and
-                               block.get('type') == 'tool_use' and
-                               block.get('id') in orphaned_ids)
-                    ]
-                else:
-                    content = [
-                        block for block in content
-                        if not (isinstance(block, dict) and block.get('type') == 'tool_use')
-                    ]
+                content = [
+                    block for block in content
+                    if not (isinstance(block, dict) and block.get('type') == 'tool_use'
+                            and block.get('id', '') in orphaned_ids)
+                ]
 
             # Skip message entirely if no content and no valid tool_calls
             if not valid_tool_calls and not content:
@@ -1126,7 +1129,11 @@ class LLMNode(BaseTool):
             # Create filtered message
             try:
                 cleaned_messages.append(
-                    message.model_copy(update={"tool_calls": valid_tool_calls, "content": content})
+                    message.model_copy(update={
+                        "tool_calls": valid_tool_calls, "content": content,
+                        "invalid_tool_calls": [tc for tc in message.invalid_tool_calls
+                                               if tc.get('id', '') not in orphaned_ids],
+                    })
                 )
             except Exception:
                 cleaned_messages.append(AIMessage(content=content, tool_calls=valid_tool_calls))
@@ -1861,7 +1868,7 @@ class LLMNode(BaseTool):
                 )
         else:
             completion = llm_client.invoke(
-                prepare_messages_for_model(messages), config=config,
+                prepare_messages_for_model(messages, model=llm_client), config=config,
             )
         completion = self._continue_nested_output(
             messages=messages,
@@ -2837,7 +2844,7 @@ class LLMNode(BaseTool):
                 if continuation_max_tokens is not None:
                     invoke_kwargs['max_tokens'] = continuation_max_tokens
                 current_completion = self.client.invoke(
-                    prepare_messages_for_model(continuation_messages),
+                    prepare_messages_for_model(continuation_messages, model=self.client),
                     **invoke_kwargs,
                 )
             except (GraphBubbleUp, McpAuthorizationRequired, OutputContinuationExhausted):
@@ -4491,7 +4498,7 @@ class LLMNode(BaseTool):
                 # ToolMessage tells the model the call was declined and to
                 # continue the remaining work; no forced rebinding or nudge turn.
                 current_completion = llm_client.invoke(
-                    prepare_messages_for_model(new_messages), config=config,
+                    prepare_messages_for_model(new_messages, model=llm_client), config=config,
                 )
                 current_completion = self._continue_nested_output(
                     messages=new_messages,
@@ -4710,7 +4717,7 @@ class LLMNode(BaseTool):
                                 break
                             try:
                                 current_completion = llm_client.invoke(
-                                    prepare_messages_for_model(new_messages), config=config,
+                                    prepare_messages_for_model(new_messages, model=llm_client), config=config,
                                 )
                                 current_completion = self._continue_nested_output(
                                     messages=new_messages,
