@@ -1,0 +1,3 @@
+# Isolated overlay for the #6830 compatibility suite; SDK dependencies are unchanged.
+litellm==1.83.14
+fastuuid==0.14.0

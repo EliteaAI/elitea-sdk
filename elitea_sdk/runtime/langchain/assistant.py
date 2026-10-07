@@ -1084,7 +1084,7 @@ class Assistant:
                     content=_make_anthropic_system_content(prompt, model)
                 )
                 response = model_with_tools.invoke(
-                    prepare_messages_for_model([system_msg] + filtered_messages),
+                    prepare_messages_for_model([system_msg] + filtered_messages, model=model),
                     config,
                 )
                 response = normalize_null_tool_call_ids(response)
