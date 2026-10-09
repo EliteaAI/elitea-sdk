@@ -19,6 +19,22 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 PIN = 'elitea_routing'
 
 
+def raise_for_refusal(response):
+    """Surface a Gateway 4xx refusal ({"error", "reason"}) as a user-readable error."""
+    status = getattr(response, 'status_code', None)
+    if isinstance(status, int) and 400 <= status < 500:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error = body.get('error') if isinstance(body, dict) else None
+        if isinstance(error, str) and error.strip():
+            from elitea_sdk.runtime.exceptions import AutoRoutingRefused
+            reason = body.get('reason')
+            raise AutoRoutingRefused(error.strip(), reason if isinstance(reason, str) else None, status)
+    response.raise_for_status()
+
+
 def projection(messages):
     result = []
     for message in messages:
@@ -187,7 +203,7 @@ class AutoChatModel(BaseChatModel):
                       'state_token': previous_binding.get('state_token') if previous_binding else None,
                       'observation': prior_observation,
                       'prior_pin': binding.get('pin') if binding else None}, timeout=(5, 90))
-            response.raise_for_status()
+            raise_for_refusal(response)
             binding = response.json()
             binding['completed_native_keys'] = completed
         if binding.get('action') != 'clarify' and sink is not None:
