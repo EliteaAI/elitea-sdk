@@ -29,7 +29,11 @@ class NoPersonalProject(PrivateSecretError):
 
 
 class PrivateSecretNotShared(PrivateSecretError):
-    """ The secret exists but its owner has not allowed external access to it """
+    """ The secret is not marked for external access, or does not exist at all.
+
+    The platform checks the sharing flag before existence, so a missing secret is reported
+    this way too; otherwise the response would reveal which secrets a user holds.
+    """
 
 
 class PrivateSecretNotFound(PrivateSecretError):
@@ -378,8 +382,8 @@ class SandboxClient:
             )
         elif reason == 'not_shared':
             error = PrivateSecretNotShared(
-                f"Private secret '{secret_name}' is not shared. Its owner must enable"
-                " 'Allow external access' on it in their personal project's secrets."
+                f"Private secret '{secret_name}' is not shared or does not exist. Create it in"
+                " your personal project's secrets and enable 'Allow external access' on it."
             )
         elif reason == 'not_found':
             error = PrivateSecretNotFound(

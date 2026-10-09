@@ -22,6 +22,8 @@ into one entry. Lives outside tests/tools/index/ because CI skips that directory
 import pytest
 from langchain_core.documents import Document
 
+from elitea_sdk.runtime.langchain.interfaces import llm_processor
+from elitea_sdk.runtime.tools.artifact import ArtifactWrapper
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
 from elitea_sdk.tools.base_indexer_toolkit import (
@@ -34,6 +36,8 @@ from elitea_sdk.tools.base_indexer_toolkit import (
 )
 from elitea_sdk.tools.code_indexer_toolkit import CodeIndexerToolkit
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
+from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
+from elitea_sdk.tools.utils import content_parser
 
 
 class StagingToolkit(BaseIndexerToolkit):
@@ -82,7 +86,7 @@ class FakeStagingAdapter:
         self.calls.append("promote")
         return self.promote_outcome
 
-    def discard_run(self, wrapper, index_name, run_id):
+    def discard_run(self, wrapper, index_name, run_id, retain_chunks=False):
         self.calls.append("discard")
         return "discarded"
 
@@ -141,10 +145,19 @@ def chunk_yielding_toolkit(monkeypatch):
     return build_staged_toolkit(monkeypatch, ChunkYieldingToolkit)
 
 
-def run_index_data(toolkit, monkeypatch, documents, save):
-    monkeypatch.setattr(StagingToolkit, "_base_loader", lambda self, **kwargs: iter(documents))
-    monkeypatch.setattr(StagingToolkit, "_save_index_generator", save)
-    return toolkit.index_data(index_name="x")
+def run_index_data(toolkit, monkeypatch, documents, save=None, loader=None, chunking_tool=None):
+    monkeypatch.setattr(StagingToolkit, "_base_loader",
+                        loader or (lambda self, **kwargs: iter(documents)))
+    if save is not None:
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator", save)
+    return toolkit.index_data(index_name="x", chunking_tool=chunking_tool)
+
+
+def failed_items(outcome, reason=None):
+    return [item
+            for category in outcome["report"]["categories"] if category["kind"] == "failed"
+            for group in category["groups"] if reason in (None, group["reason"])
+            for item in group["items"]]
 
 
 def make_documents(*ids):
@@ -955,3 +968,462 @@ class TestEveryOverrideStripsTheMarker:
         keys = toolkit_cls._remove_metadata_keys(toolkit_cls.model_construct())
 
         assert DEPENDENT_DOC_META_KEY in keys
+
+
+class ParsingStagingToolkit(StagingToolkit, NonCodeIndexerToolkit):
+    pass
+
+
+class CodeStagingToolkit(StagingToolkit, CodeIndexerToolkit):
+    pass
+
+
+class ArtifactStagingToolkit(StagingToolkit, ArtifactWrapper):
+    pass
+
+
+class SharepointStagingToolkit(StagingToolkit, SharepointApiWrapper):
+    pass
+
+
+PARSE_ERROR = "Error during content parsing for file"
+UNSUPPORTED = "Unsupported extension for file"
+
+
+def make_files(*names, dependent=()):
+    return [Document(page_content="", metadata={
+        "id": name, "name": name, "updated_on": "1",
+        IndexerKeywords.CONTENT_FILE_NAME.value: name,
+        IndexerKeywords.CONTENT_IN_BYTES.value: b"payload",
+        **({DEPENDENT_DOC_META_KEY: True} if name in dependent else {}),
+    }) for name in names]
+
+
+def make_page(doc_id, name, body="real body"):
+    return Document(page_content=body, metadata={"id": doc_id, "name": name, "updated_on": "1"})
+
+
+def parsed_by(key_of, parsed_as):
+    def parse(metadata):
+        contents = parsed_as.get(key_of(metadata), "parsed body")
+        return (contents,) if isinstance(contents, str) else contents
+
+    return parse
+
+
+def stub_parser(monkeypatch, parse):
+    def process_document_by_type(document=None, **kwargs):
+        return iter([Document(page_content=content, metadata=dict(document.metadata))
+                     for content in parse(document.metadata)])
+
+    monkeypatch.setattr(
+        "elitea_sdk.tools.base_indexer_toolkit.process_document_by_type", process_document_by_type
+    )
+
+
+def index_through_real_pipeline(monkeypatch, documents, parsed_as=None, parse=None, dependents=None,
+                                toolkit_cls=ParsingStagingToolkit, configure=lambda toolkit: None,
+                                before_loading=lambda toolkit: None, chunking_tool=None,
+                                workers=1, staging=True, source=None):
+    toolkit = build_staged_toolkit(monkeypatch, toolkit_cls)
+    toolkit.vector_adapter.supports_run_staging = staging
+    object.__setattr__(toolkit, "embeddings", None)
+    object.__setattr__(toolkit, "llm", None)
+    object.__setattr__(toolkit, "max_docs_per_add", 1)
+    object.__setattr__(toolkit, "_index_workers", workers)
+    stub_parser(monkeypatch, parse or parsed_by(BaseIndexerToolkit._extract_doc_name, parsed_as or {}))
+    configure(toolkit)
+    if dependents is not None:
+        monkeypatch.setattr(
+            toolkit_cls, "_process_document",
+            lambda self, document: iter(dependents.get(self._extract_doc_name(document.metadata), ())),
+        )
+    write_index_meta = llm_processor.add_documents
+
+    def add_documents(vectorstore=None, documents=None, ids=None):
+        if documents[0].page_content.startswith(IndexerKeywords.INDEX_META_TYPE.value):
+            return write_index_meta(vectorstore=vectorstore, documents=documents, ids=ids)
+        return [f"row-{BaseIndexerToolkit._staging_key(doc.metadata)}" for doc in documents]
+
+    def loader(self, **kwargs):
+        before_loading(self)
+        yield from (source(self, **kwargs) if source else documents)
+
+    monkeypatch.setattr(llm_processor, "add_documents", add_documents)
+    return toolkit, run_index_data(toolkit, monkeypatch, documents, loader=loader,
+                                   chunking_tool=chunking_tool)
+
+
+def assert_terminal_state(toolkit, outcome, status):
+    written_state = {
+        IndexingStatus.OK: IndexerKeywords.INDEX_META_COMPLETED.value,
+        IndexingStatus.PARTLY_INDEXED: IndexerKeywords.INDEX_META_PARTLY_OK.value,
+        IndexingStatus.ERROR: IndexerKeywords.INDEX_META_FAILED.value,
+    }[status]
+    assert outcome["status"] == status.value
+    assert outcome["report"]["status"] == status.value
+    assert toolkit.written[-1]["state"] == written_state
+
+
+def assert_totals(outcome, **expected):
+    totals = outcome["report"]["totals"]
+    assert {key: totals[key] for key in expected} == expected
+    assert totals["total"] == (totals["indexed"] + totals["skipped"] + totals["not_indexed"]
+                               + totals["failed"] + totals["unchanged"])
+
+
+PIPELINE_MODES = [
+    pytest.param({"workers": workers, "staging": staging},
+                 id=f"workers={workers}-{'staging' if staging else 'direct'}")
+    for workers in (1, 2) for staging in (True, False)
+]
+
+
+def assert_run_outcome_kept(toolkit, mode, kept):
+    if not mode["staging"]:
+        assert toolkit.vector_adapter.calls == []
+        return
+    assert ("promote" in toolkit.vector_adapter.calls) is kept
+    assert ("discard" in toolkit.vector_adapter.calls) is not kept
+
+
+def parsed_by_id(parsed_as):
+    return parsed_by(lambda metadata: metadata["id"], parsed_as)
+
+
+@pytest.mark.parametrize("mode", PIPELINE_MODES)
+class TestAParseFailureDecidesTheTerminalState:
+
+    def test_a_corrupt_file_beside_good_ones_is_partly_indexed(self, monkeypatch, mode):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("a.docx", "b.docx", "corrupted.docx"),
+            parsed_as={"corrupted.docx": PARSE_ERROR}, **mode)
+
+        assert toolkit.get_indexing_stats().runtime_skipped_error == {"corrupted.docx"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "processing_error") == ["corrupted.docx"]
+        assert_totals(outcome, indexed=2, failed=1, total=3)
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+    def test_a_run_whose_every_file_fails_to_parse_fails(self, monkeypatch, mode):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("pw_protected.pdf", "corrupted.docx"),
+            parsed_as={"pw_protected.pdf": PARSE_ERROR, "corrupted.docx": PARSE_ERROR}, **mode)
+
+        assert_terminal_state(toolkit, outcome, IndexingStatus.ERROR)
+        assert failed_items(outcome, "processing_error") == ["corrupted.docx", "pw_protected.pdf"]
+        assert_totals(outcome, indexed=0, failed=2)
+        assert_run_outcome_kept(toolkit, mode, kept=False)
+
+    @pytest.mark.parametrize("failing_id", ["first", "second"])
+    def test_a_good_file_sharing_a_name_with_a_corrupt_one_stays_indexed(
+            self, monkeypatch, mode, failing_id):
+        documents = make_files("report.docx", "report.docx")
+        documents[0].metadata["id"], documents[1].metadata["id"] = "first", "second"
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, documents,
+            parse=parsed_by_id({failing_id: PARSE_ERROR}), **mode)
+
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "processing_error") == ["report.docx"]
+        assert outcome["report"]["totals"]["indexed"] == 1
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+    def test_a_file_that_fails_mid_parse_is_counted_only_as_failed(self, monkeypatch, mode):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("good.pdf", "half.pdf"),
+            parsed_as={"half.pdf": ("first page", PARSE_ERROR)}, **mode)
+
+        assert toolkit.get_indexing_stats().runtime_skipped_error == {"half.pdf"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome) == failed_items(outcome, "processing_error") == ["half.pdf"]
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+        assert toolkit.written[-1]["indexed"] == 1
+
+    @pytest.mark.parametrize("failing_id", ["first", "second"])
+    def test_a_good_file_sharing_a_name_with_one_that_fails_mid_parse_stays_indexed(
+            self, monkeypatch, mode, failing_id):
+        documents = make_files("report.pdf", "report.pdf")
+        documents[0].metadata["id"], documents[1].metadata["id"] = "first", "second"
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, documents, parse=parsed_by_id({failing_id: ("first page", PARSE_ERROR)}), **mode)
+
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "processing_error") == ["report.pdf"]
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+        assert toolkit.written[-1]["indexed"] == 1
+
+    def test_a_code_file_that_fails_to_parse_lands_with_the_other_parse_failures(self, monkeypatch, mode):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("app.py", "broken.py"),
+            toolkit_cls=CodeStagingToolkit, parsed_as={"broken.py": PARSE_ERROR}, **mode)
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.runtime_skipped_error == {"broken.py"}
+        assert stats.documents_skipped_error == set()
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "processing_error") == ["broken.py"]
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+
+    def test_unchanged_documents_keep_an_incremental_run_partly_indexed(self, monkeypatch, mode):
+        def find_unchanged(toolkit):
+            for name in ("a.docx", "b.docx"):
+                toolkit._track_document_unchanged(name)
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("corrupted.docx"), parsed_as={"corrupted.docx": PARSE_ERROR},
+            before_loading=find_unchanged, **mode)
+
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert_totals(outcome, indexed=0, failed=1, unchanged=2)
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+
+class RepositoryStagingToolkit(StagingToolkit, CodeIndexerToolkit):
+    def key_fn(self, document: Document):
+        return document.metadata.get("filename")
+
+    def _get_files(self, path, branch):
+        return ["app.py", "locked.py"]
+
+    def _read_file(self, file_path, branch):
+        if file_path == "locked.py":
+            raise ConnectionError("403 Forbidden")
+        return "def main():\n    return 1\n"
+
+
+class TestARepositoryFileThatCannotBeReadDecidesTheTerminalState:
+
+    @pytest.mark.parametrize("mode", PIPELINE_MODES)
+    def test_an_unreadable_file_beside_a_readable_one_is_partly_indexed(self, monkeypatch, mode):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [], toolkit_cls=RepositoryStagingToolkit,
+            source=CodeIndexerToolkit._base_loader, **mode)
+
+        assert toolkit.get_indexing_stats().files_skipped_read_error == {"locked.py"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "read_error") == ["locked.py"]
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+
+class TestOnlyExplicitFailuresChangeTheTerminalState:
+
+    @staticmethod
+    def zero_byte_file(name):
+        return Document(page_content="", metadata={
+            "id": name, "name": name, "updated_on": "1",
+            IndexerKeywords.CONTENT_FILE_NAME.value: name,
+            IndexerKeywords.CONTENT_IN_BYTES.value: b"",
+        })
+
+    def test_a_page_that_produced_nothing_is_reported_but_keeps_the_run_completed(self, monkeypatch):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [make_page("1", "Page A"), make_page("2", "Blank page", body="")])
+
+        assert toolkit.get_indexing_stats().documents_skipped_error == {"Blank page"}
+        assert failed_items(outcome, "processing_error") == ["Blank page"]
+        assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+
+    def test_a_zero_byte_file_that_parsed_to_nothing_is_reported_but_keeps_the_run_completed(
+            self, monkeypatch):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [make_page("1", "Page A"), self.zero_byte_file("blank.txt")],
+            configure=lambda toolkit: monkeypatch.setattr(
+                "elitea_sdk.tools.base_indexer_toolkit.process_document_by_type",
+                content_parser.process_document_by_type))
+
+        assert toolkit.get_indexing_stats().documents_skipped_error == {"blank.txt"}
+        assert failed_items(outcome, "processing_error") == ["blank.txt"]
+        assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+
+    def test_an_empty_file_keeps_the_run_completed(self, monkeypatch):
+        empty = self.zero_byte_file("blank.md")
+        del empty.metadata[IndexerKeywords.CONTENT_FILE_NAME.value]
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [make_page("1", "Page A"), empty], chunking_tool="markdown")
+
+        assert toolkit.get_indexing_stats().files_skipped_empty == {"blank.md"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
+        assert_totals(outcome, indexed=1, skipped=1, failed=0, total=2)
+
+    def test_an_unsupported_file_keeps_the_run_completed(self, monkeypatch):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("a.docx", "image.bmp"), parsed_as={"image.bmp": UNSUPPORTED})
+
+        assert toolkit.get_indexing_stats().files_unsupported_extension == {"image.bmp"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
+        assert_totals(outcome, indexed=1, not_indexed=1, failed=0)
+
+    def test_a_failed_attachment_keeps_the_run_completed(self, monkeypatch):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("page.html"), parsed_as={"design.pdf": PARSE_ERROR},
+            dependents={"page.html": make_files("design.pdf", dependent=("design.pdf",))})
+
+        assert toolkit.get_indexing_stats().dependent_items_skipped == {"design.pdf"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
+        assert_totals(outcome, indexed=1, failed=0, total=1)
+
+
+class FakeArtifactClient:
+
+    def __init__(self, served):
+        self.served = served
+
+    def get_content_bytes(self, artifact_name):
+        response = self.served.get(artifact_name, b"payload")
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class FakeSharepointBackend:
+
+    def __init__(self, unreachable=(), unreachable_pages=()):
+        self.unreachable = unreachable
+        self.unreachable_pages = unreachable_pages
+
+    def _onenote_parse_page_items(self, page_id, **kwargs):
+        return [{"type": "image", "raw_bytes": b"png", "description": f"diagram on {page_id}",
+                 "filename": "diagram.png"}]
+
+    def load_file_content_in_bytes(self, path):
+        if path in self.unreachable:
+            raise ConnectionError("401 Unauthorized")
+        return b"payload"
+
+    def onenote_get_page_content(self, page_id):
+        if page_id in self.unreachable_pages:
+            raise ConnectionError("Graph 503")
+        return "<html>page</html>"
+
+
+@pytest.mark.parametrize("mode", PIPELINE_MODES)
+class TestADownloadFailureDecidesTheTerminalState:
+
+    @staticmethod
+    def artifacts(*names):
+        return [Document(page_content="", metadata={"name": name, "id": f"sha-{name}", "updated_on": "1"})
+                for name in names]
+
+    @staticmethod
+    def index_artifacts(monkeypatch, mode, documents, served):
+        def configure(toolkit):
+            object.__setattr__(toolkit, "bucket", "sweep")
+            object.__setattr__(toolkit, "artifact", FakeArtifactClient(served))
+
+        return index_through_real_pipeline(
+            monkeypatch, documents, toolkit_cls=ArtifactStagingToolkit, configure=configure, **mode)
+
+    @staticmethod
+    def index_sharepoint(monkeypatch, mode, documents, backend, capture_images=False):
+        def configure(toolkit):
+            object.__setattr__(toolkit, "_backend", backend)
+            object.__setattr__(toolkit, "_onenote_cfg", {"capture_images": capture_images})
+
+        monkeypatch.setattr(SharepointStagingToolkit, "_sync_backend_context", lambda self: None)
+        return index_through_real_pipeline(
+            monkeypatch, documents, toolkit_cls=SharepointStagingToolkit, configure=configure, **mode)
+
+    @staticmethod
+    def assert_partly_indexed_with_unreadable(toolkit, mode, outcome, unreadable):
+        stats = toolkit.get_indexing_stats()
+        assert stats.files_skipped_read_error == {unreadable}
+        assert stats.documents_skipped_error == set()
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome) == failed_items(outcome, "read_error") == [unreadable]
+        assert_totals(outcome, indexed=1, failed=1, total=2)
+        assert toolkit.written[-1]["indexed"] == 1
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+    def test_an_artifact_the_store_refuses_to_serve_is_partly_indexed(self, monkeypatch, mode):
+        toolkit, outcome = self.index_artifacts(
+            monkeypatch, mode, self.artifacts("good.txt", "report.pdf"),
+            served={"report.pdf": {"error": "NoSuchKey"}})
+
+        self.assert_partly_indexed_with_unreadable(toolkit, mode, outcome, "report.pdf")
+
+    def test_an_artifact_whose_download_raises_is_partly_indexed(self, monkeypatch, mode):
+        toolkit, outcome = self.index_artifacts(
+            monkeypatch, mode, self.artifacts("good.txt", "report.pdf"),
+            served={"report.pdf": ConnectionError("minio unreachable")})
+
+        self.assert_partly_indexed_with_unreadable(toolkit, mode, outcome, "report.pdf")
+
+    @staticmethod
+    def sharepoint_files(*paths):
+        return [Document(page_content="", metadata={
+            "Name": path.rsplit("/", 1)[-1], "Path": path, "id": f"sp-{path}", "updated_on": "1"})
+            for path in paths]
+
+    def test_a_sharepoint_file_whose_download_raises_is_partly_indexed(self, monkeypatch, mode):
+        toolkit, outcome = self.index_sharepoint(
+            monkeypatch, mode, self.sharepoint_files("/sites/docs/good.docx", "/sites/docs/locked.docx"),
+            FakeSharepointBackend(unreachable={"/sites/docs/locked.docx"}))
+
+        self.assert_partly_indexed_with_unreadable(toolkit, mode, outcome, "locked.docx")
+
+    @pytest.mark.parametrize("locked_folder", ["a", "b"])
+    def test_a_sharepoint_file_sharing_a_name_with_a_locked_one_stays_indexed(
+            self, monkeypatch, mode, locked_folder):
+        toolkit, outcome = self.index_sharepoint(
+            monkeypatch, mode, self.sharepoint_files("/sites/docs/a/Notes.docx", "/sites/docs/b/Notes.docx"),
+            FakeSharepointBackend(unreachable={f"/sites/docs/{locked_folder}/Notes.docx"}))
+
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "read_error") == ["Notes.docx"]
+        assert outcome["report"]["totals"]["indexed"] == 1
+        assert toolkit.written[-1]["indexed"] == 1
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+    @staticmethod
+    def onenote_pages(*pages):
+        return [Document(page_content="", metadata={
+            "source_type": "onenote", "id": page_id, "title": title, "updated_on": "1"})
+            for page_id, title in pages]
+
+    def test_a_onenote_page_whose_body_cannot_be_fetched_is_partly_indexed(self, monkeypatch, mode):
+        toolkit, outcome = self.index_sharepoint(
+            monkeypatch, mode, self.onenote_pages(("1-abc!1", "Meeting notes"), ("1-abc!2", "Roadmap")),
+            FakeSharepointBackend(unreachable_pages={"1-abc!2"}))
+
+        self.assert_partly_indexed_with_unreadable(toolkit, mode, outcome, "Roadmap")
+
+    def test_a_onenote_page_whose_images_were_indexed_is_counted_only_as_failed(self, monkeypatch, mode):
+        toolkit, outcome = self.index_sharepoint(
+            monkeypatch, mode, self.onenote_pages(("1-abc!1", "Meeting notes"), ("1-abc!2", "Roadmap")),
+            FakeSharepointBackend(unreachable_pages={"1-abc!2"}),
+            capture_images=True)
+
+        self.assert_partly_indexed_with_unreadable(toolkit, mode, outcome, "Roadmap")
+
+    @pytest.mark.parametrize("capture_images", [False, True])
+    def test_a_onenote_page_sharing_a_title_with_an_unreachable_one_stays_indexed(
+            self, monkeypatch, mode, capture_images):
+        pages = self.onenote_pages(("1-abc!1", "Untitled Page"), ("1-abc!2", "Untitled Page"))
+
+        toolkit, outcome = self.index_sharepoint(
+            monkeypatch, mode, pages, FakeSharepointBackend(unreachable_pages={"1-abc!1"}),
+            capture_images=capture_images)
+
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert failed_items(outcome, "read_error") == ["Untitled Page"]
+        assert outcome["report"]["totals"]["indexed"] == 1
+        assert toolkit.written[-1]["indexed"] == 1
+        assert_run_outcome_kept(toolkit, mode, kept=True)
+
+    def test_a_run_whose_every_download_fails_fails(self, monkeypatch, mode):
+        toolkit, outcome = self.index_artifacts(
+            monkeypatch, mode, self.artifacts("a.pdf", "b.pdf"),
+            served={"a.pdf": {"error": "NoSuchKey"}, "b.pdf": ConnectionError("minio unreachable")})
+
+        assert toolkit.get_indexing_stats().files_skipped_read_error == {"a.pdf", "b.pdf"}
+        assert_terminal_state(toolkit, outcome, IndexingStatus.ERROR)
+        assert failed_items(outcome, "read_error") == ["a.pdf", "b.pdf"]
+        assert_totals(outcome, indexed=0, failed=2, total=2)
+        assert_run_outcome_kept(toolkit, mode, kept=False)

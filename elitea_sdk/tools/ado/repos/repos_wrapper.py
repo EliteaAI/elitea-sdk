@@ -60,6 +60,22 @@ MAX_SNIPPET_CHARS = 400
 MAX_FILES_FETCHED_FOR_SNIPPETS = PAGING.default_top
 SNIPPET_READ_TAIL_MARGIN_CHARS = 4000
 SNIPPET_FETCH_WORKERS = 4
+PATH_GLOB_CHARACTERS = re.compile(r"[*?]")
+WHITESPACE = re.compile(r"\s")
+
+
+def build_inline_path_filter(path: Optional[str]) -> Optional[str]:
+    """Return an inline `path:` search token for a glob path, or None for a literal path.
+
+    The Code Search `Path` facet matches values literally, so `*`/`?` only act as
+    wildcards when sent through the query parser as an inline `path:` token.
+    """
+    if not path or not PATH_GLOB_CHARACTERS.search(path):
+        return None
+    pattern = path.lstrip("/")
+    if WHITESPACE.search(pattern):
+        pattern = f'"{pattern}"'
+    return f"path:{pattern}"
 
 
 def _relabel_guidance_offset_limit(result: Any) -> Any:
@@ -423,7 +439,15 @@ class ArgsSchema(Enum):
             Optional[str],
             Field(
                 default=None,
-                description="Restrict results to a repository path, e.g. `/src/services`.",
+                description=(
+                    "Restrict results to a repository path. A literal path such as "
+                    "`/src/services` matches that folder's whole subtree by whole "
+                    "folder names (`test` does not match `testcode`). Globs are "
+                    "supported: `*` and `**` both match across folders, e.g. "
+                    "`/testcode/**` or `src/**/utils` (a folder named utils nested "
+                    "below src, at least one folder deep). Combined with a `path:` "
+                    "in query, both must match."
+                ),
             ),
         ),
         top=(
@@ -1874,13 +1898,17 @@ class ReposApiWrapper(CodeIndexerToolkit):
         }
         if branch:
             filters["Branch"] = [branch]
-        if path:
+        search_text = query
+        inline_path_filter = build_inline_path_filter(path)
+        if inline_path_filter:
+            search_text = f"({query}) {inline_path_filter}"
+        elif path:
             filters["Path"] = [path]
 
         try:
             response = self._search_client.fetch_code_search_results(
                 request=CodeSearchRequest(
-                    search_text=query,
+                    search_text=search_text,
                     filters=filters,
                     top=top,
                     skip=skip,
@@ -1889,7 +1917,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 project=self.project,
             )
         except Exception as e:
-            msg = f"Unable to search code for query '{query}': {str(e)}"
+            msg = f"Unable to search code for query '{search_text}': {str(e)}"
             logger.error(msg)
             raise ToolException(
                 f"{msg}\nCode search requires at least Basic access and a token with the "

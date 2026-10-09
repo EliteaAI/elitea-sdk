@@ -42,7 +42,7 @@ from ..tools.hitl import (
     PendingHITLEntry,
 )
 from ..tools.indexer_tool import IndexerNode
-from ..tools.llm import LLMNode
+from ..tools.llm import LLMNode, default_tool_execution_timeout
 from ..tools.loop import LoopNode
 from ..tools.loop_output import LoopToolNode
 from ..tools.tool import ToolNode
@@ -1059,6 +1059,7 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
         result = {
             "messages": [{"role": "assistant", "content": message}],
             PIPELINE_BLOCKED_KEY: message,
+            LAST_TOOL_OUTCOME_KEY: None,
         }
         for var in output_vars:
             if var != "messages":
@@ -1534,7 +1535,7 @@ def create_graph(
                     output_variables=output_vars,
                     input_variables=node.get('input', ['messages']),
                     structured_output=node.get('structured_output', False),
-                    tool_execution_timeout=node.get('tool_execution_timeout', 900),
+                    tool_execution_timeout=node.get('tool_execution_timeout', default_tool_execution_timeout()),
                     available_tools=available_tools,
                     # Selection is already resolved above while toolkit identity is available.
                     tool_names=None,

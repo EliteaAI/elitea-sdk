@@ -139,8 +139,10 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
         if not self.github_client_instance:
             raise ValueError("GitHub client not initialized")
         
-        # Use the GitHub client's method to get files
-        return self.github_client_instance._get_files(path, branch or self.active_branch)
+        # Deliberately not the client's _get_files, which stringifies failures for agents:
+        # the indexer needs the exception so the provider's type and status survive.
+        return list(self.github_client_instance._get_files_with_identity(
+            path, branch or self.active_branch))
 
     def _get_files_with_identity(self, path: str = "", branch: str = None):
         if not self.github_client_instance:

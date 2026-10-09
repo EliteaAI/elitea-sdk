@@ -20,7 +20,7 @@ state:
     type: str
   branch_name:
     type: str
-    value: "EliteaTest"
+    value: "${ADO_BASE_BRANCH}"
   directory_path:
     type: str
     value: ""

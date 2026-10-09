@@ -36,7 +36,7 @@ nodes:
       - tool_result
     structured_output: true
     tool: set_active_branch
-    toolkit_name: ado-repos-testing
+    toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
     transition: verify_by_reading_file
   - id: verify_by_reading_file
     type: toolkit
@@ -54,7 +54,7 @@ nodes:
       - verification_result
     structured_output: true
     tool: read_file
-    toolkit_name: ado-repos-testing
+    toolkit_name: ${ADO_REPOS_TOOLKIT_NAME}
     transition: validate_results
   - id: validate_results
     type: llm

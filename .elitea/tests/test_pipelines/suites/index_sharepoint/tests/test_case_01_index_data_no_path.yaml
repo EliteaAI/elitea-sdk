@@ -1,10 +1,11 @@
 name: "ISP01-no-path"
 priority: Critical
 description: |
-  Verify index_data indexes all accessible SharePoint files with no path restriction.
+  Verify index_data indexes the SharePoint test folder
+  (Shared Documents/DO_NOT_DELETE_AlitaTestFiles) given as a server-relative path.
 
   Objective: Baseline indexing — establish that index_data completes successfully
-  and indexes documents from all accessible libraries.
+  and indexes documents from the curated test folder.
 
   Expected Behavior:
   - Tool executes without raising an exception
@@ -42,6 +43,11 @@ nodes:
       limit_files:
         type: fixed
         value: 20
+      # Scoped to the curated test folder: other libraries (e.g. private_docs) hold
+      # password-protected/corrupt files that make the run 'partly_indexed'.
+      path:
+        type: fixed
+        value: "${SERVER_RELATIVE_PATH}"
     output:
       - index_result
     structured_output: true

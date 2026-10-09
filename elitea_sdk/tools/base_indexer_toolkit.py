@@ -2,6 +2,7 @@ import contextvars
 import copy
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -9,6 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
+from http import HTTPStatus
 from queue import Empty, Full, Queue
 from typing import Any, Callable, ClassVar, Optional, List, Dict, Generator, Set, Tuple, Union
 from uuid import uuid4
@@ -16,6 +18,8 @@ from uuid import uuid4
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
+
+from ..runtime.tool_outcome import ToolErrorClass, classify_tool_error, quota_exhausted, retriable_for
 from pydantic import create_model, Field, SecretStr
 
 from .index_params import (
@@ -25,6 +29,7 @@ from .index_params import (
     build_base_stepback_search_params,
 )
 from .utils.content_parser import file_extension_by_chunker, process_document_by_type
+from .utils.retry import is_server_error_retriable, retry_on_server_error
 from .utils.tool_groups import tool_group, with_tool_groups
 from .utils.serialization import serialize_tool_result
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
@@ -164,6 +169,10 @@ class IndexingStats:
             len(self.runtime_skipped_extension) +
             len(self.runtime_skipped_error)
         )
+
+    @property
+    def explicitly_failed_documents(self) -> Set[str]:
+        return self.files_skipped_read_error | self.runtime_skipped_error
 
     def to_dict(self) -> Dict:
         """Convert stats to dictionary for reporting."""
@@ -570,6 +579,8 @@ def build_error_report(
     dependent_labels: Tuple[str, str],
     stats: Optional[IndexingStats] = None,
     indexed_count: int = 0,
+    failure: Optional[BaseException] = None,
+    retriable: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Report for a run that aborted before producing a result.
 
@@ -584,7 +595,27 @@ def build_error_report(
         dependent_labels=dependent_labels,
         errors=[error_message],
     )
+    if failure is not None:
+        report.update(describe_failure_cause(failure))
+    if retriable is not None:
+        # The classifier describes the error; only the caller knows whether THIS run could
+        # make progress on a retry.
+        report["retriable"] = retriable
     return report
+
+
+def describe_failure_cause(failure: BaseException) -> Dict[str, Any]:
+    """Publish what kind of failure this was as fields, so nobody has to match substrings
+    to learn whether waiting could help. Empty when unclassifiable: no label is safer than
+    a wrong one a consumer would branch on.
+    """
+    error_class = classify_tool_error(failure)
+    if error_class is None:
+        return {}
+    return {
+        "error_class": error_class.value,
+        "retriable": retriable_for(error_class),
+    }
 
 
 def _pick_noun(count: int, labels: Dict[str, str]) -> str:
@@ -753,6 +784,33 @@ def candidate_chunk_digest(document: Document) -> bytes:
     return chunk_digest(text_digest, document.metadata)
 
 
+retry_like_add_documents = retry_on_server_error(
+    max_attempts=5, wait_seconds=(15, 30, 60, 120), log=logger
+)
+
+
+@retry_like_add_documents
+def embed_probe_texts(embeddings, texts: List[str]) -> List[List[float]]:
+    return embeddings.embed_documents(texts)
+
+
+def probe_failure_can_clear(failure: BaseException) -> bool:
+    return (is_server_error_retriable(failure)
+            or getattr(failure, "status_code", None) == HTTPStatus.REQUEST_TIMEOUT
+            or classify_tool_error(failure) is ToolErrorClass.INFRASTRUCTURE)
+
+
+def vectors_agree(stored: List[float], current: List[float], tolerance: float) -> bool:
+    if len(stored) != len(current):
+        return False
+    scale = max(math.hypot(*stored), math.hypot(*current))
+    return scale > 0 and math.dist(stored, current) <= tolerance * scale
+
+
+class AdoptionProbeUnavailable(ToolException):
+    pass
+
+
 class IndexRunRefusedError(ToolException):
     """Refusal to start an indexing run while another one owns the index.
 
@@ -778,6 +836,7 @@ class _IndexRunState:
     pipeline_failed_keys: Set[str] = field(default_factory=set)
     doc_names: Dict[str, str] = field(default_factory=dict)
     counted_doc_keys: Set[str] = field(default_factory=set)
+    explicitly_failed_keys: Set[str] = field(default_factory=set)
     seen_keys: Set[str] = field(default_factory=set)
     preskipped_keys: Set[str] = field(default_factory=set)
     unchanged_skip_enabled: bool = False
@@ -789,6 +848,9 @@ class _IndexRunState:
     adoptable_chunks: Dict[str, List[str]] = field(default_factory=dict)
     adopted_row_pks: Set[str] = field(default_factory=set)
     reused_row_pks: Set[str] = field(default_factory=set)
+    resumable_files: Dict[str, tuple] = field(default_factory=dict)
+    resumed_files: Set[str] = field(default_factory=set)
+    resumed_chunk_count: int = 0
     orphan_candidate_ids: List[str] = field(default_factory=list)
     orphan_candidate_doc_count: int = 0
     heartbeat_stop: Optional[threading.Event] = None
@@ -959,6 +1021,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     adoption_max_chunks: ClassVar[int] = 200_000
 
+    adoption_probe_max_relative_distance: ClassVar[float] = 0.1
+    adoption_probe_rows: ClassVar[int] = 3
+
+    # Adoption re-stamps every row in one statement under the index meta lock, which Stop,
+    # discard, cancel and promote all contend for. Measured: 10.2s at 500k rows, 26s at 1M,
+    # minutes beyond. Past this the generation is discarded instead, which loses it — both
+    # outcomes are bad, and this is where blocking the index becomes the worse one.
+    adoption_restamp_max_chunks: ClassVar[int] = 500_000
+
     connection_string: Optional[SecretStr] = None
     collection_name: Optional[str] = None
     elitea: Any = None # Elitea client, if available
@@ -1064,6 +1135,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             stats.items_withdrawn += 1
             stats.items_processed = max(stats.items_processed - 1, 0)
 
+    def _track_download_failure(self, base_doc: Document):
+        self._track_explicit_base_failure(
+            base_doc, self._extract_doc_name(base_doc.metadata), 'files_skipped_read_error')
+
+    def _track_explicit_base_failure(self, base_doc: Document, doc_name: str, skip_set_name: str):
+        self._track_base_parse_failure(doc_name, skip_set_name)
+        run = getattr(self, '_index_run', None)
+        failed_key = str(self.key_fn(base_doc))
+        if run is not None and failed_key != IDLESS_STAGING_KEY:
+            run.explicitly_failed_keys.add(failed_key)
+
     def _track_document_damaged(self, doc_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
         stats.documents_skipped_error.add(doc_name)
@@ -1141,9 +1223,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 self._clean_index(index_name)
             #
             self.index_meta_init(index_name, kwargs)
-            self._load_adopted_chunk_digests()
             if staging:
                 self._start_run_heartbeat(index_name)
+            self._load_adopted_chunk_digests()
             self._emit_index_event(index_name)
             #
             self._log_tool_event(f"Indexing data into collection with suffix '{index_name}'. It can take some time...")
@@ -1191,6 +1273,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if empty_loader:
                 return self._finalize_empty_loader_run(index_name)
             #
+            result["count"] += self._index_run.resumed_chunk_count
             chunks_count = result["count"]
             failed_chunks_count = result.get("failed_count", 0)
             succeeded_chunks_count = chunks_count - failed_chunks_count
@@ -1224,7 +1307,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # them would render the damaged docs as retained content.
                 docs_count = max(docs_count - len(run.counted_doc_keys & flush_damaged_keys), 0)
 
-            lost_documents = bool(damaged_doc_keys) or result.get("failed_docs", 0) > 0
+            lost_documents = (bool(damaged_doc_keys)
+                              or result.get("failed_docs", 0) > 0
+                              or bool(stats and stats.explicitly_failed_documents))
             nothing_survived = docs_count + unchanged_count <= 0
 
             # Chunk counts drive the state only — never the user-facing summary.
@@ -1253,6 +1338,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             )
             if staging and final_state != IndexerKeywords.INDEX_META_FAILED.value:
                 self._append_retained_orphan_warning(report)
+                self._append_resumed_run_note(report)
             message = render_report_text(report)
 
             if staging:
@@ -1289,7 +1375,22 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Do maximum effort at least send custom event for supposed changed status
             self._stop_run_heartbeat()
             msg = str(e)
-            if self._staging_active():
+            # A spent quota refuses the same first files every time, so a corpus larger than
+            # one quota window only finishes if the rows are kept. Parking is worth it only
+            # where a later run would claim them; elsewhere the sweep deletes them anyway, a
+            # window later, with every attempt still calling itself retriable.
+            parkable = quota_exhausted(e) or isinstance(e, AdoptionProbeUnavailable)
+            unresumable = (self._staging_active() and parkable
+                           and self._unresumable_quota_reason())
+            park_for_resume = (self._staging_active() and parkable
+                               and not unresumable)
+            resumable_quota = not unresumable
+            if unresumable:
+                msg = (f"{msg}; the progress already made is discarded rather than retried "
+                       f"indefinitely, because {unresumable}. Raise the API quota for this "
+                       f"credential, or narrow the index scope, so a run can finish within "
+                       f"one quota window")
+            if self._staging_active() and not park_for_resume:
                 try:
                     self._discard_index_run(index_name)
                 except Exception as de:
@@ -1311,13 +1412,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         item_labels=self.index_item_labels,
                         dependent_labels=self.index_dependent_labels,
                         stats=self.get_indexing_stats(),
+                        failure=e,
+                        retriable=None if resumable_quota else False,
                     )
                     self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
                                            error=msg, report=error_report)
             except Exception as ie:
                 logger.error(f"Failed to update index meta status to FAILED for index '{index_name}': {ie}")
                 msg = f"{msg}; additionally failed to update index meta status to FAILED: {ie}"
+            if park_for_resume:
+                try:
+                    self._discard_index_run(index_name, retain_for_resume=True)
+                except Exception as de:
+                    logger.error(f"Failed to park staged rows for index '{index_name}': {de}")
             self._emit_index_event(index_name, error=msg, state=IndexerKeywords.INDEX_META_FAILED.value)
+            if unresumable:
+                # An agent sees the exception, not the meta row, so the remedy travels with
+                # it; `from e` keeps the provider error reachable for the classifier.
+                raise ToolException(msg) from e
             raise e
         finally:
             # Backstop for every exit; the handlers above stop it first, so their
@@ -1386,7 +1498,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return None
         try:
             return self.vector_adapter.claim_adoptable_run(
-                self, index_name, stale_before, self.adoption_max_chunks
+                self, index_name, stale_before, self.adoption_restamp_max_chunks
             )
         except Exception as claim_failure:
             logger.warning(
@@ -1421,6 +1533,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run = getattr(self, "_index_run", None)
         if run is None or not run.adopted_from_run_id:
             return
+        if not self._adopted_rows_embed_like_this_run():
+            self._release_adopted_rows()
+            return
         try:
             digests, row_pks, truncated = self.vector_adapter.read_run_staged_digests(
                 self, run.run_id, chunk_digest, self.adoption_max_chunks
@@ -1433,18 +1548,77 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._release_adopted_rows()
             return
         if truncated:
-            logger.warning(
-                f"The adopted run holds more than {self.adoption_max_chunks} rows, so they "
-                f"are dropped and re-indexed; raise adoption_max_chunks to reuse at this size"
+            # Dropping these lost the progress, so a corpus needing several quota windows
+            # never converged. The ids alone are cheap enough to keep the fence exact, which
+            # is all file-level resumption needs; only chunk-content reuse is given up.
+            try:
+                row_pks = self.vector_adapter.read_run_row_pks(self, run.run_id)
+            except Exception as read_failure:
+                logger.warning(
+                    f"Could not read the adopted row ids, so they are dropped and "
+                    f"re-indexed: {read_failure}"
+                )
+                self._release_adopted_rows()
+                return
+            logger.info(
+                f"The adopted run holds more than {self.adoption_max_chunks} rows, so "
+                f"{len(row_pks)} are kept by id and only the first are reusable by content"
             )
-            self._release_adopted_rows()
-            return
+        # The digest map may be partial; the id set never is. A chunk the map covers is
+        # reused, anything else superseded — correct either way, and partial reuses more.
         run.adoptable_chunks = digests
         run.adopted_row_pks = row_pks
+        try:
+            run.resumable_files = self.vector_adapter.read_run_complete_files(
+                self, run.run_id
+            )
+        except Exception as read_failure:
+            # Costs the fetch it would have skipped; the chunks are still reusable.
+            logger.warning(
+                f"Could not index the adopted rows by file, so every file is fetched "
+                f"again: {read_failure}"
+            )
+            run.resumable_files = {}
         # A silently empty reuse map is indistinguishable from a working one: the run
         # still succeeds, just at full cost. This line is the only signal that the
         # digests were prepared at all.
         logger.info(f"Indexed {len(row_pks)} adopted rows for reuse")
+
+    def _adopted_rows_embed_like_this_run(self) -> bool:
+        run = self._index_run
+        try:
+            samples = self.vector_adapter.read_run_embedding_samples(
+                self, run.run_id, self.adoption_probe_rows
+            )
+        except Exception as read_failure:
+            logger.warning(
+                f"Could not read the adopted rows' vectors, so they are dropped and "
+                f"re-embedded: {read_failure}"
+            )
+            return False
+        try:
+            current = embed_probe_texts(self.embeddings, [text for text, _ in samples]) if samples else []
+        except Exception as probe_failure:
+            if probe_failure_can_clear(probe_failure):
+                raise AdoptionProbeUnavailable(
+                    f"Could not reach '{self.embedding_model}' to check the rows adopted from an "
+                    f"interrupted run; they are kept for the next run to check: {probe_failure}"
+                ) from probe_failure
+            logger.warning(
+                f"'{self.embedding_model}' rejected the adoption probe, so the adopted rows are "
+                f"dropped and re-embedded: {probe_failure}"
+            )
+            return False
+        if samples and len(current) == len(samples) and all(
+            vectors_agree(stored, fresh, self.adoption_probe_max_relative_distance)
+            for (_, stored), fresh in zip(samples, current)
+        ):
+            return True
+        logger.warning(
+            f"The adopted rows were not embedded the way '{self.embedding_model}' embeds now, "
+            f"so they are dropped and re-embedded rather than mixed with this run's vectors"
+        )
+        return False
 
     def _release_adopted_rows(self) -> None:
         """Delete the adopted rows when this run cannot reuse them.
@@ -1468,6 +1642,45 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run.adopted_chunk_count = 0
         run.adoptable_chunks = {}
         run.adopted_row_pks = set()
+
+    def resumable_file_identity(self, file_path: str) -> Optional[str]:
+        """The identity of a file this run already holds in full, or None."""
+        run = getattr(self, "_index_run", None)
+        if run is None:
+            return None
+        entry = run.resumable_files.get(file_path)
+        return entry[0] if entry else None
+
+    def adopt_resumed_file(self, file_path: str, index_name: str) -> None:
+        """Claim the rows of a file skipped before it was fetched, and retire the
+        generation those rows replace.
+
+        Skipping means the file reaches neither _consume_pipeline_output nor
+        _reduce_duplicates. The first would claim its rows, without which
+        _assemble_promote_sets supersedes exactly the chunks the skip relied on. The
+        second is the only place that nominates the previous generation's rows for
+        removal, without which promote publishes the old rows beside the new ones.
+        Both have to happen here instead.
+        """
+        run = self._index_run
+        entry = run.resumable_files.get(file_path)
+        if not entry:
+            return
+        run.reused_row_pks.update(entry[1])
+        run.resumed_files.add(file_path)
+        run.resumed_chunk_count += len(entry[1])
+        run.chunks_written += len(entry[1])
+        self._stage_resumed_file_removal(file_path, index_name)
+
+    def _stage_resumed_file_removal(self, file_path: str, index_name: str) -> None:
+        run = self._index_run
+        indexed_data = self._read_indexed_data_once(index_name)
+        previous = indexed_data.get(file_path)
+        if not previous or previous['metadata'].get('collection') != index_name:
+            return
+        run.staged_removal_ids.setdefault(file_path, set()).update(
+            str(removal_id) for removal_id in self.remove_ids_fn(indexed_data, file_path)
+        )
 
     def _claim_adopted_row(self, document: Document) -> Optional[str]:
         run = getattr(self, "_index_run", None)
@@ -1561,13 +1774,48 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         run.finalized = True
         return outcome
 
-    def _discard_index_run(self, index_name: str):
+    def _unresumable_quota_reason(self) -> Optional[str]:
+        """Why a quota failure cannot keep its progress, phrased as something to act on.
+
+        None when it can. Each branch is a case where a later run would not claim the parked
+        rows, so parking them only delays their deletion by one sweep.
+        """
+        run = getattr(self, "_index_run", None)
+        if run is not None and run.clean_index:
+            return ("Clean Index rewrites the whole corpus and never resumes from an "
+                    "interrupted run, so turning it off would let a later run continue")
+        if not self.adoption_enabled:
+            return "resuming interrupted runs is switched off for this index"
+        if not self._generation_fits_the_restamp_bound():
+            return (f"the interrupted generation is larger than this index can re-stamp in "
+                    f"one step, over adoption_restamp_max_chunks="
+                    f"{self.adoption_restamp_max_chunks}")
+        return None
+
+    def _generation_fits_the_restamp_bound(self) -> bool:
+        """Whether a later run's claim would accept this generation, or refuse it for size
+        and leave the sweep to delete it."""
+        run = getattr(self, "_index_run", None)
+        if run is None:
+            return False
+        generation = run.chunks_written + len(run.adopted_row_pks - run.reused_row_pks)
+        if generation <= self.adoption_restamp_max_chunks:
+            return True
+        logger.warning(
+            f"The interrupted generation holds {generation} rows, above "
+            f"adoption_restamp_max_chunks ({self.adoption_restamp_max_chunks}), so no later "
+            f"run could adopt it; the rows are discarded rather than parked to be swept."
+        )
+        return False
+
+    def _discard_index_run(self, index_name: str, retain_for_resume: bool = False):
         run = getattr(self, "_index_run", None)
         # The latch makes promote and discard mutually exclusive: a terminal meta
         # write failing AFTER promote must not delete the corpus just published.
         if run is None or run.finalized:
             return
-        self.vector_adapter.discard_run(self, index_name, run.run_id)
+        self.vector_adapter.discard_run(self, index_name, run.run_id,
+                                        retain_chunks=retain_for_resume)
         run.finalized = True
 
     def _foreign_live_run_exists(self, index_name: str) -> bool:
@@ -1654,6 +1902,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _mark_batch_damaged(run: _IndexRunState, chunk_keys: List[str]):
         run.damaged_keys.update(
             chunk_key for chunk_key in set(chunk_keys) if chunk_key != IDLESS_STAGING_KEY
+        )
+
+    def _append_resumed_run_note(self, report: Dict[str, Any]):
+        """Report reuse to the user.
+
+        Adoption is invisible everywhere else: retained rows are excluded from
+        indexed_chunks while they are hidden, and a resumed run's counts are identical
+        to a clean run's. Without this line the only way to tell a resume happened is to
+        time the run.
+        """
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.reused_row_pks:
+            return
+        reused = len(run.reused_row_pks)
+        chunks = "chunk was" if reused == 1 else "chunks were"
+        report.setdefault("warnings", []).append(
+            f"Resumed the interrupted run: {reused} {chunks} reused instead of being "
+            f"embedded again."
         )
 
     def _append_retained_orphan_warning(self, report: Dict[str, Any]):
@@ -1833,14 +2099,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             logger.debug(msg)
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
-            if dependent_docs_counter > 0:
+            if dependent_docs_counter == 0:
+                self._track_document_failed(_doc_name, base_doc)
+            elif not self._is_base_doc_explicitly_failed(base_doc):
                 result["docs_count"] += 1
                 if staging:
                     counted_key = str(self.key_fn(base_doc))
                     if counted_key != IDLESS_STAGING_KEY:
                         run.counted_doc_keys.add(counted_key)
-            else:
-                self._track_document_failed(_doc_name, base_doc)
 
         workers = getattr(self, "_index_workers", 1) or 1
 
@@ -1925,7 +2191,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         chunking_config['embedding'] = self.embeddings
         chunking_config['llm'] = self.llm
 
-        def _filter_parsing_errors(docs_generator, source_name: str, dependent: bool = False):
+        def _filter_parsing_errors(docs_generator, source_document: Document, source_name: str,
+                                   dependent: bool = False):
             for doc in docs_generator:
                 if doc.page_content and doc.page_content.startswith("Unsupported extension for file"):
                     if dependent:
@@ -1936,10 +2203,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 if doc.page_content and doc.page_content.startswith("Error during content parsing for file"):
                     if dependent:
                         self._track_dependent_parse_failure(source_name, reason="error")
-                    elif hasattr(self, '_track_runtime_skipped'):
-                        self._track_base_parse_failure(source_name, 'runtime_skipped_error')
-                    elif hasattr(self, '_track_skipped_document'):
-                        self._track_document_failed(source_name)
+                    else:
+                        self._track_explicit_base_failure(source_document, source_name, 'runtime_skipped_error')
                     continue
                 if not doc.page_content or not doc.page_content.strip():
                     if dependent:
@@ -1966,7 +2231,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         content=content,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
-                    source_name=source_name, dependent=dependent
+                    source_document=document, source_name=source_name, dependent=dependent
                 ))
             if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
@@ -1996,7 +2261,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         content=content_in_bytes,
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
-                    source_name=source_name, dependent=dependent
+                    source_document=document, source_name=source_name, dependent=dependent
                 ))
             if chunking_tool:
                 # apply default chunker from toolkit config. No parsing.
@@ -2103,6 +2368,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if candidates & skip_set:
                 return True
         return False
+
+    def _is_base_doc_explicitly_failed(self, base_doc: Document) -> bool:
+        run = getattr(self, '_index_run', None)
+        return run is not None and str(self.key_fn(base_doc)) in run.explicitly_failed_keys
 
     def _collect_dependencies(self, documents: Generator[Document, None, None]):
         # Parallelism opt-in: subclasses (e.g. AzureDevOpsApiWrapper) set
@@ -2275,7 +2544,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return
         for key in run.preskipped_keys:
             run.seen_keys.add(key)
-            self._track_document_unchanged(key)
+            if key not in run.resumed_files:
+                self._track_document_unchanged(key)
 
     def _reduce_duplicates(
             self,

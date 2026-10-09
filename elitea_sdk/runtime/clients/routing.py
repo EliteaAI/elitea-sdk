@@ -272,6 +272,8 @@ class AutoChatModel(BaseChatModel):
         from elitea_sdk.runtime.clients.routing_history import adapt_completed_history
         messages = adapt_completed_history(native, messages, binding)
         target = native.bound if isinstance(native, RunnableBinding) else native
+        from elitea_sdk.runtime.langchain.utils import prepare_messages_for_model
+        messages = prepare_messages_for_model(messages, model=target)
         if 'langchain_anthropic' not in type(target).__module__:
             return messages
         from ..langchain.assistant import _make_anthropic_system_content

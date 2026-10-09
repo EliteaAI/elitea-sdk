@@ -17,7 +17,6 @@ class ToolResultStatus(str, Enum):
     SUCCESS = "success"
     ERROR = "error"
     TRUNCATED = "truncated"
-    BLOCKED = "blocked"
 
 
 class ToolErrorClass(str, Enum):
@@ -212,6 +211,31 @@ def classify_tool_error(exc: BaseException) -> Optional[ToolErrorClass]:
     if any(phrase in text for phrase in _INFRASTRUCTURE_PHRASES):
         return ToolErrorClass.INFRASTRUCTURE
     return None
+
+
+_QUOTA_EXHAUSTED_NAMES = frozenset({
+    "RateLimitExceededException", "TooManyRequests", "RateLimitError",
+})
+
+
+def quota_exhausted(exc: BaseException) -> bool:
+    """Whether a source refused because its request quota is spent.
+
+    Deliberately narrower than ToolErrorClass.INFRASTRUCTURE, which also covers timeouts
+    and 5xx: those affect one item and the caller should carry on, while a spent quota
+    will refuse every remaining item.
+    """
+    for link in _chain(exc):
+        if {cls.__name__ for cls in type(link).__mro__} & _QUOTA_EXHAUSTED_NAMES:
+            return True
+        status = _status_of(link)
+        if status == 429:
+            return True
+        if status == 403:
+            headers = {str(k).lower(): v for k, v in (_attr(link, "headers") or {}).items()}
+            if str(headers.get("x-ratelimit-remaining")) == "0":
+                return True
+    return False
 
 
 def retriable_for(error_class: Optional[ToolErrorClass]) -> bool:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 import logging
+import json
 import re
 import fnmatch
 import zipfile
 from io import BytesIO
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import requests
 import tiktoken
@@ -14,15 +15,21 @@ logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field, model_validator
 
-from github import Auth, Github, GithubIntegration, Repository
+from github import Auth, Github, GithubIntegration, GithubRetry, Repository
+from github.GithubException import RateLimitExceededException
+from github.Requester import Requester
+from urllib3.exceptions import MaxRetryError
 from github.Consts import DEFAULT_BASE_URL
 from langchain_core.tools import ToolException
+
+from ...runtime.tool_outcome import quota_exhausted
 
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils import normalize_pem_key
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
+from ...runtime.utils.trace_limits import estimate_chars, resolve_tool_result_limit
 
 from .schemas import (
     GitHubAuthConfig,
@@ -64,6 +71,7 @@ from .tool_prompts import (
     CREATE_ISSUE_PROMPT,
     UPDATE_ISSUE_PROMPT,
     DELETE_BRANCH_PROMPT,
+    GET_ISSUE_PROMPT,
 )
 
 from langchain_community.tools.github.prompt import (
@@ -76,7 +84,6 @@ from langchain_community.tools.github.prompt import (
     SEARCH_ISSUES_AND_PRS_PROMPT,
     READ_FILE_PROMPT,
     GET_ISSUES_PROMPT,
-    GET_ISSUE_PROMPT,
     COMMENT_ON_ISSUE_PROMPT,
     LIST_PRS_PROMPT,
     GET_PR_PROMPT,
@@ -89,6 +96,102 @@ from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION
 GITHUB_DOCUMENTED_GET_LIMIT_PER_SECOND = 15
 GITHUB_INDEXER_REQUESTS_PER_SECOND = 10
 GITHUB_SECONDS_BETWEEN_REQUESTS = 1 / GITHUB_INDEXER_REQUESTS_PER_SECOND
+# PyGithub's default retry sleeps until a primary rate limit resets — 2140s measured on an
+# anonymous credential — so the outage never becomes an exception anything can classify.
+GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS = 60.0
+
+
+def _means_ref_is_absent(error) -> bool:
+    """A 403 or 401 here is about the request, not the ref; blaming the ref hides it."""
+    return getattr(error, "status", None) == 404
+GITHUB_DEFAULT_PAGE_SIZE = 30
+GITHUB_ISSUE_COMMENTS_LIMIT = GITHUB_DEFAULT_PAGE_SIZE
+GITHUB_TOOLKIT_TYPE = 'github'
+GITHUB_ISSUE_COMMENTS_NOTE_RESERVE = 512
+
+
+class BoundedGithubRetry(GithubRetry):
+    """Retries transient failures, but refuses to sleep out a long rate-limit reset.
+
+    PyGithub announces its intended wait by replacing get_backoff_time on the retry it
+    returns, which is why that is what gets inspected. The bound is on the WAIT rather than
+    the retry count, so a brief secondary-rate pause still retries normally.
+    """
+
+    max_rate_limit_sleep_seconds = GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS
+
+    @classmethod
+    def for_reads_only(cls, **kwargs):
+        """Retries only the methods that are safe to repeat.
+
+        PyGithub's allowed_methods includes POST. A GitHub App client previously had
+        retry=None and retried nothing, so inheriting that would newly let a 502 on
+        create_issue or a PR comment produce duplicates.
+        """
+        return cls(allowed_methods=frozenset({"GET", "HEAD", "OPTIONS", "TRACE"}), **kwargs)
+
+    @staticmethod
+    def _intended_wait(retry, response) -> float:
+        """How long urllib3 is about to sleep, from whichever source wins.
+
+        A Retry-After header is honoured instead of the backoff, and leaves
+        get_backoff_time at 0 — so reading only that misses every secondary rate limit.
+        """
+        waits = []
+        for read in (lambda: retry.get_backoff_time(),
+                     lambda: retry.get_retry_after(response)
+                     if getattr(retry, "respect_retry_after_header", False) else None):
+            try:
+                value = read()
+            except Exception:  # pylint: disable=W0703
+                continue
+            if isinstance(value, (int, float)):
+                waits.append(float(value))
+        return max(waits) if waits else 0.0
+
+    def increment(self, method=None, url=None, response=None, error=None,
+                  _pool=None, _stacktrace=None):
+        try:
+            retry = super().increment(method, url, response, error, _pool, _stacktrace)
+        except MaxRetryError:
+            # Retries ran out, and by now the body has been read — so this would otherwise
+            # surface as an untyped 403 and classify as 'policy', asserting a credential
+            # problem that waiting cannot fix. Failing here also pays the wait only once.
+            if response is not None and self._is_rate_limited(response):
+                raise self._long_wait_error(response, url) from None
+            raise
+        if response is None:
+            return retry
+        if not self._is_rate_limited(response):
+            # A 5xx carrying Retry-After is a server asking us to wait, not a quota; capping
+            # it would skip a legitimate wait and report it as a rate limit.
+            return retry
+        intended_wait = self._intended_wait(retry, response)
+        if intended_wait <= self.max_rate_limit_sleep_seconds:
+            return retry
+        raise self._long_wait_error(response, url)
+
+    def _long_wait_error(self, response, url):
+        """The exception PyGithub would have raised had it judged this non-retryable.
+
+        Built from the body where it is still readable, because a 403 is not necessarily a
+        quota and a refusal must not be parked as retriable. super() reads the body only
+        when Retry-After is absent, so on the other branch it survives; otherwise the
+        headers are all that is left.
+        """
+        if "Retry-After" in (response.headers or {}):
+            try:
+                body = json.loads(self.get_content(response, url) or b"{}")
+            except Exception:  # pylint: disable=W0703
+                body = None
+            if isinstance(body, dict) and body:
+                return Requester.createException(response.status, response.headers, body)
+        return RateLimitExceededException(
+            response.status, {"message": "API rate limit exceeded"}, response.headers)
+
+    @staticmethod
+    def _is_rate_limited(response) -> bool:
+        return getattr(response, "status", None) in (403, 429)
 
 
 class GitHubClient(BaseModel):
@@ -199,15 +302,19 @@ class GitHubClient(BaseModel):
             # Create GitHub client
             if auth is None:
                 return Github(base_url=self.github_base_url,
-                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
+                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS,
+                              retry=BoundedGithubRetry(total=10, raise_on_status=False))
             elif auth_config.github_app_id and auth_config.github_app_private_key:
-                gi = GithubIntegration(base_url=self.github_base_url, auth=auth,
-                                       seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
+                gi = GithubIntegration(
+                    base_url=self.github_base_url, auth=auth,
+                    seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS,
+                    retry=BoundedGithubRetry.for_reads_only(total=10, raise_on_status=False))
                 installation = gi.get_installations()[0]
                 return installation.get_github_for_installation()
             else:
                 return Github(base_url=self.github_base_url, auth=auth,
-                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS)
+                              seconds_between_requests=GITHUB_SECONDS_BETWEEN_REQUESTS,
+                              retry=BoundedGithubRetry(total=10, raise_on_status=False))
 
         # Get shared client from registry (or create new one)
         registry = get_client_registry()
@@ -249,10 +356,12 @@ class GitHubClient(BaseModel):
         Returns:
             List of file paths
         """
-        blob_shas_by_path = self._get_files_with_identity(directory_path, ref, repo_name)
-        if isinstance(blob_shas_by_path, str):
-            return blob_shas_by_path
-        return list(blob_shas_by_path)
+        # Agent tools document "a plaintext report"; the indexer takes the raising path
+        # through the api_wrapper instead.
+        try:
+            return list(self._get_files_with_identity(directory_path, ref, repo_name))
+        except ToolException as e:
+            return f"Error: {e}"
 
     def _get_files_with_identity(self, directory_path: str, ref: str,
                                  repo_name: Optional[str] = None) -> Dict[str, str]:
@@ -283,7 +392,9 @@ class GitHubClient(BaseModel):
                     commit = repo.get_commit(ref)
                     tree_sha = commit.commit.tree.sha
                 except GithubException as e:
-                    return f"Error: Could not resolve ref '{ref}': {e.message}"
+                    if not _means_ref_is_absent(e):
+                        raise
+                    raise ToolException(f"Could not resolve ref '{ref}'") from e
 
             # Fetch entire tree recursively in ONE API call
             # This returns up to 100,000 entries - sufficient for most repos
@@ -313,10 +424,12 @@ class GitHubClient(BaseModel):
 
             return files
 
-        except GithubException as e:
-            return f"Error: status code {e.status}, {e.message}"
+        except ToolException:
+            raise
         except Exception as e:
-            return f"Error fetching files: {str(e)}"
+            # `from e` is load-bearing: classify_tool_error walks __cause__ to reach the
+            # provider's type and status, which is what tells a rate limit from a refusal.
+            raise ToolException(f"Could not list the repository files: {e}") from e
 
     @tool_group('read')
     def get_files_from_directory(self, directory_path: str, repo_name: Optional[str] = None) -> str:
@@ -333,16 +446,25 @@ class GitHubClient(BaseModel):
         return self._get_files(directory_path, self.active_branch, repo_name)
 
     @tool_group('read')
-    def get_issue(self, issue_number: int, repo_name: Optional[str] = None) -> str:
+    def get_issue(self, issue_number: int, comments_offset: Optional[int] = 0,
+                  repo_name: Optional[str] = None) -> Union[Dict[str, Any], str]:
         """
-        Fetches information about a specific issue.
+        Fetches information about a specific issue, including its comment thread.
 
         Parameters:
-            issue_number (str): Number of the issue to fetch
+            issue_number (int): Number of the issue to fetch
+            comments_offset (Optional[int]): How many comments to skip before the
+                returned window, for reading past the first page of a long thread
             repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
         Returns:
-            str: A dictionary containing information about the issue.
+            dict: number, title, body, state, url, created_at, updated_at, labels and
+                assignees, plus comments (each with body, user, created_at and url) and
+                comments_total. comments_note appears whenever comments beyond this
+                window remain, naming the offset that reaches the next ones and, when it
+                lies further on, the offset that reaches the end of the thread.
+                comments_error appears when the comments themselves could not be read.
+                Returns an error string on failure.
         """
         try:
             repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
@@ -355,13 +477,122 @@ class GitHubClient(BaseModel):
                 "url": issue.html_url,
                 "created_at": issue.created_at.isoformat(),
                 "updated_at": issue.updated_at.isoformat(),
-                "comments": issue.comments,
                 "labels": [label.name for label in issue.labels],
                 "assignees": [assignee.login for assignee in issue.assignees]
             }
+
+            comments_total = issue.comments
+            issue_data["comments_total"] = comments_total
+            try:
+                window_start = max(0, int(comments_offset or 0))
+            except (TypeError, ValueError):
+                return (f"comments_offset must be a whole number of comments to skip, "
+                        f"got {comments_offset!r}")
+            budget = (resolve_tool_result_limit(GITHUB_TOOLKIT_TYPE)
+                      - estimate_chars(issue_data)
+                      - GITHUB_ISSUE_COMMENTS_NOTE_RESERVE)
+            comments, oversized_url, thread_ended = [], None, False
+            if budget > 0:
+                try:
+                    comments, oversized_url, thread_ended = self._read_comment_window(
+                        issue, window_start, budget)
+                except Exception as e:
+                    logger.warning("Failed to read comments for issue %s: %s", issue.number, e)
+                    issue_data["comments_error"] = str(e)
+
+            issue_data["comments"] = comments
+            window_end = window_start + len(comments)
+            more_by_count = window_end < comments_total
+            if budget <= 0:
+                if comments_total > 0:
+                    issue_data["comments_note"] = (
+                        f"None of this issue's {comments_total} comments were read: its own "
+                        f"description fills the result size limit, so no offset will return "
+                        f"any. Read them on the issue page instead."
+                    )
+            elif comments and (more_by_count or not thread_ended):
+                counted = f"{comments_total}" if more_by_count else f"at least {window_end}"
+                note = (
+                    f"Showing comments {window_start + 1}-{window_end} of {counted}. "
+                    f"For the next ones call get_issue with comments_offset={window_end}."
+                )
+                tail_start = comments_total - len(comments)
+                if tail_start > window_end:
+                    note += f" Nearer the end of the thread, use comments_offset={tail_start}."
+                issue_data["comments_note"] = note
+            elif oversized_url:
+                issue_data["comments_note"] = (
+                    f"Comment {window_start + 1} is too large to return with this issue; read "
+                    f"it at {oversized_url}. Call get_issue with "
+                    f"comments_offset={window_start + 1} for the comments after it."
+                )
+            elif not comments and "comments_error" not in issue_data and comments_total > 0:
+                issue_data["comments_note"] = (
+                    f"No comments returned at the offset requested ({window_start}); the issue "
+                    f"reports {comments_total}. Retry below {comments_total}."
+                )
             return issue_data
         except Exception as e:
             return f"Failed to get issue: {str(e)}"
+
+    def _read_comment_window(self, issue, window_start: int,
+                             budget: int) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+        """Project the comments at window_start, stopping once they fill the budget.
+
+        Returns the window, the url of a first comment too large to carry at all, and whether
+        the thread ended inside the fetched page.
+        """
+        comments: List[Dict[str, Any]] = []
+        spent = 0
+        fetched, ended = self._fetch_comment_window(issue, window_start)
+        for comment in fetched:
+            projected = {
+                "body": comment.body,
+                "user": comment.user.login if comment.user else None,
+                "created_at": comment.created_at.isoformat() if comment.created_at else None,
+                "url": comment.html_url,
+            }
+            cost = estimate_chars(projected)
+            if comments and spent + cost > budget:
+                return comments, None, False
+            if not comments and cost > budget:
+                shortened = self._shorten_comment_body(projected, budget)
+                if shortened is None:
+                    return comments, projected["url"], False
+                projected["body"] = shortened
+                return comments + [projected], None, False
+            comments.append(projected)
+            spent += cost
+        return comments, None, ended
+
+    @staticmethod
+    def _shorten_comment_body(projected: Dict[str, Any], budget: int) -> Optional[str]:
+        """Cut a lone over-budget comment to fit, or None when a cut cannot help."""
+        body = projected["body"] or ""
+        marker = f"\n\n[truncated: {len(body)} chars, full text at {projected['url']}]"
+        room = budget - estimate_chars({**projected, "body": marker})
+        if room <= 0:
+            return None
+        return body[:room] + marker
+
+    @staticmethod
+    def _fetch_comment_window(issue, window_start: int) -> Tuple[List[Any], bool]:
+        """Return the comments at window_start, plus whether the thread ended inside them.
+
+        The second value is read off page shape rather than the issue's comment count, which
+        is a separate API read and goes stale the moment anyone comments.
+        """
+        page_index, offset_in_page = divmod(window_start, GITHUB_DEFAULT_PAGE_SIZE)
+        paginated = issue.get_comments()
+        page = paginated.get_page(page_index)
+        window = page[offset_in_page:]
+        ended = len(page) < GITHUB_DEFAULT_PAGE_SIZE
+        if offset_in_page and not ended:
+            shortfall = GITHUB_ISSUE_COMMENTS_LIMIT - len(window)
+            next_page = paginated.get_page(page_index + 1)
+            window = window + next_page[:shortfall]
+            ended = len(next_page) <= shortfall
+        return window, ended
 
     @tool_group('read')
     def list_files_in_main_branch(self, repo_name: Optional[str] = None) -> str:
@@ -1663,6 +1894,9 @@ class GitHubClient(BaseModel):
                 
             except Exception as e:
                 last_exception = e
+                if quota_exhausted(e):
+                    # Three attempts inside 1.5s cannot outlast a quota that resets hourly.
+                    raise
                 if attempt < max_retries - 1:
                     # Exponential backoff: 0.5s, 1.0s, 2.0s, ...
                     wait_time = retry_delay * (2 ** attempt)
@@ -1670,8 +1904,11 @@ class GitHubClient(BaseModel):
                     time.sleep(wait_time)
                     continue
         
-        # All retries exhausted
-        raise ToolException(f"File not found `{file_path}` on branch `{branch}` after {max_retries} attempts. Error: {str(last_exception)}")
+        # `from` keeps the provider's type reachable; the old wording called every cause,
+        # including a refusal, a missing file.
+        raise ToolException(
+            f"Could not read `{file_path}` on branch `{branch}` after {max_retries} "
+            f"attempts: {last_exception}") from last_exception
 
     @tool_group('read')
     def read_file(self, file_path: str, branch: Optional[str] = None, repo_name: Optional[str] = None,
@@ -2438,7 +2675,6 @@ class GitHubClient(BaseModel):
             }
             # Remove keys where value could not be retrieved (None due to missing attribute)
             user_data = {k: v for k, v in user_data.items() if v is not None}
-            import json
             return json.dumps(user_data, indent=2)
         except Exception as e:
             raise ToolException(f"Failed to get authenticated user: {str(e)}")
@@ -2565,7 +2801,6 @@ class GitHubClient(BaseModel):
                 "page": page,
                 "per_page": per_page,
             }
-            import json
             return json.dumps(response, indent=2)
 
         except GithubException as e:
@@ -2603,7 +2838,7 @@ class GitHubClient(BaseModel):
                 "ref": self.get_issue,
                 "name": "get_issue",
                 "mode": "get_issue",
-                "description": GET_ISSUE_PROMPT,
+                "description": GET_ISSUE_PROMPT.format(comments_limit=GITHUB_ISSUE_COMMENTS_LIMIT),
                 "args_schema": GetIssue,
             },
             {

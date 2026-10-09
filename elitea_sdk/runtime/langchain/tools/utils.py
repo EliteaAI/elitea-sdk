@@ -145,43 +145,6 @@ def unpack_json(json_data):
         raise ValueError("Wrong type of json_data")
 
 
-REQUIRED_NLTK_PACKAGES = (
-    "punkt_tab",
-    "averaged_perceptron_tagger_eng",
-)
-
-
-def download_nltk(target, force=False):
-    """Download only the NLTK resources required by the runtime."""
-    from . import state  # pylint: disable=C0415
-    #
-    if state.nltk_punkt_downloaded and not force:
-        return
-    #
-    import ssl  # pylint: disable=C0415
-    #
-    try:
-        _create_unverified_https_context = ssl._create_unverified_context  # pylint: disable=W0212
-    except AttributeError:
-        pass
-    else:
-        ssl._create_default_https_context = _create_unverified_https_context  # pylint: disable=W0212
-    #
-    import os  # pylint: disable=C0415
-    import nltk  # pylint: disable=C0415,E0401
-    import nltk.downloader  # pylint: disable=C0415,E0401
-    #
-    os.makedirs(target, exist_ok=True)
-    #
-    nltk.downloader._downloader._download_dir = target  # pylint: disable=W0212
-    nltk.data.path = [target]
-    #
-    for package in REQUIRED_NLTK_PACKAGES:
-        nltk.download(package, download_dir=target)
-    #
-    state.nltk_punkt_downloaded = True
-
-
 def preload_unstructured_nlp_model():
     """Load the spaCy model required by Unstructured's text classifiers."""
     # Unstructured owns the pinned model version, checksum, install lock, and

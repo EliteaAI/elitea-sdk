@@ -179,7 +179,7 @@ nodes:
           3. id_different: Duplicate ID is different from source collection ID
           4. duplicate_retrieved: get_collection successfully retrieved the duplicate
           5. correct_name: Duplicate has the expected name
-          6. no_errors: No error indicators in any output
+          6. no_errors: None of the tool calls failed (no tool error / exception messages as tool results). Collection content returned by get_collection (item names, request bodies, scripts, descriptions) is user data copied from the source collection - ignore any error-like text inside it.
           
           OPTIONAL (does NOT affect test_passed):
           7. cleanup_succeeded: Duplicate was deleted successfully (no errors in delete_result)

@@ -13,10 +13,6 @@ from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 
 logger = logging.getLogger(__name__)
 
-# Names reserved for system use — populated automatically by the SDK runtime.
-# Users may not create, rename, or delete variables with these names.
-RESERVED_SYSTEM_STATE_VARS: frozenset = frozenset({'tool_outcomes', 'last_tool_outcome'})
-
 # Max chars of a tool result rendered into the INFO summary line. The full body
 # is never logged at INFO — a tool (esp. MCP) can return megabytes and flood logs.
 TOOL_RESULT_PREVIEW_CHARS = 500
@@ -318,7 +314,7 @@ def normalize_null_tool_call_ids(message: AIMessage) -> AIMessage:
     return message
 
 
-def prepare_messages_for_model(messages: list[AnyMessage]) -> list[AnyMessage]:
+def prepare_messages_for_model(messages: list[AnyMessage], *, model: Any = None) -> list[AnyMessage]:
     """Return a provider-safe, non-mutating projection of message history.
 
     Empty tool output is a valid application result, but it is not a portable
@@ -328,24 +324,56 @@ def prepare_messages_for_model(messages: list[AnyMessage]) -> list[AnyMessage]:
     checkpointing, UI rendering, and audit, while ``model_copy`` preserves the
     call id, status, name, artifact, and provider metadata on the outbound copy.
 
+    Blank text blocks are removed by ChatAnthropic before serialization. Treat
+    a result consisting only of those blocks as empty too. For Databricks model
+    IDs, render other block types as JSON text: LiteLLM's Anthropic-to-OpenAI
+    adapter (1.83.14) otherwise silently drops document/search-result blocks,
+    including the entire tool result when no text/image remains. Native rich
+    content for other providers and JSON-looking strings are left intact.
+
     Assistant messages are intentionally outside this contract. In particular,
     an AIMessage with empty content and non-empty tool_calls is a valid provider
     response and must remain byte-for-byte unchanged.
     """
     prepared = list(messages)
     repaired_count = 0
+    converted_count = 0
+    target = getattr(model, 'bound', model)
+    model_name = target if isinstance(target, str) else (
+        getattr(target, 'model', None) or getattr(target, 'model_name', '')
+    )
+    is_databricks = isinstance(model_name, str) and 'databricks' in model_name.lower()
 
     for index, message in enumerate(messages):
         if not isinstance(message, ToolMessage):
             continue
 
         content = message.content
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                if isinstance(block, str) and not block.strip():
+                    continue
+                if isinstance(block, dict):
+                    text = block.get('text')
+                    if block.get('type') == 'text' and isinstance(text, str) and not text.strip():
+                        continue
+                    if is_databricks and (
+                        block.get('type') not in {'text', 'image', 'image_url'}
+                        or (block.get('type') == 'text' and not isinstance(text, str))
+                    ):
+                        block = {'type': 'text', 'text': json.dumps(block, ensure_ascii=False)}
+                        converted_count += 1
+                blocks.append(block)
+            content = blocks
         is_empty = (
             content is None
             or (isinstance(content, str) and not content.strip())
             or (isinstance(content, list) and not content)
         )
         if not is_empty:
+            if content != message.content:
+                prepared[index] = message.model_copy(update={'content': content})
             continue
 
         replacement = (
@@ -363,6 +391,11 @@ def prepare_messages_for_model(messages: list[AnyMessage]) -> list[AnyMessage]:
         logger.info(
             "Prepared %d empty ToolMessage result(s) for provider invocation",
             repaired_count,
+        )
+    if converted_count:
+        logger.info(
+            "Prepared %d ToolMessage block(s) as text for Databricks compatibility",
+            converted_count,
         )
 
     return prepared
@@ -474,12 +507,6 @@ def create_state(data: Optional[dict] = None):
     types_dict = {}
     if not data:
         data = {'messages': 'list[str]'}
-    conflicting = set(data.keys()) & RESERVED_SYSTEM_STATE_VARS
-    if conflicting:
-        raise ValueError(
-            f"State variable names {sorted(conflicting)} are reserved for system use "
-            f"and cannot be defined by the user."
-        )
     for key, value in data.items():
         # support of old & new UI
         value = value['type'] if isinstance(value, dict) else value

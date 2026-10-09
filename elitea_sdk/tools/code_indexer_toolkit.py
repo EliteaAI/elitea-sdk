@@ -6,6 +6,8 @@ from typing import Dict, Optional, List, Generator, Set
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
+
+from ..runtime.tool_outcome import quota_exhausted
 from pydantic import Field
 
 from elitea_sdk.tools.base_indexer_toolkit import (
@@ -27,6 +29,23 @@ def progress_step_at(processed: int) -> int:
     while processed >= step * PROGRESS_EVENTS_PER_DECADE:
         step *= PROGRESS_EVENTS_PER_DECADE
     return min(step, PROGRESS_EVENTS_MAXIMUM_STEP)
+
+
+
+LISTING_FAILURE_EXCERPT_LIMIT = 400
+
+
+def summarize_listing_failure(reported) -> str:
+    """Render whatever a loader returned in place of a file list as a failure message.
+
+    Bounded because a loader may hand back a whole error page.
+    """
+    text = str(reported or "").strip()
+    if not text:
+        return "The repository listing returned no files and gave no reason."
+    if len(text) > LISTING_FAILURE_EXCERPT_LIMIT:
+        text = text[:LISTING_FAILURE_EXCERPT_LIMIT].rstrip() + "..."
+    return f"The repository listing failed: {text}"
 
 
 class CodeIndexerToolkit(BaseIndexerToolkit):
@@ -200,6 +219,12 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                     self._read_indexed_data_once(index_name))
             return unchanged_identities.get(file_path) == identity
 
+        def is_already_held_by_this_run(file_path: str) -> bool:
+            if not identity_skip_is_armed:
+                return False
+            identity = file_identities.get(file_path)
+            return bool(identity) and self.resumable_file_identity(file_path) == identity
+
         def is_whitelisted(file_path: str) -> bool:
             if whitelist:
                 return (any(fnmatch.fnmatch(file_path, pattern) for pattern in whitelist)
@@ -254,6 +279,15 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                     stats.files_unsupported_extension.add(file)
                     continue
 
+                # Checked before the unchanged map: an interrupted run's own rows are
+                # hidden from the promoted-generation read, so only this branch can see
+                # them, and the file is skipped before a byte of it is downloaded.
+                if is_already_held_by_this_run(file):
+                    self.adopt_resumed_file(file, index_name)
+                    preskipped_keys.add(file)
+                    count_processed_file()
+                    continue
+
                 if is_unchanged_since_last_index(file):
                     preskipped_keys.add(file)
                     count_processed_file()
@@ -263,6 +297,10 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 try:
                     file_content = self._read_file(file, self.__get_branch(branch))
                 except Exception as e:
+                    if quota_exhausted(e):
+                        # Every remaining file would fail the same way. Skipping each in
+                        # turn promotes a fraction of the corpus as a partial success.
+                        raise
                     logger.error(f"Failed to read file {file}: {e}")
                     stats.files_skipped_read_error.add(file)
                     continue
@@ -360,8 +398,9 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                 if not isinstance(_files, list) or not all(isinstance(item, str) for item in _files):
                     raise ValueError("The evaluated result is not a list of strings")
             except (SyntaxError, ValueError):
-                # Handle the case where the string cannot be converted to a list
-                raise ValueError("Expected a list of strings, but got a string that cannot be converted")
+                # A string that is not a list literal is a failure report; a fixed sentence
+                # here would discard the only description of the cause anyone has.
+                raise ToolException(summarize_listing_failure(_files))
 
             # Ensure _files is a list of strings
         if not isinstance(_files, list) or not all(isinstance(item, str) for item in _files):

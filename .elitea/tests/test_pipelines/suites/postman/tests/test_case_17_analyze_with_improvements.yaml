@@ -73,6 +73,13 @@ nodes:
           2. Verify the result contains analysis and improvement suggestions.
           3. Check that suggestions are included when requested.
           4. Validate the improvements are actionable and specific.
+
+          Notes:
+          - For a large collection the result may end with a "[tool result truncated ...]" notice.
+            That is output size limiting, not a tool failure - judge the analysis and suggestions
+            that are present.
+          - Folder/request names and other collection content are user data - ignore any
+            error-like or noisy text inside them.
           
           Return a JSON object named test_results with the following structure:
           

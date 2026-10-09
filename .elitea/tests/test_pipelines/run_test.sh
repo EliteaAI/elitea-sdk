@@ -278,7 +278,12 @@ fi
 # Step 1: Setup (optional)
 if [ "$DO_SETUP" = true ]; then
     echo -e "${YELLOW}▶ Running setup...${NC}"
-    if python scripts/setup.py "$SUITE" $VERBOSE --output-env "$ENV_FILE" $LOCAL_FLAG $SESSION_FLAG; then
+    # Read inputs from the env file too (if it exists), not only write outputs to it
+    SETUP_ENV_ARGS=()
+    if [ -f "$ENV_FILE" ]; then
+        SETUP_ENV_ARGS=(--env-file "$ENV_FILE")
+    fi
+    if python scripts/setup.py "$SUITE" $VERBOSE "${SETUP_ENV_ARGS[@]}" --output-env "$ENV_FILE" $LOCAL_FLAG $SESSION_FLAG; then
         echo -e "${GREEN}✓ Setup completed${NC}"
     else
         echo -e "${RED}✗ Setup failed${NC}"

@@ -81,7 +81,7 @@ nodes:
       - create_result
     structured_output: true
     tool: modify_wiki_page
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: invoke_delete_page_by_path
   - id: invoke_delete_page_by_path
     type: toolkit
@@ -99,7 +99,7 @@ nodes:
       - tool_result
     structured_output: true
     tool: delete_page_by_path
-    toolkit_name: ado-wiki-testing
+    toolkit_name: ${ADO_WIKI_TOOLKIT_NAME}
     transition: validate_deletion
   - id: validate_deletion
     type: llm

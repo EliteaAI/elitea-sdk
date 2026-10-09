@@ -83,7 +83,7 @@ class FakeStagingAdapter:
         self.promote_args.append({"orphan_ids": list(orphan_ids)})
         return "promoted"
 
-    def discard_run(self, wrapper, index_name, run_id):
+    def discard_run(self, wrapper, index_name, run_id, retain_chunks=False):
         self.calls.append("discard")
         return "discarded"
 

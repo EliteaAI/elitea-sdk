@@ -2,6 +2,8 @@ import asyncio
 import contextvars
 import json
 import logging
+import math
+import os
 import re
 from traceback import format_exc
 from typing import Any, Optional, List, Union, Literal, Dict, TYPE_CHECKING, cast
@@ -14,7 +16,7 @@ from langchain_core.tools import BaseTool, ToolException
 from langchain_core.callbacks import dispatch_custom_event
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt as _langgraph_interrupt
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 try:
     from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD as _SCRATCHPAD_KEY
@@ -37,11 +39,73 @@ from ..langchain.utils import (
     prepare_messages_for_model,
     propagate_the_input_mapping,
 )
+from ..context_floor import (
+    compact_tool_results,
+    is_context_overflow,
+    resolve_floor_tokens,
+    shrink_after_overflow,
+)
 from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 
 _STANDARD_CONTENT_TYPES = {"text", "image", "image_url", "document", "search_result"}
+
+DEFAULT_TOOL_EXECUTION_TIMEOUT = 900
+TOOL_EXECUTION_TIMEOUT_ENV = 'ELITEA_TOOL_EXECUTION_TIMEOUT'
+
+
+_NO_LIMIT = object()
+_INVALID = object()
+
+
+def _parse_timeout(value: Any) -> Any:
+    """Seconds as float, _NO_LIMIT for None/0/negative/inf/'none', or _INVALID if unparsable."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in ('', 'none', 'null')):
+        return _NO_LIMIT
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return _INVALID
+    # thread.join() rejects nan and inf; nan is garbage, inf means wait forever.
+    if math.isnan(seconds):
+        return _INVALID
+    return seconds if 0 < seconds < math.inf else _NO_LIMIT
+
+
+def default_tool_execution_timeout() -> Optional[float]:
+    """Deployment-wide default, overridable via ELITEA_TOOL_EXECUTION_TIMEOUT.
+
+    Nested agents run their tool loop in a worker thread bounded by this value,
+    so it caps how long a sub-agent with its own tools may run end to end.
+    None, 0 and negative values mean "no limit".
+    """
+    raw = os.environ.get(TOOL_EXECUTION_TIMEOUT_ENV)
+    if raw is None:
+        return DEFAULT_TOOL_EXECUTION_TIMEOUT
+    parsed = _parse_timeout(raw)
+    if parsed is _NO_LIMIT:
+        return None
+    if isinstance(parsed, float):
+        return parsed
+    logging.getLogger(__name__).warning("Invalid %s=%r, using %ss", TOOL_EXECUTION_TIMEOUT_ENV,
+                                        raw, DEFAULT_TOOL_EXECUTION_TIMEOUT)
+    return DEFAULT_TOOL_EXECUTION_TIMEOUT
+
+
+def normalize_tool_execution_timeout(value: Any) -> Optional[float]:
+    """Seconds to wait for a threaded tool loop, or None for no limit.
+
+    An unparsable value falls back to the deployment default rather than
+    silently disabling the guard.
+    """
+    parsed = _parse_timeout(value)
+    if parsed is _NO_LIMIT:
+        return None
+    if isinstance(parsed, float):
+        return parsed
+    logging.getLogger(__name__).warning("Invalid tool_execution_timeout %r, using default", value)
+    return default_tool_execution_timeout()
 
 
 def is_structured_tool_content(result: Any) -> bool:
@@ -180,7 +244,18 @@ class LLMNode(BaseTool):
     available_tools: Optional[List[BaseTool]] = Field(default=None, description='Available tools for binding')
     tool_names: Optional[List[str]] = Field(default=None, description='Specific tool names to filter')
     steps_limit: Optional[int] = Field(default=25, description='Maximum steps for tool execution')
-    tool_execution_timeout: Optional[int] = Field(default=900, description='Timeout (seconds) for tool execution. Default is 15 minutes.')
+    tool_execution_timeout: Optional[float] = Field(
+        default_factory=default_tool_execution_timeout,
+        description='Timeout (seconds) for the tool-calling loop when it runs in a worker thread '
+                    '(e.g. a nested agent). None or 0 means no limit. Defaults to '
+                    f'{TOOL_EXECUTION_TIMEOUT_ENV} or {DEFAULT_TOOL_EXECUTION_TIMEOUT}s.')
+
+    @field_validator('tool_execution_timeout', mode='before')
+    @classmethod
+    def _coerce_tool_execution_timeout(cls, value: Any) -> Optional[float]:
+        # Agent meta and pipeline YAML pass the raw value; a bad one degrades to the
+        # default here instead of failing node construction.
+        return normalize_tool_execution_timeout(value)
 
     # Lazy tools mode - reduces token usage by not binding all tools upfront
     lazy_tools_mode: Optional[bool] = Field(
@@ -361,7 +436,7 @@ class LLMNode(BaseTool):
             config = {**config, 'configurable': {**(config.get('configurable') or {}),
                 'elitea_routing_output_schema': struct_model.model_json_schema()}}
         initial_completion = llm_client.invoke(
-            prepare_messages_for_model(messages), config=config,
+            prepare_messages_for_model(messages, model=llm_client), config=config,
         )
 
         if hasattr(initial_completion, 'tool_calls') and initial_completion.tool_calls:
@@ -405,7 +480,7 @@ class LLMNode(BaseTool):
         try:
             llm = self.__get_struct_output_model(llm_client, struct_model)
             return llm.invoke(
-                prepare_messages_for_model(synth_messages), config=config,
+                prepare_messages_for_model(synth_messages, model=llm_client), config=config,
             )
         except GraphBubbleUp:
             raise
@@ -462,7 +537,7 @@ class LLMNode(BaseTool):
             prompt_messages.append(HumanMessage(content=json_instruction))
 
         completion = llm_client.invoke(
-            prepare_messages_for_model(prompt_messages), config=config,
+            prepare_messages_for_model(prompt_messages, model=llm_client), config=config,
         )
         extracted = self._extract_structured_from_content(completion, struct_model)
         if extracted is not None:
@@ -936,6 +1011,36 @@ class LLMNode(BaseTool):
             except Exception as e:
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
 
+    def _enforce_context_floor(self, messages: List, llm_client=None, *, start: int = 0):
+        """Keep this turn's request inside the model's window (#5915).
+
+        Tier 2 first: when summarization is enabled, the oldest tool results of the
+        turn are condensed. Tier 1 then drops whatever still does not fit. Tier 1 runs
+        regardless of ``enable_summarization`` or the conversation's ``enabled``
+        switch, because a request that cannot be sent is a failure rather than a
+        preference. ``start`` keeps both off everything before the current turn.
+        """
+        try:
+            floor_tokens = resolve_floor_tokens(llm_client)
+            summarizer = self._context_summarizer()
+            if summarizer is not None:
+                summarizer.summarize_tool_results_mid_loop(messages, floor_tokens=floor_tokens, start=start)
+            compact_tool_results(
+                messages,
+                floor_tokens=floor_tokens,
+                start=start,
+                counter=getattr(summarizer, 'count_request', None),
+            )
+        except Exception as e:
+            logger.debug(f"Context floor check skipped: {e}")
+
+    def _context_summarizer(self):
+        """The summarization middleware, whose counter the floor must share."""
+        for mw in getattr(self.middleware_manager, '_middleware', None) or []:
+            if hasattr(mw, 'summarize_tool_results_mid_loop'):
+                return mw
+        return None
+
     @staticmethod
     def _filter_orphaned_tool_calls(messages: List) -> List:
         """Remove AI tool calls that lack matching tool results immediately after.
@@ -949,19 +1054,25 @@ class LLMNode(BaseTool):
             return messages
 
         # Single pass: identify AIMessage indices and collect following ToolMessage ids
-        # For each AIMessage with tool_calls, gather tool_call_ids from ToolMessages
-        # that appear between it and the next AIMessage (or end of list).
+        # Include native tool_use blocks even when parsing produced no tool_calls.
+        # Only the contiguous ToolMessages immediately after this AIMessage count.
         following_tool_ids: dict[int, set[str]] = {}
         current_ai_idx: int | None = None
 
         for i, msg in enumerate(messages):
-            if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
-                current_ai_idx = i
-                following_tool_ids[i] = set()
-            elif isinstance(msg, ToolMessage) and current_ai_idx is not None:
-                tc_id = getattr(msg, 'tool_call_id', None)
-                if tc_id:
-                    following_tool_ids[current_ai_idx].add(tc_id)
+            if isinstance(msg, ToolMessage):
+                if current_ai_idx is not None and msg.tool_call_id:
+                    following_tool_ids[current_ai_idx].add(msg.tool_call_id)
+            else:
+                current_ai_idx = None
+                if isinstance(msg, AIMessage) and (
+                    msg.tool_calls or (isinstance(msg.content, list) and any(
+                        isinstance(block, dict) and block.get('type') == 'tool_use'
+                        for block in msg.content
+                    ))
+                ):
+                    current_ai_idx = i
+                    following_tool_ids[i] = set()
 
         # Early exit if no AIMessages with tool_calls
         if not following_tool_ids:
@@ -988,6 +1099,12 @@ class LLMNode(BaseTool):
                     valid_tool_calls.append(tc)
                 else:
                     orphaned_ids.add(tc_id)
+            if isinstance(message.content, list):
+                orphaned_ids.update(
+                    block.get('id', '') for block in message.content
+                    if isinstance(block, dict) and block.get('type') == 'tool_use'
+                    and block.get('id') not in valid_result_ids
+                )
 
             # No orphans - keep message as-is
             if not orphaned_ids:
@@ -999,20 +1116,11 @@ class LLMNode(BaseTool):
             # Filter tool_use blocks from content if it's a list (Anthropic format)
             content = message.content
             if isinstance(content, list):
-                # When no valid tool_calls remain, remove ALL tool_use blocks
-                # Otherwise, remove only orphaned tool_use blocks
-                if valid_tool_calls:
-                    content = [
-                        block for block in content
-                        if not (isinstance(block, dict) and
-                               block.get('type') == 'tool_use' and
-                               block.get('id') in orphaned_ids)
-                    ]
-                else:
-                    content = [
-                        block for block in content
-                        if not (isinstance(block, dict) and block.get('type') == 'tool_use')
-                    ]
+                content = [
+                    block for block in content
+                    if not (isinstance(block, dict) and block.get('type') == 'tool_use'
+                            and block.get('id', '') in orphaned_ids)
+                ]
 
             # Skip message entirely if no content and no valid tool_calls
             if not valid_tool_calls and not content:
@@ -1021,7 +1129,11 @@ class LLMNode(BaseTool):
             # Create filtered message
             try:
                 cleaned_messages.append(
-                    message.model_copy(update={"tool_calls": valid_tool_calls, "content": content})
+                    message.model_copy(update={
+                        "tool_calls": valid_tool_calls, "content": content,
+                        "invalid_tool_calls": [tc for tc in message.invalid_tool_calls
+                                               if tc.get('id', '') not in orphaned_ids],
+                    })
                 )
             except Exception:
                 cleaned_messages.append(AIMessage(content=content, tool_calls=valid_tool_calls))
@@ -1756,7 +1868,7 @@ class LLMNode(BaseTool):
                 )
         else:
             completion = llm_client.invoke(
-                prepare_messages_for_model(messages), config=config,
+                prepare_messages_for_model(messages, model=llm_client), config=config,
             )
         completion = self._continue_nested_output(
             messages=messages,
@@ -2732,7 +2844,7 @@ class LLMNode(BaseTool):
                 if continuation_max_tokens is not None:
                     invoke_kwargs['max_tokens'] = continuation_max_tokens
                 current_completion = self.client.invoke(
-                    prepare_messages_for_model(continuation_messages),
+                    prepare_messages_for_model(continuation_messages, model=self.client),
                     **invoke_kwargs,
                 )
             except (GraphBubbleUp, McpAuthorizationRequired, OutputContinuationExhausted):
@@ -2839,6 +2951,15 @@ class LLMNode(BaseTool):
             return current_completion
         return self._completion_with_text(current_completion, accumulated_text)
     
+    def _join_with_timeout(self, thread: "threading.Thread") -> None:
+        """Wait for a worker thread, bounded by tool_execution_timeout."""
+        timeout = normalize_tool_execution_timeout(self.tool_execution_timeout)
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            logger.error("Async operation in node '%s' timed out after %ss "
+                         "(tool_execution_timeout)", self.name, timeout)
+            raise TimeoutError(f"Async operation in thread timed out after {timeout}s")
+
     def _run_async_in_sync_context(self, coro):
         """Run async coroutine from sync context.
 
@@ -2915,11 +3036,7 @@ class LLMNode(BaseTool):
                     logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
 
             thread.start()
-            thread.join(timeout=self.tool_execution_timeout)  # 15 minute timeout for safety
-
-            if thread.is_alive():
-                logger.error("Async operation timed out after 5 minutes")
-                raise TimeoutError("Async operation in thread timed out")
+            self._join_with_timeout(thread)
 
             # Re-raise exception if one occurred
             if exception_container:
@@ -2986,11 +3103,7 @@ class LLMNode(BaseTool):
                         logger.warning(f"Failed to propagate Streamlit context to worker thread: {e}")
 
                 thread.start()
-                thread.join(timeout=self.tool_execution_timeout)
-
-                if thread.is_alive():
-                    logger.error("Async operation timed out after 15 minutes")
-                    raise TimeoutError("Async operation in thread timed out")
+                self._join_with_timeout(thread)
 
                 if exception_container:
                     raise exception_container[0]
@@ -4234,8 +4347,7 @@ class LLMNode(BaseTool):
                                     **blocked_payload,
                                     'message': self._build_blocked_tool_guidance(blocked_payload),
                                 }
-                            # status stays 'success': a declined sensitive action is not
-                            # a tool failure, and status cannot carry ToolOutcome BLOCKED.
+                            # status stays 'success': a declined sensitive action is not a tool failure.
                             tool_message = ToolMessage(
                                 content=json.dumps(
                                     blocked_payload,
@@ -4368,6 +4480,16 @@ class LLMNode(BaseTool):
                     )
                 new_messages = sanitized_messages
 
+                # Keep this turn inside the context window before we send it.
+                # N tool results appended inside one turn can overflow the model
+                # on their own, and the summarization middleware cannot help here
+                # — it ran once before the loop and skips tool-related state to
+                # avoid splitting tool pairs (#5915). Always on: this bounds a
+                # request we are about to build, it is not a context preference.
+                self._enforce_context_floor(
+                    new_messages, llm_client, start=_pending_capture_start,
+                )
+
                 # Re-invoke with the SAME full toolset — including any sensitive
                 # tool the user just declined. The block is invocation-scoped
                 # (per-call independent approval, #5303), so the tool stays bound
@@ -4376,7 +4498,7 @@ class LLMNode(BaseTool):
                 # ToolMessage tells the model the call was declined and to
                 # continue the remaining work; no forced rebinding or nudge turn.
                 current_completion = llm_client.invoke(
-                    prepare_messages_for_model(new_messages), config=config,
+                    prepare_messages_for_model(new_messages, model=llm_client), config=config,
                 )
                 current_completion = self._continue_nested_output(
                     messages=new_messages,
@@ -4436,12 +4558,10 @@ class LLMNode(BaseTool):
                     'rate limit'
                 ])
                 
-                # Check for context window / token limit errors
-                is_context_error = any(indicator in error_str for indicator in [
-                    'context window', 'context_window', 'token limit', 'too long',
-                    'maximum context length', 'input is too long', 'exceeds the limit',
-                    'contextwindowexceedederror', 'max_tokens', 'content too large'
-                ])
+                # Check for context window / token limit errors. Typed first,
+                # prose second — the substring list stays for proxies and SDKs
+                # that only raise a generic error.
+                is_context_error = is_context_overflow(e)
                 
                 # Check for Bedrock/Claude output limit errors (recoverable by truncation)
                 is_output_limit_error = any(indicator in error_str for indicator in [
@@ -4583,36 +4703,49 @@ class LLMNode(BaseTool):
                         
                         logger.info(f"Truncated large tool result from '{last_tool_name}' and retrying LLM call")
 
-                        # CRITICAL FIX: Call LLM again with truncated message to get fresh completion
-                        # This prevents duplicate tool_call_ids that occur when we continue with
-                        # the same current_completion that still has the original tool_calls
-                        try:
-                            current_completion = llm_client.invoke(
-                                prepare_messages_for_model(new_messages), config=config,
-                            )
-                            current_completion = self._continue_nested_output(
-                                messages=new_messages,
-                                completion=current_completion,
-                                config=config,
-                            )
+                        # The first retry is the pre-#5915 behaviour: only the newest result
+                        # is replaced. Older results of this turn are compacted only if the
+                        # provider rejects the request again for its size — harder each
+                        # time — because until then nothing says they are the problem.
+                        shrink_ratios = (None, 0.5, 0.25) if is_context_error and not is_output_limit_error else (None,)
+                        counter = getattr(self._context_summarizer(), 'count_request', None)
+                        retry_error = None
+                        for shrink_ratio in shrink_ratios:
+                            if shrink_ratio is not None and not shrink_after_overflow(
+                                new_messages, start=_pending_capture_start, ratio=shrink_ratio, counter=counter,
+                            ).applied:
+                                break
+                            try:
+                                current_completion = llm_client.invoke(
+                                    prepare_messages_for_model(new_messages, model=llm_client), config=config,
+                                )
+                                current_completion = self._continue_nested_output(
+                                    messages=new_messages,
+                                    completion=current_completion,
+                                    config=config,
+                                )
+                                retry_error = None
+                                break
+                            except OutputContinuationExhausted:
+                                _PENDING_TOOL_MESSAGES.set([])
+                                raise
+                            except Exception as err:
+                                retry_error = err
+                                if not is_context_overflow(err):
+                                    break
+
+                        if retry_error is None:
                             normalize_null_tool_call_ids(current_completion)
                             new_messages.append(current_completion)
-
-                            # Continue to process any new tool calls in the fresh completion
                             if hasattr(current_completion, 'tool_calls') and current_completion.tool_calls:
                                 logger.info(f"LLM requested {len(current_completion.tool_calls)} more tool calls after truncation")
                                 continue
-                            else:
-                                logger.info("LLM completed after truncation without requesting more tools")
-                                break
-                        except Exception as retry_error:
-                            if isinstance(retry_error, OutputContinuationExhausted):
-                                _PENDING_TOOL_MESSAGES.set([])
-                                raise
-                            logger.error(f"Error retrying LLM after truncation: {retry_error}")
-                            error_msg = f"Failed to retry after truncation: {str(retry_error)}"
-                            new_messages.append(AIMessage(content=error_msg))
+                            logger.info("LLM completed after truncation without requesting more tools")
                             break
+                        logger.error(f"Error retrying LLM after truncation: {retry_error}")
+                        error_msg = f"Failed to retry after truncation: {str(retry_error)}"
+                        new_messages.append(AIMessage(content=error_msg))
+                        break
                     else:
                         # Couldn't find tool message, add error and break
                         if is_output_limit_error:

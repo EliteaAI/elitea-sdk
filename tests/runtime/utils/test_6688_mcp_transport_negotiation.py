@@ -101,6 +101,48 @@ class TestRedirects:
 
         assert decision.url == f"{SERVER}/mcp/"
 
+    def test_a_redirect_that_drops_https_on_the_same_host_is_followed_over_https(self, monkeypatch):
+        transport = patch_probe_transport(monkeypatch, routes({
+            ("POST", "/mcp/"): respond(307, {"Location": "http://mcp.example.test/mcp"}),
+            ("POST", "/mcp"): respond(200, EVENT_STREAM),
+        }))
+
+        _, decision = negotiate(f"{SERVER}/mcp/")
+
+        assert decision == TransportDecision("streamable_http", f"{SERVER}/mcp")
+        assert transport.calls == [("POST", f"{SERVER}/mcp/"), ("POST", f"{SERVER}/mcp")]
+
+    def test_a_redirect_to_plain_http_on_another_port_is_refused(self, monkeypatch):
+        transport = patch_probe_transport(monkeypatch, respond(307, {"Location": "http://mcp.example.test:8080/mcp"}))
+
+        with pytest.raises(McpEndpointError) as raised:
+            negotiate(f"{SERVER}/mcp/")
+
+        assert str(raised.value) == sso_redirect_message(307, "http://mcp.example.test:8080/mcp")
+        assert transport.calls == [("POST", f"{SERVER}/mcp/")]
+
+    @pytest.mark.parametrize("source, location", [
+        ("https://mcp.example.test:8443/mcp", "https://mcp.example.test/mcp"),
+        ("http://mcp.example.test:8765/mcp", "http://mcp.example.test/mcp"),
+    ])
+    def test_a_redirect_to_another_port_without_a_downgrade_is_refused(self, monkeypatch, source, location):
+        transport = patch_probe_transport(monkeypatch, respond(307, {"Location": location}))
+
+        with pytest.raises(McpEndpointError) as raised:
+            negotiate(source)
+
+        assert str(raised.value) == sso_redirect_message(307, location)
+        assert transport.calls == [("POST", source)]
+
+    def test_a_redirect_to_plain_http_on_another_host_is_refused(self, monkeypatch):
+        transport = patch_probe_transport(monkeypatch, respond(307, {"Location": "http://login.example.test/sso"}))
+
+        with pytest.raises(McpEndpointError) as raised:
+            negotiate(f"{SERVER}/mcp/")
+
+        assert str(raised.value) == sso_redirect_message(307, "http://login.example.test/sso")
+        assert transport.calls == [("POST", f"{SERVER}/mcp/")]
+
     def test_a_cross_origin_redirect_fails_fast_with_the_sso_message(self, monkeypatch):
         transport = patch_probe_transport(monkeypatch, respond(302, {"Location": "https://login.example.test/sso"}))
 
