@@ -625,9 +625,12 @@ class EliteAClient:
             effort = model_config.get('reasoning_effort')
             if routing_transport not in {'chat_completions', 'anthropic_messages'} or effort not in (None, 'low', 'medium', 'high'):
                 raise ValueError('Invalid Auto measured reasoning contract')
+            reasoning_format = model_config.get('routing_reasoning_format', 'nested')
+            if not isinstance(reasoning_format, str) or reasoning_format not in {'nested', 'top_level'} or (reasoning_format == 'top_level' and routing_transport != 'chat_completions'):
+                raise ValueError('Invalid Auto measured reasoning contract format')
             expected_fields = {}
             if effort is not None:
-                expected_fields = ({'reasoning': {'effort': effort}}
+                expected_fields = (({'reasoning_effort': effort} if reasoning_format == 'top_level' else {'reasoning': {'effort': effort}})
                     if routing_transport == 'chat_completions' else {
                         'thinking': {'type': 'adaptive', 'display': 'summarized'},
                         'output_config': {'effort': effort},
@@ -644,6 +647,10 @@ class EliteAClient:
         # Default means no Elitea-defined custom output cap. Optional provider
         # fields are omitted; required APIs resolve the configured model maximum.
         llm_max_tokens = model_config.get("max_tokens", None)
+        if model_config.get('routing_pin') and model_config.get('routing_output_mode') == 'provider_default':
+            # The signed max_tokens is an admission bound, not a custom limit.
+            # Required native APIs below use configured model capability data.
+            llm_max_tokens = None
         has_custom_output_limit = llm_max_tokens not in (None, -1)
         if not has_custom_output_limit:
             llm_max_tokens = None
@@ -727,7 +734,10 @@ class EliteAClient:
                 if routing_reasoning_fields:
                     # Preserve the measured wire envelope even when worker-wide
                     # defaults prefer another reasoning API representation.
-                    target_kwargs['extra_body'] = deepcopy(routing_reasoning_fields)
+                    if model_config.get('routing_reasoning_format') == 'top_level':
+                        target_kwargs['reasoning_effort'] = routing_reasoning_fields['reasoning_effort']
+                    else:
+                        target_kwargs['extra_body'] = deepcopy(routing_reasoning_fields)
             elif reasoning_effort:
                 if use_responses_api:
                     # Responses API path (OpenAI native): use reasoning dict to enable
