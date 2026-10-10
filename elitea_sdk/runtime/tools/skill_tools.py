@@ -16,13 +16,17 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, PrivateAttr
 
 from ..langchain.constants import (
+    INSTRUCTION_REFERENCED_HINT,
     LOAD_SKILL_ALREADY_ACTIVE,
     LOAD_SKILL_TOOL_DESCRIPTION,
     LOAD_SKILL_UNKNOWN,
     LOADED_SKILL_PREFIX_RE,
     LOADED_SKILL_RESULT,
+    SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS,
+    SKILL_REGISTRY_DESCRIPTION_MAX_CHARS,
     SKILL_REGISTRY_ENTRY,
     SKILL_REGISTRY_HEADER,
+    SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,20 +141,65 @@ def render_skill_registry_index(attached_skills) -> str:
     ordered = sorted(
         attached_skills, key=lambda s: (s.get('skill_id') or 0, s.get('name') or '')
     )
+    descriptions = [' '.join(str(s.get('description') or '').split()) for s in ordered]
+    max_chars = _registry_description_max_chars([len(d) for d in descriptions])
     # Escape XML specials so a free-text description cannot forge registry
     # structure (names are platform-validated to [a-z0-9-], so escaping them
-    # never diverges from the loadable name).
+    # never diverges from the loadable name). Shortening happens before escaping,
+    # so a cut never splits an escape sequence.
     entries = [
         SKILL_REGISTRY_ENTRY.format(
             name=xml_escape(' '.join(str(s.get('name') or '').split()), {'"': '&quot;'}),
-            description=xml_escape(
-                ' '.join(str(s.get('description') or '').split()) or '(no description)'
-            ),
+            description=xml_escape(_registry_description(description, max_chars, s)),
         )
-        for s in ordered
+        for s, description in zip(ordered, descriptions)
     ]
     logger.info("[Skills] Rendered registry index with %d skills into cached prefix", len(ordered))
     return (
         "<available_skills>\n" + SKILL_REGISTRY_HEADER + "\n\n"
         + "\n".join(entries) + "\n</available_skills>"
     )
+
+
+def _registry_description_max_chars(lengths: List[int]) -> int:
+    """Largest common description length that keeps the registry within its total budget.
+
+    Water-filling: descriptions shorter than the result stay whole, longer ones are
+    cut to it. When even the floor does not fit, the floor wins and the budget is
+    exceeded rather than dropping or blanking a skill.
+    """
+    def total(limit: int) -> int:
+        return sum(min(length, limit) for length in lengths)
+
+    if total(SKILL_REGISTRY_DESCRIPTION_MAX_CHARS) <= SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS:
+        return SKILL_REGISTRY_DESCRIPTION_MAX_CHARS
+    if total(SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS) > SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS:
+        logger.warning(
+            "[Skills] %d skills exceed the registry budget even at %d chars each; keeping every skill",
+            len(lengths), SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS,
+        )
+        return SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS
+    low, high = SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS, SKILL_REGISTRY_DESCRIPTION_MAX_CHARS
+    while low < high:
+        middle = (low + high + 1) // 2
+        if total(middle) <= SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def _shorten(description: str, max_chars: int) -> str:
+    if len(description) <= max_chars:
+        return description
+    cut = description[:max_chars - 1]
+    word_end = cut.rfind(' ')
+    if word_end > 0:
+        cut = cut[:word_end]
+    return cut.rstrip() + '…'
+
+
+def _registry_description(description: str, max_chars: int, skill: dict) -> str:
+    """The hint is appended after the cut, so a long description never truncates it."""
+    hint = INSTRUCTION_REFERENCED_HINT if skill.get('instruction_referenced') else ''
+    return ' '.join(part for part in (_shorten(description, max_chars), hint) if part) or '(no description)'

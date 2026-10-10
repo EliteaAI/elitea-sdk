@@ -25,7 +25,6 @@ except ImportError:
 
 from ..langchain.constants import (
     ELITEA_RS,
-    MAX_SKILLS_PER_INVOCATION,
     SKILL_REMINDER_SUFFIX,
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
@@ -2049,9 +2048,8 @@ class LLMNode(BaseTool):
                 continue
             if not instructions or not str(instructions).strip():
                 continue
+            # No cap here: elitea_core resolves at most the agent's skill limit per message.
             entries.append(SKILLS_SECTION_ENTRY.format(name=name, instructions=instructions))
-            if len(entries) >= MAX_SKILLS_PER_INVOCATION:
-                break
 
         if not entries:
             return ""

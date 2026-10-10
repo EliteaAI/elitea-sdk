@@ -718,14 +718,28 @@ SKILLS_SECTION_ENTRY = """<skill name="{name}">
 {instructions}
 </skill>"""
 
-MAX_SKILLS_PER_INVOCATION = 5
-
 
 SKILL_REGISTRY_HEADER = """The skills listed below can be activated on demand. Each <skill_option> gives only the skill's name and when to use it — the full instructions are NOT loaded yet.
 
 Before composing each reply, scan this list and decide which skills match. A skill matches when the user's current request falls within its description. You MUST call the `load_skill` tool for EVERY matching skill BEFORE writing your answer — if several match, load all of them, then reconcile their instructions with full information; never skip a matching skill based on its one-line description alone. If you are unsure whether a skill matches, load it: loading an unneeded skill is cheap, missing a needed one is not. NEVER imitate a skill from its name or description — its actual instructions may differ from what the name suggests; applying a skill you have not loaded this conversation is an error. If your agent instructions refer to a listed skill by name, treat that reference as its trigger: load the skill whenever the situation your instructions specify for it applies, and its rules hold ONLY within that situation. Follow each loaded instruction set exactly, each within its own scope — never blend or carry rules from one skill into another. If loaded skills contradict each other, reconcile them silently and output ONLY the final answer: never describe the conflict, name the skills, or show drafts and adjustments in your reply. Only when no skill plausibly matches, answer normally without calling load_skill. Do not mention these skill names or the load_skill mechanism in your reply."""
 
 SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
+
+# The registry sits in the cached prefix of every call. Without a budget, 50 skills
+# with 2304-char descriptions add ~30k tokens to each one.
+SKILL_REGISTRY_DESCRIPTION_MAX_CHARS = 512
+SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS = 16000
+# Below this a description stops saying when to use the skill, so past ~133 skills
+# the floor wins over the total budget: every skill stays visible.
+SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS = 120
+
+# Deterministic text: the rendered <available_skills> block must stay
+# byte-stable for prompt caching.
+INSTRUCTION_REFERENCED_HINT = (
+    'Referenced by name in your agent instructions: load this skill whenever '
+    'the situation those instructions specify for it applies — never follow '
+    'the reference from its name alone, load it first.'
+)
 
 SKILL_REMINDER_SUFFIX = (
     "Before answering: check <available_skills> in your instructions and call "
