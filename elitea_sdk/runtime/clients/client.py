@@ -135,6 +135,8 @@ class EliteAClient:
         self.app = f"{self.base_app_url}{self.project_id}"
         self.mcp_tools_list = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_list/{self.project_id}"
         self.mcp_tools_call = f"{self.base_url}{self.api_v2_path}/elitea_core/tools_call/{self.project_id}"
+        self.tool_spend_check_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool_spend_check/prompt_lib/{self.project_id}"
+        self.tool_spend_record_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool_spend_record/prompt_lib/{self.project_id}"
         self.application_versions = f"{self.base_url}{self.api_v2_path}/elitea_core/version/prompt_lib/{self.project_id}"
         self.list_apps_url = f"{self.base_url}{self.api_v2_path}/elitea_core/applications/prompt_lib/{self.project_id}"
         self.list_toolkits_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tools/prompt_lib/{self.project_id}"
@@ -232,6 +234,18 @@ class EliteAClient:
             return response.json()
         except (ValueError, TypeError):
             return response.text
+
+    def check_tool_spend(self, payload: dict) -> dict:
+        """Ask the platform whether a paid tool call may run; raises on transport or 5xx."""
+        response = self._request('post', self.tool_spend_check_url, headers=self.headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def record_tool_spend(self, payload: dict) -> dict:
+        """Record a paid tool call against the permit its check returned; raises on failure."""
+        response = self._request('post', self.tool_spend_record_url, headers=self.headers, json=payload)
+        response.raise_for_status()
+        return response.json()
 
     def get_app_details(self, application_id: int, version_name: Optional[str] = None):
         url = f"{self.app}/{application_id}" if version_name is None else f"{self.app}/{application_id}/{version_name}"
