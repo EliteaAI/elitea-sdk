@@ -233,3 +233,20 @@ class TestWorkerSignature:
         signer = lambda _m: "x"
         client = EliteAClient(base_url=BASE, project_id=3, auth_token="tok", tool_spend_signer=signer)
         assert client.tool_spend_signer is signer
+
+
+class TestTransportMatchesTheOtherClientCalls:
+    """Review: without verify=False a self-signed deployment turned every check into 'unreachable'."""
+
+    def test_check_and_record_skip_tls_verification_like_the_rest_of_the_client(self):
+        client = client_with(response(body=ALLOWED), response(body={}))
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED):
+            pass
+        assert [c.kwargs.get("verify") for c in client._session.request.call_args_list] == [False, False]
+
+    def test_an_allowed_check_without_a_permit_skips_the_record(self):
+        # The platform answers this when usage mode is off: nothing is metered, so nothing is recorded
+        client = client_with(response(body={"allowed": True, "exempt": False, "permit": None}))
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED) as m:
+            m.units = 1
+        assert len(calls(client)) == 1

@@ -240,14 +240,14 @@ class EliteAClient:
     def check_tool_spend(self, payload: dict, timeout=None) -> dict:
         """Ask the platform whether a paid tool call may run; raises on transport or 5xx."""
         response = self._request('post', self.tool_spend_check_url, headers=self.headers, json=payload,
-                                 **({'timeout': timeout} if timeout else {}))
+                                 verify=False, **({'timeout': timeout} if timeout else {}))
         response.raise_for_status()
         return response.json()
 
     def record_tool_spend(self, payload: dict, timeout=None) -> dict:
         """Record a paid tool call against the permit its check returned; raises on failure."""
         response = self._request('post', self.tool_spend_record_url, headers=self.headers, json=payload,
-                                 **({'timeout': timeout} if timeout else {}))
+                                 verify=False, **({'timeout': timeout} if timeout else {}))
         response.raise_for_status()
         return response.json()
 
