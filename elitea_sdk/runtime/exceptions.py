@@ -20,6 +20,27 @@ class PipelineConfigurationError(Exception):
     pass
 
 
+class AutoRoutingRefused(PipelineConfigurationError):
+    """The Gateway refused to resolve Auto (e.g. the Auto classifier is unavailable).
+
+    Subclasses PipelineConfigurationError because the indexer already shows that
+    type's message to the user instead of a generic failure.
+    """
+
+    CLASSIFIER_REASONS = frozenset({
+        "CLASSIFIER_UNAVAILABLE", "CLASSIFIER_NOT_CONFIGURED", "CLASSIFIER_PRICE_UNAVAILABLE",
+    })
+
+    def __init__(self, error, reason=None, status_code=None):
+        self.reason = reason
+        self.status_code = status_code
+        message = f"Auto model selection cannot run: {error.rstrip('.')}."
+        if reason in self.CLASSIFIER_REASONS:
+            message += (" Ask a project admin to choose a classifier in "
+                        "Project Settings \u2192 General \u2192 Chat configuration.")
+        super().__init__(message)
+
+
 class OutputContinuationExhausted(Exception):
     """Raised when a non-interactive LLM output cannot be completed safely."""
 
