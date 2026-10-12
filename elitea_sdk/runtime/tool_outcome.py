@@ -60,10 +60,19 @@ def outcome_sink() -> Iterator[List[ToolOutcome]]:
 
 
 def record_outcome(outcome: ToolOutcome) -> None:
-    """No-op unless a caller installed a sink, which the agent tool loop never does."""
+    """No-op unless a caller installed a sink."""
     sink = _OUTCOME_SINK.get()
     if sink is not None:
         sink.append(outcome)
+
+
+def recorded_outcomes() -> List[ToolOutcome]:
+    """What the innermost open sink holds so far, for a reader inside its block.
+
+    The run's callbacks fire inside the tool call (on_tool_end sees the middleware's
+    prose as a success), so this is how they learn the call actually failed (#6809).
+    """
+    return list(_OUTCOME_SINK.get() or ())
 
 
 # Matched by isinstance. ValueError covers pydantic ValidationError, which subclasses it.

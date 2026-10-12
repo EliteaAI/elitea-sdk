@@ -12,10 +12,17 @@ AST test at the bottom pins that decision.
 
 import asyncio
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import StructuredTool, ToolException
 import pytest
 
+from elitea_sdk.runtime.tool_outcome import (
+    ToolOutcome,
+    ToolResultStatus,
+    record_outcome,
+    recorded_outcomes,
+)
 from elitea_sdk.runtime.tools.llm import LLMNode
 
 
@@ -147,6 +154,63 @@ def test_parallel_subagent_failure_sets_error_status():
     assert len(failures) == 2
     assert {m.status for m in failures} == {'error'}
     assert all('child exploded' in m.content for m in failures)
+
+
+def _middleware_tool(func):
+    from elitea_sdk.runtime.middleware.strategies import TransformErrorStrategy
+    from elitea_sdk.runtime.middleware.tool_exception_handler import (
+        ToolExceptionHandlerMiddleware,
+    )
+
+    middleware = ToolExceptionHandlerMiddleware(strategies=[TransformErrorStrategy(llm=None)])
+    return middleware.wrap_tool(_tool(func=func))
+
+
+def test_middleware_caught_exception_sets_error_status():
+    """#6809: the middleware returns prose instead of raising, so without the sink the
+    loop built a success message over a failed call and the eval trace scored it ok."""
+    def _missing(path='x'):
+        raise ToolException('File not found: no-slash.txt')
+
+    result = _node(_Client(), [_middleware_tool(_missing)]).invoke(
+        {'messages': [HumanMessage(content='go')]}, config=_config('t-middleware'),
+    )
+
+    message = _tool_messages(result['messages'])[-1]
+    assert message.status == 'error'
+
+
+def test_truncated_outcome_keeps_success_status():
+    def _big(path='x'):
+        record_outcome(ToolOutcome(status=ToolResultStatus.TRUNCATED, message='cut'))
+        return 'partial'
+
+    result = _node(_Client(), [_tool(func=_big)]).invoke(
+        {'messages': [HumanMessage(content='go')]}, config=_config('t-truncated'),
+    )
+
+    assert _tool_messages(result['messages'])[-1].status == 'success'
+
+
+def test_run_callback_sees_the_error_outcome_at_tool_end():
+    """The indexer's on_tool_end fires inside the call and reads recorded_outcomes()."""
+    seen = []
+
+    class _Recorder(BaseCallbackHandler):
+        def on_tool_end(self, output, **kwargs):
+            seen.append([o.status for o in recorded_outcomes()])
+
+    def _missing(path='x'):
+        raise ToolException('File not found')
+
+    config = {**_config('t-callback'), 'callbacks': [_Recorder()]}
+    _node(_Client(), [_middleware_tool(_missing)]).invoke(
+        {'messages': [HumanMessage(content='go')]}, config=config,
+    )
+
+    assert seen == [[ToolResultStatus.ERROR]]
+    # Read outside any call: nothing leaks from the one that just ran.
+    assert recorded_outcomes() == []
 
 
 def test_only_known_failure_sites_carry_error_status():

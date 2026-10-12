@@ -46,6 +46,7 @@ from ..context_floor import (
     shrink_after_overflow,
 )
 from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
+from ..tool_outcome import outcome_sink
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 
@@ -4277,56 +4278,61 @@ class LLMNode(BaseTool):
                         from .application import Application
                         is_application = isinstance(tool_to_execute, Application)
 
-                        tool_result = None
-                        if is_application:
-                            # Application overrides invoke() (not ainvoke) to read tool_call_id
-                            # from a ToolCall envelope and collapse AgentResponse → output string.
-                            # Routing to ainvoke would hit BaseTool.ainvoke instead, which auto-
-                            # wraps the dict result and defeats the collapse.
-                            tool_call_envelope = {
-                                "type": "tool_call",
-                                "id": tool_call_id,
-                                "args": tool_args,
-                                "name": tool_name,
-                            }
-                            # A single container Application may itself fan out
-                            # into parallel leaves.  Stamp the supervisor contract
-                            # on every Application boundary, not only on a 2+
-                            # sibling batch at this level, so orchestrator ->
-                            # container -> leaf hierarchies do not silently fall
-                            # back to the legacy gather barrier.
-                            application_config = dict(config or {})
-                            application_config['configurable'] = dict(
-                                application_config.get('configurable') or {}
-                            )
-                            application_config['configurable'][
-                                '__independent_parallel_hitl__'
-                            ] = self.independent_parallel_hitl
-                            application_config['configurable'][
-                                '__parallel_hitl_max_concurrency__'
-                            ] = self.parallel_hitl_max_concurrency
-                            tool_result = tool_to_execute.invoke(
-                                tool_call_envelope, config=application_config,
-                            )
-                        elif hasattr(tool_to_execute, 'ainvoke'):
-                            try:
-                                tool_result = await tool_to_execute.ainvoke(tool_args, config=config)
-                            except (NotImplementedError, AttributeError):
-                                logger.debug(f"Tool '{tool_name}' ainvoke failed, falling back to sync invoke")
+                        # The middleware turns a tool exception into prose, so the call looks like a
+                        # success; the sink is how this loop and the run callbacks learn it failed.
+                        with outcome_sink() as recorded:
+                            tool_result = None
+                            if is_application:
+                                # Application overrides invoke() (not ainvoke) to read tool_call_id
+                                # from a ToolCall envelope and collapse AgentResponse → output string.
+                                # Routing to ainvoke would hit BaseTool.ainvoke instead, which auto-
+                                # wraps the dict result and defeats the collapse.
+                                tool_call_envelope = {
+                                    "type": "tool_call",
+                                    "id": tool_call_id,
+                                    "args": tool_args,
+                                    "name": tool_name,
+                                }
+                                # A single container Application may itself fan out
+                                # into parallel leaves.  Stamp the supervisor contract
+                                # on every Application boundary, not only on a 2+
+                                # sibling batch at this level, so orchestrator ->
+                                # container -> leaf hierarchies do not silently fall
+                                # back to the legacy gather barrier.
+                                application_config = dict(config or {})
+                                application_config['configurable'] = dict(
+                                    application_config.get('configurable') or {}
+                                )
+                                application_config['configurable'][
+                                    '__independent_parallel_hitl__'
+                                ] = self.independent_parallel_hitl
+                                application_config['configurable'][
+                                    '__parallel_hitl_max_concurrency__'
+                                ] = self.parallel_hitl_max_concurrency
+                                tool_result = tool_to_execute.invoke(
+                                    tool_call_envelope, config=application_config,
+                                )
+                            elif hasattr(tool_to_execute, 'ainvoke'):
+                                try:
+                                    tool_result = await tool_to_execute.ainvoke(tool_args, config=config)
+                                except (NotImplementedError, AttributeError):
+                                    logger.debug(f"Tool '{tool_name}' ainvoke failed, falling back to sync invoke")
+                                    tool_result = tool_to_execute.invoke(tool_args, config=config)
+                            else:
+                                # Sync-only tool
                                 tool_result = tool_to_execute.invoke(tool_args, config=config)
-                        else:
-                            # Sync-only tool
-                            tool_result = tool_to_execute.invoke(tool_args, config=config)
 
                         # Create tool message with result - preserve structured content
                         from langchain_core.messages import ToolMessage
+                        # Local: the middleware package imports this module.
+                        from ..middleware.tool_exception_handler import _stamp_error_status
 
                         # Short-circuit: Application returned an already-formed ToolMessage
                         # with collapsed content (output string, not stringified dict).
                         if isinstance(tool_result, ToolMessage):
                             if not tool_result.tool_call_id:
                                 tool_result.tool_call_id = tool_call_id
-                            new_messages.append(tool_result)
+                            new_messages.append(_stamp_error_status(tool_result, recorded))
                             continue
 
                         blocked_payload = self._parse_sensitive_tool_blocked_result(tool_result)
@@ -4375,7 +4381,7 @@ class LLMNode(BaseTool):
                                 content=serialize_tool_result(tool_result),
                                 tool_call_id=tool_call_id
                             )
-                        new_messages.append(tool_message)
+                        new_messages.append(_stamp_error_status(tool_message, recorded))
 
                     except GraphBubbleUp:
                         # GraphInterrupt (from interrupt()) and other graph-level
