@@ -54,7 +54,7 @@ class TestHappyPath:
     def test_one_block_is_one_check_and_one_record(self):
         client = client_with(response(body=ALLOWED), response(body={"recorded": True}))
         with metering.metered_call(client, "web_search", "tavily", "search", CRED,
-                                   plan={"depth": "basic"}, tool_name="web_search") as m:
+                                   tool_name="web_search") as m:
             m.units = 1
             m.meta = {"credits_source": "reported"}
         made = calls(client)
@@ -156,3 +156,36 @@ class TestRecordRetries:
         with metering.metered_call(client, "web_search", "tavily", "search", Cfg()):
             pass
         assert calls(client)[0][2]["configuration_uuid"] == "u-shared"
+
+
+class TestAccountingNeverStallsTheTool:
+    """Review: three records at the client's default (5, 30) timeout could block ~100 s."""
+
+    def test_check_and_record_use_the_short_accounting_timeout(self):
+        client = client_with(response(body=ALLOWED), response(body={}))
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED):
+            pass
+        timeouts = [c.kwargs.get("timeout") for c in client._session.request.call_args_list]
+        assert timeouts[0] == metering.ACCOUNTING_TIMEOUT
+        assert all(t[0] <= 2 and t[1] <= 5 for t in timeouts)
+
+    def test_retries_stop_at_the_overall_deadline(self, monkeypatch):
+        clock = {"now": 0.0}
+        monkeypatch.setattr(metering.time, "monotonic", lambda: clock["now"])
+        def slow_timeout(*_a, **_k):
+            clock["now"] += 6.0  # each attempt burns 6 s of wall clock before timing out
+            raise requests.Timeout("slow")
+        client = client_with()
+        client._session.request.side_effect = \
+            lambda *a, **k: response(body=ALLOWED) if "check" in a[1] else slow_timeout()
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED):
+            pass
+        records = [c for c in client._session.request.call_args_list if "record" in c.args[1]]
+        assert len(records) == 2  # 0 s + 6 s used, third attempt would start past the 10 s deadline
+        assert clock["now"] <= metering.RECORD_DEADLINE_SECONDS + 6
+
+    def test_a_4xx_record_is_not_retried(self):
+        client = client_with(response(body=ALLOWED), response(422))
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED):
+            pass
+        assert len(calls(client)) == 2

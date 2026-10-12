@@ -17,6 +17,9 @@ CODE_UNAVAILABLE = "tool_spend_unavailable"
 EXEMPT_TTL_SECONDS = 600
 RECORD_ATTEMPTS = 3
 RECORD_BACKOFF_SECONDS = (0.25, 0.75)
+# Accounting must never stall a tool: short per-request timeout plus one deadline over all retries
+ACCOUNTING_TIMEOUT = (2, 5)
+RECORD_DEADLINE_SECONDS = 10
 
 _exempt_lock = threading.Lock()
 _exempt_until: dict = {}
@@ -73,7 +76,7 @@ def _label(feature: str) -> str:
 
 def _check(elitea, payload: dict, uuid: str, feature: str) -> dict:
     try:
-        return elitea.check_tool_spend(payload)
+        return elitea.check_tool_spend(payload, timeout=ACCOUNTING_TIMEOUT)
     except Exception as error:  # pylint: disable=W0703
         if _unreachable(error):
             if _known_exempt(uuid):
@@ -87,20 +90,33 @@ def _check(elitea, payload: dict, uuid: str, feature: str) -> dict:
 
 
 def _record(elitea, payload: dict):
+    deadline = time.monotonic() + RECORD_DEADLINE_SECONDS
+    last = None
     for attempt in range(RECORD_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            elitea.record_tool_spend(payload)
+            connect, read = ACCOUNTING_TIMEOUT
+            elitea.record_tool_spend(payload, timeout=(min(connect, remaining), min(read, remaining)))
             return
-        except Exception as error:  # pylint: disable=W0703
-            if attempt + 1 >= RECORD_ATTEMPTS:
-                logger.warning("Tool spend record failed after %d attempts: %s", RECORD_ATTEMPTS, error)
+        except requests.HTTPError as error:
+            # A 4xx is a definitive rejection (bad permit/payload); retrying cannot change it
+            if error.response is not None and 400 <= error.response.status_code < 500:
+                logger.warning("Tool spend record rejected: %s", error)
                 return
-            _sleep(RECORD_BACKOFF_SECONDS[min(attempt, len(RECORD_BACKOFF_SECONDS) - 1)])
+            last = error
+        except Exception as error:  # pylint: disable=W0703
+            last = error
+        if attempt + 1 < RECORD_ATTEMPTS:
+            _sleep(min(RECORD_BACKOFF_SECONDS[min(attempt, len(RECORD_BACKOFF_SECONDS) - 1)],
+                       max(0.0, deadline - time.monotonic())))
+    logger.warning("Tool spend record failed (attempts or %ss deadline exhausted): %s", RECORD_DEADLINE_SECONDS, last)
 
 
 @contextmanager
 def metered_call(elitea, feature: str, backend: str, op: str, credential: Any,
-                 plan: Optional[dict] = None, tool_name: Optional[str] = None):
+                 tool_name: Optional[str] = None):
     """Check before, record after (also on failure). No-op without a platform client (CLI)."""
     call = MeteredCall()
     if elitea is None or not hasattr(elitea, "check_tool_spend"):
@@ -110,7 +126,7 @@ def metered_call(elitea, feature: str, backend: str, op: str, credential: Any,
     uuid, owner = _credential_ids(credential)
     base = {"feature": feature, "backend": backend, "op": op,
             "configuration_uuid": uuid, "configuration_project_id": owner}
-    verdict = _check(elitea, dict(base, plan=plan or {}), uuid, feature)
+    verdict = _check(elitea, base, uuid, feature)
     if not verdict.get("allowed"):
         raise ToolSpendDenied(verdict.get("code") or CODE_UNAVAILABLE,
                               verdict.get("message") or f"{_label(feature)} is not available.")
