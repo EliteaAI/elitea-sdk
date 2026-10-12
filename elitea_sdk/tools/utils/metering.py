@@ -21,6 +21,8 @@ RECORD_BACKOFF_SECONDS = (0.25, 0.75)
 ACCOUNTING_TIMEOUT = (2, 5)
 RECORD_DEADLINE_SECONDS = 10
 
+RECORD_SIGNING_PREFIX = "tool-spend-record-v1"
+
 _exempt_lock = threading.Lock()
 _exempt_until: dict = {}
 _sleep = time.sleep
@@ -43,6 +45,17 @@ class MeteredCall:
         self.meta: dict = {}
         self.permit: Optional[str] = None
         self.exempt: bool = False
+
+
+def record_signing_message(project_id, payload: dict) -> bytes:
+    """Canonical bytes the worker signs and the platform recomputes; twinned with elitea_core."""
+    duration = payload.get("duration_ms")
+    parts = [
+        RECORD_SIGNING_PREFIX, str(project_id), payload["feature"], payload["backend"], payload["op"],
+        str(payload["configuration_uuid"]), payload["permit"], repr(float(payload["units"])),
+        "1" if payload["ok"] else "0", "" if duration is None else str(int(duration)),
+    ]
+    return "\n".join(parts).encode("utf-8")
 
 
 def _credential_ids(credential: Any):
@@ -89,7 +102,19 @@ def _check(elitea, payload: dict, uuid: str, feature: str) -> dict:
         raise ToolSpendDenied(CODE_UNAVAILABLE, f"{_label(feature)} is temporarily unavailable.") from error
 
 
+def _signed(elitea, payload: dict) -> dict:
+    signer = getattr(elitea, "tool_spend_signer", None)
+    if not callable(signer):
+        return payload
+    try:
+        return dict(payload, signature=signer(record_signing_message(elitea.project_id, payload)))
+    except Exception as error:  # pylint: disable=W0703
+        logger.warning("Tool spend record could not be signed: %s", error)
+        return payload
+
+
 def _record(elitea, payload: dict):
+    payload = _signed(elitea, payload)
     deadline = time.monotonic() + RECORD_DEADLINE_SECONDS
     last = None
     for attempt in range(RECORD_ATTEMPTS):

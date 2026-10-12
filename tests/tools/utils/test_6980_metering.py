@@ -189,3 +189,47 @@ class TestAccountingNeverStallsTheTool:
         with metering.metered_call(client, "web_search", "tavily", "search", CRED):
             pass
         assert len(calls(client)) == 2
+
+
+# Twinned with elitea_core tests/unit/test_6980_tool_spend_service.py RECORD_VECTOR — both sides must agree
+RECORD_VECTOR_KEY = b"k" * 32
+RECORD_VECTOR_PAYLOAD = {"feature": "web_search", "backend": "tavily", "op": "search", "configuration_uuid": "u-1",
+                         "permit": "P1", "units": 2, "ok": True, "duration_ms": 15}
+RECORD_VECTOR_SIG = "43646bedcb2b154ed310f0a96213b099788909601e653e4e6879579f14fb0551"
+
+
+class TestWorkerSignature:
+    """Records are signed by the indexer (key never in the SDK) so the platform knows who sent them."""
+
+    def test_signing_message_matches_the_shared_vector(self):
+        import hashlib
+        import hmac
+        message = metering.record_signing_message(3, RECORD_VECTOR_PAYLOAD)
+        assert hmac.new(RECORD_VECTOR_KEY, message, hashlib.sha256).hexdigest() == RECORD_VECTOR_SIG
+
+    def test_numbers_are_normalised_before_signing(self):
+        as_int = metering.record_signing_message(3, RECORD_VECTOR_PAYLOAD)
+        as_float = metering.record_signing_message(3, dict(RECORD_VECTOR_PAYLOAD, units=2.0))
+        assert as_int == as_float
+
+    def test_record_carries_the_signers_signature(self):
+        client = client_with(response(body=ALLOWED), response(body={}))
+        seen = []
+        client.tool_spend_signer = lambda message: (seen.append(message), "SIG")[1]
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED) as m:
+            m.units = 1
+        record = calls(client)[1][2]
+        assert record["signature"] == "SIG"
+        assert seen == [metering.record_signing_message(3, {k: v for k, v in record.items() if k != "signature"})]
+
+    def test_no_signer_sends_an_unsigned_record(self):
+        client = client_with(response(body=ALLOWED), response(body={}))
+        with metering.metered_call(client, "web_search", "tavily", "search", CRED):
+            pass
+        assert "signature" not in calls(client)[1][2]
+
+    def test_signer_comes_from_the_constructor(self):
+        from elitea_sdk.runtime.clients.client import EliteAClient
+        signer = lambda _m: "x"
+        client = EliteAClient(base_url=BASE, project_id=3, auth_token="tok", tool_spend_signer=signer)
+        assert client.tool_spend_signer is signer

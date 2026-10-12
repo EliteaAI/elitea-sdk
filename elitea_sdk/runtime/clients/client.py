@@ -130,6 +130,8 @@ class EliteAClient:
         # ChatAnthropic) can forward identity headers (e.g. X-Project-Id) that
         # the platform proxy uses to bill the correct team.
         self.api_extra_headers = dict(api_extra_headers) if api_extra_headers else {}
+        # Injected by the indexer; signs tool spend records with a key the SDK never sees
+        self.tool_spend_signer = kwargs.get('tool_spend_signer')
         self.base_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/application/prompt_lib/"
         self.base_public_app_url = f"{self.base_url}{self.api_v2_path}/elitea_core/public_application/prompt_lib/"
         self.app = f"{self.base_app_url}{self.project_id}"
