@@ -340,7 +340,8 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         from urllib.parse import quote
         
         bucket = bucket_name or self.bucket
-        base_url = getattr(self.elitea, 'base_url', '').rstrip('/')
+        # #6985: base_url may be an in-cluster host; links are for users, so prefer the public one
+        base_url = (getattr(self.elitea, 'public_url', None) or getattr(self.elitea, 'base_url', '')).rstrip('/')
         project_id = getattr(self.elitea, 'project_id', '')
         
         # Build prefix for folder scoping
@@ -395,7 +396,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
 
                 # Add S3 download link
                 encoded_key = quote(full_key, safe='/')
-                file_info['link'] = f"{base_url}/s3/{bucket}/{encoded_key}?project_id={project_id}"
+                file_info['link'] = f"{base_url}/artifacts/s3/{bucket.lower()}/{encoded_key}?project_id={project_id}"
 
                 # Keep 'key' field in response - useful for callers to avoid URL parsing
                 # (previously removed, but key is already visible in 'link' URL)

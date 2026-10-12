@@ -114,6 +114,8 @@ class EliteAClient:
                  **kwargs):
 
         self.base_url = base_url.rstrip('/')
+        # User-facing host for links returned to users/LLMs; base_url may be in-cluster only (#6985)
+        self.public_url = (kwargs.get('public_url') or self.base_url).rstrip('/')
         self.api_v2_path = '/api/v2'
         self.llm_path = '/llm/v1'
         self.allm_path = '/llm'
