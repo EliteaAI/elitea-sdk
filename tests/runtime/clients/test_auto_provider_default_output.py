@@ -111,18 +111,18 @@ def test_effective_output_limit_prefers_int_pin_then_model_maximum():
 
 
 def test_admission_uses_model_maximum_when_pin_has_no_cap():
-    # payload ~ CONTEXT - MAX_OUT - slack passes; one that only exceeds with MAX_OUT must refuse.
-    fits = CONTEXT - MAX_OUT - 5_000
+    # payload tokens ~ CONTEXT - MAX_OUT - slack passes; one that only exceeds with MAX_OUT must refuse.
+    fits = 3 * (CONTEXT - MAX_OUT - 5_000)  # BYTES_PER_TOKEN = 3
     auto, _, _ = make_auto(None, payload_bytes=fits)
     auto.invoke([HumanMessage(content='Hi')], cfg())
-    over = CONTEXT - MAX_OUT + 1_000
+    over = 3 * (CONTEXT - MAX_OUT + 1_000)
     auto, _, _ = make_auto(None, payload_bytes=over)
     with pytest.raises(ValueError, match='conservative context allowance'):
         auto.invoke([HumanMessage(content='Hi')], cfg())
 
 
 def test_same_payload_passes_with_a_small_int_pin():
-    over = CONTEXT - MAX_OUT + 1_000
+    over = 3 * (CONTEXT - MAX_OUT + 1_000)
     auto, _, _ = make_auto(8000, payload_bytes=over)
     auto.invoke([HumanMessage(content='Hi')], cfg())
 
@@ -211,3 +211,23 @@ def test_generation_input_bytes_plain_conversation_covers_content_and_framing():
     content = sum(len(str(m.content).encode()) for m in messages)
     assert size >= content + 64 * len(messages)
     assert size < content * 1.5 + 64 * len(messages) + 2_000
+
+
+# Pre-flight compares estimated tokens (ceil(bytes / 3)), the same estimate the Gateway admits with
+def test_estimated_input_tokens_rounds_up():
+    from elitea_sdk.runtime.clients.routing import BYTES_PER_TOKEN, estimated_input_tokens
+    assert BYTES_PER_TOKEN == 3
+    assert [estimated_input_tokens(n) for n in (0, 1, 3, 4, 243_147)] == [0, 1, 1, 2, 81_049]
+
+
+def test_gateway_admitted_request_is_not_refused_by_the_sdk_preflight():
+    # 243,147 bytes -> 81,049 tokens; 81,049 + 32,000 <= 200,000 (Gateway admitted Terra).
+    # Serialized payload is the dict wrapper, so size it to land the total exactly at 243,147 - framing.
+    auto, _, _ = make_auto(None, payload_bytes=243_147 - 64 - len('{"system": ""}'))
+    auto.invoke([HumanMessage(content='Hi')], cfg())
+
+
+def test_oversized_request_is_still_refused_by_the_sdk_preflight():
+    auto, _, _ = make_auto(None, payload_bytes=600_000)
+    with pytest.raises(ValueError, match='conservative context allowance'):
+        auto.invoke([HumanMessage(content='Hi')], cfg())

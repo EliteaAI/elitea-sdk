@@ -17,6 +17,12 @@ from langchain_core.runnables import RunnableLambda, RunnableBinding
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 PIN = 'elitea_routing'
+# Prose is ~4 bytes/token, code and JSON ~3; 3 is the conservative bound (same constant as the Gateway).
+BYTES_PER_TOKEN = 3
+
+
+def estimated_input_tokens(size):
+    return -(-size // BYTES_PER_TOKEN)
 
 
 def _positive_int(value):
@@ -291,7 +297,7 @@ class AutoChatModel(BaseChatModel):
             from openai.lib._parsing import type_to_response_format_param
             payload['response_format'] = type_to_response_format_param(payload['response_format'])
         size = len(json.dumps(payload, ensure_ascii=False).encode()) + 64*len(messages)
-        if size + effective_output_limit(binding['config']) > binding['config']['context_window']:
+        if estimated_input_tokens(size) + effective_output_limit(binding['config']) > binding['config']['context_window']:
             raise ValueError('Auto native request exceeds the conservative context allowance')
 
     @staticmethod
