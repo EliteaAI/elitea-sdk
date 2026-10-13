@@ -17,6 +17,28 @@ from langchain_core.runnables import RunnableLambda, RunnableBinding
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 PIN = 'elitea_routing'
+# Prose is ~4 bytes/token, code and JSON ~3; 3 is the conservative bound (same constant as the Gateway).
+BYTES_PER_TOKEN = 3
+
+
+def estimated_input_tokens(size):
+    return -(-size // BYTES_PER_TOKEN)
+
+
+def _positive_int(value):
+    return value if type(value) is int and value > 0 else None
+
+
+def effective_output_limit(config):
+    """Output allowance the selected native call may use.
+
+    A pinned integer ``max_tokens`` is authoritative. ``None`` means the provider
+    default, which is bounded by the model's ``max_output_tokens`` (always an int).
+    """
+    limit = _positive_int(config.get('max_tokens')) or _positive_int(config.get('max_output_tokens'))
+    if limit is None:
+        raise ValueError('Auto pin carries neither max_tokens nor max_output_tokens')
+    return limit
 
 
 def raise_for_refusal(response):
@@ -63,6 +85,23 @@ def projection(messages):
             row['tool_calls'] = [{'id': c['id'], 'type': 'function', 'function': {'name': c['name'], 'arguments': c['args']}} for c in calls]
         result.append(row)
     return result
+
+
+def provider_message_view(message):
+    """What a native client serialises for one message: role, content, tool calls.
+
+    Excludes response_metadata (carries the whole routing binding under Auto),
+    usage_metadata, additional_kwargs, id, name and example, none of which are
+    sent to the provider.
+    """
+    row = {'role': message.type, 'content': message.content}
+    calls = getattr(message, 'tool_calls', None)
+    if calls:
+        row['tool_calls'] = [{'id': c['id'], 'name': c['name'], 'args': c['args']} for c in calls]
+    call_id = getattr(message, 'tool_call_id', None)
+    if call_id:
+        row['tool_call_id'] = call_id
+    return row
 
 
 def capture_routing_task(message, config):
@@ -195,8 +234,8 @@ class AutoChatModel(BaseChatModel):
                 json={'selection': self.settings['selection'], 'surface': self.settings.get('routing_surface', 'agent'),
                       'messages': projection(messages), 'tools': tools, **output_limit,
                       'generation_input_bytes': len(json.dumps(
-                          {'messages': [message.model_dump(mode='json') for message in messages],
-                           'tools': tools, 'output_schema': output_schema}, ensure_ascii=False).encode()) + 64*len(messages),
+                          {'messages': [provider_message_view(message) for message in messages],
+                           'tools': tools, 'output_schema': output_schema}, ensure_ascii=False, default=str).encode()) + 64*len(messages),
                       'runtime_context': context, 'runtime_context_token': context_token,
                       'output_schema': output_schema or configurable.get('elitea_routing_output_schema'),
                       'invocation_id': invocation_id, 'scope_id': scope_id,
@@ -212,6 +251,11 @@ class AutoChatModel(BaseChatModel):
             return None, binding
         config = {**binding['config'], 'streaming': self.settings.get('streaming', True),
                   'routing_pin': binding['pin'], 'routing_invocation_id': binding['invocation_id']}
+        explicit_cap = _positive_int(self.settings.get('max_tokens'))
+        if config.get('max_tokens') is None and explicit_cap is not None:
+            # An explicit chat cap stays authoritative even if the pin carries
+            # the provider default; never exceed the model maximum.
+            config['max_tokens'] = min(explicit_cap, _positive_int(config.get('max_output_tokens')) or explicit_cap)
         native = self.owner.get_llm(config['model_name'], config)
         if self.routing_tools:
             native = native.bind_tools(self.routing_tools, **self.tool_kwargs)
@@ -253,7 +297,7 @@ class AutoChatModel(BaseChatModel):
             from openai.lib._parsing import type_to_response_format_param
             payload['response_format'] = type_to_response_format_param(payload['response_format'])
         size = len(json.dumps(payload, ensure_ascii=False).encode()) + 64*len(messages)
-        if size + binding['config']['max_tokens'] > binding['config']['context_window']:
+        if estimated_input_tokens(size) + effective_output_limit(binding['config']) > binding['config']['context_window']:
             raise ValueError('Auto native request exceeds the conservative context allowance')
 
     @staticmethod
