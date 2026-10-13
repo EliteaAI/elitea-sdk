@@ -19,6 +19,22 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 PIN = 'elitea_routing'
 
 
+def _positive_int(value):
+    return value if type(value) is int and value > 0 else None
+
+
+def effective_output_limit(config):
+    """Output allowance the selected native call may use.
+
+    A pinned integer ``max_tokens`` is authoritative. ``None`` means the provider
+    default, which is bounded by the model's ``max_output_tokens`` (always an int).
+    """
+    limit = _positive_int(config.get('max_tokens')) or _positive_int(config.get('max_output_tokens'))
+    if limit is None:
+        raise ValueError('Auto pin carries neither max_tokens nor max_output_tokens')
+    return limit
+
+
 def raise_for_refusal(response):
     """Surface a Gateway 4xx refusal ({"error", "reason"}) as a user-readable error."""
     status = getattr(response, 'status_code', None)
@@ -212,6 +228,11 @@ class AutoChatModel(BaseChatModel):
             return None, binding
         config = {**binding['config'], 'streaming': self.settings.get('streaming', True),
                   'routing_pin': binding['pin'], 'routing_invocation_id': binding['invocation_id']}
+        explicit_cap = _positive_int(self.settings.get('max_tokens'))
+        if config.get('max_tokens') is None and explicit_cap is not None:
+            # An explicit chat cap stays authoritative even if the pin carries
+            # the provider default; never exceed the model maximum.
+            config['max_tokens'] = min(explicit_cap, _positive_int(config.get('max_output_tokens')) or explicit_cap)
         native = self.owner.get_llm(config['model_name'], config)
         if self.routing_tools:
             native = native.bind_tools(self.routing_tools, **self.tool_kwargs)
@@ -253,7 +274,7 @@ class AutoChatModel(BaseChatModel):
             from openai.lib._parsing import type_to_response_format_param
             payload['response_format'] = type_to_response_format_param(payload['response_format'])
         size = len(json.dumps(payload, ensure_ascii=False).encode()) + 64*len(messages)
-        if size + binding['config']['max_tokens'] > binding['config']['context_window']:
+        if size + effective_output_limit(binding['config']) > binding['config']['context_window']:
             raise ValueError('Auto native request exceeds the conservative context allowance')
 
     @staticmethod
