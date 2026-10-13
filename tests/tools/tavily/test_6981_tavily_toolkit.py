@@ -219,7 +219,7 @@ class TestMetering:
         fake.reply("/search", search_ok(credits=None))
         platform = Platform()
         with caplog.at_level(logging.ERROR):
-            tools(platform, search_depth_allowed="basic_advanced")["web_search"].invoke(
+            tools(platform, max_search_depth="advanced")["web_search"].invoke(
                 {"query": "q", "search_depth": "advanced"})
         assert platform.records[0]["units"] == 2
         assert platform.records[0]["meta"]["credits_source"] == "estimated"

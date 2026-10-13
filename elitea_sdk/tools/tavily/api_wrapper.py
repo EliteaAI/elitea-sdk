@@ -13,6 +13,7 @@ from langchain_core.tools import ToolException
 from pydantic import Field, PrivateAttr, SecretStr, create_model
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils.metering import ToolSpendDenied, metered_call
 from ...configurations.tavily import tavily_base_url
 from ...runtime.utils.utils import PREDICT_RUN_ID_HEADER
@@ -108,7 +109,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
     elitea: Any = None
     toolkit_name: Optional[str] = None
     max_results: int = 5
-    search_depth_allowed: Literal["basic", "basic_advanced"] = "basic"
+    max_search_depth: Literal["basic", "advanced"] = "basic"
     extract_depth: Literal["basic", "advanced"] = "basic"
     max_page_chars: int = 20000
     allowed_domains: List[str] = []
@@ -248,13 +249,14 @@ class TavilyApiWrapper(BaseToolApiWrapper):
             return f"Tavily rejected the request: {detail}"
         return "Tavily is temporarily unavailable. Try again later."
 
+    @tool_group('read')
     def web_search(self, query: str, search_depth: Optional[str] = None,
                    topic: Optional[str] = None, time_range: Optional[str] = None) -> str:
         """Search the web for current information. Returns titles, URLs and short snippets."""
         query = (query or "").strip()[:MAX_QUERY_CHARS]
         if not query:
             raise ToolException("query must not be empty")
-        depth = "advanced" if search_depth == "advanced" and self.search_depth_allowed == "basic_advanced" else "basic"
+        depth = "advanced" if search_depth == "advanced" and self.max_search_depth == "advanced" else "basic"
         max_results = max(1, min(int(self.max_results or 5), 10))
         result = self._call(
             "search", "web_search",
@@ -274,6 +276,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
                  for i, x in enumerate(items, 1)]
         return _wrap("web_search", "\n\n".join(lines))
 
+    @tool_group('read')
     def web_extract(self, urls: List[str]) -> str:
         """Fetch the readable content of up to 5 web pages (markdown)."""
         urls = [u.strip() for u in urls or [] if isinstance(u, str) and u.strip()]
@@ -297,6 +300,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         )
         return self._pages("web_extract", result, self._page_limit())
 
+    @tool_group('read')
     def web_crawl(self, url: str, instructions: Optional[str] = None, max_depth: int = 1, limit: int = 10) -> str:
         """Crawl a website starting from a URL and return the content of the pages found."""
         if err := self._domain_error(url):
@@ -320,6 +324,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         pages = len(result.get("results") or []) or 1
         return self._pages("web_crawl", result, max(1000, self._page_limit() // pages))
 
+    @tool_group('read')
     def web_map(self, url: str, instructions: Optional[str] = None, max_depth: int = 1, limit: int = 20) -> str:
         """List the URLs of a website starting from a URL (site map), without page content."""
         if err := self._domain_error(url):
@@ -349,6 +354,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
             blocks.append("Could not fetch: " + ", ".join(str(u) for u in failed))
         return _wrap(tool_name, "\n\n---\n\n".join(blocks) if blocks else "No content could be fetched.")
 
+    @with_tool_groups
     def get_available_tools(self):
         return [
             {

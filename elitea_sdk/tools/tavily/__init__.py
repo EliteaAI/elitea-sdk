@@ -22,7 +22,7 @@ TOOL_SPEND = {
     "max_units_per_call": 12,
     "chat_tools": CHAT_TOOLS,
 }
-POLICY_KEYS = ("max_results", "search_depth_allowed", "extract_depth", "max_page_chars",
+POLICY_KEYS = ("max_results", "max_search_depth", "extract_depth", "max_page_chars",
                "allowed_domains", "blocked_domains", "per_run_call_cap")
 
 
@@ -44,20 +44,21 @@ class TavilyToolkit(BaseToolkit):
     def toolkit_config_schema() -> BaseModel:
         available_tools = TavilyApiWrapper.model_construct().get_available_tools()
         selected_tools = {x['name']: x['args_schema'].schema() for x in available_tools}
+        tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         return create_model(
             name,
             tavily_configuration=(TavilyConfiguration, Field(description="Tavily Configuration",
                                                              json_schema_extra={'configuration_types': ['tavily']})),
             max_results=(int, Field(default=5, ge=1, le=10, description="Search results per query")),
-            search_depth_allowed=(Literal["basic", "basic_advanced"], Field(
-                default="basic", description="Allow 'advanced' search (2 credits per query)")),
+            max_search_depth=(Literal["basic", "advanced"], Field(
+                default="basic", description="Deepest search the model may request (advanced costs 2 credits per query)")),
             extract_depth=(Literal["basic", "advanced"], Field(
                 default="basic", description="Extraction depth ('advanced' costs double)")),
             max_page_chars=(int, Field(default=20000, ge=1000, le=50000, description="Maximum characters per page")),
             allowed_domains=(List[str], Field(default=[], description="Only these domains (empty = any)")),
             blocked_domains=(List[str], Field(default=[], description="Never these domains")),
             per_run_call_cap=(int, Field(default=10, ge=1, le=100, description="Maximum Tavily calls per run")),
-            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
+            selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             __config__=ConfigDict(json_schema_extra={
                 'metadata': {
                     "label": "Tavily", "icon_url": "tavily.svg",

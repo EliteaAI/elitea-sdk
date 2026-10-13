@@ -91,7 +91,7 @@ def test_search_basic(ledger):
 
 
 def test_search_advanced(ledger):
-    toolkit(ledger, search_depth_allowed="basic_advanced")["web_search"].invoke(
+    toolkit(ledger, max_search_depth="advanced")["web_search"].invoke(
         {"query": "Wikipedia main page", "search_depth": "advanced"})
     last = ledger.records[-1]
     assert last["meta"]["depth"] == "advanced" and last["units"] == 2
@@ -132,6 +132,7 @@ def test_bad_key_message():
 
 def test_forced_timeout(ledger, monkeypatch):
     monkeypatch.setattr(wrapper_module, "SEARCH_TIMEOUT", 0.001)
+    monkeypatch.setattr(wrapper_module, "HTTP_TIMEOUT_GRACE_SECONDS", 0)
     monkeypatch.setattr(wrapper_module, "_sleep", lambda _s: None)
     before = len(ledger.records)
     with pytest.raises(ToolException, match="did not respond in time"):
