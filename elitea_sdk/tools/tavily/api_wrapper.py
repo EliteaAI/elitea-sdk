@@ -3,8 +3,9 @@ import math
 import re
 import threading
 import time
+import uuid
 from typing import Any, List, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlsplit
 
 import requests
 from langchain_core.runnables.config import ensure_config
@@ -34,7 +35,13 @@ RETRY_DELAY_SECONDS = 1.0
 RUN_CAP_TTL_SECONDS = 6 * 3600
 RUN_CAP_PURGE_SECONDS = 60
 WRAPPER_TAG = "external_web_content"
-_CLOSING_TAG = re.compile(r"</\s*" + WRAPPER_TAG, re.IGNORECASE)
+_WRAPPER_TAG_RE = re.compile(r"<(\s*/?)\s*" + WRAPPER_TAG, re.IGNORECASE)
+# Sent to Tavily as its own limit; the HTTP read waits longer so Tavily's result (and usage) arrives
+HTTP_TIMEOUT_GRACE_SECONDS = 15
+# A timed-out crawl/map has likely completed and been billed upstream, so it is not retried
+NO_TIMEOUT_RETRY_OPS = ("crawl", "map")
+# Characters WHATWG parsers treat differently from urlsplit in the authority
+_AMBIGUOUS_AUTHORITY = ("@", "\\")
 
 # Best-effort loop guard, per process: the platform's spend limit is what protects the money
 _run_lock = threading.Lock()
@@ -58,8 +65,8 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _wrap(tool_name: str, body: str) -> str:
-    # Page text must not be able to close the untrusted block early
-    body = _CLOSING_TAG.sub("&lt;/" + WRAPPER_TAG, body or "")
+    # Page text must not be able to close the untrusted block early or open a fake one
+    body = _WRAPPER_TAG_RE.sub(lambda m: "&lt;" + m.group(1).strip() + WRAPPER_TAG, body or "")
     return f'<{WRAPPER_TAG} tool="{tool_name}">\n{UNTRUSTED_NOTE}\n\n{body}\n</{WRAPPER_TAG}>'
 
 
@@ -84,6 +91,15 @@ def _take_run_slot(key, cap: int) -> bool:
         return True
 
 
+class _GraceSession(requests.Session):
+    """tavily-python uses one timeout for Tavily's limit and the HTTP read; read a little longer."""
+
+    def request(self, *args, timeout=None, **kwargs):  # pylint: disable=W0221
+        if isinstance(timeout, (int, float)):
+            timeout = timeout + HTTP_TIMEOUT_GRACE_SECONDS
+        return super().request(*args, timeout=timeout, **kwargs)
+
+
 class TavilyApiWrapper(BaseToolApiWrapper):
     api_key: SecretStr
     configuration_uuid: Optional[str] = None
@@ -99,6 +115,8 @@ class TavilyApiWrapper(BaseToolApiWrapper):
     blocked_domains: List[str] = []
     per_run_call_cap: int = 10
     _client: Any = PrivateAttr(default=None)
+    _instance_id: str = PrivateAttr(default_factory=lambda: uuid.uuid4().hex)
+    _warned_no_run_id: bool = PrivateAttr(default=False)
 
     def _tavily(self):
         if self._client is None:
@@ -108,8 +126,12 @@ class TavilyApiWrapper(BaseToolApiWrapper):
                 # An empty key would switch tavily-python into keyless mode
                 raise ToolException("Tavily API key is not configured.")
             project = getattr(self.elitea, "project_id", None)
-            self._client = TavilyClient(api_key=key, api_base_url=tavily_base_url(),
-                                        project_id=str(project) if project is not None else None)
+            client = TavilyClient(api_key=key, api_base_url=tavily_base_url(),
+                                  project_id=str(project) if project is not None else None)
+            session = _GraceSession()
+            session.headers.update(client.session.headers)
+            client.session = session
+            self._client = client
         return self._client
 
     def _credential(self) -> dict:
@@ -121,13 +143,24 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         run_id = headers.get(PREDICT_RUN_ID_HEADER) if isinstance(headers, dict) else None
         if not run_id:
             run_id = (ensure_config().get("configurable") or {}).get("thread_id")
-        # Without a run id the budget is per wrapper instance, so a rebuilt toolkit starts over
-        return (run_id or f"instance-{id(self)}", self.configuration_uuid or self.toolkit_name or BACKEND)
+        if not run_id:
+            # Best effort: the budget is then per wrapper instance, so a rebuilt toolkit starts over
+            if not self._warned_no_run_id:
+                logger.warning("Tavily per-run cap has no run id; counting per toolkit instance")
+                self._warned_no_run_id = True
+            run_id = f"instance-{self._instance_id}"
+        return (run_id, self.configuration_uuid or self.toolkit_name or BACKEND)
 
     def _domain_error(self, url: str) -> Optional[str]:
-        parsed = urlparse(url or "")
+        url = url or ""
+        if any(ch.isspace() or ord(ch) < 32 or ch == "\\" for ch in url):
+            return "URL contains characters that are not allowed"
+        parsed = urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             return "only http/https URLs are allowed"
+        if any(ch in unquote(parsed.netloc) for ch in _AMBIGUOUS_AUTHORITY):
+            # Userinfo or a backslash makes parsers disagree on the host (urlsplit vs WHATWG)
+            return "URLs with credentials or ambiguous hosts are not allowed"
         if self.blocked_domains and _host_matches(parsed.hostname, self.blocked_domains):
             return "domain is blocked by the toolkit policy"
         if self.allowed_domains and not _host_matches(parsed.hostname, self.allowed_domains):
@@ -178,7 +211,8 @@ class TavilyApiWrapper(BaseToolApiWrapper):
             except ToolSpendDenied:
                 raise
             except (UsageLimitExceededError, TavilyTimeout, requests.ConnectionError, requests.Timeout) as error:
-                if attempt == 0:
+                timed_out = isinstance(error, (TavilyTimeout, requests.Timeout))
+                if attempt == 0 and not (timed_out and op in NO_TIMEOUT_RETRY_OPS):
                     _sleep(RETRY_DELAY_SECONDS)
                     continue
                 raise ToolException(self._message(error)) from None
@@ -190,6 +224,12 @@ class TavilyApiWrapper(BaseToolApiWrapper):
                 raise ToolException(self._message(error)) from None
             except (InvalidAPIKeyError, ForbiddenError, BadRequestError) as error:
                 raise ToolException(self._message(error)) from None
+            except ToolException:
+                raise
+            except Exception as error:  # pylint: disable=W0703
+                # Unexpected status, non-JSON body, broken stream: never surface a raw exception
+                logger.warning("Tavily %s failed with %s", op, type(error).__name__)
+                raise ToolException("Tavily is temporarily unavailable. Try again later.") from None
         raise ToolException("Tavily request failed.")
 
     def _message(self, error: Exception) -> str:

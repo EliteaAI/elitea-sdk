@@ -114,7 +114,7 @@ def test_extract_five_urls_with_a_bad_one(ledger):
 
 def test_map_small(ledger):
     out = toolkit(ledger)["web_map"].invoke({"url": "https://docs.python.org/3/", "limit": 5})
-    assert "docs.python.org" in hosts(out)
+    assert {"docs.python.org"} <= hosts(out)
     assert ledger.records[-1]["op"] == "map"
 
 
