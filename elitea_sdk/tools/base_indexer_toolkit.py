@@ -2638,11 +2638,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return super().list_collections()
 
     @tool_group('delete')
-    def remove_index(self, index_name: str = ""):
-        """Cleans the indexed data in the collection."""
+    def remove_index(self, index_name: str):
+        """Removes the named index and all of its indexed data from the vector store."""
+        if not index_name or not str(index_name).strip():
+            raise ToolException(
+                "remove_index requires a non-empty 'index_name'. "
+                f"Available indexes: {serialize_tool_result(self.list_indexes())}"
+            )
+
         deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
 
-        if index_name and deleted_count == 0:
+        if deleted_count == 0:
             raise ToolException(
                 f"Index '{index_name}' not found. "
                 f"Available indexes: {serialize_tool_result(self.list_indexes())}"
@@ -2650,8 +2656,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         self._emit_index_data_removed_event(index_name)
         return (f"Index '{index_name}' has been removed from the vector store.\n"
-                f"Available indexes: {serialize_tool_result(self.list_indexes())}") if index_name \
-            else "All indexes have been removed from the vector store."
+                f"Available indexes: {serialize_tool_result(self.list_indexes())}")
 
     def _build_collection_filter(self, filter: dict | str, index_name: str = "") -> dict:
         """Builds a filter for the collection based on the provided suffix."""
