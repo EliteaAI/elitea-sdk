@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 import threading
 import time
 from typing import Any, List, Literal, Optional
@@ -31,9 +32,14 @@ MAP_MAX_DEPTH, MAP_MAX_LIMIT, MAP_TIMEOUT = 2, 50, 60
 SEARCH_TIMEOUT, EXTRACT_TIMEOUT = 30, 30
 RETRY_DELAY_SECONDS = 1.0
 RUN_CAP_TTL_SECONDS = 6 * 3600
+RUN_CAP_PURGE_SECONDS = 60
+WRAPPER_TAG = "external_web_content"
+_CLOSING_TAG = re.compile(r"</\s*" + WRAPPER_TAG, re.IGNORECASE)
 
+# Best-effort loop guard, per process: the platform's spend limit is what protects the money
 _run_lock = threading.Lock()
 _run_calls: dict = {}
+_run_purged_at = 0.0
 _sleep = time.sleep
 
 
@@ -52,14 +58,25 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _wrap(tool_name: str, body: str) -> str:
-    return f'<external_web_content tool="{tool_name}">\n{UNTRUSTED_NOTE}\n\n{body}\n</external_web_content>'
+    # Page text must not be able to close the untrusted block early
+    body = _CLOSING_TAG.sub("&lt;/" + WRAPPER_TAG, body or "")
+    return f'<{WRAPPER_TAG} tool="{tool_name}">\n{UNTRUSTED_NOTE}\n\n{body}\n</{WRAPPER_TAG}>'
+
+
+def _domain_patterns(domains: List[str]) -> Optional[List[str]]:
+    # Tavily's crawl/map domain filters are regexes; anchor so a domain also covers its subdomains only
+    cleaned = [d.lower().strip().strip(".") for d in domains or [] if d and d.strip(".")]
+    return [rf"^(.+\.)?{re.escape(d)}$" for d in cleaned] or None
 
 
 def _take_run_slot(key, cap: int) -> bool:
+    global _run_purged_at  # pylint: disable=W0603
     now = time.monotonic()
     with _run_lock:
-        for stale in [k for k, (_, exp) in _run_calls.items() if exp < now]:
-            _run_calls.pop(stale, None)
+        if now - _run_purged_at >= RUN_CAP_PURGE_SECONDS:
+            for stale in [k for k, (_, exp) in _run_calls.items() if exp < now]:
+                _run_calls.pop(stale, None)
+            _run_purged_at = now
         count, _ = _run_calls.get(key, (0, 0))
         if count >= cap:
             return False
@@ -104,6 +121,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         run_id = headers.get(PREDICT_RUN_ID_HEADER) if isinstance(headers, dict) else None
         if not run_id:
             run_id = (ensure_config().get("configurable") or {}).get("thread_id")
+        # Without a run id the budget is per wrapper instance, so a rebuilt toolkit starts over
         return (run_id or f"instance-{id(self)}", self.configuration_uuid or self.toolkit_name or BACKEND)
 
     def _domain_error(self, url: str) -> Optional[str]:
@@ -137,7 +155,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
                      "Check whether Tavily changed include_usage.", op, tool_name, reported, estimate)
         return float(estimate), "estimated"
 
-    def _call(self, op: str, tool_name: str, request, estimate, meta) -> dict:
+    def _call(self, op: str, tool_name: str, request, estimate, meta, upper_bound: float) -> dict:
         if not _take_run_slot(self._run_key(), max(1, int(self.per_run_call_cap or 1))):
             raise ToolException(f"Web search call limit for this run reached ({self.per_run_call_cap}). "
                                 "Answer with the information already gathered.")
@@ -148,7 +166,12 @@ class TavilyApiWrapper(BaseToolApiWrapper):
             try:
                 # One metered block per HTTP attempt; a retry is a new block with its own permit
                 with metered_call(self.elitea, FEATURE, BACKEND, op, self._credential(), tool_name=tool_name) as m:
-                    result = request(client) or {}
+                    try:
+                        result = request(client) or {}
+                    except (TavilyTimeout, requests.Timeout):
+                        # The request may still complete and bill upstream: charge the upper bound
+                        m.units, m.meta = float(upper_bound), dict(meta({}), credits_source="estimated_timeout")
+                        raise
                     m.units, source = self._units(op, tool_name, result, estimate(result))
                     m.meta = dict(meta(result), credits_source=source)
                 return result
@@ -202,6 +225,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
                                timeout=SEARCH_TIMEOUT),
             estimate=lambda r: 2 if depth == "advanced" else 1,
             meta=lambda r: {"depth": depth, "results_count": len(r.get("results") or [])},
+            upper_bound=2 if depth == "advanced" else 1,
         )
         items = [x for x in result.get("results") or [] if self._allowed_result(x.get("url"))]
         if not items:
@@ -229,6 +253,7 @@ class TavilyApiWrapper(BaseToolApiWrapper):
             estimate=lambda r: math.ceil(len(r.get("results") or []) / 5) * per_batch,
             meta=lambda r: {"depth": depth, "urls_count": len(urls),
                             "failed_urls": len(r.get("failed_results") or [])},
+            upper_bound=math.ceil(len(urls) / 5) * per_batch,
         )
         return self._pages("web_extract", result, self._page_limit())
 
@@ -244,11 +269,13 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         result = self._call(
             "crawl", "web_crawl",
             lambda c: c.crawl(url, max_depth=depth, limit=limit, instructions=instructions or None,
-                              allow_external=False, exclude_domains=self.blocked_domains or None,
+                              allow_external=False, select_domains=_domain_patterns(self.allowed_domains),
+                              exclude_domains=_domain_patterns(self.blocked_domains),
                               extract_depth=extract_depth, format="markdown", include_usage=True,
                               timeout=CRAWL_TIMEOUT),
             estimate=lambda r: map_cost + extract_cost,
             meta=lambda r: {"depth": extract_depth, "results_count": len(r.get("results") or [])},
+            upper_bound=map_cost + extract_cost,
         )
         pages = len(result.get("results") or []) or 1
         return self._pages("web_crawl", result, max(1000, self._page_limit() // pages))
@@ -262,15 +289,17 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         result = self._call(
             "map", "web_map",
             lambda c: c.map(url, max_depth=depth, limit=limit, instructions=instructions or None,
-                            allow_external=False, exclude_domains=self.blocked_domains or None,
+                            allow_external=False, select_domains=_domain_patterns(self.allowed_domains),
+                            exclude_domains=_domain_patterns(self.blocked_domains),
                             include_usage=True, timeout=MAP_TIMEOUT),
             estimate=lambda r: math.ceil(limit / 10) * (2 if instructions else 1),
             meta=lambda r: {"results_count": len(r.get("results") or [])},
+            upper_bound=math.ceil(limit / 10) * (2 if instructions else 1),
         )
         found = [u for u in result.get("results") or [] if isinstance(u, str) and self._allowed_result(u)]
         if not found:
             return _wrap("web_map", f"No pages found for: {url}")
-        return _wrap("web_map", "\n".join(found))
+        return _wrap("web_map", _truncate("\n".join(found), self._page_limit()))
 
     def _pages(self, tool_name: str, result: dict, limit: int) -> str:
         blocks = [f"URL: {x.get('url')}\n{_truncate(x.get('raw_content'), limit)}"

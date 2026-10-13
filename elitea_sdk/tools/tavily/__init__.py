@@ -17,9 +17,9 @@ TOOL_SPEND = {
     "backend": "tavily",
     "configuration_type": "tavily",
     "unit": "credit",
-    "operations": ["search", "extract", "crawl", "map", "research"],
-    # Largest single Tavily call (research pro); anything above is clamped server-side
-    "max_units_per_call": 250,
+    "operations": ["search", "extract", "crawl", "map"],
+    # Largest single call here: crawl at limit 20 with instructions and advanced extract (4 + 8)
+    "max_units_per_call": 12,
     "chat_tools": CHAT_TOOLS,
 }
 POLICY_KEYS = ("max_results", "search_depth_allowed", "extract_depth", "max_page_chars",
