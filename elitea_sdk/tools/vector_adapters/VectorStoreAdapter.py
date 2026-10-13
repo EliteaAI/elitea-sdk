@@ -46,6 +46,12 @@ def _merge_cmetadata(embedding_store, patch: Dict[str, Any]):
     ).op("||", return_type=JSONB)(cast(literal(json.dumps(patch)), JSONB))
 
 
+def _driver_error_summary(error: Exception) -> str:
+    driver_error = getattr(error, "orig", None) or error
+    lines = str(driver_error).strip().splitlines()
+    return lines[0] if lines else type(driver_error).__name__
+
+
 class VectorStoreAdapter(ABC):
     """Abstract base class for vector store adapters."""
 
@@ -228,7 +234,7 @@ class PGVectorAdapter(VectorStoreAdapter):
                 return [collection[0] for collection in collections if collection[0] is not None]
         except Exception as e:
             logger.error(f"Failed to get unique collections from PGVector: {str(e)}")
-            raise ToolException(f"Failed to list indexes: {str(e)}") from e
+            raise ToolException(f"Failed to list indexes: {_driver_error_summary(e)}") from e
 
     def remove_collection(self, vectorstore_wrapper, collection_name: str):
         from sqlalchemy import text

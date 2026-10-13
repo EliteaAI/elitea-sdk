@@ -88,12 +88,22 @@ def toolkit_with_rows(monkeypatch):
 
 
 def test_list_indexes_raises_when_the_index_query_fails(toolkit_with_rows):
-    toolkit = toolkit_with_rows(sa.exc.ProgrammingError("SELECT", {}, Exception(QUERY_FAILURE)))
+    driver_error = Exception(f"{QUERY_FAILURE}\nLINE 1: SELECT distinct(jsonb_extract_path_text(...")
+    toolkit = toolkit_with_rows(sa.exc.ProgrammingError("SELECT secret_column FROM t", {}, driver_error))
 
-    with pytest.raises(ToolException, match="Failed to list indexes") as raised:
+    with pytest.raises(ToolException) as raised:
         toolkit.list_indexes()
 
-    assert QUERY_FAILURE in str(raised.value)
+    assert str(raised.value) == f"Failed to list indexes: {QUERY_FAILURE}"
+
+
+def test_list_indexes_names_the_error_type_when_the_driver_gives_no_message(toolkit_with_rows):
+    toolkit = toolkit_with_rows(sa.exc.OperationalError("SELECT", {}, TimeoutError()))
+
+    with pytest.raises(ToolException) as raised:
+        toolkit.list_indexes()
+
+    assert str(raised.value) == "Failed to list indexes: TimeoutError"
 
 
 def test_list_indexes_reports_empty_only_when_the_query_finds_no_rows(toolkit_with_rows):
@@ -118,8 +128,20 @@ def test_remove_index_reports_success_when_listing_fails_after_the_committed_del
     result = toolkit.remove_index("docs")
 
     assert result.startswith("Index 'docs' has been removed from the vector store.")
-    assert "Could not list the remaining indexes: Failed to list indexes" in result
+    assert "Could not list the available indexes: Failed to list indexes" in result
     assert removed_events == ["docs"]
+
+
+def test_remove_index_still_reports_not_found_when_listing_fails(toolkit_with_rows, monkeypatch):
+    toolkit = toolkit_with_rows(sa.exc.OperationalError("SELECT", {}, Exception(QUERY_FAILURE)))
+    monkeypatch.setattr(VectorStoreWrapperBase, "_clean_collection",
+                        lambda self, index_name="", including_index_meta=False: 0)
+
+    with pytest.raises(ToolException) as raised:
+        toolkit.remove_index("typo")
+
+    assert str(raised.value).startswith("Index 'typo' not found.")
+    assert "Could not list the available indexes: Failed to list indexes" in str(raised.value)
 
 
 def test_lazy_tools_still_treat_a_failed_listing_as_no_collections(toolkit_with_rows):
