@@ -5,8 +5,10 @@ these prove the real API shape: reported usage credits, extract/crawl/map payloa
 mapping, and that what we record never undercounts what Tavily's GET /usage shows.
 """
 import os
+import re
 import threading
 import time
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -34,6 +36,11 @@ class Platform:
         with self.lock:
             self.records.append(payload)
         return {"recorded": True}
+
+
+def hosts(text):
+    """Hostnames of every URL in a tool output (exact match, not substring)."""
+    return {(urlparse(u).hostname or "").lower() for u in re.findall(r"https?://[^\s|)\]]+", text)}
 
 
 def key_usage(key=KEY):
@@ -78,7 +85,7 @@ def test_check_connection_bad_key():
 
 def test_search_basic(ledger):
     out = toolkit(ledger)["web_search"].invoke({"query": "Python programming language official website"})
-    assert "python.org" in out and "untrusted" in out
+    assert hosts(out) & {"python.org", "www.python.org"} and "untrusted" in out
     last = ledger.records[-1]
     assert last["ok"] and last["meta"]["credits_source"] == "reported" and last["units"] == 1
 
@@ -107,7 +114,7 @@ def test_extract_five_urls_with_a_bad_one(ledger):
 
 def test_map_small(ledger):
     out = toolkit(ledger)["web_map"].invoke({"url": "https://docs.python.org/3/", "limit": 5})
-    assert "docs.python.org" in out
+    assert "docs.python.org" in hosts(out)
     assert ledger.records[-1]["op"] == "map"
 
 
