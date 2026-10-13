@@ -43,7 +43,8 @@ def contract(name, effort):
 
 @pytest.mark.parametrize('name', OPENAI_MODELS + ANTHROPIC_MODELS)
 @pytest.mark.parametrize('effort', [None, 'low', 'medium', 'high'])
-def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
+@pytest.mark.parametrize('output_mode', ['measured', 'provider_default', 'explicit'])
+def test_exact_measured_reasoning_reaches_http_body(name, effort, output_mode, monkeypatch):
     # Worker preferences deliberately conflict with the measured Chat Completions path.
     worker = SimpleNamespace(descriptor=SimpleNamespace(config={
         'use_responses_api_for': ['gpt-5.6'], 'reasoning_in_body_for': []}))
@@ -63,6 +64,9 @@ def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
         return httpx.Response(200, json=result)
 
     settings = contract(name, effort)
+    settings.update(routing_output_mode=output_mode, max_output_tokens=65536)
+    if output_mode == 'explicit':
+        settings['max_tokens'] = 48000
     original = deepcopy(settings)
     cls = ChatAnthropic if is_native else ChatOpenAI
     symbol = 'ChatAnthropic' if is_native else 'ChatOpenAI'
@@ -77,7 +81,10 @@ def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
     body = json.loads(requests[0].content)
     actual = {key: body[key] for key in ('thinking', 'output_config', 'reasoning', 'reasoning_effort') if key in body}
     assert actual == settings['routing_reasoning_fields']
-    assert body.get('max_tokens', body.get('max_completion_tokens')) == 32000
+    expected = (65536 if is_native else None) if output_mode == 'provider_default' else settings['max_tokens']
+    assert body.get('max_tokens', body.get('max_completion_tokens')) == expected
+    if expected is None:
+        assert not {'max_tokens', 'max_completion_tokens', 'max_output_tokens'} & body.keys()
     assert requests[0].url.path.endswith('/messages' if is_native else '/chat/completions')
     assert requests[0].headers['X-Elitea-Routing-Pin'] == 'signed-fixture'
     assert requests[0].headers['X-Elitea-Routing-Invocation'] == 'a'*64
@@ -136,3 +143,36 @@ def test_legacy_auto_effort_still_uses_existing_reasoning_parameter(name):
                               'routing_pin': 'old-signed-fixture', 'routing_invocation_id': 'a'*64})
     assert constructor.call_args.kwargs['reasoning_effort'] == 'high'
     assert 'extra_body' not in constructor.call_args.kwargs
+
+
+@pytest.mark.parametrize('effort',[None,'low','medium','high'])
+def test_explicit_top_level_contract_reaches_chat_http_without_nested_alias(effort,monkeypatch):
+    worker=SimpleNamespace(descriptor=SimpleNamespace(config={
+        'use_responses_api_for':['gpt-5.4'],'reasoning_in_body_for':['gpt-5.4']}))
+    monkeypatch.setitem(sys.modules,'tools',SimpleNamespace(this=SimpleNamespace(for_module=lambda _:worker)))
+    settings=contract('gpt-5.4',effort)
+    settings.update(routing_reasoning_format='top_level',routing_output_mode='provider_default',
+                    max_output_tokens=32000,routing_reasoning_fields={} if effort is None else {'reasoning_effort':effort})
+    sent=[]
+    def handle(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200,json={'id':'fixture','object':'chat.completion','created':1,'model':'gpt-5.4',
+            'choices':[{'index':0,'message':{'role':'assistant','content':'done'},'finish_reason':'stop'}],
+            'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}})
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http,patch(
+        'elitea_sdk.runtime.clients.client.ChatOpenAI',side_effect=lambda **kw:ChatOpenAI(http_client=http,**kw)):
+        result=client().get_llm('gpt-5.4',settings).invoke([HumanMessage(content='synthetic task')])
+    assert result.content=='done' and len(sent)==1
+    assert {k:v for k,v in sent[0].items() if k in {'reasoning','reasoning_effort','thinking','output_config'}}==settings['routing_reasoning_fields']
+    assert 'max_tokens' not in sent[0] and 'max_completion_tokens' not in sent[0]
+
+
+@pytest.mark.parametrize('change',[
+    {'routing_reasoning_format':'top_level'},
+    {'routing_reasoning_format':'unknown'},
+    {'routing_reasoning_format':'top_level','routing_reasoning_fields':{'reasoning_effort':'low'}},
+])
+def test_format_change_cannot_reinterpret_existing_signed_fields(change):
+    with patch('elitea_sdk.runtime.clients.client.ChatOpenAI') as constructor:
+        with pytest.raises(ValueError):client().get_llm(OPENAI_MODELS[0],{**contract(OPENAI_MODELS[0],'high'),**change})
+    constructor.assert_not_called()

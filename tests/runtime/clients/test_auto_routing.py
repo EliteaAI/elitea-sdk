@@ -59,6 +59,45 @@ def cfg(thread='child-one', run='run-one'):
     return {'configurable': {'thread_id': thread, 'checkpoint_ns': 'agent', 'elitea_routing_run_id': run}}
 
 
+def test_generation_size_ignores_diagnostics_without_reducing_generation_content():
+    messages = [SystemMessage(content='Full constructor instructions',
+                              additional_kwargs={'elitea_routing_content': ''}),
+                HumanMessage(content='Task'), AIMessage(content='Prior answer')]
+    original = m.generation_input_bytes(messages)
+    messages[-1].response_metadata.update(elitea_routing={'trace': 'x' * 200000}, model_name='private')
+    messages[-1].usage_metadata = dict(input_tokens=10000, output_tokens=2000, total_tokens=12000)
+    messages[-1].additional_kwargs['parsed'] = {'result': 'y' * 20000}
+    assert m.generation_input_bytes(messages) == original
+    assert m.generation_input_bytes(messages[1:]) < original
+    messages[-1].content += 'More provider-visible context'
+    assert m.generation_input_bytes(messages) > original
+
+
+def test_generation_size_keeps_native_blocks_tools_and_output_schema():
+    messages = [HumanMessage(content='Read the source'),
+                AIMessage(content=[{'type': 'thinking', 'thinking': 'opaque', 'signature': 'signed'}],
+                          tool_calls=[dict(id='read1', name='read_file', args={'path': 'a.py'})]),
+                ToolMessage(content='source code', tool_call_id='read1')]
+    original = m.generation_input_bytes(messages)
+    assert m.generation_input_bytes(messages, [{'type': 'function', 'function': {'name': 'read'}}]) > original
+    assert m.generation_input_bytes(messages, output_schema={'type': 'object'}) > original
+    messages[1].content[0]['signature'] += 'signed' * 40
+    assert m.generation_input_bytes(messages) > original
+    with_tools = m.generation_input_bytes(messages)
+    messages[1].tool_calls[0]['args']['path'] += '/directory' * 40
+    assert m.generation_input_bytes(messages) > with_tools
+
+
+def test_materialize_sizes_the_same_effective_schema_it_sends():
+    auto, native, requests = model()
+    config = cfg()
+    config['configurable']['elitea_routing_output_schema'] = {'type': 'object', 'properties': {'x': {'type': 'string'}}}
+    messages = [HumanMessage(content='Return x')]
+    auto.invoke(messages, config)
+    assert requests[0]['generation_input_bytes'] == m.generation_input_bytes(
+        messages, [], requests[0]['output_schema'])
+
+
 @pytest.mark.parametrize('cap', [None, -1, 2048, 32000])
 def test_output_allowance_preserves_explicit_limit_and_defers_unspecified(cap):
     auto, native, requests = model()
@@ -245,6 +284,72 @@ def test_completed_response_observation_is_scoped_and_provider_finish_normalized
     assert calls[-1]['observation']['finish_reason'] == 'stop'
     assert calls[-1]['observation']['message_index'] == 1
     assert calls[-1]['observation']['usage']['prompt_tokens_details']['cached_tokens'] == 80
+
+
+@pytest.mark.parametrize('details,expected', [({},{}),({'cache_read':None},{}),
+    ({'cache_read':0},{'cached_tokens':0}),({'cache_read':True},{}),
+    ({'cache_creation':80},{'cache_creation_tokens':80}),
+    ({'cache_creation':0,'ephemeral_5m_input_tokens':70,'ephemeral_1h_input_tokens':10},
+     {'cache_creation_tokens':80}),
+    ({'cache_creation':80,'ephemeral_5m_input_tokens':70,'ephemeral_1h_input_tokens':10},
+     {'cache_creation_tokens':80}),
+    ({'ephemeral_5m_input_tokens':0,'ephemeral_1h_input_tokens':0},{'cache_creation_tokens':0}),
+    ({'cache_creation':80,'ephemeral_5m_input_tokens':0,'ephemeral_1h_input_tokens':0},
+     {'cache_creation_tokens':80}),
+    ({'ephemeral_5m_input_tokens':70,'ephemeral_1h_input_tokens':None},{}),
+    ({'ephemeral_5m_input_tokens':True,'ephemeral_1h_input_tokens':0},{})])
+def test_cache_usage_distinguishes_unknown_from_measured_zero(details,expected):
+    msg=AIMessage(content='answer').model_copy(update={'usage_metadata':{'input_tokens':100,'output_tokens':1,
+                 'total_tokens':101,'input_token_details':details}})
+    assert m.observation(msg)['usage']['prompt_tokens_details']==expected
+
+
+def test_native_gateway_write_counter_survives_langchain_normalization():
+    # R23 native Luna receipt: LangChain dropped only the normalized write
+    # field, while both explicit native fields remained in token_usage.
+    msg = AIMessage(content='CACHE_OK',
+        usage_metadata={'input_tokens':15336, 'output_tokens':6, 'total_tokens':15342,
+                        'input_token_details':{'cache_read':0}},
+        response_metadata={'token_usage':{
+            'prompt_tokens':15336, 'cache_creation_input_tokens':15334,
+            'cache_read_input_tokens':0,
+            'prompt_tokens_details':{'cached_tokens':0, 'cache_creation_tokens':15334}}})
+    assert m.observation(msg)['usage']['prompt_tokens_details'] == {
+        'cached_tokens':0, 'cache_creation_tokens':15334}
+
+
+@pytest.mark.parametrize('details,raw,expected',[
+    ({}, {}, {}),
+    ({}, {'cache_creation_input_tokens':0}, {'cache_creation_tokens':0}),
+    ({}, {'prompt_tokens_details':{'cache_write_tokens':80}}, {'cache_creation_tokens':80}),
+    ({'cache_creation':70}, {'cache_creation_input_tokens':80}, {}),
+    ({}, {'cache_creation_input_tokens':80, 'prompt_tokens_details':{'cache_creation_tokens':70}}, {}),
+    ({}, {'cache_creation_input_tokens':True}, {}),
+    ({}, {'cache_read_input_tokens':-1}, {}),
+    ({}, {'cache_creation_input_tokens':1_000_000_001}, {}),
+    ({'cache_read':80}, {'cache_creation_input_tokens':30}, {}),
+    ({'cache_read':80}, {'cache_creation_input_tokens':20}, {'cached_tokens':80,'cache_creation_tokens':20}),
+    ({'cache_read':80}, {'cache_creation_input_tokens':'20'}, {'cached_tokens':80}),
+])
+def test_native_cache_counters_reject_conflicts_and_impossible_buckets(details,raw,expected):
+    msg=AIMessage(content='answer').model_copy(update={
+        'usage_metadata':{'input_tokens':100,'output_tokens':1,'total_tokens':101,'input_token_details':details},
+        'response_metadata':{'token_usage':raw}})
+    assert m.observation(msg)['usage']['prompt_tokens_details'] == expected
+
+
+@pytest.mark.parametrize('asynchronous',[False,True])
+def test_cache_receipt_records_start_before_model_execution(asynchronous,monkeypatch):
+    auto,native,calls=model()
+    clock=[1000]
+    monkeypatch.setattr(m.time,'time',lambda:clock[0])
+    def slow(*args,**kwargs):
+        clock[0]=1300
+        return AIMessage(content='answer')
+    native.invoke=slow
+    result=asyncio.run(auto.ainvoke([HumanMessage(content='task')],cfg())) if asynchronous else auto.invoke([HumanMessage(content='task')],cfg())
+    receipt=result.response_metadata[m.PIN]['last_response']
+    assert receipt['request_started_at']==1000 and receipt['completed_at']==1300
 
 
 def test_synthetic_human_and_harder_live_steer_keep_whole_run_binding():
