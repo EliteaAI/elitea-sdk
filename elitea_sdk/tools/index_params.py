@@ -15,10 +15,10 @@ INDEX_NAME_MAX_LENGTH = 32
 RemoveIndexParams = create_model(
     "RemoveIndexParams",
     index_name=(
-        Optional[str],
+        str,
         Field(
-            description=f"Optional index name (max {INDEX_NAME_MAX_LENGTH} characters)",
-            default="",
+            description=f"Name of the index to remove (max {INDEX_NAME_MAX_LENGTH} characters)",
+            min_length=1,
             max_length=INDEX_NAME_MAX_LENGTH,
         ),
     ),
