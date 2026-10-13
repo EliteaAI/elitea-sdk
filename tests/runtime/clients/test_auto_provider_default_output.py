@@ -174,3 +174,40 @@ def test_continuation_budget_for_auto_wrapper_with_none_pin_sends_no_cap():
     auto, _, _ = make_auto(None)
     node = continuation_node(auto)
     assert node._continuation_max_tokens(remaining_words=100, anchor='a', closure_only=False) is None
+
+
+# Input-size proxy must reflect what the provider receives, not routing metadata
+def _history(metadata_bytes):
+    from langchain_core.messages import AIMessage, ToolMessage
+    from elitea_sdk.runtime.clients.routing import PIN, routing_scope_id
+    scope = routing_scope_id(cfg())
+    messages = [HumanMessage(content='first question ' * 40)]
+    for i in range(6):
+        meta = {PIN: {'pin': 'p' * 50, 'scope_id': scope, 'invocation_id': f'old{i}', 'trace': 'x' * metadata_bytes}} if metadata_bytes else {}
+        messages.append(AIMessage(content=f'answer {i} ' * 60, response_metadata=meta,
+                                  usage_metadata={'input_tokens': 5, 'output_tokens': 5, 'total_tokens': 10},
+                                  tool_calls=[{'id': f'c{i}', 'name': 'fetch', 'args': {'q': 'v'}}]))
+        messages.append(ToolMessage(content='result ' * 30, tool_call_id=f'c{i}'))
+    messages.append(HumanMessage(content='follow up'))
+    return messages
+
+
+def _input_bytes(messages):
+    auto, _, requests = make_auto(None)
+    auto.invoke(messages, cfg())
+    return requests[0]['generation_input_bytes']
+
+
+def test_generation_input_bytes_excludes_routing_metadata():
+    plain = _input_bytes(_history(0))
+    heavy = _input_bytes(_history(10_000))
+    assert heavy == plain  # 6 assistant turns x 10 KB of metadata contribute nothing
+    assert abs(heavy - plain) <= plain * 0.10
+
+
+def test_generation_input_bytes_plain_conversation_covers_content_and_framing():
+    messages = _history(0)
+    size = _input_bytes(messages)
+    content = sum(len(str(m.content).encode()) for m in messages)
+    assert size >= content + 64 * len(messages)
+    assert size < content * 1.5 + 64 * len(messages) + 2_000

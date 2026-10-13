@@ -81,6 +81,23 @@ def projection(messages):
     return result
 
 
+def provider_message_view(message):
+    """What a native client serialises for one message: role, content, tool calls.
+
+    Excludes response_metadata (carries the whole routing binding under Auto),
+    usage_metadata, additional_kwargs, id, name and example, none of which are
+    sent to the provider.
+    """
+    row = {'role': message.type, 'content': message.content}
+    calls = getattr(message, 'tool_calls', None)
+    if calls:
+        row['tool_calls'] = [{'id': c['id'], 'name': c['name'], 'args': c['args']} for c in calls]
+    call_id = getattr(message, 'tool_call_id', None)
+    if call_id:
+        row['tool_call_id'] = call_id
+    return row
+
+
 def capture_routing_task(message, config):
     """Keep only this graph invocation's typed task across input flattening."""
     values = config.setdefault('configurable', {})
@@ -211,8 +228,8 @@ class AutoChatModel(BaseChatModel):
                 json={'selection': self.settings['selection'], 'surface': self.settings.get('routing_surface', 'agent'),
                       'messages': projection(messages), 'tools': tools, **output_limit,
                       'generation_input_bytes': len(json.dumps(
-                          {'messages': [message.model_dump(mode='json') for message in messages],
-                           'tools': tools, 'output_schema': output_schema}, ensure_ascii=False).encode()) + 64*len(messages),
+                          {'messages': [provider_message_view(message) for message in messages],
+                           'tools': tools, 'output_schema': output_schema}, ensure_ascii=False, default=str).encode()) + 64*len(messages),
                       'runtime_context': context, 'runtime_context_token': context_token,
                       'output_schema': output_schema or configurable.get('elitea_routing_output_schema'),
                       'invocation_id': invocation_id, 'scope_id': scope_id,
