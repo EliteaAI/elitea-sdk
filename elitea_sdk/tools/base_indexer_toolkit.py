@@ -2577,8 +2577,14 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         self._emit_index_data_removed_event(index_name)
         return (f"Index '{index_name}' has been removed from the vector store.\n"
-                f"Available indexes: {serialize_tool_result(self.list_indexes())}") if index_name \
+                f"{self._remaining_indexes_after_removal()}") if index_name \
             else "All indexes have been removed from the vector store."
+
+    def _remaining_indexes_after_removal(self) -> str:
+        try:
+            return f"Available indexes: {serialize_tool_result(self.list_indexes())}"
+        except ToolException as error:
+            return f"Could not list the remaining indexes: {error}"
 
     def _build_collection_filter(self, filter: dict | str, index_name: str = "") -> dict:
         """Builds a filter for the collection based on the provided suffix."""

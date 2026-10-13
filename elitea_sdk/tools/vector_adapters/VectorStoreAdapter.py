@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, List
 from logging import WARNING, getLogger
 
+from langchain_core.tools import ToolException
 from sqlalchemy import String, Text, cast, column, exists, func, literal, text, update, values
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
@@ -227,7 +228,7 @@ class PGVectorAdapter(VectorStoreAdapter):
                 return [collection[0] for collection in collections if collection[0] is not None]
         except Exception as e:
             logger.error(f"Failed to get unique collections from PGVector: {str(e)}")
-            return []
+            raise ToolException(f"Failed to list indexes: {str(e)}") from e
 
     def remove_collection(self, vectorstore_wrapper, collection_name: str):
         from sqlalchemy import text
