@@ -227,7 +227,7 @@ def test_unbound_native_history_and_mid_cycle_start_rejected():
 
 def test_native_serialized_payload_screen_includes_provider_fields():
     auto, native, calls = model()
-    native._get_request_payload = lambda *a, **k: {'system': 'native wrapper '*20000}
+    native._get_request_payload = lambda *a, **k: {'system': 'native wrapper '*60000}
     with pytest.raises(ValueError, match='native request exceeds'):
         auto.invoke([HumanMessage(content='Hi')], cfg())
     assert native.inputs == []
@@ -277,7 +277,7 @@ def test_reserved_checkpoint_binding_survives_compaction_and_resume():
 def test_oversized_live_steer_fails_without_selecting_another_model():
     auto, native, calls = model();task = HumanMessage(content='task')
     first = auto.invoke([task], cfg())
-    native._get_request_payload = lambda *a, **k: {'messages': 'x'*200000}
+    native._get_request_payload = lambda *a, **k: {'messages': 'x'*600000}
     with pytest.raises(ValueError, match='native request exceeds'):
         auto.invoke([task, first, HumanMessage(content='large added evidence')], cfg())
     assert len(calls) == 1 and len(native.inputs) == 1
