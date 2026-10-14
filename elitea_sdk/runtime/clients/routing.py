@@ -16,8 +16,8 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda, RunnableBinding
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from elitea_sdk.runtime.clients.routing_escalation import (answer_text, escalation_signal, finish_reason_of, is_final_answer,
-                                                          last_response_signal, response_signal)
+from elitea_sdk.runtime.clients.routing_escalation import (answer_text, escalation_signal, finish_reason_of, guard_request_context,
+                                                          is_final_answer, last_response_signal, response_signal)
 
 PIN = 'elitea_routing'
 # Prose is ~4 bytes/token, code and JSON ~3; 3 is the conservative bound (same constant as the Gateway).
@@ -346,7 +346,7 @@ class AutoChatModel(BaseChatModel):
             latest_index = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
             tools = [m for m in messages[latest_index+1:] if isinstance(m, ToolMessage)]
             body = {'pin': binding['pin'], 'scope_id': binding['scope_id'], 'invocation_id': binding['invocation_id'],
-                    'request_text_projection': projection(messages),
+                    'request_text_projection': guard_request_context(projection(messages)),
                     'answer_text': answer_text(response)[:GUARD_ANSWER_LIMIT],
                     'last_response': response_signal(response, tools)}
             url = f'{self.owner.base_url}/llm/v1/auto-routing/guard'

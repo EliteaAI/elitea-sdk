@@ -90,7 +90,7 @@ def test_guard_request_contract():
     body = h.guard_calls()[0]
     assert set(body) == {'pin', 'scope_id', 'invocation_id', 'request_text_projection', 'answer_text', 'last_response'}
     assert body['pin'] == 'pin-cheap' and body['answer_text'] == FIRST
-    assert body['request_text_projection'] == [{'role': 'user', 'content': 'Name two colours.'}]
+    assert body['request_text_projection'] == {'latest': 'Name two colours.', 'recent': [], 'turns_omitted': 0}
     assert body['last_response'] == {'finish_reason': 'stop', 'refusal': False, 'tool_failure': False, 'inability': False}
     resolve = next(b for n, b in h.calls if n == 'resolve')
     assert (body['scope_id'], body['invocation_id']) == (resolve['scope_id'], resolve['invocation_id'])
@@ -238,3 +238,53 @@ def test_streaming_path_is_unaffected():
     with patch.object(ChatOpenAI, 'stream', autospec=True, return_value=iter([AIMessageChunk(content=FIRST)])):
         chunks = list(h.auto.stream(ask(), h.config))
     assert h.guard_calls() == [] and chunks[0].content == FIRST
+
+
+def big_history(turns, size=3000):
+    rows = []
+    for i in range(turns):
+        rows += [HumanMessage(content=f'user {i} ' + 'u' * size), AIMessage(content=f'assistant {i} ' + 'a' * size)]
+    return rows
+
+
+def test_guard_context_shape_and_per_field_caps():
+    h = Harness()
+    h.invoke([*big_history(5), HumanMessage(content='L' * 9000)])
+    context = h.guard_calls()[0]['request_text_projection']
+    assert set(context) == {'latest', 'recent', 'turns_omitted'}
+    assert context['latest'] == 'L' * 5000
+    assert [r['role'] for r in context['recent']] == ['user', 'assistant', 'user', 'assistant']
+    assert [r['text'][:11] for r in context['recent']] == ['user 3 uuuu', 'assistant 3', 'user 4 uuuu', 'assistant 4']
+    assert all(set(r) == {'role', 'text'} and len(r['text']) == 900 for r in context['recent'])
+    assert context['turns_omitted'] == 6
+
+
+def test_guard_context_is_hard_capped_on_a_300kb_history():
+    h = Harness()
+    messages = [*big_history(50, size=3000), HumanMessage(content='Q' * 4000)]
+    assert len(json.dumps([m.content for m in messages])) > 300_000
+    h.invoke(messages)
+    body = h.guard_calls()[0]
+    assert len(json.dumps(body['request_text_projection']).encode()) < 60_000
+    assert len(json.dumps(body).encode()) < 64_000
+    assert body['request_text_projection']['turns_omitted'] == 96
+
+
+def test_guard_context_cap_truncates_recent_then_latest_for_wide_characters():
+    from elitea_sdk.runtime.clients.routing_escalation import guard_request_context
+    rows = [{'role': 'user', 'content': '\U0001F600' * 900}, {'role': 'assistant', 'content': '\U0001F600' * 900}] * 2
+    rows.append({'role': 'user', 'content': '\U0001F600' * 5000})
+    context = guard_request_context(rows)
+    assert len(json.dumps(context).encode()) < 60_000
+    assert context['recent'] == [] and 0 < len(context['latest']) < 5000 and context['turns_omitted'] == 4
+    tail = guard_request_context(rows[:3] + [{'role': 'user', 'content': 'short'}])
+    assert tail['latest'] == 'short' and len(tail['recent']) == 3
+
+
+def test_guard_context_skips_tool_rows_and_empty_assistant_turns():
+    from elitea_sdk.runtime.clients.routing_escalation import guard_request_context
+    rows = [{'role': 'system', 'content': 'sys'}, {'role': 'user', 'content': 'q1'},
+            {'role': 'assistant', 'content': ''}, {'role': 'tool', 'content': 'result'},
+            {'role': 'assistant', 'content': 'a1'}, {'role': 'user', 'content': 'q2'}]
+    assert guard_request_context(rows) == {'latest': 'q2', 'recent': [
+        {'role': 'user', 'text': 'q1'}, {'role': 'assistant', 'text': 'a1'}], 'turns_omitted': 0}

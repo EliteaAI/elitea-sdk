@@ -12,6 +12,7 @@ Platform contract (``run_config['configurable']``):
 The platform sets it for a run that regenerates an Auto answer or that was
 started by the "upgrade this answer" control. Any other shape is ignored.
 """
+import json
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 ESCALATION_KEY = 'elitea_routing_escalation'
@@ -101,3 +102,35 @@ def is_final_answer(message):
         return False
     content = message.content
     return not (isinstance(content, list) and any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content))
+
+
+# The Gateway accepts the guard's request context as a dict or string of at most 64,000 bytes.
+GUARD_LATEST_CHARS = 5_000
+GUARD_RECENT_TURNS = 4
+GUARD_RECENT_CHARS = 900
+GUARD_CONTEXT_BYTES = 60_000
+
+
+def guard_request_context(rows):
+    """Bounded context for the guard from resolve-style projection rows (role/content dicts).
+
+    ``latest`` is the newest user text, ``recent`` the last user/assistant turns
+    before it, ``turns_omitted`` the older user/assistant turns left out. Size is
+    measured on the ASCII-escaped JSON (the larger encoding) and kept under
+    GUARD_CONTEXT_BYTES: ``recent`` is dropped oldest-first, then ``latest`` shrinks.
+    """
+    latest_index = next((i for i in range(len(rows) - 1, -1, -1) if rows[i]['role'] == 'user'), None)
+    if latest_index is None:
+        return {'latest': '', 'recent': [], 'turns_omitted': 0}
+    text = lambda row: row['content'] if isinstance(row.get('content'), str) else ''
+    earlier = [row for row in rows[:latest_index] if row['role'] in {'user', 'assistant'} and text(row)]
+    recent = [{'role': row['role'], 'text': text(row)[:GUARD_RECENT_CHARS]} for row in earlier[-GUARD_RECENT_TURNS:]]
+    context = {'latest': text(rows[latest_index])[:GUARD_LATEST_CHARS], 'recent': recent,
+               'turns_omitted': len(earlier) - len(recent)}
+    while len(json.dumps(context).encode()) >= GUARD_CONTEXT_BYTES:
+        if context['recent']:
+            context['recent'] = context['recent'][1:]
+            context['turns_omitted'] += 1
+        else:
+            context['latest'] = context['latest'][:len(context['latest']) // 2]
+    return context
