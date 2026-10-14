@@ -7,6 +7,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 from pydantic import ConfigDict, Field
@@ -23,7 +24,6 @@ PIN = 'elitea_routing'
 BYTES_PER_TOKEN = 3
 GUARD_ANSWER_LIMIT = 12_000  # characters of the candidate answer sent to the guard
 GUARD_TIMEOUT = (3, 30)
-GUARD_META = 'elitea_routing_guard'
 
 
 def estimated_input_tokens(size):
@@ -260,9 +260,6 @@ class AutoChatModel(BaseChatModel):
             sink['binding'] = copy.deepcopy(binding)
         if binding.get('action') == 'clarify':
             return None, binding
-        return self._native_for(binding), binding
-
-    def _native_for(self, binding):
         config = {**binding['config'], 'streaming': self.settings.get('streaming', True),
                   'routing_pin': binding['pin'], 'routing_invocation_id': binding['invocation_id']}
         explicit_cap = _positive_int(self.settings.get('max_tokens'))
@@ -273,7 +270,7 @@ class AutoChatModel(BaseChatModel):
         native = self.owner.get_llm(config['model_name'], config)
         if self.routing_tools:
             native = native.bind_tools(self.routing_tools, **self.tool_kwargs)
-        return native
+        return native, binding
 
     @staticmethod
     def _native_messages(native, messages, binding):
@@ -319,8 +316,8 @@ class AutoChatModel(BaseChatModel):
         return {'elitea_routing_trace': binding.get('trace', {})} if binding.get('action') == 'clarify' else {PIN: copy.deepcopy(binding)}
 
     @staticmethod
-    def _stamp(message, binding, extra=None):
-        metadata = {**message.response_metadata, **AutoChatModel._binding_metadata(binding), **(extra or {})}
+    def _stamp(message, binding):
+        metadata = {**message.response_metadata, **AutoChatModel._binding_metadata(binding)}
         return message.model_copy(update={'response_metadata': metadata})
 
     @staticmethod
@@ -334,51 +331,36 @@ class AutoChatModel(BaseChatModel):
         if sink is not None:
             sink['binding'] = copy.deepcopy(binding)
 
-    def _guard_decision(self, messages, response, binding):
-        """Ask the Gateway whether a final answer may be delivered; None means deliver it.
+    def _record_guard(self, messages, response, binding):
+        """Record-only guard: judge the delivered final answer off the request path.
 
-        Never blocks the turn: any guard failure delivers the first answer. At most
-        one guard call per invocation (the flag travels with the binding).
+        The turn is never changed or delayed: the request is built here (cheap), sent
+        from a daemon thread, and every failure is ignored. At most one call per
+        invocation (the flag travels with the binding).
         """
         if (not self.settings.get('routing_guard', True) or binding.get('action') == 'clarify'
                 or binding.get('guarded') or not is_final_answer(response)):
-            return None
+            return
         binding['guarded'] = True
         try:
             latest_index = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
             tools = [m for m in messages[latest_index+1:] if isinstance(m, ToolMessage)]
-            result = self.owner._request('post', f'{self.owner.base_url}/llm/v1/auto-routing/guard',
-                headers={**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)},
-                json={'pin': binding['pin'], 'scope_id': binding['scope_id'], 'invocation_id': binding['invocation_id'],
-                      'request_text_projection': projection(messages),
-                      'answer_text': answer_text(response)[:GUARD_ANSWER_LIMIT],
-                      'last_response': response_signal(response, tools)}, timeout=GUARD_TIMEOUT)
-            result.raise_for_status()
-            body = result.json()
-            target = body.get('escalate_to') if isinstance(body, dict) else None
-            if (not isinstance(body, dict) or body.get('verdict') != 'fail' or not isinstance(target, dict)
-                    or not isinstance(target.get('config'), dict) or not isinstance(target.get('pin'), str)):
-                return None
-            text = lambda value: value[:256] if isinstance(value, str) else None
-            return {'target': target, 'meta': {'verdict': 'fail', 'code': text(body.get('code')), 'clause': text(body.get('clause')),
-                    'first_answer_sha256': hashlib.sha256(answer_text(response).encode()).hexdigest()}}
+            body = {'pin': binding['pin'], 'scope_id': binding['scope_id'], 'invocation_id': binding['invocation_id'],
+                    'request_text_projection': projection(messages),
+                    'answer_text': answer_text(response)[:GUARD_ANSWER_LIMIT],
+                    'last_response': response_signal(response, tools)}
+            url = f'{self.owner.base_url}/llm/v1/auto-routing/guard'
+            headers = {**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)}
+            threading.Thread(target=self._send_guard, args=(url, headers, body), daemon=True,
+                             name='auto-routing-guard').start()
         except Exception:
-            return None
+            return
 
-    def _prepare_escalation(self, messages, binding, decision):
-        """Escalated native, its messages and the updated binding; None keeps the first answer."""
+    def _send_guard(self, url, headers, body):
         try:
-            target = decision['target']
-            escalated = copy.deepcopy(binding)
-            escalated.update({'config': target['config'], 'pin': target['pin']})
-            if isinstance(target.get('state_token'), str):
-                escalated['state_token'] = target['state_token']
-            native = self._native_for(escalated)
-            prepared = self._native_messages(native, messages, escalated)
-            self._admit_native(native, prepared, escalated)
-            return native, prepared, escalated
+            self.owner._request('post', url, headers=headers, json=body, timeout=GUARD_TIMEOUT).raise_for_status()
         except Exception:
-            return None
+            pass  # Record-only: the log loses one verdict, the turn is unaffected.
 
     def invoke(self, input, config=None, *, stop=None, **kwargs):
         messages = self._convert_input(input).to_messages()
@@ -388,17 +370,10 @@ class AutoChatModel(BaseChatModel):
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
         response = AIMessage(content=binding['text']) if native is None else native.invoke(messages, config, stop=stop, **kwargs)
-        extra = None
-        decision = self._guard_decision(raw, response, binding) if native is not None else None
-        prepared = self._prepare_escalation(raw, binding, decision) if decision else None
-        if prepared:
-            try:
-                escalated = prepared[0].invoke(prepared[1], config, stop=stop, **kwargs)
-                response, binding, extra = escalated, prepared[2], {GUARD_META: decision['meta']}
-            except Exception:
-                pass  # The escalated generation failed: the first answer is still deliverable.
+        if native is not None:
+            self._record_guard(raw, response, binding)
         self._remember_response(response, binding, config)
-        return self._stamp(response, binding, extra)
+        return self._stamp(response, binding)
 
     async def ainvoke(self, input, config=None, *, stop=None, **kwargs):
         messages = self._convert_input(input).to_messages()
@@ -408,17 +383,10 @@ class AutoChatModel(BaseChatModel):
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
         response = AIMessage(content=binding['text']) if native is None else await native.ainvoke(messages, config, stop=stop, **kwargs)
-        extra = None
-        decision = await asyncio.to_thread(self._guard_decision, raw, response, binding) if native is not None else None
-        prepared = self._prepare_escalation(raw, binding, decision) if decision else None
-        if prepared:
-            try:
-                escalated = await prepared[0].ainvoke(prepared[1], config, stop=stop, **kwargs)
-                response, binding, extra = escalated, prepared[2], {GUARD_META: decision['meta']}
-            except Exception:
-                pass  # The escalated generation failed: the first answer is still deliverable.
+        if native is not None:
+            self._record_guard(raw, response, binding)
         self._remember_response(response, binding, config)
-        return self._stamp(response, binding, extra)
+        return self._stamp(response, binding)
 
     def stream(self, input, config=None, *, stop=None, **kwargs):
         messages = self._convert_input(input).to_messages()
