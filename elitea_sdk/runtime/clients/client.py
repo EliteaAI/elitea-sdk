@@ -35,6 +35,9 @@ from ...configurations import get_class_configurations
 
 logger = logging.getLogger(__name__)
 
+# Consumed by the LLM gateway (runtime_interface_litellm), never forwarded to the provider.
+MODEL_PROJECT_HEADER = "X-Elitea-Model-Project-Id"
+
 THINKING_BUDGET_TOKENS = {"low": 2048, "medium": 4096, "high": 9092}
 # Name tokens that predate the stored thinking_type field; consulted only while a
 # model row still has that field null (#6819). Delete once every row carries it.
@@ -629,6 +632,11 @@ class EliteAClient:
         # Default means no Elitea-defined custom output cap. Optional provider
         # fields are omitted; required APIs resolve the configured model maximum.
         llm_max_tokens = model_config.get("max_tokens", None)
+        # Tells the gateway which project's deployment was selected when a project
+        # and the public project both define a model with this name.
+        model_project_id = model_config.get("model_project_id")
+        owner_headers = {MODEL_PROJECT_HEADER: str(model_project_id)} \
+            if model_project_id not in (None, "") else {}
         has_custom_output_limit = llm_max_tokens not in (None, -1)
         if not has_custom_output_limit:
             llm_max_tokens = None
@@ -653,6 +661,7 @@ class EliteAClient:
                     "anthropic-beta": "prompt-caching-2024-07-31",
                     **(getattr(self, "api_extra_headers", None) or {}),
                     **self._llm_cookie_headers,
+                    **owner_headers,
                 },
             }
             
@@ -703,7 +712,8 @@ class EliteAClient:
             if llm_max_tokens is not None:
                 target_kwargs["max_tokens"] = llm_max_tokens
             extra_headers = {**(getattr(self, "api_extra_headers", None) or {}),
-                             **self._llm_cookie_headers}
+                             **self._llm_cookie_headers,
+                             **owner_headers}
             if extra_headers:
                 target_kwargs["default_headers"] = dict(extra_headers)
 
@@ -829,6 +839,8 @@ class EliteAClient:
         }
         if temperature is not None:
             model_config["temperature"] = temperature
+        if selected_model.get("project_id") not in (None, ""):
+            model_config["model_project_id"] = selected_model["project_id"]
 
         # Add top_p if provided
         if top_p is not None:

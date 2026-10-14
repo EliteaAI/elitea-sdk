@@ -204,6 +204,7 @@ class ApplicationToolkit(BaseToolkit):
                 # defaulted to ChatAnthropic, which drops tool_use blocks against an
                 # OpenAI-passthrough backend (no tool calls -> no sensitive-tool HITL interrupts).
                 "openai_compatible": llm_settings.get('openai_compatible', False),
+                "model_project_id": llm_settings.get('model_project_id'),
             }
             resolved_llm = client.get_llm(_model_name, model_settings)
         else:
