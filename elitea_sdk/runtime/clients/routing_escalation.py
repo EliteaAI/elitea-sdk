@@ -72,6 +72,15 @@ def escalation_signal(configurable):
     return {'event': value['event'], 'from_message_id': from_id}
 
 
+def response_signal(message, tool_messages=(), prior_observation=None):
+    """Flags for one answer. ``tool_messages`` is that turn's tool cycle, oldest first."""
+    finish = finish_reason_of(message) or (prior_observation or {}).get('finish_reason')
+    tools = list(tool_messages)
+    return {'finish_reason': finish, 'refusal': bool(is_refusal(message, finish)),
+            'tool_failure': bool(tools and tools[-1].status == 'error'),
+            'inability': is_inability(message)}
+
+
 def last_response_signal(messages, latest_index, prior_observation=None):
     """State of the last assistant answer before the current user task, or None.
 
@@ -81,10 +90,14 @@ def last_response_signal(messages, latest_index, prior_observation=None):
     index = next((i for i in range(latest_index - 1, -1, -1) if isinstance(messages[i], AIMessage)), None)
     if index is None:
         return None
-    message = messages[index]
-    finish = finish_reason_of(message) or (prior_observation or {}).get('finish_reason')
     turn_start = next((i for i in range(index - 1, -1, -1) if isinstance(messages[i], HumanMessage)), -1)
     tools = [m for m in messages[turn_start + 1:latest_index] if isinstance(m, ToolMessage)]
-    return {'finish_reason': finish, 'refusal': bool(is_refusal(message, finish)),
-            'tool_failure': bool(tools and tools[-1].status == 'error'),
-            'inability': is_inability(message)}
+    return response_signal(messages[index], tools, prior_observation)
+
+
+def is_final_answer(message):
+    """A guardable answer: no tool call requested (tool-cycle turns are never guarded)."""
+    if getattr(message, 'tool_calls', None) or finish_reason_of(message) == 'tool_calls':
+        return False
+    content = message.content
+    return not (isinstance(content, list) and any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content))
