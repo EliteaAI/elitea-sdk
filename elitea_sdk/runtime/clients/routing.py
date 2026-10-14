@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda, RunnableBinding
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from elitea_sdk.runtime.clients.routing_escalation import escalation_signal, finish_reason_of, last_response_signal
 
 PIN = 'elitea_routing'
 # Prose is ~4 bytes/token, code and JSON ~3; 3 is the conservative bound (same constant as the Gateway).
@@ -140,9 +141,7 @@ def observation(message):
     row = projection([message])[0]
     usage = message.usage_metadata or {}
     details = usage.get('input_token_details') or {}
-    finish = message.response_metadata.get('finish_reason') or message.response_metadata.get('stop_reason')
-    finish = {'end_turn': 'stop', 'tool_use': 'tool_calls', 'max_tokens': 'length'}.get(finish, finish)
-    finish = finish if finish in {'stop', 'tool_calls', 'length', 'content_filter', 'refusal', 'pause_turn'} else None
+    finish = finish_reason_of(message)
     def counter(value):
         return value if type(value) is int and 0 <= value <= 1_000_000_000 else 0
     model = message.response_metadata.get('model_name') or message.response_metadata.get('model')
@@ -217,6 +216,14 @@ class AutoChatModel(BaseChatModel):
                         break
             if prior_observation is None and previous is not None:
                 prior_observation = {**observation(previous), 'message_index': len(projection(messages[:previous_index]))}
+            # Optional, only when observed; absent keys keep today's request byte-identical.
+            signals = {}
+            escalation = escalation_signal(configurable)
+            if escalation:
+                signals['escalation'] = escalation
+            last_response = last_response_signal(messages, latest_index, prior_observation)
+            if last_response:
+                signals['last_response'] = last_response
             tools = [convert_to_openai_tool(tool) for tool in self.routing_tools]
             cap = self.settings.get('max_tokens')
             # Unspecified output belongs to the selected measured contract.
@@ -241,7 +248,7 @@ class AutoChatModel(BaseChatModel):
                       'invocation_id': invocation_id, 'scope_id': scope_id,
                       'state_token': previous_binding.get('state_token') if previous_binding else None,
                       'observation': prior_observation,
-                      'prior_pin': binding.get('pin') if binding else None}, timeout=(5, 90))
+                      'prior_pin': binding.get('pin') if binding else None, **signals}, timeout=(5, 90))
             raise_for_refusal(response)
             binding = response.json()
             binding['completed_native_keys'] = completed
