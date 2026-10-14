@@ -45,12 +45,12 @@ def http(monkeypatch):
         State.token_calls.append({"url": url, "data": data})
         return State.token_response
 
-    def fake_get(url, headers=None, timeout=None):
-        State.api_calls.append({"url": url, "headers": headers})
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        State.api_calls.append({"method": method, "url": url, "headers": headers, "json": json})
         return State.api_responses.pop(0) if State.api_responses else FakeResponse(200, {"UserId": "u-1"})
 
     monkeypatch.setattr("elitea_sdk.runtime.utils.mcp_oauth.requests.post", fake_post)
-    monkeypatch.setattr(dv.requests, "get", fake_get)
+    monkeypatch.setattr(dv.requests, "request", fake_request)
     dv._token_cache.clear()
     yield State
     dv._token_cache.clear()
@@ -227,3 +227,125 @@ def test_config_schema_exposes_configuration_and_tools():
     assert fields["refresh_token"]["hidden"] is True
     assert {"format": "password", "type": "string", "writeOnly": True} in fields["refresh_token"]["anyOf"]
     assert "refresh_token" not in DataverseConfiguration.model_json_schema().get("required", [])
+
+
+def test_update_record_patches_existing_record_only(http):
+    # If-Match: * makes Dataverse refuse the PATCH instead of upserting a brand-new record.
+    http.api_responses = [FakeResponse(200, {"epam_description": "New text", "epam_name": "Deal"})]
+    result = tools()["update_record"].run({"entity_set": "epam_engagements", "record_id": RECORD_ID,
+                                            "fields": {"epam_description": "New text"}})
+    call = http.api_calls[0]
+    assert call["method"] == "PATCH"
+    assert call["url"] == f"{ORG}/api/data/v9.2/epam_engagements({RECORD_ID})"
+    assert call["json"] == {"epam_description": "New text"}
+    assert call["headers"]["If-Match"] == "*"
+    assert call["headers"]["Prefer"] == "return=representation"
+    assert result == {"message": f"Updated 1 column(s) on epam_engagements({RECORD_ID})",
+                      "record": {"epam_description": "New text"}}
+
+
+def test_update_record_accepts_no_content_reply(http):
+    http.api_responses = [FakeResponse(204)]
+    result = tools()["update_record"].run({"entity_set": "accounts", "record_id": RECORD_ID,
+                                            "fields": {"description": None}})
+    assert result["record"] == {}
+
+
+def test_update_record_on_missing_record_never_creates_one(http):
+    http.api_responses = [FakeResponse(412, {"error": {"message": "precondition failed"}})]
+    with pytest.raises(ToolException, match="never create"):
+        tools()["update_record"].run({"entity_set": "accounts", "record_id": RECORD_ID, "fields": {"name": "x"}})
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({}, "non-empty"),
+    ({"_parentaccountid_value": "x"}, "not a column logical name"),
+    ({"parentaccountid@odata.bind": "/accounts(1)"}, "must be '/<entity_set>"),
+    ({"parentaccountid@odata.bind": "https://evil/accounts(%s)" % RECORD_ID}, "must be '/<entity_set>"),
+    ({"name; drop": "x"}, "not a column logical name"),
+    ({"statecode": 1}, "cannot be updated"),
+    ({"OwnerId": "x"}, "cannot be updated"),
+    ({"description": {"nested": 1}}, "plain value"),
+    ({f"c{i}": i for i in range(21)}, "At most 20"),
+])
+def test_update_record_rejects_unsupported_fields_without_calling_dataverse(http, fields, message):
+    with pytest.raises(ToolException, match=message):
+        tools()["update_record"].run({"entity_set": "accounts", "record_id": RECORD_ID, "fields": fields})
+    assert http.api_calls == []
+
+
+def test_update_record_is_in_write_group():
+    groups = DataverseToolkit.toolkit_config_schema().model_json_schema()["properties"]["selected_tools"]["tool_groups"]
+    assert groups["update_record"] == "write"
+    assert groups["get_record"] == "read"
+    assert groups["describe_entity"] == "read"
+
+
+def test_update_record_sets_lookup_and_choice_columns(http):
+    # Lookups go through @odata.bind with a relative /<entity set>(<guid>) reference; choices by option value.
+    http.api_responses = [FakeResponse(204)]
+    tools()["update_record"].run({"entity_set": "epam_engagements", "record_id": RECORD_ID, "fields": {
+        "epam_accountid@odata.bind": f"/accounts({RECORD_ID})",
+        "epam_prioritycode": 895450001,
+        "epam_servicescode": "895450000,895450002",
+    }})
+    assert http.api_calls[0]["json"] == {
+        "epam_accountid@odata.bind": f"/accounts({RECORD_ID})",
+        "epam_prioritycode": 895450001,
+        "epam_servicescode": "895450000,895450002",
+    }
+
+
+def _metadata_responses():
+    attributes = {"value": [
+        {"LogicalName": "epam_description", "AttributeTypeName": {"Value": "MemoType"}, "IsValidForUpdate": True,
+         "DisplayName": {"UserLocalizedLabel": {"Label": "Description"}}, "RequiredLevel": {"Value": "None"}},
+        {"LogicalName": "epam_prioritycode", "AttributeTypeName": {"Value": "PicklistType"}, "IsValidForUpdate": True,
+         "DisplayName": {"UserLocalizedLabel": {"Label": "Priority"}}, "RequiredLevel": {"Value": "ApplicationRequired"}},
+        {"LogicalName": "epam_accountid", "AttributeTypeName": {"Value": "LookupType"}, "IsValidForUpdate": True,
+         "DisplayName": {"UserLocalizedLabel": {"Label": "Account"}}, "RequiredLevel": {"Value": "None"}},
+        {"LogicalName": "epam_accountidname", "AttributeTypeName": {"Value": "StringType"}, "IsValidForUpdate": True,
+         "AttributeOf": "epam_accountid"},
+        {"LogicalName": "createdon", "AttributeTypeName": {"Value": "DateTimeType"}, "IsValidForUpdate": True},
+        {"LogicalName": "epam_number", "AttributeTypeName": {"Value": "StringType"}, "IsValidForUpdate": False},
+    ]}
+    picklists = {"value": [{"LogicalName": "epam_prioritycode", "OptionSet": {"Options": [
+        {"Value": 895450001, "Label": {"UserLocalizedLabel": {"Label": "P1 - High"}}}]}}]}
+    relations = {"value": [{"ReferencingAttribute": "epam_accountid",
+                            "ReferencingEntityNavigationPropertyName": "epam_accountid", "ReferencedEntity": "account"}]}
+    return [
+        FakeResponse(200, {"value": [{"LogicalName": "epam_engagement"}]}),
+        FakeResponse(200, attributes),
+        FakeResponse(200, picklists),
+        FakeResponse(200, relations),
+        FakeResponse(200, {"value": [{"LogicalName": "account", "EntitySetName": "accounts"}]}),
+    ]
+
+
+def test_describe_entity_lists_updatable_columns_with_options_and_bind_keys(http):
+    http.api_responses = _metadata_responses()
+    result = tools()["describe_entity"].run({"entity_set": "epam_engagements", "search": "e"})
+    cols = {c["name"]: c for c in result["columns"]}
+    # Read-only, system and helper (AttributeOf) columns are hidden
+    assert set(cols) == {"epam_description", "epam_prioritycode", "epam_accountid"}
+    assert cols["epam_prioritycode"]["required"] is True
+    assert cols["epam_prioritycode"]["options"] == [{"value": 895450001, "label": "P1 - High"}]
+    assert cols["epam_accountid"]["bind_targets"] == [
+        {"key": "epam_accountid@odata.bind", "value_format": "/accounts(<guid>)", "table": "account"}]
+    assert "note" not in result
+    assert "EntitySetName eq 'epam_engagements'" in http.api_calls[0]["url"].replace("%20", " ").replace("%27", "'")
+
+
+def test_describe_entity_without_search_skips_option_lists(http):
+    responses = _metadata_responses()
+    http.api_responses = [responses[0], responses[1], responses[3], responses[4]]
+    result = tools()["describe_entity"].run({"entity_set": "epam_engagements"})
+    assert "options" not in {c["name"]: c for c in result["columns"]}["epam_prioritycode"]
+    assert "search" in result["note"]
+    assert not any("PicklistAttributeMetadata" in c["url"] for c in http.api_calls)
+
+
+def test_describe_entity_unknown_table(http):
+    http.api_responses = [FakeResponse(200, {"value": []})]
+    with pytest.raises(ToolException, match="No table"):
+        tools()["describe_entity"].run({"entity_set": "nope"})

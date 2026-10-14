@@ -131,29 +131,48 @@ def get_access_token(settings: dict) -> str:
 
 
 def dataverse_get(settings: dict, path: str, params: Optional[dict] = None) -> dict:
+    return _dataverse_request(settings, "GET", path, params=params)
+
+
+def dataverse_patch(settings: dict, path: str, fields: dict) -> dict:
+    """Update the given columns of an existing record; If-Match: * stops PATCH from creating a new one."""
+    return _dataverse_request(settings, "PATCH", path, json_body=fields, extra_headers={
+        "If-Match": "*",
+        "Prefer": "return=representation",
+    })
+
+
+def _dataverse_request(settings: dict, method: str, path: str, params: Optional[dict] = None,
+                       json_body: Optional[dict] = None, extra_headers: Optional[dict] = None) -> dict:
     org = normalize_org_url(settings.get("url"))
     token = get_access_token(settings)
     url = f"{org}{API_PATH}{path}"
     if params:
         url += "?" + urlencode(params, quote_via=quote)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+        "Prefer": 'odata.include-annotations="OData.Community.Display.V1.FormattedValue"',
+        **(extra_headers or {}),
+    }
     try:
-        resp = requests.get(url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "OData-MaxVersion": "4.0",
-            "OData-Version": "4.0",
-            "Prefer": 'odata.include-annotations="OData.Community.Display.V1.FormattedValue"',
-        }, timeout=30)
+        resp = requests.request(method, url, headers=headers, json=json_body, timeout=30)
     except requests.RequestException as e:
         raise DataverseError(f"Could not reach Dataverse ({type(e).__name__})") from None
     if resp.status_code == 200:
         return resp.json()
+    if resp.status_code == 204:
+        return {}
     if resp.status_code == 401:
         raise DataverseError("Dataverse rejected the access token")
     if resp.status_code == 403:
         raise DataverseError("Your Dataverse user has no permission for this operation")
     if resp.status_code == 404:
         raise DataverseError("Record or table not found")
+    if resp.status_code == 412:
+        raise DataverseError("Record not found (updates never create new records)")
     if resp.status_code == 429:
         raise DataverseError("Dataverse rate limit reached, try again later")
     try:
