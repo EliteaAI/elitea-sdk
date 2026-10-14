@@ -57,6 +57,7 @@ _safe_import_configuration('testio', 'testio', 'TestIOConfiguration')
 _safe_import_configuration('openapi', 'openapi', 'OpenApiConfiguration')
 _safe_import_configuration('langfuse', 'langfuse', 'LangfuseConfiguration')
 _safe_import_configuration('aha', 'aha', 'AhaConfiguration')
+_safe_import_configuration('dataverse', 'dataverse', 'DataverseConfiguration')
 
 # Log import summary
 available_count = len(AVAILABLE_CONFIGURATIONS)
