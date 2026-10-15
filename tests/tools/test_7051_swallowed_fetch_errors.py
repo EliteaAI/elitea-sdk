@@ -23,7 +23,7 @@ from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
-from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit
+from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit, _IndexRunState
 from elitea_sdk.tools.confluence.api_wrapper import ConfluenceAPIWrapper
 from elitea_sdk.tools.qtest.api_wrapper import QtestApiWrapper
 from elitea_sdk.tools.zephyr_enterprise.api_wrapper import ZephyrApiWrapper
@@ -38,7 +38,7 @@ def fresh(wrapper_cls):
 
 
 def failed_names(wrapper):
-    return wrapper.get_indexing_stats().documents_skipped_error
+    return wrapper.get_indexing_stats().runtime_skipped_error
 
 
 def raise_tool_exception(*args, **kwargs):
@@ -58,6 +58,18 @@ class TestTheTracker:
         wrapper._track_document_left_empty_by_error(document)
 
         assert failed_names(wrapper) == {"Login works"}
+
+    def test_a_document_left_without_content_keeps_its_previously_indexed_rows(self):
+        wrapper = fresh(ZephyrApiWrapper)
+        object.__setattr__(wrapper, "_index_run", _IndexRunState(run_id="r1"))
+        wrapper._index_run.staged_removal_ids = {"7": ["previous-row-7"], "8": ["previous-row-8"]}
+        document = Document(page_content="", metadata={"id": "7", "name": "Login works"})
+
+        wrapper._track_document_left_empty_by_error(document)
+        superseded_ids, _, _ = wrapper._assemble_promote_sets()
+
+        assert superseded_ids == ["previous-row-8"]
+        assert "7" in wrapper._index_run.explicitly_failed_keys
 
     @pytest.mark.parametrize("document", [
         Document(page_content="body", metadata={"id": "7", "name": "Login works"}),

@@ -1097,7 +1097,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _track_document_left_empty_by_error(self, document: Document):
         if document.page_content or document.metadata.get(IndexerKeywords.CONTENT_IN_BYTES.value):
             return
-        self._track_document_failed(self._extract_doc_name(document.metadata), document)
+        doc_name = self._extract_doc_name(document.metadata)
+        self._track_explicit_base_failure(document, doc_name, 'runtime_skipped_error')
+        run = getattr(self, '_index_run', None)
+        failed_key = str(self.key_fn(document))
+        if run is not None and failed_key != IDLESS_STAGING_KEY:
+            run.pipeline_failed_keys.add(failed_key)
+            run.doc_names.setdefault(failed_key, doc_name)
 
     def _withdraw_document(self, doc_name: str, base_doc: Optional[Document], skip_set_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
@@ -2313,7 +2319,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             stats.files_skipped_empty,
             stats.files_unsupported_extension,
             stats.documents_skipped_error,
-            stats.documents_skipped_empty,
             stats.documents_skipped_filtered,
             stats.runtime_skipped_extension,
             stats.runtime_skipped_error,
