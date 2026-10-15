@@ -220,3 +220,50 @@ class TestConfluence:
         wrapper = self.run_with_failing_attachment_listing(self.page("real body"))
 
         assert failed_names(wrapper) == set()
+
+    @staticmethod
+    def run_with_malformed_attachment_history(document, malformed_id):
+        wrapper = fresh(ConfluenceAPIWrapper)
+        object.__setattr__(wrapper, "_index_include_attachments", True)
+
+        class Response:
+            status_code = 200
+            content = "attachment text"
+
+        class Client:
+            url = "https://confluence.example.com/wiki"
+
+            def get_attachments_from_content(self, page_id):
+                return {"results": [
+                    {"id": attachment_id, "title": f"{attachment_id}.txt",
+                     "metadata": {"mediaType": "text/plain"},
+                     "_links": {"download": f"/download/{attachment_id}"}}
+                    for attachment_id in ("att-1", "att-2")
+                ]}
+
+            def history(self, attachment_id):
+                if attachment_id == malformed_id:
+                    return ["not", "a", "dict"]
+                return {"createdBy": {"displayName": "sam"}, "createdDate": "2026-01-01",
+                        "lastUpdated": {"when": "2026-01-02"}}
+
+            def request(self, method, path, advanced_mode=True):
+                return Response()
+
+        object.__setattr__(wrapper, "client", Client())
+        yielded = list(wrapper._process_document(document))
+        return wrapper, yielded
+
+    def test_an_empty_page_that_already_yielded_an_attachment_is_not_failed(self):
+        wrapper, yielded = self.run_with_malformed_attachment_history(self.page(""), "att-2")
+
+        assert [document.metadata["name"] for document in yielded] == ["att-1.txt"]
+        assert failed_names(wrapper) == set()
+
+    def test_an_empty_page_whose_first_attachment_breaks_is_failed(self):
+        document = self.page("")
+
+        wrapper, yielded = self.run_with_malformed_attachment_history(document, "att-1")
+
+        assert yielded == []
+        assert failed_names(wrapper) == {name_of(document)}
