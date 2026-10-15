@@ -131,3 +131,24 @@ def test_a_failed_model_lookup_fails_visibly(monkeypatch, llm_calls):
     assert outcome["success"] is False
     assert "Could not look up the project's default LLM model" in outcome["error"]
     assert llm_calls == []
+
+
+def test_no_settings_keep_the_low_temperature_for_a_plain_default(monkeypatch, llm_calls):
+    client = make_client(monkeypatch, llm_calls, _Response({"items": [PROJECT_DEFAULT]}))
+
+    run(client)
+
+    _, model_config = llm_calls[0]
+    assert model_config["temperature"] == 0.1
+    assert model_config["max_tokens"] == 1024
+
+
+def test_a_reasoning_default_gets_no_custom_temperature(monkeypatch, llm_calls):
+    reasoning_default = {**PROJECT_DEFAULT, "supports_reasoning": True}
+    client = make_client(monkeypatch, llm_calls, _Response({"items": [reasoning_default]}))
+
+    run(client)
+
+    _, model_config = llm_calls[0]
+    assert "temperature" not in model_config
+    assert model_config["max_tokens"] == 1024
