@@ -2643,15 +2643,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         deleted_count = super()._clean_collection(index_name=index_name, including_index_meta=True)
 
         if index_name and deleted_count == 0:
-            raise ToolException(
-                f"Index '{index_name}' not found. "
-                f"Available indexes: {serialize_tool_result(self.list_indexes())}"
-            )
+            raise ToolException(f"Index '{index_name}' not found. {self._available_indexes_note()}")
 
         self._emit_index_data_removed_event(index_name)
         return (f"Index '{index_name}' has been removed from the vector store.\n"
-                f"Available indexes: {serialize_tool_result(self.list_indexes())}") if index_name \
+                f"{self._available_indexes_note()}") if index_name \
             else "All indexes have been removed from the vector store."
+
+    def _available_indexes_note(self) -> str:
+        try:
+            return f"Available indexes: {serialize_tool_result(self.list_indexes())}"
+        except ToolException as error:
+            return f"Could not list the available indexes: {error}"
 
     def _build_collection_filter(self, filter: dict | str, index_name: str = "") -> dict:
         """Builds a filter for the collection based on the provided suffix."""
