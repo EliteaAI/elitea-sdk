@@ -1282,6 +1282,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        attachments_yielded = False
         try:
             if self._index_include_attachments:
                 page_id = document.metadata.get('id')
@@ -1352,7 +1353,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                             IndexerKeywords.CONTENT_FILE_NAME.value: title or f".{file_ext}",
                             IndexerKeywords.CONTENT_IN_BYTES.value: content
                         })
+                    attachments_yielded = True
         except Exception as e:
+            if not attachments_yielded:
+                self._track_document_left_empty_by_error(document)
             yield from ()
 
     def _download_image(self, image_url):

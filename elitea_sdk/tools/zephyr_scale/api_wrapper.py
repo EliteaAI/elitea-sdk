@@ -23,6 +23,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_STEPS_ABSENT_STATUS = re.compile(r"\bError 422\.")
+_SCRIPT_ABSENT_STATUS = re.compile(r"\bError (404|422)\.")
+
+
+def _is_content_absent(error: ToolException, absent_status: re.Pattern) -> bool:
+    return bool(absent_status.search(str(error)))
+
+
 _additional_fields_description=("JSON containing additional optional fields such as: "
                      "'objective' (description of the objective), "
                      "'precondition' (any conditions that need to be met), "
@@ -1307,21 +1315,27 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
                             document.metadata["steps_type"] = steps_type
             except Exception as e:
                 logging.error(f"Failed to process document: {e}")
+                self._track_document_left_empty_by_error(document)
             yield document
 
     def _process_test_case(self, key):
+        fetch_errors = []
         try:
             steps = self.get_test_steps(key)
             if steps:
                 return {"steps": steps}
-        except ToolException:
-            pass
+        except ToolException as error:
+            if not _is_content_absent(error, _STEPS_ABSENT_STATUS):
+                fetch_errors.append(error)
         try:
             script = self.get_test_script(key)
             if script:
                 return {"script": script}
-        except ToolException:
-            pass
+        except ToolException as error:
+            if not _is_content_absent(error, _SCRIPT_ABSENT_STATUS):
+                fetch_errors.append(error)
+        if fetch_errors:
+            raise fetch_errors[-1]
         return {"empty": ""}
 
     @tool_group('read')
