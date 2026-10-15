@@ -1365,3 +1365,16 @@ def test_update_test_run_status_version_schema_accepts_bounded_decimal_text():
     )
     assert string_schema['maxLength'] == 10
     assert string_schema['pattern'] == r'^\d+(?:\.\d+)?$'
+
+
+def test_llm_is_per_instance_and_not_class_state():
+    pytest.importorskip('swagger_client')
+    llm_a, llm_b = object(), object()
+    kwargs = dict(base_url='https://example.invalid', qtest_project_id=1,
+                  qtest_api_token=SecretStr('token'))
+    a = QtestApiWrapper(llm=llm_a, **kwargs)
+    b = QtestApiWrapper(llm=llm_b, **kwargs)
+
+    assert a.llm is llm_a
+    assert b.llm is llm_b
+    assert 'llm' not in QtestApiWrapper.__dict__
