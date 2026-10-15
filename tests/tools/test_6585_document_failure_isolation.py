@@ -160,6 +160,13 @@ def failed_items(outcome, reason=None):
             for item in group["items"]]
 
 
+def report_group_items(outcome, kind, reason):
+    return [item
+            for category in outcome["report"]["categories"] if category["kind"] == kind
+            for group in category["groups"] if group["reason"] == reason
+            for item in group["items"]]
+
+
 def make_documents(*ids):
     return [Document(page_content="body", metadata={"id": doc_id, "name": doc_id, "updated_on": "1"})
             for doc_id in ids]
@@ -360,6 +367,42 @@ class TestFailuresNameTheDocument:
         assert failed["groups"][0]["items"] == ["page-2"]
         assert report["totals"]["failed"] == 1
 
+    def test_a_failure_is_reported_beside_an_empty_document_with_the_same_name(self, monkeypatch):
+        documents = [
+            Document(page_content="", metadata={"id": "a", "name": "Login", "updated_on": "1"}),
+            Document(page_content="body", metadata={"id": "b", "name": "Login", "updated_on": "1"}),
+        ]
+
+        toolkit, _, _ = drive_pipeline(monkeypatch, documents, failing_names=set(),
+                                       failing_ids={"b"})
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.documents_skipped_empty == {"Login"}
+        assert stats.documents_skipped_error == {"Login"}
+
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_a_nameless_document_whose_pipeline_raised_is_withdrawn_once(self, monkeypatch, workers):
+        documents = [Document(page_content="body", metadata={"updated_on": "1"})]
+
+        toolkit, _, _ = drive_pipeline(monkeypatch, documents, failing_names={None}, workers=workers)
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.documents_skipped_error == {"unknown"}
+        assert stats.documents_skipped_empty == set()
+        assert stats.items_processed == 0
+        assert stats.items_withdrawn == 1
+
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_a_document_whose_pipeline_raised_is_never_reported_as_empty(self, monkeypatch, workers):
+        documents = make_documents("page-1", "page-2")
+
+        toolkit, _, _ = drive_pipeline(monkeypatch, documents, failing_names={"page-2"},
+                                       workers=workers)
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.documents_skipped_error == {"page-2"}
+        assert stats.documents_skipped_empty == set()
+
 
     def test_a_flush_damaged_document_is_named_in_the_report(self, staged_toolkit, monkeypatch):
         def save_with_damage(self, base_documents, base_total, chunking_tool, chunking_config,
@@ -472,6 +515,28 @@ class TestSkipSetReconciliation:
         assert stats.documents_skipped_error == set()
         assert stats.items_processed == 2
         assert stats.total_fetched == stats.items_processed + stats.to_dict()["total_skipped"]
+
+    def test_an_empty_document_does_not_hide_a_failure_of_another_with_the_same_name(self):
+        toolkit = CodeToolkit.model_construct()
+        toolkit._init_indexing_stats()
+        stats = toolkit.get_indexing_stats()
+        stats.items_processed = 3
+        stats.total_fetched = 3
+
+        toolkit._track_document_empty(
+            "Login", Document(page_content="", metadata={"id": "a", "name": "Login"}))
+        toolkit._track_document_failed(
+            "Login", Document(page_content="", metadata={"id": "b", "name": "Login"}))
+
+        assert stats.documents_skipped_empty == {"Login"}
+        assert stats.documents_skipped_error == {"Login"}
+        assert stats.items_processed == 1
+        assert stats.total_fetched == stats.items_processed + stats.to_dict()["total_skipped"]
+        documents_skipped = stats.to_dict()["documents_skipped"]
+        assert documents_skipped["count"] == 2
+        assert documents_skipped["empty_content"] == ["Login"]
+        assert documents_skipped["empty_content_count"] == 1
+        assert "Documents with no indexable content (1): Login" in stats.get_summary()
 
     def test_the_same_document_failing_twice_rolls_back_once(self):
         toolkit = CodeToolkit.model_construct()
@@ -1219,16 +1284,21 @@ class TestOnlyExplicitFailuresChangeTheTerminalState:
             IndexerKeywords.CONTENT_IN_BYTES.value: b"",
         })
 
-    def test_a_page_that_produced_nothing_is_reported_but_keeps_the_run_completed(self, monkeypatch):
+    def test_a_page_that_produced_nothing_is_skipped_as_empty_and_keeps_the_run_completed(
+            self, monkeypatch):
         toolkit, outcome = index_through_real_pipeline(
             monkeypatch, [make_page("1", "Page A"), make_page("2", "Blank page", body="")])
 
-        assert toolkit.get_indexing_stats().documents_skipped_error == {"Blank page"}
-        assert failed_items(outcome, "processing_error") == ["Blank page"]
+        stats = toolkit.get_indexing_stats()
+        assert stats.documents_skipped_empty == {"Blank page"}
+        assert stats.documents_skipped_error == set()
+        assert stats.total_fetched == stats.items_processed + stats.total_skipped
+        assert failed_items(outcome) == []
+        assert report_group_items(outcome, "skipped", "empty") == ["Blank page"]
         assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
-        assert_totals(outcome, indexed=1, failed=1, total=2)
+        assert_totals(outcome, indexed=1, skipped=1, failed=0, total=2)
 
-    def test_a_zero_byte_file_that_parsed_to_nothing_is_reported_but_keeps_the_run_completed(
+    def test_a_zero_byte_file_that_parsed_to_nothing_is_skipped_as_empty(
             self, monkeypatch):
         toolkit, outcome = index_through_real_pipeline(
             monkeypatch, [make_page("1", "Page A"), self.zero_byte_file("blank.txt")],
@@ -1236,10 +1306,76 @@ class TestOnlyExplicitFailuresChangeTheTerminalState:
                 "elitea_sdk.tools.base_indexer_toolkit.process_document_by_type",
                 content_parser.process_document_by_type))
 
-        assert toolkit.get_indexing_stats().documents_skipped_error == {"blank.txt"}
-        assert failed_items(outcome, "processing_error") == ["blank.txt"]
+        assert toolkit.get_indexing_stats().documents_skipped_empty == {"blank.txt"}
+        assert failed_items(outcome) == []
+        assert report_group_items(outcome, "skipped", "empty") == ["blank.txt"]
         assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
-        assert_totals(outcome, indexed=1, failed=1, total=2)
+        assert_totals(outcome, indexed=1, skipped=1, failed=0, total=2)
+
+    def test_a_reindex_over_unchanged_pages_and_one_empty_page_reports_no_failure(self, monkeypatch):
+        def three_unchanged_pages(toolkit):
+            for page_id in ("2000", "2001", "2002"):
+                toolkit._track_document_unchanged(page_id)
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [make_page("2003", "Monitoring One-Pager", body="")],
+            before_loading=three_unchanged_pages)
+
+        assert report_group_items(outcome, "skipped", "empty") == ["Monitoring One-Pager"]
+        assert_terminal_state(toolkit, outcome, IndexingStatus.OK)
+        assert_totals(outcome, indexed=0, skipped=1, failed=0, unchanged=3, total=4)
+
+    def test_a_page_the_loader_declared_failed_stays_failed_when_it_also_produced_nothing(
+            self, monkeypatch):
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [make_page("1", "Page A"), make_page("2", "Broken page", body="")],
+            before_loading=lambda toolkit: toolkit._track_skipped_document("Broken page"))
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.documents_skipped_error == {"Broken page"}
+        assert stats.documents_skipped_empty == set()
+        assert failed_items(outcome, "processing_error") == ["Broken page"]
+        assert report_group_items(outcome, "skipped", "empty") == []
+
+    @pytest.mark.parametrize("staging", [True, False], ids=["staging", "direct"])
+    def test_a_page_its_loader_left_empty_by_an_error_is_reported_failed_not_empty(
+            self, monkeypatch, staging):
+        pages = [make_page("1", "Page A"), make_page("2", "Steps fetch failed", body="")]
+
+        def loader_that_swallowed_a_fetch_error(toolkit, **kwargs):
+            for page in pages:
+                if not page.page_content:
+                    toolkit._track_document_left_empty_by_error(page)
+                yield page
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, pages, source=loader_that_swallowed_a_fetch_error, staging=staging)
+
+        assert failed_items(outcome, "processing_error") == ["Steps fetch failed"]
+        assert report_group_items(outcome, "skipped", "empty") == []
+        assert_totals(outcome, indexed=1, skipped=0, failed=1, total=2)
+        assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
+        assert "2" in toolkit._index_run.pipeline_failed_keys
+
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_a_nameless_page_its_loader_left_empty_by_an_error_is_withdrawn_once(
+            self, monkeypatch, workers):
+        pages = [make_page("1", "Page A"), Document(page_content="", metadata={"updated_on": "1"})]
+
+        def loader_that_swallowed_a_fetch_error(toolkit, **kwargs):
+            for page in pages:
+                if not page.page_content:
+                    toolkit._track_document_left_empty_by_error(page)
+                yield page
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, pages, source=loader_that_swallowed_a_fetch_error, workers=workers)
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.runtime_skipped_error == {"unknown"}
+        assert stats.documents_skipped_empty == set()
+        assert stats.items_withdrawn == 1
+        assert_totals(outcome, indexed=1, skipped=0, failed=1, total=2)
 
     def test_an_empty_file_keeps_the_run_completed(self, monkeypatch):
         empty = self.zero_byte_file("blank.md")
