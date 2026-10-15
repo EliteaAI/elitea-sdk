@@ -1,22 +1,21 @@
-"""LLMNode must not dispatch on_custom_event("llm_node_error") on failure (#7041).
+"""LLMNode must tag error AIMessages with llm_node_error metadata on failure (#7041).
 
-Before the fix, a failed LLMNode called on_custom_event("llm_node_error", ...) with a
-fresh random run_id on every registered callback. In a parent agent running two nested
-agents in parallel, this spurious dispatch picked the still-running sibling's run_id
-from pending_llm_requests and falsely closed its UI spinner with an error state.
+When the LLM raises (e.g. AuthenticationError 401) and routing_scope is None, LLMNode.invoke()
+catches the exception and converts it to an AIMessage so the graph can continue. The AIMessage
+is tagged with response_metadata['llm_node_error'] = True so that Application._run() can detect
+it downstream and re-raise as RuntimeError, causing BaseTool.run() to fire on_tool_error and
+the UI Application chip to show an error state instead of closing as "complete".
 
-on_llm_error fires via LangChain's normal callback mechanism with the exact matching
-run_id and already handles the error correctly, so the on_custom_event dispatch was
-entirely redundant and harmful.
-
-This test verifies that on_custom_event is never called by LLMNode when the LLM raises.
+This test also verifies that no on_custom_event("llm_node_error") is dispatched — the old code
+dispatched it with a random run_id, which in a parallel nested-agent scenario picked the
+still-running sibling's run_id and falsely closed its UI spinner with an error state.
 """
 
 from unittest.mock import MagicMock, patch
-from uuid import UUID
 
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import AIMessage
 
 
 class _TrackingCallback(BaseCallbackHandler):
@@ -51,18 +50,34 @@ def _config_with_callback(cb):
     return {"callbacks": [cb]}
 
 
+def test_llm_node_error_tags_response_metadata(llm_node):
+    """When the LLM raises with routing_scope=None, invoke() returns a tagged error AIMessage (#7041)."""
+    from elitea_sdk.runtime.tools.llm import LLMNode
+
+    with patch.object(LLMNode, "_invoke_llm_internal", side_effect=RuntimeError("connection refused")):
+        result = llm_node.invoke({"messages": []})
+
+    messages = result.get("messages", [])
+    assert messages, "Expected at least one message in the result"
+    last_msg = messages[-1]
+    assert isinstance(last_msg, AIMessage), f"Expected AIMessage, got {type(last_msg)}"
+    assert last_msg.response_metadata.get("llm_node_error") is True, (
+        "Expected response_metadata['llm_node_error'] = True on error AIMessage"
+    )
+    assert last_msg.response_metadata.get("llm_node_exception_type") == "RuntimeError", (
+        f"Expected llm_node_exception_type='RuntimeError', got "
+        f"{last_msg.response_metadata.get('llm_node_exception_type')}"
+    )
+
+
 def test_llm_node_error_does_not_call_on_custom_event(llm_node):
-    """on_custom_event must not be called when the LLM raises (#7041)."""
+    """on_custom_event must not be called with 'llm_node_error' when the LLM raises (#7041)."""
     from elitea_sdk.runtime.tools.llm import LLMNode
 
     cb = _TrackingCallback()
 
-    # Patch _invoke_llm_internal to raise directly, bypassing unrelated
-    # setup code (input_mapping propagation etc.) so we exercise the exact
-    # exception-handling block in invoke() where the dispatch was removed.
     with patch.object(LLMNode, "_invoke_llm_internal", side_effect=RuntimeError("connection refused")):
-        with pytest.raises(Exception):
-            llm_node.invoke({"messages": []}, config=_config_with_callback(cb))
+        llm_node.invoke({"messages": []}, config=_config_with_callback(cb))
 
     llm_node_error_events = [e for e in cb.custom_events if e["name"] == "llm_node_error"]
     assert llm_node_error_events == [], (
@@ -79,8 +94,7 @@ def test_llm_node_error_no_custom_event_with_callback_manager(llm_node):
     mgr = CallbackManager(handlers=[cb])
 
     with patch.object(LLMNode, "_invoke_llm_internal", side_effect=RuntimeError("connection refused")):
-        with pytest.raises(Exception):
-            llm_node.invoke({"messages": []}, config={"callbacks": mgr})
+        llm_node.invoke({"messages": []}, config={"callbacks": mgr})
 
     llm_node_error_events = [e for e in cb.custom_events if e["name"] == "llm_node_error"]
     assert llm_node_error_events == [], (
