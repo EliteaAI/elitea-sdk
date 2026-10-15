@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 import weakref
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, TypeVar
@@ -108,6 +109,8 @@ class ClientEntry:
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
     reference_count: int = 1
+    # Monotonic timestamp for TTL checks (immune to wall-clock changes)
+    created_mono: float = field(default_factory=time.monotonic)
 
     def touch(self):
         """Update last accessed time and increment reference count."""
@@ -180,6 +183,7 @@ class ClientRegistry:
             entry = self._clients.get(cache_key)
             if entry is not None and self._is_expired(entry):
                 del self._clients[cache_key]
+                self._close(entry)
                 entry = None
             if not force_new and entry is not None:
                 entry.touch()
@@ -201,7 +205,8 @@ class ClientRegistry:
                 )
                 self._clients.move_to_end(cache_key)
                 while len(self._clients) > self.max_entries:
-                    self._clients.popitem(last=False)
+                    _, evicted = self._clients.popitem(last=False)
+                    self._close(evicted)
                 return client
             except Exception as e:
                 logger.error(f"[ClientRegistry] Failed to create {service_type} client: {e}")
@@ -210,7 +215,17 @@ class ClientRegistry:
     def _is_expired(self, entry: ClientEntry) -> bool:
         if self.ttl_seconds is None:
             return False
-        return (datetime.now() - entry.created_at).total_seconds() > self.ttl_seconds
+        return (time.monotonic() - entry.created_mono) > self.ttl_seconds
+
+    @staticmethod
+    def _close(entry: ClientEntry) -> None:
+        """Best-effort close of a dropped client so pooled connections are released."""
+        close = getattr(entry.client, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception as e:  # noqa: BLE001 - closing is best effort
+                logger.debug(f"[ClientRegistry] close() failed for {entry.service_type} client: {e}")
 
     def invalidate(self, credential_ref_id: str, generation_lt: Optional[int] = None) -> int:
         """
@@ -237,7 +252,7 @@ class ClientRegistry:
         with self._client_lock:
             doomed = [k for k in self._clients if predicate(k)]
             for k in doomed:
-                del self._clients[k]
+                self._close(self._clients.pop(k))
         if doomed:
             logger.info(f"[ClientRegistry] Invalidated {len(doomed)} client(s)")
         return len(doomed)

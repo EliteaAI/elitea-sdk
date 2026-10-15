@@ -1,6 +1,5 @@
 """ClientRegistry keying, eviction and invalidation (no network)."""
 
-from datetime import timedelta
 
 import pytest
 from pydantic import SecretStr
@@ -94,7 +93,7 @@ def test_lru_eviction_at_max_entries(registry):
 def test_ttl_expiry_rebuilds(registry):
     f = CountingFactory()
     first = _get(registry, f)
-    next(iter(registry._clients.values())).created_at -= timedelta(hours=2)
+    next(iter(registry._clients.values())).created_mono -= 7200
     second = _get(registry, f)
 
     assert second is not first
@@ -106,7 +105,7 @@ def test_ttl_none_disables_expiry(registry):
     registry.ttl_seconds = None
     f = CountingFactory()
     first = _get(registry, f)
-    next(iter(registry._clients.values())).created_at -= timedelta(days=365)
+    next(iter(registry._clients.values())).created_mono -= 365 * 86400
     assert _get(registry, f) is first
 
 
