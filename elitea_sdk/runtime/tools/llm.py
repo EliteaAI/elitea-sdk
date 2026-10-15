@@ -1238,7 +1238,10 @@ class LLMNode(BaseTool):
             logger.error(f"Error in LLM Node: {format_exc()}")
             logger.error(f"Model being used: {model_info}")
             logger.error(f"Error type: {type(e).__name__}")
-            result = {"messages": [AIMessage(content=f"Error: {e}")]}
+            _error_msg = AIMessage(content=f"Error: {e}")
+            _error_msg.response_metadata['llm_node_error'] = True
+            _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
+            result = {"messages": [_error_msg]}
 
         # Run after_model hooks and add context_info
         if middleware_mgr is not None and isinstance(result, dict) and 'messages' in result:

@@ -825,6 +825,19 @@ class Application(BaseTool):
                 config=nested_config,
             )
 
+        # Detect swallowed LLM errors: LLMNode.invoke() catches provider exceptions
+        # (e.g. AuthenticationError 401) and returns them as AIMessage prose instead of
+        # raising. Without this check, Application._run() returns normally with error
+        # text as the tool output, BaseTool.run() fires on_tool_end (not on_tool_error),
+        # and the UI Application chip closes as "complete" instead of "error" (#7041).
+        if isinstance(response, dict):
+            for _msg in reversed(response.get('messages', [])):
+                if getattr(_msg, 'response_metadata', {}).get('llm_node_error'):
+                    _exc_type = _msg.response_metadata.get('llm_node_exception_type', 'LLMError')
+                    raise RuntimeError(
+                        f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
+                    )
+
         normalized_output = extract_application_response_output(response)
 
         # Build standardized AgentResponse
