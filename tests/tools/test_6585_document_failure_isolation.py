@@ -381,6 +381,18 @@ class TestFailuresNameTheDocument:
         assert stats.documents_skipped_error == {"Login"}
 
     @pytest.mark.parametrize("workers", [1, 2])
+    def test_a_nameless_document_whose_pipeline_raised_is_withdrawn_once(self, monkeypatch, workers):
+        documents = [Document(page_content="body", metadata={"updated_on": "1"})]
+
+        toolkit, _, _ = drive_pipeline(monkeypatch, documents, failing_names={None}, workers=workers)
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.documents_skipped_error == {"unknown"}
+        assert stats.documents_skipped_empty == set()
+        assert stats.items_processed == 0
+        assert stats.items_withdrawn == 1
+
+    @pytest.mark.parametrize("workers", [1, 2])
     def test_a_document_whose_pipeline_raised_is_never_reported_as_empty(self, monkeypatch, workers):
         documents = make_documents("page-1", "page-2")
 
@@ -1344,6 +1356,26 @@ class TestOnlyExplicitFailuresChangeTheTerminalState:
         assert_totals(outcome, indexed=1, skipped=0, failed=1, total=2)
         assert_terminal_state(toolkit, outcome, IndexingStatus.PARTLY_INDEXED)
         assert "2" in toolkit._index_run.pipeline_failed_keys
+
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_a_nameless_page_its_loader_left_empty_by_an_error_is_withdrawn_once(
+            self, monkeypatch, workers):
+        pages = [make_page("1", "Page A"), Document(page_content="", metadata={"updated_on": "1"})]
+
+        def loader_that_swallowed_a_fetch_error(toolkit, **kwargs):
+            for page in pages:
+                if not page.page_content:
+                    toolkit._track_document_left_empty_by_error(page)
+                yield page
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, pages, source=loader_that_swallowed_a_fetch_error, workers=workers)
+
+        stats = toolkit.get_indexing_stats()
+        assert stats.runtime_skipped_error == {"unknown"}
+        assert stats.documents_skipped_empty == set()
+        assert stats.items_withdrawn == 1
+        assert_totals(outcome, indexed=1, skipped=0, failed=1, total=2)
 
     def test_an_empty_file_keeps_the_run_completed(self, monkeypatch):
         empty = self.zero_byte_file("blank.md")

@@ -1092,6 +1092,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         self._withdraw_document(doc_name, base_doc, 'documents_skipped_error')
 
     def _track_document_empty(self, doc_name: str, base_doc: Optional[Document] = None):
+        stats = self.get_indexing_stats() or self._init_indexing_stats()
+        if doc_name in stats.documents_skipped_error | stats.explicitly_failed_documents:
+            return
         self._withdraw_document(doc_name, base_doc, 'documents_skipped_empty')
 
     def _track_document_left_empty_by_error(self, document: Document):
