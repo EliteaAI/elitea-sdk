@@ -429,7 +429,6 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 "`pip install git+https://github.com/Roman-Mitusov/qtest-api.git`"
             )
 
-        cls.llm = values.get('llm')
         # Call parent validator to set up embeddings and vectorstore params
         return super().validate_toolkit(values)
 

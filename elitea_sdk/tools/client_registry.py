@@ -6,7 +6,10 @@ creating duplicate HTTP connections when multiple toolkits connect
 to the same service.
 
 Key Features:
-- Clients are cached by (service_type, base_url, auth_hash)
+- Clients are cached by an explicit, hashable ClientKey (service, target,
+  toolkit instance, credential reference/generation, auth-config digest)
+- Bounded cache: LRU eviction at max_entries and a TTL checked on access
+- Entries can be invalidated by credential reference or toolkit instance
 - Thread-safe access with locking
 - Automatic cleanup of stale connections
 - Connection pooling across toolkits
@@ -26,9 +29,11 @@ Usage:
 """
 
 import hashlib
+import json
 import logging
 import threading
 import weakref
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, TypeVar
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +41,62 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
+
+
+def _normalize(config: Dict[str, Any]) -> Dict[str, str]:
+    """Reduce a config dict to hashable strings; secrets are hashed, not kept."""
+    normalized = {}
+    for key, value in sorted(config.items()):
+        if hasattr(value, 'get_secret_value'):
+            normalized[key] = hashlib.sha256(
+                value.get_secret_value().encode()
+            ).hexdigest()[:16]
+        elif isinstance(value, str):
+            normalized[key] = value
+        elif isinstance(value, dict):
+            normalized[key] = json.dumps(value, sort_keys=True, default=str)
+        elif value is not None:
+            normalized[key] = str(value)
+    return normalized
+
+
+def _partition_digest(auth_config: Dict[str, Any], extra: Optional[Dict[str, Any]]) -> str:
+    """sha256 over the auth config and any extra settings that change client behaviour."""
+    payload = str((sorted(_normalize(auth_config).items()),
+                   sorted(_normalize(extra or {}).items())))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class ClientKey:
+    """Identity of a cached client.
+
+    The instance/credential fields are populated by callers that know them;
+    legacy callers leave them None and are partitioned by ``partition_digest``.
+    """
+    service_type: str
+    base_url: str
+    toolkit_instance_id: Optional[str] = None
+    credential_ref_id: Optional[str] = None
+    credential_generation: Optional[int] = None
+    auth_mode: Optional[str] = None
+    canonical_target: Optional[str] = None
+    partition_digest: str = ""
+
+    @classmethod
+    def from_legacy(
+        cls,
+        service_type: str,
+        base_url: str,
+        auth_config: Dict[str, Any],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> 'ClientKey':
+        """Key derived from the auth config plus extra settings (e.g. custom headers)."""
+        return cls(
+            service_type=service_type,
+            base_url=base_url.rstrip('/'),
+            partition_digest=_partition_digest(auth_config, extra),
+        )
 
 
 @dataclass
@@ -78,7 +139,9 @@ class ClientRegistry:
     def __init__(self):
         if self._initialized:
             return
-        self._clients: Dict[str, ClientEntry] = {}
+        self._clients: 'OrderedDict[ClientKey, ClientEntry]' = OrderedDict()
+        self.max_entries: int = 256
+        self.ttl_seconds: Optional[float] = 3600
         self._client_lock = threading.RLock()
         self._initialized = True
         logger.info("[ClientRegistry] Initialized")
@@ -88,44 +151,14 @@ class ClientRegistry:
         """Get the singleton instance."""
         return cls()
 
-    @staticmethod
-    def _compute_auth_hash(auth_config: Dict[str, Any]) -> str:
-        """
-        Compute a hash of authentication config for cache key.
-
-        Handles SecretStr and other sensitive values safely.
-        """
-        # Normalize auth config for hashing
-        normalized = {}
-        for key, value in sorted(auth_config.items()):
-            if hasattr(value, 'get_secret_value'):
-                # Handle SecretStr - use hash of value, not value itself
-                normalized[key] = hashlib.sha256(
-                    value.get_secret_value().encode()
-                ).hexdigest()[:16]
-            elif isinstance(value, str):
-                normalized[key] = value
-            elif value is not None:
-                normalized[key] = str(value)
-
-        # Create deterministic hash
-        config_str = str(sorted(normalized.items()))
-        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
-
-    @staticmethod
-    def _make_cache_key(service_type: str, base_url: str, auth_hash: str) -> str:
-        """Create a cache key for a client."""
-        # Normalize base_url (remove trailing slash)
-        base_url = base_url.rstrip('/')
-        return f"{service_type}:{base_url}:{auth_hash}"
-
     def get_client(
         self,
         service_type: str,
         base_url: str,
         auth_config: Dict[str, Any],
         factory: Callable[[], T],
-        force_new: bool = False
+        force_new: bool = False,
+        key: Optional[ClientKey] = None
     ) -> T:
         """
         Get or create a client for the given service.
@@ -136,17 +169,21 @@ class ClientRegistry:
             auth_config: Authentication configuration (token, username, etc.)
             factory: Callable that creates a new client if not cached
             force_new: If True, always create a new client (bypass cache)
+            key: Explicit cache key; derived from the other arguments when omitted
 
         Returns:
             The API client (shared or new)
         """
-        auth_hash = self._compute_auth_hash(auth_config)
-        cache_key = self._make_cache_key(service_type, base_url, auth_hash)
+        cache_key = key or ClientKey.from_legacy(service_type, base_url, auth_config)
 
         with self._client_lock:
-            if not force_new and cache_key in self._clients:
-                entry = self._clients[cache_key]
+            entry = self._clients.get(cache_key)
+            if entry is not None and self._is_expired(entry):
+                del self._clients[cache_key]
+                entry = None
+            if not force_new and entry is not None:
                 entry.touch()
+                self._clients.move_to_end(cache_key)
                 logger.info(
                     f"[ClientRegistry] Reusing {service_type} client for {base_url} "
                     f"(refs: {entry.reference_count})"
@@ -162,16 +199,55 @@ class ClientRegistry:
                     service_type=service_type,
                     base_url=base_url
                 )
+                self._clients.move_to_end(cache_key)
+                while len(self._clients) > self.max_entries:
+                    self._clients.popitem(last=False)
                 return client
             except Exception as e:
                 logger.error(f"[ClientRegistry] Failed to create {service_type} client: {e}")
                 raise
 
+    def _is_expired(self, entry: ClientEntry) -> bool:
+        if self.ttl_seconds is None:
+            return False
+        return (datetime.now() - entry.created_at).total_seconds() > self.ttl_seconds
+
+    def invalidate(self, credential_ref_id: str, generation_lt: Optional[int] = None) -> int:
+        """
+        Drop clients built from a credential, e.g. after it was rotated or revoked.
+
+        Args:
+            credential_ref_id: Credential reference to invalidate
+            generation_lt: If given, only drop entries whose credential generation
+                is older (a missing generation counts as 0)
+
+        Returns:
+            Number of entries removed
+        """
+        return self._remove_where(
+            lambda k: k.credential_ref_id == credential_ref_id
+            and (generation_lt is None or (k.credential_generation or 0) < generation_lt)
+        )
+
+    def invalidate_instance(self, toolkit_instance_id: str) -> int:
+        """Drop clients owned by a toolkit instance. Returns the number removed."""
+        return self._remove_where(lambda k: k.toolkit_instance_id == toolkit_instance_id)
+
+    def _remove_where(self, predicate: Callable[[ClientKey], bool]) -> int:
+        with self._client_lock:
+            doomed = [k for k in self._clients if predicate(k)]
+            for k in doomed:
+                del self._clients[k]
+        if doomed:
+            logger.info(f"[ClientRegistry] Invalidated {len(doomed)} client(s)")
+        return len(doomed)
+
     def release_client(
         self,
         service_type: str,
         base_url: str,
-        auth_config: Dict[str, Any]
+        auth_config: Dict[str, Any],
+        key: Optional[ClientKey] = None
     ) -> bool:
         """
         Release a reference to a client.
@@ -182,12 +258,12 @@ class ClientRegistry:
             service_type: Type of service
             base_url: Base URL of the service
             auth_config: Authentication configuration
+            key: Explicit cache key; derived from the other arguments when omitted
 
         Returns:
             True if client was found and released
         """
-        auth_hash = self._compute_auth_hash(auth_config)
-        cache_key = self._make_cache_key(service_type, base_url, auth_hash)
+        cache_key = key or ClientKey.from_legacy(service_type, base_url, auth_config)
 
         with self._client_lock:
             if cache_key in self._clients:

@@ -762,7 +762,6 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             values.get('base_url'),
         )
 
-        cls.llm = values.get('llm')
         return super().validate_toolkit(values)
 
     def model_post_init(self, __context) -> None:
@@ -773,7 +772,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if not base_url or not isinstance(base_url, str) or not base_url.startswith('http'):
             return
 
-        from ..client_registry import get_client_registry
+        from ..client_registry import ClientKey, get_client_registry
 
         # Extract auth values (handle SecretStr) - safely check type first
         token = None
@@ -807,17 +806,23 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
                 return JiraClient(url=self.base_url, username=self.username, password=api_key,
                            cloud=self.cloud, verify_ssl=self.verify_ssl, api_version=self.api_version)
 
+        # Custom headers mutate the client, so they are part of the cache key:
+        # toolkits with different headers must not share a client.
+        custom_headers = self.custom_headers or {}
+
         # Get shared client from registry (or create new one)
         registry = get_client_registry()
         self._client = registry.get_client(
             service_type='jira',
             base_url=self.base_url,
             auth_config=auth_config,
-            factory=create_jira_client
+            factory=create_jira_client,
+            key=ClientKey.from_legacy(
+                'jira', self.base_url, auth_config, extra={'custom_headers': custom_headers}
+            ),
         )
 
         # Apply custom headers (toolkit-specific, applied each time)
-        custom_headers = self.custom_headers or {}
         if custom_headers:
             logger.info(f"Jira tool: applying {len(custom_headers)} custom headers")
             for header, value in custom_headers.items():
