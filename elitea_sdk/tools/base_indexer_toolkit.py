@@ -134,6 +134,7 @@ class IndexingStats:
 
     # For non-code toolkits (documents/runtime)
     documents_skipped_error: Set[str] = field(default_factory=set)
+    documents_skipped_empty: Set[str] = field(default_factory=set)
     documents_skipped_filtered: Set[str] = field(default_factory=set)
     runtime_skipped_extension: Set[str] = field(default_factory=set)
     runtime_skipped_error: Set[str] = field(default_factory=set)
@@ -162,6 +163,7 @@ class IndexingStats:
             len(self.files_skipped_empty) +
             len(self.files_unsupported_extension) +
             len(self.documents_skipped_error) +
+            len(self.documents_skipped_empty) +
             len(self.documents_skipped_filtered) +
             len(self.runtime_skipped_extension) +
             len(self.runtime_skipped_error)
@@ -184,6 +186,7 @@ class IndexingStats:
         )
         documents_skipped_count = (
             len(self.documents_skipped_error) +
+            len(self.documents_skipped_empty) +
             len(self.documents_skipped_filtered)
         )
         runtime_skipped_count = (
@@ -213,6 +216,8 @@ class IndexingStats:
                 "count": documents_skipped_count,
                 "error": sorted(self.documents_skipped_error),
                 "error_count": len(self.documents_skipped_error),
+                "empty_content": sorted(self.documents_skipped_empty),
+                "empty_content_count": len(self.documents_skipped_empty),
                 "filtered": sorted(self.documents_skipped_filtered),
                 "filtered_count": len(self.documents_skipped_filtered),
             },
@@ -258,6 +263,7 @@ class IndexingStats:
 
         # Count document/runtime-related skips (top-level)
         doc_skips = (len(self.documents_skipped_error) +
+                    len(self.documents_skipped_empty) +
                     len(self.documents_skipped_filtered) +
                     len(self.runtime_skipped_extension) +
                     len(self.runtime_skipped_error))
@@ -308,6 +314,12 @@ class IndexingStats:
             lines.append(f"  - Documents with errors ({len(sorted_doc_error)}): {', '.join(sorted_doc_error[:5])}")
             if len(sorted_doc_error) > 5:
                 lines.append(f"    ... and {len(sorted_doc_error) - 5} more")
+
+        if self.documents_skipped_empty:
+            sorted_doc_empty = sorted(self.documents_skipped_empty)
+            lines.append(f"  - Documents with no indexable content ({len(sorted_doc_empty)}): {', '.join(sorted_doc_empty[:5])}")
+            if len(sorted_doc_empty) > 5:
+                lines.append(f"    ... and {len(sorted_doc_empty) - 5} more")
 
         if self.documents_skipped_filtered:
             sorted_doc_filtered = sorted(self.documents_skipped_filtered)
@@ -439,7 +451,7 @@ _REPORT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, Tuple[str, ...]], ...] = 
     (ReportKind.SKIPPED, "blacklisted", "Matching the configured exclude patterns",
      ("files_skipped_blacklist",)),
     (ReportKind.SKIPPED, "empty", "Contained no indexable content",
-     ("files_skipped_empty",)),
+     ("files_skipped_empty", "documents_skipped_empty")),
     (ReportKind.NOT_INDEXED, "unsupported_format", "Unsupported format",
      ("files_unsupported_extension", "runtime_skipped_extension")),
     (ReportKind.FAILED, "read_error", "Could not be read",
@@ -1077,13 +1089,25 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         stats.documents_already_indexed.add(doc_identifier)
 
     def _track_document_failed(self, doc_name: str, base_doc: Optional[Document] = None):
+        self._withdraw_document(doc_name, base_doc, 'documents_skipped_error')
+
+    def _track_document_empty(self, doc_name: str, base_doc: Optional[Document] = None):
+        self._withdraw_document(doc_name, base_doc, 'documents_skipped_empty')
+
+    def _track_document_left_empty_by_error(self, document: Document):
+        if document.page_content or document.metadata.get(IndexerKeywords.CONTENT_IN_BYTES.value):
+            return
+        self._track_document_failed(self._extract_doc_name(document.metadata), document)
+
+    def _withdraw_document(self, doc_name: str, base_doc: Optional[Document], skip_set_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
         if base_doc is not None and self._is_base_doc_tracked_as_skipped(base_doc):
             return
+        skip_set = getattr(stats, skip_set_name)
         with _STATS_COUNTER_LOCK:
-            if doc_name in stats.documents_skipped_error:
+            if doc_name in skip_set:
                 return
-            stats.documents_skipped_error.add(doc_name)
+            skip_set.add(doc_name)
             stats.items_withdrawn += 1
             stats.items_processed = max(stats.items_processed - 1, 0)
 
@@ -1970,6 +1994,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             logger.error(f"Pipeline failed for base doc #{base_doc_counter} '{doc_name}': {format_exc()}")
             record_grouped_error(result, [doc_name], exc)
             result["failed_docs"] = result.get("failed_docs", 0) + 1
+            self._track_document_failed(doc_name, base_doc)
             if staging:
                 failed_doc_key = str(self.key_fn(base_doc))
                 if failed_doc_key != IDLESS_STAGING_KEY:
@@ -2027,7 +2052,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._log_tool_event(msg)
             result["count"] += dependent_docs_counter
             if dependent_docs_counter == 0:
-                self._track_document_failed(_doc_name, base_doc)
+                self._track_document_empty(_doc_name, base_doc)
             elif not self._is_base_doc_explicitly_failed(base_doc):
                 result["docs_count"] += 1
                 if staging:
@@ -2288,6 +2313,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             stats.files_skipped_empty,
             stats.files_unsupported_extension,
             stats.documents_skipped_error,
+            stats.documents_skipped_empty,
             stats.documents_skipped_filtered,
             stats.runtime_skipped_extension,
             stats.runtime_skipped_error,

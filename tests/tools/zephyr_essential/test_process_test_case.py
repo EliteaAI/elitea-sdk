@@ -45,14 +45,13 @@ def test_falls_back_to_script_when_steps_raise(wrapper):
     assert result == {"script": "print('hello')"}
 
 
-def test_returns_empty_when_both_raise(wrapper):
+def test_raises_when_both_raise(wrapper):
     with patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_steps",
                        side_effect=ToolException("Unable to extract test case steps")), \
          patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_script",
                        side_effect=ToolException("Unable to get test script")):
-        result = wrapper._process_test_case("PROJ-T4")
-
-    assert result == {"empty": ""}
+        with pytest.raises(ToolException, match="Unable to get test script"):
+            wrapper._process_test_case("PROJ-T4")
 
 
 def test_returns_empty_when_both_missing(wrapper):
@@ -61,3 +60,44 @@ def test_returns_empty_when_both_missing(wrapper):
         result = wrapper._process_test_case("PROJ-T5")
 
     assert result == {"empty": ""}
+
+
+def essential_http_error(status, resource):
+    return ToolException(
+        f"Unexpected status code {status} for GET /testcases/PROJ-T6/{resource}: b'{{}}'")
+
+
+def test_raises_a_server_error_after_empty_steps(wrapper):
+    with patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_steps", return_value=[]), \
+         patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_script",
+                      side_effect=essential_http_error(500, "testscript")):
+        with pytest.raises(ToolException, match="status code 500"):
+            wrapper._process_test_case("PROJ-T7")
+
+
+def test_returns_empty_for_a_step_case_without_steps(wrapper):
+    with patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_steps", return_value=[]), \
+         patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_script",
+                      side_effect=essential_http_error(404, "testscript")):
+        result = wrapper._process_test_case("PROJ-T8")
+
+    assert result == {"empty": ""}
+
+
+def test_returns_empty_for_a_plain_case_without_a_script(wrapper):
+    with patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_steps",
+                      side_effect=essential_http_error(422, "teststeps")), \
+         patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_script",
+                      side_effect=essential_http_error(404, "testscript")):
+        result = wrapper._process_test_case("PROJ-T9")
+
+    assert result == {"empty": ""}
+
+
+def test_raises_when_the_test_case_itself_is_gone(wrapper):
+    with patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_steps",
+                      side_effect=essential_http_error(404, "teststeps")), \
+         patch.object(ZephyrEssentialApiWrapper, "get_test_case_test_script",
+                      side_effect=essential_http_error(404, "testscript")):
+        with pytest.raises(ToolException, match="status code 404"):
+            wrapper._process_test_case("PROJ-T10")

@@ -1353,6 +1353,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                             IndexerKeywords.CONTENT_IN_BYTES.value: content
                         })
         except Exception as e:
+            self._track_document_left_empty_by_error(document)
             yield from ()
 
     def _download_image(self, image_url):
