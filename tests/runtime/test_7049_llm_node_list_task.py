@@ -35,6 +35,8 @@ def _sent_task(task):
 
 
 @pytest.mark.parametrize('task', [
+    # The state default of a "list" variable: an empty user message is a 400 on Anthropic.
+    [],
     ['a.pdf', 'b.pdf'],
     [{'name': 'a.pdf', 'filepath': '/x/a.pdf'}],
     [1, 2, 3],
@@ -52,7 +54,7 @@ def test_content_block_task_is_kept():
 @pytest.mark.parametrize('task,expected', [
     (None, ''),
     ('plain', 'plain'),
-    ([], ''),
+    ([], '[]'),
     (42, '42'),
     ({'k': 'v'}, "{'k': 'v'}"),
     (['ünï'], '["ünï"]'),
