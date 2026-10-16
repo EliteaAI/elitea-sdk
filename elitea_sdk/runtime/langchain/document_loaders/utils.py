@@ -1,6 +1,9 @@
 import logging
 import re
 import string
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import List, Optional
 
 from gensim.parsing import remove_stopwords
 from PIL import Image
@@ -16,6 +19,20 @@ logger = logging.getLogger(__name__)
 # Images with max(width, height) below this are upscaled to avoid
 # poor LLM results on very small images (icons, thumbnails, etc.).
 MIN_IMAGE_DIMENSION_FOR_LLM = 256
+
+_image_description_failures: ContextVar[Optional[List[str]]] = ContextVar(
+    "image_description_failures", default=None
+)
+
+
+@contextmanager
+def collect_image_description_failures():
+    failures: List[str] = []
+    token = _image_description_failures.set(failures)
+    try:
+        yield failures
+    finally:
+        _image_description_failures.reset(token)
 
 
 def cleanse_data(document: str) -> str:
@@ -66,17 +83,23 @@ def perform_llm_prediction_for_image_bytes(
             logger.info("Image description cache hit for '%s'", image_name or "<unnamed>")
             return cached
     base64_string = bytes_to_base64(image_bytes)
-    result = llm.invoke([
-        HumanMessage(
-            content=[
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/{image_format};base64,{base64_string}"},
-                },
-            ]
-        )
-    ])
+    try:
+        result = llm.invoke([
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/{image_format};base64,{base64_string}"},
+                    },
+                ]
+            )
+        ])
+    except Exception as error:
+        failures = _image_description_failures.get()
+        if failures is not None:
+            failures.append(str(error))
+        raise
     description = extract_text_from_completion(result)
     if cache is not None and description:
         cache.set(image_bytes, description, image_name=image_name, prompt=prompt)

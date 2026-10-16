@@ -196,6 +196,7 @@ class TestToolkitTestReRaise:
             toolkit_config={"toolkit_name": "artifact", "settings": {}},
             tool_name="index_data",
             tool_params={"value": "x"},
+            llm_model="stub-model",
         )
 
     def test_budget_error_propagates(self, monkeypatch):

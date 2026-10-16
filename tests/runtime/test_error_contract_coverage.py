@@ -514,6 +514,7 @@ class TestToolTestPanelClassification:
                 toolkit_config={"type": "github", "toolkit_name": "tk", "settings": {}},
                 tool_name="failing_tool",
                 tool_params={"value": "x"},
+                llm_model="stub-model",
             )
 
     def test_typed_fields_are_added(self):

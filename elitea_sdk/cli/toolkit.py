@@ -132,10 +132,10 @@ def toolkit_schema(ctx, toolkit_name: str):
               help='Tool parameters JSON file')
 @click.option('--param', multiple=True, 
               help='Tool parameter as key=value (can be used multiple times)')
-@click.option('--llm-model', default='gpt-4o-mini', 
-              help='LLM model to use (default: gpt-4o-mini)')
-@click.option('--temperature', default=0.1, type=float,
-              help='LLM temperature (default: 0.1)')
+@click.option('--llm-model', default=None,
+              help="LLM model to use (default: the project's default LLM model)")
+@click.option('--temperature', default=None, type=float,
+              help='LLM temperature (default: 0.1 with --llm-model, the provider default otherwise)')
 @click.option('--max-tokens', default=1000, type=int,
               help='LLM max tokens (default: 1000)')
 @click.pass_context
@@ -199,10 +199,11 @@ def toolkit_test(ctx, toolkit_type: str, tool: str, config_file, params,
         }
         
         # LLM configuration
-        llm_config = {
-            'temperature': temperature,
-            'max_tokens': max_tokens,
-        }
+        llm_config = {'max_tokens': max_tokens}
+        if temperature is not None:
+            llm_config['temperature'] = temperature
+        elif llm_model:
+            llm_config['temperature'] = 0.1
         
         # Execute test
         logger.info(f"Testing tool '{tool}' from toolkit '{toolkit_type}'")
