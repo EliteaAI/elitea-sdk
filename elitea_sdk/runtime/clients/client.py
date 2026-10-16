@@ -395,6 +395,11 @@ class EliteAClient:
             return data.get('items', [])
         return []
 
+    def _project_default_llm(self) -> Optional[Dict[str, Any]]:
+        resp = self._request('get', self.models_url, headers=self.headers, verify=False)
+        resp.raise_for_status()
+        return next((model for model in resp.json().get('items', []) if model.get('default')), None)
+
     def get_filtered_models(self, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Get filtered list of available models based on flexible criteria.
@@ -1709,7 +1714,7 @@ class EliteAClient:
                 - callbacks: List of callback handlers for event processing
                 - configurable: Additional configuration parameters
                 - tags: Tags for the execution
-            llm_model: Name of the LLM model to use (default: 'gpt-4o-mini')
+            llm_model: Name of the LLM model to use (default: the project's default LLM model)
             mcp_tokens: Optional dictionary of MCP OAuth tokens by server URL
             llm_config: Configuration for the LLM containing:
                 - max_tokens: Maximum tokens for response (default: 1000)
@@ -1752,14 +1757,43 @@ class EliteAClient:
         """
         if tool_params is None:
             tool_params = {}
-        if llm_model is None:
-            llm_model = 'gpt-4o-mini'
+        events_dispatched = []
+        is_auto_selection = ((llm_config or {}).get('selection') or {}).get('mode') == 'auto'
+        if llm_model is None and not is_auto_selection:
+            try:
+                default_model = self._project_default_llm()
+                missing_model_error = None if default_model else (
+                    "No LLM model was provided and no default LLM model is available in this project"
+                )
+            except Exception as lookup_error:  # pylint: disable=W0703
+                missing_model_error = f"Could not look up the project's default LLM model: {lookup_error}"
+            if missing_model_error:
+                logger.error(missing_model_error)
+                return {
+                    "success": False,
+                    "error": missing_model_error,
+                    "debug_error": missing_model_error,
+                    "tool_name": tool_name,
+                    "toolkit_config": None,
+                    "llm_model": None,
+                    "events_dispatched": events_dispatched,
+                    "execution_time_seconds": 0.0
+                }
+            llm_model = default_model['name']
+            llm_config = {
+                **(llm_config or {'max_tokens': 1024}),
+                'model_project_id': default_model.get('project_id'),
+                'openai_compatible': bool(default_model.get('openai_compatible', False)),
+            }
+            caller_chose_sampling = (llm_config.get('temperature') is not None
+                                     or llm_config.get('reasoning_effort') is not None)
+            if not caller_chose_sampling and not default_model.get('supports_reasoning'):
+                llm_config['temperature'] = 0.1
         if llm_config is None:
             llm_config = {
                 'max_tokens': 1024,
                 'temperature': 0.1,
             }
-        events_dispatched = []
 
         try:
             toolkit_config_parsed_json = self._validate_toolkit_config(toolkit_config)

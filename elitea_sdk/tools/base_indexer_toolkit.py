@@ -33,6 +33,7 @@ from .utils.retry import is_server_error_retriable, retry_on_server_error
 from .utils.tool_groups import tool_group, with_tool_groups
 from .utils.serialization import serialize_tool_result
 from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
+from ..runtime.langchain.document_loaders.utils import collect_image_description_failures
 from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from .vector_adapters.VectorStoreAdapter import (
     IDENTITY_STAMP_BATCH_SIZE,
@@ -154,6 +155,8 @@ class IndexingStats:
     dependent_items_filtered: Set[str] = field(default_factory=set)
     dependent_items_unsupported: Set[str] = field(default_factory=set)
     dependent_items_empty: Set[str] = field(default_factory=set)
+    images_not_described: Set[str] = field(default_factory=set)
+    image_description_errors: Dict[str, Dict[str, None]] = field(default_factory=dict)
 
     @property
     def total_skipped(self) -> int:
@@ -242,6 +245,10 @@ class IndexingStats:
                 "count": len(self.dependent_items_empty),
                 "items": sorted(self.dependent_items_empty),
             },
+            "images_not_described": {
+                "count": len(self.images_not_described),
+                "items": sorted(self.images_not_described),
+            },
             "documents_already_indexed": {
                 "count": len(self.documents_already_indexed),
                 "items": sorted(self.documents_already_indexed),
@@ -266,7 +273,7 @@ class IndexingStats:
                     len(self.runtime_skipped_error))
 
         total_skipped = file_skips + doc_skips
-        dependent_skipped = len(self.dependent_items_skipped)
+        dependent_skipped = len(self.dependent_items_skipped) + len(self.images_not_described)
 
         if total_skipped == 0 and dependent_skipped == 0:
             return ""
@@ -338,6 +345,13 @@ class IndexingStats:
             if len(sorted_dependent) > 5:
                 lines.append(f"    ... and {len(sorted_dependent) - 5} more")
 
+        if self.images_not_described:
+            sorted_images = sorted(self.images_not_described)
+            lines.append(f"\nImages that could not be described ({len(sorted_images)} total, their documents' text was still indexed):")
+            lines.append(f"  - {', '.join(sorted_images[:5])}")
+            if len(sorted_images) > 5:
+                lines.append(f"    ... and {len(sorted_images) - 5} more")
+
         # Documents that matched by incremental dedup — not skipped in the failure
         # sense, so tracked in their own section to keep counts unambiguous.
         if self.documents_already_indexed:
@@ -384,14 +398,15 @@ class IndexingStats:
         # own noun and contribute nothing to the category count or to the totals —
         # counting them would make `totals.total` a documents+attachments hybrid.
         dependent_total = 0
-        for kind, reason, label, attribute in _DEPENDENT_GROUP_SPECS:
+        for kind, reason, label, attribute, group_labels in _DEPENDENT_GROUP_SPECS:
             items = sorted(getattr(self, attribute))
             if not items:
                 continue
             dependent_total += len(items)
             categories[kind]["groups"].append(
                 _build_report_group(
-                    reason, label, items, labels=dependent_labels, dependent=True, counted=False
+                    reason, label, items, labels=group_labels or dependent_labels,
+                    dependent=True, counted=False,
                 )
             )
 
@@ -451,15 +466,17 @@ _REPORT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, Tuple[str, ...]], ...] = 
      ("documents_skipped_error", "runtime_skipped_error")),
 )
 
-_DEPENDENT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, str], ...] = (
+_DEPENDENT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, str, Optional[Tuple[str, str]]], ...] = (
     (ReportKind.SKIPPED, "filtered", "Excluded by configured filters",
-     "dependent_items_filtered"),
+     "dependent_items_filtered", None),
     (ReportKind.NOT_INDEXED, "unsupported_format", "Unsupported format",
-     "dependent_items_unsupported"),
+     "dependent_items_unsupported", None),
     (ReportKind.SKIPPED, "empty", "Contained no indexable content",
-     "dependent_items_empty"),
+     "dependent_items_empty", None),
     (ReportKind.FAILED, "processing_error", "Could not be processed",
-     "dependent_items_skipped"),
+     "dependent_items_skipped", None),
+    (ReportKind.FAILED, "image_description_error", "Could not be described",
+     "images_not_described", ("image", "images")),
 )
 
 _CATEGORY_RENDERING = {
@@ -1146,6 +1163,41 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if run is not None and failed_key != IDLESS_STAGING_KEY:
             run.explicitly_failed_keys.add(failed_key)
 
+    _LOST_IMAGE_LOCATION_KEYS: ClassVar[Tuple[str, ...]] = ('file_path', 'path', 'key', 'id')
+
+    @classmethod
+    def _lost_image_label(cls, metadata: dict, source_name: str, dependent: bool) -> str:
+        meta_lower = {str(key).lower(): value for key, value in metadata.items()}
+        if dependent:
+            location = meta_lower.get(IndexerKeywords.PARENT.value)
+            return f"{source_name} (in {location})" if location not in (None, '', -1) else source_name
+        location = next((str(meta_lower[key]) for key in cls._LOST_IMAGE_LOCATION_KEYS if meta_lower.get(key)), None)
+        return f"{source_name} ({location})" if location and location != source_name else source_name
+
+    def _parse_tracking_lost_images(self, label: str, parse: Callable[[], Any]) -> List[Document]:
+        with collect_image_description_failures() as failures:
+            chunks = list(parse())
+        if failures and chunks:
+            stats = self.get_indexing_stats() or self._init_indexing_stats()
+            stats.images_not_described.update(
+                f"{label}: lost image {count}" for count in range(1, len(failures) + 1)
+            )
+            for failure in failures:
+                cause = _ERROR_DETAIL_TAIL.sub("", failure).strip() or failure
+                stats.image_description_errors.setdefault(cause, {})[label] = None
+        return chunks
+
+    def _render_image_description_errors(self) -> List[str]:
+        stats = self.get_indexing_stats()
+        if not stats or not stats.image_description_errors:
+            return []
+        model = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None)
+        describer = f"Model '{model}'" if isinstance(model, str) and model else "The model"
+        return render_grouped_errors({
+            f"{describer} could not describe images: {cause}": documents
+            for cause, documents in stats.image_description_errors.items()
+        })
+
     def _track_document_damaged(self, doc_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
         stats.documents_skipped_error.add(doc_name)
@@ -1278,7 +1330,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             failed_chunks_count = result.get("failed_count", 0)
             succeeded_chunks_count = chunks_count - failed_chunks_count
             docs_count = result.get("docs_count", 0)
-            errors = render_grouped_errors(result.get("error_groups")) + result.get("errors", [])
+            errors = (render_grouped_errors(result.get("error_groups"))
+                      + self._render_image_description_errors()
+                      + result.get("errors", []))
 
             run = self._index_run
             damaged_doc_keys = (run.damaged_keys | run.pipeline_failed_keys) if staging else set()
@@ -2225,7 +2279,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 content = document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)
                 source_name = self._parse_failure_label(
                     document.metadata, content_type, dependent)
-                return list(_filter_parsing_errors(
+                return self._parse_tracking_lost_images(
+                    self._lost_image_label(document.metadata, source_name, dependent), lambda: _filter_parsing_errors(
                     process_document_by_type(
                         document=document,
                         content=content,
@@ -2255,7 +2310,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 content_type = file_extension_by_chunker(chunking_tool)
                 source_name = self._parse_failure_label(
                     document.metadata, content_type, dependent)
-                return list(_filter_parsing_errors(
+                return self._parse_tracking_lost_images(
+                    self._lost_image_label(document.metadata, source_name, dependent), lambda: _filter_parsing_errors(
                     process_document_by_type(
                         document=document,
                         content=content_in_bytes,

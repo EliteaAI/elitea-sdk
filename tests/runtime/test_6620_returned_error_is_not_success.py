@@ -105,6 +105,7 @@ def run_tool(client, monkeypatch, result, tool_name="index_data"):
         toolkit_config={"toolkit_name": "artifact", "settings": {}},
         tool_name=tool_name,
         tool_params={"index_name": "demo"},
+        llm_model="stub-model",
     )
 
 
