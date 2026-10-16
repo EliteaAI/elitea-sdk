@@ -1402,9 +1402,7 @@ class LLMNode(BaseTool):
                     else SKILL_REMINDER_SUFFIX
                 )
 
-            task_content = func_args.get('task')
-            if not isinstance(task_content, (str, list)):
-                task_content = str(task_content) if task_content is not None else ""
+            task_content = self._task_message_content(func_args.get('task'))
             _chat_history = list(func_args.get('chat_history', []))
             # When chat_history already ends in a ToolMessage we are RESUMING an
             # in-progress tool loop (the #4993 park/reconcile re-invoke: children
@@ -2399,6 +2397,30 @@ class LLMNode(BaseTool):
         if not content:
             return ''
         return str(content)
+
+    @staticmethod
+    def _task_message_content(task: Any) -> Union[str, list]:
+        """Content for the task HumanMessage built from the node's 'task' input.
+
+        A list is kept as content blocks only when it holds typed blocks
+        (``{"type": "text"|"image_url"|...}``); bare strings beside them become
+        text blocks. Any other list is pipeline data (a "list" variable mapped
+        to the task) and is sent as JSON text: passed through raw, its items
+        reach the provider as malformed blocks and Bedrock rejects the call
+        with a 400 (#7049).
+        """
+        if task is None:
+            return ""
+        if isinstance(task, str):
+            return task
+        if isinstance(task, list):
+            typed = [isinstance(item, dict) and isinstance(item.get('type'), str) for item in task]
+            if any(typed) and all(ok or isinstance(item, str) for ok, item in zip(typed, task)):
+                return [item if ok else {"type": "text", "text": item} for ok, item in zip(typed, task)]
+            # An empty list is still data: "[]", not an empty user message, which
+            # Anthropic rejects ("user messages must have non-empty content").
+            return json.dumps(task, ensure_ascii=False, default=str)
+        return str(task)
 
     @staticmethod
     def _extract_content_from_completion(completion) -> dict:
