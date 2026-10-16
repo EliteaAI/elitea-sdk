@@ -145,3 +145,24 @@ def test_application_run_does_not_raise_when_tagged_message_is_not_final():
     }
     # Should not raise; the final non-Human message is the successful reply.
     _raise_if_llm_node_error(response)
+
+
+def test_application_run_does_not_raise_when_current_run_has_no_ai_message():
+    """A child pipeline whose result is in state/output (not a final AIMessage) must NOT raise.
+
+    If the current run added a HumanMessage but no AI or Tool reply, the scan walks backwards
+    and hits the HumanMessage first. Stopping there prevents it from crossing into a tagged
+    error from a *previous* run.
+    """
+    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+
+    response = {
+        "messages": [
+            HumanMessage(content="first call"),
+            _tagged_error("Error: 401"),
+            HumanMessage(content="second call"),
+            # current run produced no AI/Tool message — result is in output/state
+        ]
+    }
+    # Must not raise: the scan hits the current run's HumanMessage and stops.
+    _raise_if_llm_node_error(response)

@@ -147,27 +147,32 @@ def extract_application_response_output(response: Any) -> str:
 
 
 def _raise_if_llm_node_error(response: Any) -> None:
-    """Raise RuntimeError if the final non-Human message in response is a tagged LLM error.
+    """Raise RuntimeError if the final message of the current run is a tagged LLM error.
 
     LLMNode.invoke() catches provider exceptions (e.g. AuthenticationError 401) and converts
     them to AIMessage(content="Error: ...") tagged with response_metadata['llm_node_error']=True
-    so that Application._run() can detect and re-raise them. Only the final non-Human message is
-    checked: response['messages'] may contain the child's full checkpoint history across many
-    calls, so scanning the whole list would falsely raise on a tagged error from a previous
-    (already-recovered) call.
+    so that Application._run() can detect and re-raise them.
+
+    The scan stops at the first HumanMessage encountered while walking backwards — that message
+    is the input boundary of the current run. This prevents two false-raise scenarios:
+    - A tagged error from a prior turn that the agent already recovered from (the child's
+      checkpoint history grows across calls when thread_id is fixed).
+    - A child pipeline whose current run produced no AI/Tool message (result is in `output` or
+      state); walking past the current run's HumanMessage into the previous run's tagged error
+      would raise incorrectly.
     """
     if not isinstance(response, dict):
         return
-    _final_msg = None
     for _msg in reversed(response.get('messages', [])):
-        if isinstance(_msg, BaseMessage) and not isinstance(_msg, HumanMessage):
-            _final_msg = _msg
-            break
-    if _final_msg is not None and getattr(_final_msg, 'response_metadata', {}).get('llm_node_error'):
-        _exc_type = _final_msg.response_metadata.get('llm_node_exception_type', 'LLMError')
-        raise RuntimeError(
-            f"Nested agent LLM failed ({_exc_type}): {_final_msg.content}"
-        )
+        if isinstance(_msg, HumanMessage):
+            return  # reached this run's input boundary; nothing from this run is a tagged error
+        if isinstance(_msg, BaseMessage):
+            if getattr(_msg, 'response_metadata', {}).get('llm_node_error'):
+                _exc_type = _msg.response_metadata.get('llm_node_exception_type', 'LLMError')
+                raise RuntimeError(
+                    f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
+                )
+            return  # final non-Human message is clean; no error
 
 
 class Application(BaseTool):

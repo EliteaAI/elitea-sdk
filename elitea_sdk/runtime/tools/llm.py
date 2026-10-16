@@ -4784,7 +4784,10 @@ class LLMNode(BaseTool):
                     logger.error(f"Error in LLM call during iteration {iteration}: {e}")
                     # Add error message and break the loop
                     error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
-                    new_messages.append(AIMessage(content=error_msg))
+                    _tagged = AIMessage(content=error_msg)
+                    _tagged.response_metadata['llm_node_error'] = True
+                    _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
+                    new_messages.append(_tagged)
                     break
 
         # Handle max iterations (against the local budget, which injections may have bumped)
