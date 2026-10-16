@@ -4647,9 +4647,12 @@ class LLMNode(BaseTool):
                         error_details.append("- Model ID doesn't contain unexpected prefixes")
                     
                     error_msg = "\n".join(error_details)
-                    new_messages.append(AIMessage(content=error_msg))
+                    _tagged = AIMessage(content=error_msg)
+                    _tagged.response_metadata['llm_node_error'] = True
+                    _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
+                    new_messages.append(_tagged)
                     break
-                
+
                 if is_context_error or is_output_limit_error:
                     error_type = "output limit" if is_output_limit_error else "context window"
                     logger.warning(f"{error_type.title()} exceeded during tool execution iteration {iteration}")

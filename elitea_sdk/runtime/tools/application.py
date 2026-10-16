@@ -146,6 +146,30 @@ def extract_application_response_output(response: Any) -> str:
     return ''
 
 
+def _raise_if_llm_node_error(response: Any) -> None:
+    """Raise RuntimeError if the final non-Human message in response is a tagged LLM error.
+
+    LLMNode.invoke() catches provider exceptions (e.g. AuthenticationError 401) and converts
+    them to AIMessage(content="Error: ...") tagged with response_metadata['llm_node_error']=True
+    so that Application._run() can detect and re-raise them. Only the final non-Human message is
+    checked: response['messages'] may contain the child's full checkpoint history across many
+    calls, so scanning the whole list would falsely raise on a tagged error from a previous
+    (already-recovered) call.
+    """
+    if not isinstance(response, dict):
+        return
+    _final_msg = None
+    for _msg in reversed(response.get('messages', [])):
+        if isinstance(_msg, BaseMessage) and not isinstance(_msg, HumanMessage):
+            _final_msg = _msg
+            break
+    if _final_msg is not None and getattr(_final_msg, 'response_metadata', {}).get('llm_node_error'):
+        _exc_type = _final_msg.response_metadata.get('llm_node_exception_type', 'LLMError')
+        raise RuntimeError(
+            f"Nested agent LLM failed ({_exc_type}): {_final_msg.content}"
+        )
+
+
 class Application(BaseTool):
     name: str
     description: str
@@ -825,18 +849,9 @@ class Application(BaseTool):
                 config=nested_config,
             )
 
-        # Detect swallowed LLM errors: LLMNode.invoke() catches provider exceptions
-        # (e.g. AuthenticationError 401) and returns them as AIMessage prose instead of
-        # raising. Without this check, Application._run() returns normally with error
-        # text as the tool output, BaseTool.run() fires on_tool_end (not on_tool_error),
-        # and the UI Application chip closes as "complete" instead of "error" (#7041).
-        if isinstance(response, dict):
-            for _msg in reversed(response.get('messages', [])):
-                if getattr(_msg, 'response_metadata', {}).get('llm_node_error'):
-                    _exc_type = _msg.response_metadata.get('llm_node_exception_type', 'LLMError')
-                    raise RuntimeError(
-                        f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
-                    )
+        # Detect swallowed LLM errors and re-raise so BaseTool.run() fires
+        # on_tool_error and the UI Application chip shows an error state (#7041).
+        _raise_if_llm_node_error(response)
 
         normalized_output = extract_application_response_output(response)
 

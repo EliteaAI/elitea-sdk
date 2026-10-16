@@ -6,6 +6,10 @@ is tagged with response_metadata['llm_node_error'] = True so that Application._r
 it downstream and re-raise as RuntimeError, causing BaseTool.run() to fire on_tool_error and
 the UI Application chip to show an error state instead of closing as "complete".
 
+Application._run() checks only the *final* non-Human message so that a tagged error from a
+previous call (already committed to the child's checkpoint) does not cause every subsequent
+call to that sub-agent to raise.
+
 This test also verifies that no on_custom_event("llm_node_error") is dispatched — the old code
 dispatched it with a random run_id, which in a parallel nested-agent scenario picked the
 still-running sibling's run_id and falsely closed its UI spinner with an error state.
@@ -15,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 
 class _TrackingCallback(BaseCallbackHandler):
@@ -100,3 +104,44 @@ def test_llm_node_error_no_custom_event_with_callback_manager(llm_node):
     assert llm_node_error_events == [], (
         f"Expected no llm_node_error custom events but got: {llm_node_error_events}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Application._run() boundary tests
+# ---------------------------------------------------------------------------
+
+def _tagged_error(text="Error: auth failed", exc_type="AuthenticationError"):
+    msg = AIMessage(content=text)
+    msg.response_metadata["llm_node_error"] = True
+    msg.response_metadata["llm_node_exception_type"] = exc_type
+    return msg
+
+
+def test_application_run_raises_when_final_message_is_tagged():
+    """A tagged final non-Human message must raise RuntimeError (#7041)."""
+    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+
+    response = {"messages": [HumanMessage(content="go"), _tagged_error()]}
+    with pytest.raises(RuntimeError, match="Nested agent LLM failed"):
+        _raise_if_llm_node_error(response)
+
+
+def test_application_run_does_not_raise_when_tagged_message_is_not_final():
+    """An older tagged message followed by a successful reply must NOT raise.
+
+    This prevents a tagged error from a previous call (committed to the child's
+    checkpoint history) from poisoning every later call to the same sub-agent.
+    """
+    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+
+    successful_reply = AIMessage(content="all good now")
+    response = {
+        "messages": [
+            HumanMessage(content="first call"),
+            _tagged_error("Error: 401"),
+            HumanMessage(content="second call"),
+            successful_reply,
+        ]
+    }
+    # Should not raise; the final non-Human message is the successful reply.
+    _raise_if_llm_node_error(response)
