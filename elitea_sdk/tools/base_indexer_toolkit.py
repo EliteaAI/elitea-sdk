@@ -1162,10 +1162,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if run is not None and failed_key != IDLESS_STAGING_KEY:
             run.explicitly_failed_keys.add(failed_key)
 
-    @staticmethod
-    def _lost_image_label(metadata: dict, source_name: str, dependent: bool) -> str:
-        parent = metadata.get(IndexerKeywords.PARENT.value)
-        return f"{source_name} (in {parent})" if dependent and parent not in (None, '', -1) else source_name
+    _LOST_IMAGE_LOCATION_KEYS: ClassVar[Tuple[str, ...]] = ('file_path', 'path', 'key', 'id')
+
+    @classmethod
+    def _lost_image_label(cls, metadata: dict, source_name: str, dependent: bool) -> str:
+        meta_lower = {str(key).lower(): value for key, value in metadata.items()}
+        if dependent:
+            location = meta_lower.get(IndexerKeywords.PARENT.value)
+            return f"{source_name} (in {location})" if location not in (None, '', -1) else source_name
+        location = next((str(meta_lower[key]) for key in cls._LOST_IMAGE_LOCATION_KEYS if meta_lower.get(key)), None)
+        return f"{source_name} ({location})" if location and location != source_name else source_name
 
     def _parse_tracking_lost_images(self, label: str, parse: Callable[[], Any]) -> List[Document]:
         with collect_image_description_failures() as failures:

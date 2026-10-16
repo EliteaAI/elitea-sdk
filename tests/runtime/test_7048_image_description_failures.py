@@ -146,7 +146,22 @@ class TestIndexerTracksLostImages:
         }
 
     def test_a_base_document_is_labelled_by_its_own_name(self):
-        assert BaseIndexerToolkit._lost_image_label({"parent_id": "page-1"}, "report.pdf", dependent=False) == "report.pdf"
+        assert BaseIndexerToolkit._lost_image_label({"name": "report.pdf", "key": "report.pdf"}, "report.pdf",
+                                                    dependent=False) == "report.pdf"
+
+    def test_same_named_documents_in_different_folders_are_counted_apart(self):
+        indexer = _Indexer()
+
+        for folder in ("Shared/A", "Shared/B"):
+            label = BaseIndexerToolkit._lost_image_label(
+                {"name": "report.pdf", "Path": f"{folder}/report.pdf"}, "report.pdf", dependent=False)
+            BaseIndexerToolkit._parse_tracking_lost_images(
+                indexer, label, lambda: _parse(_pdf_with_image(), "report.pdf", _RefusingLlm())
+            )
+
+        assert indexer.stats.images_not_described == {
+            "report.pdf (Shared/A/report.pdf): lost image 1", "report.pdf (Shared/B/report.pdf): lost image 1",
+        }
 
     def test_a_document_that_produced_nothing_is_not_counted_twice(self):
         indexer = _Indexer()
