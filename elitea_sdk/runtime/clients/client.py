@@ -1745,13 +1745,15 @@ class EliteAClient:
                     "execution_time_seconds": 0.0
                 }
             llm_model = default_model['name']
-            if llm_config is None and not default_model.get('supports_reasoning'):
-                llm_config = {'max_tokens': 1024, 'temperature': 0.1}
             llm_config = {
                 **(llm_config or {'max_tokens': 1024}),
                 'model_project_id': default_model.get('project_id'),
                 'openai_compatible': bool(default_model.get('openai_compatible', False)),
             }
+            caller_chose_sampling = (llm_config.get('temperature') is not None
+                                     or llm_config.get('reasoning_effort') is not None)
+            if not caller_chose_sampling and not default_model.get('supports_reasoning'):
+                llm_config['temperature'] = 0.1
         if llm_config is None:
             llm_config = {
                 'max_tokens': 1024,

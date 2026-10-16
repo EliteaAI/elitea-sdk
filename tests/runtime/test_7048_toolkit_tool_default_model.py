@@ -152,3 +152,21 @@ def test_a_reasoning_default_gets_no_custom_temperature(monkeypatch, llm_calls):
     _, model_config = llm_calls[0]
     assert "temperature" not in model_config
     assert model_config["max_tokens"] == 1024
+
+
+def test_settings_with_only_max_tokens_keep_the_low_temperature_for_a_plain_default(monkeypatch, llm_calls):
+    client = make_client(monkeypatch, llm_calls, _Response({"items": [PROJECT_DEFAULT]}))
+
+    run(client, llm_config={"max_tokens": 1000})
+
+    _, model_config = llm_calls[0]
+    assert model_config["temperature"] == 0.1
+    assert model_config["max_tokens"] == 1000
+
+
+def test_a_caller_temperature_is_kept(monkeypatch, llm_calls):
+    client = make_client(monkeypatch, llm_calls, _Response({"items": [PROJECT_DEFAULT]}))
+
+    run(client, llm_config={"max_tokens": 1000, "temperature": 0.5})
+
+    assert llm_calls[0][1]["temperature"] == 0.5
