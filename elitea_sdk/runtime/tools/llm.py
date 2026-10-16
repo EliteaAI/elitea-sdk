@@ -2417,8 +2417,8 @@ class LLMNode(BaseTool):
             typed = [isinstance(item, dict) and isinstance(item.get('type'), str) for item in task]
             if any(typed) and all(ok or isinstance(item, str) for ok, item in zip(typed, task)):
                 return [item if ok else {"type": "text", "text": item} for ok, item in zip(typed, task)]
-            if not task:
-                return ""
+            # An empty list is still data: "[]", not an empty user message, which
+            # Anthropic rejects ("user messages must have non-empty content").
             return json.dumps(task, ensure_ascii=False, default=str)
         return str(task)
 
