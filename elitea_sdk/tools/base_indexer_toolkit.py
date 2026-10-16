@@ -154,6 +154,7 @@ class IndexingStats:
     dependent_items_unsupported: Set[str] = field(default_factory=set)
     dependent_items_empty: Set[str] = field(default_factory=set)
     images_not_described: Set[str] = field(default_factory=set)
+    image_description_errors: Dict[str, Dict[str, None]] = field(default_factory=dict)
 
     @property
     def total_skipped(self) -> int:
@@ -1181,7 +1182,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             stats.images_not_described.update(
                 f"{label}: lost image {count}" for count in range(1, len(failures) + 1)
             )
+            for failure in failures:
+                cause = _ERROR_DETAIL_TAIL.sub("", failure).strip() or failure
+                stats.image_description_errors.setdefault(cause, {})[label] = None
         return chunks
+
+    def _render_image_description_errors(self) -> List[str]:
+        stats = self.get_indexing_stats()
+        if not stats or not stats.image_description_errors:
+            return []
+        model = getattr(self.llm, 'model_name', None) or getattr(self.llm, 'model', None)
+        describer = f"Model '{model}'" if isinstance(model, str) and model else "The model"
+        return render_grouped_errors({
+            f"{describer} could not describe images: {cause}": documents
+            for cause, documents in stats.image_description_errors.items()
+        })
 
     def _track_document_damaged(self, doc_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
@@ -1315,7 +1330,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             failed_chunks_count = result.get("failed_count", 0)
             succeeded_chunks_count = chunks_count - failed_chunks_count
             docs_count = result.get("docs_count", 0)
-            errors = render_grouped_errors(result.get("error_groups")) + result.get("errors", [])
+            errors = (render_grouped_errors(result.get("error_groups"))
+                      + self._render_image_description_errors()
+                      + result.get("errors", []))
 
             run = self._index_run
             damaged_doc_keys = (run.damaged_keys | run.pipeline_failed_keys) if staging else set()
