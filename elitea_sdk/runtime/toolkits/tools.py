@@ -22,6 +22,7 @@ from .mcp_config import (
     get_mcp_server_config,
     load_mcp_servers_config,
 )
+from ..exceptions import AgentAccessDeniedError
 from ..tools.mcp_server_tool import McpServerTool
 from ..tools.mcp_input_schema import build_mcp_args_schema
 from ..tools.sandbox import SandboxToolkit
@@ -1141,6 +1142,9 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     # OAuth authorization required by nested agent's toolkit — propagate so the
                     # frontend error handler can emit the mcp_authorization_required event.
                     raise
+                except AgentAccessDeniedError:
+                    # A local run without editor access must say so, not run with sub-agents missing
+                    raise
                 except Exception as app_err:
                     # Gracefully skip application tools that fail to load (e.g., deleted agents).
                     # McpAuthorizationRequired is re-raised above as it is never transient and
@@ -1638,7 +1642,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     logger.error(f"❌ Failed to initialize McpConfigToolkit: {e}")
                     if not debug_mode:
                         raise
-        except McpAuthorizationRequired:
+        except (McpAuthorizationRequired, AgentAccessDeniedError):
             # Re-raise auth required exceptions directly
             raise
         except Exception as e:

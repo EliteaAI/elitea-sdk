@@ -25,7 +25,7 @@ from ..middleware import (
     TransformErrorStrategy,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
-from ..exceptions import budget_exceeded_from
+from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools, read_declared_failure
@@ -126,7 +126,7 @@ class EliteAClient:
         self.auth_token = auth_token
         self.auth_session = auth_session if not auth_token else None
         self.session_cookie_name = session_cookie_name
-        self.headers = {'X-SECRET': kwargs.get('XSECRET', 'secret')}
+        self.headers = {}
         if auth_token:
             self.headers["Authorization"] = f"Bearer {auth_token}"
         if api_extra_headers is not None:
@@ -948,6 +948,12 @@ class EliteAClient:
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
+        if resp.status_code == 403:
+            # Expanded details carry credentials, so outside the platform they need editor access
+            raise AgentAccessDeniedError(
+                f"Running platform agent {application_id}/{application_version_id} locally requires "
+                f"editor access to project {self.project_id} (403)"
+            )
         logger.error(f"Failed to fetch application version details: {resp.status_code} - {resp.text}."
                      f" Application ID: {application_id}, Version ID: {application_version_id}, Project ID: {self.project_id}")
         raise ApiDetailsRequestError(f"Failed to fetch application version details for {application_id}/{application_version_id}: {resp.status_code} - {resp.text}")
@@ -1126,6 +1132,8 @@ class EliteAClient:
         else:
             try:
                 data = self.get_app_version_details(application_id, application_version_id)
+            except AgentAccessDeniedError:
+                raise
             except ApiDetailsRequestError as e:
                 error_msg = f"Failed to fetch application version details for {application_id}/{application_version_id}\nDetails: {e}"
                 logger.error(error_msg)
