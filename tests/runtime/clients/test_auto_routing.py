@@ -51,7 +51,7 @@ def model():
             'invocation_id': kwargs['json']['invocation_id'], 'expires_at': time.time()+3600})
     owner._request = request
     owner.get_llm = Mock(return_value=native)
-    value = m.AutoChatModel(owner=owner, settings={'selection': {'mode': 'auto'}, 'routing_surface': 'agent'})
+    value = m.AutoChatModel(owner=owner, settings={'selection': {'mode': 'auto'}, 'routing_surface': 'agent', 'routing_guard': False})
     return value, native, calls
 
 
