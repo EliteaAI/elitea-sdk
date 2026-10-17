@@ -162,6 +162,41 @@ Connect to an MCP server providing database operations:
 }
 ```
 
+### Example 5: Parallel Web Search and Page Fetching
+
+Use [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) to
+find current web sources and read relevant pages. The anonymous endpoint needs
+no Parallel account or API key and runs searches in Fast mode. It is free for
+light use, with rate limits.
+
+Add this entry to your agent's toolkit configuration list. The current SDK loader
+expects `url` and `headers` directly under `settings`:
+
+```json
+{
+  "type": "mcp",
+  "toolkit_name": "parallel_search",
+  "settings": {
+    "url": "https://search.parallel.ai/mcp",
+    "headers": {
+      "User-Agent": "elitea-sdk"
+    },
+    "selected_tools": ["web_search", "web_fetch"],
+    "timeout": 60
+  }
+}
+```
+
+The SDK discovers the remote tools over HTTP. Use `web_search` to find sources,
+then `web_fetch` to read the relevant result URLs. For example, ask your agent:
+"Find the current Python documentation for TaskGroup cancellation, read the
+relevant page, and summarize the behavior with source links."
+
+For direct tool calls, `web_search` requires an `objective` and a nonempty
+`search_queries` array; `web_fetch` requires a `urls` array. Reuse one stable
+`session_id` across related search and fetch calls if you supply it. Keep the
+endpoint at `/mcp` and omit the `Authorization` header for anonymous access.
+
 ## Tool Naming
 
 Tools from the MCP server are automatically prefixed to avoid naming conflicts:
