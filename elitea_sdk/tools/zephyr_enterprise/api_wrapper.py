@@ -183,6 +183,7 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
                 document.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = page_content.encode('utf-8')
             except Exception as e:
                 logging.error(f"Failed to process document: {e}")
+                self._track_document_left_empty_by_error(document)
             yield document
 
     @with_tool_groups

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 from typing import Optional, Generator, Literal
 from pydantic import model_validator, create_model, Field, SecretStr, PrivateAttr
 
@@ -13,6 +14,13 @@ from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
+
+_STEPS_ABSENT_STATUS = re.compile(r"^Unexpected status code 422 for GET ")
+_SCRIPT_ABSENT_STATUS = re.compile(r"^Unexpected status code (404|422) for GET ")
+
+
+def _is_content_absent(error: ToolException, absent_status: re.Pattern) -> bool:
+    return bool(absent_status.search(str(error)))
 
 
 class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
@@ -353,22 +361,31 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
                         metadata["steps_type"] = steps_type
             except Exception as e:
                 logging.error(f"Failed to process document: {e}")
+                document = Document(page_content="", metadata=metadata)
+                self._track_document_left_empty_by_error(document)
+                yield document
+                continue
             #
             yield Document(page_content="", metadata=metadata)
 
     def _process_test_case(self, key) -> dict:
+        fetch_errors = []
         try:
             steps = self.get_test_case_test_steps(key)
             if steps:
                 return {"steps": steps}
-        except ToolException:
-            pass
+        except ToolException as error:
+            if not _is_content_absent(error, _STEPS_ABSENT_STATUS):
+                fetch_errors.append(error)
         try:
             script = self.get_test_case_test_script(key)
             if script:
                 return {"script": script}
-        except ToolException:
-            pass
+        except ToolException as error:
+            if not _is_content_absent(error, _SCRIPT_ABSENT_STATUS):
+                fetch_errors.append(error)
+        if fetch_errors:
+            raise fetch_errors[-1]
         return {"empty": ""}
 
     @with_tool_groups

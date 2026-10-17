@@ -44,14 +44,13 @@ def test_falls_back_to_script_when_steps_raise(wrapper):
     assert result == {"script": "print('hello')"}
 
 
-def test_returns_empty_when_both_raise(wrapper):
+def test_raises_when_both_raise(wrapper):
     with patch.object(ZephyrScaleApiWrapper, "get_test_steps",
                        side_effect=ToolException("Unable to extract test case steps")), \
          patch.object(ZephyrScaleApiWrapper, "get_test_script",
                        side_effect=ToolException("Unable to get test script")):
-        result = wrapper._process_test_case("PROJ-T4")
-
-    assert result == {"empty": ""}
+        with pytest.raises(ToolException, match="Unable to get test script"):
+            wrapper._process_test_case("PROJ-T4")
 
 
 def test_returns_empty_when_both_missing(wrapper):
@@ -60,3 +59,37 @@ def test_returns_empty_when_both_missing(wrapper):
         result = wrapper._process_test_case("PROJ-T5")
 
     assert result == {"empty": ""}
+
+
+def scale_http_error(status):
+    return ToolException(f"Unable to get content for test case with key: PROJ-T6:\nError {status}. Response: b'{{}}'")
+
+
+def test_returns_empty_for_a_step_by_step_case_without_a_script(wrapper):
+    with patch.object(ZephyrScaleApiWrapper, "get_test_steps", return_value=[]), \
+         patch.object(ZephyrScaleApiWrapper, "get_test_script", side_effect=scale_http_error(422)):
+        result = wrapper._process_test_case("PROJ-T6")
+
+    assert result == {"empty": ""}
+
+
+def test_returns_empty_for_a_plain_case_without_steps_or_script(wrapper):
+    with patch.object(ZephyrScaleApiWrapper, "get_test_steps", side_effect=scale_http_error(422)), \
+         patch.object(ZephyrScaleApiWrapper, "get_test_script", side_effect=scale_http_error(404)):
+        result = wrapper._process_test_case("PROJ-T7")
+
+    assert result == {"empty": ""}
+
+
+def test_raises_a_server_error_even_when_the_other_call_reports_absence(wrapper):
+    with patch.object(ZephyrScaleApiWrapper, "get_test_steps", side_effect=scale_http_error(422)), \
+         patch.object(ZephyrScaleApiWrapper, "get_test_script", side_effect=scale_http_error(500)):
+        with pytest.raises(ToolException, match="Error 500"):
+            wrapper._process_test_case("PROJ-T8")
+
+
+def test_raises_when_the_test_case_itself_is_gone(wrapper):
+    with patch.object(ZephyrScaleApiWrapper, "get_test_steps", side_effect=scale_http_error(404)), \
+         patch.object(ZephyrScaleApiWrapper, "get_test_script", side_effect=scale_http_error(404)):
+        with pytest.raises(ToolException, match="Error 404"):
+            wrapper._process_test_case("PROJ-T9")
