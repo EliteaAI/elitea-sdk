@@ -1,10 +1,13 @@
 """Issue #7065 - the SDK no longer sends X-SECRET, and a 403 on an agent fetch is surfaced.
 
 PATCH version (the expanded agent fetch) now needs the unsecret permission. Inside the platform
-the runtime gets expanded details with the predict (#7064), so this only affects running a
-platform agent outside the platform (CLI, Streamlit) as a viewer. That 403 used to be logged
-as "Skipping application tool" and the agent ran with a sub-agent silently missing; it now
-raises AgentAccessDeniedError with a clear message instead.
+the runtime gets expanded details with the predict (#7064), so it only calls PATCH for a sub-agent
+the prefetch could not expand. As a viewer that call now gets 403.
+
+Review round 1: a sub-agent that cannot be loaded must keep being skipped, as before - a
+pipeline may never use it, so it must not fail a viewer's run inside the platform. Only the
+top-level agent fetch raises AgentAccessDeniedError; in practice only the CLI and Streamlit
+reach it, because platform runs always supply the top-level details.
 """
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -52,7 +55,7 @@ def test_a_403_on_the_agent_fetch_raises_access_denied():
     client = _client()
 
     with patch("requests.Session.request", return_value=_response(403)):
-        with pytest.raises(AgentAccessDeniedError, match='editor access to project 3'):
+        with pytest.raises(AgentAccessDeniedError, match='requires editor access to project 3'):
             client.get_app_version_details(11, 22)
 
 
@@ -72,18 +75,28 @@ def test_application_does_not_wrap_access_denied_in_a_tool_exception():
             client.application(11, 22)
 
 
-def test_get_tools_propagates_access_denied_instead_of_skipping_the_sub_agent():
+def test_get_tools_skips_a_sub_agent_the_user_may_not_load():
+    # A viewer in the platform hits this for a sub-agent the prefetch could not expand
     from elitea_sdk.runtime.toolkits import tools as tools_mod
 
     tool = {'type': 'application', 'name': 'child', 'settings': {
         'application_id': 11, 'application_version_id': 22}}
 
     def denied(*args, **kwargs):
-        raise AgentAccessDeniedError("Running platform agent 11/22 locally requires editor access")
+        raise AgentAccessDeniedError("Loading agent 11/22 requires editor access to project 3 (403)")
 
     with patch.object(tools_mod.ApplicationToolkit, 'get_toolkit', side_effect=denied):
-        with pytest.raises(AgentAccessDeniedError):
-            tools_mod.get_tools([tool], elitea_client=SimpleNamespace(project_id=3), llm=None)
+        assert tools_mod.get_tools([tool], elitea_client=SimpleNamespace(project_id=3), llm=None) == []
+
+
+def test_the_error_message_does_not_assume_a_local_run():
+    client = _client()
+
+    with patch("requests.Session.request", return_value=_response(403)):
+        with pytest.raises(AgentAccessDeniedError) as exc:
+            client.get_app_version_details(11, 22)
+
+    assert 'locally' not in str(exc.value)
 
 
 def test_get_tools_still_skips_a_sub_agent_that_fails_otherwise():

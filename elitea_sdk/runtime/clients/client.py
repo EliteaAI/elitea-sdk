@@ -949,10 +949,10 @@ class EliteAClient:
         if resp.ok:
             return resp.json()
         if resp.status_code == 403:
-            # Expanded details carry credentials, so outside the platform they need editor access
+            # Expanded details carry credentials, so they need editor access; get_tools still skips sub-agents
             raise AgentAccessDeniedError(
-                f"Running platform agent {application_id}/{application_version_id} locally requires "
-                f"editor access to project {self.project_id} (403)"
+                f"Loading agent {application_id}/{application_version_id} requires editor access "
+                f"to project {self.project_id} (403)"
             )
         logger.error(f"Failed to fetch application version details: {resp.status_code} - {resp.text}."
                      f" Application ID: {application_id}, Version ID: {application_version_id}, Project ID: {self.project_id}")
