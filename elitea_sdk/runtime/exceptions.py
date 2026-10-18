@@ -148,3 +148,7 @@ def budget_exceeded_from(exc):
         return BudgetExceededError(str(exc), scope)
     #
     return None
+
+
+class AgentAccessDeniedError(Exception):
+    """Expanded agent details need editor access outside the platform; never skipped silently."""

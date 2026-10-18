@@ -437,7 +437,6 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
         # Use expander for accordion functionality
         with st.expander(login_title, expanded=st.session_state.login_form_expanded):
             deployment_value = environ.get('DEPLOYMENT_URL', None)
-            deployment_secret = environ.get('XSECRET', 'secret')
             api_key_value = environ.get('API_KEY', None)
             project_id_value = int(environ.get('PROJECT_ID', 0))
             if st.session_state.client:
@@ -455,7 +454,6 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                 deployment = st.text_input("Deployment URL", placeholder="Enter Deployment URL", value=deployment_value)
                 api_key = st.text_input("API Key", placeholder="Enter API Key", value=api_key_value, type="password")
                 project_id = st.number_input("Project ID", format="%d", min_value=0, value=project_id_value, placeholder="Enter Project ID")
-                deployment_secret = st.text_input("Deployment Secret", placeholder="Enter Deployment Secret", value=deployment_secret)
                 
                 # Change button text based on login status
                 button_text = "Re-Login" if st.session_state.client else "Login"
@@ -469,7 +467,6 @@ def run_streamlit(st, ai_icon=None, user_icon=None):
                                 base_url=deployment,
                                 project_id=project_id,
                                 auth_token=api_key,
-                                api_extra_headers={"X-SECRET": deployment_secret}
                             )
                             
                             
