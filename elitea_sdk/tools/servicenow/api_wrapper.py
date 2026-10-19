@@ -9,6 +9,7 @@ from pysnc.record import GlideElement, GlideRecord
 
 from langchain_core.tools import ToolException
 from ..elitea_base import BaseToolApiWrapper
+from ..utils import normalize_base_url
 from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ class ServiceNowAPIWrapper(BaseToolApiWrapper):
     @model_validator(mode='before')
     @classmethod
     def validate_toolkit(cls, values):
-        base_url = values['base_url']
+        base_url = values['base_url'] = normalize_base_url(values['base_url'])
         password = SecretStr(values['password'])
         username = values['username']
         cls.fields = values.get('fields', ['sys_id', 'number', 'state', 'short_description', 'description', 'priority', 'category', 'urgency', 'impact', 'creation_date'])

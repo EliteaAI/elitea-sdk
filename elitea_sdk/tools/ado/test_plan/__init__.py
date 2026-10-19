@@ -11,7 +11,7 @@ from ....configurations.pgvector import PgVectorConfiguration
 from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from .test_plan_wrapper import TestPlanApiWrapper
 from ...base.tool import BaseAction
-from ...utils import clean_string, get_max_toolkit_length, check_connection_response
+from ...utils import clean_string, get_max_toolkit_length, check_connection_response, normalize_base_url
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 
@@ -92,7 +92,7 @@ class AzureDevOpsPlansToolkit(BaseToolkit):
                 raise ValueError("ADO project is required")
             token = ado_config.token.get_secret_value() if ado_config.token else ""
             response = requests.get(
-                f'{ado_config.organization_url}/{project}/_apis/testplan/plans?api-version=7.0',
+                f'{normalize_base_url(ado_config.organization_url)}/{project}/_apis/testplan/plans?api-version=7.0',
                 headers={'Authorization': f'Bearer {token}'},
                 timeout=5
             )

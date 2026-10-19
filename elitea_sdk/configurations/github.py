@@ -106,7 +106,7 @@ class GithubConfiguration(BaseModel):
         import jwt
         import time
 
-        base_url = settings.get('base_url', 'https://api.github.com')
+        base_url = (settings.get('base_url') or 'https://api.github.com').strip().rstrip('/')
         access_token = settings.get('access_token')
         username = settings.get('username')
         password = settings.get('password')
