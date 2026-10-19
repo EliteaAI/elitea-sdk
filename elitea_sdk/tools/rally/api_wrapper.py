@@ -8,6 +8,7 @@ from pydantic.fields import PrivateAttr
 from langchain_core.tools import ToolException
 
 from ..elitea_base import BaseToolApiWrapper
+from ..utils import normalize_host
 from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,8 @@ class RallyApiWrapper(BaseToolApiWrapper):
             if (not values.get('username') or not values.get('password')) and not values.get('api_key'):
                 raise ToolException(
                     "Either user and password or api_key must be defined to establish connection with Rally.")
+            # pyral builds 'https://<server>/slm/...' itself, so it needs a bare host
+            values['server'] = normalize_host(values.get('server'))
             # Set up connection to Rally
             cls._client = Rally(server=values['server'], user=values.get('username'), password=values.get('password'),
                                 apikey=values.get('api_key'), workspace=values.get('workspace'),

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ConfigDict, create_model
 
 from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
-from ..utils import clean_string, get_max_toolkit_length, check_connection_response
+from ..utils import clean_string, get_max_toolkit_length, check_connection_response, normalize_base_url
 from ...configurations.bitbucket import BitbucketConfiguration
 from ...configurations.utils import url_host_matches_domain
 from ...configurations.pgvector import PgVectorConfiguration
@@ -75,7 +75,7 @@ class EliteABitbucketToolkit(BaseToolkit):
         @check_connection_response
         def check_connection(self):
             bitbucket_config = self.bitbucket_configuration or {}
-            url = bitbucket_config.get('url', '')
+            url = normalize_base_url(bitbucket_config.get('url', ''))
             username = bitbucket_config.get('username', '')
             password = bitbucket_config.get('password', '')
 

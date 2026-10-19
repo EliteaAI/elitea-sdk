@@ -12,6 +12,7 @@ from .cloud_api_wrapper import BitbucketCloudApi, BitbucketServerApi
 from pydantic.fields import PrivateAttr
 
 from ..code_indexer_toolkit import CodeIndexerToolkit
+from ..utils import normalize_base_url
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
@@ -181,7 +182,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                 "Please install it with `pip install atlassian-python-api`"
             )
         from langchain_core.utils import get_from_dict_or_env
-        url_value = get_from_dict_or_env(values, ["url"], "BITBUCKET_BASE_URL", default='https://api.bitbucket.org/')
+        url_value = normalize_base_url(
+            get_from_dict_or_env(values, ["url"], "BITBUCKET_BASE_URL", default='https://api.bitbucket.org/')
+        )
+        values['url'] = url_value
         cls._bitbucket = BitbucketCloudApi(
             url=url_value,
             username=values['username'],
@@ -189,7 +193,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             workspace=values['project'],
             repository=values['repository']
         ) if values.get('cloud') else BitbucketServerApi(
-            url=values['url'],
+            url=url_value,
             username=values['username'],
             password=values['password'],
             project=values['project'],

@@ -16,6 +16,7 @@ from pydantic.fields import FieldInfo as Field
 
 from ..work_item import AzureDevOpsApiWrapper
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
+from ...utils import normalize_base_url
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ....runtime.utils.utils import IndexerKeywords
 from ...utils.tool_groups import tool_group, with_tool_groups
@@ -188,6 +189,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
 
     @model_validator(mode='before')
     def validate_toolkit(cls, values):
+        values['organization_url'] = normalize_base_url(values.get('organization_url'))
         try:
             credentials = BasicAuthentication('', values['token'])
             connection = Connection(base_url=values['organization_url'], creds=credentials)

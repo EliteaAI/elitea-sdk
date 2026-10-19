@@ -19,7 +19,7 @@ from ..exceptions import ToolkitConfigurationError
 from ..llm.img_utils import ImageDescriptionCache
 from ...runtime.langchain.document_loaders.utils import perform_llm_prediction_for_image_bytes
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
-from ..utils import is_cookie_token, parse_cookie_string, get_file_bytes_from_artifact, detect_mime_type
+from ..utils import is_cookie_token, parse_cookie_string, get_file_bytes_from_artifact, detect_mime_type, normalize_base_url
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker, process_content_by_type
 from ..utils.serialization import serialize_tool_result
@@ -745,6 +745,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             )
 
         # Just validate and normalize values - client creation moved to model_post_init
+        if 'base_url' in values:
+            values['base_url'] = normalize_base_url(values['base_url'])
         additional_fields = values.get('additional_fields')
         if isinstance(additional_fields, str):
             values['additional_fields'] = [i.strip() for i in additional_fields.split(',')]

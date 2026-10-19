@@ -16,6 +16,7 @@ from testrail_api import StatusCodeError, TestRailAPI
 
 from ..chunkers.code.constants import get_file_extension, image_extensions
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
+from ..utils import normalize_base_url
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.serialization import serialize_tool_result
 from ...runtime.utils.utils import IndexerKeywords
@@ -545,7 +546,7 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                 "`pip install testrail_api`"
             )
 
-        url = values["url"]
+        url = values["url"] = normalize_base_url(values["url"])
         password = values.get("password")
         email = values.get("email")
         cls._client = TestRailAPI(url, email, password)

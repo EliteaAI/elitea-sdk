@@ -11,6 +11,7 @@ from .schemas import (
 )
 from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
+from ..utils import normalize_base_url
 from ..utils.tool_groups import with_tool_groups
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
         github_app_id = get_from_dict_or_env(values, ["app_id", "github_app_id"], "GITHUB_APP_ID", default='')
         github_app_private_key = get_from_dict_or_env(values, ["app_private_key", "github_app_private_key"], "GITHUB_APP_PRIVATE_KEY", default='')
         github_base_url = get_from_dict_or_env(values, ["base_url", "github_base_url"], "GITHUB_BASE_URL", default='https://api.github.com')
+        github_base_url = normalize_base_url(github_base_url) or 'https://api.github.com'
 
         auth_config = GitHubAuthConfig(
             github_access_token=github_access_token,

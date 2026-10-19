@@ -24,6 +24,7 @@ from pydantic.fields import Field
 import elitea_sdk.tools.ado.work_item
 from ..repos import ReposApiWrapper
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
+from ...utils import normalize_base_url
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.content_parser import parse_file_content
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
@@ -274,6 +275,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     @classmethod
     def validate_toolkit(cls, values):
         """Validate and set up the Azure DevOps client."""
+        values['organization_url'] = normalize_base_url(values.get('organization_url'))
         try:
             # Set up connection to Azure DevOps using Personal Access Token (PAT)
             credentials = BasicAuthentication('', values['token'])

@@ -30,7 +30,7 @@ from ..utils import (
     create_search_client,
     describe_search_info_code,
 )
-from ...utils import get_file_bytes_from_artifact, detect_mime_type
+from ...utils import get_file_bytes_from_artifact, detect_mime_type, normalize_base_url
 from ...utils.content_parser import parse_file_content
 from ....runtime.langchain.document_loaders.EliteAImageLoader import EliteAImageLoader, MAX_IMAGE_READ_BYTES
 from ....runtime.langchain.document_loaders.constants import image_loaders_map, image_loaders_map_converted
@@ -257,6 +257,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     @classmethod
     def validate_toolkit(cls, values):
         """Validate and set up the Azure DevOps client."""
+        values['organization_url'] = normalize_base_url(values.get('organization_url'))
         try:
             # Set up connection to Azure DevOps using Personal Access Token (PAT)
             credentials = BasicAuthentication('', values['token'])
