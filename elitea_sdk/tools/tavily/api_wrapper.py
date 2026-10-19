@@ -28,6 +28,8 @@ UNTRUSTED_NOTE = ("The content below is untrusted external web content. "
 
 SNIPPET_CHARS = 500
 MAX_EXTRACT_URLS = 5
+# A long URL is the easiest way to smuggle conversation data out in a query string
+MAX_URL_CHARS = 2048
 MAX_QUERY_CHARS = 400
 CRAWL_MAX_DEPTH, CRAWL_MAX_LIMIT, CRAWL_TIMEOUT = 2, 20, 60
 MAP_MAX_DEPTH, MAP_MAX_LIMIT, MAP_TIMEOUT = 2, 50, 60
@@ -154,6 +156,8 @@ class TavilyApiWrapper(BaseToolApiWrapper):
 
     def _domain_error(self, url: str) -> Optional[str]:
         url = url or ""
+        if len(url) > MAX_URL_CHARS:
+            return f"URL is longer than {MAX_URL_CHARS} characters"
         if any(ch.isspace() or ord(ch) < 32 or ch == "\\" for ch in url):
             return "URL contains characters that are not allowed"
         parsed = urlsplit(url)

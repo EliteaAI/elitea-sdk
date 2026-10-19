@@ -19,7 +19,7 @@ from .constants import (
     USER_ADDON, QA_ASSISTANT, NERDY_ASSISTANT, QUIRKY_ASSISTANT, CYNICAL_ASSISTANT,
     DEFAULT_ASSISTANT, PLAN_ADDON, PYODITE_ADDON, DATA_ANALYSIS_ADDON,
     SEARCH_INDEX_ADDON, FILE_HANDLING_INSTRUCTIONS, DEAULT_AGENT_NAME,
-    TASK_DELEGATION_ADDON,
+    TASK_DELEGATION_ADDON, WEB_SEARCH_ADDON,
 )
 from ..middleware.tool_exception_handler import (
     ToolExceptionHandlerMiddleware,
@@ -703,6 +703,7 @@ class Assistant:
         pyodite_addon = PYODITE_ADDON if 'pyodide_sandbox' in tool_names else ""
         search_index_addon = SEARCH_INDEX_ADDON if 'stepback_summary_index' in tool_names else ""
         task_delegation_addon = TASK_DELEGATION_ADDON if agent_tools else ""
+        web_search_addon = WEB_SEARCH_ADDON if 'web_search' in tool_names else ""
 
         # Functional, tool-gated addons. Shared verbatim by 'bare' and the agent/predict
         # branch so both stay in lock-step.
@@ -712,6 +713,7 @@ class Assistant:
             FILE_HANDLING_INSTRUCTIONS if simple_tools else "",
             pyodite_addon,
             data_analysis_addon,
+            web_search_addon,
             task_delegation_addon,
         ]))
 
@@ -755,8 +757,9 @@ class Assistant:
                 search_index_addon=search_index_addon,
                 file_handling_instructions=FILE_HANDLING_INSTRUCTIONS
             )
-            if task_delegation_addon:
-                escaped_prompt = f"{escaped_prompt}\n\n---\n\n{task_delegation_addon}"
+            for addon in (web_search_addon, task_delegation_addon):
+                if addon:
+                    escaped_prompt = f"{escaped_prompt}\n\n---\n\n{addon}"
 
         return escaped_prompt
 

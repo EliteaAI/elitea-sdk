@@ -291,6 +291,17 @@ class TestBounds:
                 api.web_extract(urls)
         assert fake.requests == []
 
+    def test_overlong_url_rejected_before_any_call(self, fake):
+        # #6982 review: a long query string is the easiest channel for exfiltrating chat data via a URL
+        api = tools(Platform())["web_extract"].api_wrapper
+        long_url = "https://example.com/?q=" + "a" * 2100
+        with pytest.raises(ToolException, match="longer than 2048"):
+            api.web_extract([long_url])
+        for name in ("web_crawl", "web_map"):
+            with pytest.raises(ToolException, match="longer than 2048"):
+                getattr(api, name)(long_url)
+        assert fake.requests == []
+
     def test_allowed_domains_only(self, fake):
         api = tools(Platform(), allowed_domains=["docs.python.org"])["web_extract"].api_wrapper
         with pytest.raises(ToolException, match="allowed domains"):
