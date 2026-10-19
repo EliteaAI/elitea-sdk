@@ -87,6 +87,14 @@ def reraise_signal_exceptions(error: Exception) -> None:
     if budget_error is not None:
         raise budget_error from error
 
+    # Nested-agent LLM failures must reach BaseTool.run() so it fires on_tool_error
+    # (→ AgentToolError socket event → UI chip shows error state). If the middleware
+    # catches this it would call _generate_llm_error, spending another LLM completion
+    # on the same broken model and delaying the error response (#7041).
+    from elitea_sdk.runtime.tools.application import LlmNodeError
+    if isinstance(error, LlmNodeError):
+        raise error
+
 
 def swarm_handle_tool_errors(error: Exception) -> str:
     """``handle_tool_errors`` for the swarm ToolNodes (#6172).
