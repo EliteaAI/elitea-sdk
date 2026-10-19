@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -32,7 +33,11 @@ from .utils.content_parser import file_extension_by_chunker, process_document_by
 from .utils.retry import is_server_error_retriable, retry_on_server_error
 from .utils.tool_groups import tool_group, with_tool_groups
 from .utils.serialization import serialize_tool_result
-from ..runtime.langchain.document_loaders.constants import loaders_allowed_to_override
+from ..runtime.langchain.document_loaders.constants import (
+    image_loaders_map,
+    image_loaders_map_converted,
+    loaders_allowed_to_override,
+)
 from ..runtime.langchain.document_loaders.utils import collect_image_description_failures
 from ..runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from .vector_adapters.VectorStoreAdapter import (
@@ -58,6 +63,11 @@ _STATS_COUNTER_LOCK = threading.Lock()
 # multi-KB string per batch, which would otherwise be copied into index_meta, every
 # history snapshot, the socket event and the tool result.
 _ERROR_DETAIL_TAIL = re.compile(r"\s*(\[SQL:|\[parameters:|\(Background on this error).*", re.DOTALL)
+_IMAGE_EXTENSIONS = frozenset(image_loaders_map) | frozenset(image_loaders_map_converted)
+
+
+def _is_image_file(file_name: Optional[str]) -> bool:
+    return bool(file_name) and os.path.splitext(file_name)[1].lower() in _IMAGE_EXTENSIONS
 
 
 class IndexingStatus(str, Enum):
@@ -1207,14 +1217,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         location = next((str(meta_lower[key]) for key in cls._LOST_IMAGE_LOCATION_KEYS if meta_lower.get(key)), None)
         return f"{source_name} ({location})" if location and location != source_name else source_name
 
-    def _parse_tracking_lost_images(self, label: str, parse: Callable[[], Any]) -> List[Document]:
+    def _parse_tracking_lost_images(self, label: str, parse: Callable[[], Any],
+                                    standalone_image: bool = False) -> List[Document]:
         with collect_image_description_failures() as failures:
             chunks = list(parse())
-        if failures and chunks:
+        if failures and (chunks or standalone_image):
             stats = self.get_indexing_stats() or self._init_indexing_stats()
-            stats.images_not_described.update(
-                f"{label}: lost image {count}" for count in range(1, len(failures) + 1)
-            )
+            if chunks:
+                stats.images_not_described.update(
+                    f"{label}: lost image {count}" for count in range(1, len(failures) + 1)
+                )
             for failure in failures:
                 cause = _ERROR_DETAIL_TAIL.sub("", failure).strip() or failure
                 stats.image_description_errors.setdefault(cause, {})[label] = None
@@ -2321,7 +2333,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
                     source_document=document, source_name=source_name, dependent=dependent
-                ))
+                ), standalone_image=_is_image_file(content_type))
             if chunking_tool and (content_in_bytes := document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)) is not None:
                 if not content_in_bytes:
                     # Content bytes are empty (e.g. an empty ADO wiki page).
@@ -2352,7 +2364,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         extension_source=content_type, llm=self.llm, chunking_config=local_config,
                         image_cache=getattr(self, "_image_cache", None)),
                     source_document=document, source_name=source_name, dependent=dependent
-                ))
+                ), standalone_image=_is_image_file(content_type))
             if chunking_tool:
                 # apply default chunker from toolkit config. No parsing.
                 chunker = chunkers.get(chunking_tool)
