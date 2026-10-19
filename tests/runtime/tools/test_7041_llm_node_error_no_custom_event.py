@@ -182,7 +182,12 @@ def test_llm_node_error_propagates_through_perform_tool_calling():
     Before this fix, the generic `except Exception as e` block in __perform_tool_calling
     converted the LlmNodeError into a ToolMessage(status="error") and continued the loop,
     causing the parent to finish successfully and the UI to show "complete" instead of error.
+
+    This test drives __perform_tool_calling directly via asyncio rather than going through
+    the full invoke() -> _invoke_llm_internal() stack, which requires extensive mock setup
+    (input_mapping, message filtering, tool binding, etc.).
     """
+    import asyncio
     from elitea_sdk.runtime.tools.application import Application, LlmNodeError
     from elitea_sdk.runtime.tools.llm import LLMNode
     from langchain_core.messages import AIMessage, HumanMessage
@@ -205,7 +210,18 @@ def test_llm_node_error_propagates_through_perform_tool_calling():
     fake_tool.name = "nested_agent"
     fake_tool.invoke.side_effect = err
 
-    with patch.object(LLMNode, "_invoke_llm_internal", return_value=ai_with_tool_call), \
-         patch.object(LLMNode, "_resolve_tool_to_execute", return_value=fake_tool):
+    messages = [HumanMessage(content="call the agent")]
+
+    # Access the name-mangled async method directly.
+    perform_tc = node._LLMNode__perform_tool_calling  # noqa: SLF001
+
+    with patch.object(LLMNode, "_resolve_tool_to_execute", return_value=fake_tool):
         with pytest.raises(LlmNodeError, match="Nested agent LLM failed"):
-            node.invoke({"messages": [HumanMessage(content="call the agent")]})
+            asyncio.run(
+                perform_tc(
+                    ai_with_tool_call,
+                    messages,
+                    client,
+                    config=None,
+                )
+            )
