@@ -16,6 +16,17 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
+
+class LlmNodeError(RuntimeError):
+    """Raised when a nested agent's LLM node fails.
+
+    Using a dedicated subclass (instead of plain RuntimeError) lets callers in
+    the parent agent's tool-calling loop re-raise it explicitly without
+    resorting to fragile string matching, ensuring the error propagates to
+    BaseTool.run() where on_tool_error fires and the UI chip shows error state.
+    """
+
+
 applicationToolSchema = create_model(
     "applicatrionSchema", 
     task = (str, FieldInfo(description="Task for Application. Include all context needed by the application.")), 
@@ -169,7 +180,7 @@ def _raise_if_llm_node_error(response: Any) -> None:
         if isinstance(_msg, BaseMessage):
             if getattr(_msg, 'response_metadata', {}).get('llm_node_error'):
                 _exc_type = _msg.response_metadata.get('llm_node_exception_type', 'LLMError')
-                raise RuntimeError(
+                raise LlmNodeError(
                     f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
                 )
             return  # final non-Human message is clean; no error

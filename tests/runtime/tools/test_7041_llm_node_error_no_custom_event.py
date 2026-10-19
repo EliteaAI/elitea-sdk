@@ -3,7 +3,7 @@
 When the LLM raises (e.g. AuthenticationError 401) and routing_scope is None, LLMNode.invoke()
 catches the exception and converts it to an AIMessage so the graph can continue. The AIMessage
 is tagged with response_metadata['llm_node_error'] = True so that Application._run() can detect
-it downstream and re-raise as RuntimeError, causing BaseTool.run() to fire on_tool_error and
+it downstream and re-raise as LlmNodeError, causing BaseTool.run() to fire on_tool_error and
 the UI Application chip to show an error state instead of closing as "complete".
 
 Application._run() checks only the *final* non-Human message so that a tagged error from a
@@ -13,6 +13,10 @@ call to that sub-agent to raise.
 This test also verifies that no on_custom_event("llm_node_error") is dispatched — the old code
 dispatched it with a random run_id, which in a parallel nested-agent scenario picked the
 still-running sibling's run_id and falsely closed its UI spinner with an error state.
+
+Additionally, tests that LlmNodeError raised by a sub-agent's Application._run() propagates
+through the parent agent's __perform_tool_calling loop instead of being swallowed as a
+ToolMessage(status="error") (#7041 end-to-end propagation gap).
 """
 
 from unittest.mock import MagicMock, patch
@@ -118,11 +122,11 @@ def _tagged_error(text="Error: auth failed", exc_type="AuthenticationError"):
 
 
 def test_application_run_raises_when_final_message_is_tagged():
-    """A tagged final non-Human message must raise RuntimeError (#7041)."""
-    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+    """A tagged final non-Human message must raise LlmNodeError (#7041)."""
+    from elitea_sdk.runtime.tools.application import LlmNodeError, _raise_if_llm_node_error
 
     response = {"messages": [HumanMessage(content="go"), _tagged_error()]}
-    with pytest.raises(RuntimeError, match="Nested agent LLM failed"):
+    with pytest.raises(LlmNodeError, match="Nested agent LLM failed"):
         _raise_if_llm_node_error(response)
 
 
@@ -166,3 +170,40 @@ def test_application_run_does_not_raise_when_current_run_has_no_ai_message():
     }
     # Must not raise: the scan hits the current run's HumanMessage and stops.
     _raise_if_llm_node_error(response)
+
+
+# ---------------------------------------------------------------------------
+# Propagation through __perform_tool_calling (#7041 end-to-end gap)
+# ---------------------------------------------------------------------------
+
+def test_llm_node_error_propagates_through_perform_tool_calling():
+    """LlmNodeError from a sub-agent must not be swallowed by the parent's tool-calling loop.
+
+    Before this fix, the generic `except Exception as e` block in __perform_tool_calling
+    converted the LlmNodeError into a ToolMessage(status="error") and continued the loop,
+    causing the parent to finish successfully and the UI to show "complete" instead of error.
+    """
+    from elitea_sdk.runtime.tools.application import LlmNodeError
+
+    # Simulate an Application tool whose _run raises LlmNodeError
+    fake_tool = MagicMock()
+    fake_tool.name = "nested_agent"
+    fake_tool.invoke.side_effect = LlmNodeError("Nested agent LLM failed (NotFoundError): model not found")
+
+    from elitea_sdk.runtime.tools.llm import LLMNode
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.messages import ToolCall
+
+    client = MagicMock()
+    client.model_name = "parent-model"
+    client._llm_type = "fake"
+
+    node = LLMNode(name="parent", description="parent", client=client)
+
+    tool_call = {"name": "nested_agent", "args": {"task": "do something"}, "id": "call_abc", "type": "tool_call"}
+    ai_with_tool_call = AIMessage(content="", tool_calls=[tool_call])
+
+    with patch.object(LLMNode, "_invoke_llm_internal", return_value=ai_with_tool_call):
+        node._tools = {"nested_agent": fake_tool}
+        with pytest.raises(LlmNodeError, match="Nested agent LLM failed"):
+            node.invoke({"messages": [HumanMessage(content="call the agent")]})
