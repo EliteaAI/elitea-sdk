@@ -183,16 +183,9 @@ def test_llm_node_error_propagates_through_perform_tool_calling():
     converted the LlmNodeError into a ToolMessage(status="error") and continued the loop,
     causing the parent to finish successfully and the UI to show "complete" instead of error.
     """
-    from elitea_sdk.runtime.tools.application import LlmNodeError
-
-    # Simulate an Application tool whose _run raises LlmNodeError
-    fake_tool = MagicMock()
-    fake_tool.name = "nested_agent"
-    fake_tool.invoke.side_effect = LlmNodeError("Nested agent LLM failed (NotFoundError): model not found")
-
+    from elitea_sdk.runtime.tools.application import Application, LlmNodeError
     from elitea_sdk.runtime.tools.llm import LLMNode
     from langchain_core.messages import AIMessage, HumanMessage
-    from langchain_core.messages import ToolCall
 
     client = MagicMock()
     client.model_name = "parent-model"
@@ -203,7 +196,16 @@ def test_llm_node_error_propagates_through_perform_tool_calling():
     tool_call = {"name": "nested_agent", "args": {"task": "do something"}, "id": "call_abc", "type": "tool_call"}
     ai_with_tool_call = AIMessage(content="", tool_calls=[tool_call])
 
-    with patch.object(LLMNode, "_invoke_llm_internal", return_value=ai_with_tool_call):
-        node._tools = {"nested_agent": fake_tool}
+    err = LlmNodeError("Nested agent LLM failed (NotFoundError): model not found")
+
+    # Must spec=Application so isinstance(tool_to_execute, Application) is True in the
+    # __perform_tool_calling path — only Application tools use .invoke(), the non-Application
+    # branch calls .ainvoke() which would swallow the exception before hitting our guard.
+    fake_tool = MagicMock(spec=Application)
+    fake_tool.name = "nested_agent"
+    fake_tool.invoke.side_effect = err
+
+    with patch.object(LLMNode, "_invoke_llm_internal", return_value=ai_with_tool_call), \
+         patch.object(LLMNode, "_resolve_tool_to_execute", return_value=fake_tool):
         with pytest.raises(LlmNodeError, match="Nested agent LLM failed"):
             node.invoke({"messages": [HumanMessage(content="call the agent")]})
