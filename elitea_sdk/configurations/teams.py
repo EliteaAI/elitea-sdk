@@ -1,9 +1,29 @@
 import requests
 import logging
 from typing import Optional, List, Dict
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
 
 log = logging.getLogger(__name__)
+
+# Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions).
+TEAMS_SCOPE_DESCRIPTIONS: Dict[str, str] = {
+    "User.ReadBasic.All": "Look up people by email: chat members, senders and recipients.",
+    "Chat.Read": "Read your chats and chat messages: list_chats, find_chat_messages, search_teams_messages.",
+    "ChatMessage.Send": "Send chat messages as you: send_chat_message.",
+    "Chat.Create": "Start a new 1:1 or group chat when send_chat_message finds no existing chat.",
+    "Team.ReadBasic.All": "List the teams you are a member of: list_teams, team names, connection test.",
+    "Channel.ReadBasic.All": "List the channels of a team: list_channels, channel names.",
+    "ChannelMessage.Send": "Post and reply in channels as you: send_channel_message.",
+}
+TEAMS_SCOPES = list(TEAMS_SCOPE_DESCRIPTIONS)
+TEAMS_DEFAULT_SCOPES = ["User.ReadBasic.All", "Chat.Read", "Team.ReadBasic.All", "Channel.ReadBasic.All"]
+
+
+def normalize_teams_scopes(value) -> List[str]:
+    """Allowed Teams permissions from a stored value (list or string); default when empty."""
+    return normalize_scopes(value, TEAMS_SCOPES, TEAMS_DEFAULT_SCOPES, source="Teams")
 
 
 class TeamsConfiguration(BaseModel):
@@ -39,16 +59,19 @@ class TeamsConfiguration(BaseModel):
         description="OAuth Discovery Endpoint. Format: https://login.microsoftonline.com/{tenant_id}"
     )
     scopes: Optional[List[str]] = Field(
-        default=None,
-        description=(
-            "OAuth Scopes (e.g., User.Read, User.ReadBasic.All, Chat.Read, ChatMessage.Send, Chat.Create, "
-            "Team.ReadBasic.All, Channel.ReadBasic.All, ChannelMessage.Send)"
-        )
+        default=list(TEAMS_DEFAULT_SCOPES),
+        description=SCOPES_NOTE,
+        json_schema_extra=scopes_field_extra(TEAMS_SCOPE_DESCRIPTIONS),
     )
     auto_refresh_token: Optional[bool] = Field(
         default=True,
         description="Automatically refresh the access token using the offline_access scope."
     )
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value):
+        return normalize_teams_scopes(value)
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
@@ -122,7 +145,10 @@ class TeamsConfiguration(BaseModel):
                     configuration_uuid=configuration_uuid,
                 )
             elif resp.status_code == 403:
-                return "Access forbidden - token lacks required Microsoft Graph Teams permissions (Team.ReadBasic.All)"
+                return (
+                    "Access forbidden - the token lacks the Microsoft Graph permission Team.ReadBasic.All. "
+                    "Tick it in the credential scopes and sign in again."
+                )
             else:
                 return f"Microsoft Graph API request failed with status {resp.status_code}"
 
@@ -169,9 +195,7 @@ class TeamsConfiguration(BaseModel):
             fetch_oauth_authorization_server_metadata,
         )
 
-        effective_scopes = list(scopes or [])
-        if "offline_access" not in effective_scopes:
-            effective_scopes.insert(0, "offline_access")
+        effective_scopes = ["offline_access", *normalize_teams_scopes(scopes)]
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         azure_v2_endpoint = f"{base_discovery}/v2.0/.well-known/openid-configuration"
