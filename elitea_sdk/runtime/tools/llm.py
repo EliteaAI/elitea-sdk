@@ -4460,13 +4460,6 @@ class LLMNode(BaseTool):
                         if budget_error is not None:
                             _PENDING_TOOL_MESSAGES.set([])
                             raise budget_error from e
-                        # Re-raise LLM failures from nested agents so they propagate to
-                        # BaseTool.run() and fire on_tool_error, causing the UI chip to
-                        # show an error state instead of silently completing (#7041).
-                        from .application import LlmNodeError
-                        if isinstance(e, LlmNodeError):
-                            _PENDING_TOOL_MESSAGES.set([])
-                            raise
                         import traceback
                         error_details = traceback.format_exc()
                         # Use debug level to avoid duplicate output when CLI callbacks are active

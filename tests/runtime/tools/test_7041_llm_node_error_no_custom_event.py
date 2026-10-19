@@ -14,9 +14,10 @@ This test also verifies that no on_custom_event("llm_node_error") is dispatched 
 dispatched it with a random run_id, which in a parallel nested-agent scenario picked the
 still-running sibling's run_id and falsely closed its UI spinner with an error state.
 
-Additionally, tests that LlmNodeError raised by a sub-agent's Application._run() propagates
-through the parent agent's __perform_tool_calling loop instead of being swallowed as a
-ToolMessage(status="error") (#7041 end-to-end propagation gap).
+Additionally, tests that LlmNodeError raised by a sub-agent's Application._run() is converted
+to a ToolMessage(status="error") by the parent's __perform_tool_calling loop so the parent
+agent continues running (#7041). BaseTool.run() fires on_tool_error BEFORE re-raising, so the
+UI chip already transitions to error state before __perform_tool_calling catches the exception.
 """
 
 from unittest.mock import MagicMock, patch
@@ -176,21 +177,23 @@ def test_application_run_does_not_raise_when_current_run_has_no_ai_message():
 # Propagation through __perform_tool_calling (#7041 end-to-end gap)
 # ---------------------------------------------------------------------------
 
-def test_llm_node_error_propagates_through_perform_tool_calling():
-    """LlmNodeError from a sub-agent must not be swallowed by the parent's tool-calling loop.
+def test_llm_node_error_becomes_tool_message_parent_continues():
+    """LlmNodeError from a sub-agent must become a ToolMessage(status='error') so the parent continues.
 
-    Before this fix, the generic `except Exception as e` block in __perform_tool_calling
-    converted the LlmNodeError into a ToolMessage(status="error") and continued the loop,
-    causing the parent to finish successfully and the UI to show "complete" instead of error.
+    BaseTool.run() fires on_tool_error (→ AgentToolError socket event → UI chip shows error state)
+    BEFORE re-raising the exception. The exception then reaches __perform_tool_calling's generic
+    except block, which converts it to a ToolMessage(status='error') and lets the parent loop
+    continue — the parent agent should NOT stop because a nested agent's LLM failed (#7041).
 
     This test drives __perform_tool_calling directly via asyncio rather than going through
     the full invoke() -> _invoke_llm_internal() stack, which requires extensive mock setup
     (input_mapping, message filtering, tool binding, etc.).
     """
     import asyncio
+    from langchain_core.messages import ToolMessage
+
     from elitea_sdk.runtime.tools.application import Application, LlmNodeError
     from elitea_sdk.runtime.tools.llm import LLMNode
-    from langchain_core.messages import AIMessage, HumanMessage
 
     client = MagicMock()
     client.model_name = "parent-model"
@@ -205,7 +208,7 @@ def test_llm_node_error_propagates_through_perform_tool_calling():
 
     # Must spec=Application so isinstance(tool_to_execute, Application) is True in the
     # __perform_tool_calling path — only Application tools use .invoke(), the non-Application
-    # branch calls .ainvoke() which would swallow the exception before hitting our guard.
+    # branch calls .ainvoke() which would hit a different code path.
     fake_tool = MagicMock(spec=Application)
     fake_tool.name = "nested_agent"
     fake_tool.invoke.side_effect = err
@@ -216,12 +219,24 @@ def test_llm_node_error_propagates_through_perform_tool_calling():
     perform_tc = node._LLMNode__perform_tool_calling  # noqa: SLF001
 
     with patch.object(LLMNode, "_resolve_tool_to_execute", return_value=fake_tool):
-        with pytest.raises(LlmNodeError, match="Nested agent LLM failed"):
-            asyncio.run(
-                perform_tc(
-                    ai_with_tool_call,
-                    messages,
-                    client,
-                    config=None,
-                )
+        result_messages, _completion = asyncio.run(
+            perform_tc(
+                ai_with_tool_call,
+                messages,
+                client,
+                config=None,
             )
+        )
+
+    # The parent must continue: __perform_tool_calling must return normally with
+    # a ToolMessage(status='error') carrying the failure details (#7041).
+    assert result_messages, "Expected at least one message in result"
+    tool_msgs = [m for m in result_messages if isinstance(m, ToolMessage)]
+    assert tool_msgs, "Expected a ToolMessage in the result messages"
+    error_msg = tool_msgs[-1]
+    assert error_msg.status == "error", (
+        f"Expected ToolMessage status='error', got {error_msg.status!r}"
+    )
+    assert "nested_agent" in error_msg.content or "Nested agent LLM failed" in error_msg.content, (
+        f"Expected error content to mention the failure, got: {error_msg.content!r}"
+    )
