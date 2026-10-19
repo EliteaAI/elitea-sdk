@@ -23,6 +23,8 @@ state:
     value: "created >= -3d AND labels in (ELITEA_AI_CREATED) ORDER BY assignee"
   get_tests_result:
     type: str
+  get_tests_summary:
+    type: str
   expected_success_indicators:
     type: list
     value: ["issueId", "jira", "testType"]
@@ -47,12 +49,94 @@ nodes:
     structured_output: false
     tool: get_tests
     toolkit_name: ${XRAY_TOOLKIT_NAME}
+    transition: summarize_get_tests_result
+
+  - id: summarize_get_tests_result
+    type: code
+    code:
+      type: fixed
+      value: |
+        import ast
+        
+        raw_value = elitea_state.get("get_tests_result", "")
+        if isinstance(raw_value, str):
+          raw_result = raw_value
+        else:
+          raw_result = repr(raw_value)
+        summary = {
+          "tool_executed": False,
+          "parse_mode": "none",
+          "tests_count": 0,
+          "has_test_data": False,
+          "success_indicator_found": "none",
+          "error_indicator_found": "none",
+          "error": None
+        }
+        
+        error_indicators = elitea_state.get("error_indicators", []) or []
+        expected_success_indicators = elitea_state.get("expected_success_indicators", []) or []
+        lower_result = raw_result.lower()
+        
+        for indicator in error_indicators:
+          if indicator.lower() in lower_result:
+            summary["error_indicator_found"] = indicator
+            break
+        
+        parsed = None
+        if raw_result.strip():
+          if isinstance(raw_value, list):
+            parsed = raw_value
+            summary["parse_mode"] = "native_list"
+          else:
+            try:
+              parsed = ast.literal_eval(raw_result)
+              summary["parse_mode"] = "python_literal"
+            except Exception:
+              parsed = None
+        
+        if isinstance(parsed, list):
+          summary["tool_executed"] = True
+          summary["tests_count"] = len(parsed)
+          if not parsed:
+            summary["has_test_data"] = True
+          else:
+            first_item = parsed[0]
+            if isinstance(first_item, dict):
+              has_issue_id = "issueId" in first_item
+              jira_value = first_item.get("jira")
+              has_jira_dict = isinstance(jira_value, dict)
+              has_test_type = isinstance(first_item.get("testType"), dict)
+              summary["has_test_data"] = has_issue_id and has_jira_dict and has_test_type
+              for indicator in expected_success_indicators:
+                if indicator == "issueId" and has_issue_id:
+                  summary["success_indicator_found"] = indicator
+                  break
+                if indicator == "jira" and has_jira_dict:
+                  summary["success_indicator_found"] = indicator
+                  break
+                if indicator == "testType" and has_test_type:
+                  summary["success_indicator_found"] = indicator
+                  break
+          if summary["error_indicator_found"] != "none":
+            summary["error"] = f"Tool output contains error indicator: {summary['error_indicator_found']}"
+        else:
+          summary["error"] = "Tool output is not parseable as a list of test objects."
+        
+        {"get_tests_summary": str(summary)}
+    input:
+      - get_tests_result
+      - expected_success_indicators
+      - error_indicators
+    output:
+      - get_tests_summary
+    structured_output: true
     transition: validate_results
 
   - id: validate_results
     type: llm
     input:
       - get_tests_result
+      - get_tests_summary
       - jql_query
       - expected_success_indicators
       - error_indicators
@@ -69,6 +153,7 @@ nodes:
           Analyze the output from the 'get_tests' tool execution.
 
           JQL Query: {jql_query}
+          Get Tests Summary: {get_tests_summary}
           Get Tests Result: {get_tests_result}
           Expected Success Indicators: {expected_success_indicators}
           Error Indicators: {error_indicators}
@@ -76,9 +161,9 @@ nodes:
           This is a POSITIVE test - we expect successful test retrieval.
 
           Validation Criteria (ALL must pass for test_passed=true):
-          1. tool_executed: Tool ran without throwing an exception
+          1. tool_executed: Use the parsed facts from Get Tests Summary to determine whether the tool ran successfully
           2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears in test content like summaries or descriptions.
-          3. has_extracted_tests: Response is a JSON list of test objects (the tool returns the list directly, there is no "Extracted tests" header). An empty list [] is VALID - no tests matched the JQL.
+          3. has_extracted_tests: Response is a Python-style or JSON-style list of test objects. An empty list [] is VALID - no tests matched the JQL.
           4. has_test_data: If the list is non-empty, its items contain test details (issueId, jira fields). Pass this check for an empty list.
 
           Return JSON test_results:
@@ -94,7 +179,8 @@ nodes:
             "error": string | null
           }}
 
-          Treat a JSON array of test objects as a valid successful response even if it does not literally say "Extracted tests".
+          Treat a JSON array OR a Python-style list of test objects as a valid successful response even if it does not literally say "Extracted tests".
+          Prefer the structured facts in Get Tests Summary over trying to re-parse the raw result text.
 
           Return ONLY the JSON object.
     model: ${DEFAULT_LLM_MODEL}
