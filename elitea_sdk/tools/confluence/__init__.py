@@ -101,11 +101,13 @@ class ConfluenceToolkit(BaseToolkit):
 
         model = create_model(
             name,
-            space_key=(str, Field(
-                description="Space Key — the short code identifying the Confluence space "
-                            "(not the human-readable Space Name).\n"
-                            "Found in the space URL, right after the `/display/` path segment, "
-                            "e.g. `MPS` in `https://your-domain.atlassian.net/wiki/display/MPS/...`"
+            space_key=(Optional[str], Field(
+                description="Optional. Enter the Confluence space key, not its display name, to restrict this "
+                            "toolkit to one space. Leave empty to allow access to all spaces available to the "
+                            "configured Confluence account. Agents, pipelines, and indexes can select a space "
+                            "within this scope. You can find the key in the space URL, for example "
+                            "/spaces/KEY/ or /display/KEY/.",
+                default=None
             )),
             api_version=(Literal['Auto', '1', '2'], Field(
                 description="REST API version used for all Confluence operations.\n\n"
@@ -210,7 +212,8 @@ class ConfluenceToolkit(BaseToolkit):
             description = tool["description"]
             if toolkit_name:
                 description = f"Toolkit: {toolkit_name}\n{description}"
-            description = f"Confluence space: {confluence_api_wrapper.space}\n{description}"
+            if confluence_api_wrapper.space:
+                description = f"Confluence space: {confluence_api_wrapper.space} (toolkit is restricted to this space)\n{description}"
             description = description[:1000]
             tools.append(BaseAction(
                 api_wrapper=confluence_api_wrapper,
