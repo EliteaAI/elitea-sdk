@@ -12,7 +12,7 @@ from enum import Enum
 from hashlib import sha256
 from http import HTTPStatus
 from queue import Empty, Full, Queue
-from typing import Any, Callable, ClassVar, Optional, List, Dict, Generator, Set, Tuple, Union
+from typing import Any, Callable, ClassVar, Optional, Iterable, List, Dict, Generator, Set, Tuple, Union
 from uuid import uuid4
 
 from langchain_core.callbacks import dispatch_custom_event
@@ -583,6 +583,16 @@ def indexed_rows_of(entry: Dict[str, Any]):
     return zip(entry.get('ids') or [],
                entry.get('commit_hashes') or [],
                entry.get('blob_shas') or [])
+
+
+def _record_lost_images(toolkit, label: str, failures: List[str]) -> None:
+    stats = toolkit.get_indexing_stats() or toolkit._init_indexing_stats()
+    stats.images_not_described.update(
+        f"{label}: lost image {count}" for count in range(1, len(failures) + 1)
+    )
+    for failure in failures:
+        cause = _ERROR_DETAIL_TAIL.sub("", failure).strip() or failure
+        stats.image_description_errors.setdefault(cause, {})[label] = None
 
 
 def _resolve_base_total(base_total) -> Optional[int]:
@@ -1158,6 +1168,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             run.pipeline_failed_keys.add(failed_key)
             run.doc_names.setdefault(failed_key, doc_name)
 
+    def _discard_partially_parsed(self, document: Document, doc_name: str):
+        run = getattr(self, '_index_run', None)
+        failed_key = self._staging_key(document.metadata)
+        if run is not None and failed_key != IDLESS_STAGING_KEY:
+            run.pipeline_failed_keys.add(failed_key)
+            run.doc_names.setdefault(failed_key, doc_name)
+
     def _withdraw_document(self, doc_name: str, base_doc: Optional[Document], skip_set_name: str):
         stats = self.get_indexing_stats() or self._init_indexing_stats()
         if base_doc is not None and self._is_base_doc_tracked_as_skipped(base_doc):
@@ -1211,14 +1228,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         with collect_image_description_failures() as failures:
             chunks = list(parse())
         if failures and chunks:
-            stats = self.get_indexing_stats() or self._init_indexing_stats()
-            stats.images_not_described.update(
-                f"{label}: lost image {count}" for count in range(1, len(failures) + 1)
-            )
-            for failure in failures:
-                cause = _ERROR_DETAIL_TAIL.sub("", failure).strip() or failure
-                stats.image_description_errors.setdefault(cause, {})[label] = None
+            _record_lost_images(self, label, failures)
         return chunks
+
+    def _stream_tracking_lost_images(self, label: str, parse: Callable[[], Any]) -> Generator[Document, None, None]:
+        produced = False
+        with collect_image_description_failures() as failures:
+            for chunk in parse():
+                produced = True
+                yield chunk
+        if failures and produced:
+            _record_lost_images(self, label, failures)
 
     def _render_image_description_errors(self) -> List[str]:
         stats = self.get_indexing_stats()
@@ -2099,11 +2119,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             executors. All side effects (skip trackers, metadata mutation on
             the doc's own dict) are thread-safe: set.add is GIL-safe and each
             worker touches only its own doc."""
+            return list(_stream_pipeline(base_doc))
+
+        def _stream_pipeline(base_doc: Document) -> Generator[Document, None, None]:
             docs_gen = self._extend_data((base_doc for _ in range(1)))
             docs_gen = self._collect_dependencies(docs_gen)
             docs_gen = self._apply_loaders_chunkers(docs_gen, chunking_tool, chunking_config)
-            docs_gen = self._clean_metadata(docs_gen)
-            return list(docs_gen)
+            return self._clean_metadata(docs_gen)
+
+        def _restore_for_retry(base_doc: Document, loader_metadata: Optional[Dict[str, Any]], exc: Exception) -> None:
+            logger.warning(
+                f"Pipeline failed for '{self._extract_doc_name(base_doc.metadata)}', "
+                f"retrying once: {exc}"
+            )
+            if loader_metadata is not None:
+                base_doc.metadata = loader_metadata
 
         def _run_pipeline_with_retry(base_doc: Document) -> List[Document]:
             # Bounded retry for the fetch/parse half only — the flush path already
@@ -2116,13 +2146,22 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             try:
                 return _run_pipeline(base_doc)
             except Exception as exc:
-                logger.warning(
-                    f"Pipeline failed for '{self._extract_doc_name(base_doc.metadata)}', "
-                    f"retrying once: {exc}"
-                )
-                if loader_metadata is not None:
-                    base_doc.metadata = loader_metadata
+                _restore_for_retry(base_doc, loader_metadata, exc)
                 return _run_pipeline(base_doc)
+
+        def _stream_pipeline_with_retry(base_doc: Document) -> Generator[Document, None, None]:
+            loader_metadata = snapshot_loader_metadata(base_doc)
+            handed_over = False
+            try:
+                for chunk in _stream_pipeline(base_doc):
+                    handed_over = True
+                    yield chunk
+                return
+            except Exception as exc:
+                if handed_over:
+                    raise
+                _restore_for_retry(base_doc, loader_metadata, exc)
+            yield from _stream_pipeline(base_doc)
 
         def _handle_pipeline_failure(base_doc: Document, base_doc_counter: int, exc: Exception) -> None:
             from traceback import format_exc
@@ -2137,12 +2176,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     run.pipeline_failed_keys.add(failed_doc_key)
                     run.doc_names.setdefault(failed_doc_key, doc_name)
 
-        def _consume_pipeline_output(base_doc: Document, base_doc_counter: int, chunks: List[Document]) -> None:
+        def _consume_pipeline_output(base_doc: Document, base_doc_counter: int, chunks: Iterable[Document]) -> None:
             """Main-thread-only. Applies index_name/collection metadata, buffers
             chunks, and updates per-base-doc counters + skip trackers. Kept
             single-writer to preserve original ordering of side effects."""
             _doc_name = self._extract_doc_name(base_doc.metadata)
-            logger.debug(f"Indexing base document #{base_doc_counter}: {base_doc} with {len(chunks)} dependent chunks")
+            logger.debug(f"Indexing base document #{base_doc_counter}: {base_doc}")
 
             dependent_docs_counter = 0
             for doc in chunks:
@@ -2200,6 +2239,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         if workers <= 1:
             # Serial path — identical semantics to the pre-Phase-6 loop.
+            partial_rows_roll_back = staging
             base_doc_counter = 0
             for base_doc in base_documents:
                 base_doc_counter += 1
@@ -2209,6 +2249,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     f"Dependent documents for '{_doc_name}' were processed. "
                     f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
                 )
+                if partial_rows_roll_back:
+                    try:
+                        _consume_pipeline_output(base_doc, base_doc_counter, _stream_pipeline_with_retry(base_doc))
+                    except Exception as exc:
+                        _handle_pipeline_failure(base_doc, base_doc_counter, exc)
+                        _consume_pipeline_output(base_doc, base_doc_counter, [])
+                    continue
                 try:
                     chunks = _run_pipeline_with_retry(base_doc)
                 except Exception as exc:
@@ -2281,6 +2328,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         def _filter_parsing_errors(docs_generator, source_document: Document, source_name: str,
                                    dependent: bool = False):
+            handed_over = False
             for doc in docs_generator:
                 if doc.page_content and doc.page_content.startswith("Unsupported extension for file"):
                     if dependent:
@@ -2293,6 +2341,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         self._track_dependent_parse_failure(source_name, reason="error")
                     else:
                         self._track_explicit_base_failure(source_document, source_name, 'runtime_skipped_error')
+                    if handed_over:
+                        self._discard_partially_parsed(source_document, source_name)
                     continue
                 if not doc.page_content or not doc.page_content.strip():
                     if dependent:
@@ -2300,11 +2350,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     elif hasattr(self, '_track_skipped_file_empty'):
                         self._track_base_parse_failure(source_name, 'files_skipped_empty')
                     continue
+                handed_over = True
                 yield doc
 
         def _chunk_one(document):
-            """Per-doc chunking. Returns a list of chunk Documents (materialized).
-            Safe to run on a worker thread — mutates only the doc's own metadata and
+            """Per-doc chunking. Safe to run on a worker thread — mutates only the doc's own metadata and
             uses a per-call shallow copy of chunking_config."""
             local_config = dict(chunking_config)
             dependent = bool(document.metadata.get(DEPENDENT_DOC_META_KEY))
@@ -2313,7 +2363,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 content = document.metadata.pop(IndexerKeywords.CONTENT_IN_BYTES.value, None)
                 source_name = self._parse_failure_label(
                     document.metadata, content_type, dependent)
-                return self._parse_tracking_lost_images(
+                return self._stream_tracking_lost_images(
                     self._lost_image_label(document.metadata, source_name, dependent), lambda: _filter_parsing_errors(
                     process_document_by_type(
                         document=document,
@@ -2344,7 +2394,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 content_type = file_extension_by_chunker(chunking_tool)
                 source_name = self._parse_failure_label(
                     document.metadata, content_type, dependent)
-                return self._parse_tracking_lost_images(
+                return self._stream_tracking_lost_images(
                     self._lost_image_label(document.metadata, source_name, dependent), lambda: _filter_parsing_errors(
                     process_document_by_type(
                         document=document,
@@ -2359,6 +2409,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 return list(chunker(file_content_generator=iter([document]), config=local_config))
             # return as is if neither chunker nor content type are specified
             return [document]
+
+        def _chunk_one_in_worker(document):
+            return list(_chunk_one(document))
 
         workers = getattr(self, "_index_workers", 1) or 1
         # Nested-pool guard: when called from an outer indexer worker thread
@@ -2383,7 +2436,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             doc_iter = iter(documents)
             for _ in range(workers):
                 try:
-                    in_flight.add(executor.submit(_chunk_one, next(doc_iter)))
+                    in_flight.add(executor.submit(_chunk_one_in_worker, next(doc_iter)))
                 except StopIteration:
                     break
             while in_flight:
@@ -2391,7 +2444,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 for future in done:
                     chunks = future.result()
                     try:
-                        in_flight.add(executor.submit(_chunk_one, next(doc_iter)))
+                        in_flight.add(executor.submit(_chunk_one_in_worker, next(doc_iter)))
                     except StopIteration:
                         pass
                     yield from chunks

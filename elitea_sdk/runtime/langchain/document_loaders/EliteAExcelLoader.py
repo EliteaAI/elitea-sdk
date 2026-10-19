@@ -16,11 +16,17 @@ import logging
 import os
 import zipfile
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Union
+from itertools import chain, islice
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 import pandas as pd
+import tiktoken
 from json import loads
 
 from openpyxl import load_workbook
+from openpyxl.packaging.relationship import get_dependents, get_rels_path
+from openpyxl.utils.cell import range_boundaries
+from openpyxl.xml.constants import REL_NS, SHEET_MAIN_NS
+from openpyxl.xml.functions import iterparse
 from xlrd import open_workbook
 from langchain_core.documents import Document
 from .EliteATableLoader import EliteATableLoader
@@ -29,6 +35,11 @@ from elitea_sdk.runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS, LOA
 logger = logging.getLogger(__name__)
 
 cell_delimiter = " | "
+
+HYPERLINK_TAG = f"{{{SHEET_MAIN_NS}}}hyperlink"
+RELATIONSHIP_ID_ATTRIBUTE = f"{{{REL_NS}}}id"
+HYPERLINK_MARKER = b"hyperlink"
+SHEET_SCAN_BLOCK_BYTES = 1 << 20
 
 EXCEL_MAX_REQUEST_ROWS = 10_000
 EXCEL_MAX_IMAGE_COUNT = 32
@@ -448,6 +459,61 @@ def _format_row_cells(cells) -> str:
     return cell_delimiter.join(parts)
 
 
+def _render_streamed_cell(value, hyperlink_targets: Dict[Tuple[int, int], Optional[str]],
+                          position: Tuple[int, int]) -> str:
+    if position in hyperlink_targets:
+        return f"[{value or ''}]({hyperlink_targets[position]})"
+    return "" if value is None else str(value)
+
+
+def _measure_sheet_extent_from_cells(sheet) -> None:
+    sheet.reset_dimensions()
+    last_row = last_column = None
+    for cells in sheet.rows:
+        if cells:
+            last_row = cells[-1].row
+            last_column = max(last_column or 0, cells[-1].column)
+    sheet._max_row, sheet._max_column = last_row, last_column
+
+
+def _sheet_mentions_hyperlinks(sheet) -> bool:
+    overlap = len(HYPERLINK_MARKER) - 1
+    tail = b""
+    with sheet._get_source() as source:
+        while block := source.read(SHEET_SCAN_BLOCK_BYTES):
+            if HYPERLINK_MARKER in tail + block:
+                return True
+            tail = block[-overlap:]
+    return False
+
+
+def _sheet_relationship_targets(sheet) -> Dict[str, str]:
+    archive = sheet.parent._archive
+    rels_path = get_rels_path(sheet._worksheet_path)
+    if rels_path not in archive.namelist():
+        return {}
+    return {relationship.Id: relationship.Target for relationship in get_dependents(archive, rels_path)}
+
+
+def _sheet_hyperlink_targets(sheet) -> Dict[Tuple[int, int], Optional[str]]:
+    if not _sheet_mentions_hyperlinks(sheet):
+        return {}
+    relationship_targets = _sheet_relationship_targets(sheet)
+    last_row = sheet.max_row
+    last_column = sheet.max_column
+    targets = {}
+    with sheet._get_source() as source:
+        for _, element in iterparse(source):
+            if element.tag == HYPERLINK_TAG and element.get('ref'):
+                target = relationship_targets.get(element.get(RELATIONSHIP_ID_ATTRIBUTE))
+                min_column, min_row, max_column, max_row = range_boundaries(element.get('ref'))
+                for row in range(min_row, min(max_row, last_row or max_row) + 1):
+                    for column in range(min_column, min(max_column, last_column or max_column) + 1):
+                        targets[(row, column)] = target
+            element.clear()
+    return targets
+
+
 def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
                     include_headers, header_row):
     wb = load_workbook(openable, read_only=True, data_only=True)
@@ -656,8 +722,6 @@ class EliteAExcelLoader(EliteATableLoader):
         self.include_headers = kwargs.get('include_headers', True)
         self.header_row = kwargs.get('header_row', 1)
         self.evaluate_formulas = bool(kwargs.get('evaluate_formulas', False))
-        # TEMPORARY (EL-TODO): lets indexing bypass the safety guard for oversized
-        # sheets until a chunked/streaming read path exists. Not exposed via read_file.
         self.skip_size_check = bool(kwargs.get('skip_size_check', False))
         # Set and validate chunking parameters only once
         self.max_tokens = int(kwargs.get('max_tokens', LOADER_MAX_TOKENS_DEFAULT))
@@ -838,77 +902,93 @@ class EliteAExcelLoader(EliteATableLoader):
            c. If a single row exceeds max_tokens, it is placed in its own chunk without splitting, with the header prepended if applicable.
         3. Returns: List[str], where each string is a chunk ready for further processing.
         """
-        import tiktoken
-        encoding = tiktoken.get_encoding('cl100k_base')
+        return list(self._iter_row_chunks(iter(rows)))
 
-        # --- Inner functions ---
-        def count_tokens(text):
-            """Count tokens in text using tiktoken encoding."""
-            return len(encoding.encode(text))
+    def _iter_row_chunks(self, rows: Iterator[str]) -> Iterator[str]:
+        if self.max_tokens < 1:
+            yield '\n'.join(rows)
+            return
+
+        header = None
+        if self.add_header_to_chunks:
+            leading_rows = list(islice(rows, self.header_row_number))
+            if leading_rows:
+                header = leading_rows.pop(self.header_row_number - 1)
+            rows = chain(leading_rows, rows)
 
         def finalize_chunk(chunk_rows):
-            """Join rows for a chunk, prepending header if needed."""
             if self.add_header_to_chunks and header:
                 return '\n'.join([header] + chunk_rows)
-            else:
-                return '\n'.join(chunk_rows)
-        # --- End inner functions ---
+            return '\n'.join(chunk_rows)
 
-        # If max_tokens < 1, return all rows as a single chunk
-        if self.max_tokens < 1:
-            return ['\n'.join(rows)]
-
-        # Extract header if needed
-        header = None
-        if self.add_header_to_chunks and rows:
-            header_idx = self.header_row_number - 1
-            header = rows.pop(header_idx)
-
-        chunks = []  # List to store final chunks
-        current_chunk = []  # Accumulate rows for the current chunk
-        current_tokens = 0  # Token count for the current chunk
-
+        encoding = tiktoken.get_encoding('cl100k_base')
+        current_chunk = []
+        current_tokens = 0
         for row in rows:
-            row_tokens = count_tokens(row)
-            # If row itself exceeds max_tokens, flush current chunk and add row as its own chunk (with header if needed)
+            row_tokens = len(encoding.encode(row))
             if row_tokens > self.max_tokens:
                 if current_chunk:
-                    chunks.append(finalize_chunk(current_chunk))
+                    yield finalize_chunk(current_chunk)
                     current_chunk = []
                     current_tokens = 0
-                # Add the large row as its own chunk, with header if needed
-                if self.add_header_to_chunks and header:
-                    chunks.append(finalize_chunk([row]))
-                else:
-                    chunks.append(row)
+                yield finalize_chunk([row])
                 continue
-            # If adding row would exceed max_tokens, flush current chunk and start new
             if current_tokens + row_tokens > self.max_tokens:
                 if current_chunk:
-                    chunks.append(finalize_chunk(current_chunk))
+                    yield finalize_chunk(current_chunk)
                 current_chunk = [row]
                 current_tokens = row_tokens
             else:
                 current_chunk.append(row)
                 current_tokens += row_tokens
-        # Add any remaining rows as the last chunk
         if current_chunk:
-            chunks.append(finalize_chunk(current_chunk))
-        return chunks
+            yield finalize_chunk(current_chunk)
 
-    def load(self) -> list:
-        """Loads Excel file into a list of Documents, one per chunk per sheet."""
-        docs = []
-        content_per_sheet = self.get_content()
-        for sheet_name, content_chunks in content_per_sheet.items():
-            metadata = {
+    def _streams_workbook(self) -> bool:
+        extension = os.path.splitext(str(self.file_name or ''))[-1].lower()
+        return (self.skip_size_check and extension == '.xlsx'
+                and not self.evaluate_formulas and not self._is_row_range_mode())
+
+    def _iter_sheet_chunks(self) -> Iterator[Tuple[str, str]]:
+        if self._streams_workbook():
+            yield from self._stream_xlsx_chunks()
+            return
+        for sheet_name, content_chunks in self.get_content().items():
+            for chunk in content_chunks:
+                yield sheet_name, chunk
+
+    def _stream_xlsx_chunks(self) -> Iterator[Tuple[str, str]]:
+        workbook = load_workbook(self.file_path, read_only=True, data_only=True)
+        try:
+            if self.sheet_name and self.sheet_name not in workbook.sheetnames:
+                yield self.sheet_name, f"Sheet '{self.sheet_name}' does not exist in the workbook."
+                return
+            for sheet_name in [self.sheet_name] if self.sheet_name else workbook.sheetnames:
+                for chunk in self._iter_row_chunks(self._iter_streamed_rows(workbook[sheet_name])):
+                    yield sheet_name, chunk
+        finally:
+            workbook.close()
+
+    def _iter_streamed_rows(self, sheet) -> Iterator[str]:
+        _measure_sheet_extent_from_cells(sheet)
+        hyperlink_targets = _sheet_hyperlink_targets(sheet)
+        for row_number, values in enumerate(sheet.iter_rows(values_only=True), start=1):
+            yield cell_delimiter.join(
+                _render_streamed_cell(value, hyperlink_targets, (row_number, column_number))
+                for column_number, value in enumerate(values, start=1)
+            )
+
+    def iter_documents(self) -> Iterator[Document]:
+        for sheet_name, chunk in self._iter_sheet_chunks():
+            yield Document(page_content=chunk, metadata={
                 "source": f'{self.file_path}:{sheet_name}',
                 "sheet_name": sheet_name,
                 "file_type": "excel",
-            }
-            for chunk in content_chunks:
-                docs.append(Document(page_content=chunk, metadata=metadata))
-        return docs
+            })
+
+    def load(self) -> list:
+        """Loads Excel file into a list of Documents, one per chunk per sheet."""
+        return list(self.iter_documents())
 
     def read(self, lazy: bool = False):
         df = pd.read_excel(self.file_path, sheet_name=None, engine='calamine')

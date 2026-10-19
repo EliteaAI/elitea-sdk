@@ -4,11 +4,12 @@ import re
 import tempfile
 from logging import getLogger
 from pathlib import Path
-from typing import Generator, List
+from typing import Generator, Iterator, List
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
 
+from elitea_sdk.runtime.langchain.constants import LOADER_MAX_TOKENS_DEFAULT
 from elitea_sdk.runtime.langchain.document_loaders.constants import loaders_map, LoaderProperties
 from ...runtime.langchain.document_loaders.EliteATextLoader import EliteATextLoader
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
@@ -338,6 +339,29 @@ def _load_content_from_bytes_with_prompt(file_content: bytes, extension: str = N
             os.remove(temp_file_path)
 
 
+def _bounded_chunk_tokens(extension_config: dict) -> int:
+    try:
+        max_tokens = int(extension_config.get('max_tokens', LOADER_MAX_TOKENS_DEFAULT))
+    except (TypeError, ValueError):
+        return LOADER_MAX_TOKENS_DEFAULT
+    return max_tokens if max_tokens > 0 else LOADER_MAX_TOKENS_DEFAULT
+
+
+def _indexing_chunking_config(chunking_config) -> dict:
+    indexing_config = dict(chunking_config or {})
+    xlsx_config = indexing_config.get('.xlsx', {})
+    xls_config = indexing_config.get('.xls', {})
+    indexing_config['.xlsx'] = {**xlsx_config, 'skip_size_check': True,
+                                'max_tokens': _bounded_chunk_tokens(xlsx_config)}
+    indexing_config['.xls'] = {**xls_config, 'max_tokens': _bounded_chunk_tokens(xls_config)}
+    return indexing_config
+
+
+def _iter_loaded_documents(loader) -> Iterator[Document]:
+    iter_documents = getattr(loader, 'iter_documents', None)
+    return iter_documents() if callable(iter_documents) else iter(loader.load())
+
+
 def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None, image_cache=None) \
         -> Generator[Document, None, None]:
     """Process the content of a file based on its type using a configured loader cosidering the origin document.
@@ -347,10 +371,7 @@ def process_document_by_type(content, extension_source: str, document: Document 
     share a per-toolkit LRU across every document processed in an indexing run.
     """
     try:
-        # TEMPORARY (EL-TODO): force-bypass the Excel size guard for indexing only —
-        # oversized sheets should be capped/chunked here eventually, not skipped outright.
-        indexing_chunking_config = dict(chunking_config or {})
-        indexing_chunking_config['.xlsx'] = {**indexing_chunking_config.get('.xlsx', {}), 'skip_size_check': True}
+        indexing_chunking_config = _indexing_chunking_config(chunking_config)
         chunks = process_content_by_type(content, extension_source, llm, indexing_chunking_config, image_cache=image_cache)
         chunks_counter = 0
         for chunk in chunks:
@@ -372,7 +393,7 @@ def process_document_by_type(content, extension_source: str, document: Document 
             metadata={**document.metadata, 'chunk_id': 1}
         )
     except Exception as e:
-        msg = f"Error during content parsing for file {extension_source}:\n{e}"
+        msg = f"Error during content parsing for file {extension_source}:\n{str(e) or type(e).__name__}"
         logger.warning(msg)
         yield Document(
             page_content=msg,
@@ -405,6 +426,7 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
     elif not extensions:
         extensions = [".txt"]
 
+    loaded_any = False
     for extension in extensions:
         try:
             with tempfile.NamedTemporaryFile(mode='w+b', suffix=extension, delete=False) as temp_file:
@@ -491,10 +513,12 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                 except (TypeError, ValueError):
                     pass
                 loader = loader_cls(file_path=temp_file_path, **loader_kwargs)
-                yield from loader.load()
+                for loaded_document in _iter_loaded_documents(loader):
+                    loaded_any = True
+                    yield loaded_document
                 break
         except Exception as e:
-            if fallback_extensions:
+            if fallback_extensions and not loaded_any:
                 logger.warning(f"Error loading attachment: {str(e)} for file {temp_file_path} (extension: {extension})")
                 logger.warning(f"Continuing with fallback extensions: {fallback_extensions}.")
                 continue
