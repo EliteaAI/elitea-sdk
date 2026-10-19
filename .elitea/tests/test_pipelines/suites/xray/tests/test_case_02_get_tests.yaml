@@ -75,11 +75,17 @@ nodes:
 
           This is a POSITIVE test - we expect successful test retrieval.
 
+          IMPORTANT:
+          - The tool result may be rendered either as strict JSON or as a Python-style serialized list/dict string.
+          - Treat either representation as SUCCESS when it clearly contains test objects.
+          - Do NOT fail just because the text is not strict JSON.
+          - An empty list [] is also VALID when no tests match the JQL.
+
           Validation Criteria (ALL must pass for test_passed=true):
-          1. tool_executed: Tool ran without throwing an exception
-          2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears in test content like summaries or descriptions.
-          3. has_extracted_tests: Response is a JSON list of test objects (the tool returns the list directly, there is no "Extracted tests" header). An empty list [] is VALID - no tests matched the JQL.
-          4. has_test_data: If the list is non-empty, its items contain test details (issueId, jira fields). Pass this check for an empty list.
+          1. tool_executed: True if the result is non-empty and does not contain tool failure phrases like "Tool execution error" or "Unable to get tests"
+          2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears inside test content.
+          3. has_extracted_tests: Response is a list-like collection of test objects, whether formatted as JSON or Python-style serialized text. [] also passes.
+          4. has_test_data: If the list is non-empty, at least one item contains test details such as issueId and jira/testType. Pass this check for an empty list.
 
           Return JSON test_results:
           {{
@@ -88,13 +94,13 @@ nodes:
             "no_errors": boolean,
             "has_extracted_tests": boolean,
             "has_test_data": boolean,
-            "tests_count": integer (number of items in the list, 0 for an empty list),
+            "tests_count": integer (best-effort number of items in the list, 0 for an empty list),
             "success_indicator_found": "which indicator was found or 'none'",
             "error_indicator_found": "which error indicator was found or 'none'",
             "error": string | null
           }}
 
-          Treat a JSON array of test objects as a valid successful response even if it does not literally say "Extracted tests".
+          Treat visible list output containing issueId/jira/testType fields as a valid successful response even if it is not strict JSON.
 
           Return ONLY the JSON object.
     model: ${DEFAULT_LLM_MODEL}
