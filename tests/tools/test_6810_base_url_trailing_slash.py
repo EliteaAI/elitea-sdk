@@ -198,12 +198,24 @@ class TestTestRail:
     def test_client_gets_normalized_url(self):
         from elitea_sdk.tools.testrail import api_wrapper as tr_module
 
+        # The validator assigns cls._client, so restore it to keep the mock from
+        # leaking into other TestRail tests
+        wrapper_cls = tr_module.TestrailAPIWrapper
+        missing = object()
+        original_client = vars(wrapper_cls).get('_client', missing)
         # The validator re-imports TestRailAPI locally, so patch it at the source
-        with patch('testrail_api.TestRailAPI') as api_cls:
-            try:
-                tr_module.TestrailAPIWrapper(url='https://testrail.example.com/', email='e', password='p')
-            except Exception:
-                pass
+        try:
+            with patch('testrail_api.TestRailAPI') as api_cls:
+                try:
+                    wrapper_cls(url='https://testrail.example.com/', email='e', password='p')
+                except Exception:
+                    pass
+        finally:
+            if original_client is missing:
+                if '_client' in vars(wrapper_cls):
+                    delattr(wrapper_cls, '_client')
+            else:
+                setattr(wrapper_cls, '_client', original_client)
 
         assert api_cls.call_args.args[0] == 'https://testrail.example.com'
 
