@@ -71,11 +71,13 @@ class _AttachmentSelection(NamedTuple):
     truncated: bool
 
 
+_EMPTY_SPACE_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "n/a"})
+
 createPage = create_model(
     "createPage",
     space=(Optional[str], Field(
-        description="Key of the Confluence space to create the page in. Required when the toolkit has no space configured; "
-                    "must match the toolkit's space when it is restricted to one.",
+        description="Key of the Confluence space to create the page in. Leave empty to use the toolkit's space; "
+                    "required only when the toolkit has no space configured.",
         default=None)),
     title=(str, Field(description="Title of the page")),
     body=(str, Field(description="Body of the page")),
@@ -92,8 +94,8 @@ createPage = create_model(
 createPages = create_model(
     "createPages",
     space=(Optional[str], Field(
-        description="Key of the Confluence space to create the pages in. Required when the toolkit has no space configured; "
-                    "must match the toolkit's space when it is restricted to one.",
+        description="Key of the Confluence space to create the pages in. Leave empty to use the toolkit's space; "
+                    "required only when the toolkit has no space configured.",
         default=None)),
     pages_info=(str, Field(
         description="""JSON string containing information about page name and its content per syntax: [{"page1_name": "page1_content"}, {"page2_name": "page2_content"}]""")),
@@ -108,8 +110,8 @@ deletePage = create_model(
     page_id=(Optional[str], Field(description="Page id", default=None)),
     page_title=(Optional[str], Field(description="Page title", default=None)),
     space=(Optional[str], Field(
-        description="Key of the Confluence space to look the page title up in. Required for title-based deletion when "
-                    "the toolkit has no space configured.",
+        description="Key of the Confluence space to look the page title up in. Leave empty to use the toolkit's "
+                    "space; required for title-based deletion only when the toolkit has no space configured.",
         default=None)),
 )
 
@@ -127,16 +129,16 @@ updatePageById = create_model(
 updatePageByTitle = create_model(
     "updatePageByTitle",
     page_title=(str, Field(description="Page title")),
-    space=(Optional[str], Field(
-        description="Key of the Confluence space to look the page title up in. Required when the toolkit has no "
-                    "space configured.",
-        default=None)),
     representation=(Optional[str],
                     Field(description="Content representation format: storage for html, wiki for markdown",
                           default='storage')),
     new_title=(Optional[str], Field(description="New page title", default=None)),
     new_body=(Optional[str], Field(description="New page content", default=None)),
     new_labels=(Optional[list], Field(description="Page labels", default=None)),
+    space=(Optional[str], Field(
+        description="Key of the Confluence space to look the page title up in. Leave empty to use the toolkit's "
+                    "space; required only when the toolkit has no space configured.",
+        default=None)),
 )
 
 updatePages = create_model(
@@ -164,7 +166,7 @@ getPageIdByTitleInput = create_model(
     title=(str, Field(description="Page title")),
     type=(Optional[str], Field(description="Jira type of content: Page or Blogpost. Defaults to page", default="page")),
     space=(Optional[str], Field(
-        description="Optional Confluence space key to narrow this operation. Must match the toolkit's space when the toolkit is restricted to one.",
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),
 
 )
@@ -173,7 +175,7 @@ pageExists = create_model(
     "pageExists",
     title=(str, Field(description="Title of the page")),
     space=(Optional[str], Field(
-        description="Optional Confluence space key to narrow this operation. Must match the toolkit's space when the toolkit is restricted to one.",
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),
 )
 
@@ -181,7 +183,7 @@ getPagesWithLabel = create_model(
     "getPagesWithLabel",
     label=(str, Field(description="Label of the pages")),
     space=(Optional[str], Field(
-        description="Optional Confluence space key to narrow this operation. Must match the toolkit's space when the toolkit is restricted to one.",
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),
 )
 
@@ -190,7 +192,7 @@ searchPages = create_model(
     query=(str, Field(description="Query text to search pages", min_length=1)),
     skip_images=(Optional[bool], Field(description="Whether we need to skip existing images or not", default=False)),
     space=(Optional[str], Field(
-        description="Optional Confluence space key to narrow this operation. Must match the toolkit's space when the toolkit is restricted to one.",
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),
 )
 
@@ -198,7 +200,7 @@ siteSearch = create_model(
     "siteSearch",
     query=(str, Field(description="Query text to execute site search in Confluence")),
     space=(Optional[str], Field(
-        description="Optional Confluence space key to narrow this operation. Must match the toolkit's space when the toolkit is restricted to one.",
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),
 )
 
@@ -385,12 +387,15 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
     @staticmethod
     def _normalize_space(space: Optional[str]) -> Optional[str]:
-        """Treat None, empty and whitespace-only space keys alike as "no space" and strip wrapping quotes."""
+        """Treat None, empty, whitespace-only and placeholder space keys alike as "no space" and strip wrapping quotes."""
         if space is None:
             return None
         space = str(space).strip()
         if len(space) >= 2 and space[0] == space[-1] and space[0] in "'`\"":
             space = space[1:-1].strip()
+        # LLM-filled arguments often spell "no value" as a string
+        if space.casefold() in _EMPTY_SPACE_PLACEHOLDERS:
+            return None
         return space or None
 
     @staticmethod

@@ -29,7 +29,7 @@ def page_in(space_key, page_id='1'):
 
 
 class TestNormalizeSpace:
-    @pytest.mark.parametrize('raw', [None, '', '   ', '""', "' '"])
+    @pytest.mark.parametrize('raw', [None, '', '   ', '""', "' '", 'null', 'None', '"null"', 'undefined', 'N/A'])
     def test_blank_values_mean_no_space(self, raw):
         assert ConfluenceAPIWrapper._normalize_space(raw) is None
 
@@ -51,6 +51,24 @@ class TestNormalizeSpace:
         assert values['space'] is None
 
 
+class TestRuntimeSpaceSchema:
+    # Pipeline toolkit nodes make every field required, so the LLM always fills `space`;
+    # it must be told that empty means "the toolkit's space" (CF18/CF19 regressions).
+    @pytest.mark.parametrize('schema_name', ['createPage', 'createPages', 'deletePage', 'updatePageByTitle',
+                                             'getPageIdByTitleInput', 'pageExists', 'getPagesWithLabel',
+                                             'searchPages', 'siteSearch'])
+    def test_space_description_allows_empty(self, schema_name):
+        from elitea_sdk.tools.confluence import api_wrapper
+        field = getattr(api_wrapper, schema_name).model_fields['space']
+        assert field.default is None
+        assert "Leave empty to use the toolkit's space" in field.description
+
+    def test_update_by_title_keeps_original_field_order(self):
+        from elitea_sdk.tools.confluence.api_wrapper import updatePageByTitle
+        assert list(updatePageByTitle.model_fields) == [
+            'page_title', 'representation', 'new_title', 'new_body', 'new_labels', 'space']
+
+
 class TestResolveSpace:
     # Toolkit space / runtime space -> result, mirroring the index table in the issue
     @pytest.mark.parametrize('toolkit, runtime, expected', [
@@ -61,6 +79,7 @@ class TestResolveSpace:
         ('T', '', 'T'),
         ('T', 'T', 'T'),
         ('T', ' t ', 'T'),
+        ('T', 'null', 'T'),
     ])
     def test_allowed_combinations(self, toolkit, runtime, expected):
         assert make_wrapper(toolkit)._resolve_space(runtime) == expected
