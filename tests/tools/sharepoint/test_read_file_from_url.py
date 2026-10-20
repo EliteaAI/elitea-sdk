@@ -164,6 +164,16 @@ class TestParseSharepointFileUrl:
         with pytest.raises(ToolException, match="Must be a full HTTPS URL"):
             parse_sharepoint_file_url(url)
 
+    @pytest.mark.parametrize("url", [
+        f"https://{HOST}/sites/Team/_layouts/15/WopiFrame.aspx"
+        "?sourcedoc=/sites/Team/Shared%20Documents/a.docx&action=default",
+        f"https://{HOST}/sites/Team/_layouts/15/Doc.aspx"
+        "?sourcedoc=%2Fsites%2FTeam%2FShared%20Documents%2Fa.docx",
+    ])
+    def test_sourcedoc_holding_a_path_resolves_to_that_path(self, url):
+        assert parse_sharepoint_file_url(url).server_relative_paths == (
+            "/sites/Team/Shared Documents/a.docx",)
+
     def test_malformed_sourcedoc_is_rejected(self):
         with pytest.raises(ToolException, match="not a document id"):
             parse_sharepoint_file_url(f"https://{HOST}/sites/Team/_layouts/15/Doc.aspx?sourcedoc=abc")

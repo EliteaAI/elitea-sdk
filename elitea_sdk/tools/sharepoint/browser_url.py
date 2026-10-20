@@ -42,12 +42,12 @@ class SharepointFileUrl:
     is_sharing_link: bool = False
 
 
-def _id_path_candidates(raw_query: str) -> Tuple[str, ...]:
+def _path_candidates(raw_query: str, param: str) -> Tuple[str, ...]:
     """SharePoint (ASP.NET) decodes '+' in the query as a space, so that reading
     goes first; the literal-'+' reading covers URLs whose '+' was decoded from
     %2B before they reached the tool."""
     raw_id = next((value for key, _, value in (pair.partition('=') for pair in raw_query.split('&'))
-                   if unquote(key).lower() == 'id'), '')
+                   if unquote(key).lower() == param), '')
     candidates = (unquote(raw_id.replace('+', ' ')).rstrip('/'), unquote(raw_id).rstrip('/'))
     return tuple(dict.fromkeys(path for path in candidates if path.startswith('/')))
 
@@ -67,12 +67,15 @@ def parse_sharepoint_file_url(url: Optional[str]) -> SharepointFileUrl:
     if 'sourcedoc' in query:
         guid = _GUID.match(query['sourcedoc'].strip())
         if not guid:
+            sourcedoc_paths = _path_candidates(parsed.query, 'sourcedoc')
+            if sourcedoc_paths:
+                return SharepointFileUrl(host=host, server_relative_paths=sourcedoc_paths)
             raise ToolException(
                 "Invalid SharePoint URL: the 'sourcedoc' parameter is not a document id.")
         site_path = _LAYOUTS_SEGMENT.split(path, maxsplit=1)[0].rstrip('/')
         return SharepointFileUrl(host=host, site_path=site_path, unique_id=guid.group(1))
 
-    id_paths = _id_path_candidates(parsed.query)
+    id_paths = _path_candidates(parsed.query, 'id')
     if id_paths:
         return SharepointFileUrl(host=host, server_relative_paths=id_paths)
 
