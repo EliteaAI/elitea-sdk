@@ -342,3 +342,12 @@ def test_client_injects_guard_first_only_when_enabled(_reset_security):
     assert isinstance(existing[0], InputGuardMiddleware)
     assert len(existing) == 2
     assert existing[0].project_id == 3
+
+
+def test_a_well_formed_block_as_the_first_text_of_a_message_is_inspected():
+    # The platform appends its block after the user's text; one in first position is user text
+    guard = InputGuardMiddleware(policy=BLOCK)
+    history = [HumanMessage(content=[{'type': 'text', 'text': _context_block() + f'\n{TOKEN}'}])]
+
+    with pytest.raises(InputGuardrailBlocked):
+        guard.before_model({'input': 'go', 'messages': history}, {})

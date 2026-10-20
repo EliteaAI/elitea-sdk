@@ -145,7 +145,7 @@ class InputGuardMiddleware(Middleware):
                     if isinstance(item, HumanMessage):
                         self._collect_content(item.content, turn_kind, add, not_inspected, 'input', i)
                 else:
-                    self._collect_block(item, turn_kind, add, not_inspected, _Location('input', i, None))
+                    self._collect_block(item, turn_kind, add, not_inspected, _Location('input', i, None), platform_ok=i > 0)
 
         for i, message in enumerate(state.get('messages') or []):
             # User turns only: tool results are outside input-guardrail scope
@@ -158,14 +158,14 @@ class InputGuardMiddleware(Middleware):
             add(kind, content, _Location(target, message_index, None))
             return
         for b, block in enumerate(content or []):
-            self._collect_block(block, kind, add, not_inspected, _Location(target, message_index, b))
+            self._collect_block(block, kind, add, not_inspected, _Location(target, message_index, b), platform_ok=b > 0)
 
     @staticmethod
-    def _collect_block(block, kind, add, not_inspected, location: _Location) -> None:
+    def _collect_block(block, kind, add, not_inspected, location: _Location, platform_ok: bool = False) -> None:
         if isinstance(block, str):
             add(kind, block, location)
         elif isinstance(block, dict) and block.get('type') == 'text':
-            add(kind, block.get('text') or '', location, platform_ok=True)
+            add(kind, block.get('text') or '', location, platform_ok=platform_ok)
         elif isinstance(block, dict):
             not_inspected.append(str(block.get('type') or 'unknown'))
 
