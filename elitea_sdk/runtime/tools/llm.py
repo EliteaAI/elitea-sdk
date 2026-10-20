@@ -44,7 +44,7 @@ from ..context_floor import (
     resolve_floor_tokens,
     shrink_after_overflow,
 )
-from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
+from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..tool_outcome import outcome_sink
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
@@ -1212,7 +1212,7 @@ class LLMNode(BaseTool):
         middleware_updates = []
         original_state = None
 
-        # Run before_model hooks (may summarize messages)
+        # Run before_model hooks (may summarize messages, may raise InputGuardrailBlocked)
         if middleware_mgr is not None and isinstance(state, dict):
             original_state = state.copy()
             state, middleware_updates = middleware_mgr.run_before_model(state, config or {})
@@ -1222,7 +1222,7 @@ class LLMNode(BaseTool):
             result = self._invoke_llm_internal(state, config, middleware_updates)
         except GraphBubbleUp:
             raise
-        except OutputContinuationExhausted:
+        except (OutputContinuationExhausted, InputGuardrailBlocked):
             raise
         except Exception as e:
             # A budget rejection is a policy outcome with no recovery, so it must not
@@ -4049,8 +4049,10 @@ class LLMNode(BaseTool):
                         status="error",
                     ))
                     continue
-                # Never hand a budget rejection back as tool output: the parent model
-                # would reason about it as data and may retry or paraphrase it
+                # Never hand a budget rejection or guardrail block back as tool output:
+                # the parent model would reason about it as data and may retry it
+                if isinstance(result, InputGuardrailBlocked):
+                    raise result
                 budget_error = budget_exceeded_from(result)
                 if budget_error is not None:
                     raise budget_error from result
@@ -4451,7 +4453,7 @@ class LLMNode(BaseTool):
                         ))
                         continue
                     except Exception as e:
-                        if isinstance(e, OutputContinuationExhausted):
+                        if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked)):
                             _PENDING_TOOL_MESSAGES.set([])
                             raise
                         # Same reasoning as the MCP clause above: swallowing a budget
@@ -4560,7 +4562,7 @@ class LLMNode(BaseTool):
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
-                if isinstance(e, OutputContinuationExhausted):
+                if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked)):
                     _PENDING_TOOL_MESSAGES.set([])
                     raise
                 # Checked before the string-matching classification below, which has no

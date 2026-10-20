@@ -23,6 +23,10 @@ _sensitive_action_company_name: str = DEFAULT_SENSITIVE_ACTION_COMPANY_NAME
 _sensitive_action_message_template: str = DEFAULT_SENSITIVE_ACTION_MESSAGE_TEMPLATE
 _sensitive_tools_initialized: bool = False
 
+# Input guardrail (#6886): the raw ``input_guardrail`` config block, parsed lazily
+_input_guard_policy: Optional[Dict] = None
+_input_guard_initialized: bool = False
+
 
 def get_tool_name_aliases(tool_name: Optional[str]) -> List[str]:
     """Return canonical aliases for a tool name.
@@ -163,6 +167,48 @@ def configure_sensitive_tools(
         message_template or DEFAULT_SENSITIVE_ACTION_MESSAGE_TEMPLATE
     )
     _sensitive_tools_initialized = True
+
+def configure_input_guard(policy: Optional[Dict] = None) -> None:
+    """Configure the input guardrail from the platform's ``input_guardrail`` block."""
+    global _input_guard_policy, _input_guard_initialized
+    _input_guard_policy = dict(policy) if policy else None
+    _input_guard_initialized = True
+    if _input_guard_policy and _input_guard_policy.get('enabled'):
+        logger.info(
+            "[SECURITY] Input guardrail enabled: categories=%s on_error=%s",
+            _input_guard_policy.get('categories'), _input_guard_policy.get('on_error', 'fail_open'),
+        )
+
+
+def _load_input_guard_from_env() -> None:
+    global _input_guard_policy, _input_guard_initialized
+    if _input_guard_initialized:
+        return
+    env_policy = os.environ.get('ELITEA_INPUT_GUARDRAIL', '')
+    if env_policy:
+        try:
+            parsed = json.loads(env_policy)
+            _input_guard_policy = parsed if isinstance(parsed, dict) else None
+        except Exception as e:
+            logger.warning(f"[SECURITY] Failed to parse ELITEA_INPUT_GUARDRAIL: {e}")
+    _input_guard_initialized = True
+
+
+def get_input_guard_policy() -> Optional[Dict]:
+    _load_input_guard_from_env()
+    return dict(_input_guard_policy) if _input_guard_policy else None
+
+
+def has_input_guard_config() -> bool:
+    _load_input_guard_from_env()
+    return bool(_input_guard_policy and _input_guard_policy.get('enabled'))
+
+
+def reset_input_guard() -> None:
+    global _input_guard_policy, _input_guard_initialized
+    _input_guard_policy = None
+    _input_guard_initialized = False
+
 
 def _load_blocklist_from_env() -> None:
     """Load blocklist from environment variables if not configured."""

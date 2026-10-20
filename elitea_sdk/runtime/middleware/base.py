@@ -16,6 +16,8 @@ from typing import Any, List, Optional, Dict, Callable
 
 from langchain_core.tools import BaseTool
 
+from ..exceptions import InputGuardrailBlocked
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,7 +121,9 @@ class Middleware(ABC):
             config: Runtime configuration (thread_id, etc.)
 
         Returns:
-            State updates dict (e.g., {'messages': [...]}) or None
+            State updates dict (e.g., {'messages': [...]}) or None. Besides
+            'messages', the manager applies 'input' (the current turn) and
+            'transient_messages' (a model-only view, never checkpointed).
         """
         return None
 
@@ -317,6 +321,14 @@ class MiddlewareManager:
                     state = {**state, 'messages': transformed_messages}
 
                 updates = mw.before_model(state, config)
+                if updates and 'input' in updates:
+                    # The current turn lives outside 'messages' in the LLM node state;
+                    # without this a redacted turn would never reach the model input
+                    state = {**state, 'input': updates['input']}
+                if updates and 'transient_messages' in updates:
+                    # Same contract as transform_messages_for_model: replaces the model's
+                    # view only. A 'messages' update would append and reorder instead.
+                    state = {**state, 'messages': updates['transient_messages']}
                 if updates and 'messages' in updates:
                     # Only collect RemoveMessage operations for checkpoint
                     # The actual messages are already in state after processing
@@ -334,6 +346,10 @@ class MiddlewareManager:
                         f"[MiddlewareManager] {type(mw).__name__} applied: "
                         f"{original_count} -> {new_count} messages, RemoveMessage ops: {len(remove_ops)}"
                     )
+            except InputGuardrailBlocked:
+                # A policy decision, not a middleware failure: swallowing it would send
+                # the very input the guardrail refused
+                raise
             except Exception as e:
                 logger.error(f"Middleware {type(mw).__name__} before_model failed: {e}")
         return state, remove_ops
