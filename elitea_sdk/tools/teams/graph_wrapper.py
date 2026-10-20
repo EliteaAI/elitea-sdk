@@ -50,6 +50,8 @@ _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 _BREAK_RE = re.compile(r"<\s*(?:br\s*/?|/p|/div|/li)\s*>", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 
+from ...runtime.utils.mcp_oauth import is_entra_url
+
 log = logging.getLogger(__name__)
 
 
@@ -337,6 +339,10 @@ class TeamsGraphWrapper:
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
         if not self._refresh_token or not self._oauth_token_endpoint:
+            return False
+        # Never send the refresh token and client secret to a non-Entra host
+        if not is_entra_url(self._oauth_token_endpoint):
+            log.warning("%s: token refresh skipped, token endpoint is not an Entra host", type(self).__name__)
             return False
         try:
             data = {

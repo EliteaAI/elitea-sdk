@@ -1015,8 +1015,23 @@ def refresh_oauth_token(
         raise ValueError(f"Token refresh failed: {error_msg}")
 
 
+ENTRA_HOSTS = frozenset({"login.microsoftonline.com"})
+
+
+def is_entra_url(url) -> bool:
+    """True only for https URLs on the Entra login host; stored secrets must never go anywhere else."""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in ENTRA_HOSTS and not parsed.username
+
+
 def entra_token_endpoint(oauth_discovery_endpoint: str) -> str:
     """Token endpoint for an Entra authority such as https://login.microsoftonline.com/<tenant>."""
+    if not is_entra_url(oauth_discovery_endpoint):
+        raise ValueError("OAuth authority must be https://login.microsoftonline.com/<tenant>")
     return f"{oauth_discovery_endpoint.rstrip('/')}/oauth2/v2.0/token"
 
 
@@ -1028,7 +1043,7 @@ def access_token_from_stored_login(settings: dict, default_scope: str = "https:/
     if hasattr(refresh_value, "get_secret_value"):
         refresh_value = refresh_value.get_secret_value()
     endpoint = settings.get("oauth_discovery_endpoint")
-    if not refresh_value or not endpoint:
+    if not refresh_value or not endpoint or not is_entra_url(endpoint):
         return None
     secret = settings.get("client_secret")
     if hasattr(secret, "get_secret_value"):

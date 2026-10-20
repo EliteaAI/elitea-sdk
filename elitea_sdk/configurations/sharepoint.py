@@ -3,7 +3,7 @@ import requests
 import logging
 from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,15 @@ class SharepointConfiguration(BaseModel):
         default=None, description="Refresh token of the signed-in user (set by Login)",
         json_schema_extra={"hidden": True},
     )
+
+    @field_validator("oauth_discovery_endpoint")
+    @classmethod
+    def _entra_authority_only(cls, value):
+        # The client secret and the stored login are posted to this authority's token endpoint
+        from ..runtime.utils.mcp_oauth import is_entra_url
+        if value and not is_entra_url(value):
+            raise ValueError("Must be https://login.microsoftonline.com/<tenant_id>")
+        return value
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:

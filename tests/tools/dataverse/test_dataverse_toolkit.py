@@ -383,3 +383,22 @@ def test_get_tools_passes_runtime_tokens_through(monkeypatch):
     with pytest.raises(RuntimeError, match="stop"):
         dataverse_module.get_tools({"settings": {"dataverse_configuration": SETTINGS, "tokens": {"k": "v"}}})
     assert captured["tokens"] == {"k": "v"}
+
+
+def test_expired_injected_token_falls_back_to_stored_login_once(http):
+    # The platform cache can hand out a token with ~2 minutes left; a long run must not die on it.
+    http.api_responses = [FakeResponse(401, {}), FakeResponse(200, {"UserId": "u-1"})]
+    settings = {**SETTINGS, "access_token": "stale"}
+
+    assert DataverseConfiguration.check_connection(settings) is None
+
+    assert len(http.token_calls) == 1
+    assert [c["headers"]["Authorization"] for c in http.api_calls] == ["Bearer stale", "Bearer at-1"]
+
+
+def test_injected_token_401_without_stored_login_is_reported(http):
+    http.api_responses = [FakeResponse(401, {})]
+    settings = {**SETTINGS, "access_token": "stale", "refresh_token": None}
+    with pytest.raises(DataverseError, match="rejected"):
+        dv._dataverse_request(settings, "GET", "/WhoAmI")
+    assert http.token_calls == []

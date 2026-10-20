@@ -93,7 +93,7 @@ def wrapper():
 class TestHttp:
     def test_refreshes_token_once_on_401(self, graph):
         w = TeamsGraphWrapper(token=FAKE_TOKEN, scopes=["Chat.Read"], refresh_token="stub-refresh",
-                              oauth_token_endpoint="https://login.example.com/token")
+                              oauth_token_endpoint="https://login.microsoftonline.com/t/oauth2/v2.0/token")
         graph.on("GET", f"{G}/me/joinedTeams", _resp(401, {"error": {"message": "expired"}}),
                  _resp(json_body={"value": []}))
         with patch("requests.post", return_value=_resp(json_body={"access_token": "stub-new"})) as post:

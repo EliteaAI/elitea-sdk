@@ -145,3 +145,50 @@ def test_injected_token_without_refresh_keeps_stored_login(module_path, settings
         toolkit_cls.get_toolkit(**{settings_key: config, "tokens": {f"uuid-1:{AUTHORITY}": {"access_token": "at"}}})
     assert captured["token"] == "at"
     assert captured["refresh_token"] == "stored-refresh"
+
+
+# --- Secrets never leave for a non-Entra host -------------------------------------------------
+# Anyone who can edit a shared credential could otherwise point the authority at their own server
+# and receive the vault client_secret plus the stored refresh token on the next refresh.
+
+EVIL = ["https://evil.example.com/tenant-1", "http://login.microsoftonline.com/tenant-1",
+        "https://login.microsoftonline.com.evil.com/t", "https://user@login.microsoftonline.com/t", ""]
+
+
+@pytest.mark.parametrize("authority", EVIL)
+def test_entra_token_endpoint_refuses_other_hosts(authority):
+    with pytest.raises(ValueError):
+        entra_token_endpoint(authority)
+
+
+@pytest.mark.parametrize("authority", EVIL[:4])
+def test_stored_login_never_posts_to_other_hosts(authority, token_endpoint):
+    settings = {"oauth_discovery_endpoint": authority, "refresh_token": "r", "client_secret": "s", "client_id": "c"}
+    assert access_token_from_stored_login(settings) is None
+    assert token_endpoint.calls == []
+
+
+@pytest.mark.parametrize("config_cls", CONFIGS)
+def test_credential_with_non_entra_authority_cannot_be_saved(config_cls):
+    base = {"client_id": "c", "client_secret": "s", "site_url": "https://contoso.sharepoint.com/sites/a"}
+    with pytest.raises(ValueError, match="login.microsoftonline.com"):
+        config_cls.model_validate({**base, "oauth_discovery_endpoint": "https://evil.example.com/t"})
+    config_cls.model_validate({**base, "oauth_discovery_endpoint": AUTHORITY})
+
+
+@pytest.mark.parametrize("module_path,cls_name", [
+    ("elitea_sdk.tools.outlook.graph_wrapper", "OutlookGraphWrapper"),
+    ("elitea_sdk.tools.teams.graph_wrapper", "TeamsGraphWrapper"),
+    ("elitea_sdk.tools.sharepoint.graph_wrapper", "SharepointGraphWrapper"),
+])
+def test_401_retry_refuses_non_entra_token_endpoint(module_path, cls_name, monkeypatch):
+    # The reactive 401 refresh posts the stored login; a tampered endpoint must short-circuit it.
+    import importlib
+    module = importlib.import_module(module_path)
+    posted = []
+    monkeypatch.setattr(module.requests, "post", lambda *a, **k: posted.append(a) or None)
+    wrapper = object.__new__(getattr(module, cls_name))
+    wrapper._refresh_token, wrapper._oauth_token_endpoint = "r", "https://evil.example.com/token"
+    wrapper._client_id, wrapper._client_secret, wrapper._scopes = "c", "s", []
+    assert wrapper._try_refresh_token() is False
+    assert posted == []

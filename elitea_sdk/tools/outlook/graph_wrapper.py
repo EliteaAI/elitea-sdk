@@ -57,6 +57,8 @@ _SUMMARY_FIELDS = ("id,conversationId,parentFolderId,subject,from,toRecipients,c
 _CHECK_FIELDS = "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead"
 _SENT_FIELDS = "id,conversationId,internetMessageId,subject,toRecipients,sentDateTime"
 
+from ...runtime.utils.mcp_oauth import is_entra_url
+
 log = logging.getLogger(__name__)
 
 
@@ -360,6 +362,10 @@ class OutlookGraphWrapper:
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
         if not self._refresh_token or not self._oauth_token_endpoint:
+            return False
+        # Never send the refresh token and client secret to a non-Entra host
+        if not is_entra_url(self._oauth_token_endpoint):
+            log.warning("%s: token refresh skipped, token endpoint is not an Entra host", type(self).__name__)
             return False
         try:
             data = {
