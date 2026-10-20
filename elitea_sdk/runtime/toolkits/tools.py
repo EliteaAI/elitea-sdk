@@ -9,8 +9,10 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field
 
+from elitea_sdk.tools import AVAILABLE_TOOLS, TOOLKIT_TYPE_ALIASES
 from elitea_sdk.tools import get_toolkits as elitea_toolkits
 from elitea_sdk.tools import get_tools as elitea_tools
+from ..credential_slots import GovernedCredentialError, has_slots
 from .application import ApplicationToolkit
 from .artifact import ArtifactToolkit
 from .vectorstore import VectorStoreToolkit
@@ -1035,6 +1037,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     _delegated_auth_errors: Dict[str, McpAuthorizationRequired] = {}
 
     for tool in deduplicated_tools:
+        # A governed credential slot is only resolved for built-in, configuration-backed toolkits
+        # (elitea_sdk.tools.get_tools). MCP, application, community and custom-module tools would
+        # run with the slot unresolved, so refuse them before any branch below handles them.
+        if has_slots(tool.get('settings')) and TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type']) not in AVAILABLE_TOOLS:
+            raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
         # Flag to track if this tool was processed by the main loop
         # Used to prevent double processing by fallback systems
         tool_handled = False
@@ -1665,6 +1672,8 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     # Tool must have its own logic of handling it
     if mcp_tokens:
         for tool in unhandled_tools:
+            if has_slots(tool.get('settings')):
+                continue  # governed toolkits never receive the browser token map
             if 'settings' not in tool:
                 tool['settings'] = {}
             tool['settings']['tokens'] = mcp_tokens
