@@ -25,7 +25,7 @@ from json import loads
 from openpyxl import load_workbook
 from openpyxl.packaging.relationship import get_dependents, get_rels_path
 from openpyxl.utils.cell import range_boundaries
-from openpyxl.xml.constants import REL_NS, SHEET_MAIN_NS
+from openpyxl.xml.constants import COMMENTS_NS, REL_NS, SHEET_MAIN_NS
 from openpyxl.xml.functions import iterparse
 from xlrd import open_workbook
 from langchain_core.documents import Document
@@ -38,7 +38,9 @@ cell_delimiter = " | "
 
 HYPERLINK_TAG = f"{{{SHEET_MAIN_NS}}}hyperlink"
 RELATIONSHIP_ID_ATTRIBUTE = f"{{{REL_NS}}}id"
-HYPERLINK_MARKER = b"hyperlink"
+MERGE_CELL_TAG = f"{{{SHEET_MAIN_NS}}}mergeCell"
+COMMENT_TAG = f"{{{SHEET_MAIN_NS}}}comment"
+SHEET_ANNOTATION_MARKERS = (b"hyperlink", b"mergeCell")
 SHEET_SCAN_BLOCK_BYTES = 1 << 20
 
 EXCEL_MAX_REQUEST_ROWS = 10_000
@@ -459,11 +461,24 @@ def _format_row_cells(cells) -> str:
     return cell_delimiter.join(parts)
 
 
-def _render_streamed_cell(value, hyperlink_targets: Dict[Tuple[int, int], Optional[str]],
-                          position: Tuple[int, int]) -> str:
-    if position in hyperlink_targets:
-        return f"[{value or ''}]({hyperlink_targets[position]})"
-    return "" if value is None else str(value)
+@dataclass(frozen=True)
+class _StreamedLink:
+    target: Optional[str]
+    text_for_empty_cell: Optional[str]
+
+
+@dataclass
+class _SheetAnnotations:
+    merged_ranges: List[str]
+    hyperlinks: List[Tuple[str, Optional[str], Optional[str]]]
+
+
+def _render_streamed_cell(value, links: Dict[Tuple[int, int], _StreamedLink], position: Tuple[int, int]) -> str:
+    link = links.get(position)
+    if link is None:
+        return "" if value is None else str(value)
+    shown = link.text_for_empty_cell if value is None else value
+    return f"[{shown or ''}]({link.target})"
 
 
 def _measure_sheet_extent_from_cells(sheet) -> None:
@@ -476,42 +491,103 @@ def _measure_sheet_extent_from_cells(sheet) -> None:
     sheet._max_row, sheet._max_column = last_row, last_column
 
 
-def _sheet_mentions_hyperlinks(sheet) -> bool:
-    overlap = len(HYPERLINK_MARKER) - 1
+def _widen_sheet_extent(sheet, ref: str) -> Tuple[int, int, int, int]:
+    min_column, min_row, max_column, max_row = range_boundaries(ref)
+    sheet._max_row = max(sheet._max_row or 0, max_row)
+    sheet._max_column = max(sheet._max_column or 0, max_column)
+    return min_column, min_row, max_column, max_row
+
+
+def _cells_of(bounds: Tuple[int, int, int, int]) -> Iterator[Tuple[int, int]]:
+    min_column, min_row, max_column, max_row = bounds
+    for row in range(min_row, max_row + 1):
+        for column in range(min_column, max_column + 1):
+            yield row, column
+
+
+def _sheet_mentions_annotations(sheet) -> bool:
+    overlap = max(len(marker) for marker in SHEET_ANNOTATION_MARKERS) - 1
     tail = b""
     with sheet._get_source() as source:
         while block := source.read(SHEET_SCAN_BLOCK_BYTES):
-            if HYPERLINK_MARKER in tail + block:
+            window = tail + block
+            if any(marker in window for marker in SHEET_ANNOTATION_MARKERS):
                 return True
             tail = block[-overlap:]
     return False
 
 
-def _sheet_relationship_targets(sheet) -> Dict[str, str]:
+def _sheet_relationships(sheet):
     archive = sheet.parent._archive
     rels_path = get_rels_path(sheet._worksheet_path)
     if rels_path not in archive.namelist():
-        return {}
-    return {relationship.Id: relationship.Target for relationship in get_dependents(archive, rels_path)}
+        return None
+    return get_dependents(archive, rels_path)
 
 
-def _sheet_hyperlink_targets(sheet) -> Dict[Tuple[int, int], Optional[str]]:
-    if not _sheet_mentions_hyperlinks(sheet):
-        return {}
-    relationship_targets = _sheet_relationship_targets(sheet)
-    last_row = sheet.max_row
-    last_column = sheet.max_column
-    targets = {}
+def _read_sheet_annotations(sheet) -> _SheetAnnotations:
+    annotations = _SheetAnnotations(merged_ranges=[], hyperlinks=[])
+    if not _sheet_mentions_annotations(sheet):
+        return annotations
     with sheet._get_source() as source:
         for _, element in iterparse(source):
-            if element.tag == HYPERLINK_TAG and element.get('ref'):
-                target = relationship_targets.get(element.get(RELATIONSHIP_ID_ATTRIBUTE))
-                min_column, min_row, max_column, max_row = range_boundaries(element.get('ref'))
-                for row in range(min_row, min(max_row, last_row or max_row) + 1):
-                    for column in range(min_column, min(max_column, last_column or max_column) + 1):
-                        targets[(row, column)] = target
+            if element.tag == MERGE_CELL_TAG and element.get('ref'):
+                annotations.merged_ranges.append(element.get('ref'))
+            elif element.tag == HYPERLINK_TAG and element.get('ref'):
+                annotations.hyperlinks.append(
+                    (element.get('ref'), element.get(RELATIONSHIP_ID_ATTRIBUTE), element.get('location')))
             element.clear()
-    return targets
+    return annotations
+
+
+def _sheet_comment_refs(sheet, relationships) -> List[str]:
+    if relationships is None:
+        return []
+    refs = []
+    for relationship in relationships.find(COMMENTS_NS):
+        with sheet.parent._archive.open(relationship.target) as source:
+            for _, element in iterparse(source):
+                if element.tag == COMMENT_TAG and element.get('ref'):
+                    refs.append(element.get('ref'))
+                element.clear()
+    return refs
+
+
+def _bind_streamed_sheet_layout(sheet) -> Dict[Tuple[int, int], _StreamedLink]:
+    _measure_sheet_extent_from_cells(sheet)
+    annotations = _read_sheet_annotations(sheet)
+    relationships = _sheet_relationships(sheet)
+
+    merged_anchors = {}
+    for merged_range in annotations.merged_ranges:
+        bounds = _widen_sheet_extent(sheet, merged_range)
+        anchor = (bounds[1], bounds[0])
+        for position in _cells_of(bounds):
+            if position != anchor:
+                merged_anchors.setdefault(position, anchor)
+
+    links: Dict[Tuple[int, int], _StreamedLink] = {}
+
+    def bind(position, target, location):
+        previous = links.get(position)
+        filled = previous is not None and previous.text_for_empty_cell is not None
+        text = previous.text_for_empty_cell if filled else (target or location)
+        links[position] = _StreamedLink(target, text)
+
+    for ref, relationship_id, location in annotations.hyperlinks:
+        target = relationships.get(relationship_id).Target if relationship_id and relationships else None
+        bounds = _widen_sheet_extent(sheet, ref)
+        if ":" in ref:
+            for position in _cells_of(bounds):
+                if position not in merged_anchors:
+                    bind(position, target, location)
+        else:
+            position = (bounds[1], bounds[0])
+            bind(merged_anchors.get(position, position), target, location)
+
+    for ref in _sheet_comment_refs(sheet, relationships):
+        _widen_sheet_extent(sheet, ref)
+    return links
 
 
 def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
@@ -970,11 +1046,10 @@ class EliteAExcelLoader(EliteATableLoader):
             workbook.close()
 
     def _iter_streamed_rows(self, sheet) -> Iterator[str]:
-        _measure_sheet_extent_from_cells(sheet)
-        hyperlink_targets = _sheet_hyperlink_targets(sheet)
+        hyperlinks = _bind_streamed_sheet_layout(sheet)
         for row_number, values in enumerate(sheet.iter_rows(values_only=True), start=1):
             yield cell_delimiter.join(
-                _render_streamed_cell(value, hyperlink_targets, (row_number, column_number))
+                _render_streamed_cell(value, hyperlinks, (row_number, column_number))
                 for column_number, value in enumerate(values, start=1)
             )
 

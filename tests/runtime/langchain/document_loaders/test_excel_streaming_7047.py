@@ -22,6 +22,7 @@ import pytest
 import tiktoken
 from langchain_core.documents import Document
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.worksheet.hyperlink import Hyperlink
 
 from elitea_sdk.runtime.langchain.document_loaders import EliteAExcelLoader as excel_module
@@ -266,3 +267,100 @@ def test_a_loader_failing_after_it_yielded_does_not_restart_on_a_fallback_extens
             produced.append(document.page_content)
 
     assert produced == ["first window"]
+
+
+def without_empty_cells(path, dropped_cells=(), moved_refs=()):
+    rewritten = path.replace(".xlsx", "_sparse.xlsx")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename.startswith("xl/worksheets/sheet"):
+                data = re.sub(rb'<c r="[A-Z]+[0-9]+"(?: s="[0-9]+")?\s*/>', b"", data)
+                for coordinate in dropped_cells:
+                    data = re.sub(rb'<c r="%s"[^>]*>.*?</c>' % coordinate, b"", data)
+                for old_ref, new_ref in moved_refs:
+                    data = data.replace(b'ref="%s"' % old_ref, b'ref="%s"' % new_ref)
+            target.writestr(item, data)
+    return rewritten
+
+
+def sparse_workbook(tmp_path, name, annotate):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Annotated"
+    sheet["A1"], sheet["B1"] = "h1", "h2"
+    sheet["A1"].hyperlink = "http://a.com"
+    sheet["A2"] = "merged"
+    sheet["A4"] = "m2"
+    dropped_cells, moved_refs = annotate(sheet)
+    path = str(tmp_path / f"{name}.xlsx")
+    workbook.save(path)
+    return without_empty_cells(path, dropped_cells, moved_refs)
+
+
+def merge_beyond_the_cells(sheet):
+    sheet.merge_cells("A2:D2")
+    return [], []
+
+
+def link_beyond_the_cells(sheet):
+    sheet["E9"] = "link text Excel did not store"
+    sheet["E9"].hyperlink = "http://empty.com"
+    return [b"E9"], []
+
+
+def comment_beyond_the_cells(sheet):
+    sheet["G12"].comment = Comment("note", "author")
+    return [b"G12"], []
+
+
+def links_on_merged_cells(sheet):
+    sheet.merge_cells("A2:D2")
+    sheet["B6"] = "wide"
+    sheet.merge_cells("B6:C7")
+    linked = {"H20": "http://anchor.com", "J30": "http://range.com",
+              "F3": Hyperlink(ref="F3", location="'Annotated'!A1")}
+    for coordinate, link in linked.items():
+        sheet[coordinate] = "link text Excel did not store"
+        sheet[coordinate].hyperlink = link
+    return [b"H20", b"J30", b"F3"], [(b"H20", b"C7"), (b"J30", b"A2:B4")]
+
+
+def links_overlapping_an_empty_cell(sheet):
+    sheet["E9"] = "link text Excel did not store"
+    sheet["E9"].hyperlink = Hyperlink(ref="E9", tooltip="link with neither target nor location")
+    sheet["H20"] = "link text Excel did not store"
+    sheet["H20"].hyperlink = "http://second.com"
+    return [b"E9", b"H20"], [(b"H20", b"E9")]
+
+
+SPARSE_LAYOUTS = [
+    pytest.param(merge_beyond_the_cells, id="merge-beyond-cells"),
+    pytest.param(link_beyond_the_cells, id="link-beyond-cells"),
+    pytest.param(comment_beyond_the_cells, id="comment-beyond-cells"),
+    pytest.param(links_on_merged_cells, id="links-on-merged-cells"),
+    pytest.param(links_overlapping_an_empty_cell, id="links-overlapping-an-empty-cell"),
+]
+
+
+@pytest.mark.parametrize("annotate", SPARSE_LAYOUTS)
+def test_the_sparse_fixture_omits_empty_cells_like_excel(tmp_path, annotate):
+    with zipfile.ZipFile(sparse_workbook(tmp_path, annotate.__name__, annotate)) as archive:
+        sheet_xml = archive.read("xl/worksheets/sheet1.xml")
+
+    assert re.findall(rb'<c r="([A-Z]+[0-9]+)"', sheet_xml) == [b"A1", b"B1", b"A2", b"A4"] + (
+        [b"B6"] if annotate is links_on_merged_cells else [])
+
+
+@pytest.mark.parametrize("config", [
+    pytest.param({"max_tokens": -1}, id="one-chunk-per-sheet"),
+    pytest.param({"max_tokens": 8}, id="token-windows"),
+])
+@pytest.mark.parametrize("annotate", SPARSE_LAYOUTS)
+def test_merges_links_and_comments_outside_the_written_cells_stream_like_the_full_read(
+        tmp_path, monkeypatch, annotate, config):
+    path = sparse_workbook(tmp_path, annotate.__name__, annotate)
+    streamed = loaded(path, skip_size_check=True, **config)
+    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
+
+    assert streamed == loaded(path, skip_size_check=True, **config)

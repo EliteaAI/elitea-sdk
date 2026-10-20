@@ -20,7 +20,8 @@ import pytest
 from langchain_core.documents import Document
 
 from elitea_sdk.runtime.langchain.document_loaders.utils import _image_description_failures
-from elitea_sdk.tools.base_indexer_toolkit import PARSE_SOURCE_META_KEY, IndexingStatus
+from elitea_sdk.tools import chunkers
+from elitea_sdk.tools.base_indexer_toolkit import DEPENDENT_DOC_META_KEY, PARSE_SOURCE_META_KEY, IndexingStatus
 from tests.tools.test_6585_document_failure_isolation import (
     PIPELINE_MODES,
     ParsingStagingToolkit,
@@ -28,6 +29,7 @@ from tests.tools.test_6585_document_failure_isolation import (
     failed_items,
     index_through_real_pipeline,
     make_files,
+    make_page,
 )
 
 LARGE = 300
@@ -77,7 +79,7 @@ STAGED_MATERIALISED = {"workers": 2, "staging": True}
 
 
 def rows_kept(toolkit):
-    return toolkit._index_run.chunks_written - len(rows_deleted_at_promote(toolkit))
+    return toolkit._index_run.chunks_written - len(set(rows_deleted_at_promote(toolkit)))
 
 
 def report_summary(toolkit, outcome):
@@ -305,3 +307,67 @@ def test_stored_chunks_carry_no_parse_bookkeeping(monkeypatch, mode):
 
     assert len(produced) == 6
     assert [chunk for chunk in produced if PARSE_SOURCE_META_KEY in chunk.metadata] == []
+
+
+def test_chunker_output_handed_over_before_a_retry_ends_like_a_materialised_run(monkeypatch):
+    def run(mode):
+        page = make_page("page-1", "page.md")
+        note = Document(page_content="note body", metadata={
+            "id": "note-1", "name": "note.md", "updated_on": "1", DEPENDENT_DOC_META_KEY: True})
+        failed_once = []
+
+        def chunker_failing_once_on_the_page(file_content_generator=None, config=None):
+            for document in file_content_generator:
+                if not document.metadata.get(DEPENDENT_DOC_META_KEY) and not failed_once:
+                    failed_once.append(True)
+                    raise RuntimeError("transient embeddings failure")
+                yield Document(page_content=f"{document.page_content} part 1", metadata=document.metadata)
+                yield Document(page_content=f"{document.page_content} part 2", metadata=document.metadata)
+
+        def configure(toolkit):
+            monkeypatch.setitem(chunkers.__all__, "flaky", chunker_failing_once_on_the_page)
+            monkeypatch.setattr(ParsingStagingToolkit, "_process_document", lambda self, document: iter([note]))
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [page], configure=configure, chunking_tool="flaky", **mode)
+        return bool(failed_once), report_summary(toolkit, outcome), rows_kept(toolkit), note.metadata.get("collection")
+
+    streamed = run(STAGED_SERIAL)
+
+    assert streamed[0] is True
+    assert streamed == run(STAGED_MATERIALISED)
+
+
+def test_a_retried_attempt_spanning_several_keys_discards_every_row_it_handed_over(monkeypatch):
+    def run(mode):
+        page = Document(page_content="page body", metadata={"name": "page.md", "updated_on": "1"})
+        notes = [Document(page_content=f"{name} body", metadata={"id": name, "name": name, "updated_on": "1"})
+                 for name in ("note-1", "note-2")]
+        failed_once, rejected_once = [], []
+
+        def chunker_failing_once_on_the_page(file_content_generator=None, config=None):
+            for document in file_content_generator:
+                if not document.metadata.get(DEPENDENT_DOC_META_KEY) and not failed_once:
+                    failed_once.append(True)
+                    raise RuntimeError("transient embeddings failure")
+                yield Document(page_content=document.page_content, metadata=document.metadata)
+
+        def rejects_the_first_note_2_batch(document):
+            if document.metadata.get("id") == "note-2" and not rejected_once:
+                rejected_once.append(True)
+                return True
+            return False
+
+        def configure(toolkit):
+            monkeypatch.setitem(chunkers.__all__, "flaky", chunker_failing_once_on_the_page)
+            monkeypatch.setattr(ParsingStagingToolkit, "_process_document", lambda self, document: iter(notes))
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, [page], configure=configure, chunking_tool="flaky",
+            rejects=rejects_the_first_note_2_batch, **mode)
+        assert toolkit._index_run.damaged_keys == {"note-2"}
+        return report_summary(toolkit, outcome), rows_kept(toolkit)
+
+    streamed = run(STAGED_SERIAL)
+
+    assert streamed == run(STAGED_MATERIALISED)

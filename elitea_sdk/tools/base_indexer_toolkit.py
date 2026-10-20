@@ -875,7 +875,6 @@ class _IndexRunState:
     recorded_row_pks: Dict[str, List[str]] = field(default_factory=dict)
     parse_source_ids: Iterator[int] = field(default_factory=itertools.count)
     parse_source_row_pks: Dict[int, List[str]] = field(default_factory=dict)
-    parse_source_keys: Dict[int, str] = field(default_factory=dict)
     discarded_parse_sources: Set[int] = field(default_factory=set)
     damaged_keys: Set[str] = field(default_factory=set)
     pipeline_failed_keys: Set[str] = field(default_factory=set)
@@ -1877,7 +1876,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         damaged_pk_ids.extend(
             row_pk
             for parse_source in run.discarded_parse_sources
-            if run.parse_source_keys.get(parse_source) not in damaged_doc_keys
             for row_pk in run.parse_source_row_pks.get(parse_source, [])
         )
         # An adopted row this run did not reuse describes content the run did not produce:
@@ -2180,12 +2178,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 _restore_for_retry(base_doc, loader_metadata, exc)
                 return _run_pipeline(base_doc)
 
+        def _revocable_handover(chunks: Iterable[Document]) -> Generator[Document, None, None]:
+            attempt_source = self._open_parse_source()
+            for chunk in chunks:
+                chunk.metadata.setdefault(PARSE_SOURCE_META_KEY, attempt_source)
+                yield chunk
+
         def _stream_pipeline_with_retry(base_doc: Document) -> Generator[Document, None, None]:
             loader_metadata = snapshot_loader_metadata(base_doc)
             first_attempt_sources = set()
             try:
-                for chunk in _stream_pipeline(base_doc):
-                    first_attempt_sources.add(chunk.metadata.get(PARSE_SOURCE_META_KEY))
+                for chunk in _revocable_handover(_stream_pipeline(base_doc)):
+                    first_attempt_sources.add(chunk.metadata[PARSE_SOURCE_META_KEY])
                     yield chunk
                 return
             except Exception as exc:
@@ -2240,8 +2244,6 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         doc.metadata['collection'] += f";{index_name}"
                 if staging:
                     chunk_key = self._staging_key(doc.metadata)
-                    if parse_source is not None:
-                        run.parse_source_keys[parse_source] = chunk_key
                     if chunk_key != IDLESS_STAGING_KEY:
                         run.pending_chunk_counts[chunk_key] = run.pending_chunk_counts.get(chunk_key, 0) + 1
                         run.doc_names.setdefault(chunk_key, _doc_name)
