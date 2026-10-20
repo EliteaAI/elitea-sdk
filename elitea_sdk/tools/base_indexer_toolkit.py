@@ -2104,17 +2104,31 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         #
         pg_vector_add_docs_chunk: list = []
-        buffered_parse_sources: Dict[int, int] = {}
+        pg_vector_add_parse_sources: List[Optional[int]] = []
+        failed_flushes: List[Tuple[List[str], List[str], List[Optional[int]], Exception]] = []
 
         staging = self._staging_active()
         run = getattr(self, "_index_run", None)
 
-        def _flush_chunk(chunk: list):
-            """Flush a chunk of documents to the vectorstore, tracking failures in result."""
-            if not chunk:
+        def _release_pending_chunk(chunk_key: str):
+            if staging and chunk_key != IDLESS_STAGING_KEY:
+                run.pending_chunk_counts[chunk_key] -= 1
+
+        def _flush_chunk():
+            """Flush the buffered documents to the vectorstore."""
+            buffered = list(zip(pg_vector_add_docs_chunk, pg_vector_add_parse_sources))
+            pg_vector_add_docs_chunk.clear()
+            pg_vector_add_parse_sources.clear()
+            for doc, parse_source in buffered:
+                if self._is_parse_source_discarded(parse_source):
+                    _release_pending_chunk(self._staging_key(doc.metadata))
+            buffered = [(doc, parse_source) for doc, parse_source in buffered
+                        if not self._is_parse_source_discarded(parse_source)]
+            if not buffered:
                 return
+            chunk = [doc for doc, _ in buffered]
+            chunk_parse_sources = [parse_source for _, parse_source in buffered]
             chunk_keys = [self._staging_key(doc.metadata) for doc in chunk] if staging else []
-            chunk_parse_sources = [buffered_parse_sources.pop(id(doc), None) for doc in chunk]
             try:
                 inserted_ids = add_documents(vectorstore=self.vectorstore, documents=chunk)
                 self._log_tool_event(f"{len(chunk)} documents have been indexed. Continuing...")
@@ -2129,16 +2143,30 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 from traceback import format_exc
                 err = format_exc()
                 logger.error(f"Failed to add {len(chunk)} documents to vectorstore: {err}")
-                result["failed_count"] = result.get("failed_count", 0) + len(chunk)
-                record_grouped_error(
-                    result, [self._extract_doc_name(doc.metadata) for doc in chunk], exc
-                )
+                failed_flushes.append((
+                    [self._extract_doc_name(doc.metadata) for doc in chunk],
+                    chunk_keys, chunk_parse_sources, exc,
+                ))
+
+        def _settle_failed_flushes():
+            for doc_names, chunk_keys, chunk_parse_sources, exc in failed_flushes:
+                kept = []
+                for position, parse_source in enumerate(chunk_parse_sources):
+                    if not self._is_parse_source_discarded(parse_source):
+                        kept.append(position)
+                    elif staging:
+                        _release_pending_chunk(chunk_keys[position])
+                if not kept:
+                    continue
+                result["failed_count"] = result.get("failed_count", 0) + len(kept)
+                record_grouped_error(result, [doc_names[position] for position in kept], exc)
                 if staging:
                     # Failed chunks are dropped, never retried, so a doc with any
                     # chunk in this batch can never reach pending count zero —
                     # damaged is what routes its staged ids OUT of the promote set
                     # and its already-persisted rows INTO the promote-txn delete.
-                    self._mark_batch_damaged(run, chunk_keys)
+                    self._mark_batch_damaged(run, [chunk_keys[position] for position in kept])
+            failed_flushes.clear()
 
         def _run_pipeline(base_doc: Document) -> List[Document]:
             """Full serial pipeline for one base doc → materialized chunk list.
@@ -2266,12 +2294,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         dependent_docs_counter += 1
                         continue
                 pg_vector_add_docs_chunk.append(doc)
-                if parse_source is not None:
-                    buffered_parse_sources[id(doc)] = parse_source
+                pg_vector_add_parse_sources.append(parse_source)
                 dependent_docs_counter += 1
                 if _buffer_is_full():
-                    _flush_chunk(pg_vector_add_docs_chunk)
-                    pg_vector_add_docs_chunk.clear()
+                    _flush_chunk()
 
             dependent_docs_counter -= sum(
                 count for parse_source, count in chunks_by_parse_source.items()
@@ -2296,86 +2322,89 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         workers = getattr(self, "_index_workers", 1) or 1
 
-        if workers <= 1:
-            # Serial path — identical semantics to the pre-Phase-6 loop.
-            partial_rows_roll_back = staging
-            base_doc_counter = 0
-            for base_doc in base_documents:
-                base_doc_counter += 1
-                _doc_name = self._extract_doc_name(base_doc.metadata)
-                self._log_tool_event(f"Processing document #{base_doc_counter}: '{_doc_name}'.")
-                self._log_tool_event(
-                    f"Dependent documents for '{_doc_name}' were processed. "
-                    f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
-                )
-                if partial_rows_roll_back:
-                    try:
-                        _consume_pipeline_output(base_doc, base_doc_counter, _stream_pipeline_with_retry(base_doc))
-                    except Exception as exc:
-                        _handle_pipeline_failure(base_doc, base_doc_counter, exc)
-                        _consume_pipeline_output(base_doc, base_doc_counter, [])
-                    continue
-                try:
-                    chunks = _run_pipeline_with_retry(base_doc)
-                except Exception as exc:
-                    _handle_pipeline_failure(base_doc, base_doc_counter, exc)
-                    chunks = []
-                _consume_pipeline_output(base_doc, base_doc_counter, chunks)
-            if pg_vector_add_docs_chunk:
-                _flush_chunk(pg_vector_add_docs_chunk)
-            return
-
-        # Parallel path — outer per-base-doc executor with unordered dispatch.
-        # This is where cross-doc parallelism lives: previously the outer for-loop
-        # was serial and only fed 1 doc into the inner Phase 4/5 executors, so
-        # they only ever saw 1 in-flight task. Now the full pipeline runs per
-        # worker (with inner parallelism disabled via the nested-pool guards),
-        # so N base docs are truly processed concurrently.
-        executor = ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="indexer-base",
-        )
         try:
-            in_flight: Dict[Any, Any] = {}  # future -> (base_doc, counter)
-            counter = 0
-            doc_iter = iter(base_documents)
-
-            def _submit_next() -> bool:
-                nonlocal counter
-                try:
-                    base_doc = next(doc_iter)
-                except StopIteration:
-                    return False
-                counter += 1
-                _doc_name = self._extract_doc_name(base_doc.metadata)
-                self._log_tool_event(f"Processing document #{counter}: '{_doc_name}'.")
-                self._log_tool_event(
-                    f"Dependent documents for '{_doc_name}' were processed. "
-                    f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
-                )
-                in_flight[executor.submit(_run_pipeline_with_retry, base_doc)] = (base_doc, counter)
-                return True
-
-            for _ in range(workers):
-                if not _submit_next():
-                    break
-
-            while in_flight:
-                done, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
-                for future in done:
-                    base_doc, base_doc_counter = in_flight.pop(future)
+            if workers <= 1:
+                # Serial path — identical semantics to the pre-Phase-6 loop.
+                partial_rows_roll_back = staging
+                base_doc_counter = 0
+                for base_doc in base_documents:
+                    base_doc_counter += 1
+                    _doc_name = self._extract_doc_name(base_doc.metadata)
+                    self._log_tool_event(f"Processing document #{base_doc_counter}: '{_doc_name}'.")
+                    self._log_tool_event(
+                        f"Dependent documents for '{_doc_name}' were processed. "
+                        f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
+                    )
+                    if partial_rows_roll_back:
+                        try:
+                            _consume_pipeline_output(base_doc, base_doc_counter, _stream_pipeline_with_retry(base_doc))
+                        except Exception as exc:
+                            _handle_pipeline_failure(base_doc, base_doc_counter, exc)
+                            _consume_pipeline_output(base_doc, base_doc_counter, [])
+                        continue
                     try:
-                        chunks = future.result()
+                        chunks = _run_pipeline_with_retry(base_doc)
                     except Exception as exc:
                         _handle_pipeline_failure(base_doc, base_doc_counter, exc)
                         chunks = []
                     _consume_pipeline_output(base_doc, base_doc_counter, chunks)
-                    _submit_next()
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+                if pg_vector_add_docs_chunk:
+                    _flush_chunk()
+                return
 
-        if pg_vector_add_docs_chunk:
-            _flush_chunk(pg_vector_add_docs_chunk)
+            # Parallel path — outer per-base-doc executor with unordered dispatch.
+            # This is where cross-doc parallelism lives: previously the outer for-loop
+            # was serial and only fed 1 doc into the inner Phase 4/5 executors, so
+            # they only ever saw 1 in-flight task. Now the full pipeline runs per
+            # worker (with inner parallelism disabled via the nested-pool guards),
+            # so N base docs are truly processed concurrently.
+            executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="indexer-base",
+            )
+            try:
+                in_flight: Dict[Any, Any] = {}  # future -> (base_doc, counter)
+                counter = 0
+                doc_iter = iter(base_documents)
+
+                def _submit_next() -> bool:
+                    nonlocal counter
+                    try:
+                        base_doc = next(doc_iter)
+                    except StopIteration:
+                        return False
+                    counter += 1
+                    _doc_name = self._extract_doc_name(base_doc.metadata)
+                    self._log_tool_event(f"Processing document #{counter}: '{_doc_name}'.")
+                    self._log_tool_event(
+                        f"Dependent documents for '{_doc_name}' were processed. "
+                        f"Applying chunking tool '{chunking_tool if chunking_tool else 'default'}' if specified and preparing documents for indexing..."
+                    )
+                    in_flight[executor.submit(_run_pipeline_with_retry, base_doc)] = (base_doc, counter)
+                    return True
+
+                for _ in range(workers):
+                    if not _submit_next():
+                        break
+
+                while in_flight:
+                    done, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        base_doc, base_doc_counter = in_flight.pop(future)
+                        try:
+                            chunks = future.result()
+                        except Exception as exc:
+                            _handle_pipeline_failure(base_doc, base_doc_counter, exc)
+                            chunks = []
+                        _consume_pipeline_output(base_doc, base_doc_counter, chunks)
+                        _submit_next()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            if pg_vector_add_docs_chunk:
+                _flush_chunk()
+        finally:
+            _settle_failed_flushes()
 
     def _apply_loaders_chunkers(self, documents: Generator[Document, None, None], chunking_tool: str=None, chunking_config=None) -> Generator[Document, None, None]:
         from ..tools.chunkers import __all__ as chunkers

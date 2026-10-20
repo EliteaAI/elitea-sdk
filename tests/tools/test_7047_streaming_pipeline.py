@@ -343,7 +343,7 @@ def test_a_retried_attempt_spanning_several_keys_discards_every_row_it_handed_ov
         page = Document(page_content="page body", metadata={"name": "page.md", "updated_on": "1"})
         notes = [Document(page_content=f"{name} body", metadata={"id": name, "name": name, "updated_on": "1"})
                  for name in ("note-1", "note-2")]
-        failed_once, rejected_once = [], []
+        failed_once = []
 
         def chunker_failing_once_on_the_page(file_content_generator=None, config=None):
             for document in file_content_generator:
@@ -352,11 +352,8 @@ def test_a_retried_attempt_spanning_several_keys_discards_every_row_it_handed_ov
                     raise RuntimeError("transient embeddings failure")
                 yield Document(page_content=document.page_content, metadata=document.metadata)
 
-        def rejects_the_first_note_2_batch(document):
-            if document.metadata.get("id") == "note-2" and not rejected_once:
-                rejected_once.append(True)
-                return True
-            return False
+        def rejects_every_note_2_batch(document):
+            return document.metadata.get("id") == "note-2"
 
         def configure(toolkit):
             monkeypatch.setitem(chunkers.__all__, "flaky", chunker_failing_once_on_the_page)
@@ -364,7 +361,7 @@ def test_a_retried_attempt_spanning_several_keys_discards_every_row_it_handed_ov
 
         toolkit, outcome = index_through_real_pipeline(
             monkeypatch, [page], configure=configure, chunking_tool="flaky",
-            rejects=rejects_the_first_note_2_batch, **mode)
+            rejects=rejects_every_note_2_batch, **mode)
         assert toolkit._index_run.damaged_keys == {"note-2"}
         return report_summary(toolkit, outcome), rows_kept(toolkit)
 
@@ -415,3 +412,128 @@ def test_a_retry_that_also_fails_leaves_no_rows_for_an_idless_document(monkeypat
 
     assert streamed[1] == 0
     assert streamed == run(STAGED_MATERIALISED)
+
+
+def test_buffered_chunks_of_a_discarded_source_are_never_embedded(monkeypatch):
+    stored = []
+
+    def parse(document=None, **kwargs):
+        name = document.metadata["name"]
+
+        def stream():
+            if name == "att.xlsx":
+                for index in range(3):
+                    yield Document(page_content=f"att.xlsx chunk {index}", metadata=dict(document.metadata))
+                yield Document(page_content="Error during content parsing for file att.xlsx:\nchartsheet",
+                               metadata=dict(document.metadata))
+                return
+            yield Document(page_content=f"{name} body", metadata=dict(document.metadata))
+        return stream()
+
+    def configure(toolkit):
+        object.__setattr__(toolkit, "max_docs_per_add", 20)
+        monkeypatch.setattr("elitea_sdk.tools.base_indexer_toolkit.process_document_by_type", parse)
+
+    def store_sees(document):
+        stored.append(document.page_content)
+        return False
+
+    toolkit, outcome = index_through_real_pipeline(
+        monkeypatch, make_files("page.docx"), configure=configure, rejects=store_sees,
+        dependents={"page.docx": make_files("att.xlsx", dependent=("att.xlsx",))}, **STAGED_SERIAL)
+
+    assert stored == ["page.docx body"]
+    assert toolkit._index_run.pending_chunk_counts == {"page.docx": 0}
+    assert toolkit._index_run.chunks_written == 1
+    assert outcome["report"]["totals"]["indexed"] == 1
+
+
+def test_chunks_of_a_discarded_source_never_claim_a_reusable_row(monkeypatch):
+    offered_for_reuse = []
+
+    def parse(document=None, **kwargs):
+        name = document.metadata["name"]
+
+        def stream():
+            yield Document(page_content=f"{name} chunk", metadata=dict(document.metadata))
+            if name == "att.xlsx":
+                yield Document(page_content="Error during content parsing for file att.xlsx:\nchartsheet",
+                               metadata=dict(document.metadata))
+        return stream()
+
+    def configure(toolkit):
+        monkeypatch.setattr("elitea_sdk.tools.base_indexer_toolkit.process_document_by_type", parse)
+        monkeypatch.setattr(ParsingStagingToolkit, "_claim_adopted_row",
+                            lambda self, document: offered_for_reuse.append(document.page_content))
+
+    index_through_real_pipeline(
+        monkeypatch, make_files("page.docx"), configure=configure,
+        dependents={"page.docx": make_files("att.xlsx", dependent=("att.xlsx",))}, **STAGED_MATERIALISED)
+
+    assert offered_for_reuse == ["page.docx chunk"]
+
+
+def test_a_rejected_write_of_a_source_discarded_later_leaves_its_page_indexed(monkeypatch):
+    def run(mode):
+        def parse(document=None, **kwargs):
+            name = document.metadata["name"]
+
+            def stream():
+                if name == "att.xlsx":
+                    for index in range(3):
+                        yield Document(page_content=f"att.xlsx chunk {index}", metadata=dict(document.metadata))
+                    yield Document(page_content="Error during content parsing for file att.xlsx:\nchartsheet",
+                                   metadata=dict(document.metadata))
+                    return
+                yield Document(page_content=f"{name} body", metadata=dict(document.metadata))
+            return stream()
+
+        def configure(toolkit):
+            monkeypatch.setattr("elitea_sdk.tools.base_indexer_toolkit.process_document_by_type", parse)
+
+        toolkit, outcome = index_through_real_pipeline(
+            monkeypatch, make_files("page.docx"), configure=configure,
+            rejects=lambda document: document.page_content == "att.xlsx chunk 0",
+            dependents={"page.docx": make_files("att.xlsx", dependent=("att.xlsx",))}, **mode)
+        return toolkit, outcome
+
+    streamed, streamed_outcome = run(STAGED_SERIAL)
+    materialised, materialised_outcome = run(STAGED_MATERIALISED)
+
+    assert_terminal_state(streamed, streamed_outcome, IndexingStatus.OK)
+    assert streamed._index_run.damaged_keys == set()
+    assert streamed._index_run.pending_chunk_counts == {"page.docx": 0}
+    assert streamed_outcome["report"]["totals"]["indexed"] == 1
+    assert report_summary(streamed, streamed_outcome) == report_summary(materialised, materialised_outcome)
+    assert rows_kept(streamed) == rows_kept(materialised) == 1
+
+
+def test_a_rejected_write_mixing_sources_counts_only_the_chunks_that_were_kept(monkeypatch):
+    def parse(document=None, **kwargs):
+        name = document.metadata["name"]
+
+        def stream():
+            if name == "att.xlsx":
+                for index in range(3):
+                    yield Document(page_content=f"att.xlsx chunk {index}", metadata=dict(document.metadata))
+                yield Document(page_content="Error during content parsing for file att.xlsx:\nchartsheet",
+                               metadata=dict(document.metadata))
+                return
+            yield Document(page_content=f"{name} body", metadata=dict(document.metadata))
+        return stream()
+
+    def configure(toolkit):
+        object.__setattr__(toolkit, "max_docs_per_add", 2)
+        monkeypatch.setattr("elitea_sdk.tools.base_indexer_toolkit.process_document_by_type", parse)
+
+    page = make_files("page.docx")[0]
+    page.metadata.pop("id")
+    toolkit, outcome = index_through_real_pipeline(
+        monkeypatch, [page], configure=configure,
+        rejects=lambda document: document.page_content == "att.xlsx chunk 0",
+        dependents={"page.docx": make_files("ok.docx", "att.xlsx", dependent=("ok.docx", "att.xlsx"))},
+        **STAGED_SERIAL)
+
+    assert toolkit._index_run.damaged_keys == {"ok.docx"}
+    assert outcome["report"]["errors"] == ["ok.docx: the store rejected the batch"]
+    assert toolkit.written[-1]["updated"] == 1
