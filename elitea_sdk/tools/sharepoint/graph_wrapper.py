@@ -18,7 +18,7 @@ import math
 import os
 import re
 import time
-from typing import Any, Callable, Dict, Optional, List, Tuple, Union
+from typing import Any, Callable, Dict, Generator, Optional, List, Tuple, Union
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
 import requests
@@ -27,6 +27,7 @@ from langchain_core.tools import ToolException
 from ...runtime.utils.mcp_oauth import McpAuthorizationRequired, is_entra_url
 
 from .base_wrapper import BaseSharepointWrapper
+from .browser_url import NOT_A_FILE_URL_MESSAGE, SharepointFileUrl, parse_sharepoint_file_url
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content, parse_content_from_bytes
 from ..utils.file_metadata import bound_read_result, describe_requested_range
@@ -2171,7 +2172,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
     @staticmethod
     def _excel_over_limit(exc: ExcelReadLimitExceeded, file_name: str,
                           start_line: Optional[int], end_line: Optional[int],
-                          ) -> Dict[str, Any]:
+                          tool_name: str) -> Dict[str, Any]:
         """Turn an over-limit workbook into guidance instead of a bare raise.
 
         A workbook big enough to trip the pre-parse estimate never reaches the
@@ -2182,7 +2183,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         return build_excel_over_limit_response(
             exc.estimate, filename=file_name,
             requested=describe_requested_range(start_line, end_line),
-            tool_name="read_file_from_sharing_link",
+            tool_name=tool_name,
             supports_sheet_name=False,
         )
 
@@ -2217,12 +2218,18 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             ToolException: If URL is invalid, file type is unsupported, or file
                           exceeds size limit
         """
+        return self._read_sharing_link(
+            sharing_url, is_capture_image, start_line, end_line,
+            tool_name="read_file_from_sharing_link")
+
+    def _read_sharing_link(self, sharing_url: str, is_capture_image: bool,
+                           start_line: Optional[int], end_line: Optional[int],
+                           tool_name: str) -> Union[str, Dict[str, Any]]:
         if not sharing_url or not sharing_url.startswith('https://'):
             raise ToolException("Invalid sharing URL. Must be a full HTTPS URL.")
 
         # Encode URL for Graph /shares endpoint (base64url with u! prefix)
-        encoded = base64.b64encode(sharing_url.encode('utf-8')).decode('utf-8')
-        share_id = 'u!' + encoded.rstrip('=').replace('/', '_').replace('+', '-')
+        share_id = self._encode_share_id(sharing_url)
         url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem"
         headers = {**self._auth_headers(), "Prefer": "redeemSharingLinkIfNecessary"}
 
@@ -2245,7 +2252,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     return bound_read_result(
                         result, file_name, start_line=start_line, end_line=end_line)
                 except ExcelReadLimitExceeded as e:
-                    return self._excel_over_limit(e, file_name, start_line, end_line)
+                    return self._excel_over_limit(
+                        e, file_name, start_line, end_line, tool_name)
                 finally:
                     # Always clean up temp file
                     if os.path.exists(temp_path):
@@ -2257,17 +2265,92 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             raise ToolException(error_msg or "Access denied to sharing link")
 
         self._raise_with_body(resp)
-        data = resp.json()
+        return self._read_drive_item(
+            resp.json(), f"{_GRAPH_BASE}/shares/{share_id}/driveItem/content",
+            is_capture_image, start_line, end_line, tool_name)
 
-        file_name = data.get('name', 'unknown')
-        file_size = data.get('size')  # Graph API returns file size in bytes
+    def read_file_from_url(self, url: str, is_capture_image: bool = False,
+                           start_line: Optional[int] = None,
+                           end_line: Optional[int] = None
+                           ) -> Union[str, Dict[str, Any]]:
+        """Read the single file a SharePoint/OneDrive browser URL points at.
 
+        The URL is resolved to its driveItem with targeted Graph lookups, so the
+        containing folder is never enumerated. Sharing links are redeemed the
+        same way :meth:`read_file_from_sharing_link` redeems them.
+        """
+        target = parse_sharepoint_file_url(url)
+        if target.is_sharing_link:
+            return self._read_sharing_link(
+                url.strip(), is_capture_image, start_line, end_line,
+                tool_name="read_file_from_url")
+
+        item_url, item = self._locate_drive_item(target)
+        if 'file' not in item:
+            raise ToolException(NOT_A_FILE_URL_MESSAGE)
+        return self._read_drive_item(
+            item, f"{item_url}/content", is_capture_image, start_line, end_line,
+            tool_name="read_file_from_url")
+
+    def _locate_drive_item(self, target: SharepointFileUrl) -> Tuple[str, dict]:
+        if target.server_relative_paths:
+            for path in target.server_relative_paths:
+                file_url = f"https://{target.host}{quote(path)}"
+                item_url = f"{_GRAPH_BASE}/shares/{self._encode_share_id(file_url)}/driveItem"
+                item = self._get_json_or_none(item_url, forbidden_means_missing=True)
+                if item is not None:
+                    return item_url, item
+        else:
+            site = self._get_json_or_none(
+                f"{_GRAPH_BASE}/sites/{target.host}:{quote(target.site_path)}"
+                if target.site_path else f"{_GRAPH_BASE}/sites/{target.host}")
+            if site is not None:
+                for drive_url in self._candidate_drive_urls(site['id']):
+                    item_url = f"{drive_url}/items/{target.unique_id}"
+                    item = self._get_json_or_none(item_url)
+                    if item is not None:
+                        return item_url, item
+        raise ToolException(
+            "File not found or access denied: the URL does not resolve to a SharePoint "
+            "file you can access. Check that the URL is complete, that the file still "
+            "exists, and that your account can open it.")
+
+    def _candidate_drive_urls(self, site_id: str) -> Generator[str, None, None]:
+        yield f"{_GRAPH_BASE}/sites/{site_id}/drive"
+        drives = self._get(
+            f"{_GRAPH_BASE}/sites/{site_id}/drives", params={"$select": "id"})
+        for drive in drives.get('value', []):
+            yield f"{_GRAPH_BASE}/drives/{drive['id']}"
+
+    def _get_json_or_none(self, url: str, forbidden_means_missing: bool = False
+                          ) -> Optional[dict]:
+        """Graph's /shares answers 403 both for an unresolvable path and for a file
+        the user cannot open, so callers there pass forbidden_means_missing."""
+        resp = self._get_raw(url, headers={"Accept": "application/json"}, timeout=60)
+        if resp.status_code in (400, 404) or (forbidden_means_missing and resp.status_code == 403):
+            return None
+        if resp.status_code == 403:
+            raise ToolException(
+                "Access denied: your account does not have permission to read this "
+                "SharePoint file.")
+        self._raise_with_body(resp)
+        return resp.json()
+
+    @staticmethod
+    def _encode_share_id(url: str) -> str:
+        encoded = base64.b64encode(url.encode('utf-8')).decode('utf-8')
+        return 'u!' + encoded.rstrip('=').replace('/', '_').replace('+', '-')
+
+    def _read_drive_item(self, item: dict, content_url: str, is_capture_image: bool,
+                         start_line: Optional[int], end_line: Optional[int],
+                         tool_name: str) -> Union[str, Dict[str, Any]]:
+        file_name = item.get('name', 'unknown')
         # Validate file type and size BEFORE downloading content
-        self._validate_sharing_link_file(file_name, file_size)
+        self._validate_sharing_link_file(file_name, item.get('size'))
 
-        download_url = data.get('@microsoft.graph.downloadUrl')
+        download_url = item.get('@microsoft.graph.downloadUrl')
         if not download_url:
-            download_url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem/content"
+            download_url = content_url
             headers = self._auth_headers()
         else:
             headers = None
@@ -2287,12 +2370,11 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             return bound_read_result(
                 result, file_name, start_line=start_line, end_line=end_line)
         except ExcelReadLimitExceeded as e:
-            return self._excel_over_limit(e, file_name, start_line, end_line)
+            return self._excel_over_limit(e, file_name, start_line, end_line, tool_name)
         finally:
             # Always clean up temp file
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
-
 
     def _download_public_link(self, sharing_url: str) -> Tuple[str, Optional[str]]:
         """Download a file from a public sharing link directly.
