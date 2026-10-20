@@ -49,6 +49,11 @@ class SharepointConfiguration(BaseModel):
                     "When enabled, the OAuth authorization request will include offline_access, "
                     "allowing the system to silently renew the access token without user interaction."
     )
+    # Set by the Login button on the toolkit page; lets scheduled runs work without a browser login
+    refresh_token: Optional[SecretStr] = Field(
+        default=None, description="Refresh token of the signed-in user (set by Login)",
+        json_schema_extra={"hidden": True},
+    )
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
@@ -417,7 +422,8 @@ class SharepointConfiguration(BaseModel):
         scopes = settings.get("scopes")
         configuration_uuid = settings.get("configuration_uuid")
         auto_refresh_token = settings.get("auto_refresh_token", False)
-        access_token = settings.get("access_token")
+        from ..runtime.utils.mcp_oauth import access_token_from_stored_login
+        access_token = access_token_from_stored_login(settings)
         if not access_token:
             raise SharepointConfiguration._build_mcp_authorization_required(
                 message=(

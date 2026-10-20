@@ -54,6 +54,11 @@ class OutlookConfiguration(BaseModel):
         default=True,
         description="Automatically refresh the access token using the offline_access scope."
     )
+    # Set by the Login button on the toolkit page; lets scheduled runs work without a browser login
+    refresh_token: Optional[SecretStr] = Field(
+        default=None, description="Refresh token of the signed-in user (set by Login)",
+        json_schema_extra={"hidden": True},
+    )
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
@@ -85,7 +90,8 @@ class OutlookConfiguration(BaseModel):
         """Delegated flow - verify access token via Graph API."""
         scopes = settings.get("scopes")
         configuration_uuid = settings.get("configuration_uuid")
-        access_token = settings.get("access_token")
+        from ..runtime.utils.mcp_oauth import access_token_from_stored_login
+        access_token = access_token_from_stored_login(settings)
 
         if not access_token:
             raise OutlookConfiguration._build_mcp_authorization_required(

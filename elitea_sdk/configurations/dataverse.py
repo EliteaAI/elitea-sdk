@@ -96,6 +96,9 @@ def get_access_token(settings: dict) -> str:
     from ..runtime.utils.mcp_oauth import refresh_oauth_token
 
     org = normalize_org_url(settings.get("url"))
+    # Token injected by the platform's stored-login service (scheduled runs); no refresh here
+    if _secret(settings.get("access_token")):
+        return _secret(settings.get("access_token"))
     tenant = (settings.get("tenant_id") or "").strip()
     client_id = (settings.get("client_id") or "").strip()
     client_secret = _secret(settings.get("client_secret"))
@@ -221,3 +224,8 @@ def build_login_required(settings: dict, message: str):
         tool_name="Dataverse",
         toolkit_type="dataverse",
     )
+
+
+def entra_authority(settings: dict) -> str:
+    """Authority the platform keys injected tokens by, same as the Login flow's server_url."""
+    return f"https://login.microsoftonline.com/{(settings.get('tenant_id') or '').strip()}"

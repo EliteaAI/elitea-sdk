@@ -1013,3 +1013,38 @@ def refresh_oauth_token(
         error_msg = token_data.get("error_description") or token_data.get("error") or response.text
         logger.error(f"MCP OAuth: token refresh failed - {response.status_code}: {error_msg}")
         raise ValueError(f"Token refresh failed: {error_msg}")
+
+
+def entra_token_endpoint(oauth_discovery_endpoint: str) -> str:
+    """Token endpoint for an Entra authority such as https://login.microsoftonline.com/<tenant>."""
+    return f"{oauth_discovery_endpoint.rstrip('/')}/oauth2/v2.0/token"
+
+
+def access_token_from_stored_login(settings: dict, default_scope: str = "https://graph.microsoft.com/.default"):
+    """Access token from the credential's own token, else one refresh of its stored login; None if neither works."""
+    if settings.get("access_token"):
+        return settings["access_token"]
+    refresh_value = settings.get("refresh_token")
+    if hasattr(refresh_value, "get_secret_value"):
+        refresh_value = refresh_value.get_secret_value()
+    endpoint = settings.get("oauth_discovery_endpoint")
+    if not refresh_value or not endpoint:
+        return None
+    secret = settings.get("client_secret")
+    if hasattr(secret, "get_secret_value"):
+        secret = secret.get_secret_value()
+    scopes = settings.get("scopes") or [default_scope]
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    try:
+        data = refresh_oauth_token(
+            token_endpoint=entra_token_endpoint(endpoint),
+            refresh_token=refresh_value,
+            client_id=settings.get("client_id"),
+            client_secret=secret,
+            scope=" ".join(["offline_access", *[s for s in scopes if s != "offline_access"]]),
+        )
+    except (ValueError, requests.RequestException) as e:
+        logger.warning("Stored login refresh failed: %s", type(e).__name__)
+        return None
+    return data.get("access_token")

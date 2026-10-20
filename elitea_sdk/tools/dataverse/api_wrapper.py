@@ -88,11 +88,13 @@ class DataverseApiWrapper(BaseToolApiWrapper):
     client_id: Optional[str] = None
     client_secret: Optional[SecretStr] = None
     refresh_token: Optional[SecretStr] = None
+    access_token: Optional[SecretStr] = None
 
     def _settings(self) -> dict:
         return {
             "url": self.url, "tenant_id": self.tenant_id, "client_id": self.client_id,
             "client_secret": self.client_secret, "refresh_token": self.refresh_token,
+            "access_token": self.access_token,
         }
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
