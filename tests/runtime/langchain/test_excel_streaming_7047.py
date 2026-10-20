@@ -16,12 +16,13 @@
 
 import datetime
 import re
+import tracemalloc
 import zipfile
 
 import pytest
 import tiktoken
 from langchain_core.documents import Document
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.worksheet.hyperlink import Hyperlink
 
@@ -269,7 +270,7 @@ def test_a_loader_failing_after_it_yielded_does_not_restart_on_a_fallback_extens
     assert produced == ["first window"]
 
 
-def without_empty_cells(path, dropped_cells=(), moved_refs=()):
+def without_empty_cells(path, dropped_cells=(), moved_refs=(), added_merges=()):
     rewritten = path.replace(".xlsx", "_sparse.xlsx")
     with zipfile.ZipFile(path) as source, zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as target:
         for item in source.infolist():
@@ -280,6 +281,11 @@ def without_empty_cells(path, dropped_cells=(), moved_refs=()):
                     data = re.sub(rb'<c r="%s"[^>]*>.*?</c>' % coordinate, b"", data)
                 for old_ref, new_ref in moved_refs:
                     data = data.replace(b'ref="%s"' % old_ref, b'ref="%s"' % new_ref)
+                data = re.sub(rb'<row [^>]*(?:/>|></row>)', b"", data)
+                if added_merges:
+                    merges = b"".join(b'<mergeCell ref="%s"/>' % ref for ref in added_merges)
+                    data = data.replace(b"</sheetData>", b'</sheetData><mergeCells count="%d">%s</mergeCells>'
+                                        % (len(added_merges), merges))
             target.writestr(item, data)
     return rewritten
 
@@ -292,10 +298,10 @@ def sparse_workbook(tmp_path, name, annotate):
     sheet["A1"].hyperlink = "http://a.com"
     sheet["A2"] = "merged"
     sheet["A4"] = "m2"
-    dropped_cells, moved_refs = annotate(sheet)
+    dropped_cells, moved_refs, *added_merges = annotate(sheet)
     path = str(tmp_path / f"{name}.xlsx")
     workbook.save(path)
-    return without_empty_cells(path, dropped_cells, moved_refs)
+    return without_empty_cells(path, dropped_cells, moved_refs, *added_merges)
 
 
 def merge_beyond_the_cells(sheet):
@@ -334,12 +340,25 @@ def links_overlapping_an_empty_cell(sheet):
     return [b"E9", b"H20"], [(b"H20", b"E9")]
 
 
+def merge_below_the_cells(sheet):
+    sheet.merge_cells("A4:A7")
+    return [], []
+
+
+def value_in_a_hidden_merged_cell(sheet):
+    sheet["B2"] = "hidden"
+    sheet["C2"] = "z"
+    return [], [], [b"A2:B2"]
+
+
 SPARSE_LAYOUTS = [
     pytest.param(merge_beyond_the_cells, id="merge-beyond-cells"),
     pytest.param(link_beyond_the_cells, id="link-beyond-cells"),
     pytest.param(comment_beyond_the_cells, id="comment-beyond-cells"),
     pytest.param(links_on_merged_cells, id="links-on-merged-cells"),
     pytest.param(links_overlapping_an_empty_cell, id="links-overlapping-an-empty-cell"),
+    pytest.param(merge_below_the_cells, id="merge-below-cells"),
+    pytest.param(value_in_a_hidden_merged_cell, id="value-in-hidden-merged-cell"),
 ]
 
 
@@ -348,8 +367,11 @@ def test_the_sparse_fixture_omits_empty_cells_like_excel(tmp_path, annotate):
     with zipfile.ZipFile(sparse_workbook(tmp_path, annotate.__name__, annotate)) as archive:
         sheet_xml = archive.read("xl/worksheets/sheet1.xml")
 
-    assert re.findall(rb'<c r="([A-Z]+[0-9]+)"', sheet_xml) == [b"A1", b"B1", b"A2", b"A4"] + (
-        [b"B6"] if annotate is links_on_merged_cells else [])
+    written_cells = re.findall(rb'<c r="([A-Z]+[0-9]+)"', sheet_xml)
+    assert sorted(written_cells) == sorted([b"A1", b"B1", b"A2", b"A4"] + {
+        links_on_merged_cells: [b"B6"], value_in_a_hidden_merged_cell: [b"B2", b"C2"]}.get(annotate, []))
+    assert re.findall(rb'<row r="([0-9]+)"', sheet_xml) == sorted(
+        {re.match(rb"[A-Z]+([0-9]+)", cell).group(1) for cell in written_cells}, key=int)
 
 
 @pytest.mark.parametrize("config", [
@@ -364,3 +386,66 @@ def test_merges_links_and_comments_outside_the_written_cells_stream_like_the_ful
     monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
     assert streamed == loaded(path, skip_size_check=True, **config)
+
+
+def test_a_whole_column_merge_costs_memory_per_range_not_per_cell(tmp_path):
+    workbook = Workbook()
+    workbook.active.append(["a", "b"])
+    path = str(tmp_path / "column_merge.xlsx")
+    workbook.save(path)
+    path = without_empty_cells(path, added_merges=[b"C1:C1048576"])
+    read_only = load_workbook(path, read_only=True, data_only=True)
+    try:
+        tracemalloc.start()
+        layout = excel_module._bind_streamed_sheet_layout(read_only.active)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        read_only.close()
+
+    assert read_only.active.max_row == 1_048_576
+    assert peak < 1_000_000
+    assert excel_module._render_streamed_row(("a", "b", "x"), 2, layout) == "a | b | "
+
+
+def report_with_a_merge_and_a_link_per_row(tmp_path, rows):
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in range(1, rows + 1):
+        sheet.append([f"item {row}", f"merged {row}", None, None, f"link {row}"])
+        sheet.merge_cells(f"B{row}:C{row}")
+        sheet[f"E{row}"].hyperlink = f"http://example.com/{row}"
+    sheet["G1"] = "link on a hidden merged cell"
+    sheet["G1"].hyperlink = "http://example.com/hidden"
+    path = str(tmp_path / "report.xlsx")
+    workbook.save(path)
+    return without_empty_cells(path, dropped_cells=[b"G1"], moved_refs=[(b"G1", b"C1")])
+
+
+def test_placing_links_checks_only_the_merges_on_their_row(tmp_path, monkeypatch):
+    rows = 3_000
+    path = report_with_a_merge_and_a_link_per_row(tmp_path, rows)
+    checks = []
+    hides = excel_module._MergedRange.hides
+
+    def counted_hides(self, position):
+        checks.append(position)
+        return hides(self, position)
+
+    read_only = load_workbook(path, read_only=True, data_only=True)
+    try:
+        monkeypatch.setattr(excel_module._MergedRange, "hides", counted_hides)
+        layout = excel_module._bind_streamed_sheet_layout(read_only.active)
+    finally:
+        read_only.close()
+
+    assert len(checks) <= 2 * (rows + 1)
+    assert layout.links[(1, 2)].target == "http://example.com/hidden"
+
+
+def test_a_report_with_a_merge_and_a_link_per_row_streams_like_the_full_read(tmp_path, monkeypatch):
+    path = report_with_a_merge_and_a_link_per_row(tmp_path, 50)
+    streamed = loaded(path, skip_size_check=True, max_tokens=-1)
+    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
+
+    assert streamed == loaded(path, skip_size_check=True, max_tokens=-1)

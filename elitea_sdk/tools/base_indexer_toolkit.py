@@ -2184,18 +2184,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 chunk.metadata.setdefault(PARSE_SOURCE_META_KEY, attempt_source)
                 yield chunk
 
-        def _stream_pipeline_with_retry(base_doc: Document) -> Generator[Document, None, None]:
-            loader_metadata = snapshot_loader_metadata(base_doc)
-            first_attempt_sources = set()
+        def _stream_attempt(base_doc: Document) -> Generator[Document, None, None]:
+            attempt_sources = set()
             try:
                 for chunk in _revocable_handover(_stream_pipeline(base_doc)):
-                    first_attempt_sources.add(chunk.metadata[PARSE_SOURCE_META_KEY])
+                    attempt_sources.add(chunk.metadata[PARSE_SOURCE_META_KEY])
                     yield chunk
+            except Exception:
+                self._discard_parse_sources(attempt_sources)
+                raise
+
+        def _stream_pipeline_with_retry(base_doc: Document) -> Generator[Document, None, None]:
+            loader_metadata = snapshot_loader_metadata(base_doc)
+            try:
+                yield from _stream_attempt(base_doc)
                 return
             except Exception as exc:
-                self._discard_parse_sources(first_attempt_sources)
                 _restore_for_retry(base_doc, loader_metadata, exc)
-            yield from _stream_pipeline(base_doc)
+            yield from _stream_attempt(base_doc)
 
         def _buffer_is_full() -> bool:
             return (len(pg_vector_add_docs_chunk) >= self.max_docs_per_add
@@ -2227,12 +2233,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 parse_source = doc.metadata.pop(PARSE_SOURCE_META_KEY, None)
                 if self._is_parse_source_discarded(parse_source):
                     continue
-                if parse_source is not None:
-                    chunks_by_parse_source[parse_source] = chunks_by_parse_source.get(parse_source, 0) + 1
                 if not doc.page_content:
                     # To avoid case when all documents have empty content
                     # See llm_processor.add_documents which exclude metadata of docs with empty content
                     continue
+                if parse_source is not None:
+                    chunks_by_parse_source[parse_source] = chunks_by_parse_source.get(parse_source, 0) + 1
                 if 'id' not in doc.metadata or 'updated_on' not in doc.metadata:
                     logger.warning(f"Document is missing required metadata field 'id' or 'updated_on': {doc.metadata}")
                 if staging:

@@ -371,3 +371,47 @@ def test_a_retried_attempt_spanning_several_keys_discards_every_row_it_handed_ov
     streamed = run(STAGED_SERIAL)
 
     assert streamed == run(STAGED_MATERIALISED)
+
+
+def index_with_a_flaky_page_chunker(monkeypatch, mode, page, note_chunks, page_failures):
+    note = Document(page_content="note body", metadata={
+        "id": "note-1", "name": "note.md", "updated_on": "1", DEPENDENT_DOC_META_KEY: True})
+    failures = []
+
+    def chunker(file_content_generator=None, config=None):
+        for document in file_content_generator:
+            if not document.metadata.get(DEPENDENT_DOC_META_KEY):
+                if len(failures) < page_failures:
+                    failures.append(True)
+                    raise RuntimeError("transient embeddings failure")
+                yield Document(page_content=document.page_content, metadata=document.metadata)
+                continue
+            for content in note_chunks:
+                yield Document(page_content=content, metadata=document.metadata)
+
+    def configure(toolkit):
+        monkeypatch.setitem(chunkers.__all__, "flaky", chunker)
+        monkeypatch.setattr(ParsingStagingToolkit, "_process_document", lambda self, document: iter([note]))
+
+    toolkit, outcome = index_through_real_pipeline(
+        monkeypatch, [page], configure=configure, chunking_tool="flaky", **mode)
+    return report_summary(toolkit, outcome), rows_kept(toolkit)
+
+
+def test_an_empty_chunk_of_a_discarded_attempt_does_not_lower_the_chunk_count(monkeypatch):
+    def run(mode):
+        return index_with_a_flaky_page_chunker(
+            monkeypatch, mode, make_page("page-1", "page.md"), note_chunks=["", "note body"], page_failures=1)
+
+    assert run(STAGED_SERIAL) == run(STAGED_MATERIALISED)
+
+
+def test_a_retry_that_also_fails_leaves_no_rows_for_an_idless_document(monkeypatch):
+    def run(mode):
+        page = Document(page_content="page body", metadata={"name": "page.md", "updated_on": "1"})
+        return index_with_a_flaky_page_chunker(monkeypatch, mode, page, note_chunks=["note body"], page_failures=2)
+
+    streamed = run(STAGED_SERIAL)
+
+    assert streamed[1] == 0
+    assert streamed == run(STAGED_MATERIALISED)

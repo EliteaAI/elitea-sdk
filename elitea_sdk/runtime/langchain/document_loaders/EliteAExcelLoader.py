@@ -15,7 +15,7 @@ import io
 import logging
 import os
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 import pandas as pd
@@ -467,14 +467,75 @@ class _StreamedLink:
     text_for_empty_cell: Optional[str]
 
 
+@dataclass(frozen=True)
+class _MergedRange:
+    min_column: int
+    min_row: int
+    max_column: int
+    max_row: int
+    xml_order: int
+
+    @property
+    def anchor(self) -> Tuple[int, int]:
+        return self.min_row, self.min_column
+
+    def covers(self, position: Tuple[int, int]) -> bool:
+        row, column = position
+        return self.min_row <= row <= self.max_row and self.min_column <= column <= self.max_column
+
+    def hides(self, position: Tuple[int, int]) -> bool:
+        return position != self.anchor and self.covers(position)
+
+
+@dataclass
+class _MergedRangeSweep:
+    merged_ranges: List[_MergedRange]
+    _ranges_by_first_row: List[_MergedRange] = field(init=False)
+    _next_range: int = field(init=False, default=0)
+    _ranges_on_row: List[_MergedRange] = field(init=False, default_factory=list)
+
+    def __post_init__(self):
+        self._ranges_by_first_row = sorted(self.merged_ranges, key=lambda merged: merged.min_row)
+
+    def ranges_on_row(self, row: int) -> List[_MergedRange]:
+        while (self._next_range < len(self._ranges_by_first_row)
+               and self._ranges_by_first_row[self._next_range].min_row <= row):
+            self._ranges_on_row.append(self._ranges_by_first_row[self._next_range])
+            self._next_range += 1
+        self._ranges_on_row = [merged for merged in self._ranges_on_row if merged.max_row >= row]
+        return self._ranges_on_row
+
+
+@dataclass
+class _StreamedSheetLayout:
+    links: Dict[Tuple[int, int], _StreamedLink]
+    merged_rows: _MergedRangeSweep
+
+    def merged_ranges_on_row(self, row: int) -> List[_MergedRange]:
+        return self.merged_rows.ranges_on_row(row)
+
+
+def _ranges_hiding(positions, merged_ranges: List[_MergedRange]) -> Dict[Tuple[int, int], _MergedRange]:
+    sweep = _MergedRangeSweep(merged_ranges)
+    hiding = {}
+    for position in sorted(positions):
+        candidates = [merged for merged in sweep.ranges_on_row(position[0]) if merged.hides(position)]
+        if candidates:
+            hiding[position] = min(candidates, key=lambda merged: merged.xml_order)
+    return hiding
+
+
 @dataclass
 class _SheetAnnotations:
     merged_ranges: List[str]
     hyperlinks: List[Tuple[str, Optional[str], Optional[str]]]
 
 
-def _render_streamed_cell(value, links: Dict[Tuple[int, int], _StreamedLink], position: Tuple[int, int]) -> str:
-    link = links.get(position)
+def _render_streamed_cell(value, layout: _StreamedSheetLayout, position: Tuple[int, int],
+                          merged_ranges_on_row: List[_MergedRange]) -> str:
+    if any(merged.hides(position) for merged in merged_ranges_on_row):
+        value = None
+    link = layout.links.get(position)
     if link is None:
         return "" if value is None else str(value)
     shown = link.text_for_empty_cell if value is None else value
@@ -553,18 +614,21 @@ def _sheet_comment_refs(sheet, relationships) -> List[str]:
     return refs
 
 
-def _bind_streamed_sheet_layout(sheet) -> Dict[Tuple[int, int], _StreamedLink]:
+def _render_streamed_row(values, row_number: int, layout: _StreamedSheetLayout) -> str:
+    merged_ranges_on_row = layout.merged_ranges_on_row(row_number)
+    return cell_delimiter.join(
+        _render_streamed_cell(value, layout, (row_number, column_number), merged_ranges_on_row)
+        for column_number, value in enumerate(values, start=1)
+    )
+
+
+def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
     _measure_sheet_extent_from_cells(sheet)
     annotations = _read_sheet_annotations(sheet)
     relationships = _sheet_relationships(sheet)
 
-    merged_anchors = {}
-    for merged_range in annotations.merged_ranges:
-        bounds = _widen_sheet_extent(sheet, merged_range)
-        anchor = (bounds[1], bounds[0])
-        for position in _cells_of(bounds):
-            if position != anchor:
-                merged_anchors.setdefault(position, anchor)
+    merged_ranges = [_MergedRange(*_widen_sheet_extent(sheet, merged_range), xml_order=xml_order)
+                     for xml_order, merged_range in enumerate(annotations.merged_ranges)]
 
     links: Dict[Tuple[int, int], _StreamedLink] = {}
 
@@ -574,20 +638,27 @@ def _bind_streamed_sheet_layout(sheet) -> Dict[Tuple[int, int], _StreamedLink]:
         text = previous.text_for_empty_cell if filled else (target or location)
         links[position] = _StreamedLink(target, text)
 
+    placed_links = []
     for ref, relationship_id, location in annotations.hyperlinks:
         target = relationships.get(relationship_id).Target if relationship_id and relationships else None
         bounds = _widen_sheet_extent(sheet, ref)
-        if ":" in ref:
-            for position in _cells_of(bounds):
-                if position not in merged_anchors:
+        positions = list(_cells_of(bounds)) if ":" in ref else [(bounds[1], bounds[0])]
+        placed_links.append((":" in ref, positions, target, location))
+
+    hiding = _ranges_hiding({position for _, positions, _, _ in placed_links for position in positions},
+                            merged_ranges)
+    for spans_range, positions, target, location in placed_links:
+        if spans_range:
+            for position in positions:
+                if position not in hiding:
                     bind(position, target, location)
         else:
-            position = (bounds[1], bounds[0])
-            bind(merged_anchors.get(position, position), target, location)
+            position = positions[0]
+            bind(hiding[position].anchor if position in hiding else position, target, location)
 
     for ref in _sheet_comment_refs(sheet, relationships):
         _widen_sheet_extent(sheet, ref)
-    return links
+    return _StreamedSheetLayout(links=links, merged_rows=_MergedRangeSweep(merged_ranges))
 
 
 def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
@@ -1046,12 +1117,13 @@ class EliteAExcelLoader(EliteATableLoader):
             workbook.close()
 
     def _iter_streamed_rows(self, sheet) -> Iterator[str]:
-        hyperlinks = _bind_streamed_sheet_layout(sheet)
-        for row_number, values in enumerate(sheet.iter_rows(values_only=True), start=1):
-            yield cell_delimiter.join(
-                _render_streamed_cell(value, hyperlinks, (row_number, column_number))
-                for column_number, value in enumerate(values, start=1)
-            )
+        layout = _bind_streamed_sheet_layout(sheet)
+        rows_read = 0
+        for rows_read, values in enumerate(sheet.iter_rows(values_only=True), start=1):
+            yield _render_streamed_row(values, rows_read, layout)
+        blank_row = (None,) * (sheet.max_column or 0)
+        for row_number in range(rows_read + 1, (sheet.max_row or 0) + 1):
+            yield _render_streamed_row(blank_row, row_number, layout)
 
     def iter_documents(self) -> Iterator[Document]:
         for sheet_name, chunk in self._iter_sheet_chunks():
