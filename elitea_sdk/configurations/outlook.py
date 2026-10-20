@@ -1,9 +1,31 @@
 import requests
 import logging
 from typing import Optional, List, Dict
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
 
 log = logging.getLogger(__name__)
+
+# Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions).
+OUTLOOK_SCOPE_DESCRIPTIONS: Dict[str, str] = {
+    "Mail.Read": "Read your mail: list, get, search and check new messages, read threads, list folders.",
+    "Mail.ReadWrite": (
+        "Change your mail: mark as read, move and delete messages. send_mail and reply_to_message "
+        "also use it to return the sent message ID."
+    ),
+    "Mail.Send": "Send mail as you: send_mail and reply_to_message.",
+    "Mail.Read.Shared": "Read mail in mailboxes shared with you (when Mailbox is another person's address).",
+    "Mail.ReadWrite.Shared": "Change mail in mailboxes shared with you (mark as read, move, delete).",
+    "Mail.Send.Shared": "Send mail on behalf of a shared mailbox.",
+}
+OUTLOOK_SCOPES = list(OUTLOOK_SCOPE_DESCRIPTIONS)
+OUTLOOK_DEFAULT_SCOPES = ["Mail.Read"]
+
+
+def normalize_outlook_scopes(value) -> List[str]:
+    """Allowed Outlook permissions from a stored value (list or string); default when empty."""
+    return normalize_scopes(value, OUTLOOK_SCOPES, OUTLOOK_DEFAULT_SCOPES, source="Outlook")
 
 
 class OutlookConfiguration(BaseModel):
@@ -47,13 +69,19 @@ class OutlookConfiguration(BaseModel):
         description="OAuth Discovery Endpoint. Format: https://login.microsoftonline.com/{tenant_id}"
     )
     scopes: Optional[List[str]] = Field(
-        default=None,
-        description="OAuth Scopes (e.g., Mail.Read, Mail.Send)"
+        default=list(OUTLOOK_DEFAULT_SCOPES),
+        description=SCOPES_NOTE,
+        json_schema_extra=scopes_field_extra(OUTLOOK_SCOPE_DESCRIPTIONS),
     )
     auto_refresh_token: Optional[bool] = Field(
         default=True,
         description="Automatically refresh the access token using the offline_access scope."
     )
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value):
+        return normalize_outlook_scopes(value)
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
@@ -132,8 +160,11 @@ class OutlookConfiguration(BaseModel):
             elif resp.status_code == 403:
                 if mailbox:
                     return (f"Access to mailbox '{mailbox}' is forbidden - you need Full Access to it "
-                            "and the Mail.Read.Shared scope")
-                return "Access forbidden - token lacks required Microsoft Graph Mail permissions"
+                            "and the Mail.Read.Shared scope. Tick it in the credential scopes and sign in again.")
+                return (
+                    "Access forbidden - the token lacks the Microsoft Graph permission Mail.Read. "
+                    "Tick it in the credential scopes and sign in again."
+                )
             elif resp.status_code == 404 and mailbox:
                 return (f"'{mailbox}' is not a mailbox you can open. A distribution list or group has no "
                         "mailbox of its own (its mail arrives in your inbox): leave the mailbox field empty")
@@ -183,9 +214,7 @@ class OutlookConfiguration(BaseModel):
             fetch_oauth_authorization_server_metadata,
         )
 
-        effective_scopes = list(scopes or [])
-        if "offline_access" not in effective_scopes:
-            effective_scopes.insert(0, "offline_access")
+        effective_scopes = ["offline_access", *normalize_outlook_scopes(scopes)]
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         azure_v2_endpoint = f"{base_discovery}/v2.0/.well-known/openid-configuration"
