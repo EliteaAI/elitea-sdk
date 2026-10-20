@@ -6,6 +6,8 @@ from typing import Optional
 from langchain_core.tools import ToolException
 from langgraph.store.base import BaseStore
 
+from ..runtime.credential_slots import GovernedCredentialError, apply_credential_slots, has_slots, scrub
+
 logger = logging.getLogger(__name__)
 
 # Available tools and toolkits - populated by safe imports
@@ -297,6 +299,16 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
 
         # Cache tool type and add common settings
         tool_type = TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type'])
+        # Governed credential slots (C-1009 WP-1D): resolve right before the toolkit is built,
+        # into this local copy only. A slot that cannot be resolved stops here, so a toolkit that
+        # reads a missing secret as anonymous access (e.g. GitHub) is never built without it.
+        released = frozenset()
+        if has_slots(settings):
+            if tool_type not in AVAILABLE_TOOLS:
+                raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
+            settings, released = apply_credential_slots(
+                settings, str(tool.get('id')), getattr(elitea, 'credential_resolver', None))
+            tool['settings'] = settings
         settings['elitea'] = elitea
         settings['llm'] = llm
         settings['store'] = store
@@ -309,7 +321,12 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
 
         # Handle ADO special cases
         if tool_type in ['ado_boards', 'ado_wiki', 'ado_plans']:
-            toolkit_tools.extend(AVAILABLE_TOOLS['ado']['get_tools'](tool_type, tool))
+            try:
+                toolkit_tools.extend(AVAILABLE_TOOLS['ado']['get_tools'](tool_type, tool))
+            except Exception as e:
+                if not released:
+                    raise
+                raise ToolException(f"Error getting tools for {tool_type}: {scrub(str(e), released)}") from None
         elif tool_type == 'mcp':
             logger.debug(f"Skipping MCP toolkit '{tool.get('toolkit_name')}' - handled by runtime toolkit system")
         elif tool_type == 'planning':
@@ -330,6 +347,11 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
                 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
                 if isinstance(e, McpAuthorizationRequired):
                     raise
+                if released:
+                    # Error texts echo inputs (pydantic input_value); never log or raise a released value.
+                    msg = scrub(str(e), released)
+                    logger.error(f"Error getting tools for {tool_type}: {msg}")
+                    raise ToolException(msg if isinstance(e, ToolException) else f"Error getting tools for {tool_type}: {msg}") from None
                 if isinstance(e, ToolException):
                     raise
                 logger.error(f"Error getting tools for {tool_type}: {e}")
