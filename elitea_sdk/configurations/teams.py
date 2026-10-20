@@ -67,6 +67,20 @@ class TeamsConfiguration(BaseModel):
         default=True,
         description="Automatically refresh the access token using the offline_access scope."
     )
+    # Set by the Login button on the toolkit page; lets scheduled runs work without a browser login
+    refresh_token: Optional[SecretStr] = Field(
+        default=None, description="Refresh token of the signed-in user (set by Login)",
+        json_schema_extra={"hidden": True},
+    )
+
+    @field_validator("oauth_discovery_endpoint")
+    @classmethod
+    def _entra_authority_only(cls, value):
+        # The client secret and the stored login are posted to this authority's token endpoint
+        from ..runtime.utils.mcp_oauth import is_entra_url
+        if value and not is_entra_url(value):
+            raise ValueError("Must be https://login.microsoftonline.com/<tenant_id>")
+        return value
 
     @field_validator("scopes", mode="before")
     @classmethod
@@ -103,7 +117,8 @@ class TeamsConfiguration(BaseModel):
         """Delegated flow - verify access token via Graph API."""
         scopes = settings.get("scopes")
         configuration_uuid = settings.get("configuration_uuid")
-        access_token = settings.get("access_token")
+        from ..runtime.utils.mcp_oauth import access_token_from_stored_login
+        access_token = access_token_from_stored_login(settings)
 
         if not access_token:
             raise TeamsConfiguration._build_mcp_authorization_required(

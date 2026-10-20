@@ -24,7 +24,7 @@ from urllib.parse import quote, unquote, urlparse, parse_qs
 import requests
 from langchain_core.tools import ToolException
 
-from ...runtime.utils.mcp_oauth import McpAuthorizationRequired
+from ...runtime.utils.mcp_oauth import McpAuthorizationRequired, is_entra_url
 
 from .base_wrapper import BaseSharepointWrapper
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
@@ -168,6 +168,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         Returns True if successful and self._token was updated, False otherwise.
         """
         if not self._refresh_token or not self._oauth_token_endpoint:
+            return False
+        # Never send the refresh token and client secret to a non-Entra host
+        if not is_entra_url(self._oauth_token_endpoint):
+            logging.warning("%s: token refresh skipped, token endpoint is not an Entra host", type(self).__name__)
             return False
         try:
             data = {

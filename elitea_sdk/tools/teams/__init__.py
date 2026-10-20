@@ -106,7 +106,9 @@ class TeamsToolkit(BaseToolkit):
             if token_data:
                 if isinstance(token_data, dict):
                     wrapper_payload['token'] = token_data.get('access_token')
-                    wrapper_payload['refresh_token'] = token_data.get('refresh_token')
+                    # Keep the credential's stored login when the injected token carries none
+                    if token_data.get('refresh_token'):
+                        wrapper_payload['refresh_token'] = token_data['refresh_token']
                 else:
                     wrapper_payload['token'] = token_data
 

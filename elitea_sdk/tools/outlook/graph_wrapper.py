@@ -27,6 +27,7 @@ import requests
 from langchain_core.tools import ToolException
 
 from ...configurations.microsoft_graph_scopes import missing_permission_hint
+from ...runtime.utils.mcp_oauth import is_entra_url
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -386,6 +387,10 @@ class OutlookGraphWrapper:
     def _try_refresh_token(self) -> bool:
         """Attempt to refresh the access token using stored refresh_token."""
         if not self._refresh_token or not self._oauth_token_endpoint:
+            return False
+        # Never send the refresh token and client secret to a non-Entra host
+        if not is_entra_url(self._oauth_token_endpoint):
+            log.warning("%s: token refresh skipped, token endpoint is not an Entra host", type(self).__name__)
             return False
         try:
             data = {
