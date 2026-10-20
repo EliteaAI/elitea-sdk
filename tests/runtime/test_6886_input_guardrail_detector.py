@@ -152,6 +152,131 @@ def test_timeout_is_an_error(monkeypatch):
     assert result.error == 'timeout'
 
 
+def _token():
+    return _text(next(v for v in VECTORS['positive'] if v['rule_id'] == 'github_token'))
+
+
+def test_oversize_still_inspects_the_current_turn_and_acts_on_it():
+    """Over the budget, history is cut - not the turn the user just sent."""
+    policy = policy_from_dict({'enabled': True, 'max_inspect_chars': 200})
+    segments = [Segment('history', 0, 'x' * 500), Segment('current_turn', 0, f'use {_token()}')]
+
+    result = inspect(segments, policy)
+
+    assert result.error == 'oversize'
+    assert [(d.rule_id, d.segment_kind) for d in result.detections] == [('github_token', 'current_turn')]
+    assert effective_action(result, policy) == 'block'
+    assert [e['is_error'] for e in audit_actions(result, policy)] == [False, True]
+
+
+def test_oversize_truncates_history_instead_of_skipping_it():
+    policy = policy_from_dict({'enabled': True, 'max_inspect_chars': 100})
+    segments = [Segment('history', 0, f'{_token()} ' + 'x' * 500), Segment('current_turn', 0, 'hi')]
+
+    result = inspect(segments, policy)
+
+    assert result.error == 'oversize'
+    assert [d.segment_kind for d in result.detections] == ['history']
+
+
+def test_oversize_budget_goes_to_the_newest_history_first():
+    policy = policy_from_dict({'enabled': True, 'max_inspect_chars': 60})
+    segments = [Segment('history', 0, f'{_token()}'), Segment('history', 1, 'y' * 60)]
+
+    result = inspect(segments, policy)
+
+    assert result.error == 'oversize'
+    assert result.detections == ()
+
+
+def test_timeout_keeps_the_detections_made_before_it(monkeypatch):
+    policy = policy_from_dict({'enabled': True, 'categories': {'credentials': 'redact'}})
+    real = input_detector.time.monotonic
+    state = {'calls': 0}
+
+    def clock():
+        state['calls'] += 1
+        # the second rule check onwards is past the deadline
+        return real() if state['calls'] < 6 else real() + 100
+
+    monkeypatch.setattr(input_detector.time, 'monotonic', clock)
+    segments = [Segment('current_turn', 0, f'use {_token()}'), Segment('history', 0, f'use {_token()}')]
+
+    result = inspect(segments, policy)
+
+    assert result.error == 'timeout'
+    assert result.detections and result.action == 'redact'
+    assert effective_action(result, policy) == 'redact'
+    assert {r[0] for r in result.redacted} <= {'current_turn'}
+
+
+def test_fail_closed_blocks_on_any_error_and_fail_open_keeps_the_detected_action():
+    closed = policy_from_dict({'enabled': True, 'max_inspect_chars': 5, 'on_error': 'fail_closed'})
+    opened = policy_from_dict({'enabled': True, 'max_inspect_chars': 5})
+
+    assert effective_action(inspect(_turn('long enough text'), closed), closed) == 'block'
+    assert effective_action(inspect(_turn('long enough text'), opened), opened) == 'none'
+
+
+def test_summary_keys_are_unchanged():
+    policy = policy_from_dict({'enabled': True})
+
+    assert set(summary(inspect(_turn('x'), policy), policy)) == {
+        'action', 'categories', 'rules', 'segments', 'detection_count', 'not_inspected',
+        'error', 'on_error', 'elapsed_ms', 'audit',
+    }
+
+
+@pytest.mark.parametrize('pattern', ['a{4294967296}', '(' * 1200 + 'a' + ')' * 1200, '(unclosed'])
+def test_pathological_allow_patterns_are_dropped_not_raised(pattern):
+    policy = policy_from_dict({'enabled': True, 'allow_patterns': [pattern, 'ok']})
+
+    assert [p.pattern for p in policy.allow_patterns] == ['ok']
+
+
+@pytest.mark.parametrize('vector', VECTORS['adversarial'], ids=lambda v: v['id'])
+def test_adversarial_input_inspects_in_linear_time(vector):
+    text = ''.join(vector['parts']) * vector['repeat']
+    policy = policy_from_dict({**ALL_ON, 'timeout_ms': 60_000, 'max_inspect_chars': 1_000_000})
+
+    started = time.monotonic()
+    result = inspect(_turn(text), policy)
+
+    assert time.monotonic() - started < 2
+    assert result.error is None
+
+
+def test_timeout_fires_on_a_pathological_input_with_a_small_budget():
+    text = 'a.' * 250_000
+    policy = policy_from_dict({**ALL_ON, 'timeout_ms': 1, 'max_inspect_chars': 1_000_000})
+
+    started = time.monotonic()
+    result = inspect(_turn(text), policy)
+
+    assert result.error == 'timeout'
+    assert time.monotonic() - started < 1
+
+
+def test_match_is_found_across_a_window_boundary_exactly_once():
+    token = _token().split(' ', 1)[1]
+    step = input_detector.WINDOW_STEP
+    for offset in (step - len(token) // 2, step - 1, step, step + 1):
+        text = 'x ' * (offset // 2) + ' ' + token + ' tail'
+        policy = policy_from_dict({'enabled': True, 'max_inspect_chars': 1_000_000})
+
+        result = inspect(_turn(text), policy)
+
+        assert [(d.rule_id) for d in result.detections] == ['github_token'], offset
+        assert text[result.detections[0].start:result.detections[0].end] == token
+
+
+def test_a_token_after_a_huge_prefix_is_still_found():
+    text = 'lorem ipsum ' * 15_000 + _token()
+    policy = policy_from_dict({'enabled': True, 'max_inspect_chars': 1_000_000, 'timeout_ms': 5000})
+
+    assert [d.rule_id for d in inspect(_turn(text), policy).detections] == ['github_token']
+
+
 def test_internal_error_never_raises_and_carries_no_input(monkeypatch):
     secret = _text(VECTORS['positive'][0])
 
