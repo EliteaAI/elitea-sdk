@@ -20,6 +20,10 @@ from ..exceptions import InputGuardrailBlocked
 
 logger = logging.getLogger(__name__)
 
+# State key carrying {message id: original} for messages a before_model hook swapped for a
+# model-only copy; see MiddlewareManager.run_before_model and LLMNode.invoke
+TRANSIENT_ORIGINALS_KEY = '_transient_originals'
+
 
 class Middleware(ABC):
     """
@@ -328,7 +332,22 @@ class MiddlewareManager:
                 if updates and 'transient_messages' in updates:
                     # Same contract as transform_messages_for_model: replaces the model's
                     # view only. A 'messages' update would append and reorder instead.
-                    state = {**state, 'messages': updates['transient_messages']}
+                    # The originals ride along under TRANSIENT_ORIGINALS_KEY so the node can
+                    # put them back in what it returns: the add_messages reducer replaces
+                    # a stored message by id, and a transient copy shares its id.
+                    originals = {
+                        m.id: m for m in state.get('messages') or []
+                        if getattr(m, 'id', None)
+                    }
+                    swapped = {
+                        m.id: originals[m.id] for m in updates['transient_messages']
+                        if getattr(m, 'id', None) in originals and originals[m.id] is not m
+                    }
+                    state = {
+                        **state,
+                        'messages': updates['transient_messages'],
+                        TRANSIENT_ORIGINALS_KEY: {**state.get(TRANSIENT_ORIGINALS_KEY, {}), **swapped},
+                    }
                 if updates and 'messages' in updates:
                     # Only collect RemoveMessage operations for checkpoint
                     # The actual messages are already in state after processing

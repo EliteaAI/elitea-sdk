@@ -1243,6 +1243,18 @@ class LLMNode(BaseTool):
             _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
             result = {"messages": [_error_msg]}
 
+        # A before_model hook may have swapped stored messages for model-only copies (input
+        # guardrail redaction). The copies keep the stored ids, so returning them would
+        # overwrite the originals in the checkpoint: put the originals back.
+        # Imported here: the middleware package imports the agent graph, which imports this module
+        from ..middleware.base import TRANSIENT_ORIGINALS_KEY
+        originals = state.get(TRANSIENT_ORIGINALS_KEY) if isinstance(state, dict) else None
+        if originals and isinstance(result, dict) and isinstance(result.get('messages'), list):
+            result['messages'] = [
+                originals.get(getattr(m, 'id', None), m) if getattr(m, 'id', None) else m
+                for m in result['messages']
+            ]
+
         # Run after_model hooks and add context_info
         if middleware_mgr is not None and isinstance(result, dict) and 'messages' in result:
             final_state = {**(original_state or state), 'messages': result['messages']}

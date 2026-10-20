@@ -24,6 +24,7 @@ from ..guardrails.input_detector import (
     Segment,
     effective_action,
     inspect,
+    is_platform_context_block,
     policy_from_dict,
     segment_hash,
     summary,
@@ -34,8 +35,6 @@ logger = logging.getLogger(__name__)
 
 EVENT_NAME = 'input_guardrail'
 INSPECTED_CONFIG_KEY = 'input_guardrail_inspected'
-# Platform-generated context blocks are not user input
-_PLATFORM_BLOCK_PREFIX = '<runtime_context'
 
 
 class _Location:
@@ -125,8 +124,11 @@ class InputGuardMiddleware(Middleware):
         not_inspected: List[str] = []
         counters: Dict[str, int] = {}
 
-        def add(kind: str, text: str, location: _Location) -> None:
-            if not text or text.lstrip().startswith(_PLATFORM_BLOCK_PREFIX) or segment_hash(text) in skip:
+        def add(kind: str, text: str, location: _Location, platform_ok: bool = False) -> None:
+            # Platform-built context blocks are not user input, but only the exact block
+            # the platform writes as its own content block counts: a user's string that
+            # starts with the tag is inspected like any other text
+            if not text or segment_hash(text) in skip or (platform_ok and is_platform_context_block(text)):
                 return
             index = counters.get(kind, 0)
             counters[kind] = index + 1
@@ -163,7 +165,7 @@ class InputGuardMiddleware(Middleware):
         if isinstance(block, str):
             add(kind, block, location)
         elif isinstance(block, dict) and block.get('type') == 'text':
-            add(kind, block.get('text') or '', location)
+            add(kind, block.get('text') or '', location, platform_ok=True)
         elif isinstance(block, dict):
             not_inspected.append(str(block.get('type') or 'unknown'))
 
