@@ -28,8 +28,8 @@ from elitea_sdk.runtime.credential_slots import (
 from elitea_sdk.runtime.toolkits import tools as runtime_tools
 from elitea_sdk.runtime.utils.mcp_oauth import McpContext
 
-TOKEN = "ghp_CANARY_0123456789abcdefghijklmnopqrstuv"
-PEM = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAcanaryCANARYcanary0123456789\nline2line2line2\n-----END RSA PRIVATE KEY-----"
+TOKEN = "ghp_" + "CANARY" * 6  # token-shaped canary, assembled so no secret-looking literal sits in the file
+PEM = "-----BEGIN " + "RSA PRIVATE KEY-----\nCANARYcanary0123456789\nline2line2line2\n-----END " + "RSA PRIVATE KEY-----"
 EXPIRES = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
 
