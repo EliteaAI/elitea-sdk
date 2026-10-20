@@ -138,7 +138,7 @@ def test_size_cap_is_an_error_and_follows_on_error():
 
     result = inspect(_turn(text), open_policy)
 
-    assert result.error == 'timeout'
+    assert result.error == 'oversize'
     assert effective_action(result, open_policy) == 'none'
     assert effective_action(inspect(_turn(text), closed_policy), closed_policy) == 'block'
 
@@ -191,7 +191,7 @@ def test_audit_action_for_an_error():
 
     entries = audit_actions(inspect(_turn('ab'), policy), policy)
 
-    assert entries == [{'action': 'input:error.timeout:fail_open', 'segment_kind': None, 'is_error': True}]
+    assert entries == [{'action': 'input:error.oversize:fail_open', 'segment_kind': None, 'is_error': True}]
 
 
 def test_benign_prose_and_code_corpus_has_no_credential_hits():

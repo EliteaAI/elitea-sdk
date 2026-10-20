@@ -1879,7 +1879,7 @@ class LLMNode(BaseTool):
             # The Auto metadata contains signed checkpoint/pin tokens.
             logger.info("Initial Auto completion: tool_calls=%s", len(completion.tool_calls or []))
         else:
-            logger.info(f"Initial completion: {completion}")
+            logger.info("Initial completion: tool_calls=%s", len(getattr(completion, 'tool_calls', None) or []))
 
         # Handle both tool-calling and regular responses
         if hasattr(completion, 'tool_calls') and completion.tool_calls:
@@ -4298,7 +4298,8 @@ class LLMNode(BaseTool):
 
                 if tool_to_execute:
                     try:
-                        logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
+                        # Argument values can carry user input; names only (#6886)
+                        logger.info("Executing tool '%s' with args: %s", tool_name, sorted((tool_args or {}).keys()) if isinstance(tool_args, dict) else type(tool_args).__name__)
 
                         # Expose accumulated intermediate messages BEFORE invoking
                         # the tool.  If the tool triggers a sensitive-tool interrupt,

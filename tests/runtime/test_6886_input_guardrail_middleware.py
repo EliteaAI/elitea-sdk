@@ -184,7 +184,7 @@ def test_fail_open_passes_on_detector_error():
     guard.callbacks['input_guardrail'] = events.append
 
     assert guard.before_model({'input': 'harmless but long', 'messages': []}, {}) is None
-    assert events[0]['audit'][0]['action'] == 'input:error.timeout:fail_open'
+    assert events[0]['audit'][0]['action'] == 'input:error.oversize:fail_open'
 
 
 def test_disabled_guardrail_sends_exactly_the_same_messages():

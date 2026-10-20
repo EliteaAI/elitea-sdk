@@ -2040,7 +2040,7 @@ class EliteAClient:
                 else:
                     logger.info(f"Found tool '{tool_name}' using fallback matching ('{actual_tool_name}')")
 
-                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {tool_params}")
+                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {sorted((tool_params or {}).keys()) if isinstance(tool_params, dict) else type(tool_params).__name__}")
 
                 # Start timing the tool execution
                 start_time = time.time()
