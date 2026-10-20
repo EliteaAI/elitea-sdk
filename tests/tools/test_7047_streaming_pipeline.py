@@ -537,3 +537,35 @@ def test_a_rejected_write_mixing_sources_counts_only_the_chunks_that_were_kept(m
     assert toolkit._index_run.damaged_keys == {"ok.docx"}
     assert outcome["report"]["errors"] == ["ok.docx: the store rejected the batch"]
     assert toolkit.written[-1]["updated"] == 1
+
+
+@pytest.mark.parametrize("mode", PIPELINE_MODES)
+def test_a_write_failure_is_reported_in_the_order_it_happened(monkeypatch, mode):
+    def dependents_failing_for_b(self, document):
+        if document.metadata["name"] == "b.docx":
+            raise RuntimeError("attachment fetch failed")
+        return iter(())
+
+    def configure(toolkit):
+        monkeypatch.setattr(ParsingStagingToolkit, "_process_document", dependents_failing_for_b)
+
+    _, outcome = index_through_real_pipeline(
+        monkeypatch, make_files("a.docx", "b.docx"), configure=configure,
+        rejects=lambda document: document.metadata["name"] == "a.docx", **mode)
+
+    assert outcome["report"]["errors"] == [
+        "a.docx: the store rejected the batch",
+        "b.docx: attachment fetch failed",
+    ]
+
+
+@pytest.mark.parametrize("mode", PIPELINE_MODES)
+def test_a_failed_final_write_is_reported(monkeypatch, mode):
+    def configure(toolkit):
+        object.__setattr__(toolkit, "max_docs_per_add", 20)
+
+    toolkit, outcome = index_through_real_pipeline(
+        monkeypatch, make_files("a.docx", "b.docx"), configure=configure,
+        rejects=lambda document: True, **mode)
+
+    assert outcome["report"]["errors"] == ["a.docx, b.docx: the store rejected the batch"]

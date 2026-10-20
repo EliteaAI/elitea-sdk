@@ -2341,6 +2341,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         except Exception as exc:
                             _handle_pipeline_failure(base_doc, base_doc_counter, exc)
                             _consume_pipeline_output(base_doc, base_doc_counter, [])
+                        _settle_failed_flushes()
                         continue
                     try:
                         chunks = _run_pipeline_with_retry(base_doc)
@@ -2348,6 +2349,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         _handle_pipeline_failure(base_doc, base_doc_counter, exc)
                         chunks = []
                     _consume_pipeline_output(base_doc, base_doc_counter, chunks)
+                    _settle_failed_flushes()
                 if pg_vector_add_docs_chunk:
                     _flush_chunk()
                 return
@@ -2397,6 +2399,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                             _handle_pipeline_failure(base_doc, base_doc_counter, exc)
                             chunks = []
                         _consume_pipeline_output(base_doc, base_doc_counter, chunks)
+                        _settle_failed_flushes()
                         _submit_next()
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
