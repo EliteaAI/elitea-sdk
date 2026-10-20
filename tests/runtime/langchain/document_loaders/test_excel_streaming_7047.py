@@ -1,0 +1,268 @@
+# Copyright (c) 2026 EPAM Systems
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Indexing reads .xlsx in streaming read-only mode with the same output as the full read (#7047)."""
+
+import datetime
+import re
+import zipfile
+
+import pytest
+import tiktoken
+from langchain_core.documents import Document
+from openpyxl import Workbook
+from openpyxl.worksheet.hyperlink import Hyperlink
+
+from elitea_sdk.runtime.langchain.document_loaders import EliteAExcelLoader as excel_module
+from elitea_sdk.runtime.langchain.document_loaders.EliteAExcelLoader import (
+    EXCEL_MAX_REQUEST_ROWS,
+    EliteAExcelLoader,
+)
+from elitea_sdk.tools.utils import content_parser
+
+ENCODING = tiktoken.get_encoding("cl100k_base")
+
+
+def window_tokens(chunk):
+    return sum(len(ENCODING.encode(row)) for row in chunk.splitlines())
+
+
+def build_workbook(tmp_path, write_only=False):
+    workbook = Workbook(write_only=write_only)
+    if not write_only:
+        workbook.remove(workbook.active)
+    emails = workbook.create_sheet("Emails")
+    emails.append(["Subject", "Sender", "Sent", "Body", "Score"])
+    for index in range(40):
+        emails.append([f"Subject {index}", None if index % 7 == 0 else f"sender{index}@example.com",
+                       datetime.datetime(2026, 1, 1 + index % 28), "word " * (index % 13), index * 1.5])
+    notes = workbook.create_sheet("Нотатки")
+    notes.append(["Key", "Value"])
+    notes.append(["alpha", 1])
+    notes.append([None, None])
+    notes.append(["omega", "last"])
+    if not write_only:
+        emails["A2"].hyperlink = "https://example.com/first"
+        emails["B5"].hyperlink = "https://example.com/sender"
+        emails["A9"].hyperlink = Hyperlink(ref="A9", location="'Нотатки'!A1")
+    path = tmp_path / ("write_only.xlsx" if write_only else "streamed.xlsx")
+    workbook.save(path)
+    return str(path)
+
+
+def loaded(path, **kwargs):
+    loader = EliteAExcelLoader(file_path=path, file_name=path, **kwargs)
+    return [(document.metadata["sheet_name"], document.page_content) for document in loader.load()]
+
+
+LOADER_CONFIGS = [
+    pytest.param({"max_tokens": -1}, id="one-chunk-per-sheet"),
+    pytest.param({"max_tokens": 40}, id="token-windows"),
+    pytest.param({"max_tokens": 40, "add_header_to_chunks": True}, id="header-per-window"),
+    pytest.param({"max_tokens": 40, "add_header_to_chunks": True, "header_row_number": 2}, id="second-row-header"),
+    pytest.param({"max_tokens": 40, "sheet_name": "Нотатки"}, id="named-sheet"),
+    pytest.param({"max_tokens": 40, "sheet_name": "Missing"}, id="missing-sheet"),
+]
+
+
+@pytest.mark.parametrize("config", LOADER_CONFIGS)
+def test_streamed_read_matches_the_full_read(tmp_path, monkeypatch, config):
+    path = build_workbook(tmp_path)
+    streamed = loaded(path, skip_size_check=True, **config)
+    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
+
+    assert streamed == loaded(path, skip_size_check=True, **config)
+
+
+def test_every_window_starts_with_the_header_exactly_once(tmp_path):
+    path = build_workbook(tmp_path)
+
+    windows = [chunk.splitlines() for sheet, chunk in
+               loaded(path, skip_size_check=True, max_tokens=40, add_header_to_chunks=True) if sheet == "Emails"]
+
+    assert len(windows) > 1
+    assert all(lines[0].startswith("Subject | Sender") for lines in windows)
+    assert all(sum(line.startswith("Subject | Sender") for line in lines) == 1 for lines in windows)
+
+
+def test_streamed_read_renders_external_and_internal_hyperlinks(tmp_path):
+    path = build_workbook(tmp_path)
+
+    content = "\n".join(chunk for _, chunk in loaded(path, skip_size_check=True, max_tokens=-1))
+
+    assert "[Subject 0](https://example.com/first)" in content
+    assert "[sender3@example.com](https://example.com/sender)" in content
+    assert "[Subject 7](None)" in content
+
+
+def test_streamed_read_opens_the_workbook_read_only_and_closes_it(tmp_path, monkeypatch):
+    path = build_workbook(tmp_path)
+    opened = []
+    real_load_workbook = excel_module.load_workbook
+
+    def spy(*args, **kwargs):
+        workbook = real_load_workbook(*args, **kwargs)
+        opened.append((kwargs, workbook))
+        return workbook
+
+    monkeypatch.setattr(excel_module, "load_workbook", spy)
+
+    loaded(path, skip_size_check=True, max_tokens=40)
+
+    assert [kwargs.get("read_only") for kwargs, _ in opened] == [True]
+    assert opened[0][1]._archive.fp is None
+
+
+def test_streamed_read_keeps_every_row_when_the_dimension_tag_is_missing(tmp_path):
+    path = build_workbook(tmp_path, write_only=True)
+
+    rows = "\n".join(chunk for _, chunk in loaded(path, skip_size_check=True, max_tokens=-1)).splitlines()
+
+    assert len(rows) == 41 + 4
+    assert rows[-1] == "omega | last"
+
+
+def test_formula_evaluation_keeps_the_full_read(tmp_path, monkeypatch):
+    path = build_workbook(tmp_path)
+    opened = []
+    real_load_workbook = excel_module.load_workbook
+    monkeypatch.setattr(excel_module, "load_workbook",
+                        lambda *args, **kwargs: opened.append(kwargs) or real_load_workbook(*args, **kwargs))
+
+    loaded(path, skip_size_check=True, evaluate_formulas=True, max_tokens=40)
+
+    assert opened and not any(kwargs.get("read_only") for kwargs in opened)
+
+
+def test_documents_are_produced_one_window_at_a_time(tmp_path):
+    path = build_workbook(tmp_path)
+    loader = EliteAExcelLoader(file_path=path, file_name=path, skip_size_check=True, max_tokens=40)
+
+    documents = loader.iter_documents()
+    first = next(documents)
+
+    assert first.metadata["sheet_name"] == "Emails"
+    assert window_tokens(first.page_content) <= 40
+    documents.close()
+
+
+def index_workbook(path, chunking_config):
+    with open(path, "rb") as source:
+        content = source.read()
+    return list(content_parser.process_document_by_type(
+        content=content, extension_source="emails.xlsx",
+        document=Document(page_content="", metadata={"id": "emails"}), chunking_config=chunking_config))
+
+
+def large_workbook(tmp_path, rows):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Large"
+    sheet.append(["Subject", "Body"])
+    for index in range(rows):
+        sheet.append([f"Subject {index}", f"body text number {index}"])
+    path = tmp_path / "large.xlsx"
+    workbook.save(path)
+    return str(path)
+
+
+def test_indexing_keeps_one_chunk_per_sheet_the_form_submits_as_unbounded(tmp_path, monkeypatch):
+    path = large_workbook(tmp_path, 2_000)
+    form_config = {".xlsx": {"max_tokens": -1, "skip_size_check": False}}
+    streamed = [chunk.page_content for chunk in index_workbook(path, form_config)]
+    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
+
+    assert len(streamed) == 1
+    assert streamed == [chunk.page_content for chunk in index_workbook(path, form_config)]
+
+
+def test_indexing_keeps_a_token_window_the_user_chose(tmp_path):
+    path = large_workbook(tmp_path, 2_000)
+
+    chunks = index_workbook(path, {".xlsx": {"max_tokens": 64}})
+
+    assert max(window_tokens(chunk.page_content) for chunk in chunks) <= 64
+
+
+def test_indexing_reads_a_sheet_above_the_read_file_row_limit(tmp_path):
+    path = large_workbook(tmp_path, EXCEL_MAX_REQUEST_ROWS + 10)
+
+    chunks = index_workbook(path, {})
+
+    assert not chunks[0].page_content.startswith("Error during content parsing")
+    assert f"Subject {EXCEL_MAX_REQUEST_ROWS + 9} | body text number {EXCEL_MAX_REQUEST_ROWS + 9}" in chunks[-1].page_content
+
+
+def test_loaders_that_stream_are_not_materialised():
+    class StreamingLoader:
+        def iter_documents(self):
+            yield Document(page_content="streamed")
+
+        def load(self):
+            raise AssertionError("load must not be called for a streaming loader")
+
+    assert [document.page_content for document in content_parser._iter_loaded_documents(StreamingLoader())] == ["streamed"]
+
+
+def with_wrong_dimension_tags(path):
+    rewritten = path.replace(".xlsx", "_wrong_dimension.xlsx")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename.startswith("xl/worksheets/sheet"):
+                data = re.sub(rb'<dimension ref="[^"]*"\s*/>', b'<dimension ref="A1"/>', data)
+            target.writestr(item, data)
+    return rewritten
+
+
+def test_a_wrong_dimension_tag_does_not_cut_the_sheet(tmp_path, monkeypatch):
+    path = with_wrong_dimension_tags(build_workbook(tmp_path))
+    streamed = loaded(path, skip_size_check=True, max_tokens=-1)
+    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
+
+    assert streamed == loaded(path, skip_size_check=True, max_tokens=-1)
+    assert "[sender3@example.com](https://example.com/sender)" in streamed[0][1]
+
+
+def test_an_empty_sheet_streams_like_the_full_read(tmp_path, monkeypatch):
+    workbook = Workbook()
+    workbook.active.title = "Empty"
+    workbook.create_sheet("Filled").append(["a", "b"])
+    path = str(tmp_path / "with_empty.xlsx")
+    workbook.save(path)
+    streamed = loaded(path, skip_size_check=True, max_tokens=40)
+    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
+
+    assert streamed == loaded(path, skip_size_check=True, max_tokens=40)
+
+
+def test_a_loader_failing_after_it_yielded_does_not_restart_on_a_fallback_extension(monkeypatch):
+    class HalfwayLoader:
+        def __init__(self, file_path=None, **kwargs):
+            pass
+
+        def iter_documents(self):
+            yield Document(page_content="first window")
+            raise MemoryError()
+
+    monkeypatch.setitem(content_parser.loaders_map, ".xlsx", {
+        "class": HalfwayLoader, "kwargs": {}, "allowed_to_override": {}})
+    produced = []
+
+    with pytest.raises(MemoryError):
+        for document in content_parser.process_content_by_type(
+                b"payload", "attachment.xlsx", fallback_extensions=[".txt"]):
+            produced.append(document.page_content)
+
+    assert produced == ["first window"]
