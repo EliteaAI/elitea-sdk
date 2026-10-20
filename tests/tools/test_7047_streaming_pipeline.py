@@ -19,7 +19,7 @@ import threading
 import pytest
 from langchain_core.documents import Document
 
-from elitea_sdk.runtime.langchain.document_loaders.utils import _image_description_failures
+from elitea_sdk.runtime.langchain.document_loaders import utils as loader_utils
 from elitea_sdk.tools import chunkers
 from elitea_sdk.tools.base_indexer_toolkit import DEPENDENT_DOC_META_KEY, PARSE_SOURCE_META_KEY, IndexingStatus
 from tests.tools.test_6585_document_failure_isolation import (
@@ -153,7 +153,7 @@ def test_an_image_lost_while_streaming_is_still_reported(monkeypatch):
     def parse(document=None, **kwargs):
         def stream():
             yield Document(page_content="text before the picture", metadata=dict(document.metadata))
-            _image_description_failures.get().append("model rejected the image")
+            loader_utils._image_description_failures.get().append("model rejected the image")
             yield Document(page_content="text after the picture", metadata=dict(document.metadata))
         return stream()
 
@@ -274,7 +274,7 @@ def test_an_image_lost_in_a_file_that_then_failed_is_not_reported(monkeypatch):
     def parse(document=None, **kwargs):
         def stream():
             yield Document(page_content="text before the picture", metadata=dict(document.metadata))
-            _image_description_failures.get().append("model rejected the image")
+            loader_utils._image_description_failures.get().append("model rejected the image")
             yield Document(page_content="Error during content parsing for file deck.pptx:\nbroken slide",
                            metadata=dict(document.metadata))
         return stream()
