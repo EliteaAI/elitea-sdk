@@ -237,7 +237,7 @@ class EliteAClient:
         """List one page of schedules in the project.
 
         Args:
-            limit: Rows per page. The API lowers a value above its cap.
+            limit: Rows per page, 1 to 100; the API answers 400 for a value outside that range.
             offset: Rows to skip.
             **filters: Query filters, for example entity_type, status, enabled,
                 owner_ids, entity_id, search. A filter set to None is not sent.
