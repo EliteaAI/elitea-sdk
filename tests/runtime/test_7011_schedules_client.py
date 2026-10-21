@@ -95,6 +95,10 @@ def test_el7011_r1_5_list_schedules_returns_json(client, send):
     lambda c: c.run_schedule(SCHEDULE_ID),
     lambda c: c.list_schedule_runs(SCHEDULE_ID),
     lambda c: c.change_schedule_owner(SCHEDULE_ID, 20),
+    lambda c: c.check_schedule({"name": "x"}),
+    lambda c: c.get_schedule_run(SCHEDULE_ID, 3),
+    lambda c: c.get_schedule_settings(),
+    lambda c: c.update_schedule_settings({"allow_run_without_asking": True}),
 ])
 def test_el7011_r1_6_every_method_uses_request_headers_and_timeout(client, send, call):
     send.return_value = make_response(200, {"ok": True})
@@ -208,3 +212,26 @@ def test_el7011_r4_2_server_400_surfaces_field_error(client, send, call):
         call(client)
     assert exc.value.status_code == 400
     assert exc.value.body == {"run_mode": "invalid"}
+
+
+@pytest.mark.parametrize("method, args, verb, suffix, sent", [
+    ("check_schedule", ({"name": "n"},), "post", "/check", {"name": "n"}),
+    ("get_schedule_run", (SCHEDULE_ID, 5), "get", f"/{SCHEDULE_ID}/runs/5", None),
+    ("get_schedule_settings", (), "get", "/settings", None),
+    ("update_schedule_settings", ({"allow_run_without_asking": True},), "put", "/settings", {"allow_run_without_asking": True}),
+])
+def test_el7011_r5_1_to_r5_4_check_run_detail_and_settings(client, send, base, method, args, verb, suffix, sent):
+    assert getattr(client, method)(*args) == {"ok": True}
+    call_args, kwargs = send.call_args
+    assert call_args == (verb, f"{base}{suffix}")
+    assert kwargs.get("json") == sent
+
+
+@pytest.mark.parametrize("code", ["risk_confirmation_required", "schedule_blocked"])
+def test_el7011_r5_5_409_body_keeps_code_fingerprint_blocking(client, send, code):
+    body = {"code": code, "fingerprint": "abc", "blocking": ["x"]}
+    send.return_value = make_response(409, body)
+    with pytest.raises(ApiDetailsRequestError) as exc:
+        client.check_schedule({"name": "n"})
+    assert exc.value.status_code == 409
+    assert exc.value.body == body
