@@ -45,7 +45,7 @@ import functools
 import json
 import re
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple, Optional, Protocol, Tuple, TypeVar, Union
 
@@ -406,6 +406,15 @@ def collect_slot_items(
     return [{"toolkit_instance_id": toolkit_instance_id, **item} for item in items]
 
 
+def _expired(envelope: CredentialEnvelope) -> bool:
+    expires_at = envelope.expires_at
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at <= datetime.now(timezone.utc)
+
+
 def apply_credential_slots(
     settings: Dict[str, Any],
     toolkit_instance_id: str,
@@ -426,7 +435,8 @@ def apply_credential_slots(
     All slots are collected and validated first, then released with one resolver call
     (`resolve_many`, or one call per slot for a resolver that lacks it). `released` is ``{field: envelope}``
     already released for this toolkit (`resolve_run_slots`): the resolver is then not called, and each
-    envelope is validated like a fresh reply; it must cover exactly this toolkit's slotted fields.
+    envelope is validated like a fresh reply (and refused as ``STALE_CONTEXT`` once expired); it must cover
+    exactly this toolkit's slotted fields.
 
     Raises `GovernedCredentialError`: no resolver -> ``WORKER_CAPABILITY_UNAVAILABLE``; a slot
     anywhere but directly under a top-level settings key -> ``UNSUPPORTED_AUTH_MODE``; the
@@ -461,6 +471,8 @@ def apply_credential_slots(
                 raise GovernedCredentialError("CREDENTIAL_GENERATION_MISMATCH")
             if set(envelope.fields) != set(paths):
                 raise GovernedCredentialError("DEPENDENCY_UNAVAILABLE")
+            if released is not None and _expired(envelope):  # released up front: the window to use it is longer
+                raise GovernedCredentialError("STALE_CONTEXT")
             for path, secret in envelope.fields.items():
                 value = str(secret.get_secret_value())
                 _write_path(new_config, path, value)

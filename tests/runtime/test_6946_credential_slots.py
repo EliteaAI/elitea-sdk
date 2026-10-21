@@ -1088,3 +1088,92 @@ def test_the_runtime_build_aborts_before_the_first_built_in_toolkit_when_a_slot_
     with pytest.raises(GovernedCredentialError) as exc:
         runtime_tools.get_tools(tools_list, elitea_client=SimpleNamespace(credential_resolver=resolver))
     assert exc.value.reason_code == "DENIED_RBAC" and recorder == []
+
+
+# --- review fixes: expiry of up-front releases, shared pre-check, id contract, release lifetime ---------
+
+PAST = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+
+def test_an_expired_released_envelope_is_stale_context_but_a_fresh_reply_is_not_rechecked():
+    settings = three_slot_settings()
+    released = {k: BatchResolver()._envelope(k) for k in BatchResolver.PATHS}
+    released["jira_configuration"] = CredentialEnvelope({"api_key": "x"}, 3, PAST)
+    with pytest.raises(GovernedCredentialError) as exc:
+        apply_credential_slots(settings, "tk", None, released=released)
+    assert exc.value.reason_code == "STALE_CONTEXT"
+    naive_past = CredentialEnvelope({"api_key": "x"}, 3, PAST.replace(tzinfo=None))
+    with pytest.raises(GovernedCredentialError):
+        apply_credential_slots(settings, "tk", None, released={**released, "jira_configuration": naive_past})
+    no_expiry = CredentialEnvelope({"api_key": "x"}, 3, None)
+    apply_credential_slots(settings, "tk", None, released={**released, "jira_configuration": no_expiry})
+
+
+def test_an_expired_envelope_of_the_third_toolkit_aborts_the_run_before_any_build(recorder):
+    class ExpiredThird(RunResolver):
+        def _envelope(self, toolkit_instance_id):
+            expires = PAST if toolkit_instance_id == "3" else EXPIRES
+            return CredentialEnvelope({"access_token": f"secret-{toolkit_instance_id}"}, 1, expires)
+
+    with pytest.raises(GovernedCredentialError) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=ExpiredThird()), llm=None)
+    assert exc.value.reason_code == "STALE_CONTEXT" and recorder == []
+
+
+def test_invalid_tool_names_of_a_later_toolkit_stop_the_run_before_any_release(recorder):
+    bad = github_settings()
+    bad["selected_tools"] = ["_x"]
+    resolver = RunResolver()
+    tools_list = [_github_tool(tool_id=n) for n in (1, 2, 3)] + [_github_tool(bad, tool_id=4)] + [
+        _github_tool(tool_id=n) for n in (5, 6)]
+    with pytest.raises(ValueError):
+        sdk_tools.get_tools(tools_list, SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert resolver.all_calls == [] and resolver.many_calls == [] and resolver.single_calls == [] and recorder == []
+
+
+def test_an_int_tool_id_reaches_the_resolver_as_a_string(recorder):
+    seen = []
+
+    class StrictResolver(RunResolver):
+        def resolve_all(self, *, items):
+            seen.extend(items)
+            assert [i["toolkit_instance_id"] for i in items] == ["7"]
+            assert all(type(i["toolkit_instance_id"]) is str for i in items)
+            return super().resolve_all(items=items)
+
+    sdk_tools.get_tools([_github_tool(tool_id=7)], SimpleNamespace(credential_resolver=StrictResolver()), llm=None)
+    assert len(seen) == 1 and _built_tokens(recorder) == ["secret-7"]
+
+
+def test_each_tools_scrub_set_is_its_own_when_the_third_toolkit_fails(monkeypatch):
+    built = []
+
+    def get_tools(tool):
+        token = tool["settings"]["github_configuration"]["access_token"]
+        if tool["id"] == 3:
+            raise ValueError(f"echo {token} and earlier secret-1")
+        built.append(token)
+        return [_tool()]
+
+    monkeypatch.setitem(sdk_tools.AVAILABLE_TOOLS, "github", {"get_tools": get_tools})
+    with pytest.raises(ToolException) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=RunResolver()), llm=None)
+    assert built == ["secret-1", "secret-2"]
+    assert "secret-3" not in str(exc.value) and cs.REDACTED in str(exc.value)
+    assert "secret-1" in str(exc.value)    # only the failing toolkit's own released values are scrubbed
+
+
+def test_the_runtime_build_clears_the_released_envelopes_after_the_loop(recorder, monkeypatch):
+    captured = []
+    real = runtime_tools.elitea_tools
+
+    def spy(tools_list, elitea_client, llm, memory_store, **kwargs):
+        captured.append(kwargs.get("released_slots"))
+        return real(tools_list, elitea_client, llm, memory_store, **kwargs)
+
+    monkeypatch.setattr(runtime_tools, "elitea_tools", spy)
+    monkeypatch.setattr(runtime_tools, "community_tools", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_tools, "_mcp_tools", lambda *a, **k: [])
+    tools_list = [_runtime_tool("github", n, github_settings()) for n in range(1, 4)]
+    runtime_tools.get_tools(tools_list, elitea_client=SimpleNamespace(credential_resolver=RunResolver()))
+    assert len(captured) == 3 and captured[0] is captured[1] is captured[2] and captured[0] == {}

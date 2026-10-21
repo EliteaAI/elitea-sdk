@@ -1774,6 +1774,9 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     "[Toolkit Auth] Deferred authorization for built-in toolkit with %d proxy tool(s)",
                     len(_proxies),
                 )
+    for _envelopes in _released_slots.values():  # released material must not outlive the build
+        _envelopes.clear()
+    _released_slots.clear()
     logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {_elitea_loaded_count} tools")
 
     # Add MCP tools registered via elitea-mcp CLI (static registry)
