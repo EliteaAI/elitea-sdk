@@ -99,7 +99,10 @@ def normalize_app_type(app_type: str) -> str:
 
 
 class ApiDetailsRequestError(Exception):
-    ...
+    def __init__(self, *args, status_code: int | None = None, body=None):
+        super().__init__(*args)
+        self.status_code = status_code
+        self.body = body
 
 
 class AuthSessionExpiredError(Exception):
