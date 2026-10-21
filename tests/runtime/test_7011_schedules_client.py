@@ -98,7 +98,7 @@ def test_el7011_r1_5_list_schedules_returns_json(client, send):
     lambda c: c.check_schedule({"name": "x"}),
     lambda c: c.get_schedule_run(SCHEDULE_ID, 3),
     lambda c: c.get_schedule_settings(),
-    lambda c: c.update_schedule_settings({"max_runs": 1}),
+    lambda c: c.update_schedule_settings({"allow_run_without_asking": True}),
 ])
 def test_el7011_r1_6_every_method_uses_request_headers_and_timeout(client, send, call):
     send.return_value = make_response(200, {"ok": True})
@@ -218,7 +218,7 @@ def test_el7011_r4_2_server_400_surfaces_field_error(client, send, call):
     ("check_schedule", ({"name": "n"},), "post", "/check", {"name": "n"}),
     ("get_schedule_run", (SCHEDULE_ID, 5), "get", f"/{SCHEDULE_ID}/runs/5", None),
     ("get_schedule_settings", (), "get", "/settings", None),
-    ("update_schedule_settings", ({"max_active": 3},), "put", "/settings", {"max_active": 3}),
+    ("update_schedule_settings", ({"allow_run_without_asking": True},), "put", "/settings", {"allow_run_without_asking": True}),
 ])
 def test_el7011_r5_1_to_r5_4_check_run_detail_and_settings(client, send, base, method, args, verb, suffix, sent):
     assert getattr(client, method)(*args) == {"ok": True}

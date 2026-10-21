@@ -275,14 +275,19 @@ class EliteAClient:
         Args:
             data: The body, sent unchanged. Keys: name, description, entity_type,
                 application_id, version_id, run_mode, prompt, variables, cron,
-                timezone, expires_at, approval_rule. The API checks them.
+                timezone, expires_at, approval_rule, enabled (false saves the
+                schedule paused; default true), risk_ack (the `fingerprint` of
+                a risk 409, to confirm the risk). The API checks them.
 
         Returns:
             The new schedule details as a dict (the API answers 201).
 
         Raises:
             ApiDetailsRequestError: The API answers 400 or more. A 400 carries
-                the field error in `body`; `status_code` holds the status.
+                the field error in `body`; `status_code` holds the status. A 409
+                with `code` risk_confirmation_required or risk_changed holds a
+                `fingerprint`: retry with it as `risk_ack`. A 409 with `code`
+                schedule_blocked cannot be confirmed: `blocking` lists the causes.
         """
         return self._schedule_call('post', self._schedules_url(), json=data)
 
@@ -291,8 +296,9 @@ class EliteAClient:
 
         Args:
             schedule_id: Id of the schedule.
-            data: The same keys as create_schedule, sent unchanged. It must not
-                hold `enabled`: use pause_schedule and resume_schedule instead.
+            data: The same keys as create_schedule, sent unchanged, including
+                `risk_ack`. It must not hold `enabled`: use pause_schedule and
+                resume_schedule instead.
 
         Returns:
             The updated schedule details as a dict.
@@ -300,7 +306,9 @@ class EliteAClient:
         Raises:
             ValueError: `data` holds `enabled`. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. A 400 carries
-                the field error in `body`; `status_code` holds the status.
+                the field error in `body`; `status_code` holds the status. A 409
+                with `code` risk_confirmation_required, risk_changed or
+                schedule_blocked is handled as in create_schedule.
         """
         if 'enabled' in data:
             raise ValueError("update_schedule does not change 'enabled'; "

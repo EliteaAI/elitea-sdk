@@ -40,14 +40,14 @@ ENDPOINTS = {
     "list_schedule_runs": ("GET", "/{schedule_id}/runs"),
     "change_schedule_owner": ("POST", "/{schedule_id}/owner"),
     "check_schedule": ("POST", "/check"),
-    "get_schedule_run": ("GET", "/{schedule_id}/runs/55"),
+    "get_schedule_run": ("GET", "/{schedule_id}/runs/{run_id}"),
     "get_schedule_settings": ("GET", "/settings"),
     "update_schedule_settings": ("PUT", "/settings"),
 }
 NO_ID_METHODS = ("list_schedules", "create_schedule", "check_schedule",
                  "get_schedule_settings", "update_schedule_settings")
 RISK_409 = {"code": "risk_confirmation_required", "fingerprint": "abc123", "blocking": []}
-ROUTES = {(verb.lower(), SCHEDULES + path.format(schedule_id=SCHEDULE_ID)): name
+ROUTES = {(verb.lower(), SCHEDULES + path.format(schedule_id=SCHEDULE_ID, run_id=55)): name
           for name, (verb, path) in ENDPOINTS.items()}
 ROUTES[("get", APPS)] = "get_list_of_apps"
 
@@ -199,7 +199,7 @@ def test_el7011_us45_r1_2_methods_table_has_arguments_and_endpoint():
         arguments, endpoint = rows[name]
         if name not in NO_ID_METHODS:
             assert "schedule_id" in arguments, name
-        assert endpoint == f"`{verb} {(path or '/').replace('/55', '/{run_id}')}`", name
+        assert endpoint == f"`{verb} {path or '/'}`", name
 
 
 @pytest.mark.parametrize("name", list(ENDPOINTS))
@@ -420,7 +420,7 @@ def test_el7011_us45_r5_3_settings_text_names_the_approval_rule_values():
     assert "approval_rule" in method_sections()["create_schedule"]
 
 
-def test_el7011_us45_r5_5_risk_section_runs_the_risk_ack_retry(env, capsys):
+def test_el7011_us45_r5_5_risk_section_runs_the_risk_ack_retry(env):
     api = FakeApi()
     api.answer("create_schedule", (409, RISK_409), (201, SCHEDULE))
     (code,) = python_blocks(section("Risk refusals"))
