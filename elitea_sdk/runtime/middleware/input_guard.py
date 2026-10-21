@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 EVENT_NAME = 'input_guardrail'
 INSPECTED_CONFIG_KEY = 'input_guardrail_inspected'
+MAX_CLEAN_HASHES = 1024
 
 
 class _Location:
@@ -65,6 +66,10 @@ class InputGuardMiddleware(Middleware):
         # Hashes already reported by this instance. History is re-sent on every
         # model call of a tool loop; without this a record/warn hit repeats per call.
         self._reported: Set[str] = set()
+        # Hashes this instance scanned in full and found nothing in. The policy is fixed
+        # per instance, so an unchanged text needs no second scan on the next call.
+        # A dict keeps insertion order for oldest-first eviction.
+        self._clean: Dict[str, None] = {}
 
     def get_tools(self):
         return []
@@ -94,6 +99,7 @@ class InputGuardMiddleware(Middleware):
             return None
 
         result = inspect(segments, self.policy, not_inspected)
+        self._remember_clean(segments, result)
         action = effective_action(result, self.policy)
         if result.detections or result.error:
             hit = {(d.segment_kind, d.segment_index) for d in result.detections}
@@ -128,7 +134,10 @@ class InputGuardMiddleware(Middleware):
             # Platform-built context blocks are not user input, but only the exact block
             # the platform writes as its own content block counts: a user's string that
             # starts with the tag is inspected like any other text
-            if not text or segment_hash(text) in skip or (platform_ok and is_platform_context_block(text)):
+            if not text or (platform_ok and is_platform_context_block(text)):
+                return
+            digest = segment_hash(text)
+            if digest in skip or digest in self._clean:
                 return
             index = counters.get(kind, 0)
             counters[kind] = index + 1
@@ -152,6 +161,19 @@ class InputGuardMiddleware(Middleware):
             if isinstance(message, HumanMessage):
                 self._collect_content(message.content, 'history', add, not_inspected, 'messages', i)
         return segments, locations, not_inspected
+
+    def _remember_clean(self, segments: List[Segment], result) -> None:
+        # An error means the budget or deadline may have cut a segment short, so
+        # nothing from that scan counts as clean
+        if result.error:
+            return
+        hit = {(d.segment_kind, d.segment_index) for d in result.detections}
+        for segment in segments:
+            if (segment.kind, segment.index) in hit:
+                continue
+            self._clean[segment_hash(segment.text)] = None
+            if len(self._clean) > MAX_CLEAN_HASHES:
+                del self._clean[next(iter(self._clean))]
 
     def _collect_content(self, content, kind, add, not_inspected, target, message_index) -> None:
         if isinstance(content, str):

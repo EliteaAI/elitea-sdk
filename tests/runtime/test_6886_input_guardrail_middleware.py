@@ -240,6 +240,74 @@ def test_warn_and_record_pass_the_input_through_and_report_once():
     assert TOKEN not in json.dumps(events)
 
 
+def _count_scans(monkeypatch):
+    from elitea_sdk.runtime.middleware import input_guard
+    scanned = []
+
+    def counting(segments, policy, not_inspected=()):
+        scanned.extend(s.text for s in segments)
+        return input_detector.inspect(segments, policy, not_inspected)
+
+    monkeypatch.setattr(input_guard, 'inspect', counting)
+    return scanned
+
+
+def test_tool_loop_scans_each_unchanged_history_segment_once(monkeypatch):
+    # #7142: a tool loop with N model calls re-sends the same history every call
+    scanned = _count_scans(monkeypatch)
+    guard = InputGuardMiddleware(policy=BLOCK)
+    history = [HumanMessage(content='first question'), AIMessage(content='answer'),
+               HumanMessage(content='second question')]
+    state = {'input': 'third question', 'messages': history}
+
+    for _ in range(4):
+        assert guard.before_model(state, {}) is None
+
+    assert sorted(scanned) == ['first question', 'second question', 'third question']
+
+
+def test_new_history_text_is_still_scanned_after_the_cache_fills(monkeypatch):
+    scanned = _count_scans(monkeypatch)
+    guard = InputGuardMiddleware(policy=BLOCK)
+    guard.before_model({'input': 'hello', 'messages': []}, {})
+
+    with pytest.raises(InputGuardrailBlocked):
+        guard.before_model({'input': 'hello', 'messages': [HumanMessage(content=f'use {TOKEN}')]}, {})
+
+    assert scanned == ['hello', f'use {TOKEN}']
+
+
+def test_detected_history_is_scanned_and_handled_on_every_call():
+    guard = InputGuardMiddleware(policy=REDACT)
+    state = {'input': 'next', 'messages': [HumanMessage(content=f'mail {EMAIL}')]}
+
+    for _ in range(3):
+        update = guard.before_model(state, {})
+        assert EMAIL not in update['transient_messages'][0].content
+
+
+def test_a_cut_short_scan_is_not_cached_as_clean(monkeypatch):
+    scanned = _count_scans(monkeypatch)
+    guard = InputGuardMiddleware(policy={**BLOCK, 'max_inspect_chars': 5})
+    state = {'input': 'harmless but long', 'messages': []}
+
+    guard.before_model(state, {})
+    guard.before_model(state, {})
+
+    assert scanned == ['harmless but long'] * 2
+
+
+def test_clean_cache_is_bounded(monkeypatch):
+    from elitea_sdk.runtime.middleware import input_guard
+    monkeypatch.setattr(input_guard, 'MAX_CLEAN_HASHES', 3)
+    guard = InputGuardMiddleware(policy=BLOCK)
+
+    for i in range(10):
+        guard.before_model({'input': f'turn {i}', 'messages': []}, {})
+
+    assert list(guard._clean) == [segment_hash(f'turn {i}') for i in (7, 8, 9)]
+
+
 def test_fail_closed_blocks_on_detector_error():
     guard = InputGuardMiddleware(policy={**BLOCK, 'on_error': 'fail_closed', 'max_inspect_chars': 5})
 
