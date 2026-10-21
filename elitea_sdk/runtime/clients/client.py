@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
 from ..middleware import (
+    InputGuardMiddleware,
     LoggingStrategy,
     ProjectContextMiddleware,
     SensitiveToolGuardMiddleware,
@@ -1084,6 +1085,25 @@ class EliteAClient:
         except ValueError as e:
             logger.warning("Skipping invalid on-demand Project Context: %s", e)
 
+    def _inject_input_guard(self, middleware_list: list, conversation_id: Optional[str] = None) -> None:
+        """Inject the input guardrail (#6886) when the platform enabled it."""
+        try:
+            from ..toolkits.security import get_input_guard_policy, has_input_guard_config
+
+            if not has_input_guard_config():
+                return
+
+            if any(isinstance(mw, InputGuardMiddleware) for mw in middleware_list):
+                return
+
+            middleware_list.insert(0, InputGuardMiddleware(
+                policy=get_input_guard_policy(),
+                project_id=self.project_id,
+                conversation_id=conversation_id,
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to auto-inject InputGuardMiddleware: {e}")
+
     def _inject_sensitive_tool_guard(
         self,
         middleware_list: list,
@@ -1208,6 +1228,8 @@ class EliteAClient:
         # Auto-create middleware based on internal_tools configuration
         # This bridges the UI's internal_tools toggles to the middleware system
         middleware_list = list(middleware) if middleware else []
+        # First, so it inspects the history before summarization rewrites it
+        self._inject_input_guard(middleware_list, conversation_id)
         internal_tools = data.get('meta', {}).get('internal_tools', [])
         if 'planner' in internal_tools:
             # Create PlanningMiddleware when planner is enabled in internal_tools
@@ -1653,6 +1675,8 @@ class EliteAClient:
         # Auto-create middleware based on internal_tools parameter
         # This matches the behavior in application() method
         middleware_list = []
+        # First, so it inspects the history before summarization rewrites it
+        self._inject_input_guard(middleware_list, conversation_id)
         has_planner = 'planner' in internal_tools
         if has_planner:
             from ..middleware.planning import PlanningMiddleware
@@ -2040,7 +2064,7 @@ class EliteAClient:
                 else:
                     logger.info(f"Found tool '{tool_name}' using fallback matching ('{actual_tool_name}')")
 
-                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {tool_params}")
+                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {sorted((tool_params or {}).keys()) if isinstance(tool_params, dict) else type(tool_params).__name__}")
 
                 # Start timing the tool execution
                 start_time = time.time()

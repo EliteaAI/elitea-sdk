@@ -38,7 +38,7 @@ from langchain_core.tools import BaseTool, ToolException
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langgraph.errors import GraphBubbleUp
 
-from ..exceptions import budget_exceeded_from
+from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from pydantic import BaseModel, Field
 
@@ -761,7 +761,7 @@ class InvokeToolTool(BaseTool):
             result = actual_tool.invoke(arguments)
             return serialize_tool_result(result) if result is not None \
                 else "Tool executed successfully (no output)"
-        except GraphBubbleUp:
+        except (GraphBubbleUp, InputGuardrailBlocked):
             raise
         except McpAuthorizationRequired:
             # Must precede the ToolException clause, which this subclasses. Without
@@ -905,7 +905,7 @@ class InvokeToolTool(BaseTool):
                 result = actual_tool.invoke(arguments)
             return serialize_tool_result(result) if result is not None \
                 else "Tool executed successfully (no output)"
-        except GraphBubbleUp:
+        except (GraphBubbleUp, InputGuardrailBlocked):
             raise
         except McpAuthorizationRequired:
             # Must precede the ToolException clause, which this subclasses. Without

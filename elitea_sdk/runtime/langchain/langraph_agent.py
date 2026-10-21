@@ -2642,7 +2642,12 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 hitl_for_ui = (
                     hitl_interrupts_for_ui[0] if hitl_interrupts_for_ui else {}
                 )
-                logger.info(f"[HITL] Execution paused at HITL node: {hitl_for_ui}")
+                # The payload holds tool args and HITL text; keys only (#6886)
+                logger.info(
+                    "[HITL] Execution paused at HITL node: type=%s keys=%s",
+                    hitl_for_ui.get('guardrail_type') if isinstance(hitl_for_ui, dict) else None,
+                    sorted(hitl_for_ui.keys()) if isinstance(hitl_for_ui, dict) else [],
+                )
 
                 result_with_state = {
                     "output": hitl_interrupt.get("message", "Awaiting human review..."),

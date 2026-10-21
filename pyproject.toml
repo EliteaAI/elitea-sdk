@@ -245,6 +245,7 @@ elitea_sdk = [
     "docs/code/*.md",
     "docs/faq/*.md",
     "docs/prompts/*.md",
+    "runtime/guardrails/*.json",
 ]
 
 [tool.setuptools.packages.find]

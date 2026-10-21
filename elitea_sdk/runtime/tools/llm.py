@@ -44,7 +44,7 @@ from ..context_floor import (
     resolve_floor_tokens,
     shrink_after_overflow,
 )
-from ..exceptions import OutputContinuationExhausted, budget_exceeded_from
+from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..tool_outcome import outcome_sink
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
@@ -1212,7 +1212,7 @@ class LLMNode(BaseTool):
         middleware_updates = []
         original_state = None
 
-        # Run before_model hooks (may summarize messages)
+        # Run before_model hooks (may summarize messages, may raise InputGuardrailBlocked)
         if middleware_mgr is not None and isinstance(state, dict):
             original_state = state.copy()
             state, middleware_updates = middleware_mgr.run_before_model(state, config or {})
@@ -1222,7 +1222,7 @@ class LLMNode(BaseTool):
             result = self._invoke_llm_internal(state, config, middleware_updates)
         except GraphBubbleUp:
             raise
-        except OutputContinuationExhausted:
+        except (OutputContinuationExhausted, InputGuardrailBlocked):
             raise
         except Exception as e:
             # A budget rejection is a policy outcome with no recovery, so it must not
@@ -1242,6 +1242,18 @@ class LLMNode(BaseTool):
             _error_msg.response_metadata['llm_node_error'] = True
             _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
             result = {"messages": [_error_msg]}
+
+        # A before_model hook may have swapped stored messages for model-only copies (input
+        # guardrail redaction). The copies keep the stored ids, so returning them would
+        # overwrite the originals in the checkpoint: put the originals back.
+        # Imported here: the middleware package imports the agent graph, which imports this module
+        from ..middleware.base import TRANSIENT_ORIGINALS_KEY
+        originals = state.get(TRANSIENT_ORIGINALS_KEY) if isinstance(state, dict) else None
+        if originals and isinstance(result, dict) and isinstance(result.get('messages'), list):
+            result['messages'] = [
+                originals.get(getattr(m, 'id', None), m) if getattr(m, 'id', None) else m
+                for m in result['messages']
+            ]
 
         # Run after_model hooks and add context_info
         if middleware_mgr is not None and isinstance(result, dict) and 'messages' in result:
@@ -1879,7 +1891,7 @@ class LLMNode(BaseTool):
             # The Auto metadata contains signed checkpoint/pin tokens.
             logger.info("Initial Auto completion: tool_calls=%s", len(completion.tool_calls or []))
         else:
-            logger.info(f"Initial completion: {completion}")
+            logger.info("Initial completion: tool_calls=%s", len(getattr(completion, 'tool_calls', None) or []))
 
         # Handle both tool-calling and regular responses
         if hasattr(completion, 'tool_calls') and completion.tool_calls:
@@ -4049,8 +4061,10 @@ class LLMNode(BaseTool):
                         status="error",
                     ))
                     continue
-                # Never hand a budget rejection back as tool output: the parent model
-                # would reason about it as data and may retry or paraphrase it
+                # Never hand a budget rejection or guardrail block back as tool output:
+                # the parent model would reason about it as data and may retry it
+                if isinstance(result, InputGuardrailBlocked):
+                    raise result
                 budget_error = budget_exceeded_from(result)
                 if budget_error is not None:
                     raise budget_error from result
@@ -4296,7 +4310,8 @@ class LLMNode(BaseTool):
 
                 if tool_to_execute:
                     try:
-                        logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
+                        # Argument values can carry user input; names only (#6886)
+                        logger.info("Executing tool '%s' with args: %s", tool_name, sorted((tool_args or {}).keys()) if isinstance(tool_args, dict) else type(tool_args).__name__)
 
                         # Expose accumulated intermediate messages BEFORE invoking
                         # the tool.  If the tool triggers a sensitive-tool interrupt,
@@ -4451,7 +4466,7 @@ class LLMNode(BaseTool):
                         ))
                         continue
                     except Exception as e:
-                        if isinstance(e, OutputContinuationExhausted):
+                        if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked)):
                             _PENDING_TOOL_MESSAGES.set([])
                             raise
                         # Same reasoning as the MCP clause above: swallowing a budget
@@ -4560,7 +4575,7 @@ class LLMNode(BaseTool):
                 _PENDING_TOOL_MESSAGES.set([])
                 raise
             except Exception as e:
-                if isinstance(e, OutputContinuationExhausted):
+                if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked)):
                     _PENDING_TOOL_MESSAGES.set([])
                     raise
                 # Checked before the string-matching classification below, which has no
