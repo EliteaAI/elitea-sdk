@@ -971,26 +971,32 @@ class EliteAClient:
         return data.get('value', None)
 
     @staticmethod
-    def _stamp_context_window(llm: Any, context_settings: Optional[dict]) -> None:
-        """Tell the context floor the request's real window instead of the unknown-model ceiling."""
+    def _with_context_window(llm: Any, context_settings: Optional[dict]) -> Any:
+        """A per-request copy of ``llm`` that tells the context floor the request's real window."""
         window = (context_settings or {}).get('effective_window')
-        if llm is None or not window:
-            return
+        if llm is None or not window or not hasattr(llm, 'model_copy'):
+            return llm
         try:
-            object.__setattr__(getattr(llm, 'bound', llm), '_elitea_context_window', int(window))
+            bound = getattr(llm, 'bound', None)
+            if bound is not None and hasattr(bound, 'model_copy'):
+                stamped = bound.model_copy()
+                object.__setattr__(stamped, '_elitea_context_window', int(window))
+                return llm.model_copy(update={'bound': stamped})
+            stamped = llm.model_copy()
+            object.__setattr__(stamped, '_elitea_context_window', int(window))
+            return stamped
         except Exception as e:
             logger.debug(f"Could not stamp context window on LLM: {e}")
+            return llm
 
     def _inject_summarization(
-        self, middleware_list: list, context_settings: Optional[dict], conversation_id: Optional[str] = None,
-        llm: Any = None,
+        self, middleware_list: list, context_settings: Optional[dict], conversation_id: Optional[str] = None
     ):
         """
         Inject summarization middleware into the middleware list based on context settings.
         """
         if not context_settings or not conversation_id:
             return
-        self._stamp_context_window(llm, context_settings)
 
         # Check if context management is enabled (master switch)
         if not context_settings.get('enabled', True):
@@ -1216,7 +1222,8 @@ class EliteAClient:
         self._inject_project_context(middleware_list, project_context, conversation_id)
 
         # Automatically compresses conversation history when threshold is exceeded
-        self._inject_summarization(middleware_list, context_settings, conversation_id, llm)
+        llm = self._with_context_window(llm, context_settings)
+        self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Automatically clears stale tool outputs when a token threshold is exceeded
         self._inject_context_editing(middleware_list, context_settings, conversation_id)
@@ -1662,7 +1669,8 @@ class EliteAClient:
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
 
         # Automatically compresses conversation history when a threshold is exceeded
-        self._inject_summarization(middleware_list, context_settings, conversation_id, llm)
+        llm = self._with_context_window(llm, context_settings)
+        self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Automatically clears stale tool outputs when a token threshold is exceeded
         self._inject_context_editing(middleware_list, context_settings, conversation_id)

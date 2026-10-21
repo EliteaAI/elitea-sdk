@@ -136,6 +136,10 @@ TOOL_RESULT_SUMMARY_INPUT_CHARS = 128_000
 SUMMARIZED_SENTINEL = '[tool result summarized: context floor]'
 
 
+# Keeps summary calls out of the run's callback rollup; their usage is reported in auxiliary_usage (#6898)
+_NO_RUN_CALLBACKS = {'callbacks': []}
+
+
 class SummarizationMiddleware(LangChainSummarizationMiddleware):
     """
     Extends LangChain's SummarizationMiddleware with EliteA-specific features.
@@ -182,7 +186,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         self.conversation_id = conversation_id
         self.callbacks = callbacks or {}
         self.last_context_info = None
-        # Summarization LLM calls bypass the run's callbacks, so their usage is reported here
+        # Summarization calls run without the run's callbacks, so this is the only report of their usage
         self._auxiliary_usage: List[Dict[str, Any]] = []
         self._last_fitting_count = 0
         self.summarization_enabled = summarization_enabled
@@ -345,7 +349,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             name=getattr(message, 'name', None) or 'unknown', args=args, content=content,
         )
         try:
-            response = self.model.invoke([HumanMessage(content=prompt)])
+            response = self.model.invoke([HumanMessage(content=prompt)], config=_NO_RUN_CALLBACKS)
             self._record_usage(response)
             return response.text.strip()
         except Exception as e:
@@ -719,7 +723,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
                 prompt_content = f"{self.summary_prompt}\n\n<messages>\n{formatted_messages}\n</messages>"
 
             # Wrap in HumanMessage for model compatibility
-            response = self.model.invoke([HumanMessage(content=prompt_content)])
+            response = self.model.invoke([HumanMessage(content=prompt_content)], config=_NO_RUN_CALLBACKS)
             self._record_usage(response)
 
             # Handle both .text and .content
