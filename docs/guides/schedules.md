@@ -287,7 +287,7 @@ A save (`create_schedule` or `update_schedule`) can answer 409 with a `code` in 
 
 | `code` | Meaning | What to do |
 |---|---|---|
-| `risk_confirmation_required` | The schedule carries a risk. `body["fingerprint"]` names it. | Read the risk, then send the same `data` again with `risk_ack` set to the fingerprint. |
+| `risk_confirmation_required` | The schedule carries a risk. `body["fingerprint"]` names it. | Read the risk, then send the same `data` again with `risk_ack` set to `{"fingerprint": <fingerprint>, "confirmed_name": <schedule name>}`. `confirmed_name` must equal the schedule name when the approval rule is `run_without_asking`. |
 | `schedule_blocked` | A rule blocks the schedule. `body["blocking"]` lists the reasons. | Change the schedule. A retry with `risk_ack` does not help. |
 
 ```python
@@ -302,7 +302,9 @@ except ApiDetailsRequestError as error:
     if error.status_code != 409:
         raise
     if body.get("code") == "risk_confirmation_required":
-        schedule = client.create_schedule({**data, "risk_ack": body["fingerprint"]})
+        schedule = client.create_schedule({**data, "risk_ack": {
+            "fingerprint": body["fingerprint"], "confirmed_name": data["name"],
+        }})
     elif body.get("code") == "schedule_blocked":
         print("Blocked:", body["blocking"])
     else:

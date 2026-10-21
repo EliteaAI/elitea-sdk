@@ -276,8 +276,9 @@ class EliteAClient:
             data: The body, sent unchanged. Keys: name, description, entity_type,
                 application_id, version_id, run_mode, prompt, variables, cron,
                 timezone, expires_at, approval_rule, enabled (false saves the
-                schedule paused; default true), risk_ack (the `fingerprint` of
-                a risk 409, to confirm the risk). The API checks them.
+                schedule paused; default true), risk_ack (a dict with
+                `fingerprint` of a risk 409 and `confirmed_name`, the schedule
+                name, to confirm the risk). The API checks them.
 
         Returns:
             The new schedule details as a dict (the API answers 201).
@@ -286,7 +287,7 @@ class EliteAClient:
             ApiDetailsRequestError: The API answers 400 or more. A 400 carries
                 the field error in `body`; `status_code` holds the status. A 409
                 with `code` risk_confirmation_required or risk_changed holds a
-                `fingerprint`: retry with it as `risk_ack`. A 409 with `code`
+                `fingerprint`: retry with `risk_ack` set. A 409 with `code`
                 schedule_blocked cannot be confirmed: `blocking` lists the causes.
         """
         return self._schedule_call('post', self._schedules_url(), json=data)

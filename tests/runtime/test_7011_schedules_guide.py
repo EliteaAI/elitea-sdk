@@ -427,7 +427,8 @@ def test_el7011_us45_r5_5_risk_section_runs_the_risk_ack_retry(env):
     run(api, setup_block(), code)
     first, second = api.bodies["create_schedule"]
     assert "risk_ack" not in first
-    assert second["risk_ack"] == RISK_409["fingerprint"]
+    assert second["risk_ack"] == {"fingerprint": RISK_409["fingerprint"],
+                                  "confirmed_name": first["name"]}
     assert api.calls.count("create_schedule") == 2
 
 
