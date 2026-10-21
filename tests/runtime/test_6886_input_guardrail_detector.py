@@ -352,3 +352,20 @@ def test_100kb_input_inspects_well_under_budget():
 
 def test_placeholder_format():
     assert re.fullmatch(r'\[REDACTED:credentials\]', placeholder('credentials'))
+
+
+@pytest.mark.parametrize('pattern', [r'(a+)+$', r'(a*)*', r'(?:a|b+)*c', r'(?=(a+)+)'])
+def test_nested_quantifier_allow_patterns_are_dropped(pattern):
+    policy = policy_from_dict({'enabled': True, 'allow_patterns': [pattern, r'AKIA[0-9]{4,16}', r'(foo|bar)+']})
+
+    assert [p.pattern for p in policy.allow_patterns] == [r'AKIA[0-9]{4,16}', r'(foo|bar)+']
+
+
+def test_summary_bounds_not_inspected_block_types():
+    policy = policy_from_dict({'enabled': True})
+    many = [f'type-{i}-' + 'x' * 100 for i in range(100)]
+
+    listed = summary(inspect(_turn('x'), policy, not_inspected=many), policy)['not_inspected']
+
+    assert len(listed) == input_detector.MAX_NOT_INSPECTED
+    assert all(len(t) <= input_detector.MAX_BLOCK_TYPE_CHARS for t in listed)
