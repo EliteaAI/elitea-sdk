@@ -6,7 +6,7 @@ from typing import Optional
 from langchain_core.tools import ToolException
 from langgraph.store.base import BaseStore
 
-from ..runtime.credential_slots import GovernedCredentialError, apply_credential_slots, has_slots, scrub
+from ..runtime.credential_slots import GovernedCredentialError, apply_credential_slots, memoize_slot_scans, scan_slots, scrub
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +264,7 @@ def _filter_blocked_tools(toolkit_tools: list, toolkit_type: str) -> list:
         return toolkit_tools
 
 
+@memoize_slot_scans
 def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args, **kwargs):
     tools = []
 
@@ -303,11 +304,12 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
         # into this local copy only. A slot that cannot be resolved stops here, so a toolkit that
         # reads a missing secret as anonymous access (e.g. GitHub) is never built without it.
         released = frozenset()
-        if has_slots(settings):
+        slot_scan = scan_slots(raw_settings)  # the shallow copy has the same top-level shape
+        if slot_scan.found:
             if tool_type not in AVAILABLE_TOOLS:
                 raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
             settings, released = apply_credential_slots(
-                settings, str(tool.get('id')), getattr(elitea, 'credential_resolver', None))
+                settings, str(tool.get('id')), getattr(elitea, 'credential_resolver', None), scan=slot_scan)
             tool['settings'] = settings
         settings['elitea'] = elitea
         settings['llm'] = llm

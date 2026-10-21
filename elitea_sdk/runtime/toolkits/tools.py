@@ -12,7 +12,7 @@ from pydantic import Field
 from elitea_sdk.tools import AVAILABLE_TOOLS, TOOLKIT_TYPE_ALIASES
 from elitea_sdk.tools import get_toolkits as elitea_toolkits
 from elitea_sdk.tools import get_tools as elitea_tools
-from ..credential_slots import GovernedCredentialError, has_slots
+from ..credential_slots import GovernedCredentialError, has_slots, memoize_slot_scans
 from .application import ApplicationToolkit
 from .artifact import ArtifactToolkit
 from .vectorstore import VectorStoreToolkit
@@ -961,6 +961,7 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
+@memoize_slot_scans
 def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None, auto_approve_sensitive_actions: bool = False) -> list:
     """
     Process tool configurations and return instantiated tools.
