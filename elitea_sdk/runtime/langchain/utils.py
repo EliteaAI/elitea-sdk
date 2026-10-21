@@ -398,7 +398,26 @@ def prepare_messages_for_model(messages: list[AnyMessage], *, model: Any = None)
             converted_count,
         )
 
-    return prepared
+    # Drop ToolMessages whose call is not in the directly preceding AIMessage
+    # (e.g. the call was summarized away): Anthropic rejects such tool_result blocks.
+    open_call_ids: set = set()
+    kept = []
+    for message in prepared:
+        if isinstance(message, ToolMessage):
+            if message.tool_call_id in open_call_ids:
+                kept.append(message)
+            continue
+        open_call_ids = (
+            {tc.get('id') for tc in message.tool_calls}
+            if isinstance(message, AIMessage) and message.tool_calls else set()
+        )
+        kept.append(message)
+    if len(kept) != len(prepared):
+        logger.warning(
+            "Dropped %d orphaned ToolMessage(s) before provider invocation",
+            len(prepared) - len(kept),
+        )
+    return kept
 
 
 def _extract_json(json_string: str) -> dict:

@@ -461,8 +461,9 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             else:
                 break
 
-        self._last_fitting_count = fitting_count
-        cutoff_index = len(pre_preserved) - fitting_count
+        # Don't split AIMessage tool_calls from their ToolMessage results
+        cutoff_index = self._find_safe_cutoff_point(messages, len(pre_preserved) - fitting_count)
+        self._last_fitting_count = max(0, len(pre_preserved) - cutoff_index)
         return cutoff_index
 
     def before_model(self, state: dict, config: dict) -> Optional[dict]:
