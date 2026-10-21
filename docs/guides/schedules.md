@@ -6,6 +6,12 @@ This guide shows each method, who may call it, the errors, and one full example.
 
 ## Setup
 
+Install the SDK from its folder:
+
+```bash
+pip install '.[all]'
+```
+
 The client needs the same three variables as the rest of the SDK (see "Environment Setup" in the `README.md`).
 
 ```bash
@@ -48,6 +54,10 @@ The endpoint column shows the HTTP method and the path after this base.
 | `run_schedule(schedule_id, trigger='manual')` | `POST /{schedule_id}/run` | `{"run_id": ...}` (status 202) |
 | `list_schedule_runs(schedule_id, limit=20, offset=0, status=None)` | `GET /{schedule_id}/runs` | One page: `total` and `rows` |
 | `change_schedule_owner(schedule_id, owner_id)` | `POST /{schedule_id}/owner` | The schedule with its new owner |
+| `check_schedule(data)` | `POST /check` | The risk check of `data` |
+| `get_schedule_run(schedule_id, run_id)` | `GET /{schedule_id}/runs/{run_id}` | One run |
+| `get_schedule_settings()` | `GET /settings` | The project setting |
+| `update_schedule_settings(data)` | `PUT /settings` | The changed project setting |
 
 Each method returns the JSON answer as a `dict`.
 When the API answers 400 or more, the method raises `ApiDetailsRequestError` (see [Errors](#errors)).
@@ -71,6 +81,8 @@ Creates a schedule. The client sends `data` as it is; the API checks it.
 
 Keys: `name`, `description`, `entity_type` (`agent` or `pipeline`), `application_id`, `version_id`, `run_mode`, `prompt`, `variables`, `cron`, `timezone`, `expires_at`, `approval_rule` and `enabled`.
 `enabled` false saves the schedule paused. The default is true.
+`approval_rule` is `pause_and_ask` or `run_without_asking` (see [`get_schedule_settings`](#get_schedule_settings)).
+A save can answer 409 for a risk. See [Risk refusals](#risk-refusals).
 
 The run input depends on the entity:
 
@@ -187,6 +199,48 @@ schedule = client.change_schedule_owner(schedule_id, owner_id=15)
 print(schedule["owner"]["name"])
 ```
 
+### `check_schedule`
+
+Checks the risk of a schedule before you save it. Send the same `data` as `create_schedule`; the client sends it as it is.
+The answer holds `fingerprint` and `blocking`. It needs the right to create schedules.
+
+```python
+check = client.check_schedule({
+    "name": "Digest", "entity_type": "agent", "application_id": 5, "version_id": 91,
+    "prompt": "Summarize the news", "cron": "0 9 * * 1", "timezone": "UTC",
+})
+print(check["fingerprint"], check["blocking"])
+```
+
+### `get_schedule_run`
+
+Reads one run of a schedule.
+
+```python
+run = client.get_schedule_run(schedule_id, 55)
+print(run["id"], run["status"])
+```
+
+### `get_schedule_settings`
+
+Reads the project setting for schedules. `approval_rule` tells what a run does when it needs approval:
+`pause_and_ask` pauses the run and waits for an answer, and `run_without_asking` goes on without asking.
+
+```python
+settings = client.get_schedule_settings()
+print(settings["approval_rule"])
+```
+
+### `update_schedule_settings`
+
+Changes the project setting. Only a project admin may do it.
+Send `approval_rule` as `pause_and_ask` or `run_without_asking`.
+
+```python
+settings = client.update_schedule_settings({"approval_rule": "run_without_asking"})
+print(settings["approval_rule"])
+```
+
 ## Who sees what
 
 The client acts as its caller: the user who owns the `API_KEY` token.
@@ -225,6 +279,34 @@ except ApiDetailsRequestError as error:
     if error.status_code != 409 or "active_run_id" not in error.body:
         raise
     print(f"Status {error.status_code}: run {error.body['active_run_id']} is still active")
+```
+
+## Risk refusals
+
+A save (`create_schedule` or `update_schedule`) can answer 409 with a `code` in `body`:
+
+| `code` | Meaning | What to do |
+|---|---|---|
+| `risk_confirmation_required` | The schedule carries a risk. `body["fingerprint"]` names it. | Read the risk, then send the same `data` again with `risk_ack` set to the fingerprint. |
+| `schedule_blocked` | A rule blocks the schedule. `body["blocking"]` lists the reasons. | Change the schedule. A retry with `risk_ack` does not help. |
+
+```python
+data = {
+    "name": "Digest", "entity_type": "agent", "application_id": 5, "version_id": 91,
+    "prompt": "Summarize the news", "cron": "0 9 * * 1", "timezone": "UTC",
+}
+try:
+    schedule = client.create_schedule(data)
+except ApiDetailsRequestError as error:
+    body = error.body if isinstance(error.body, dict) else {}
+    if error.status_code != 409:
+        raise
+    if body.get("code") == "risk_confirmation_required":
+        schedule = client.create_schedule({**data, "risk_ack": body["fingerprint"]})
+    elif body.get("code") == "schedule_blocked":
+        print("Blocked:", body["blocking"])
+    else:
+        raise
 ```
 
 ## End-to-end example
