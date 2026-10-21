@@ -1,12 +1,15 @@
 import logging
 import types
 from importlib import import_module
-from typing import Optional
+from typing import Any, Dict, Mapping, Optional
 
 from langchain_core.tools import ToolException
 from langgraph.store.base import BaseStore
 
-from ..runtime.credential_slots import GovernedCredentialError, apply_credential_slots, memoize_slot_scans, scan_slots, scrub
+from ..runtime.credential_slots import (
+    GovernedCredentialError, apply_credential_slots, collect_slot_items, memoize_slot_scans, resolve_run_slots,
+    scan_slots, scrub,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -264,9 +267,51 @@ def _filter_blocked_tools(toolkit_tools: list, toolkit_type: str) -> list:
         return toolkit_tools
 
 
+def release_run_slots(tools_list, elitea) -> Dict[str, Mapping[str, Any]]:
+    """Release the governed credential slots of every toolkit in `tools_list` with ONE resolver call.
+
+    Returns ``{toolkit id (str): {field: envelope}}`` for `get_tools(released_slots=...)`; ``{}`` when the
+    resolver has no ``resolve_all``, nothing needs a release, or a toolkit id repeats (the build loop then
+    resolves per toolkit, as before). A toolkit the loop would refuse (unsupported type, nested or malformed
+    slot) is refused here, before anything is released.
+    """
+    resolver = getattr(elitea, 'credential_resolver', None)
+    if not callable(getattr(resolver, 'resolve_all', None)):
+        return {}
+    items, toolkit_ids, checks = [], set(), []
+    for tool in tools_list:
+        raw_settings = tool.get('settings')
+        slot_scan = scan_slots(raw_settings) if raw_settings else None
+        if slot_scan is None or not slot_scan.found:
+            continue
+        if 'type' not in tool:
+            return {}
+        if TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type']) not in AVAILABLE_TOOLS:
+            raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
+        toolkit_id = str(tool.get('id'))
+        tool_items = collect_slot_items(raw_settings, toolkit_id, scan=slot_scan)
+        if toolkit_id in toolkit_ids:
+            return {}
+        if tool_items:
+            toolkit_ids.add(toolkit_id)
+            items.extend(tool_items)
+            checks.append((raw_settings, toolkit_id, slot_scan))
+    if not items:
+        return {}
+    released = resolve_run_slots(resolver, items)
+    # Check every envelope against its slot now, so a bad one aborts the run before the first toolkit is built.
+    for raw_settings, toolkit_id, slot_scan in checks:
+        apply_credential_slots(raw_settings, toolkit_id, None, scan=slot_scan, released=released[toolkit_id])
+    return released
+
+
 @memoize_slot_scans
-def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args, **kwargs):
+def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
+              released_slots: Optional[Mapping[str, Mapping[str, Any]]] = None, **kwargs):
     tools = []
+    # Governed slots of the whole run in one release; a caller that builds toolkits one at a time passes its own.
+    if released_slots is None:
+        released_slots = release_run_slots(tools_list, elitea)
 
     for tool in tools_list:
         toolkit_tools = []
@@ -309,7 +354,8 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
             if tool_type not in AVAILABLE_TOOLS:
                 raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
             settings, released = apply_credential_slots(
-                settings, str(tool.get('id')), getattr(elitea, 'credential_resolver', None), scan=slot_scan)
+                settings, str(tool.get('id')), getattr(elitea, 'credential_resolver', None), scan=slot_scan,
+                released=released_slots.get(str(tool.get('id'))))
             tool['settings'] = settings
         settings['elitea'] = elitea
         settings['llm'] = llm

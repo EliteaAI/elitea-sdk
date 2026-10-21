@@ -24,7 +24,13 @@ resolver offers it::
         -> {<settings key>: CredentialEnvelope}
 
 and otherwise one slot at a time, as
-``resolver(toolkit_instance_id=<str>, field=<settings key>, slot=<slot dict>)``.
+``resolver(toolkit_instance_id=<str>, field=<settings key>, slot=<slot dict>)``. A resolver that also offers::
+
+    resolver.resolve_all(items=[{"toolkit_instance_id": <str>, "field": <settings key>, "slot": <slot dict>}, ...])
+        -> {(<toolkit_instance_id>, <settings key>): CredentialEnvelope}
+
+is called once for the slots of every toolkit of a run (`resolve_run_slots`); the envelopes are then handed to
+`apply_credential_slots(released=...)` toolkit by toolkit.
 Either way each reply must be a `CredentialEnvelope` (or the call raises `GovernedCredentialError`
 with the release refusal code), and every envelope is validated against its own slot here.
 
@@ -164,7 +170,8 @@ class CredentialResolver(Protocol):
 
     A resolver MAY also expose ``resolve_many(*, toolkit_instance_id, items) -> {field: envelope}``
     (items: ``[{"field": str, "slot": dict}]``); it is then called once per toolkit build instead
-    of ``__call__`` once per slot.
+    of ``__call__`` once per slot. It MAY also expose ``resolve_all(*, items) -> {(toolkit_instance_id, field): envelope}``
+    (items: ``[{"toolkit_instance_id": str, "field": str, "slot": dict}]``) for the slots of a whole run.
     """
 
     def __call__(self, *, toolkit_instance_id: str, field: str, slot: Mapping[str, Any]) -> CredentialEnvelope:
@@ -341,12 +348,71 @@ def _resolve_slots(
     return replies
 
 
+def resolve_run_slots(resolver: CredentialResolver, items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Release the items of a whole run with one ``resolver.resolve_all`` call; ``{toolkit_instance_id: {field: reply}}``.
+
+    Typed errors only; a reply that is not exactly the requested (toolkit, field) set is ``DEPENDENCY_UNAVAILABLE``.
+    """
+    try:
+        replies = resolver.resolve_all(items=items)  # type: ignore[attr-defined]
+    except GovernedCredentialError:
+        raise
+    except Exception:
+        raise GovernedCredentialError("DEPENDENCY_UNAVAILABLE") from None
+    if not isinstance(replies, Mapping) or set(replies) != {(i["toolkit_instance_id"], i["field"]) for i in items}:
+        raise GovernedCredentialError("DEPENDENCY_UNAVAILABLE")
+    by_toolkit: Dict[str, Dict[str, Any]] = {}
+    for (toolkit_instance_id, field), envelope in replies.items():
+        by_toolkit.setdefault(toolkit_instance_id, {})[field] = envelope
+    return by_toolkit
+
+
+def _checked_scan(settings: Dict[str, Any], scan: Optional[SlotScan]) -> SlotScan:
+    if scan is None:
+        return scan_slots(settings)
+    # A caller's scan is a hint, never trusted: its top-level shape must match these settings.
+    top = tuple(k for k, v in settings.items() if isinstance(v, dict) and SLOT_KEY in v)
+    if top != scan.slotted or (not scan.found and (top or SLOT_KEY in settings)):
+        raise GovernedCredentialError("STALE_CONTEXT")
+    return scan
+
+
+def _plan_slots(settings: Dict[str, Any], toolkit_instance_id: Any, scan: SlotScan):
+    """Validate every slot: ``(plan, items)``, plan = ``(key, new_config, generation, paths)`` per slotted key."""
+    if not isinstance(toolkit_instance_id, str) or not toolkit_instance_id:
+        raise GovernedCredentialError("STALE_CONTEXT")
+    plan = []
+    items: List[Dict[str, Any]] = []
+    for key in scan.slotted:
+        config = settings[key]
+        slot = config[SLOT_KEY]
+        generation, paths = _validate_slot(slot)
+        plan.append((key, _copy_containers({k: v for k, v in config.items() if k != SLOT_KEY}), generation, paths))
+        if paths:
+            items.append({"field": key, "slot": _copy_containers(slot)})
+    return plan, items
+
+
+def collect_slot_items(
+    settings: Dict[str, Any], toolkit_instance_id: str, *, scan: Optional[SlotScan] = None
+) -> List[Dict[str, Any]]:
+    """The ``resolve_all`` items of one toolkit (``[]`` when it needs no release), validated like `apply_credential_slots`."""
+    scan = _checked_scan(settings, scan)
+    if not scan.found:
+        return []
+    if scan.nested:
+        raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
+    _plan, items = _plan_slots(settings, toolkit_instance_id, scan)
+    return [{"toolkit_instance_id": toolkit_instance_id, **item} for item in items]
+
+
 def apply_credential_slots(
     settings: Dict[str, Any],
     toolkit_instance_id: str,
     resolver: Optional[CredentialResolver],
     *,
     scan: Optional[SlotScan] = None,
+    released: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], FrozenSet[str]]:
     """Resolve every slot in `settings` and return ``(new_settings, released_values)``.
 
@@ -358,7 +424,9 @@ def apply_credential_slots(
     Without it the settings are scanned here.
 
     All slots are collected and validated first, then released with one resolver call
-    (`resolve_many`, or one call per slot for a resolver that lacks it).
+    (`resolve_many`, or one call per slot for a resolver that lacks it). `released` is ``{field: envelope}``
+    already released for this toolkit (`resolve_run_slots`): the resolver is then not called, and each
+    envelope is validated like a fresh reply; it must cover exactly this toolkit's slotted fields.
 
     Raises `GovernedCredentialError`: no resolver -> ``WORKER_CAPABILITY_UNAVAILABLE``; a slot
     anywhere but directly under a top-level settings key -> ``UNSUPPORTED_AUTH_MODE``; the
@@ -366,35 +434,24 @@ def apply_credential_slots(
     ``CREDENTIAL_GENERATION_MISMATCH`` / ``DEPENDENCY_UNAVAILABLE``.
     """
     result = dict(settings)
-    if scan is None:
-        scan = scan_slots(settings)
-    else:
-        # A caller's scan is a hint, never trusted: its top-level shape must match these settings.
-        top = tuple(k for k, v in settings.items() if isinstance(v, dict) and SLOT_KEY in v)
-        if top != scan.slotted or (not scan.found and (top or SLOT_KEY in settings)):
-            raise GovernedCredentialError("STALE_CONTEXT")
+    scan = _checked_scan(settings, scan)
     if not scan.found:
         return result, frozenset()
     # Slots below the top level cannot be resolved here; never leave one behind unresolved.
     if scan.nested:
         raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
-    if resolver is None:
+    if resolver is None and released is None:
         raise GovernedCredentialError("WORKER_CAPABILITY_UNAVAILABLE")
-    if not isinstance(toolkit_instance_id, str) or not toolkit_instance_id:
-        raise GovernedCredentialError("STALE_CONTEXT")
 
-    plan = []  # (key, new_config, generation, paths) per slotted key
-    items: List[Dict[str, Any]] = []
-    for key in scan.slotted:
-        config = settings[key]
-        slot = config[SLOT_KEY]
-        generation, paths = _validate_slot(slot)
-        plan.append((key, _copy_containers({k: v for k, v in config.items() if k != SLOT_KEY}), generation, paths))
-        if paths:
-            items.append({"field": key, "slot": _copy_containers(slot)})
-    replies = _resolve_slots(resolver, toolkit_instance_id, items) if items else {}
+    plan, items = _plan_slots(settings, toolkit_instance_id, scan)
+    if released is not None:
+        if not isinstance(released, Mapping) or set(released) != {item["field"] for item in items}:
+            raise GovernedCredentialError("DEPENDENCY_UNAVAILABLE")
+        replies = released
+    else:
+        replies = _resolve_slots(resolver, toolkit_instance_id, items) if items else {}
 
-    released = set()
+    values = set()
     for key, new_config, generation, paths in plan:
         if paths:
             envelope = replies[key]
@@ -408,9 +465,9 @@ def apply_credential_slots(
                 value = str(secret.get_secret_value())
                 _write_path(new_config, path, value)
                 if value:
-                    released.add(value)
+                    values.add(value)
         result[key] = new_config
-    return result, frozenset(released)
+    return result, frozenset(values)
 
 
 def _variants(value: str) -> Iterable[str]:

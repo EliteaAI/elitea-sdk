@@ -24,7 +24,9 @@ from elitea_sdk.runtime.credential_slots import (
     GovernedCredentialError,
     apply_credential_slots,
     has_slots,
+    collect_slot_items,
     memoize_slot_scans,
+    resolve_run_slots,
     scrub,
 )
 from elitea_sdk.runtime import credential_slots as cs
@@ -834,3 +836,255 @@ def test_scan_depth_boundary_is_level_7_on_both_paths():
     beyond_slotted = {"cfg": {SLOT_KEY: slot(), "sub": _slot_at_level(6, "a")}}
     assert not cs.scan_slots(beyond_plain).found
     assert not cs.scan_slots(beyond_slotted).nested and cs.scan_slots(beyond_slotted).slotted == ("cfg",)
+
+
+# --- run level: the slots of every toolkit of a run in ONE resolver call (perf PR 5) ------------------
+
+
+class RunResolver:
+    """Spy resolver exposing `resolve_all`, `resolve_many` and the single-slot call."""
+
+    def __init__(self, error=None, generation=1, omit=None):
+        self.all_calls, self.many_calls, self.single_calls = [], [], []
+        self.error, self.generation, self.omit = error, generation, omit
+
+    def _envelope(self, toolkit_instance_id):
+        return CredentialEnvelope({"access_token": f"secret-{toolkit_instance_id}"}, self.generation, EXPIRES)
+
+    def resolve_all(self, *, items):
+        self.all_calls.append(items)
+        if self.error is not None:
+            raise self.error
+        replies = {(i["toolkit_instance_id"], i["field"]): self._envelope(i["toolkit_instance_id"]) for i in items}
+        replies.pop(self.omit, None)
+        return replies
+
+    def resolve_many(self, *, toolkit_instance_id, items):
+        self.many_calls.append(toolkit_instance_id)
+        return {i["field"]: self._envelope(toolkit_instance_id) for i in items}
+
+    def __call__(self, *, toolkit_instance_id, field, slot):
+        self.single_calls.append(toolkit_instance_id)
+        return self._envelope(toolkit_instance_id)
+
+
+def _six_tools():
+    return [_github_tool(tool_id=n) for n in range(1, 7)]
+
+
+def _built_tokens(recorder):
+    return [t["settings"]["github_configuration"]["access_token"] for t in recorder]
+
+
+def test_six_toolkits_are_released_with_one_resolve_all_call(recorder):
+    resolver = RunResolver()
+    tools_list = _six_tools()
+    before = copy.deepcopy(tools_list)
+
+    result = sdk_tools.get_tools(tools_list, SimpleNamespace(credential_resolver=resolver), llm=None)
+
+    assert len(result) == 6 and len(resolver.all_calls) == 1
+    assert resolver.many_calls == [] and resolver.single_calls == []
+    assert [(i["toolkit_instance_id"], i["field"]) for i in resolver.all_calls[0]] == [
+        (str(n), "github_configuration") for n in range(1, 7)]
+    assert resolver.all_calls[0][2]["slot"] == tools_list[2]["settings"]["github_configuration"][SLOT_KEY]
+    assert _built_tokens(recorder) == [f"secret-{n}" for n in range(1, 7)]
+    assert all(SLOT_KEY not in t["settings"]["github_configuration"] for t in recorder)
+    assert tools_list == before                                    # caller's payload untouched
+
+
+def test_toolkits_without_settings_or_slots_do_not_reach_the_resolver(recorder):
+    plain = {"github_configuration": {"base_url": "u", "access_token": "legacy"}, "selected_tools": ["list_branches"]}
+    tools_list = [_github_tool(tool_id=1), {"type": "github", "id": 2, "settings": {}}, _github_tool(plain, tool_id=3),
+                  _github_tool(tool_id=4)]
+    resolver = RunResolver()
+    sdk_tools.get_tools(tools_list, SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert [i["toolkit_instance_id"] for i in resolver.all_calls[0]] == ["1", "4"] and len(resolver.all_calls) == 1
+    assert _built_tokens(recorder) == ["secret-1", "legacy", "secret-4"]
+
+
+def test_a_run_without_slots_makes_no_resolve_all_call(recorder):
+    plain = {"github_configuration": {"base_url": "u", "access_token": "legacy"}, "selected_tools": ["list_branches"]}
+    resolver = RunResolver()
+    sdk_tools.get_tools([_github_tool(plain, tool_id=n) for n in (1, 2)], SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert resolver.all_calls == [] and resolver.many_calls == [] and resolver.single_calls == []
+
+
+def test_a_resolver_with_only_resolve_many_keeps_one_call_per_toolkit(recorder):
+    class ManyOnly:
+        def __init__(self):
+            self.many_calls = []
+
+        def resolve_many(self, *, toolkit_instance_id, items):
+            self.many_calls.append(toolkit_instance_id)
+            return {i["field"]: CredentialEnvelope({"access_token": f"secret-{toolkit_instance_id}"}, 1, EXPIRES)
+                    for i in items}
+
+    resolver = ManyOnly()
+    sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert resolver.many_calls == [str(n) for n in range(1, 7)]
+    assert _built_tokens(recorder) == [f"secret-{n}" for n in range(1, 7)]
+
+
+def test_a_single_slot_resolver_keeps_one_call_per_slot(recorder):
+    resolver = FakeResolver()
+    sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert [c["toolkit_instance_id"] for c in resolver.calls] == [str(n) for n in range(1, 7)]
+    assert len(recorder) == 6
+
+
+def test_a_refused_slot_aborts_the_run_before_the_first_toolkit_is_built(recorder):
+    resolver = RunResolver(error=GovernedCredentialError("DENIED_GRANT"))
+    with pytest.raises(GovernedCredentialError) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert exc.value.reason_code == "DENIED_GRANT" and recorder == [] and len(resolver.all_calls) == 1
+
+
+def test_an_unexpected_resolver_failure_is_typed_and_leaks_nothing(recorder):
+    resolver = RunResolver(error=RuntimeError(TOKEN))
+    with pytest.raises(GovernedCredentialError) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert exc.value.reason_code == "DEPENDENCY_UNAVAILABLE" and TOKEN not in str(exc.value)
+    assert exc.value.__cause__ is None and recorder == []
+
+
+def test_a_reply_missing_the_third_toolkit_aborts_before_any_build(recorder):
+    resolver = RunResolver(omit=("3", "github_configuration"))
+    with pytest.raises(GovernedCredentialError) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert exc.value.reason_code == "DEPENDENCY_UNAVAILABLE" and recorder == []
+
+
+def test_a_stale_envelope_of_the_third_toolkit_aborts_before_the_first_is_built(recorder):
+    class StaleThird(RunResolver):
+        def _envelope(self, toolkit_instance_id):
+            generation = 9 if toolkit_instance_id == "3" else 1
+            return CredentialEnvelope({"access_token": f"secret-{toolkit_instance_id}"}, generation, EXPIRES)
+
+    with pytest.raises(GovernedCredentialError) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=StaleThird()), llm=None)
+    assert exc.value.reason_code == "CREDENTIAL_GENERATION_MISMATCH" and recorder == []
+
+
+def test_the_scan_walks_each_tool_once_with_the_run_level_call(recorder, walks):
+    resolver = RunResolver()
+    sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert len(walks) == 6 and len(resolver.all_calls) == 1
+
+
+def test_an_unsupported_type_is_refused_before_the_batch_call(recorder):
+    resolver = RunResolver()
+    tools_list = [_github_tool(tool_id=1), _github_tool(tool_id=2, tool_type="some_community_toolkit"),
+                  _github_tool(tool_id=3)]
+    with pytest.raises(GovernedCredentialError) as exc:
+        sdk_tools.get_tools(tools_list, SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert exc.value.reason_code == "UNSUPPORTED_AUTH_MODE"
+    assert resolver.all_calls == [] and resolver.many_calls == [] and recorder == []
+
+
+def test_a_nested_or_malformed_slot_is_refused_before_the_batch_call(recorder):
+    nested = github_settings()
+    nested["github_configuration"]["sub"] = {SLOT_KEY: slot()}
+    malformed = github_settings()
+    malformed["github_configuration"][SLOT_KEY] = {"v": 2, "credential_generation": 1, "fields": ["access_token"]}
+    for bad, code in ((nested, "UNSUPPORTED_AUTH_MODE"), (malformed, "STALE_CONTEXT")):
+        resolver = RunResolver()
+        tools_list = [_github_tool(tool_id=1), _github_tool(bad, tool_id=2)]
+        with pytest.raises(GovernedCredentialError) as exc:
+            sdk_tools.get_tools(tools_list, SimpleNamespace(credential_resolver=resolver), llm=None)
+        assert exc.value.reason_code == code and resolver.all_calls == [] and recorder == []
+
+
+def test_a_repeated_toolkit_id_falls_back_to_one_call_per_toolkit(recorder):
+    resolver = RunResolver()
+    sdk_tools.get_tools([_github_tool(tool_id=7), _github_tool(tool_id=7)], SimpleNamespace(credential_resolver=resolver), llm=None)
+    assert resolver.all_calls == [] and resolver.many_calls == ["7", "7"] and len(recorder) == 2
+
+
+def test_toolkit_errors_stay_scrubbed_with_run_level_envelopes(recorder, monkeypatch):
+    def failing(tool):
+        raise ValueError(f"bad token {tool['settings']['github_configuration']['access_token']}")
+
+    monkeypatch.setitem(sdk_tools.AVAILABLE_TOOLS, "github", {"get_tools": failing})
+    with pytest.raises(ToolException) as exc:
+        sdk_tools.get_tools(_six_tools(), SimpleNamespace(credential_resolver=RunResolver()), llm=None)
+    assert "secret-1" not in str(exc.value) and cs.REDACTED in str(exc.value)
+
+
+def test_released_slots_are_applied_without_a_resolver_and_returned_for_scrubbing():
+    settings = three_slot_settings()
+    released = {k: BatchResolver()._envelope(k) for k in BatchResolver.PATHS}
+    result, values = apply_credential_slots(settings, "tk-9", None, released=released)
+    assert result["jira_configuration"]["api_key"] == "secret-jira_configuration"
+    assert values == frozenset(f"secret-{k}" for k in BatchResolver.PATHS)
+    assert all(SLOT_KEY not in result[k] for k in BatchResolver.PATHS) and SLOT_KEY in settings["github_configuration"]
+
+
+def test_released_envelopes_are_validated_like_fresh_replies():
+    settings = three_slot_settings()
+    good = {k: BatchResolver()._envelope(k) for k in BatchResolver.PATHS}
+    cases = [
+        ({k: v for k, v in good.items() if k != "jira_configuration"}, "DEPENDENCY_UNAVAILABLE"),
+        ({**good, "extra": good["jira_configuration"]}, "DEPENDENCY_UNAVAILABLE"),
+        ({**good, "jira_configuration": "not-an-envelope"}, "DEPENDENCY_UNAVAILABLE"),
+        ({**good, "jira_configuration": CredentialEnvelope({"api_key": "x"}, 99, EXPIRES)}, "CREDENTIAL_GENERATION_MISMATCH"),
+        ({**good, "jira_configuration": CredentialEnvelope({"other": "x"}, 3, EXPIRES)}, "DEPENDENCY_UNAVAILABLE"),
+        ("nope", "DEPENDENCY_UNAVAILABLE"),
+    ]
+    for released, code in cases:
+        with pytest.raises(GovernedCredentialError) as exc:
+            apply_credential_slots(settings, "tk", None, released=released)
+        assert exc.value.reason_code == code
+
+
+def test_released_slots_never_call_the_resolver():
+    resolver = BatchResolver()
+    released = {k: resolver._envelope(k) for k in BatchResolver.PATHS}
+    apply_credential_slots(three_slot_settings(), "tk", resolver, released=released)
+    assert resolver.many_calls == [] and resolver.single_calls == []
+
+
+def test_collect_slot_items_names_the_toolkit_and_validates_like_apply():
+    items = collect_slot_items(three_slot_settings(), "tk-9")
+    assert [(i["toolkit_instance_id"], i["field"]) for i in items] == [
+        ("tk-9", "github_configuration"), ("tk-9", "jira_configuration"), ("tk-9", "pgvector_configuration")]
+    assert collect_slot_items({"cfg": {"a": 1}}, "tk") == [] and collect_slot_items({"cfg": {SLOT_KEY: slot(())}}, "tk") == []
+    with pytest.raises(GovernedCredentialError) as exc:
+        collect_slot_items(three_slot_settings(), "")
+    assert exc.value.reason_code == "STALE_CONTEXT"
+
+
+def test_resolve_run_slots_groups_the_reply_by_toolkit_and_checks_its_keys():
+    resolver = RunResolver()
+    items = [{"toolkit_instance_id": t, "field": "github_configuration", "slot": slot()} for t in ("a", "b")]
+    assert {t: set(fields) for t, fields in resolve_run_slots(resolver, items).items()} == {
+        "a": {"github_configuration"}, "b": {"github_configuration"}}
+    resolver.omit = ("b", "github_configuration")
+    with pytest.raises(GovernedCredentialError) as exc:
+        resolve_run_slots(resolver, items)
+    assert exc.value.reason_code == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_the_runtime_build_releases_every_built_in_toolkit_in_one_call(recorder, walks, monkeypatch):
+    resolver = RunResolver()
+    elitea_client = SimpleNamespace(credential_resolver=resolver)
+    monkeypatch.setattr(runtime_tools, "community_tools", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_tools, "_mcp_tools", lambda *a, **k: [])
+    tools_list = [_runtime_tool("github", n, github_settings()) for n in range(1, 7)]
+
+    result = runtime_tools.get_tools(tools_list, elitea_client=elitea_client, mcp_context=McpContext(tokens={"u": {"access_token": "T"}}))
+
+    assert len(result) == 6 and len(resolver.all_calls) == 1 and resolver.many_calls == [] and resolver.single_calls == []
+    assert _built_tokens(recorder) == [f"secret-{n}" for n in range(1, 7)]
+    assert len(walks) == 6
+    assert all("tokens" not in t["settings"] for t in recorder)
+
+
+def test_the_runtime_build_aborts_before_the_first_built_in_toolkit_when_a_slot_is_refused(recorder, monkeypatch):
+    resolver = RunResolver(error=GovernedCredentialError("DENIED_RBAC"))
+    monkeypatch.setattr(runtime_tools, "community_tools", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_tools, "_mcp_tools", lambda *a, **k: [])
+    tools_list = [_runtime_tool("github", n, github_settings()) for n in range(1, 4)]
+    with pytest.raises(GovernedCredentialError) as exc:
+        runtime_tools.get_tools(tools_list, elitea_client=SimpleNamespace(credential_resolver=resolver))
+    assert exc.value.reason_code == "DENIED_RBAC" and recorder == []
