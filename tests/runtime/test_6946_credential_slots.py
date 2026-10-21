@@ -23,8 +23,10 @@ from elitea_sdk.runtime.credential_slots import (
     GovernedCredentialError,
     apply_credential_slots,
     has_slots,
+    memoize_slot_scans,
     scrub,
 )
+from elitea_sdk.runtime import credential_slots as cs
 from elitea_sdk.runtime.toolkits import tools as runtime_tools
 from elitea_sdk.runtime.utils.mcp_oauth import McpContext
 
@@ -510,3 +512,233 @@ def test_runtime_is_inert_without_slots(runtime):
     runtime_tools.get_tools([plain], elitea_client=SimpleNamespace(), mcp_context=McpContext(tokens=tokens))
 
     assert runtime == [expected]
+
+
+# --- batch release and single-scan counts (C-1009 perf PR 5: M1 SDK side, S3, L7) -----------------
+
+
+def three_slot_settings():
+    return {
+        "github_configuration": {"base_url": "u", SLOT_KEY: slot(("access_token",))},
+        "jira_configuration": {"base_url": "j", SLOT_KEY: slot(("api_key",), generation=3)},
+        "pgvector_configuration": {"connection_string": "c", SLOT_KEY: slot(("connection_string",), generation=2)},
+        "selected_tools": ["x"],
+    }
+
+
+class BatchResolver:
+    """Spy resolver exposing both `resolve_many` and the single-slot call."""
+
+    GENERATIONS = {"github_configuration": 1, "jira_configuration": 3, "pgvector_configuration": 2}
+    PATHS = {"github_configuration": "access_token", "jira_configuration": "api_key",
+             "pgvector_configuration": "connection_string"}
+
+    def __init__(self, replies=None, error=None):
+        self.many_calls = []
+        self.single_calls = []
+        self.replies = replies
+        self.error = error
+
+    def _envelope(self, field):
+        return CredentialEnvelope({self.PATHS[field]: f"secret-{field}"}, self.GENERATIONS[field], EXPIRES)
+
+    def resolve_many(self, *, toolkit_instance_id, items):
+        self.many_calls.append({"toolkit_instance_id": toolkit_instance_id, "items": items})
+        if self.error is not None:
+            raise self.error
+        if self.replies is not None:
+            return self.replies
+        return {item["field"]: self._envelope(item["field"]) for item in items}
+
+    def __call__(self, *, toolkit_instance_id, field, slot):
+        self.single_calls.append(field)
+        return self._envelope(field)
+
+
+class SingleOnlyResolver:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *, toolkit_instance_id, field, slot):
+        self.calls.append(field)
+        return BatchResolver()._envelope(field)
+
+
+def test_three_slots_are_released_with_one_resolve_many_call():
+    settings = three_slot_settings()
+    before = copy.deepcopy(settings)
+    resolver = BatchResolver()
+
+    result, released = apply_credential_slots(settings, "tk-9", resolver)
+
+    assert len(resolver.many_calls) == 1 and resolver.single_calls == []
+    call = resolver.many_calls[0]
+    assert call["toolkit_instance_id"] == "tk-9"
+    assert [i["field"] for i in call["items"]] == ["github_configuration", "jira_configuration", "pgvector_configuration"]
+    assert call["items"][1]["slot"] == settings["jira_configuration"][SLOT_KEY]
+    assert call["items"][1]["slot"] is not settings["jira_configuration"][SLOT_KEY]   # a copy
+    assert result["github_configuration"]["access_token"] == "secret-github_configuration"
+    assert result["jira_configuration"]["api_key"] == "secret-jira_configuration"
+    assert result["pgvector_configuration"]["connection_string"] == "secret-pgvector_configuration"
+    assert all(SLOT_KEY not in result[k] for k in BatchResolver.PATHS)
+    assert released == frozenset(f"secret-{k}" for k in BatchResolver.PATHS)
+    assert settings == before
+
+
+def test_resolver_without_resolve_many_gets_three_single_calls():
+    resolver = SingleOnlyResolver()
+    result, released = apply_credential_slots(three_slot_settings(), "tk-9", resolver)
+    assert resolver.calls == ["github_configuration", "jira_configuration", "pgvector_configuration"]
+    assert len(released) == 3 and result["jira_configuration"]["api_key"] == "secret-jira_configuration"
+
+
+def test_slots_without_fields_do_not_reach_the_resolver_at_all():
+    resolver = BatchResolver()
+    apply_credential_slots({"cfg": {SLOT_KEY: slot(())}}, "tk", resolver)
+    assert resolver.many_calls == [] and resolver.single_calls == []
+
+
+def test_a_malformed_second_slot_is_refused_before_any_release():
+    settings = three_slot_settings()
+    settings["jira_configuration"][SLOT_KEY] = {"v": 2, "credential_generation": 1, "fields": ["api_key"]}
+    resolver = BatchResolver()
+    with pytest.raises(GovernedCredentialError) as exc:
+        apply_credential_slots(settings, "tk", resolver)
+    assert exc.value.reason_code == "STALE_CONTEXT"
+    assert resolver.many_calls == [] and resolver.single_calls == []
+
+
+def _batch_envelope(field, generation=None, paths=None):
+    return CredentialEnvelope({p: "v" for p in (paths or [BatchResolver.PATHS[field]])},
+                              generation if generation is not None else BatchResolver.GENERATIONS[field])
+
+
+def test_every_batch_envelope_is_validated_against_its_own_slot():
+    good = {f: _batch_envelope(f) for f in BatchResolver.PATHS}
+    cases = {
+        "generation": ({**good, "jira_configuration": _batch_envelope("jira_configuration", generation=9)},
+                       "CREDENTIAL_GENERATION_MISMATCH"),
+        "swapped": ({**good, "github_configuration": good["jira_configuration"],
+                     "jira_configuration": good["github_configuration"]}, "CREDENTIAL_GENERATION_MISMATCH"),
+        "field set": ({**good, "pgvector_configuration": _batch_envelope(
+            "pgvector_configuration", paths=["connection_string", "extra"])}, "DEPENDENCY_UNAVAILABLE"),
+        "missing field": ({k: v for k, v in good.items() if k != "jira_configuration"}, "DEPENDENCY_UNAVAILABLE"),
+        "unknown field": ({**good, "other_configuration": good["github_configuration"]}, "DEPENDENCY_UNAVAILABLE"),
+        "not an envelope": ({**good, "github_configuration": {"access_token": TOKEN}}, "DEPENDENCY_UNAVAILABLE"),
+        "not a mapping": ([good["github_configuration"]], "DEPENDENCY_UNAVAILABLE"),
+    }
+    for name, (replies, code) in cases.items():
+        with pytest.raises(GovernedCredentialError) as exc:
+            apply_credential_slots(three_slot_settings(), "tk", BatchResolver(replies=replies))
+        assert exc.value.reason_code == code, name
+
+
+def test_resolve_many_failures_are_typed_and_leak_nothing():
+    with pytest.raises(GovernedCredentialError) as refused:
+        apply_credential_slots(three_slot_settings(), "tk", BatchResolver(error=GovernedCredentialError("DENIED_GRANT")))
+    assert refused.value.reason_code == "DENIED_GRANT"
+    with pytest.raises(GovernedCredentialError) as boom:
+        apply_credential_slots(three_slot_settings(), "tk",
+                               BatchResolver(error=RuntimeError(f"bus exploded {TOKEN} 53d98fb5")))
+    assert boom.value.reason_code == "DEPENDENCY_UNAVAILABLE"
+    assert TOKEN not in str(boom.value) and "53d98fb5" not in str(boom.value) and boom.value.__suppress_context__
+
+
+def test_a_slot_inside_a_list_or_at_the_root_is_refused_not_ignored():
+    for settings in (
+        {"cfg": {SLOT_KEY: slot()}, "other": [{"x": {SLOT_KEY: slot()}}]},
+        {"cfg": {SLOT_KEY: slot()}, SLOT_KEY: slot()},
+    ):
+        resolver = BatchResolver()
+        with pytest.raises(GovernedCredentialError) as exc:
+            apply_credential_slots(settings, "tk", resolver)
+        assert exc.value.reason_code == "UNSUPPORTED_AUTH_MODE"
+        assert resolver.many_calls == []
+
+
+@pytest.fixture
+def walks(monkeypatch):
+    """Count full traversals of a settings dict."""
+    calls = []
+    real = cs._scan_settings
+
+    def spy(settings):
+        calls.append(settings)
+        return real(settings)
+
+    monkeypatch.setattr(cs, "_scan_settings", spy)
+    return calls
+
+
+def test_scans_are_memoized_only_inside_a_scope(walks):
+    settings = three_slot_settings()
+    has_slots(settings), has_slots(settings)
+    assert len(walks) == 2                                   # no scope: today's behaviour, nothing cached
+
+    walks.clear()
+
+    @memoize_slot_scans
+    def scoped():
+        return [has_slots(settings) for _ in range(5)] + [has_slots(three_slot_settings())]
+
+    assert scoped() == [True] * 6
+    assert len(walks) == 2                                   # one per distinct dict
+    has_slots(settings)
+    assert len(walks) == 3                                   # the scope ended; the cache is gone
+
+
+def test_get_tools_builds_three_slots_with_one_resolver_call_and_one_walk(recorder, walks):
+    resolver = BatchResolver()
+    elitea = SimpleNamespace(credential_resolver=resolver)
+    tools_list = [{"type": "github", "id": 7, "toolkit_name": "gh", "settings": three_slot_settings()}]
+
+    sdk_tools.get_tools(tools_list, elitea, llm=None)
+
+    assert len(resolver.many_calls) == 1 and resolver.single_calls == []
+    assert len(walks) == 1
+    built = recorder[0]["settings"]
+    assert built["jira_configuration"]["api_key"] == "secret-jira_configuration"
+    assert all(SLOT_KEY not in built[k] for k in BatchResolver.PATHS)
+
+
+def test_get_tools_fallback_resolver_gets_one_call_per_slot(recorder):
+    resolver = SingleOnlyResolver()
+    elitea = SimpleNamespace(credential_resolver=resolver)
+    tools_list = [{"type": "github", "id": 7, "toolkit_name": "gh", "settings": three_slot_settings()}]
+    sdk_tools.get_tools(tools_list, elitea, llm=None)
+    assert resolver.calls == ["github_configuration", "jira_configuration", "pgvector_configuration"]
+
+
+def test_slotless_settings_cost_one_walk_and_no_resolver_call(recorder, walks, monkeypatch):
+    plain = {"github_configuration": {"base_url": "u", "access_token": "legacy"}, "selected_tools": ["list_branches"]}
+    resolver = BatchResolver()
+    elitea_client = SimpleNamespace(credential_resolver=resolver)
+    monkeypatch.setattr(runtime_tools, "community_tools", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_tools, "_mcp_tools", lambda *a, **k: [])
+    tokens = {"u": {"access_token": "T"}}
+
+    # Whole runtime path: loop-head gate, mcp token branch, then the SDK get_tools gate.
+    runtime_tools.get_tools([_runtime_tool("github", 1, plain)], elitea_client=elitea_client,
+                            mcp_context=McpContext(tokens=tokens))
+
+    assert len(walks) == 1
+    assert resolver.many_calls == [] and resolver.single_calls == []
+    assert recorder[0]["settings"]["github_configuration"] == plain["github_configuration"]
+
+    walks.clear()
+    sdk_tools.get_tools([_github_tool(plain)], elitea_client, llm=None)   # direct SDK entry: its own scope
+    assert len(walks) == 1
+
+
+def test_governed_runtime_build_walks_once_and_releases_once(recorder, walks, monkeypatch):
+    resolver = BatchResolver()
+    elitea_client = SimpleNamespace(credential_resolver=resolver)
+    monkeypatch.setattr(runtime_tools, "community_tools", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_tools, "_mcp_tools", lambda *a, **k: [])
+
+    runtime_tools.get_tools([_runtime_tool("github", 1, three_slot_settings())], elitea_client=elitea_client,
+                            mcp_context=McpContext(tokens={"u": {"access_token": "T"}}))
+
+    assert len(walks) == 1
+    assert len(resolver.many_calls) == 1 and resolver.single_calls == []
+    assert "tokens" not in recorder[0]["settings"]
