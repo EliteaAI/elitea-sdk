@@ -149,6 +149,8 @@ class EliteAClient:
         self.tool_spend_record_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool_spend_record/prompt_lib/{self.project_id}"
         self.application_versions = f"{self.base_url}{self.api_v2_path}/elitea_core/version/prompt_lib/{self.project_id}"
         self.list_apps_url = f"{self.base_url}{self.api_v2_path}/elitea_core/applications/prompt_lib/{self.project_id}"
+        self.schedules_url = f"{self.base_url}{self.api_v2_path}/elitea_core/schedules/prompt_lib/{self.project_id}"
+        self.schedule_url = f"{self.base_url}{self.api_v2_path}/elitea_core/schedule/prompt_lib/{self.project_id}"
         self.list_toolkits_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tools/prompt_lib/{self.project_id}"
         self.toolkit_details_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool/prompt_lib/{self.project_id}"
         self.secrets_url = f"{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}"
@@ -209,6 +211,46 @@ class EliteAClient:
                     "the user session is no longer valid"
                 )
         return response
+
+    @staticmethod
+    def _schedule_response(resp):
+        """None on 204, the JSON below 400, else ApiDetailsRequestError with status_code and body."""
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = resp.text
+            raise ApiDetailsRequestError(
+                f"Schedule request to {resp.url} failed with status {resp.status_code}",
+                status_code=resp.status_code, body=body,
+            )
+        return None if resp.status_code == 204 else resp.json()
+
+    def _schedule_call(self, method: str, url: str, **kwargs):
+        return self._schedule_response(
+            self._request(method, url, headers=self.headers, verify=False, **kwargs))
+
+    def list_schedules(self, limit: int = 20, offset: int = 0, **filters) -> dict:
+        """One page of schedules; filters that are None are dropped."""
+        params = {'limit': limit, 'offset': offset}
+        params.update({k: v for k, v in filters.items() if v is not None})
+        return self._schedule_call('get', self.schedules_url, params=params)
+
+    def get_schedule(self, schedule_id: int) -> dict:
+        return self._schedule_call('get', f"{self.schedule_url}/{schedule_id}")
+
+    def create_schedule(self, data: dict) -> dict:
+        """Create a schedule. `data` keys: name, description, entity_type, application_id,
+        version_id, run_mode, prompt, variables, cron, timezone, expires_at, approval_rule.
+        Sent unchanged; the API checks them and a 400 raises ApiDetailsRequestError."""
+        return self._schedule_call('post', self.schedule_url, json=data)
+
+    def update_schedule(self, schedule_id: int, data: dict) -> dict:
+        """Update a schedule. `data` takes the same keys as create_schedule, sent unchanged."""
+        return self._schedule_call('put', f"{self.schedule_url}/{schedule_id}", json=data)
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        return self._schedule_call('delete', f"{self.schedule_url}/{schedule_id}")
 
     def get_mcp_toolkits(self):
         # Static registry; fetched once per client instead of once per nested get_tools call
