@@ -39,8 +39,15 @@ ENDPOINTS = {
     "run_schedule": ("POST", "/{schedule_id}/run"),
     "list_schedule_runs": ("GET", "/{schedule_id}/runs"),
     "change_schedule_owner": ("POST", "/{schedule_id}/owner"),
+    "check_schedule": ("POST", "/check"),
+    "get_schedule_run": ("GET", "/{schedule_id}/runs/{run_id}"),
+    "get_schedule_settings": ("GET", "/settings"),
+    "update_schedule_settings": ("PUT", "/settings"),
 }
-ROUTES = {(verb.lower(), SCHEDULES + path.format(schedule_id=SCHEDULE_ID)): name
+NO_ID_METHODS = ("list_schedules", "create_schedule", "check_schedule",
+                 "get_schedule_settings", "update_schedule_settings")
+RISK_409 = {"code": "risk_confirmation_required", "fingerprint": "abc123", "blocking": []}
+ROUTES = {(verb.lower(), SCHEDULES + path.format(schedule_id=SCHEDULE_ID, run_id=55)): name
           for name, (verb, path) in ENDPOINTS.items()}
 ROUTES[("get", APPS)] = "get_list_of_apps"
 
@@ -82,6 +89,10 @@ class FakeApi:
             "run_schedule": [(202, {"run_id": 55})],
             "list_schedule_runs": [(200, {"total": 1, "rows": [RUN]})],
             "change_schedule_owner": [(200, {**SCHEDULE, "owner": {"id": 15, "name": "Bob"}})],
+            "check_schedule": [(200, {"risk": "high", "fingerprint": "abc123", "blocking": []})],
+            "get_schedule_run": [(200, RUN)],
+            "get_schedule_settings": [(200, {"approval_rule": "pause_and_ask"})],
+            "update_schedule_settings": [(200, {"approval_rule": "run_without_asking"})],
         }
 
     def answer(self, name, *answers):
@@ -186,7 +197,7 @@ def test_el7011_us45_r1_2_methods_table_has_arguments_and_endpoint():
     assert set(rows) == set(ENDPOINTS)
     for name, (verb, path) in ENDPOINTS.items():
         arguments, endpoint = rows[name]
-        if name not in ("list_schedules", "create_schedule"):
+        if name not in NO_ID_METHODS:
             assert "schedule_id" in arguments, name
         assert endpoint == f"`{verb} {path or '/'}`", name
 
@@ -395,3 +406,38 @@ def test_el7011_us45_r3_2_errors_text_explains_403_and_404():
     text = section("Errors")
     assert "403" in text and "right" in text
     assert "404" in text and "another user" in text
+
+
+# AC6 — CR-14: risk_ack, blocked, approval_rule, install (TC-US44-26 to TC-US44-30)
+
+def test_el7011_us45_r5_1_setup_shows_the_install_step():
+    assert "pip install '.[all]'" in section("Setup")
+
+
+def test_el7011_us45_r5_3_settings_text_names_the_approval_rule_values():
+    text = method_sections()["get_schedule_settings"] + method_sections()["update_schedule_settings"]
+    assert "pause_and_ask" in text and "run_without_asking" in text
+    assert "approval_rule" in method_sections()["create_schedule"]
+
+
+def test_el7011_us45_r5_5_risk_section_runs_the_risk_ack_retry(env):
+    api = FakeApi()
+    api.answer("create_schedule", (409, RISK_409), (201, SCHEDULE))
+    (code,) = python_blocks(section("Risk refusals"))
+    run(api, setup_block(), code)
+    first, second = api.bodies["create_schedule"]
+    assert "risk_ack" not in first
+    assert second["risk_ack"] == {"fingerprint": RISK_409["fingerprint"],
+                                  "confirmed_name": first["name"]}
+    assert api.calls.count("create_schedule") == 2
+
+
+def test_el7011_us45_r5_5_blocked_refusal_is_not_retried(env, capsys):
+    api = FakeApi()
+    api.answer("create_schedule", (409, {"code": "schedule_blocked", "fingerprint": "x",
+                                         "blocking": ["secret in prompt"]}))
+    (code,) = python_blocks(section("Risk refusals"))
+    run(api, setup_block(), code)
+    assert api.calls.count("create_schedule") == 1
+    assert "secret in prompt" in capsys.readouterr().out
+    assert "schedule_blocked" in section("Risk refusals")

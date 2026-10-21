@@ -275,14 +275,20 @@ class EliteAClient:
         Args:
             data: The body, sent unchanged. Keys: name, description, entity_type,
                 application_id, version_id, run_mode, prompt, variables, cron,
-                timezone, expires_at, approval_rule. The API checks them.
+                timezone, expires_at, approval_rule, enabled (false saves the
+                schedule paused; default true), risk_ack (a dict with
+                `fingerprint` of a risk 409 and `confirmed_name`, the schedule
+                name, to confirm the risk). The API checks them.
 
         Returns:
             The new schedule details as a dict (the API answers 201).
 
         Raises:
             ApiDetailsRequestError: The API answers 400 or more. A 400 carries
-                the field error in `body`; `status_code` holds the status.
+                the field error in `body`; `status_code` holds the status. A 409
+                with `code` risk_confirmation_required or risk_changed holds a
+                `fingerprint`: retry with `risk_ack` set. A 409 with `code`
+                schedule_blocked cannot be confirmed: `blocking` lists the causes.
         """
         return self._schedule_call('post', self._schedules_url(), json=data)
 
@@ -291,8 +297,9 @@ class EliteAClient:
 
         Args:
             schedule_id: Id of the schedule.
-            data: The same keys as create_schedule, sent unchanged. It must not
-                hold `enabled`: use pause_schedule and resume_schedule instead.
+            data: The same keys as create_schedule, sent unchanged, including
+                `risk_ack`. It must not hold `enabled`: use pause_schedule and
+                resume_schedule instead.
 
         Returns:
             The updated schedule details as a dict.
@@ -300,7 +307,9 @@ class EliteAClient:
         Raises:
             ValueError: `data` holds `enabled`. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. A 400 carries
-                the field error in `body`; `status_code` holds the status.
+                the field error in `body`; `status_code` holds the status. A 409
+                with `code` risk_confirmation_required, risk_changed or
+                schedule_blocked is handled as in create_schedule.
         """
         if 'enabled' in data:
             raise ValueError("update_schedule does not change 'enabled'; "
@@ -348,8 +357,10 @@ class EliteAClient:
 
         Raises:
             ApiDetailsRequestError: The API answers 400 or more, for example
-                409 when the schedule has no version or the project reached its
-                cap of active schedules. The error has `status_code` and `body`.
+                409 when the schedule has no version, the project reached its
+                cap of active schedules, or the check finds a risk
+                (`risk_confirmation_required`) or a block (`schedule_blocked`).
+                The error has `status_code` and `body`.
         """
         return self._schedule_call('post', self._schedules_url(schedule_id, 'resume'))
 
@@ -391,6 +402,66 @@ class EliteAClient:
         if status is not None:
             params['status'] = status
         return self._schedule_call('get', self._schedules_url(schedule_id, 'runs'), params=params)
+
+    def check_schedule(self, data: dict) -> dict:
+        """Check a schedule payload before a save.
+
+        Args:
+            data: The same keys as create_schedule, sent unchanged.
+
+        Returns:
+            The check result as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. A 409 with
+                `code` risk_confirmation_required or schedule_blocked keeps
+                `code`, `fingerprint` and `blocking` in `body`.
+        """
+        return self._schedule_call('post', self._schedules_url('check'), json=data)
+
+    def get_schedule_run(self, schedule_id: int, run_id: int) -> dict:
+        """Read the detail of one run of a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+            run_id: Id of the run.
+
+        Returns:
+            The run details as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('get', self._schedules_url(schedule_id, 'runs', run_id))
+
+    def get_schedule_settings(self) -> dict:
+        """Read the schedule settings of the project.
+
+        Returns:
+            The settings as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('get', self._schedules_url('settings'))
+
+    def update_schedule_settings(self, data: dict) -> dict:
+        """Change the schedule settings of the project. Only a project admin may do it.
+
+        Args:
+            data: The settings to save, sent unchanged.
+
+        Returns:
+            The saved settings as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                403 when the caller is not an admin. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('put', self._schedules_url('settings'), json=data)
 
     def change_schedule_owner(self, schedule_id: int, owner_id: int) -> dict:
         """Give a schedule to another project member. Only a project admin may do it.
