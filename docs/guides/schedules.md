@@ -196,3 +196,105 @@ It has the same rights as that user has in the UI.
 - A project admin sees every schedule of the project. An admin may edit, pause, resume and delete any of them, and change the owner.
 - Only the owner may run a schedule. An admin who runs another user's schedule gets 403.
 - Each schedule has `allowed_actions`: the actions the caller may take on it.
+
+## Errors
+
+When the API answers 400 or more, the method raises `ApiDetailsRequestError`.
+The error has two fields:
+
+- `status_code`: the HTTP status.
+- `body`: the parsed JSON answer, or the text when the answer is not JSON.
+
+| Status | Meaning |
+|---|---|
+| 400 | A field is not valid. `body` names the problem, for example a bad cron or a `run_mode` rule. |
+| 403 | The caller lacks the right for this action. Examples: a user without schedule rights, or an admin who runs another user's schedule. |
+| 404 | The schedule does not exist, or it belongs to another user and the caller is not an admin. |
+| 409 | Run now: a run of this schedule is still active, and `body["active_run_id"]` holds its id. Resume: the project has its maximum number of active schedules. |
+
+`update_schedule` with `enabled` raises `ValueError` before any request.
+
+This example handles one case: a second Run now while the first run is still active.
+Any other error goes on to the caller.
+
+```python
+client.run_schedule(schedule_id)  # starts a run
+try:
+    client.run_schedule(schedule_id)  # the first run is still active
+except ApiDetailsRequestError as error:
+    if error.status_code != 409 or "active_run_id" not in error.body:
+        raise
+    print(f"Status {error.status_code}: run {error.body['active_run_id']} is still active")
+```
+
+## End-to-end example
+
+This script needs only the three variables of [Setup](#setup) and one agent in the project.
+It does these steps:
+
+1. It takes the first agent of the project and the agent's default version.
+2. It creates a paused schedule (`enabled` false), so no cron run starts.
+3. It starts one run now. Run now works on a paused schedule.
+4. It prints the runs of the schedule.
+5. It deletes the schedule in `finally`, so nothing stays behind, even when a step fails.
+
+The agent prompt has one placeholder, `{{topic}}`, and one schedule variable, `topic`, fills it.
+Each variable name must equal a placeholder of the prompt.
+A variable that is not a placeholder, or a placeholder without a variable, gets 400.
+An agent schedule has no `run_mode`.
+
+When a variable is missing or the project has no agent, the script stops and creates nothing.
+
+```python
+import os
+import sys
+
+from elitea_sdk.runtime.clients.client import ApiDetailsRequestError, EliteAClient
+
+for name in ("DEPLOYMENT_URL", "API_KEY", "PROJECT_ID"):
+    if not os.environ.get(name):
+        sys.exit(f"Set the {name} environment variable")
+
+client = EliteAClient(
+    base_url=os.environ["DEPLOYMENT_URL"],
+    project_id=int(os.environ["PROJECT_ID"]),
+    auth_token=os.environ["API_KEY"],
+)
+
+# The first agent and its default version; pipelines are skipped.
+agent = None
+for app in client.get_list_of_apps():
+    version = client.get_app_details(app["id"])["version_details"]
+    if version.get("agent_type") != "pipeline":
+        agent = app
+        break
+if agent is None:
+    sys.exit("No agent in this project")
+
+schedule = client.create_schedule({
+    "name": "SDK example",
+    "description": "Weekly news digest",
+    "entity_type": "agent",
+    "application_id": agent["id"],
+    "version_id": version["id"],
+    "prompt": "Summarize the news about {{topic}}",
+    "variables": [{"name": "topic", "value": "AI"}],
+    "cron": "0 9 * * 1",
+    "timezone": "UTC",
+    "enabled": False,
+})
+print(f"Created schedule {schedule['id']} for agent {agent['name']}")
+
+try:
+    answer = client.run_schedule(schedule["id"])
+    print(f"Started run {answer['run_id']}")
+    for run in client.list_schedule_runs(schedule["id"])["rows"]:
+        print(run["id"], run["trigger"], run["status"], run["started_at"])
+finally:
+    try:
+        client.delete_schedule(schedule["id"])
+        print(f"Deleted schedule {schedule['id']}")
+    except ApiDetailsRequestError as error:
+        # Keep the first error visible; tell the reader what is left behind.
+        print(f"Could not delete schedule {schedule['id']} (status {error.status_code}). Delete it in the UI.")
+```
