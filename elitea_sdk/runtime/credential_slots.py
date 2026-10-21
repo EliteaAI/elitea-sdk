@@ -27,6 +27,10 @@ and otherwise one slot at a time, as
 ``resolver(toolkit_instance_id=<str>, field=<settings key>, slot=<slot dict>)``.
 Either way each reply must be a `CredentialEnvelope` (or the call raises `GovernedCredentialError`
 with the release refusal code), and every envelope is validated against its own slot here.
+
+Batching releases (and so audits) every slot of the toolkit before any envelope is validated.
+One bad envelope still fails the whole build with a typed error, and nothing is used partially:
+the new settings are only returned once every slot has been validated and written.
 """
 
 from __future__ import annotations
@@ -191,13 +195,32 @@ class SlotScan(NamedTuple):
 
 _NO_SLOTS = SlotScan(False, (), False)
 _F = TypeVar("_F", bound=Callable[..., Any])
-# Scan results memoized for the duration of one `get_tools` (see `memoize_slot_scans`). The entry
-# keeps the scanned dict alive so an `id` cannot be reused by another dict while it is cached.
-_SCAN_MEMO: ContextVar[Optional[Dict[int, Tuple[Any, SlotScan]]]] = ContextVar("c1009_slot_scan_memo", default=None)
+
+
+class _ScanScope:
+    """Scan results memoized for the duration of one `get_tools` (see `memoize_slot_scans`).
+
+    Each entry keeps the scanned dict alive so an `id` cannot be reused by another dict while it
+    is cached. `active` is cleared when the call ends, so a task that copied the context and
+    outlives the call (an executor running `copy_context().run`) never reads a stale scan.
+    """
+
+    __slots__ = ("active", "scans")
+
+    def __init__(self) -> None:
+        self.active = True
+        self.scans: Dict[int, Tuple[Any, SlotScan]] = {}
+
+
+_SCAN_SCOPE: ContextVar[Optional[_ScanScope]] = ContextVar("c1009_slot_scan_scope", default=None)
 
 
 def _scan_settings(settings: Dict[str, Any]) -> SlotScan:
-    """The ONE traversal: find the slotted top-level keys and whether any other slot exists."""
+    """The ONE traversal: find the slotted top-level keys and whether any other slot exists.
+
+    Depth: with the root at level 0, a slot is found down to level 7 on both paths (a non-slotted
+    top-level value is scanned at depth 6, the children of a slotted config at depth 5).
+    """
     slotted: List[str] = []
     nested = SLOT_KEY in settings
     for key, value in settings.items():
@@ -216,33 +239,38 @@ def scan_slots(settings: Any) -> SlotScan:
     """Scan `settings` for credential slots, once per dict inside a `memoize_slot_scans` scope."""
     if not isinstance(settings, dict):
         return _NO_SLOTS
-    memo = _SCAN_MEMO.get()
-    if memo is None:
+    scope = _SCAN_SCOPE.get()
+    if scope is None or not scope.active:
         return _scan_settings(settings)
-    hit = memo.get(id(settings))
+    hit = scope.scans.get(id(settings))
     if hit is not None and hit[0] is settings:
         return hit[1]
     scan = _scan_settings(settings)
-    memo[id(settings)] = (settings, scan)
+    scope.scans[id(settings)] = (settings, scan)
     return scan
 
 
 def memoize_slot_scans(fn: _F) -> _F:
     """Decorator: inside `fn`, every settings dict is deep-scanned for slots at most once.
 
-    Nested decorated calls share the outermost scope. Assumes no slot is added to a settings dict
-    while the call runs (the governed payload is sealed before the build starts).
+    Nested decorated calls share the outermost scope. The scope is closed when the outermost call
+    ends (also on an exception); a context copied inside it no longer serves cached scans.
+    Assumes no slot is added to a settings dict while the call runs (the governed payload is
+    sealed before the build starts).
     """
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        if _SCAN_MEMO.get() is not None:
+        outer = _SCAN_SCOPE.get()
+        if outer is not None and outer.active:
             return fn(*args, **kwargs)
-        token = _SCAN_MEMO.set({})
+        scope = _ScanScope()
+        token = _SCAN_SCOPE.set(scope)
         try:
             return fn(*args, **kwargs)
         finally:
-            _SCAN_MEMO.reset(token)
+            scope.active = False
+            _SCAN_SCOPE.reset(token)
 
     return wrapper  # type: ignore[return-value]
 
@@ -326,7 +354,8 @@ def apply_credential_slots(
     slot-bearing configuration dict with a copy, minus the slot, plus the released paths as
     plain ``str``. `released_values` exists only to `scrub` error texts: never log, store or
     return it. `scan` is the caller's `scan_slots` result for this same settings structure (or
-    its shallow copy); without it the settings are scanned here.
+    its shallow copy); its top-level shape is re-checked here and a mismatch is ``STALE_CONTEXT``.
+    Without it the settings are scanned here.
 
     All slots are collected and validated first, then released with one resolver call
     (`resolve_many`, or one call per slot for a resolver that lacks it).
@@ -339,6 +368,11 @@ def apply_credential_slots(
     result = dict(settings)
     if scan is None:
         scan = scan_slots(settings)
+    else:
+        # A caller's scan is a hint, never trusted: its top-level shape must match these settings.
+        top = tuple(k for k, v in settings.items() if isinstance(v, dict) and SLOT_KEY in v)
+        if top != scan.slotted or (not scan.found and (top or SLOT_KEY in settings)):
+            raise GovernedCredentialError("STALE_CONTEXT")
     if not scan.found:
         return result, frozenset()
     # Slots below the top level cannot be resolved here; never leave one behind unresolved.

@@ -6,6 +6,7 @@ copy only. A slot that cannot be resolved stops the run with a typed error; it i
 dropped, because e.g. the GitHub toolkit treats a missing token as anonymous access.
 """
 
+import contextvars
 import copy
 import json
 import pickle
@@ -442,6 +443,7 @@ def test_get_tools_is_inert_without_slots(recorder):
     assert resolver.calls == []
     built = recorder[0]["settings"]
     assert built == {**plain, "elitea": elitea, "llm": llm, "store": None}
+    assert {k: v for k, v in built.items() if k not in ("elitea", "llm", "store")} == before[0]["settings"]
     assert built["github_configuration"] is plain["github_configuration"]   # not even copied
     # Without a client attribute at all, the slotless path is identical.
     recorder.clear()
@@ -742,3 +744,93 @@ def test_governed_runtime_build_walks_once_and_releases_once(recorder, walks, mo
     assert len(walks) == 1
     assert len(resolver.many_calls) == 1 and resolver.single_calls == []
     assert "tokens" not in recorder[0]["settings"]
+
+
+# --- review fixes: untrusted caller scan, bounded memo scope, depth boundary ----------------------
+
+
+def test_a_caller_supplied_scan_is_checked_against_the_settings():
+    settings = three_slot_settings()
+    good = cs.scan_slots(settings)
+    apply_credential_slots(settings, "tk", BatchResolver(), scan=good)              # the real scan is accepted
+
+    stale = [
+        cs.SlotScan(False, (), False),                                              # claims slotless
+        cs.SlotScan(True, good.slotted[:2], False),                                 # misses a slotted key
+        cs.SlotScan(True, good.slotted + ("selected_tools",), False),               # names a key with no slot
+        cs.SlotScan(True, ("missing_configuration",) + good.slotted, False),        # names an absent key
+        cs.SlotScan(True, tuple(reversed(good.slotted)), False),
+    ]
+    for scan in stale:
+        resolver = BatchResolver()
+        with pytest.raises(GovernedCredentialError) as exc:
+            apply_credential_slots(copy.deepcopy(settings), "tk", resolver, scan=scan)
+        assert exc.value.reason_code == "STALE_CONTEXT"
+        assert resolver.many_calls == []
+    # A root-level slot with a "slotless" scan is refused too.
+    with pytest.raises(GovernedCredentialError) as exc:
+        apply_credential_slots({SLOT_KEY: slot()}, "tk", BatchResolver(), scan=cs.SlotScan(False, (), False))
+    assert exc.value.reason_code == "STALE_CONTEXT"
+
+
+def test_scope_is_reset_after_a_raise_and_nested_calls_share_the_outer_scope(walks):
+    settings = three_slot_settings()
+
+    @memoize_slot_scans
+    def inner():
+        return has_slots(settings)
+
+    @memoize_slot_scans
+    def outer():
+        return [has_slots(settings), inner(), inner()]
+
+    assert outer() == [True, True, True]
+    assert len(walks) == 1                                   # nested calls reused the outer scope
+
+    @memoize_slot_scans
+    def boom():
+        has_slots(settings)
+        raise RuntimeError("x")
+
+    walks.clear()
+    with pytest.raises(RuntimeError):
+        boom()
+    assert cs._SCAN_SCOPE.get() is None                      # reset in finally
+    has_slots(settings)
+    has_slots(settings)
+    assert len(walks) == 3                                   # 1 inside boom, then 2 uncached
+
+
+def test_a_copied_context_that_outlives_the_scope_does_not_serve_cached_scans(walks):
+    settings = three_slot_settings()
+    captured = []
+
+    @memoize_slot_scans
+    def scoped():
+        has_slots(settings)
+        captured.append(contextvars.copy_context())
+
+    scoped()
+    walks.clear()
+    captured[0].run(lambda: (has_slots(settings), has_slots(settings)))
+    assert len(walks) == 2                                   # the closed scope is ignored, nothing cached
+
+
+def _slot_at_level(level, wrapper_key):
+    node = {SLOT_KEY: slot()}
+    for _ in range(level):
+        node = {wrapper_key: node}
+    return node
+
+
+def test_scan_depth_boundary_is_level_7_on_both_paths():
+    # Root = level 0. Non-slotted top-level value is level 1; a slotted config's children are level 2.
+    for level in (2, 7):
+        plain_path = {"other": _slot_at_level(level - 1, "a")}
+        slotted_path = {"cfg": {SLOT_KEY: slot(), "sub": _slot_at_level(level - 2, "a")}}
+        assert cs.scan_slots(plain_path).nested and has_slots(plain_path), level
+        assert cs.scan_slots(slotted_path).nested, level
+    beyond_plain = {"other": _slot_at_level(7, "a")}
+    beyond_slotted = {"cfg": {SLOT_KEY: slot(), "sub": _slot_at_level(6, "a")}}
+    assert not cs.scan_slots(beyond_plain).found
+    assert not cs.scan_slots(beyond_slotted).nested and cs.scan_slots(beyond_slotted).slotted == ("cfg",)
