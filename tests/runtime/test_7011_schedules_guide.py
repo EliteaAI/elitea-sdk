@@ -313,8 +313,9 @@ def test_el7011_us45_r2_5_missing_variable_stops_before_any_call(env):
     assert api.calls == []
 
 
-def test_el7011_us45_r2_5_no_agent_stops_before_create(env):
-    api = FakeApi(apps=(PIPELINE,))
+@pytest.mark.parametrize("apps", [(), (PIPELINE,)], ids=["empty", "pipeline_only"])
+def test_el7011_us45_r2_5_no_agent_stops_before_create(env, apps):
+    api = FakeApi(apps=apps)
     with pytest.raises(SystemExit) as stop:
         run(api, end_to_end_block())
     assert stop.value.code == "No agent in this project"
@@ -379,6 +380,15 @@ def test_el7011_us45_r3_1_other_errors_reach_the_caller(env, capsys):
         run(api, setup_block(), errors_block())
     assert error.value.status_code == 404
     assert "active_run_id" not in capsys.readouterr().out
+
+
+def test_el7011_us45_r3_1_a_409_without_active_run_reaches_the_caller(env, capsys):
+    api = FakeApi()
+    api.answer("run_schedule", (202, {"run_id": 54}), (409, {"error": "version_deleted"}))
+    with pytest.raises(ApiDetailsRequestError) as error:
+        run(api, setup_block(), errors_block())
+    assert error.value.body == {"error": "version_deleted"}
+    assert "still active" not in capsys.readouterr().out
 
 
 def test_el7011_us45_r3_2_errors_text_explains_403_and_404():
