@@ -377,7 +377,7 @@ def test_el7011_us45_r2_4_failed_delete_keeps_the_first_error(env, capsys):
 def test_el7011_us45_r3_1_second_run_now_prints_409_and_active_run_id(env, capsys):
     api = FakeApi()
     api.answer("run_schedule", (202, {"run_id": 54}),
-               (409, {"error": "A run of this schedule is active", "active_run_id": 54}))
+               (409, {"code": "run_active", "error": "A run of this schedule is active", "active_run_id": 54}))
     run(api, setup_block(), errors_block())
     assert api.calls.count("run_schedule") == 2
     out = capsys.readouterr().out
@@ -386,7 +386,7 @@ def test_el7011_us45_r3_1_second_run_now_prints_409_and_active_run_id(env, capsy
 
 def test_el7011_us45_r3_1_other_errors_reach_the_caller(env, capsys):
     api = FakeApi()
-    api.answer("run_schedule", (404, {"error": "not found"}))
+    api.answer("run_schedule", (404, {"code": "not_found", "error": "Schedule not found"}))
     with pytest.raises(ApiDetailsRequestError) as error:
         run(api, setup_block(), errors_block())
     assert error.value.status_code == 404
@@ -395,10 +395,11 @@ def test_el7011_us45_r3_1_other_errors_reach_the_caller(env, capsys):
 
 def test_el7011_us45_r3_1_a_409_without_active_run_reaches_the_caller(env, capsys):
     api = FakeApi()
-    api.answer("run_schedule", (202, {"run_id": 54}), (409, {"error": "version_deleted"}))
+    deleted = {"code": "version_deleted", "error": "The version of this schedule is deleted"}
+    api.answer("run_schedule", (202, {"run_id": 54}), (409, deleted))
     with pytest.raises(ApiDetailsRequestError) as error:
         run(api, setup_block(), errors_block())
-    assert error.value.body == {"error": "version_deleted"}
+    assert error.value.body == deleted
     assert "still active" not in capsys.readouterr().out
 
 
@@ -406,6 +407,24 @@ def test_el7011_us45_r3_2_errors_text_explains_403_and_404():
     text = section("Errors")
     assert "403" in text and "right" in text
     assert "404" in text and "another user" in text
+
+
+def test_el7011_us45_r3_2_errors_text_names_the_shared_refusal_body():
+    """BUG-29: every refusal body carries code and error, plus field when one input is wrong."""
+    text = section("Errors")
+    for key in ('`code`', '`error`', '`field`'):
+        assert key in text
+    for code in ('invalid_input', 'not_owner', 'not_found', 'run_active'):
+        assert f'`{code}`' in text
+
+
+def test_el7011_us45_r3_1_errors_example_checks_the_run_active_code():
+    (code,) = python_blocks(section("Errors"))
+    assert 'error.body.get("code") != "run_active"' in code
+
+
+def test_el7011_us45_r5_3_risk_text_says_every_refusal_has_a_code():
+    assert "Every refusal has a `code`" in section("Risk refusals")
 
 
 # AC6 — CR-14: risk_ack, blocked, approval_rule, install (TC-US44-26 to TC-US44-30)

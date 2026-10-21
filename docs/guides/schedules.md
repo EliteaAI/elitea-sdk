@@ -259,12 +259,18 @@ The error has two fields:
 - `status_code`: the HTTP status.
 - `body`: the parsed JSON answer, or the text when the answer is not JSON.
 
+Every refusal of the Schedules API has the same `body`:
+
+- `code`: a stable machine value. Branch on it.
+- `error`: a text for people. It can change, so do not compare it.
+- `field`: the input that is wrong, only when one input is wrong.
+
 | Status | Meaning |
 |---|---|
-| 400 | A field is not valid. `body` names the problem, for example a bad cron or a `run_mode` rule. |
-| 403 | The caller lacks the right for this action. Examples: a user without schedule rights, or an admin who runs another user's schedule. |
-| 404 | The schedule does not exist, or it belongs to another user and the caller is not an admin. |
-| 409 | Run now: a run of this schedule is still active, and `body["active_run_id"]` holds its id. Resume: the project has its maximum number of active schedules. |
+| 400 | A field is not valid: `code` is `invalid_input` and `field` names the field, for example a bad `cron` or a `run_mode` rule. |
+| 403 | The caller lacks the right for this action, for example a user without schedule rights. An admin who runs another user's schedule gets `code` `not_owner`. |
+| 404 | The schedule does not exist, or it belongs to another user and the caller is not an admin: `code` is `not_found` (`run_not_found` for a run). |
+| 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` holds its id. Resume: the project has its maximum number of active schedules. |
 
 `update_schedule` with `enabled` raises `ValueError` before any request.
 
@@ -276,14 +282,14 @@ client.run_schedule(schedule_id)  # starts a run
 try:
     client.run_schedule(schedule_id)  # the first run is still active
 except ApiDetailsRequestError as error:
-    if error.status_code != 409 or "active_run_id" not in error.body:
+    if error.status_code != 409 or error.body.get("code") != "run_active":
         raise
     print(f"Status {error.status_code}: run {error.body['active_run_id']} is still active")
 ```
 
 ## Risk refusals
 
-A save (`create_schedule` or `update_schedule`) can answer 409 with a `code` in `body`:
+Every refusal has a `code` (see Errors). A save (`create_schedule` or `update_schedule`) can also answer 409 with one of these risk codes:
 
 | `code` | Meaning | What to do |
 |---|---|---|
