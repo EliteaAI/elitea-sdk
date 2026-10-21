@@ -160,6 +160,27 @@ ReadFromSharingLink = create_model(
                     "Omit to read to the end.")),
 )
 
+ReadFromUrl = create_model(
+    "ReadFromUrl",
+    url=(str, Field(
+        description="Full URL of a single SharePoint or OneDrive file, as copied from the "
+                    "browser address bar or shared with you. Accepts direct file URLs "
+                    "(company.sharepoint.com/sites/Site/Shared Documents/report.pdf), "
+                    "library viewer URLs (.../Forms/AllItems.aspx?id=...), Office for the web "
+                    "URLs (.../_layouts/15/Doc.aspx?sourcedoc={...}) and sharing links "
+                    "(company.sharepoint.com/:x:/s/...).")),
+    is_capture_image=(Optional[bool], Field(
+        description="Determines is pictures in the document should be recognized.",
+        default=False)
+    ),
+    start_line=(Optional[int], Field(default=None, ge=1,
+        description="Starting line number (1-indexed, inclusive) for a partial read. "
+                    "Omit to read from the beginning.")),
+    end_line=(Optional[int], Field(default=None, ge=1,
+        description="Ending line number (1-indexed, inclusive) for a partial read. "
+                    "Omit to read to the end.")),
+)
+
 UploadFile = create_model(
     "UploadFile",
     folder_path=(str, Field(
@@ -740,6 +761,29 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.read_file_from_sharing_link(
             sharing_url=sharing_url,
+            is_capture_image=is_capture_image,
+            start_line=start_line,
+            end_line=end_line,
+        )
+
+    @tool_group('read')
+    def read_file_from_url(self, url: str, is_capture_image: bool = False,
+                           start_line: Optional[int] = None,
+                           end_line: Optional[int] = None):
+        """Read a SharePoint/OneDrive file directly from its URL.
+
+        Use this whenever the user gives a link to a file: a URL copied from the
+        browser address bar (direct file URL, AllItems.aspx?id=...,
+        Doc.aspx?sourcedoc=..., onedrive.aspx?id=...) or a sharing link
+        (/:x:/s/...). The file is opened straight from the URL, so do not call
+        get_files_list to find it first.
+
+        Returns the parsed file content, or a content_too_large response with the
+        total line count and a start_line/end_line range to retry with.
+        """
+        self._sync_backend_context()
+        return self._backend.read_file_from_url(
+            url=url,
             is_capture_image=is_capture_image,
             start_line=start_line,
             end_line=end_line,
@@ -1504,6 +1548,12 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 "description": self.read_file_from_sharing_link.__doc__,
                 "args_schema": ReadFromSharingLink,
                 "ref": self.read_file_from_sharing_link,
+            },
+            {
+                "name": "read_file_from_url",
+                "description": self.read_file_from_url.__doc__,
+                "args_schema": ReadFromUrl,
+                "ref": self.read_file_from_url,
             },
             # NOTE: add_attachment_to_list_item is intentionally excluded from available tools.
             # Microsoft Graph API has no endpoint for SharePoint list item attachments (v1.0 or beta),

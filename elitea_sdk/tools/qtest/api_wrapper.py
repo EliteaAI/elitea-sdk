@@ -3330,6 +3330,7 @@ Examples:
                 
             except Exception as e:
                 logger.error(f"Failed to extend document {document.metadata.get('id')}: {e}")
+                self._track_document_left_empty_by_error(document)
             
             yield document
 

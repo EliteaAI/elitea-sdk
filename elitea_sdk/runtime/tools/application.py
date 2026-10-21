@@ -146,6 +146,35 @@ def extract_application_response_output(response: Any) -> str:
     return ''
 
 
+def _raise_if_llm_node_error(response: Any) -> None:
+    """Raise RuntimeError if the final message of the current run is a tagged LLM error.
+
+    LLMNode.invoke() catches provider exceptions (e.g. AuthenticationError 401) and converts
+    them to AIMessage(content="Error: ...") tagged with response_metadata['llm_node_error']=True
+    so that Application._run() can detect and re-raise them.
+
+    The scan stops at the first HumanMessage encountered while walking backwards — that message
+    is the input boundary of the current run. This prevents two false-raise scenarios:
+    - A tagged error from a prior turn that the agent already recovered from (the child's
+      checkpoint history grows across calls when thread_id is fixed).
+    - A child pipeline whose current run produced no AI/Tool message (result is in `output` or
+      state); walking past the current run's HumanMessage into the previous run's tagged error
+      would raise incorrectly.
+    """
+    if not isinstance(response, dict):
+        return
+    for _msg in reversed(response.get('messages', [])):
+        if isinstance(_msg, HumanMessage):
+            return  # reached this run's input boundary; nothing from this run is a tagged error
+        if isinstance(_msg, BaseMessage):
+            if getattr(_msg, 'response_metadata', {}).get('llm_node_error'):
+                _exc_type = _msg.response_metadata.get('llm_node_exception_type', 'LLMError')
+                raise RuntimeError(
+                    f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
+                )
+            return  # final non-Human message is clean; no error
+
+
 class Application(BaseTool):
     name: str
     description: str
@@ -824,6 +853,10 @@ class Application(BaseTool):
                 _resume_payload,
                 config=nested_config,
             )
+
+        # Detect swallowed LLM errors and re-raise so BaseTool.run() fires
+        # on_tool_error and the UI Application chip shows an error state (#7041).
+        _raise_if_llm_node_error(response)
 
         normalized_output = extract_application_response_output(response)
 

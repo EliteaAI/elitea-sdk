@@ -40,6 +40,7 @@ from ..utils import (
 )
 from ...base_indexer_toolkit import IndexTools
 from ...code_indexer_toolkit import CodeIndexerToolkit
+from ...utils import normalize_base_url
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
 from ...utils.text_operations import apply_line_slice
@@ -542,7 +543,9 @@ class ReposApiWrapper(CodeIndexerToolkit):
         from langchain_core.utils import get_from_dict_or_env
 
         # Get ADO configuration values
-        organization_url = get_from_dict_or_env(values, ["organization_url"], "ADO_ORGANIZATION_URL", default=None)
+        organization_url = normalize_base_url(
+            get_from_dict_or_env(values, ["organization_url"], "ADO_ORGANIZATION_URL", default=None)
+        )
         project = get_from_dict_or_env(values, ["project"], "ADO_PROJECT", default=None)
         token = get_from_dict_or_env(values, ["token"], "ADO_TOKEN", default=None)
 

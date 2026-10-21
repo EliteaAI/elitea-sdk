@@ -8,6 +8,7 @@ from langchain_core.tools import ToolException
 from pydantic import create_model, Field, PrivateAttr, model_validator, SecretStr
 
 from ...elitea_base import BaseToolApiWrapper
+from ...utils import normalize_base_url
 from ...utils.tool_groups import tool_group, with_tool_groups
 
 
@@ -20,13 +21,14 @@ class SonarApiWrapper(BaseToolApiWrapper):
     @model_validator(mode='before')
     @classmethod
     def validate_toolkit(cls, values):
-        url = values.get('url')
+        url = normalize_base_url(values.get('url'))
         sonar_token = values.get('sonar_token')
         sonar_project_name = values.get('sonar_project_name')
         if not url or not sonar_token or not sonar_project_name:
             raise ValueError("SonarQube credentials are not provided properly.")
         cls._client = requests.Session()
         cls._client.auth = (sonar_token, '')
+        values['url'] = url
         return values
 
     @tool_group('read')
@@ -40,7 +42,7 @@ class SonarApiWrapper(BaseToolApiWrapper):
         payload_params = self.parse_payload_params(params)
         payload_params['componentKeys'] = self.sonar_project_name
         response = self._client.get(
-            url=f"{self.url}/{relative_url}",
+            url=f"{self.url}/{relative_url.lstrip('/')}",
             params=payload_params
         )
         response.raise_for_status()

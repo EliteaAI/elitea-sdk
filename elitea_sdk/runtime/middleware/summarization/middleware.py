@@ -136,6 +136,10 @@ TOOL_RESULT_SUMMARY_INPUT_CHARS = 128_000
 SUMMARIZED_SENTINEL = '[tool result summarized: context floor]'
 
 
+# Keeps summary calls out of the run's callback rollup; their usage is reported in auxiliary_usage (#6898)
+_NO_RUN_CALLBACKS = {'callbacks': []}
+
+
 class SummarizationMiddleware(LangChainSummarizationMiddleware):
     """
     Extends LangChain's SummarizationMiddleware with EliteA-specific features.
@@ -182,6 +186,8 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         self.conversation_id = conversation_id
         self.callbacks = callbacks or {}
         self.last_context_info = None
+        # Summarization calls run without the run's callbacks, so this is the only report of their usage
+        self._auxiliary_usage: List[Dict[str, Any]] = []
         self._last_fitting_count = 0
         self.summarization_enabled = summarization_enabled
 
@@ -208,6 +214,32 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             f"SummarizationMiddleware initialized "
             f"(trigger={self.trigger}, keep={self.keep}, summarization_enabled={self.summarization_enabled})"
         )
+
+    @property
+    def last_context_info(self) -> Optional[Dict[str, Any]]:
+        info = self._last_context_info
+        if info is not None and self._auxiliary_usage:
+            return {**info, 'auxiliary_usage': list(self._auxiliary_usage)}
+        return info
+
+    @last_context_info.setter
+    def last_context_info(self, value: Optional[Dict[str, Any]]) -> None:
+        self._last_context_info = value
+
+    def _record_usage(self, response: Any) -> None:
+        usage = getattr(response, 'usage_metadata', None) or {}
+        if not usage:
+            return
+        details = usage.get('input_token_details') or {}
+        metadata = getattr(response, 'response_metadata', None) or {}
+        self._auxiliary_usage.append({
+            'model_name': metadata.get('model_name') or getattr(self.model, 'model_name', None)
+            or getattr(self.model, 'model', None),
+            'input_tokens': usage.get('input_tokens', 0),
+            'output_tokens': usage.get('output_tokens', 0),
+            'cache_read_tokens': details.get('cache_read', 0),
+            'cache_creation_tokens': details.get('cache_creation', 0),
+        })
 
     def get_tools(self) -> List[BaseTool]:
         """No tools - operates on state directly."""
@@ -317,7 +349,9 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             name=getattr(message, 'name', None) or 'unknown', args=args, content=content,
         )
         try:
-            return self.model.invoke([HumanMessage(content=prompt)]).text.strip()
+            response = self.model.invoke([HumanMessage(content=prompt)], config=_NO_RUN_CALLBACKS)
+            self._record_usage(response)
+            return response.text.strip()
         except Exception as e:
             logger.warning(f"Mid-loop tool result summary failed, leaving it to the floor: {e}")
             return None
@@ -689,7 +723,8 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
                 prompt_content = f"{self.summary_prompt}\n\n<messages>\n{formatted_messages}\n</messages>"
 
             # Wrap in HumanMessage for model compatibility
-            response = self.model.invoke([HumanMessage(content=prompt_content)])
+            response = self.model.invoke([HumanMessage(content=prompt_content)], config=_NO_RUN_CALLBACKS)
+            self._record_usage(response)
 
             # Handle both .text and .content
             if hasattr(response, 'content'):

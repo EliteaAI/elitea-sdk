@@ -57,6 +57,7 @@ from elitea_sdk.tools import _inject_toolkit_id, _inject_display_metadata, _patc
 INTERNAL_TOOL_DISPLAY_NAMES: dict = {
     'attachments':     'Attachments',           # artifact bucket; no chip event
     'image_generation': 'Image creation',       # provider toolkit; no chip event
+    'web_search':      'Web Search',            # injected tavily toolkit copy; no chip event
     'data_analysis':   'Data Analysis',         # DataAnalysisToolkit — chip injected
     'planner':         'Planner',               # deprecated no-op; no chip event
     'pyodide':         'Python sandbox',        # SandboxToolkit — chip injected

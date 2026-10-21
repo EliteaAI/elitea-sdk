@@ -71,9 +71,14 @@ class _AttachmentSelection(NamedTuple):
     truncated: bool
 
 
+_EMPTY_SPACE_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "n/a"})
+
 createPage = create_model(
     "createPage",
-    space=(Optional[str], Field(description="Confluence space that is used for page's creation", default=None)),
+    space=(Optional[str], Field(
+        description="Key of the Confluence space to create the page in. Leave empty to use the toolkit's space; "
+                    "required only when the toolkit has no space configured.",
+        default=None)),
     title=(str, Field(description="Title of the page")),
     body=(str, Field(description="Body of the page")),
     status=(Optional[str],
@@ -88,7 +93,10 @@ createPage = create_model(
 
 createPages = create_model(
     "createPages",
-    space=(Optional[str], Field(description="Confluence space that is used for pages creation", default=None)),
+    space=(Optional[str], Field(
+        description="Key of the Confluence space to create the pages in. Leave empty to use the toolkit's space; "
+                    "required only when the toolkit has no space configured.",
+        default=None)),
     pages_info=(str, Field(
         description="""JSON string containing information about page name and its content per syntax: [{"page1_name": "page1_content"}, {"page2_name": "page2_content"}]""")),
     parent_id=(Optional[str], Field(description="Page parent id (optional)", default=None)),
@@ -101,6 +109,10 @@ deletePage = create_model(
     "deletePage",
     page_id=(Optional[str], Field(description="Page id", default=None)),
     page_title=(Optional[str], Field(description="Page title", default=None)),
+    space=(Optional[str], Field(
+        description="Key of the Confluence space to look the page title up in. Leave empty to use the toolkit's "
+                    "space; required for title-based deletion only when the toolkit has no space configured.",
+        default=None)),
 )
 
 updatePageById = create_model(
@@ -123,6 +135,10 @@ updatePageByTitle = create_model(
     new_title=(Optional[str], Field(description="New page title", default=None)),
     new_body=(Optional[str], Field(description="New page content", default=None)),
     new_labels=(Optional[list], Field(description="Page labels", default=None)),
+    space=(Optional[str], Field(
+        description="Key of the Confluence space to look the page title up in. Leave empty to use the toolkit's "
+                    "space; required only when the toolkit has no space configured.",
+        default=None)),
 )
 
 updatePages = create_model(
@@ -149,28 +165,43 @@ getPageIdByTitleInput = create_model(
     "getPageIdByTitleInput",
     title=(str, Field(description="Page title")),
     type=(Optional[str], Field(description="Jira type of content: Page or Blogpost. Defaults to page", default="page")),
+    space=(Optional[str], Field(
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
+        default=None)),
 
 )
 
 pageExists = create_model(
     "pageExists",
     title=(str, Field(description="Title of the page")),
+    space=(Optional[str], Field(
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
+        default=None)),
 )
 
 getPagesWithLabel = create_model(
     "getPagesWithLabel",
     label=(str, Field(description="Label of the pages")),
+    space=(Optional[str], Field(
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
+        default=None)),
 )
 
 searchPages = create_model(
     "searchPages",
     query=(str, Field(description="Query text to search pages", min_length=1)),
-    skip_images=(Optional[bool], Field(description="Whether we need to skip existing images or not", default=False))
+    skip_images=(Optional[bool], Field(description="Whether we need to skip existing images or not", default=False)),
+    space=(Optional[str], Field(
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
+        default=None)),
 )
 
 siteSearch = create_model(
     "siteSearch",
     query=(str, Field(description="Query text to execute site search in Confluence")),
+    space=(Optional[str], Field(
+        description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
+        default=None)),
 )
 
 pageId = create_model(
@@ -351,27 +382,73 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             client_instance._update_header(header, value)
 
         values['client'] = client_instance
+        values['space'] = cls._normalize_space(values.get('space'))
         return super().validate_toolkit(values)
 
-    def __unquote_confluence_space(self) -> str | None:
-        if self.space:
-            # Remove single quotes or backticks if present
-            if (self.space.startswith("'") and self.space.endswith("'")) or (
-                    self.space.startswith("`") and self.space.endswith("`")):
-                return self.space[1:-1]
-            else:
-                return self.space
-        else:
+    @staticmethod
+    def _normalize_space(space: Optional[str]) -> Optional[str]:
+        """Treat None, empty, whitespace-only and placeholder space keys alike as "no space" and strip wrapping quotes."""
+        if space is None:
             return None
+        space = str(space).strip()
+        if len(space) >= 2 and space[0] == space[-1] and space[0] in "'`\"":
+            space = space[1:-1].strip()
+        # LLM-filled arguments often spell "no value" as a string
+        if space.casefold() in _EMPTY_SPACE_PLACEHOLDERS:
+            return None
+        return space or None
 
-    def __sanitize_confluence_space(self) -> str:
-        """Ensure the space parameter is enclosed in double quotes."""
-        unquoted_space = self.__unquote_confluence_space()
-        if unquoted_space:
-            # Add double quotes if not already present
-            if not (unquoted_space.startswith('"') and unquoted_space.endswith('"')):
-                unquoted_space = f'"{unquoted_space}"'
-        return unquoted_space
+    @staticmethod
+    def _same_space(first: Optional[str], second: Optional[str]) -> bool:
+        return bool(first) and bool(second) and first.casefold() == second.casefold()
+
+    def _resolve_space(self, space: Optional[str] = None, required: bool = False) -> Optional[str]:
+        """Return the space an operation is scoped to.
+
+        A toolkit-level space always wins; a runtime space may only repeat it. Without a toolkit space
+        the runtime space is used as-is, and None means "all spaces the credentials can access".
+        """
+        requested = self._normalize_space(space)
+        if self.space:
+            if requested and not self._same_space(requested, self.space):
+                raise ToolException(
+                    f"This toolkit is restricted to Confluence space '{self.space}'; "
+                    f"space '{requested}' is outside its scope."
+                )
+            return self.space
+        if required and not requested:
+            raise ToolException(
+                "A Confluence space key is required for this operation because the toolkit has no space "
+                "configured. Provide the 'space' parameter."
+            )
+        return requested
+
+    def _space_scope_error(self, page_id: str, page_space: Optional[str]) -> ToolException:
+        found = f"space '{page_space}'" if page_space else "an unknown space"
+        return ToolException(
+            f"Page '{page_id}' belongs to {found}, but this toolkit is restricted to "
+            f"Confluence space '{self.space}'."
+        )
+
+    def _check_page_space(self, page_id: str, page: Optional[dict]) -> None:
+        """Reject a fetched page (expanded with 'space') that lies outside the toolkit space."""
+        if not self.space:
+            return
+        page_space = ((page or {}).get('space') or {}).get('key')
+        if not self._same_space(page_space, self.space):
+            raise self._space_scope_error(page_id, page_space)
+
+    def _assert_page_in_space(self, page_id: str) -> None:
+        """Page-id based tools must not reach pages outside the toolkit space."""
+        if not self.space or not page_id:
+            return
+        self._check_page_space(page_id, self.client.get_page_by_id(page_id, expand='space'))
+
+    def _space_cql(self, space: Optional[str]) -> str:
+        """CQL type/space clause for search tools."""
+        if not space:
+            return 'type=page'
+        return f'type=page and space="{self._escape_cql_query(space)}"'
 
     @tool_group('write')
     def create_page(self, title: str, body: str, status: str = 'current', space: str = None, parent_id: str = None,
@@ -379,11 +456,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         """ Creates a page in the Confluence space. Represents content in html (storage) or wiki (wiki) formats
             Page could be either published status='current' or make a draft with status='draft'
         """
-        if self.client.get_page_by_title(space=self.space, title=title) is not None:
+        # normal user flow: put pages in the Space Home, not in the root of the Space
+        user_space = self._resolve_space(space, required=True)
+        if self.client.get_page_by_title(space=user_space, title=title) is not None:
             return f"Page with title {title} already exists, please use other title."
 
-        # normal user flow: put pages in the Space Home, not in the root of the Space
-        user_space = space if space else self.space
         logger.info(f"Page will be created within the space {user_space}")
 
         # Handle parent_id properly - only fetch homepage if parent_id is not provided
@@ -441,7 +518,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     def create_pages(self, pages_info: str, status: str = 'current', space: str = None, parent_id: str = None):
         """ Creates a batch of pages in the Confluence space."""
         created_pages = []
-        user_space = space if space else self.space
+        user_space = self._resolve_space(space, required=True)
         logger.info(f"Pages will be created within the space {user_space}")
 
         # duplicate action to avoid extra api calls in downstream function
@@ -570,12 +647,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         }
 
     @tool_group('delete')
-    def delete_page(self, page_id: str = None, page_title: str = None):
+    def delete_page(self, page_id: str = None, page_title: str = None, space: str = None):
         """ Deletes a page by its defined page_id or page_title """
         if not page_id and not page_title:
             raise ValueError("Either page_id or page_title is required to delete the page")
-        resolved_page_id = page_id if page_id else (
-                self.client.get_page_by_title(space=self.space, title=page_title) or {}).get('id')
+        if page_id:
+            self._assert_page_in_space(page_id)
+            resolved_page_id = page_id
+        else:
+            resolved_page_id = (self.client.get_page_by_title(
+                space=self._resolve_space(space, required=True), title=page_title) or {}).get('id')
         if resolved_page_id:
             self.client.remove_page(resolved_page_id)
             message = f"Page with ID '{resolved_page_id}' has been successfully deleted."
@@ -587,11 +668,13 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     def update_page_by_id(self, page_id: str, representation: str = 'storage', new_title: str = None,
                           new_body: str = None, new_labels: list = None):
         """ Updates an existing Confluence page (using id or title) by replacing its content, title, labels """
-        current_page = self.client.get_page_by_id(page_id, expand='version,body.view')
+        current_page = self.client.get_page_by_id(page_id, expand='version,body.view,space')
         if not current_page:
             return f"Page with ID {page_id} not found."
+        self._check_page_space(page_id, current_page)
 
-        if new_title and current_page['title'] != new_title and self.client.get_page_by_title(space=self.space,
+        page_space = (current_page.get('space') or {}).get('key') or self.space
+        if new_title and current_page['title'] != new_title and self.client.get_page_by_title(space=page_space,
                                                                                               title=new_title):
             return f"Page with title {new_title} already exists."
 
@@ -637,9 +720,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
     @tool_group('write')
     def update_page_by_title(self, page_title: str, representation: str = 'storage', new_title: str = None,
-                             new_body: str = None, new_labels: list = None):
+                             new_body: str = None, new_labels: list = None, space: str = None):
         """ Updates an existing Confluence page (using id or title) by replacing its content, title, labels """
-        current_page = self.client.get_page_by_title(space=self.space, title=page_title)
+        current_page = self.client.get_page_by_title(space=self._resolve_space(space, required=True),
+                                                     title=page_title)
         if not current_page:
             return f"Page with title {page_title} not found."
 
@@ -686,6 +770,8 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     @tool_group('read')
     def get_page_tree(self, page_id: str) -> List[dict]:
         """ Gets page tree for the Confluence space, each page with id, title and parent_id """
+        # descendants always live in the root page's space
+        self._assert_page_in_space(page_id)
         return self.get_all_descendants(page_id)
 
     def get_all_descendants(self, page_id: str):
@@ -706,22 +792,31 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
         return descendants
 
-    def page_exists(self, title: str):
+    def page_exists(self, title: str, space: str = None):
         """ Checks if a page exists in the Confluence space."""
-        status = self.client.page_exists(space=self.space, title=title)
+        status = self.client.page_exists(space=self._resolve_space(space), title=title)
         return status
 
     @tool_group('read')
-    def get_pages_with_label(self, label: str):
-        """ Gets pages with specific label in the Confluence space."""
-        return self._get_labeled_page(label)
+    def get_pages_with_label(self, label: str, space: str = None):
+        """ Gets pages with specific label in the Confluence space (or in all accessible spaces when none is set)."""
+        return self._get_labeled_page(label, self._resolve_space(space))
 
     @tool_group('read')
-    def list_pages_with_label(self, label: str):
-        """ Lists the pages with specific label in the Confluence space."""
-        return [{'id': page['page_id'], 'title': page['page_title']} for page in self._get_labeled_page(label)]
+    def list_pages_with_label(self, label: str, space: str = None):
+        """ Lists the pages with specific label in the Confluence space (or in all accessible spaces when none is set)."""
+        return [{'id': page['page_id'], 'title': page['page_title']}
+                for page in self._get_labeled_page(label, self._resolve_space(space))]
 
-    def _get_labeled_page(self, label: str):
+    def _get_pages_by_label(self, label: str, space: Optional[str], start: int) -> list:
+        if not space:
+            return self.client.get_all_pages_by_label(label, start=start, limit=self.limit)
+        # get_all_pages_by_label cannot filter by space, so query the label within the space directly
+        cql = f'type=page AND label="{self._escape_cql_query(label)}" AND space="{self._escape_cql_query(space)}"'
+        results = self.client.cql(cql, start=start, limit=self.limit).get("results", [])
+        return [result['content'] for result in results if result.get('content')]
+
+    def _get_labeled_page(self, label: str, space: Optional[str] = None):
         """Gets pages with specific label in the Confluence space.
 
         Uses pagination with deduplication to handle cases where:
@@ -743,11 +838,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         # presence of additional results instead of a fixed number
         # of iterations based purely on max_pages/limit.
         while len(pages_info) < (self.max_pages or 0) and iteration < max_iterations:
-            pages = self.client.get_all_pages_by_label(
-                label,
-                start=start,
-                limit=self.limit,
-            )  # , expand="body.view.value"
+            pages = self._get_pages_by_label(label, space, start)
             if not pages:
                 break
 
@@ -770,7 +861,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 break
 
             if new_ids:
-                for page in self.get_pages_by_id(new_ids):
+                for page in self.get_pages_by_id(new_ids, skip_out_of_space=True):
                     meta = getattr(page, "metadata", {}) or {}
                     page_id = meta.get("id")
                     page_title = meta.get("title")
@@ -817,8 +908,12 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 and not restrictions["read"]["restrictions"]["group"]["results"]
         )
 
-    def get_pages_by_id(self, page_ids: List[str], skip_images: bool = False, content_format: Optional[Any] = None):
-        """ Gets pages by id in the Confluence space."""
+    def get_pages_by_id(self, page_ids: List[str], skip_images: bool = False, content_format: Optional[Any] = None,
+                        skip_out_of_space: bool = False):
+        """ Gets pages by id in the Confluence space.
+
+        Pages outside the toolkit space raise, or are dropped when skip_out_of_space is set (search results).
+        """
         effective_format = content_format or self.content_format
         for page_id in page_ids:
             get_page = retry(
@@ -835,7 +930,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             )(self.client.get_page_by_id)
             try:
                 page = get_page(
-                    page_id=page_id, expand=f"{effective_format.value},version"
+                    page_id=page_id, expand=f"{effective_format.value},version,space"
                 )
             except (ApiError, HTTPError) as e:
                 logger.error(f"Error fetching page with ID {page_id}: {e}")
@@ -846,6 +941,13 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                 self._errors.append(page_content_temp)
                 return Document(page_content=page_content_temp,
                                 metadata={})
+            try:
+                self._check_page_space(page_id, page)
+            except ToolException:
+                if skip_out_of_space:
+                    logger.warning(f"Skipping page {page_id}: outside toolkit space '{self.space}'")
+                    continue
+                raise
             # TODO: update on toolkit advanced settings level as a separate feature
             # if not self.include_restricted_content and not self.is_public_page(page):
             #     continue
@@ -898,14 +1000,15 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         # return self._strip_base64_images(result[0].page_content) if skip_images else result[0].page_content
 
     @tool_group('read')
-    def get_page_id_by_title(self, title: str, type: str = "page"):
+    def get_page_id_by_title(self, title: str, type: str = "page", space: str = None):
         """
         Provide page id from search result by title.
         :param title: title
         :param type: type of content: page or blogpost. Defaults to page
+        :param space: optional space key; without one the first match across accessible spaces is returned
         """
 
-        result = self.client.get_page_id(space=self.space, title=title, type=type)
+        result = self.client.get_page_id(space=self._resolve_space(space), title=title, type=type)
         return result if result else "Page not found. Check the title or space."
 
     def _strip_base64_images(self, content):
@@ -931,7 +1034,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             # when all returned pages are duplicates
             if not page_ids:
                 break
-            for page in self.get_pages_by_id(page_ids, skip_images):
+            for page in self.get_pages_by_id(page_ids, skip_images, skip_out_of_space=True):
                 page_info = {
                     'content': page.page_content,
                     'page_id': page.metadata['id'],
@@ -943,27 +1046,21 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return pages_info if pages_info else f"Unable to find anything using query {cql}. Check space or query."
 
     @tool_group('read')
-    def search_pages(self, query: str, skip_images: bool = False):
+    def search_pages(self, query: str, skip_images: bool = False, space: str = None):
         """Search pages in Confluence by query text in title or page content."""
 
         if not query:
             raise ToolException("Search query text is empty. Query parameter is required for Confluence search.")
 
-        if not self.space:
-            cql = f'(type=page) and (title~"{query}" or text~"{query}")'
-        else:
-            cql = f'(type=page and space={self.__sanitize_confluence_space()}) and (title~"{query}" or text~"{query}")'
+        cql = f'({self._space_cql(self._resolve_space(space))}) and (title~"{query}" or text~"{query}")'
         return self._process_search(cql, skip_images)
 
     @tool_group('read')
-    def search_by_title(self, query: str, skip_images: bool = False):
+    def search_by_title(self, query: str, skip_images: bool = False, space: str = None):
         """Search pages in Confluence by query text in title."""
 
         query = self._escape_cql_query(query)
-        if not self.space:
-            cql = f'(type=page) and (title~"{query}")'
-        else:
-            cql = f'(type=page and space={self.__sanitize_confluence_space()}) and (title~"{query}")'
+        cql = f'({self._space_cql(self._resolve_space(space))}) and (title~"{query}")'
         return self._process_search(cql, skip_images)
 
     def _escape_cql_query(self, query: str) -> str:
@@ -979,14 +1076,11 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return query.replace('\\', '\\\\').replace('"', '\\"')
 
     @tool_group('read')
-    def site_search(self, query: str):
+    def site_search(self, query: str, space: str = None):
         """Search for pages in Confluence using site search by query text."""
         content = []
         query = self._escape_cql_query(query)
-        if not self.space:
-            cql = f'(type=page) and (siteSearch~"{query}")'
-        else:
-            cql = f'(type=page and space={self.__sanitize_confluence_space()}) and (siteSearch~"{query}")'
+        cql = f'({self._space_cql(self._resolve_space(space))}) and (siteSearch~"{query}")'
         pages = self.client.cql(cql, start=0, limit=10).get("results", [])
         if not pages:
             return f"Unable to find anything using query {query}"
@@ -1122,6 +1216,12 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     @tool_group('execute')
     def execute_generic_confluence(self, method: str, relative_url: str, params: Optional[str] = "") -> str:
         """Generic Confluence Tool for Official Atlassian Confluence REST API to call, searching, creating, updating pages, etc."""
+        if self.space:
+            raise ToolException(
+                f"execute_generic_confluence is unavailable because this toolkit is restricted to Confluence space "
+                f"'{self.space}' and raw REST calls cannot be limited to one space. Use the dedicated Confluence "
+                f"tools instead, or clear the toolkit's Space Key."
+            )
         payload_params = parse_payload_params(params)
         if method == "GET":
             response = self.client.request(
@@ -1213,9 +1313,15 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         self._index_include_attachments = kwargs.get('include_attachments', False)
         self._include_extensions = kwargs.get('include_extensions', [])
         self._skip_extensions = kwargs.get('skip_extensions', [])
+        # The index space narrows the toolkit scope and can never widen it
+        index_space = self._resolve_space(kwargs.get('space_key'))
+        if not (index_space or kwargs.get('page_ids') or kwargs.get('label') or kwargs.get('cql')):
+            raise ToolException(
+                "Specify at least one of Space Key, Page IDs, Label or CQL to index Confluence content."
+            )
         base_params = {
             'url': self.base_url,
-            'space_key': self.space,
+            'space_key': index_space,
             'min_retry_seconds': self.min_retry_seconds,
             'max_retry_seconds': self.max_retry_seconds,
             'number_of_retries': self.number_of_retries
@@ -1231,7 +1337,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         }
         confluence_loader_params['content_format'] = mapping.get(content_format, ContentFormat.VIEW)
         confluence_loader_params['url'] = self.base_url
-        confluence_loader_params['space_key'] = self.space
+        confluence_loader_params['space_key'] = index_space
         confluence_loader_params['min_retry_seconds'] = self.min_retry_seconds
         confluence_loader_params['max_retry_seconds'] = self.max_retry_seconds
         confluence_loader_params['number_of_retries'] = self.number_of_retries
@@ -1282,6 +1388,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        attachments_yielded = False
         try:
             if self._index_include_attachments:
                 page_id = document.metadata.get('id')
@@ -1352,7 +1459,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                             IndexerKeywords.CONTENT_FILE_NAME.value: title or f".{file_ext}",
                             IndexerKeywords.CONTENT_IN_BYTES.value: content
                         })
+                    attachments_yielded = True
         except Exception as e:
+            if not attachments_yielded:
+                self._track_document_left_empty_by_error(document)
             yield from ()
 
     def _download_image(self, image_url):
@@ -1640,9 +1750,10 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         """
         try:
             # Get the page content
-            page = self.client.get_page_by_id(page_id, expand="body.storage")
+            page = self.client.get_page_by_id(page_id, expand="body.storage,space")
             if not page:
                 return f"Page with ID {page_id} not found."
+            self._check_page_space(page_id, page)
 
             page_title = page['title']
             page_content = page['body']['storage']['value']
@@ -1908,6 +2019,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         limited or the listing was incomplete, the list ends with an entry whose only key is 'notice'.
         """
         try:
+            self._assert_page_in_space(page_id)
             attachments = self.client.get_attachments_from_content(page_id)
             if not attachments or not attachments.get('results'):
                 return f"No attachments found for page ID {page_id}."
@@ -2314,6 +2426,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     ) -> str:
         """Upload file from artifact and add to Confluence page content. Images display inline with optional visible caption, other files as attachment links."""
         try:
+            self._assert_page_in_space(page_id)
             # Upload file to Confluence
             upload_info = self._upload_file_from_artifact(page_id, filepath, filename)
             uploaded_filename = upload_info['filename']
@@ -2386,6 +2499,12 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         return {
             "content_format": (Literal['view', 'storage', 'export_view', 'editor', 'anonymous'],
                             Field(description="The format of the content to be retrieved.", default='view')),
+            "space_key": (Optional[str], Field(
+                description="Optional. Limit this index to a Confluence space using its space key. Leave empty to "
+                            "use the toolkit's scope. If the toolkit has no space restriction, all spaces accessible "
+                            "to the configured Confluence account are eligible. This filter is combined with Page "
+                            "IDs, Label, and CQL and cannot override a toolkit-level restriction.",
+                default=None)),
             "page_ids": (Optional[List[str]], Field(description="List of page IDs to retrieve.", default=None)),
             "label": (Optional[str], Field(description="Label to filter pages.", default=None)),
             "cql": (Optional[str], Field(description="CQL query to filter pages.", default=None)),
@@ -2435,6 +2554,9 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             )
 
         base_doc = (self.execute_generic_confluence.__doc__ or '').strip()
+        if self.space:
+            base_doc += (f"\nUnavailable: the toolkit is restricted to space '{self.space}'; "
+                         f"use the dedicated Confluence tools.")
         return (
             f"{base_doc}\n\n"
             f"Active API version: v{api_version} (base path: {endpoint_base}).\n"

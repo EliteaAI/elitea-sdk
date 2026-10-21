@@ -250,7 +250,7 @@ class SandboxClient:
         self.auth_token = auth_token
         self.auth_session = auth_session if not auth_token else None
         self.session_cookie_name = session_cookie_name
-        self.headers = {'X-SECRET': kwargs.get('XSECRET', 'secret')}
+        self.headers = {}
         if auth_token:
             self.headers['Authorization'] = f'Bearer {auth_token}'
         if api_extra_headers is not None:

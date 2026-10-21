@@ -19,13 +19,14 @@ from pydantic import ValidationError
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
 from ..middleware import (
+    InputGuardMiddleware,
     LoggingStrategy,
     ProjectContextMiddleware,
     SensitiveToolGuardMiddleware,
     TransformErrorStrategy,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
-from ..exceptions import budget_exceeded_from
+from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools, read_declared_failure
@@ -126,7 +127,7 @@ class EliteAClient:
         self.auth_token = auth_token
         self.auth_session = auth_session if not auth_token else None
         self.session_cookie_name = session_cookie_name
-        self.headers = {'X-SECRET': kwargs.get('XSECRET', 'secret')}
+        self.headers = {}
         if auth_token:
             self.headers["Authorization"] = f"Bearer {auth_token}"
         if api_extra_headers is not None:
@@ -394,6 +395,11 @@ class EliteAClient:
             # API returns {"items": [...], ...}
             return data.get('items', [])
         return []
+
+    def _project_default_llm(self) -> Optional[Dict[str, Any]]:
+        resp = self._request('get', self.models_url, headers=self.headers, verify=False)
+        resp.raise_for_status()
+        return next((model for model in resp.json().get('items', []) if model.get('default')), None)
 
     def get_filtered_models(self, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
@@ -948,6 +954,12 @@ class EliteAClient:
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
+        if resp.status_code == 403:
+            # Expanded details carry credentials, so they need editor access; get_tools still skips sub-agents
+            raise AgentAccessDeniedError(
+                f"Loading agent {application_id}/{application_version_id} requires editor access "
+                f"to project {self.project_id} (403)"
+            )
         logger.error(f"Failed to fetch application version details: {resp.status_code} - {resp.text}."
                      f" Application ID: {application_id}, Version ID: {application_version_id}, Project ID: {self.project_id}")
         raise ApiDetailsRequestError(f"Failed to fetch application version details for {application_id}/{application_version_id}: {resp.status_code} - {resp.text}")
@@ -958,6 +970,25 @@ class EliteAClient:
         data = self._request('get', url, headers=self.headers, verify=False).json()
         logger.debug(f"Unsecret response for '{secret_name}': value={mask_sensitive_value(data.get('value', ''))}")
         return data.get('value', None)
+
+    @staticmethod
+    def _with_context_window(llm: Any, context_settings: Optional[dict]) -> Any:
+        """A per-request copy of ``llm`` that tells the context floor the request's real window."""
+        window = (context_settings or {}).get('effective_window')
+        if llm is None or not window or not hasattr(llm, 'model_copy'):
+            return llm
+        try:
+            bound = getattr(llm, 'bound', None)
+            if bound is not None and hasattr(bound, 'model_copy'):
+                stamped = bound.model_copy()
+                object.__setattr__(stamped, '_elitea_context_window', int(window))
+                return llm.model_copy(update={'bound': stamped})
+            stamped = llm.model_copy()
+            object.__setattr__(stamped, '_elitea_context_window', int(window))
+            return stamped
+        except Exception as e:
+            logger.debug(f"Could not stamp context window on LLM: {e}")
+            return llm
 
     def _inject_summarization(
         self, middleware_list: list, context_settings: Optional[dict], conversation_id: Optional[str] = None
@@ -989,6 +1020,9 @@ class EliteAClient:
 
             # Try low-tier model first for cost efficiency
             summarization_llm = self.get_low_tier_llm(max_tokens=summary_max_tokens, temperature=summary_temperature)
+            if summarization_llm is None:
+                logger.warning("No LLM available for summarization, SummarizationMiddleware not injected")
+                return
 
             # Extract callbacks from context_settings for backend integration
             callbacks = context_settings.get('callbacks', {})
@@ -1050,6 +1084,25 @@ class EliteAClient:
             ))
         except ValueError as e:
             logger.warning("Skipping invalid on-demand Project Context: %s", e)
+
+    def _inject_input_guard(self, middleware_list: list, conversation_id: Optional[str] = None) -> None:
+        """Inject the input guardrail (#6886) when the platform enabled it."""
+        try:
+            from ..toolkits.security import get_input_guard_policy, has_input_guard_config
+
+            if not has_input_guard_config():
+                return
+
+            if any(isinstance(mw, InputGuardMiddleware) for mw in middleware_list):
+                return
+
+            middleware_list.insert(0, InputGuardMiddleware(
+                policy=get_input_guard_policy(),
+                project_id=self.project_id,
+                conversation_id=conversation_id,
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to auto-inject InputGuardMiddleware: {e}")
 
     def _inject_sensitive_tool_guard(
         self,
@@ -1126,6 +1179,8 @@ class EliteAClient:
         else:
             try:
                 data = self.get_app_version_details(application_id, application_version_id)
+            except AgentAccessDeniedError:
+                raise
             except ApiDetailsRequestError as e:
                 error_msg = f"Failed to fetch application version details for {application_id}/{application_version_id}\nDetails: {e}"
                 logger.error(error_msg)
@@ -1173,6 +1228,8 @@ class EliteAClient:
         # Auto-create middleware based on internal_tools configuration
         # This bridges the UI's internal_tools toggles to the middleware system
         middleware_list = list(middleware) if middleware else []
+        # First, so it inspects the history before summarization rewrites it
+        self._inject_input_guard(middleware_list, conversation_id)
         internal_tools = data.get('meta', {}).get('internal_tools', [])
         if 'planner' in internal_tools:
             # Create PlanningMiddleware when planner is enabled in internal_tools
@@ -1187,6 +1244,7 @@ class EliteAClient:
         self._inject_project_context(middleware_list, project_context, conversation_id)
 
         # Automatically compresses conversation history when threshold is exceeded
+        llm = self._with_context_window(llm, context_settings)
         self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Automatically clears stale tool outputs when a token threshold is exceeded
@@ -1617,6 +1675,8 @@ class EliteAClient:
         # Auto-create middleware based on internal_tools parameter
         # This matches the behavior in application() method
         middleware_list = []
+        # First, so it inspects the history before summarization rewrites it
+        self._inject_input_guard(middleware_list, conversation_id)
         has_planner = 'planner' in internal_tools
         if has_planner:
             from ..middleware.planning import PlanningMiddleware
@@ -1633,6 +1693,7 @@ class EliteAClient:
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
 
         # Automatically compresses conversation history when a threshold is exceeded
+        llm = self._with_context_window(llm, context_settings)
         self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Automatically clears stale tool outputs when a token threshold is exceeded
@@ -1709,7 +1770,7 @@ class EliteAClient:
                 - callbacks: List of callback handlers for event processing
                 - configurable: Additional configuration parameters
                 - tags: Tags for the execution
-            llm_model: Name of the LLM model to use (default: 'gpt-4o-mini')
+            llm_model: Name of the LLM model to use (default: the project's default LLM model)
             mcp_tokens: Optional dictionary of MCP OAuth tokens by server URL
             llm_config: Configuration for the LLM containing:
                 - max_tokens: Maximum tokens for response (default: 1000)
@@ -1752,14 +1813,43 @@ class EliteAClient:
         """
         if tool_params is None:
             tool_params = {}
-        if llm_model is None:
-            llm_model = 'gpt-4o-mini'
+        events_dispatched = []
+        is_auto_selection = ((llm_config or {}).get('selection') or {}).get('mode') == 'auto'
+        if llm_model is None and not is_auto_selection:
+            try:
+                default_model = self._project_default_llm()
+                missing_model_error = None if default_model else (
+                    "No LLM model was provided and no default LLM model is available in this project"
+                )
+            except Exception as lookup_error:  # pylint: disable=W0703
+                missing_model_error = f"Could not look up the project's default LLM model: {lookup_error}"
+            if missing_model_error:
+                logger.error(missing_model_error)
+                return {
+                    "success": False,
+                    "error": missing_model_error,
+                    "debug_error": missing_model_error,
+                    "tool_name": tool_name,
+                    "toolkit_config": None,
+                    "llm_model": None,
+                    "events_dispatched": events_dispatched,
+                    "execution_time_seconds": 0.0
+                }
+            llm_model = default_model['name']
+            llm_config = {
+                **(llm_config or {'max_tokens': 1024}),
+                'model_project_id': default_model.get('project_id'),
+                'openai_compatible': bool(default_model.get('openai_compatible', False)),
+            }
+            caller_chose_sampling = (llm_config.get('temperature') is not None
+                                     or llm_config.get('reasoning_effort') is not None)
+            if not caller_chose_sampling and not default_model.get('supports_reasoning'):
+                llm_config['temperature'] = 0.1
         if llm_config is None:
             llm_config = {
                 'max_tokens': 1024,
                 'temperature': 0.1,
             }
-        events_dispatched = []
 
         try:
             toolkit_config_parsed_json = self._validate_toolkit_config(toolkit_config)
@@ -1974,7 +2064,7 @@ class EliteAClient:
                 else:
                     logger.info(f"Found tool '{tool_name}' using fallback matching ('{actual_tool_name}')")
 
-                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {tool_params}")
+                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {sorted((tool_params or {}).keys()) if isinstance(tool_params, dict) else type(tool_params).__name__}")
 
                 # Start timing the tool execution
                 start_time = time.time()

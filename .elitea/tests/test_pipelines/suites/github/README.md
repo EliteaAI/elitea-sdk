@@ -54,7 +54,7 @@ nodes:
 
 1. **GitHub Toolkit configured** - A GitHub toolkit must be created in the project with:
    - Valid GitHub access token
-   - Repository configured (e.g., `EliteaAI/elitea-testing`)
+   - Repository configured (e.g., `EliteaAI/elitea-testing-public`)
    - Appropriate permissions for read/write operations
 
 2. **Environment Variables** - Set in `.env` file:
@@ -112,7 +112,7 @@ nodes:
 
 1. **GitHub Toolkit configured** - A GitHub toolkit must be created in the project with:
    - Valid GitHub access token
-   - Repository configured (e.g., `EliteaAI/elitea-testing`)
+   - Repository configured (e.g., `EliteaAI/elitea-testing-public`)
    - Appropriate permissions for read/write operations
 
 2. **Environment Variable** - Set `GITHUB_TOOLKIT_ID` in environment or `.env` file:
