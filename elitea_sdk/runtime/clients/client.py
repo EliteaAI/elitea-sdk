@@ -99,7 +99,10 @@ def normalize_app_type(app_type: str) -> str:
 
 
 class ApiDetailsRequestError(Exception):
-    ...
+    def __init__(self, *args, status_code: int | None = None, body=None):
+        super().__init__(*args)
+        self.status_code = status_code
+        self.body = body
 
 
 class AuthSessionExpiredError(Exception):
@@ -206,6 +209,207 @@ class EliteAClient:
                     "the user session is no longer valid"
                 )
         return response
+
+    @staticmethod
+    def _schedule_response(resp):
+        """None on 204, the JSON below 400, else ApiDetailsRequestError with status_code and body."""
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = resp.text
+            raise ApiDetailsRequestError(
+                f"Schedule request to {resp.url} failed with status {resp.status_code}",
+                status_code=resp.status_code, body=body,
+            )
+        return None if resp.status_code == 204 else resp.json()
+
+    def _schedules_url(self, *parts) -> str:
+        """URL of the Schedules resource, with optional path parts such as an id and an action."""
+        base = f"{self.base_url}{self.api_v2_path}/elitea_core/schedules/prompt_lib/{self.project_id}"
+        return '/'.join([base, *map(str, parts)])
+
+    def _schedule_call(self, method: str, url: str, **kwargs):
+        return self._schedule_response(
+            self._request(method, url, headers=self.headers, verify=False, **kwargs))
+
+    def list_schedules(self, limit: int = 20, offset: int = 0, **filters) -> dict:
+        """List one page of schedules in the project.
+
+        Args:
+            limit: Rows per page. The API lowers a value above its cap.
+            offset: Rows to skip.
+            **filters: Query filters, for example entity_type, status, enabled,
+                owner_ids, entity_id, search. A filter set to None is not sent.
+
+        Returns:
+            The API page as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body` (the parsed JSON, else the text).
+        """
+        params = {'limit': limit, 'offset': offset}
+        params.update({k: v for k, v in filters.items() if v is not None})
+        return self._schedule_call('get', self._schedules_url(), params=params)
+
+    def get_schedule(self, schedule_id: int) -> dict:
+        """Read one schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            The schedule details as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                404 when the schedule does not exist. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('get', self._schedules_url(schedule_id))
+
+    def create_schedule(self, data: dict) -> dict:
+        """Create a schedule.
+
+        Args:
+            data: The body, sent unchanged. Keys: name, description, entity_type,
+                application_id, version_id, run_mode, prompt, variables, cron,
+                timezone, expires_at, approval_rule. The API checks them.
+
+        Returns:
+            The new schedule details as a dict (the API answers 201).
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. A 400 carries
+                the field error in `body`; `status_code` holds the status.
+        """
+        return self._schedule_call('post', self._schedules_url(), json=data)
+
+    def update_schedule(self, schedule_id: int, data: dict) -> dict:
+        """Change the fields of a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+            data: The same keys as create_schedule, sent unchanged. It must not
+                hold `enabled`: use pause_schedule and resume_schedule instead.
+
+        Returns:
+            The updated schedule details as a dict.
+
+        Raises:
+            ValueError: `data` holds `enabled`. No request is sent.
+            ApiDetailsRequestError: The API answers 400 or more. A 400 carries
+                the field error in `body`; `status_code` holds the status.
+        """
+        if 'enabled' in data:
+            raise ValueError("update_schedule does not change 'enabled'; "
+                             "use pause_schedule or resume_schedule")
+        return self._schedule_call('put', self._schedules_url(schedule_id), json=data)
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        """Delete a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            None (the API answers 204).
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('delete', self._schedules_url(schedule_id))
+
+    def pause_schedule(self, schedule_id: int) -> dict:
+        """Pause a schedule, so it starts no future runs. A run in progress goes on.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            The schedule details as a dict, with `enabled` false.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'pause'))
+
+    def resume_schedule(self, schedule_id: int) -> dict:
+        """Resume a paused schedule, so it runs on its timetable again.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            The schedule details as a dict, with `enabled` true.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                409 when the schedule has no version or the project reached its
+                cap of active schedules. The error has `status_code` and `body`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'resume'))
+
+    def run_schedule(self, schedule_id: int, trigger: str = 'manual') -> dict:
+        """Start one run of a schedule now.
+
+        Args:
+            schedule_id: Id of the schedule.
+            trigger: 'manual' (Run now, the default) or 'test' (Test run).
+
+        Returns:
+            The API answer (202) as a dict with `run_id`.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. A 409 means a
+                run is already active: `body` holds `error` and `active_run_id`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'run'),
+                                   json={'trigger': trigger})
+
+    def list_schedule_runs(self, schedule_id: int, limit: int = 20, offset: int = 0,
+                           status: str | None = None) -> dict:
+        """List one page of the runs of a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+            limit: Rows per page. The API lowers a value above its cap.
+            offset: Rows to skip.
+            status: Only runs with this status. Not sent when None.
+
+        Returns:
+            The API page as a dict with `total` and `rows`.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        params = {'limit': limit, 'offset': offset}
+        if status is not None:
+            params['status'] = status
+        return self._schedule_call('get', self._schedules_url(schedule_id, 'runs'), params=params)
+
+    def change_schedule_owner(self, schedule_id: int, owner_id: int) -> dict:
+        """Give a schedule to another project member. Only a project admin may do it.
+
+        Args:
+            schedule_id: Id of the schedule.
+            owner_id: User id of the new owner.
+
+        Returns:
+            The schedule details as a dict, with the new owner.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                400 with `field` owner_id when the user is not a project member,
+                or 403 when the caller is not an admin. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'owner'),
+                                   json={'owner_id': owner_id})
 
     def get_mcp_toolkits(self):
         # Static registry; fetched once per client instead of once per nested get_tools call
