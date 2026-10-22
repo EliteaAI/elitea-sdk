@@ -994,6 +994,10 @@ class EliteAClient:
         settings = summary_llm_settings or {}
         max_tokens = settings.get('max_tokens') or 4000
         model_name = settings.get('model_name')
+        # Building a client never fails for a removed model; the call is what 401s, so check first
+        if model_name and not any(model.get('name') == model_name for model in self.get_available_models()):
+            logger.warning(f"Summarization model '{model_name}' is not available, using low-tier model")
+            model_name = None
         if model_name:
             model_config = {'max_tokens': max_tokens}
             for key in ('temperature', 'reasoning_effort', 'model_project_id'):
