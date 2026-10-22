@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 _IMAGE_TOKEN_ESTIMATE = 85
 
 
+def _response_text(response) -> str:
+    """Text of a model response; reasoning models return content blocks (thinking + text)."""
+    content = getattr(response, 'content', response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ''.join(
+            block if isinstance(block, str) else (block.get('text') or '')
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get('type') == 'text')
+        )
+    return str(content or '')
+
+
 def _is_tool_related_message(msg) -> bool:
     """Check if a message is part of a tool-call interaction (not user-facing).
 
@@ -734,15 +748,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             response = self.model.invoke([HumanMessage(content=prompt_content)], config=_NO_RUN_CALLBACKS)
             self._record_usage(response)
 
-            # Handle both .text and .content
-            if hasattr(response, 'content'):
-                content = response.content
-                result = content.strip() if isinstance(content, str) else str(content)
-            elif hasattr(response, 'text'):
-                result = response.text.strip()
-            else:
-                result = str(response)
-            logger.info(f'Summary response has no content or text attribute, using {result}')
+            result = _response_text(response).strip()
+            if not result:
+                logger.error("Summary response has no text content")
+                return None
             return result
         except Exception as e:
             logger.error(f"Error generating summary: {e}")
