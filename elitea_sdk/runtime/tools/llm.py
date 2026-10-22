@@ -1010,6 +1010,46 @@ class LLMNode(BaseTool):
             except Exception as e:
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
 
+    def _should_bind_tools(self, configurable: dict) -> bool:
+        return (
+            len(self.tool_names or []) > 0 or
+            (self.lazy_tools_mode and self.tool_registry is not None) or
+            bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
+            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
+        )
+
+    def _report_overhead_estimate(self, state: dict, config: Optional[RunnableConfig]) -> None:
+        """Report the system prompt and tool schemas before before_model hooks run.
+
+        _invoke_llm_internal reports the exact prefix later; without this estimate the
+        summarization trigger of a fresh middleware compares message history only.
+        """
+        middleware_mgr = self.middleware_manager
+        if middleware_mgr is None or not any(
+            hasattr(mw, 'set_prompt_overhead') for mw in getattr(middleware_mgr, '_middleware', [])
+        ):
+            return
+        try:
+            configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
+            func_args = propagate_the_input_mapping(
+                input_mapping=self.input_mapping, input_variables=self.input_variables, state=state
+            )
+            if 'system' in func_args:
+                system_content = str(func_args.get('system') or '')
+                if self.lazy_tools_mode and self.tool_registry is not None and not configurable.get('selected_tools'):
+                    system_content = f"{system_content}\n\n{self.tool_registry.generate_index()}"
+            else:
+                system_content = next(
+                    (m.content for m in state.get('messages', []) if isinstance(m, SystemMessage)), None
+                )
+            tools = self.get_filtered_tools(config=config) if self._should_bind_tools(configurable) else []
+            self._report_prompt_overhead(
+                [SystemMessage(content=system_content)] if system_content else [],
+                build_tool_binding_plan(tools).provider_tools if tools else [],
+            )
+        except Exception as e:
+            logger.debug(f"Prompt overhead estimate skipped: {e}")
+
     def _enforce_context_floor(self, messages: List, llm_client=None, *, start: int = 0):
         """Keep this turn's request inside the model's window (#5915).
 
@@ -1055,32 +1095,47 @@ class LLMNode(BaseTool):
         # Single pass: identify AIMessage indices and collect following ToolMessage ids
         # Include native tool_use blocks even when parsing produced no tool_calls.
         # Only the contiguous ToolMessages immediately after this AIMessage count.
+        # ToolMessages with no matching call in that AIMessage (e.g. the call was
+        # summarized away) are orphaned results, which Anthropic rejects too.
         following_tool_ids: dict[int, set[str]] = {}
+        orphaned_results: set[int] = set()
         current_ai_idx: int | None = None
+        current_call_ids: set[str] = set()
 
         for i, msg in enumerate(messages):
             if isinstance(msg, ToolMessage):
-                if current_ai_idx is not None and msg.tool_call_id:
+                if current_ai_idx is not None and msg.tool_call_id in current_call_ids:
                     following_tool_ids[current_ai_idx].add(msg.tool_call_id)
+                else:
+                    orphaned_results.add(i)
             else:
                 current_ai_idx = None
-                if isinstance(msg, AIMessage) and (
-                    msg.tool_calls or (isinstance(msg.content, list) and any(
-                        isinstance(block, dict) and block.get('type') == 'tool_use'
-                        for block in msg.content
-                    ))
-                ):
-                    current_ai_idx = i
-                    following_tool_ids[i] = set()
+                current_call_ids = set()
+                if isinstance(msg, AIMessage):
+                    current_call_ids = {
+                        tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')
+                        for tc in msg.tool_calls
+                    }
+                    if isinstance(msg.content, list):
+                        current_call_ids.update(
+                            block.get('id', '') for block in msg.content
+                            if isinstance(block, dict) and block.get('type') == 'tool_use'
+                        )
+                    current_call_ids.discard('')
+                    if current_call_ids:
+                        current_ai_idx = i
+                        following_tool_ids[i] = set()
 
-        # Early exit if no AIMessages with tool_calls
-        if not following_tool_ids:
+        # Early exit if no AIMessages with tool_calls and no orphaned results
+        if not following_tool_ids and not orphaned_results:
             return messages
 
         cleaned_messages: List = []
         filtered_count = 0
 
         for i, message in enumerate(messages):
+            if i in orphaned_results:
+                continue
             if i not in following_tool_ids:
                 cleaned_messages.append(message)
                 continue
@@ -1139,6 +1194,8 @@ class LLMNode(BaseTool):
 
         if filtered_count > 0:
             logger.info("Filtered %d orphaned tool_calls from message history", filtered_count)
+        if orphaned_results:
+            logger.info("Filtered %d orphaned tool results from message history", len(orphaned_results))
         return cleaned_messages
 
     def _get_tool_identity(self, tool: BaseTool) -> Dict[str, Optional[str]]:
@@ -1215,6 +1272,8 @@ class LLMNode(BaseTool):
         # Run before_model hooks (may summarize messages, may raise InputGuardrailBlocked)
         if middleware_mgr is not None and isinstance(state, dict):
             original_state = state.copy()
+            # The trigger runs before the request is built, so give it the prefix up front
+            self._report_overhead_estimate(state, config)
             state, middleware_updates = middleware_mgr.run_before_model(state, config or {})
 
         # Do LLM invocation
@@ -1536,12 +1595,7 @@ class LLMNode(BaseTool):
         # 1. Traditional mode: specific tool_names are provided, OR
         # 2. Lazy mode: tool_registry exists (meta-tools will be bound), OR
         # 3. available_tools exist (covers lazy mode auto-disabled case)
-        should_bind_tools = (
-            len(self.tool_names or []) > 0 or
-            (self.lazy_tools_mode and self.tool_registry is not None) or
-            bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
-            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
-        )
+        should_bind_tools = self._should_bind_tools(configurable)
 
         bound_tools = []
 
