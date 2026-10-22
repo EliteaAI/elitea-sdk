@@ -1024,6 +1024,11 @@ class LLMNode(BaseTool):
         _invoke_llm_internal reports the exact prefix later; without this estimate the
         summarization trigger of a fresh middleware compares message history only.
         """
+        middleware_mgr = self.middleware_manager
+        if middleware_mgr is None or not any(
+            hasattr(mw, 'set_prompt_overhead') for mw in getattr(middleware_mgr, '_middleware', [])
+        ):
+            return
         try:
             configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
             func_args = propagate_the_input_mapping(
@@ -1116,6 +1121,7 @@ class LLMNode(BaseTool):
                             block.get('id', '') for block in msg.content
                             if isinstance(block, dict) and block.get('type') == 'tool_use'
                         )
+                    current_call_ids.discard('')
                     if current_call_ids:
                         current_ai_idx = i
                         following_tool_ids[i] = set()
