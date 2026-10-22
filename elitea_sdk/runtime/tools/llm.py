@@ -1010,6 +1010,41 @@ class LLMNode(BaseTool):
             except Exception as e:
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
 
+    def _should_bind_tools(self, configurable: dict) -> bool:
+        return (
+            len(self.tool_names or []) > 0 or
+            (self.lazy_tools_mode and self.tool_registry is not None) or
+            bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
+            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
+        )
+
+    def _report_overhead_estimate(self, state: dict, config: Optional[RunnableConfig]) -> None:
+        """Report the system prompt and tool schemas before before_model hooks run.
+
+        _invoke_llm_internal reports the exact prefix later; without this estimate the
+        summarization trigger of a fresh middleware compares message history only.
+        """
+        try:
+            configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
+            func_args = propagate_the_input_mapping(
+                input_mapping=self.input_mapping, input_variables=self.input_variables, state=state
+            )
+            if 'system' in func_args:
+                system_content = str(func_args.get('system') or '')
+                if self.lazy_tools_mode and self.tool_registry is not None and not configurable.get('selected_tools'):
+                    system_content = f"{system_content}\n\n{self.tool_registry.generate_index()}"
+            else:
+                system_content = next(
+                    (m.content for m in state.get('messages', []) if isinstance(m, SystemMessage)), None
+                )
+            tools = self.get_filtered_tools(config=config) if self._should_bind_tools(configurable) else []
+            self._report_prompt_overhead(
+                [SystemMessage(content=system_content)] if system_content else [],
+                build_tool_binding_plan(tools).provider_tools if tools else [],
+            )
+        except Exception as e:
+            logger.debug(f"Prompt overhead estimate skipped: {e}")
+
     def _enforce_context_floor(self, messages: List, llm_client=None, *, start: int = 0):
         """Keep this turn's request inside the model's window (#5915).
 
@@ -1231,6 +1266,8 @@ class LLMNode(BaseTool):
         # Run before_model hooks (may summarize messages)
         if middleware_mgr is not None and isinstance(state, dict):
             original_state = state.copy()
+            # The trigger runs before the request is built, so give it the prefix up front
+            self._report_overhead_estimate(state, config)
             state, middleware_updates = middleware_mgr.run_before_model(state, config or {})
 
         # Do LLM invocation
@@ -1540,12 +1577,7 @@ class LLMNode(BaseTool):
         # 1. Traditional mode: specific tool_names are provided, OR
         # 2. Lazy mode: tool_registry exists (meta-tools will be bound), OR
         # 3. available_tools exist (covers lazy mode auto-disabled case)
-        should_bind_tools = (
-            len(self.tool_names or []) > 0 or
-            (self.lazy_tools_mode and self.tool_registry is not None) or
-            bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
-            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
-        )
+        should_bind_tools = self._should_bind_tools(configurable)
 
         bound_tools = []
 

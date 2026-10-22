@@ -449,7 +449,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             self._last_fitting_count = 0
             return super()._determine_cutoff_index(messages)
 
-        remaining_budget = max(0, trigger_limit - preserved_tokens)
+        # A trigger that counts the prefix must leave room for it, otherwise every
+        # message "fits" and nothing is summarized
+        overhead = sum(self.prompt_overhead.values()) if self.count_overhead_in_trigger else 0
+        remaining_budget = max(0, trigger_limit - overhead - preserved_tokens)
 
         fitting_count = 0
         tokens_so_far = 0
@@ -586,6 +589,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         })
 
         summary = self._create_summary(messages_to_summarize)
+        if summary is None:
+            # Keep the history rather than replacing it with an error text
+            self._fire_callback('summarized', {**(self.last_context_info or {}), 'summarized': False})
+            return None
 
         # User-facing counts for preserved messages (exclude tool internals)
         preserved_user_facing = [m for m in preserved_messages if not _is_tool_related_message(m)]
@@ -681,8 +688,8 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
 
         return None  # No state updates needed
 
-    def _create_summary(self, messages_to_summarize: list) -> str:
-        """Generate summary for the given messages.
+    def _create_summary(self, messages_to_summarize: list) -> Optional[str]:
+        """Generate summary for the given messages; None when the summary call fails.
 
         Override to handle response.content vs response.text compatibility.
         """
@@ -739,7 +746,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             return result
         except Exception as e:
             logger.error(f"Error generating summary: {e}")
-            return f"Error generating summary: {e!s}"
+            return None
 
     def _trim_messages_for_summary(self, messages: list) -> list:
         """Trim messages to fit within summary generation limits.

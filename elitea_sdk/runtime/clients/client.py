@@ -989,6 +989,22 @@ class EliteAClient:
             logger.debug(f"Could not stamp context window on LLM: {e}")
             return llm
 
+    def _summarization_llm(self, summary_llm_settings: Optional[dict]):
+        """The model picked in the context strategy, else the project's low-tier model."""
+        settings = summary_llm_settings or {}
+        max_tokens = settings.get('max_tokens') or 4000
+        model_name = settings.get('model_name')
+        if model_name:
+            model_config = {'max_tokens': max_tokens}
+            for key in ('temperature', 'reasoning_effort', 'model_project_id'):
+                if settings.get(key) is not None:
+                    model_config[key] = settings[key]
+            try:
+                return self.get_llm(model_name, model_config)
+            except Exception as e:
+                logger.warning(f"Summarization model '{model_name}' unavailable, using low-tier model: {e}")
+        return self.get_low_tier_llm(max_tokens=max_tokens, temperature=settings.get('temperature'))
+
     def _inject_summarization(
         self, middleware_list: list, context_settings: Optional[dict], conversation_id: Optional[str] = None
     ):
@@ -1013,12 +1029,7 @@ class EliteAClient:
         try:
             from ..middleware.summarization import SummarizationMiddleware
 
-            # Get model config from context strategy
-            summary_max_tokens = context_settings.get('max_tokens', 4000)
-            summary_temperature = context_settings.get('temperature', 0.7)
-
-            # Try low-tier model first for cost efficiency
-            summarization_llm = self.get_low_tier_llm(max_tokens=summary_max_tokens, temperature=summary_temperature)
+            summarization_llm = self._summarization_llm(context_settings.get('summary_llm_settings'))
             if summarization_llm is None:
                 logger.warning("No LLM available for summarization, SummarizationMiddleware not injected")
                 return
