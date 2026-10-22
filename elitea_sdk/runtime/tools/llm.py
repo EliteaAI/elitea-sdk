@@ -1055,32 +1055,46 @@ class LLMNode(BaseTool):
         # Single pass: identify AIMessage indices and collect following ToolMessage ids
         # Include native tool_use blocks even when parsing produced no tool_calls.
         # Only the contiguous ToolMessages immediately after this AIMessage count.
+        # ToolMessages with no matching call in that AIMessage (e.g. the call was
+        # summarized away) are orphaned results, which Anthropic rejects too.
         following_tool_ids: dict[int, set[str]] = {}
+        orphaned_results: set[int] = set()
         current_ai_idx: int | None = None
+        current_call_ids: set[str] = set()
 
         for i, msg in enumerate(messages):
             if isinstance(msg, ToolMessage):
-                if current_ai_idx is not None and msg.tool_call_id:
+                if current_ai_idx is not None and msg.tool_call_id in current_call_ids:
                     following_tool_ids[current_ai_idx].add(msg.tool_call_id)
+                else:
+                    orphaned_results.add(i)
             else:
                 current_ai_idx = None
-                if isinstance(msg, AIMessage) and (
-                    msg.tool_calls or (isinstance(msg.content, list) and any(
-                        isinstance(block, dict) and block.get('type') == 'tool_use'
-                        for block in msg.content
-                    ))
-                ):
-                    current_ai_idx = i
-                    following_tool_ids[i] = set()
+                current_call_ids = set()
+                if isinstance(msg, AIMessage):
+                    current_call_ids = {
+                        tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', '')
+                        for tc in msg.tool_calls
+                    }
+                    if isinstance(msg.content, list):
+                        current_call_ids.update(
+                            block.get('id', '') for block in msg.content
+                            if isinstance(block, dict) and block.get('type') == 'tool_use'
+                        )
+                    if current_call_ids:
+                        current_ai_idx = i
+                        following_tool_ids[i] = set()
 
-        # Early exit if no AIMessages with tool_calls
-        if not following_tool_ids:
+        # Early exit if no AIMessages with tool_calls and no orphaned results
+        if not following_tool_ids and not orphaned_results:
             return messages
 
         cleaned_messages: List = []
         filtered_count = 0
 
         for i, message in enumerate(messages):
+            if i in orphaned_results:
+                continue
             if i not in following_tool_ids:
                 cleaned_messages.append(message)
                 continue
@@ -1139,6 +1153,8 @@ class LLMNode(BaseTool):
 
         if filtered_count > 0:
             logger.info("Filtered %d orphaned tool_calls from message history", filtered_count)
+        if orphaned_results:
+            logger.info("Filtered %d orphaned tool results from message history", len(orphaned_results))
         return cleaned_messages
 
     def _get_tool_identity(self, tool: BaseTool) -> Dict[str, Optional[str]]:
