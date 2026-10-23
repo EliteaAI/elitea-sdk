@@ -236,3 +236,15 @@ class BaseSharepointWrapper(ABC):
         """
         raise ToolException(self._SHARING_LINK_NOT_SUPPORTED)
 
+
+    _FILE_URL_NOT_SUPPORTED = (
+        "Reading files by URL requires Graph API delegated access. "
+        "Provide token + scopes to enable URL support, or use read_document "
+        "with the file's server-relative path."
+    )
+
+    def read_file_from_url(self, url: str, is_capture_image: bool = False,
+                           start_line: Optional[int] = None,
+                           end_line: Optional[int] = None
+                           ) -> Union[str, Dict[str, Any]]:
+        raise ToolException(self._FILE_URL_NOT_SUPPORTED)

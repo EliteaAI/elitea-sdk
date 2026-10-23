@@ -16,7 +16,13 @@ from typing import Any, List, Optional, Dict, Callable
 
 from langchain_core.tools import BaseTool
 
+from ..exceptions import InputGuardrailBlocked
+
 logger = logging.getLogger(__name__)
+
+# State key carrying {message id: original} for messages a before_model hook swapped for a
+# model-only copy; see MiddlewareManager.run_before_model and LLMNode.invoke
+TRANSIENT_ORIGINALS_KEY = '_transient_originals'
 
 
 class Middleware(ABC):
@@ -119,7 +125,9 @@ class Middleware(ABC):
             config: Runtime configuration (thread_id, etc.)
 
         Returns:
-            State updates dict (e.g., {'messages': [...]}) or None
+            State updates dict (e.g., {'messages': [...]}) or None. Besides
+            'messages', the manager applies 'input' (the current turn) and
+            'transient_messages' (a model-only view, never checkpointed).
         """
         return None
 
@@ -317,6 +325,29 @@ class MiddlewareManager:
                     state = {**state, 'messages': transformed_messages}
 
                 updates = mw.before_model(state, config)
+                if updates and 'input' in updates:
+                    # The current turn lives outside 'messages' in the LLM node state;
+                    # without this a redacted turn would never reach the model input
+                    state = {**state, 'input': updates['input']}
+                if updates and 'transient_messages' in updates:
+                    # Same contract as transform_messages_for_model: replaces the model's
+                    # view only. A 'messages' update would append and reorder instead.
+                    # The originals ride along under TRANSIENT_ORIGINALS_KEY so the node can
+                    # put them back in what it returns: the add_messages reducer replaces
+                    # a stored message by id, and a transient copy shares its id.
+                    originals = {
+                        m.id: m for m in state.get('messages') or []
+                        if getattr(m, 'id', None)
+                    }
+                    swapped = {
+                        m.id: originals[m.id] for m in updates['transient_messages']
+                        if getattr(m, 'id', None) in originals and originals[m.id] is not m
+                    }
+                    state = {
+                        **state,
+                        'messages': updates['transient_messages'],
+                        TRANSIENT_ORIGINALS_KEY: {**state.get(TRANSIENT_ORIGINALS_KEY, {}), **swapped},
+                    }
                 if updates and 'messages' in updates:
                     # Only collect RemoveMessage operations for checkpoint
                     # The actual messages are already in state after processing
@@ -334,6 +365,10 @@ class MiddlewareManager:
                         f"[MiddlewareManager] {type(mw).__name__} applied: "
                         f"{original_count} -> {new_count} messages, RemoveMessage ops: {len(remove_ops)}"
                     )
+            except InputGuardrailBlocked:
+                # A policy decision, not a middleware failure: swallowing it would send
+                # the very input the guardrail refused
+                raise
             except Exception as e:
                 logger.error(f"Middleware {type(mw).__name__} before_model failed: {e}")
         return state, remove_ops
