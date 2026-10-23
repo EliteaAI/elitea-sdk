@@ -6,9 +6,11 @@ as one chunk per page, outside chunking_config and the include/skip extension fi
 the index only as their own dependent documents, page bodies must be chunked, and a failed attachment
 download must be reported instead of indexed as text.
 """
+import logging
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from langchain_community.document_loaders.confluence import ContentFormat
 from langchain_core.documents import Document
 
@@ -20,6 +22,13 @@ from elitea_sdk.tools.confluence.api_wrapper import BLANK_PAGE_KEY, PAGE_SOURCE_
 
 PAGE_BODY = 'Release checklist for the payments service'
 ATTACHMENT_TEXT = 'ONLY-IN-THE-PDF quarterly figures'
+
+
+@pytest.fixture(autouse=True)
+def backoff_sleeps(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr('elitea_sdk.tools.confluence.api_wrapper.time.sleep', sleeps.append)
+    return sleeps
 
 
 def make_wrapper(client):
@@ -291,7 +300,10 @@ class TestPageWithoutBody:
                                          MagicMock(status_code=503, content=b''), ConnectionError('reset')])
     def test_page_whose_downloads_all_fail_keeps_a_row_with_its_attachments(self, failure):
         client = self.holder_client()
-        client.request.side_effect = [failure]
+        if isinstance(failure, Exception):
+            client.request.side_effect = failure
+        else:
+            client.request.return_value = failure
         wrapper = make_wrapper(client)
 
         [page_chunk] = self.indexed_page_chunks(wrapper, page_document(wrapper))
@@ -338,3 +350,58 @@ class TestPageWithoutBody:
         wrapper = make_wrapper(self.holder_client())
 
         assert self.indexed_page_chunks(wrapper, page_document(wrapper, skip_extensions=['*.pdf'])) == []
+
+
+class TestTransientDownloadIsRetriedInRun:
+    def process(self, client):
+        wrapper = make_wrapper(client)
+        wrapper._index_include_attachments = True
+        wrapper._include_extensions = []
+        wrapper._skip_extensions = []
+        page = Document(page_content=PAGE_BODY, metadata={
+            'id': '101', '_attachments_data': client.get_attachments_from_content.return_value['results']})
+        return wrapper, list(wrapper._process_document(page))
+
+    @pytest.mark.parametrize('blip', [MagicMock(status_code=503, content=b''), ConnectionError('reset'),
+                                      requests.ConnectionError('reset'), requests.Timeout('read timed out')])
+    def test_transient_blip_is_retried_and_indexed(self, blip, backoff_sleeps, caplog):
+        client = confluence_client()
+        client.request.side_effect = [blip, MagicMock(status_code=200, content=b'figures')]
+
+        with caplog.at_level(logging.INFO, logger='elitea_sdk.tools.confluence.api_wrapper'):
+            wrapper, [attachment] = self.process(client)
+
+        assert 'Attachment download attempt 1/3 failed' in caplog.text
+
+        assert attachment.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] == b'figures'
+        assert wrapper.get_indexing_stats().dependent_items_skipped == set()
+        assert backoff_sleeps == [0.5]
+
+    @pytest.mark.parametrize('failure', [MagicMock(status_code=503, content=b''), ConnectionError('reset')])
+    def test_persistent_transient_failure_is_recorded_after_bounded_attempts(self, failure, backoff_sleeps):
+        client = confluence_client()
+        if isinstance(failure, Exception):
+            client.request.side_effect = failure
+        else:
+            client.request.return_value = failure
+
+        wrapper, documents = self.process(client)
+
+        assert documents == []
+        assert client.request.call_count == 3
+        assert backoff_sleeps == [0.5, 1.0]
+        assert wrapper.get_indexing_stats().dependent_items_skipped == {'figures.pdf'}
+
+    @pytest.mark.parametrize('failure', [MagicMock(status_code=404, content=b''), ValueError('bad url'),
+                                         requests.exceptions.InvalidURL('no host')])
+    def test_permanent_failure_is_not_retried(self, failure, backoff_sleeps):
+        client = confluence_client()
+        if isinstance(failure, Exception):
+            client.request.side_effect = failure
+        else:
+            client.request.return_value = failure
+
+        self.process(client)
+
+        assert client.request.call_count == 1
+        assert backoff_sleeps == []

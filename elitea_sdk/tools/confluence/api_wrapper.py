@@ -4,6 +4,7 @@ import logging
 import re
 import subprocess
 import tempfile
+import time
 import traceback
 import unicodedata
 from io import BytesIO
@@ -48,6 +49,11 @@ FILENAME_MACRO_PARAMS = frozenset({'name', 'filename', 'file'})
 PAGE_SOURCE_KEY = '_page_source'
 
 BLANK_PAGE_KEY = '_blank_page'
+
+ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
+ATTACHMENT_DOWNLOAD_INITIAL_BACKOFF = 0.5
+TRANSIENT_DOWNLOAD_STATUSES = frozenset({408, 429, 502, 503, 504})
+TRANSIENT_DOWNLOAD_EXCEPTIONS = (requests.ConnectionError, requests.Timeout, ConnectionError, TimeoutError)
 
 
 def _has_visible_text(text: str) -> bool:
@@ -1382,6 +1388,24 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         existing = document.metadata.get(key)
         document.metadata[key] = f"{existing};{attachment_id}" if existing else attachment_id
 
+    def _download_attachment(self, attachment_path: str):
+        for attempt in range(1, ATTACHMENT_DOWNLOAD_ATTEMPTS + 1):
+            last_attempt = attempt == ATTACHMENT_DOWNLOAD_ATTEMPTS
+            try:
+                resp = self.client.request(method="GET", path=attachment_path, advanced_mode=True)
+            except TRANSIENT_DOWNLOAD_EXCEPTIONS as e:
+                if last_attempt:
+                    raise
+                failure = str(e)
+            else:
+                if last_attempt or resp.status_code not in TRANSIENT_DOWNLOAD_STATUSES:
+                    return resp
+                failure = f"HTTP status code {resp.status_code}"
+            delay = ATTACHMENT_DOWNLOAD_INITIAL_BACKOFF * 2 ** (attempt - 1)
+            logger.info(f"Attachment download attempt {attempt}/{ATTACHMENT_DOWNLOAD_ATTEMPTS} failed for "
+                        f"'{attachment_path}': {failure}. Retrying in {delay:.1f}s.")
+            time.sleep(delay)
+
     def _extend_data(self, documents: Generator[Document, None, None]):
         for document in documents:
             if document.metadata.get(BLANK_PAGE_KEY):
@@ -1488,7 +1512,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                     if not document.page_content.strip():
                         document.page_content = document.metadata.get('title', '')
                     try:
-                        resp = self.client.request(method="GET", path=attachment_path, advanced_mode=True)
+                        resp = self._download_attachment(attachment_path)
                     except Exception as e:
                         logger.warning(f"Failed to download attachment {download_url}: {e}")
                         self._track_skipped_attachment(title, reason="error")
