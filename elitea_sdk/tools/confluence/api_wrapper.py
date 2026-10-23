@@ -4,7 +4,9 @@ import logging
 import re
 import subprocess
 import tempfile
+import time
 import traceback
+import unicodedata
 from io import BytesIO
 from json import JSONDecodeError
 from pathlib import Path
@@ -43,6 +45,19 @@ ATTACHMENT_LISTING_MACROS = frozenset({'attachments', 'gallery', 'space-attachme
 # 'name'). Restricting the harvest to these keeps an unrelated string parameter
 # (a jira jqlQuery, a toc title) from accidentally matching an attachment title.
 FILENAME_MACRO_PARAMS = frozenset({'name', 'filename', 'file'})
+
+PAGE_SOURCE_KEY = '_page_source'
+
+BLANK_PAGE_KEY = '_blank_page'
+
+ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
+ATTACHMENT_DOWNLOAD_INITIAL_BACKOFF = 0.5
+TRANSIENT_DOWNLOAD_STATUSES = frozenset({408, 429, 502, 503, 504})
+TRANSIENT_DOWNLOAD_EXCEPTIONS = (requests.ConnectionError, requests.Timeout, ConnectionError, TimeoutError)
+
+
+def _has_visible_text(text: str) -> bool:
+    return any(not character.isspace() and unicodedata.category(character) != 'Cf' for character in text)
 
 
 def _extract_legacy_doc(file_content: bytes) -> str:
@@ -1313,6 +1328,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         self._index_include_attachments = kwargs.get('include_attachments', False)
         self._include_extensions = kwargs.get('include_extensions', [])
         self._skip_extensions = kwargs.get('skip_extensions', [])
+        self._chunking_tool = kwargs.get('chunking_tool')
         # The index space narrows the toolkit scope and can never widen it
         index_space = self._resolve_space(kwargs.get('space_key'))
         if not (index_space or kwargs.get('page_ids') or kwargs.get('label') or kwargs.get('cql')):
@@ -1341,12 +1357,16 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
         confluence_loader_params['min_retry_seconds'] = self.min_retry_seconds
         confluence_loader_params['max_retry_seconds'] = self.max_retry_seconds
         confluence_loader_params['number_of_retries'] = self.number_of_retries
+        confluence_loader_params['include_attachments'] = False
         bins_with_llm = confluence_loader_params.pop('bins_with_llm', False)
         loader = EliteAConfluenceLoader(self.client, self.llm, bins_with_llm, **confluence_loader_params)
 
         for document in loader._lazy_load(kwargs={}):
             if 'updated_on' not in document.metadata and 'when' in document.metadata:
                 document.metadata['updated_on'] = document.metadata['when']
+            if not _has_visible_text(document.page_content):
+                document.page_content = ''
+                document.metadata[BLANK_PAGE_KEY] = True
             # Pre-populate the attachment list so _dependents_diverged and
             # _process_document share a single REST call per page instead of
             # each fetching independently.
@@ -1360,6 +1380,53 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                         logger.warning(
                             f"Failed to fetch attachments for page {page_id}: {e}."
                         )
+            yield document
+
+    @staticmethod
+    def _keep_attachment_as_dependent(document: Document, attachment_id: str):
+        key = IndexerKeywords.DEPENDENT_DOCS.value
+        existing = document.metadata.get(key)
+        document.metadata[key] = f"{existing};{attachment_id}" if existing else attachment_id
+
+    def _download_attachment(self, attachment_path: str):
+        for attempt in range(1, ATTACHMENT_DOWNLOAD_ATTEMPTS + 1):
+            last_attempt = attempt == ATTACHMENT_DOWNLOAD_ATTEMPTS
+            try:
+                resp = self.client.request(method="GET", path=attachment_path, advanced_mode=True)
+            except TRANSIENT_DOWNLOAD_EXCEPTIONS as e:
+                if last_attempt:
+                    raise
+                failure = str(e)
+            else:
+                if last_attempt or resp.status_code not in TRANSIENT_DOWNLOAD_STATUSES:
+                    return resp
+                failure = f"HTTP status code {resp.status_code}"
+            delay = ATTACHMENT_DOWNLOAD_INITIAL_BACKOFF * 2 ** (attempt - 1)
+            logger.info(f"Attachment download attempt {attempt}/{ATTACHMENT_DOWNLOAD_ATTEMPTS} failed for "
+                        f"'{attachment_path}': {failure}. Retrying in {delay:.1f}s.")
+            time.sleep(delay)
+
+    def _extend_data(self, documents: Generator[Document, None, None]):
+        for document in documents:
+            if document.metadata.get(BLANK_PAGE_KEY):
+                document.page_content = ''
+            if self._chunking_tool and document.page_content.strip():
+                document.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = document.page_content.encode('utf-8')
+                document.metadata[PAGE_SOURCE_KEY] = document.metadata.get('source')
+            yield document
+
+    def _remove_metadata_keys(self) -> List[str]:
+        return super()._remove_metadata_keys() + [BLANK_PAGE_KEY]
+
+    def _clean_metadata(self, documents: Generator[Document, None, None]):
+        return super()._clean_metadata(self._with_page_source(documents))
+
+    @staticmethod
+    def _with_page_source(documents: Generator[Document, None, None]) -> Generator[Document, None, None]:
+        for document in documents:
+            page_source = document.metadata.pop(PAGE_SOURCE_KEY, None)
+            if page_source:
+                document.metadata['source'] = page_source
             yield document
 
     def _attachment_passes_extension_filters(self, title: str) -> bool:
@@ -1442,23 +1509,26 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
                                    attachment.get('metadata', {}).get('labels', {}).get('results', [])],
                         'download_url': download_url
                     }
+                    if not document.page_content.strip():
+                        document.page_content = document.metadata.get('title', '')
                     try:
-                        resp = self.client.request(method="GET", path=attachment_path, advanced_mode=True)
-                        if resp.status_code == 200:
-                            content = resp.content
-                        else:
-                            content = f"[Failed to download {download_url}: HTTP status code {resp.status_code}]"
+                        resp = self._download_attachment(attachment_path)
                     except Exception as e:
-                        content = f"[Error downloading content: {str(e)}]"
+                        logger.warning(f"Failed to download attachment {download_url}: {e}")
+                        self._track_skipped_attachment(title, reason="error")
+                        self._keep_attachment_as_dependent(document, attachment['id'])
+                        continue
+                    if resp.status_code != 200:
+                        logger.warning(f"Failed to download attachment {download_url}: HTTP status code {resp.status_code}")
+                        self._track_skipped_attachment(title, reason="error")
+                        self._keep_attachment_as_dependent(document, attachment['id'])
+                        continue
 
-                    if isinstance(content, str):
-                        yield Document(page_content=content, metadata=metadata)
-                    else:
-                        yield Document(page_content="", metadata={
-                            **metadata,
-                            IndexerKeywords.CONTENT_FILE_NAME.value: title or f".{file_ext}",
-                            IndexerKeywords.CONTENT_IN_BYTES.value: content
-                        })
+                    yield Document(page_content="", metadata={
+                        **metadata,
+                        IndexerKeywords.CONTENT_FILE_NAME.value: title or f".{file_ext}",
+                        IndexerKeywords.CONTENT_IN_BYTES.value: resp.content
+                    })
                     attachments_yielded = True
         except Exception as e:
             if not attachments_yielded:
@@ -2497,6 +2567,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
     def _index_tool_params(self):
         """Return the parameters for indexing data."""
         return {
+            "chunking_tool": (Literal['text', ''], Field(description="Name of chunking tool", default='text')),
             "content_format": (Literal['view', 'storage', 'export_view', 'editor', 'anonymous'],
                             Field(description="The format of the content to be retrieved.", default='view')),
             "space_key": (Optional[str], Field(
