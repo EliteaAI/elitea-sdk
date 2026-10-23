@@ -30,7 +30,11 @@ import logging
 from functools import wraps
 from typing import List, Optional, Dict, Any, Callable, Tuple
 
-from elitea_sdk.runtime.exceptions import budget_exceeded_from, SandboxAdmissionRefused
+from elitea_sdk.runtime.exceptions import (
+    InputGuardrailBlocked,
+    SandboxAdmissionRefused,
+    budget_exceeded_from,
+)
 from elitea_sdk.runtime.tool_outcome import (
     ToolOutcome,
     ToolResultStatus,
@@ -79,6 +83,10 @@ def reraise_signal_exceptions(error: Exception) -> None:
     # "This execution path does not exist" - the agent loop branches on it to fall
     # back from ainvoke to invoke, so turning it into prose would break that fallback.
     if isinstance(error, NotImplementedError):
+        raise error
+
+    # A guardrail block inside a sub-agent must stop the run, not come back as prose
+    if isinstance(error, InputGuardrailBlocked):
         raise error
 
     # Budget rejections bypass the strategies: TransformErrorStrategy would

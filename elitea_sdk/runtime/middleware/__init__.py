@@ -72,6 +72,7 @@ from .base import (
     Middleware,
     MiddlewareManager,
 )
+from .input_guard import InputGuardMiddleware
 from .planning import PlanningMiddleware
 from .project_context import ProjectContextMiddleware
 from .sensitive_tool_guard import SensitiveToolGuardMiddleware
@@ -89,6 +90,7 @@ from .strategies import (
 __all__ = [
     "Middleware",
     "MiddlewareManager",
+    "InputGuardMiddleware",
     "PlanningMiddleware",
     "ProjectContextMiddleware",
     "SensitiveToolGuardMiddleware",

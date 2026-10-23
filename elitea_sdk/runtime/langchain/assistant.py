@@ -7,7 +7,7 @@ from jinja2 import DebugUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from langgraph.errors import GraphBubbleUp
 
-from ..exceptions import budget_exceeded_from
+from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage, ToolMessage
@@ -1260,7 +1260,7 @@ class Assistant:
                 try:
                     result = application_tool.invoke({"task": task}, config=config)
                     content = _extract_subagent_output(result)
-                except GraphBubbleUp:
+                except (GraphBubbleUp, InputGuardrailBlocked):
                     raise
                 except Exception as e:
                     # Otherwise the rejection returns as a handoff message and the main

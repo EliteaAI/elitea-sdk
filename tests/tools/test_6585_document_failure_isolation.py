@@ -19,6 +19,8 @@ already flushed, leave a lost document out of the report, or collapse several fa
 into one entry. Lives outside tests/tools/index/ because CI skips that directory.
 """
 
+import itertools
+
 import pytest
 from langchain_core.documents import Document
 
@@ -1089,7 +1091,7 @@ def stub_parser(monkeypatch, parse):
 def index_through_real_pipeline(monkeypatch, documents, parsed_as=None, parse=None, dependents=None,
                                 toolkit_cls=ParsingStagingToolkit, configure=lambda toolkit: None,
                                 before_loading=lambda toolkit: None, chunking_tool=None,
-                                workers=1, staging=True, source=None):
+                                workers=1, staging=True, source=None, rejects=lambda document: False):
     toolkit = build_staged_toolkit(monkeypatch, toolkit_cls)
     toolkit.vector_adapter.supports_run_staging = staging
     object.__setattr__(toolkit, "embeddings", None)
@@ -1104,11 +1106,14 @@ def index_through_real_pipeline(monkeypatch, documents, parsed_as=None, parse=No
             lambda self, document: iter(dependents.get(self._extract_doc_name(document.metadata), ())),
         )
     write_index_meta = llm_processor.add_documents
+    row_numbers = itertools.count(1)
 
     def add_documents(vectorstore=None, documents=None, ids=None):
         if documents[0].page_content.startswith(IndexerKeywords.INDEX_META_TYPE.value):
             return write_index_meta(vectorstore=vectorstore, documents=documents, ids=ids)
-        return [f"row-{BaseIndexerToolkit._staging_key(doc.metadata)}" for doc in documents]
+        if any(rejects(doc) for doc in documents):
+            raise RuntimeError("the store rejected the batch")
+        return [f"row-{BaseIndexerToolkit._staging_key(doc.metadata)}-{next(row_numbers)}" for doc in documents]
 
     def loader(self, **kwargs):
         before_loading(self)

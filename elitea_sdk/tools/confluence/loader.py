@@ -1,3 +1,4 @@
+import re
 from io import BytesIO
 from typing import Optional, List
 from logging import getLogger
@@ -69,9 +70,40 @@ class EliteAConfluenceLoader(ConfluenceLoader):
         self.number_of_retries: int = kwargs.get('number_of_retries', 3)
         self.min_retry_seconds: int = kwargs.get('min_retry_seconds', 5)
         self.max_retry_seconds: int = kwargs.get('max_retry_seconds', 60)
-        if self.label or self.cql or self.page_ids:
+        if self.space_key and (self.label or self.cql or self.page_ids):
+            # Space combined with other filters narrows them instead of adding the whole space
+            self.cql = self._space_scoped_cql(self.space_key, self.cql, self.label, self.page_ids)
+            self.label = None
+            self.page_ids = None
             self.space_key = None
         self.confluence = confluence_client
+
+    @staticmethod
+    def _cql_quote(value) -> str:
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    @classmethod
+    def _space_scoped_cql(cls, space_key: str, cql: Optional[str], label: Optional[str],
+                          page_ids: Optional[List[str]]) -> str:
+        """Fold CQL, label and page id filters into one CQL query limited to space_key.
+
+        Upstream runs each filter as an independent query (a union); label and page id lookups cannot be
+        limited to a space, so the union is expressed as one OR-ed CQL query intersected with the space.
+        """
+        order_by = ''
+        if cql:
+            match = re.search(r'\s+order\s+by\s+.*$', cql, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                order_by = cql[match.start():]
+                cql = cql[:match.start()]
+        conditions = []
+        if cql and cql.strip():
+            conditions.append(f'({cql.strip()})')
+        if label:
+            conditions.append(f'(type=page AND label={cls._cql_quote(label)})')
+        if page_ids:
+            conditions.append(f'(id in ({",".join(cls._cql_quote(page_id) for page_id in page_ids)}))')
+        return f'space={cls._cql_quote(space_key)} AND ({" OR ".join(conditions)}){order_by}'
 
     def __perform_llm_prediction_for_image(self, image: Image) -> str:
         byte_array, image_format = encode_image_for_llm(image)

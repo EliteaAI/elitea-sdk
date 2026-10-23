@@ -12,6 +12,7 @@ from ...configurations.pgvector import PgVectorConfiguration
 from ...configurations.sharepoint import SharepointConfiguration
 from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
+from ...runtime.utils.mcp_oauth import entra_token_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +156,9 @@ class SharepointToolkit(BaseToolkit):
                 if isinstance(token, dict):
                     if token.get('refresh_token'):
                         wrapper_payload['refresh_token'] = token['refresh_token']
-                    oauth_discovery = sp_config.get('oauth_discovery_endpoint', '').rstrip('/')
+                    oauth_discovery = sp_config.get('oauth_discovery_endpoint', '')
                     if oauth_discovery:
-                        wrapper_payload['oauth_token_endpoint'] = f"{oauth_discovery}/v2.0/oauth2/token"
+                        wrapper_payload['oauth_token_endpoint'] = entra_token_endpoint(oauth_discovery)
                 # Delegated tokens from mcp_tokens are always Azure AD Graph tokens.
                 # Ensure 'scopes' is non-empty so validate_toolkit selects
                 # SharepointGraphWrapper (token + scopes path) rather than

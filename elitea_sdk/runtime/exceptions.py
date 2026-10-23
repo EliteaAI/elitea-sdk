@@ -118,6 +118,29 @@ class SandboxAdmissionRefused(Exception):
         self.retry_after = retry_after
 
 
+class InputGuardrailBlocked(Exception):
+    """The input guardrail (#6886) blocked a model call: the input held a credential
+    or other data the policy does not allow to reach a model.
+
+    Never swallowed, for the same reason as BudgetExceededError: turning it into
+    message content would hand the parent model a policy rejection to reason about.
+    The message and attributes name categories and rule ids only, never the value.
+    """
+
+    error_code = "input_guardrail_blocked"
+
+    def __init__(self, categories=(), rules=(), segments=(), summary=None):
+        self.categories = list(categories)
+        self.rules = list(rules)
+        self.segments = list(segments)
+        self.summary = summary or {}
+        label = ", ".join(self.categories) or "restricted data"
+        super().__init__(
+            f"Input blocked by the input guardrail: it appears to contain {label}. "
+            "It was not sent to the model."
+        )
+
+
 def budget_exceeded_from(exc):
     """Return a BudgetExceededError if exc is a budget rejection, else None.
 

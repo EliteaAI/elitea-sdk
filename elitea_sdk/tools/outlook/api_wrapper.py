@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
+from ...configurations.outlook import normalize_outlook_scopes
 from .graph_wrapper import OutlookGraphWrapper
 from ..utils.tool_groups import tool_group, with_tool_groups
 from .models import (
@@ -53,6 +54,12 @@ class OutlookApiWrapper(BaseModel):
     class Config:
         arbitrary_types_allowed = True
         extra = "allow"
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value):
+        # Only the permissions the credential offers reach sign-in and token refresh.
+        return normalize_outlook_scopes(value)
 
     @model_validator(mode="after")
     def validate_and_create_backend(self) -> "OutlookApiWrapper":
