@@ -1,5 +1,6 @@
 """Native message preservation, replay and parallel task isolation without inference."""
 import asyncio
+import json
 import importlib.util
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -219,12 +220,22 @@ def test_image_reaches_vision_pin_and_requests_image_modality():
     assert native.inputs[-1][-1] is task
 
 
+def test_typeless_converse_image_is_sized_as_an_image_not_its_bytes():
+    raw = b'\x89PNG' + b'\x00'*600000
+    payload = {'messages': [{'role': 'user', 'content': [{'text': 'describe'},
+               {'image': {'format': 'png', 'source': {'bytes': raw}}}]}], 'blob': raw}
+    sized = m.sized_images(payload)
+    assert sized['messages'][0]['content'][0] == {'text': 'describe'}
+    assert len(json.dumps(sized)) < 3*m.IMAGE_INPUT_BYTES
+
+
 def test_text_only_pin_replaces_image_with_placeholder():
     auto, native, calls = model()
     request = auto.owner._request
     def text_only(method, url, **kwargs):
         response = request(method, url, **kwargs)
-        body = response.json();body['config']['supports_vision'] = False
+        body = response.json()
+        body['config']['supports_vision'] = False
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
     auto.owner._request = text_only
     task = HumanMessage(content=[{'type': 'text', 'text': 'describe'}, {'type': 'image_url', 'image_url': {'url': 'data:fixture'}}])

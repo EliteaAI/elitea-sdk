@@ -51,13 +51,20 @@ def without_images(messages):
 
 
 def sized_images(value):
-    """Swap image payloads for a fixed-size stand-in so byte screens estimate image tokens."""
+    """Swap image payloads for a fixed-size stand-in so byte screens estimate image tokens.
+
+    Covers typed blocks (OpenAI, Anthropic) and Converse-style typeless
+    ``{'image': {'format', 'source': {'bytes'}}}`` blocks; raw bytes are never stringified.
+    """
     if isinstance(value, dict):
-        if value.get('type') in IMAGE_BLOCKS:
-            return {'type': value['type'], 'estimate': 'x' * IMAGE_INPUT_BYTES}
+        image = value.get('image')
+        if value.get('type') in IMAGE_BLOCKS or (isinstance(image, dict) and 'source' in image):
+            return {'type': value.get('type', 'image'), 'estimate': 'x' * IMAGE_INPUT_BYTES}
         return {k: sized_images(v) for k, v in value.items()}
     if isinstance(value, list):
         return [sized_images(v) for v in value]
+    if isinstance(value, (bytes, bytearray)):
+        return 'x' * IMAGE_INPUT_BYTES
     return value
 
 
