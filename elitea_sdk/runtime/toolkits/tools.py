@@ -9,8 +9,10 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field
 
+from elitea_sdk.tools import AVAILABLE_TOOLS, TOOLKIT_TYPE_ALIASES
 from elitea_sdk.tools import get_toolkits as elitea_toolkits
-from elitea_sdk.tools import get_tools as elitea_tools
+from elitea_sdk.tools import get_tools as elitea_tools, release_run_slots
+from ..credential_slots import GovernedCredentialError, has_slots, memoize_slot_scans
 from .application import ApplicationToolkit
 from .artifact import ArtifactToolkit
 from .vectorstore import VectorStoreToolkit
@@ -960,6 +962,7 @@ def get_toolkits():
     return core_toolkits + mcp_config_toolkits + community_toolkits() + elitea_toolkits()
 
 
+@memoize_slot_scans
 def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None, auto_approve_sensitive_actions: bool = False) -> list:
     """
     Process tool configurations and return instantiated tools.
@@ -1036,6 +1039,11 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     _delegated_auth_errors: Dict[str, McpAuthorizationRequired] = {}
 
     for tool in deduplicated_tools:
+        # A governed credential slot is only resolved for built-in, configuration-backed toolkits
+        # (elitea_sdk.tools.get_tools). MCP, application, community and custom-module tools would
+        # run with the slot unresolved, so refuse them before any branch below handles them.
+        if has_slots(tool.get('settings')) and TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type']) not in AVAILABLE_TOOLS:
+            raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
         # Flag to track if this tool was processed by the main loop
         # Used to prevent double processing by fallback systems
         tool_handled = False
@@ -1666,6 +1674,8 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     # Tool must have its own logic of handling it
     if mcp_tokens:
         for tool in unhandled_tools:
+            if has_slots(tool.get('settings')):
+                continue  # governed toolkits never receive the browser token map
             if 'settings' not in tool:
                 tool['settings'] = {}
             tool['settings']['tokens'] = mcp_tokens
@@ -1676,9 +1686,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
     # prevents agent re-prompt loops while preserving construction-time auth for direct
     # nodes (issues #5638 and #5925).
     _elitea_loaded_count = 0
+    # Governed credential slots of all these toolkits are released in one resolver call, before the first build.
+    _released_slots = release_run_slots(unhandled_tools, elitea_client)
     for _u_tool in unhandled_tools:
         try:
-            _loaded = elitea_tools([_u_tool], elitea_client, llm, memory_store)
+            _loaded = elitea_tools([_u_tool], elitea_client, llm, memory_store,
+                                   **({'released_slots': _released_slots} if _released_slots else {}))
             tools += _loaded
             _elitea_loaded_count += len(_loaded)
         except McpAuthorizationRequired as auth_err:
@@ -1762,6 +1775,9 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                     "[Toolkit Auth] Deferred authorization for built-in toolkit with %d proxy tool(s)",
                     len(_proxies),
                 )
+    for _envelopes in _released_slots.values():  # released material must not outlive the build
+        _envelopes.clear()
+    _released_slots.clear()
     logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {_elitea_loaded_count} tools")
 
     # Add MCP tools registered via elitea-mcp CLI (static registry)
