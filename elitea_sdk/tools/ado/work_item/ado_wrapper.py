@@ -7,7 +7,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Generator, Optional
+from typing import Any, Dict, List, Generator, Literal, Optional
 
 from azure.devops.connection import Connection
 from azure.devops.v7_1.core import CoreClient
@@ -60,6 +60,10 @@ _ATTACHMENT_STREAM_CEILING_BYTES = 100 * 1024 * 1024
 # The budget is per call, tracked by the serial gates-off loop — concurrent callers
 # (e.g. indexer fetch workers) each get their own, so the aggregate scales with workers.
 _WORK_ITEM_STREAM_BUDGET_BYTES = 512 * 1024 * 1024
+# Work item fields whose value fits on one line and under this many characters are
+# rendered as "- **name:** value" bullets by the markdown indexing path; longer ones
+# get their own '## name' section.
+_MARKDOWN_INLINE_FIELD_CHARS = 200
 _IMAGE_UNAVAILABLE = "[image unavailable: {reason}]"
 _IMAGE_LIMIT_NOTE = "[image skipped: per-call image limit of {limit} reached]"
 _IMAGE_BUDGET_NOTE = "[image skipped: per-call download budget reached]"
@@ -1375,6 +1379,10 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         image_description_prompt: Optional[str] = None,
         fields: Optional[List[str]] = None,
         sanitize: Optional[bool] = True,
+        chunking_tool: Optional[str] = None,
+        include_attachments: Optional[bool] = False,
+        include_extensions: Optional[List[str]] = None,
+        skip_extensions: Optional[List[str]] = None,
         **kwargs,
     ) -> Generator[Document, None, None]:
         # Expose worker count to _save_index_generator (base-doc executor) and
@@ -1399,6 +1407,13 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         # dicts). process_images still injects image descriptions when on;
         # they survive sanitize=False as <img image-description="..."> markup.
         self._index_sanitize = True if sanitize is None else bool(sanitize)
+        # chunking_tool='markdown' renders the work item as markdown and hands it
+        # to the chunker as bytes so chunking_config ('.md' max_tokens) applies;
+        # empty keeps the single JSON chunk.
+        self._index_chunking_tool = chunking_tool or None
+        self._index_include_attachments = bool(include_attachments)
+        self._index_include_extensions = include_extensions or []
+        self._index_skip_extensions = skip_extensions or []
         result = self._client.query_by_wiql(Wiql(query=wiql))
         # Flat queries (FROM workitems) populate .work_items; tree/link queries
         # (FROM workitemLinks ... MODE (Recursive)) populate .work_item_relations
@@ -1478,6 +1493,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         image_prompt = getattr(self, "_index_image_description_prompt", None)
         fields_filter = getattr(self, "_index_fields", None)
         sanitize = getattr(self, "_index_sanitize", True)
+        chunking_tool = getattr(self, "_index_chunking_tool", None)
 
         wi = self._client.get_work_item(id=wi_id, project=self.project, expand='all')
         raw_fields = dict(wi.fields or {})
@@ -1541,23 +1557,48 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     value = self._sanitize_html(value)
             filtered[name] = value
 
-        return Document(
-            page_content=json.dumps(filtered, ensure_ascii=False, default=str),
-            metadata={
-                'id': str(wi.id),
-                'type': raw_fields.get('System.WorkItemType', ''),
-                'title': raw_fields.get('System.Title', ''),
-                'state': raw_fields.get('System.State', ''),
-                'area': raw_fields.get('System.AreaPath', ''),
-                'reason': raw_fields.get('System.Reason', ''),
-                'iteration': raw_fields.get('System.IterationPath', ''),
-                'updated_on': raw_fields.get('System.ChangedDate', ''),
-                'attachment_ids': {
-                    rel.url.split('/')[-1]: rel.attributes.get('name', '')
-                    for rel in wi.relations or [] if rel.rel == 'AttachedFile'
-                },
+        metadata = {
+            'id': str(wi.id),
+            'type': raw_fields.get('System.WorkItemType', ''),
+            'title': raw_fields.get('System.Title', ''),
+            'state': raw_fields.get('System.State', ''),
+            'area': raw_fields.get('System.AreaPath', ''),
+            'reason': raw_fields.get('System.Reason', ''),
+            'iteration': raw_fields.get('System.IterationPath', ''),
+            'updated_on': raw_fields.get('System.ChangedDate', ''),
+            'attachment_ids': {
+                rel.url.split('/')[-1]: rel.attributes.get('name', '')
+                for rel in wi.relations or [] if rel.rel == 'AttachedFile'
             },
-        )
+        }
+        if chunking_tool:
+            content = self._work_item_to_markdown(wi.id, raw_fields.get('System.Title', ''), filtered)
+            metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = content.encode('utf-8')
+        else:
+            content = json.dumps(filtered, ensure_ascii=False, default=str)
+        return Document(page_content=content, metadata=metadata)
+
+    @staticmethod
+    def _work_item_to_markdown(wi_id, title, fields: Dict[str, Any]) -> str:
+        """Render the selected fields as markdown: short scalar fields as a
+        bullet list, multi-line or long fields (Description, Repro Steps,
+        Acceptance Criteria, ...) as '## <field>' sections, so the markdown
+        chunker can split a long work item into several chunks."""
+        inline: List[str] = []
+        sections: List[str] = []
+        for name, value in fields.items():
+            if value is None or value == '':
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+            if '\n' in text or len(text) > _MARKDOWN_INLINE_FIELD_CHARS:
+                sections.append(f"## {name}\n\n{text}")
+            else:
+                inline.append(f"- **{name}:** {text}")
+        parts = [f"# {wi_id}: {title}" if title else f"# {wi_id}"]
+        if inline:
+            parts.append('\n'.join(inline))
+        parts.extend(sections)
+        return '\n\n'.join(parts) + '\n'
 
     @staticmethod
     def _flatten_identity(value):
@@ -1590,7 +1631,36 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         content_generator = self._client.get_attachment_content(id=attachment_id, download=True)
         return b"".join(content_generator)
 
+    def _matches_extension_filter(self, name: str) -> bool:
+        """Apply include_extensions/skip_extensions (glob-like, case-insensitive,
+        matched against the file name; same convention as the ADO wiki indexer).
+        Empty include_extensions means "everything not in skip_extensions"."""
+        def _match(pattern):
+            return re.match(re.escape(pattern).replace(r'\*', '.*') + '$', name or '', re.IGNORECASE)
+        if any(_match(p) for p in getattr(self, '_index_skip_extensions', None) or []):
+            return False
+        include = getattr(self, '_index_include_extensions', None) or []
+        return not include or any(_match(p) for p in include)
+
+    def _dependents_diverged(self, document: Document, idx_data) -> bool:
+        # Turning include_attachments on (or changing the extension filters) on a
+        # rerun does not bump System.ChangedDate, so diff the attachment set that
+        # would be indexed now against the stored dependent_docs.
+        if not getattr(self, '_index_include_attachments', False):
+            return False
+        attachment_ids = document.metadata.get('attachment_ids') or {}
+        if isinstance(attachment_ids, str):
+            attachment_ids = json.loads(attachment_ids)
+        current = {att_id for att_id, name in attachment_ids.items() if self._matches_extension_filter(name)}
+        stored = {
+            s for s in (idx_data.get(IndexerKeywords.DEPENDENT_DOCS.value, []) or [])
+            if isinstance(s, str) and s
+        }
+        return current != stored
+
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        if not getattr(self, '_index_include_attachments', False):
+            return
         raw_attachment_ids = document.metadata.get('attachment_ids', {})
 
         # Normalize attachment_ids: accept dict or JSON string, raise otherwise
@@ -1616,7 +1686,30 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )
 
         for attachment_id, file_name in attachment_ids.items():
-            content = self.get_attachment_content(attachment_id=attachment_id)
+            if not self._matches_extension_filter(file_name):
+                self._track_skipped_attachment(file_name, reason="filtered")
+                continue
+            try:
+                content = self._get_attachment_content_capped(
+                    attachment_id, limit=_ATTACHMENT_STREAM_CEILING_BYTES)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Failed to download attachment '%s' (%s) of work item %s: %s",
+                    file_name, attachment_id, document.metadata.get('id'), e,
+                )
+                self._track_skipped_attachment(file_name, reason="error")
+                continue
+            if content is None:
+                logger.warning(
+                    "Attachment '%s' (%s) of work item %s exceeds %s MB; skipped.",
+                    file_name, attachment_id, document.metadata.get('id'),
+                    _ATTACHMENT_STREAM_CEILING_BYTES // (1024 * 1024),
+                )
+                self._track_skipped_attachment(file_name, reason="too_large")
+                continue
+            if not content:
+                self._track_skipped_attachment(file_name, reason="empty")
+                continue
             yield Document(
                 page_content="",
                 metadata={
@@ -1673,6 +1766,40 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     "that inflates the payload. Metadata columns (title, "
                     "state, area, iteration, updated_on) on the resulting "
                     "Document are always populated regardless of this list."
+                ),
+            )),
+            "chunking_tool": (Literal['markdown', ''], Field(
+                default='markdown',
+                description=(
+                    "Chunking tool for the work item itself. 'markdown' (default) "
+                    "renders the selected fields as markdown (short fields as a "
+                    "list, long ones such as Description or Repro Steps as "
+                    "sections) and splits it per chunking_config ('.md' "
+                    "max_tokens). Empty string indexes each work item as a "
+                    "single JSON chunk."
+                ),
+            )),
+            "include_attachments": (Optional[bool], Field(
+                default=False,
+                description=(
+                    "If True, also download and index files attached to work "
+                    "items (AttachedFile relations) as dependent documents, "
+                    "parsed per chunking_config. Default False."
+                ),
+            )),
+            "include_extensions": (Optional[List[str]], Field(
+                default=[],
+                description=(
+                    "Glob-style file-name patterns of attachments to index, e.g. "
+                    "[\"*.pdf\", \"*.docx\"]. Empty list means include everything "
+                    "not in skip_extensions. Ignored unless include_attachments=True."
+                ),
+            )),
+            "skip_extensions": (Optional[List[str]], Field(
+                default=[],
+                description=(
+                    "Glob-style file-name patterns of attachments to skip, e.g. "
+                    "[\"*.zip\", \"*.exe\"]. Evaluated before include_extensions."
                 ),
             )),
             "sanitize": (Optional[bool], Field(
