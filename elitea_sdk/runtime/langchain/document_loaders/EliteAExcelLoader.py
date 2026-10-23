@@ -15,12 +15,18 @@ import io
 import logging
 import os
 import zipfile
-from dataclasses import dataclass
-from typing import Iterator, List, Optional, Union
+from dataclasses import dataclass, field
+from itertools import chain, islice
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 import pandas as pd
+import tiktoken
 from json import loads
 
 from openpyxl import load_workbook
+from openpyxl.packaging.relationship import get_dependents, get_rels_path
+from openpyxl.utils.cell import range_boundaries
+from openpyxl.xml.constants import COMMENTS_NS, REL_NS, SHEET_MAIN_NS
+from openpyxl.xml.functions import iterparse
 from xlrd import open_workbook
 from langchain_core.documents import Document
 from .EliteATableLoader import EliteATableLoader
@@ -29,6 +35,13 @@ from elitea_sdk.runtime.langchain.constants import DEFAULT_MAX_OUTPUT_CHARS, LOA
 logger = logging.getLogger(__name__)
 
 cell_delimiter = " | "
+
+HYPERLINK_TAG = f"{{{SHEET_MAIN_NS}}}hyperlink"
+RELATIONSHIP_ID_ATTRIBUTE = f"{{{REL_NS}}}id"
+MERGE_CELL_TAG = f"{{{SHEET_MAIN_NS}}}mergeCell"
+COMMENT_TAG = f"{{{SHEET_MAIN_NS}}}comment"
+SHEET_ANNOTATION_MARKERS = (b"hyperlink", b"mergeCell")
+SHEET_SCAN_BLOCK_BYTES = 1 << 20
 
 EXCEL_MAX_REQUEST_ROWS = 10_000
 EXCEL_MAX_IMAGE_COUNT = 32
@@ -448,6 +461,206 @@ def _format_row_cells(cells) -> str:
     return cell_delimiter.join(parts)
 
 
+@dataclass(frozen=True)
+class _StreamedLink:
+    target: Optional[str]
+    text_for_empty_cell: Optional[str]
+
+
+@dataclass(frozen=True)
+class _MergedRange:
+    min_column: int
+    min_row: int
+    max_column: int
+    max_row: int
+    xml_order: int
+
+    @property
+    def anchor(self) -> Tuple[int, int]:
+        return self.min_row, self.min_column
+
+    def covers(self, position: Tuple[int, int]) -> bool:
+        row, column = position
+        return self.min_row <= row <= self.max_row and self.min_column <= column <= self.max_column
+
+    def hides(self, position: Tuple[int, int]) -> bool:
+        return position != self.anchor and self.covers(position)
+
+
+@dataclass
+class _MergedRangeSweep:
+    merged_ranges: List[_MergedRange]
+    _ranges_by_first_row: List[_MergedRange] = field(init=False)
+    _next_range: int = field(init=False, default=0)
+    _ranges_on_row: List[_MergedRange] = field(init=False, default_factory=list)
+
+    def __post_init__(self):
+        self._ranges_by_first_row = sorted(self.merged_ranges, key=lambda merged: merged.min_row)
+
+    def ranges_on_row(self, row: int) -> List[_MergedRange]:
+        while (self._next_range < len(self._ranges_by_first_row)
+               and self._ranges_by_first_row[self._next_range].min_row <= row):
+            self._ranges_on_row.append(self._ranges_by_first_row[self._next_range])
+            self._next_range += 1
+        self._ranges_on_row = [merged for merged in self._ranges_on_row if merged.max_row >= row]
+        return self._ranges_on_row
+
+
+@dataclass
+class _StreamedSheetLayout:
+    links: Dict[Tuple[int, int], _StreamedLink]
+    merged_rows: _MergedRangeSweep
+
+    def merged_ranges_on_row(self, row: int) -> List[_MergedRange]:
+        return self.merged_rows.ranges_on_row(row)
+
+
+def _ranges_hiding(positions, merged_ranges: List[_MergedRange]) -> Dict[Tuple[int, int], _MergedRange]:
+    sweep = _MergedRangeSweep(merged_ranges)
+    hiding = {}
+    for position in sorted(positions):
+        candidates = [merged for merged in sweep.ranges_on_row(position[0]) if merged.hides(position)]
+        if candidates:
+            hiding[position] = min(candidates, key=lambda merged: merged.xml_order)
+    return hiding
+
+
+@dataclass
+class _SheetAnnotations:
+    merged_ranges: List[str]
+    hyperlinks: List[Tuple[str, Optional[str], Optional[str]]]
+
+
+def _render_streamed_cell(value, layout: _StreamedSheetLayout, position: Tuple[int, int],
+                          merged_ranges_on_row: List[_MergedRange]) -> str:
+    if any(merged.hides(position) for merged in merged_ranges_on_row):
+        value = None
+    link = layout.links.get(position)
+    if link is None:
+        return "" if value is None else str(value)
+    shown = link.text_for_empty_cell if value is None else value
+    return f"[{shown or ''}]({link.target})"
+
+
+def _measure_sheet_extent_from_cells(sheet) -> None:
+    sheet.reset_dimensions()
+    last_row = last_column = None
+    for cells in sheet.rows:
+        if cells:
+            last_row = cells[-1].row
+            last_column = max(last_column or 0, cells[-1].column)
+    sheet._max_row, sheet._max_column = last_row, last_column
+
+
+def _widen_sheet_extent(sheet, ref: str) -> Tuple[int, int, int, int]:
+    min_column, min_row, max_column, max_row = range_boundaries(ref)
+    sheet._max_row = max(sheet._max_row or 0, max_row)
+    sheet._max_column = max(sheet._max_column or 0, max_column)
+    return min_column, min_row, max_column, max_row
+
+
+def _cells_of(bounds: Tuple[int, int, int, int]) -> Iterator[Tuple[int, int]]:
+    min_column, min_row, max_column, max_row = bounds
+    for row in range(min_row, max_row + 1):
+        for column in range(min_column, max_column + 1):
+            yield row, column
+
+
+def _sheet_mentions_annotations(sheet) -> bool:
+    overlap = max(len(marker) for marker in SHEET_ANNOTATION_MARKERS) - 1
+    tail = b""
+    with sheet._get_source() as source:
+        while block := source.read(SHEET_SCAN_BLOCK_BYTES):
+            window = tail + block
+            if any(marker in window for marker in SHEET_ANNOTATION_MARKERS):
+                return True
+            tail = block[-overlap:]
+    return False
+
+
+def _sheet_relationships(sheet):
+    archive = sheet.parent._archive
+    rels_path = get_rels_path(sheet._worksheet_path)
+    if rels_path not in archive.namelist():
+        return None
+    return get_dependents(archive, rels_path)
+
+
+def _read_sheet_annotations(sheet) -> _SheetAnnotations:
+    annotations = _SheetAnnotations(merged_ranges=[], hyperlinks=[])
+    if not _sheet_mentions_annotations(sheet):
+        return annotations
+    with sheet._get_source() as source:
+        for _, element in iterparse(source):
+            if element.tag == MERGE_CELL_TAG and element.get('ref'):
+                annotations.merged_ranges.append(element.get('ref'))
+            elif element.tag == HYPERLINK_TAG and element.get('ref'):
+                annotations.hyperlinks.append(
+                    (element.get('ref'), element.get(RELATIONSHIP_ID_ATTRIBUTE), element.get('location')))
+            element.clear()
+    return annotations
+
+
+def _sheet_comment_refs(sheet, relationships) -> List[str]:
+    if relationships is None:
+        return []
+    refs = []
+    for relationship in relationships.find(COMMENTS_NS):
+        with sheet.parent._archive.open(relationship.target) as source:
+            for _, element in iterparse(source):
+                if element.tag == COMMENT_TAG and element.get('ref'):
+                    refs.append(element.get('ref'))
+                element.clear()
+    return refs
+
+
+def _render_streamed_row(values, row_number: int, layout: _StreamedSheetLayout) -> str:
+    merged_ranges_on_row = layout.merged_ranges_on_row(row_number)
+    return cell_delimiter.join(
+        _render_streamed_cell(value, layout, (row_number, column_number), merged_ranges_on_row)
+        for column_number, value in enumerate(values, start=1)
+    )
+
+
+def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
+    _measure_sheet_extent_from_cells(sheet)
+    annotations = _read_sheet_annotations(sheet)
+    relationships = _sheet_relationships(sheet)
+
+    merged_ranges = [_MergedRange(*_widen_sheet_extent(sheet, merged_range), xml_order=xml_order)
+                     for xml_order, merged_range in enumerate(annotations.merged_ranges)]
+
+    links: Dict[Tuple[int, int], _StreamedLink] = {}
+
+    def bind(position, target, location):
+        previous = links.get(position)
+        filled = previous is not None and previous.text_for_empty_cell is not None
+        text = previous.text_for_empty_cell if filled else (target or location)
+        links[position] = _StreamedLink(target, text)
+
+    placed_links = []
+    for ref, relationship_id, location in annotations.hyperlinks:
+        target = relationships.get(relationship_id).Target if relationship_id and relationships else None
+        bounds = _widen_sheet_extent(sheet, ref)
+        positions = list(_cells_of(bounds)) if ":" in ref else [(bounds[1], bounds[0])]
+        placed_links.append((":" in ref, positions, target, location))
+
+    hiding = _ranges_hiding({position for _, positions, _, _ in placed_links for position in positions},
+                            merged_ranges)
+    for spans_range, positions, target, location in placed_links:
+        if spans_range:
+            for position in positions:
+                if position not in hiding:
+                    bind(position, target, location)
+        else:
+            position = positions[0]
+            bind(hiding[position].anchor if position in hiding else position, target, location)
+
+    for ref in _sheet_comment_refs(sheet, relationships):
+        _widen_sheet_extent(sheet, ref)
+    return _StreamedSheetLayout(links=links, merged_rows=_MergedRangeSweep(merged_ranges))
+
+
 def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
                     include_headers, header_row):
     wb = load_workbook(openable, read_only=True, data_only=True)
@@ -656,8 +869,6 @@ class EliteAExcelLoader(EliteATableLoader):
         self.include_headers = kwargs.get('include_headers', True)
         self.header_row = kwargs.get('header_row', 1)
         self.evaluate_formulas = bool(kwargs.get('evaluate_formulas', False))
-        # TEMPORARY (EL-TODO): lets indexing bypass the safety guard for oversized
-        # sheets until a chunked/streaming read path exists. Not exposed via read_file.
         self.skip_size_check = bool(kwargs.get('skip_size_check', False))
         # Set and validate chunking parameters only once
         self.max_tokens = int(kwargs.get('max_tokens', LOADER_MAX_TOKENS_DEFAULT))
@@ -838,77 +1049,93 @@ class EliteAExcelLoader(EliteATableLoader):
            c. If a single row exceeds max_tokens, it is placed in its own chunk without splitting, with the header prepended if applicable.
         3. Returns: List[str], where each string is a chunk ready for further processing.
         """
-        import tiktoken
-        encoding = tiktoken.get_encoding('cl100k_base')
+        return list(self._iter_row_chunks(iter(rows)))
 
-        # --- Inner functions ---
-        def count_tokens(text):
-            """Count tokens in text using tiktoken encoding."""
-            return len(encoding.encode(text))
+    def _iter_row_chunks(self, rows: Iterator[str]) -> Iterator[str]:
+        if self.max_tokens < 1:
+            yield '\n'.join(rows)
+            return
+
+        header = None
+        if self.add_header_to_chunks:
+            leading_rows = list(islice(rows, self.header_row_number))
+            if leading_rows:
+                header = leading_rows.pop(self.header_row_number - 1)
+            rows = chain(leading_rows, rows)
 
         def finalize_chunk(chunk_rows):
-            """Join rows for a chunk, prepending header if needed."""
             if self.add_header_to_chunks and header:
                 return '\n'.join([header] + chunk_rows)
-            else:
-                return '\n'.join(chunk_rows)
-        # --- End inner functions ---
+            return '\n'.join(chunk_rows)
 
-        # If max_tokens < 1, return all rows as a single chunk
-        if self.max_tokens < 1:
-            return ['\n'.join(rows)]
-
-        # Extract header if needed
-        header = None
-        if self.add_header_to_chunks and rows:
-            header_idx = self.header_row_number - 1
-            header = rows.pop(header_idx)
-
-        chunks = []  # List to store final chunks
-        current_chunk = []  # Accumulate rows for the current chunk
-        current_tokens = 0  # Token count for the current chunk
-
+        encoding = tiktoken.get_encoding('cl100k_base')
+        current_chunk = []
+        current_tokens = 0
         for row in rows:
-            row_tokens = count_tokens(row)
-            # If row itself exceeds max_tokens, flush current chunk and add row as its own chunk (with header if needed)
+            row_tokens = len(encoding.encode(row))
             if row_tokens > self.max_tokens:
                 if current_chunk:
-                    chunks.append(finalize_chunk(current_chunk))
+                    yield finalize_chunk(current_chunk)
                     current_chunk = []
                     current_tokens = 0
-                # Add the large row as its own chunk, with header if needed
-                if self.add_header_to_chunks and header:
-                    chunks.append(finalize_chunk([row]))
-                else:
-                    chunks.append(row)
+                yield finalize_chunk([row])
                 continue
-            # If adding row would exceed max_tokens, flush current chunk and start new
             if current_tokens + row_tokens > self.max_tokens:
                 if current_chunk:
-                    chunks.append(finalize_chunk(current_chunk))
+                    yield finalize_chunk(current_chunk)
                 current_chunk = [row]
                 current_tokens = row_tokens
             else:
                 current_chunk.append(row)
                 current_tokens += row_tokens
-        # Add any remaining rows as the last chunk
         if current_chunk:
-            chunks.append(finalize_chunk(current_chunk))
-        return chunks
+            yield finalize_chunk(current_chunk)
 
-    def load(self) -> list:
-        """Loads Excel file into a list of Documents, one per chunk per sheet."""
-        docs = []
-        content_per_sheet = self.get_content()
-        for sheet_name, content_chunks in content_per_sheet.items():
-            metadata = {
+    def _streams_workbook(self) -> bool:
+        extension = os.path.splitext(str(self.file_name or ''))[-1].lower()
+        return (self.skip_size_check and extension == '.xlsx'
+                and not self.evaluate_formulas and not self._is_row_range_mode())
+
+    def _iter_sheet_chunks(self) -> Iterator[Tuple[str, str]]:
+        if self._streams_workbook():
+            yield from self._stream_xlsx_chunks()
+            return
+        for sheet_name, content_chunks in self.get_content().items():
+            for chunk in content_chunks:
+                yield sheet_name, chunk
+
+    def _stream_xlsx_chunks(self) -> Iterator[Tuple[str, str]]:
+        workbook = load_workbook(self.file_path, read_only=True, data_only=True)
+        try:
+            if self.sheet_name and self.sheet_name not in workbook.sheetnames:
+                yield self.sheet_name, f"Sheet '{self.sheet_name}' does not exist in the workbook."
+                return
+            for sheet_name in [self.sheet_name] if self.sheet_name else workbook.sheetnames:
+                for chunk in self._iter_row_chunks(self._iter_streamed_rows(workbook[sheet_name])):
+                    yield sheet_name, chunk
+        finally:
+            workbook.close()
+
+    def _iter_streamed_rows(self, sheet) -> Iterator[str]:
+        layout = _bind_streamed_sheet_layout(sheet)
+        rows_read = 0
+        for rows_read, values in enumerate(sheet.iter_rows(values_only=True), start=1):
+            yield _render_streamed_row(values, rows_read, layout)
+        blank_row = (None,) * (sheet.max_column or 0)
+        for row_number in range(rows_read + 1, (sheet.max_row or 0) + 1):
+            yield _render_streamed_row(blank_row, row_number, layout)
+
+    def iter_documents(self) -> Iterator[Document]:
+        for sheet_name, chunk in self._iter_sheet_chunks():
+            yield Document(page_content=chunk, metadata={
                 "source": f'{self.file_path}:{sheet_name}',
                 "sheet_name": sheet_name,
                 "file_type": "excel",
-            }
-            for chunk in content_chunks:
-                docs.append(Document(page_content=chunk, metadata=metadata))
-        return docs
+            })
+
+    def load(self) -> list:
+        """Loads Excel file into a list of Documents, one per chunk per sheet."""
+        return list(self.iter_documents())
 
     def read(self, lazy: bool = False):
         df = pd.read_excel(self.file_path, sheet_name=None, engine='calamine')

@@ -57,6 +57,8 @@ def _fake_page(page_id: str, **bodies):
         "_links": {"base": "https://example.atlassian.net", "webui": "/x"},
         "body": {key: {"value": html} for key, html in bodies.items()},
         "version": {"number": 1},
+        # read tools reject pages outside the toolkit space (#6918)
+        "space": {"key": "AT"},
     }
 
 
@@ -104,19 +106,19 @@ class TestReadPageByIdExpand:
         wrapper.client.get_page_by_id.return_value = _fake_page("123")
         wrapper.read_page_by_id("123")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.view,version"
+        assert kwargs["expand"] == "body.view,version,space"
 
     def test_override_storage_changes_expand(self, wrapper):
         wrapper.client.get_page_by_id.return_value = _fake_page("123")
         wrapper.read_page_by_id("123", content_format="storage")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.storage,version"
+        assert kwargs["expand"] == "body.storage,version,space"
 
     def test_override_export_view_changes_expand(self, wrapper):
         wrapper.client.get_page_by_id.return_value = _fake_page("123", export_view="<p>x</p>")
         wrapper.read_page_by_id("123", content_format="export_view")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.export_view,version"
+        assert kwargs["expand"] == "body.export_view,version,space"
 
     def test_unknown_override_falls_back_to_toolkit_default(self, wrapper):
         wrapper.client.get_page_by_id.return_value = _fake_page("123")
@@ -124,7 +126,7 @@ class TestReadPageByIdExpand:
         # Bypass the schema layer by calling read_page_by_id directly with an unknown value.
         wrapper.read_page_by_id("123", content_format="nonexistent_format")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.view,version"
+        assert kwargs["expand"] == "body.view,version,space"
 
     def test_override_does_not_mutate_toolkit_state(self, wrapper):
         """Per-call override must not change self.content_format for future calls."""
@@ -135,7 +137,7 @@ class TestReadPageByIdExpand:
         wrapper.client.get_page_by_id.return_value = _fake_page("456")
         wrapper.read_page_by_id("456")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.view,version"
+        assert kwargs["expand"] == "body.view,version,space"
 
 
 class TestProcessPageRendering:
@@ -171,7 +173,7 @@ class TestStyledView:
         wrapper.client.get_page_by_id.return_value = _fake_page("123", styled_view="<p>STYLED-MARKER</p>")
         wrapper.read_page_by_id("123", content_format="styled_view")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.styled_view,version"
+        assert kwargs["expand"] == "body.styled_view,version,space"
 
     def test_renders_styled_view_body(self, wrapper):
         wrapper.client.get_page_by_id.return_value = _fake_page(
@@ -197,7 +199,7 @@ class TestAtlasDocFormat:
         wrapper.client.get_page_by_id.return_value = _fake_page("123", atlas_doc_format=self.ADF_JSON)
         wrapper.read_page_by_id("123", content_format="atlas_doc_format")
         kwargs = wrapper.client.get_page_by_id.call_args.kwargs
-        assert kwargs["expand"] == "body.atlas_doc_format,version"
+        assert kwargs["expand"] == "body.atlas_doc_format,version,space"
 
     def test_returns_adf_json_verbatim(self, wrapper):
         """The ADF JSON must be passed through without HTML stripping."""

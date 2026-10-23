@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 _IMAGE_TOKEN_ESTIMATE = 85
 
 
+def _response_text(response) -> str:
+    """Text of a model response; reasoning models return content blocks (thinking + text)."""
+    content = getattr(response, 'content', response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ''.join(
+            block if isinstance(block, str) else (block.get('text') or '')
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get('type') == 'text')
+        )
+    return str(content or '')
+
+
 def _is_tool_related_message(msg) -> bool:
     """Check if a message is part of a tool-call interaction (not user-facing).
 
@@ -136,6 +150,10 @@ TOOL_RESULT_SUMMARY_INPUT_CHARS = 128_000
 SUMMARIZED_SENTINEL = '[tool result summarized: context floor]'
 
 
+# Keeps summary calls out of the run's callback rollup; their usage is reported in auxiliary_usage (#6898)
+_NO_RUN_CALLBACKS = {'callbacks': []}
+
+
 class SummarizationMiddleware(LangChainSummarizationMiddleware):
     """
     Extends LangChain's SummarizationMiddleware with EliteA-specific features.
@@ -182,6 +200,8 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         self.conversation_id = conversation_id
         self.callbacks = callbacks or {}
         self.last_context_info = None
+        # Summarization calls run without the run's callbacks, so this is the only report of their usage
+        self._auxiliary_usage: List[Dict[str, Any]] = []
         self._last_fitting_count = 0
         self.summarization_enabled = summarization_enabled
 
@@ -208,6 +228,32 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             f"SummarizationMiddleware initialized "
             f"(trigger={self.trigger}, keep={self.keep}, summarization_enabled={self.summarization_enabled})"
         )
+
+    @property
+    def last_context_info(self) -> Optional[Dict[str, Any]]:
+        info = self._last_context_info
+        if info is not None and self._auxiliary_usage:
+            return {**info, 'auxiliary_usage': list(self._auxiliary_usage)}
+        return info
+
+    @last_context_info.setter
+    def last_context_info(self, value: Optional[Dict[str, Any]]) -> None:
+        self._last_context_info = value
+
+    def _record_usage(self, response: Any) -> None:
+        usage = getattr(response, 'usage_metadata', None) or {}
+        if not usage:
+            return
+        details = usage.get('input_token_details') or {}
+        metadata = getattr(response, 'response_metadata', None) or {}
+        self._auxiliary_usage.append({
+            'model_name': metadata.get('model_name') or getattr(self.model, 'model_name', None)
+            or getattr(self.model, 'model', None),
+            'input_tokens': usage.get('input_tokens', 0),
+            'output_tokens': usage.get('output_tokens', 0),
+            'cache_read_tokens': details.get('cache_read', 0),
+            'cache_creation_tokens': details.get('cache_creation', 0),
+        })
 
     def get_tools(self) -> List[BaseTool]:
         """No tools - operates on state directly."""
@@ -317,7 +363,9 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             name=getattr(message, 'name', None) or 'unknown', args=args, content=content,
         )
         try:
-            return self.model.invoke([HumanMessage(content=prompt)]).text.strip()
+            response = self.model.invoke([HumanMessage(content=prompt)], config=_NO_RUN_CALLBACKS)
+            self._record_usage(response)
+            return response.text.strip()
         except Exception as e:
             logger.warning(f"Mid-loop tool result summary failed, leaving it to the floor: {e}")
             return None
@@ -415,7 +463,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             self._last_fitting_count = 0
             return super()._determine_cutoff_index(messages)
 
-        remaining_budget = max(0, trigger_limit - preserved_tokens)
+        # A trigger that counts the prefix must leave room for it, otherwise every
+        # message "fits" and nothing is summarized
+        overhead = sum(self.prompt_overhead.values()) if self.count_overhead_in_trigger else 0
+        remaining_budget = max(0, trigger_limit - overhead - preserved_tokens)
 
         fitting_count = 0
         tokens_so_far = 0
@@ -427,8 +478,9 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             else:
                 break
 
-        self._last_fitting_count = fitting_count
-        cutoff_index = len(pre_preserved) - fitting_count
+        # Don't split AIMessage tool_calls from their ToolMessage results
+        cutoff_index = self._find_safe_cutoff_point(messages, len(pre_preserved) - fitting_count)
+        self._last_fitting_count = max(0, len(pre_preserved) - cutoff_index)
         return cutoff_index
 
     def before_model(self, state: dict, config: dict) -> Optional[dict]:
@@ -551,6 +603,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         })
 
         summary = self._create_summary(messages_to_summarize)
+        if summary is None:
+            # Keep the history rather than replacing it with an error text
+            self._fire_callback('summarized', {**(self.last_context_info or {}), 'summarized': False})
+            return None
 
         # User-facing counts for preserved messages (exclude tool internals)
         preserved_user_facing = [m for m in preserved_messages if not _is_tool_related_message(m)]
@@ -646,8 +702,8 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
 
         return None  # No state updates needed
 
-    def _create_summary(self, messages_to_summarize: list) -> str:
-        """Generate summary for the given messages.
+    def _create_summary(self, messages_to_summarize: list) -> Optional[str]:
+        """Generate summary for the given messages; None when the summary call fails.
 
         Override to handle response.content vs response.text compatibility.
         """
@@ -689,21 +745,17 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
                 prompt_content = f"{self.summary_prompt}\n\n<messages>\n{formatted_messages}\n</messages>"
 
             # Wrap in HumanMessage for model compatibility
-            response = self.model.invoke([HumanMessage(content=prompt_content)])
+            response = self.model.invoke([HumanMessage(content=prompt_content)], config=_NO_RUN_CALLBACKS)
+            self._record_usage(response)
 
-            # Handle both .text and .content
-            if hasattr(response, 'content'):
-                content = response.content
-                result = content.strip() if isinstance(content, str) else str(content)
-            elif hasattr(response, 'text'):
-                result = response.text.strip()
-            else:
-                result = str(response)
-            logger.info(f'Summary response has no content or text attribute, using {result}')
+            result = _response_text(response).strip()
+            if not result:
+                logger.error("Summary response has no text content")
+                return None
             return result
         except Exception as e:
             logger.error(f"Error generating summary: {e}")
-            return f"Error generating summary: {e!s}"
+            return None
 
     def _trim_messages_for_summary(self, messages: list) -> list:
         """Trim messages to fit within summary generation limits.

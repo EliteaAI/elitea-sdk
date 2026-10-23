@@ -11,8 +11,8 @@ description: |
   - Response contains status code and response data.
 
 toolkits:
-  - id: ${CONFLUENCE_TOOLKIT_ID}
-    name: ${CONFLUENCE_TOOLKIT_NAME}
+  - id: ${CONFLUENCE_UNRESTRICTED_TOOLKIT_ID}
+    name: ${CONFLUENCE_UNRESTRICTED_TOOLKIT_NAME}
 
 state:
   method:
@@ -35,7 +35,7 @@ nodes:
   - id: invoke_execute_generic_confluence
     type: toolkit
     tool: execute_generic_confluence
-    toolkit_name: ${CONFLUENCE_TOOLKIT_NAME}
+    toolkit_name: ${CONFLUENCE_UNRESTRICTED_TOOLKIT_NAME}
     input:
       - method
       - relative_url
