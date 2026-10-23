@@ -129,9 +129,9 @@ create_wi_field = """JSON of the work item fields to create in Azure DevOps, i.e
 # Input models for Azure DevOps operations
 ADOWorkItemsSearch = create_model(
     "AzureDevOpsSearchModel",
-    query=(str, Field(description="WIQL query for searching Azure DevOps work items")),
+    query=(str, Field(description="WIQL query for searching Azure DevOps work items. When `fields` is not provided, the columns in the SELECT clause are the fields returned for each work item.")),
     limit=(Optional[int], Field(description="Number of items to return. IMPORTANT: Tool returns all items if limit=-1. If parameter is not provided then the value will be taken from tool configuration.", default=None)),
-    fields=(Optional[list[str]], Field(description="Comma-separated list of requested fields", default=None))
+    fields=(Optional[list[str]], Field(description="Field reference names to return for each work item, e.g. ['System.Title', 'System.WorkItemType', 'System.State']. Overrides the WIQL SELECT columns. If neither is given, returns System.Title, System.State, System.AssignedTo, System.WorkItemType, System.CreatedDate and System.ChangedDate. Every item always includes its id and url.", default=None))
 )
 
 ADOWorkItemsTextSearch = create_model(
@@ -295,18 +295,24 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         return super().validate_toolkit(values)
 
-    def _parse_work_items(self, work_items, fields=None):
-        """Parse work items dynamically based on the fields requested."""
+    def _parse_work_items(self, work_items, fields=None, columns=None):
+        """Parse work items dynamically based on the fields requested.
+
+        `columns` are the WIQL SELECT columns; they are used when no explicit `fields` are given.
+        """
         parsed_items = []
 
-        # If no specific fields are provided, default to the basic ones
+        # If no specific fields are provided, use the WIQL SELECT columns
         if fields is None:
-            fields = ["System.Title", "System.State", "System.AssignedTo", "System.WorkItemType", "System.CreatedDate",
-                      "System.ChangedDate"]
+            fields = [column.reference_name for column in columns or [] if getattr(column, "reference_name", None)]
 
         # Remove 'System.Id' from the fields list, as it's not a field you request, it's metadata
         fields = [field for field in fields if "System.Id" not in field]
-        fields = [field for field in fields if "System.WorkItemType" not in field]
+
+        # Fall back to the basic fields when nothing else is left to request
+        if not fields:
+            fields = ["System.Title", "System.State", "System.AssignedTo", "System.WorkItemType", "System.CreatedDate",
+                      "System.ChangedDate"]
         for item in work_items:
             # Fetch full details of the work item, including the requested fields
             full_item = self._client.get_work_item(id=item.id, project=self.project, fields=fields)
@@ -565,7 +571,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
     @tool_group('read')
     def search_work_items(self, query: str, limit: int = None, fields=None):
-        """Search for work items with a WIQL query (SELECT ... FROM WorkItems WHERE ...) and dynamically fetch fields based on the query. Requires a valid WIQL statement, not free text - for keyword or phrase search use search_work_items_by_text."""
+        """Search for work items with a WIQL query (SELECT ... FROM WorkItems WHERE ...). Requires a valid WIQL statement, not free text - for keyword or phrase search use search_work_items_by_text.
+        Each result has id, url and the fields named in the SELECT clause, e.g. SELECT [System.Id], [System.Title], [System.WorkItemType], [System.State] FROM WorkItems WHERE ...
+        Pass `fields` to return a different set of fields than the SELECT clause."""
         try:
             # Create a Wiql object with the query
             wiql = Wiql(query=query)
@@ -577,13 +585,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             # Execute the WIQL query
             if not limit:
                 limit = self.limit
-            work_items = self._client.query_by_wiql(wiql, top=None if limit < 0 else limit, team_context=TeamContext(project=self.project)).work_items
+            query_result = self._client.query_by_wiql(wiql, top=None if limit < 0 else limit, team_context=TeamContext(project=self.project))
+            work_items = query_result.work_items
 
             if not work_items:
                 return "No work items found."
 
             # Parse the work items and fetch the fields dynamically
-            parsed_work_items = self._parse_work_items(work_items, fields)
+            parsed_work_items = self._parse_work_items(work_items, fields, columns=query_result.columns)
 
             # Return the parsed work items
             return parsed_work_items

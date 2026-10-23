@@ -7,7 +7,7 @@ from pydantic.fields import Field
 from .api_wrapper import DataverseApiWrapper
 from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
-from ...configurations.dataverse import DataverseConfiguration
+from ...configurations.dataverse import DataverseConfiguration, entra_authority
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "dataverse"
@@ -17,6 +17,7 @@ def get_tools(tool):
     return DataverseToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         dataverse_configuration=tool['settings']['dataverse_configuration'],
+        tokens=tool['settings'].get('tokens', {}),
         toolkit_name=tool.get('toolkit_name'),
     ).get_tools()
 
@@ -48,7 +49,11 @@ class DataverseToolkit(BaseToolkit):
     @filter_missconfigured_index_tools
     def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, **kwargs):
         selected_tools = selected_tools or []
-        wrapper_payload = {**kwargs, **kwargs.get('dataverse_configuration', {})}
+        config = kwargs.get('dataverse_configuration', {})
+        wrapper_payload = {**kwargs, **config}
+        injected = (kwargs.get('tokens') or {}).get(f"{config.get('configuration_uuid')}:{entra_authority(config)}")
+        if injected:
+            wrapper_payload['access_token'] = injected.get('access_token') if isinstance(injected, dict) else injected
         api_wrapper = DataverseApiWrapper(**wrapper_payload)
         tools = []
         for tool in api_wrapper.get_available_tools():
