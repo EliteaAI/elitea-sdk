@@ -52,6 +52,18 @@ def _sanitize_text(text: str) -> str:
     return text.replace('\x00', '')
 
 
+def _attachment_prefix(metadata: dict, filename: str) -> str:
+    """Context put in front of every attachment chunk: the email subject plus the attachment name."""
+    subject = f"**Subject:** {_sanitize_text(metadata['subject'])}\n" if metadata.get('subject') else ''
+    return f"{subject}**Attachment: {filename}**\n\n"
+
+
+def _attachment_budget(max_tokens: int, prefix: str) -> int:
+    """Tokens left for attachment content once the prefix is counted against max_tokens."""
+    from elitea_sdk.tools.chunkers.utils import tiktoken_length
+    return max(max_tokens - tiktoken_length(prefix), 1)
+
+
 class EliteAEmailLoader(BaseLoader):
     """
     Loader for email files (.eml and .msg formats).
@@ -220,17 +232,19 @@ class EliteAEmailLoader(BaseLoader):
         Returns:
             List of Documents with email content and metadata.
         """
+        return self._elements_to_documents(self._partition(file_obj, file_type), file_type)
+
+    @staticmethod
+    def _partition(file_obj, file_type: str):
+        """Split the email into unstructured elements (body only, attachments are handled separately)."""
         if file_type == 'eml':
             from unstructured.partition.email import partition_email as partition_func
         else:
             from unstructured.partition.msg import partition_msg as partition_func
 
         if hasattr(file_obj, 'read'):
-            elements = partition_func(file=file_obj, process_attachments=False)
-        else:
-            elements = partition_func(filename=str(file_obj), process_attachments=False)
-
-        return self._elements_to_documents(elements, file_type)
+            return partition_func(file=file_obj, process_attachments=False)
+        return partition_func(filename=str(file_obj), process_attachments=False)
 
     def _extract_headers_from_eml(self) -> dict:
         """
@@ -429,16 +443,31 @@ class EliteAEmailLoader(BaseLoader):
         Returns:
             Parsed content as string, or empty string if parsing fails.
         """
+        documents = self._load_attachment_documents(filename, content, current_depth)
+        return "\n".join(doc.page_content for doc in documents)
+
+    def _load_attachment_documents(self, filename: str, content: bytes, current_depth: int = 0,
+                                   max_tokens: Optional[int] = None) -> List[Document]:
+        """
+        Load an attachment with the loader registered for its extension.
+
+        max_tokens > 0 is passed to the attachment loader as its chunk limit; otherwise
+        the loader runs with its registered defaults (the read path, get_content()).
+
+        Returns:
+            The attachment loader's non-empty documents (its own chunks), or an empty
+            list if the attachment is skipped or cannot be parsed.
+        """
         # Check recursion depth
         if current_depth >= self.max_attachment_depth:
             logger.warning(f"Max attachment depth ({self.max_attachment_depth}) reached, skipping nested attachment: {filename}")
-            return ""
+            return []
 
         # Check attachment size
         content_size_mb = len(content) / (1024 * 1024)
         if content_size_mb > self.max_attachment_size_mb:
             logger.warning(f"Attachment {filename} size ({content_size_mb:.2f}MB) exceeds limit ({self.max_attachment_size_mb}MB), skipping")
-            return ""
+            return []
 
         from .constants import loaders_map
 
@@ -447,7 +476,7 @@ class EliteAEmailLoader(BaseLoader):
 
         if extension not in loaders_map:
             logger.debug(f"No loader found for extension {extension}, skipping attachment {filename}")
-            return ""
+            return []
 
         temp_file = None
         try:
@@ -463,7 +492,13 @@ class EliteAEmailLoader(BaseLoader):
             loader_cls = loader_config['class']
             loader_kwargs = loader_config.get('kwargs', {}).copy()
 
-            loader_kwargs.pop('max_tokens', None)
+            # load() chunks attachments with the email's own limit (#7173) so loaders split
+            # on their own boundaries (CSV/Excel rows, markdown headers); load() re-caps
+            # whatever still overflows.
+            if max_tokens and max_tokens > 0:
+                loader_kwargs['max_tokens'] = max_tokens
+            else:
+                loader_kwargs.pop('max_tokens', None)
 
             # Pass depth to nested email loaders to prevent infinite recursion
             # Check if loader is same class or subclass of current email loader
@@ -472,20 +507,19 @@ class EliteAEmailLoader(BaseLoader):
                 loader_kwargs['max_attachment_size_mb'] = self.max_attachment_size_mb
                 # Create a depth-aware wrapper for nested attachments
                 loader = loader_cls(file_path=temp_file, **loader_kwargs)
-                # Monkey-patch the _parse_attachment_content to pass depth + 1
-                original_parse = loader._parse_attachment_content
-                loader._parse_attachment_content = lambda fn, cnt: original_parse(fn, cnt, current_depth + 1)
+                # Monkey-patch the _load_attachment_documents to pass depth + 1
+                original_load = loader._load_attachment_documents
+                loader._load_attachment_documents = lambda fn, cnt, _depth=0, **kw: original_load(fn, cnt, current_depth + 1, **kw)
             else:
                 loader = loader_cls(file_path=temp_file, **loader_kwargs)
 
             documents = loader.load()
 
-            page_contents = [doc.page_content for doc in documents if doc.page_content]
-            return "\n".join(page_contents)
+            return [doc for doc in documents if doc.page_content]
 
         except Exception as e:
             logger.warning(f"Failed to parse attachment {filename}: {e}")
-            return ""
+            return []
         finally:
             if temp_file and os.path.exists(temp_file):
                 try:
@@ -508,11 +542,37 @@ class EliteAEmailLoader(BaseLoader):
         Returns:
             List containing a single Document with combined content and metadata.
         """
+        parts = self._elements_to_parts(elements, file_type)
+        if parts is None:
+            return []
+        metadata, email_content, attachments = parts
+
+        content_parts = [email_content] if email_content else []
+        for filename, documents in attachments:
+            parsed_content = _sanitize_text("\n".join(doc.page_content for doc in documents))
+            if parsed_content:
+                content_parts.append(f"\n---\n**Attachment: {filename}**\n\n{parsed_content}")
+
+        page_content = '\n'.join(content_parts)
+
+        return [Document(page_content=page_content, metadata=metadata)]
+
+    def _elements_to_parts(self, elements, file_type: str, max_tokens: Optional[int] = None):
+        """
+        Extract the email metadata, the headers+body text and the parsed attachments.
+        With max_tokens > 0 each attachment loader chunks to max_tokens minus the
+        attachment prefix that load() puts in front of every attachment chunk.
+
+        Returns:
+            (metadata, email_content, attachments) where attachments is a list of
+            (sanitized_filename, attachment_documents), or None for an empty body
+            when ignore_empty_body is set.
+        """
         is_empty_body = not elements
 
         # Return early if ignoring empty body emails
         if is_empty_body and self.ignore_empty_body:
-            return []
+            return None
 
         # Extract metadata based on elements presence
         if is_empty_body:
@@ -597,17 +657,19 @@ class EliteAEmailLoader(BaseLoader):
             if body_parts:
                 content_parts.append('\n\n'.join(body_parts))
 
-        # Parse and append attachment content if process_attachments is enabled
+        # Parse attachment content if process_attachments is enabled
+        attachments = []
         if self.process_attachments and attachments_with_content:
             for filename, content in attachments_with_content:
-                parsed_content = _sanitize_text(self._parse_attachment_content(filename, content))
-                if parsed_content:
-                    sanitized_filename = _sanitize_text(filename)
-                    content_parts.append(f"\n---\n**Attachment: {sanitized_filename}**\n\n{parsed_content}")
+                safe_filename = _sanitize_text(filename)
+                budget = None
+                if max_tokens and max_tokens > 0:
+                    budget = _attachment_budget(max_tokens, _attachment_prefix(metadata, safe_filename))
+                documents = self._load_attachment_documents(filename, content, max_tokens=budget)
+                if documents:
+                    attachments.append((safe_filename, documents))
 
-        page_content = '\n'.join(content_parts)
-
-        return [Document(page_content=page_content, metadata=metadata)]
+        return metadata, '\n'.join(content_parts), attachments
 
     def load(self) -> List[Document]:
         """
@@ -616,16 +678,47 @@ class EliteAEmailLoader(BaseLoader):
         Returns:
             List of Documents with email content chunked by headers.
         """
-        docs = self._load_raw()
+        if not (self.max_tokens and self.max_tokens > 0):
+            return self._load_raw()
 
-        # Apply chunking if max_tokens is set (lazy import to avoid circular dependency)
-        if self.max_tokens and self.max_tokens > 0:
-            from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_by_headers_chunker
-            return list(markdown_by_headers_chunker(
-                iter(docs),
-                config={'max_tokens': self.max_tokens}
-            ))
+        # Lazy import to avoid circular dependency
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_by_headers_chunker
+        from elitea_sdk.tools.chunkers.utils import tiktoken_length
 
+        file_type = self._detect_file_type()
+        file_obj = self.file_path if self.file_path else BytesIO(self.file_content)
+        parts = self._elements_to_parts(self._partition(file_obj, file_type), file_type, self.max_tokens)
+        if parts is None:
+            return []
+        metadata, email_content, attachments = parts
+
+        docs = list(markdown_by_headers_chunker(
+            iter([Document(page_content=email_content, metadata=metadata)]),
+            config={'max_tokens': self.max_tokens}
+        ))
+        # Each attachment chunk produced by the attachment's own loader stays a separate
+        # chunk (capped at max_tokens) instead of being merged back into one block (#7173).
+        for filename, documents in attachments:
+            prefix = _attachment_prefix(metadata, filename)
+            budget = _attachment_budget(self.max_tokens, prefix)
+            # Loaders count tokens per row/section, so their chunks can still run over;
+            # re-split those on line boundaries so CSV/Excel rows are not cut in half.
+            splitter = RecursiveCharacterTextSplitter(chunk_size=budget, chunk_overlap=0,
+                                                      length_function=tiktoken_length)
+            for document in documents:
+                text = _sanitize_text(document.page_content)
+                pieces = [(text, 'markdown')] if tiktoken_length(text) <= budget else \
+                    [(piece, 'text') for piece in splitter.split_text(text)]
+                for content, method_name in pieces:
+                    docs.append(Document(
+                        page_content=f"{prefix}{content}",
+                        metadata={**metadata, 'email_attachment': filename, 'headers': '',
+                                  'chunk_type': 'document', 'method_name': method_name},
+                    ))
+
+        for chunk_id, doc in enumerate(docs, 1):
+            doc.metadata['chunk_id'] = chunk_id
         return docs
 
     def _load_raw(self) -> List[Document]:

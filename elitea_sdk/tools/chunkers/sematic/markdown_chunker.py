@@ -152,6 +152,8 @@ def markdown_by_headers_chunker(file_content_generator: Generator[Document, None
     return_each_line = config.get("return_each_line", False)
     headers_to_split_on = config.get("headers_to_split_on", [])
     headers_to_split_on = [header.split(' ', 1) for header in headers_to_split_on]
+    max_tokens = config.get("max_tokens")
+    tokens_overlapping = config.get("token_overlap", 10)
     for doc in file_content_generator:
         doc_metadata = doc.metadata
         doc_content = doc.page_content
@@ -163,14 +165,29 @@ def markdown_by_headers_chunker(file_content_generator: Generator[Document, None
         )
         md_header_splits = markdown_splitter.split_text(doc_content)
         for chunk in md_header_splits:
-            chunk_id += 1
             headers_meta = list(chunk.metadata.values())
-            docmeta = copy(doc_metadata)
-            docmeta.update({"headers": "; ".join(headers_meta)})
-            docmeta['chunk_id'] = chunk_id
-            docmeta['chunk_type'] = "document"
-            docmeta['method_name'] = 'markdown'
-            yield Document(
-                page_content=chunk.page_content,
-                metadata=docmeta
-            )
+            for subchunk, method_name in split_oversized(chunk.page_content, max_tokens, tokens_overlapping):
+                chunk_id += 1
+                docmeta = copy(doc_metadata)
+                docmeta.update({"headers": "; ".join(headers_meta)})
+                docmeta['chunk_id'] = chunk_id
+                docmeta['chunk_type'] = "document"
+                docmeta['method_name'] = method_name
+                yield Document(
+                    page_content=subchunk,
+                    metadata=docmeta
+                )
+
+
+def split_oversized(content: str, max_tokens, tokens_overlapping: int) -> Generator[tuple, None, None]:
+    """Yield (text, method_name) pairs: the content itself when it fits in max_tokens,
+    otherwise token-sized pieces of it. max_tokens <= 0 or None disables the limit."""
+    if max_tokens and max_tokens > 0 and tiktoken_length(content) > max_tokens:
+        for subchunk in TokenTextSplitter(
+            encoding_name="cl100k_base",
+            chunk_size=max_tokens,
+            chunk_overlap=tokens_overlapping
+        ).split_text(content):
+            yield subchunk, 'text'
+    else:
+        yield content, 'markdown'
