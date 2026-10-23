@@ -19,10 +19,46 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 PIN = 'elitea_routing'
 # Prose is ~4 bytes/token, code and JSON ~3; 3 is the conservative bound (same constant as the Gateway).
 BYTES_PER_TOKEN = 3
+IMAGE_BLOCKS = {'image_url', 'image', 'input_image'}
+# Providers bill an image by its pixels, not its base64 length; 2k tokens bounds one image.
+IMAGE_INPUT_BYTES = 2000 * BYTES_PER_TOKEN
+CLASSIFIER_IMAGE_TEXT = '[image]'
+TEXT_ONLY_IMAGE_TEXT = '[Image omitted: the selected model does not accept image input]'
 
 
 def estimated_input_tokens(size):
     return -(-size // BYTES_PER_TOKEN)
+
+
+def _is_image(block):
+    return isinstance(block, dict) and block.get('type') in IMAGE_BLOCKS
+
+
+def required_modalities(messages):
+    return ['image'] if any(isinstance(message.content, list) and any(_is_image(b) for b in message.content)
+                            for message in messages) else []
+
+
+def without_images(messages):
+    """Text-only pin: keep the turn, replace each image with a visible placeholder."""
+    result = []
+    for message in messages:
+        if isinstance(message.content, list) and any(_is_image(b) for b in message.content):
+            message = message.model_copy(update={'content': [
+                {'type': 'text', 'text': TEXT_ONLY_IMAGE_TEXT} if _is_image(b) else b for b in message.content]})
+        result.append(message)
+    return result
+
+
+def sized_images(value):
+    """Swap image payloads for a fixed-size stand-in so byte screens estimate image tokens."""
+    if isinstance(value, dict):
+        if value.get('type') in IMAGE_BLOCKS:
+            return {'type': value['type'], 'estimate': 'x' * IMAGE_INPUT_BYTES}
+        return {k: sized_images(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sized_images(v) for v in value]
+    return value
 
 
 def _positive_int(value):
@@ -74,6 +110,8 @@ def projection(messages):
                     text.append(block.get('text', ''))
                 elif isinstance(block, dict) and block.get('type') in {'thinking', 'redacted_thinking', 'tool_use', 'reasoning', 'reasoning_content'}:
                     continue  # Opaque provider content remains on the generation path.
+                elif _is_image(block):
+                    text.append(CLASSIFIER_IMAGE_TEXT)  # Pixels stay on the generation path.
                 else:
                     raise ValueError('Auto does not yet qualify this input modality')
             content = '\n'.join(text)
@@ -222,6 +260,7 @@ class AutoChatModel(BaseChatModel):
             # Unspecified output belongs to the selected measured contract.
             # Sending a synthetic 8k limit would exclude 32k-only presets.
             output_limit = {} if cap in (None, -1) else {'output_cap': cap}
+            modalities = required_modalities(messages)
             from elitea_sdk.runtime.clients.routing_context import instruction_view, retrieval_sources
             context = {'active_instructions': dict(instruction_view(self.active_instructions)),
                        'retrieval_options': retrieval_sources(self.routing_tools, str(latest.content))}
@@ -233,8 +272,9 @@ class AutoChatModel(BaseChatModel):
                 headers={**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)},
                 json={'selection': self.settings['selection'], 'surface': self.settings.get('routing_surface', 'agent'),
                       'messages': projection(messages), 'tools': tools, **output_limit,
+                      **({'required_modalities': modalities} if modalities else {}),
                       'generation_input_bytes': len(json.dumps(
-                          {'messages': [provider_message_view(message) for message in messages],
+                          {'messages': sized_images([provider_message_view(message) for message in messages]),
                            'tools': tools, 'output_schema': output_schema}, ensure_ascii=False, default=str).encode()) + 64*len(messages),
                       'runtime_context': context, 'runtime_context_token': context_token,
                       'output_schema': output_schema or configurable.get('elitea_routing_output_schema'),
@@ -265,6 +305,8 @@ class AutoChatModel(BaseChatModel):
     def _native_messages(native, messages, binding):
         from elitea_sdk.runtime.clients.routing_history import adapt_completed_history
         messages = adapt_completed_history(native, messages, binding)
+        if binding['config'].get('supports_vision') is False:
+            messages = without_images(messages)
         target = native.bound if isinstance(native, RunnableBinding) else native
         from elitea_sdk.runtime.langchain.utils import prepare_messages_for_model
         messages = prepare_messages_for_model(messages, model=target)
@@ -277,12 +319,14 @@ class AutoChatModel(BaseChatModel):
 
     @staticmethod
     def _admit_native(native, messages, binding, stop=None, **kwargs):
-        # A same-run steer cannot expand the frozen text-only qualification.
-        # Validate content without classifying again or altering the pin.
+        # A same-run steer cannot expand the frozen qualification: images reach
+        # only a vision pin (text-only pins already carry placeholders).
+        vision = binding['config'].get('supports_vision') is not False
         for message in messages:
             if isinstance(message, HumanMessage) and isinstance(message.content, list):
                 for block in message.content:
-                    if not isinstance(block, str) and not (isinstance(block, dict) and block.get('type') in {'text', 'output_text'}):
+                    if not isinstance(block, str) and not (isinstance(block, dict) and block.get('type') in {'text', 'output_text'}) \
+                            and not (vision and _is_image(block)):
                         raise ValueError('Auto does not yet qualify this input modality')
         # A conservative screening bound over the actual LangChain provider
         # payload, including native blocks and bound tools. This is not exact
@@ -296,7 +340,7 @@ class AutoChatModel(BaseChatModel):
             # Same expansion used by the installed OpenAI parse transport.
             from openai.lib._parsing import type_to_response_format_param
             payload['response_format'] = type_to_response_format_param(payload['response_format'])
-        size = len(json.dumps(payload, ensure_ascii=False).encode()) + 64*len(messages)
+        size = len(json.dumps(sized_images(payload), ensure_ascii=False, default=str).encode()) + 64*len(messages)
         if estimated_input_tokens(size) + effective_output_limit(binding['config']) > binding['config']['context_window']:
             raise ValueError('Auto native request exceeds the conservative context allowance')
 
