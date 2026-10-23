@@ -3,7 +3,7 @@ from typing import Optional
 
 import requests
 from langchain_core.tools import ToolException
-from pydantic import PrivateAttr, SecretStr
+from pydantic import PrivateAttr, SecretStr, field_validator
 
 from .model import (
     SalesforceCreateCase,
@@ -14,6 +14,7 @@ from .model import (
     SalesforceInput
 )
 from ..elitea_base import BaseToolApiWrapper
+from ..utils import normalize_base_url
 from ..utils.tool_groups import tool_group, with_tool_groups
 
 
@@ -24,6 +25,11 @@ class SalesforceApiWrapper(BaseToolApiWrapper):
     api_version: str = "v59.0"
     
     _access_token: Optional[str] = PrivateAttr(default=None)
+
+    @field_validator('base_url', mode='before')
+    @classmethod
+    def _normalize_base_url(cls, value):
+        return normalize_base_url(value)
 
     def authenticate(self):
         """

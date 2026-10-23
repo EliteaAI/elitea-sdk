@@ -96,6 +96,9 @@ def get_access_token(settings: dict) -> str:
     from ..runtime.utils.mcp_oauth import refresh_oauth_token
 
     org = normalize_org_url(settings.get("url"))
+    # Token injected by the platform's stored-login service (scheduled runs); no refresh here
+    if _secret(settings.get("access_token")):
+        return _secret(settings.get("access_token"))
     tenant = (settings.get("tenant_id") or "").strip()
     client_id = (settings.get("client_id") or "").strip()
     client_secret = _secret(settings.get("client_secret"))
@@ -142,13 +145,7 @@ def dataverse_patch(settings: dict, path: str, fields: dict) -> dict:
     })
 
 
-def _dataverse_request(settings: dict, method: str, path: str, params: Optional[dict] = None,
-                       json_body: Optional[dict] = None, extra_headers: Optional[dict] = None) -> dict:
-    org = normalize_org_url(settings.get("url"))
-    token = get_access_token(settings)
-    url = f"{org}{API_PATH}{path}"
-    if params:
-        url += "?" + urlencode(params, quote_via=quote)
+def _send(settings: dict, method: str, url: str, token: str, json_body, extra_headers) -> requests.Response:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -158,9 +155,22 @@ def _dataverse_request(settings: dict, method: str, path: str, params: Optional[
         **(extra_headers or {}),
     }
     try:
-        resp = requests.request(method, url, headers=headers, json=json_body, timeout=30)
+        return requests.request(method, url, headers=headers, json=json_body, timeout=30)
     except requests.RequestException as e:
         raise DataverseError(f"Could not reach Dataverse ({type(e).__name__})") from None
+
+
+def _dataverse_request(settings: dict, method: str, path: str, params: Optional[dict] = None,
+                       json_body: Optional[dict] = None, extra_headers: Optional[dict] = None) -> dict:
+    org = normalize_org_url(settings.get("url"))
+    url = f"{org}{API_PATH}{path}"
+    if params:
+        url += "?" + urlencode(params, quote_via=quote)
+    resp = _send(settings, method, url, get_access_token(settings), json_body, extra_headers)
+    # A platform-injected token may expire mid-run; the stored login can mint a fresh one
+    if resp.status_code == 401 and _secret(settings.get("access_token")) and _secret(settings.get("refresh_token")):
+        fresh = {**settings, "access_token": None}
+        resp = _send(fresh, method, url, get_access_token(fresh), json_body, extra_headers)
     if resp.status_code == 200:
         return resp.json()
     if resp.status_code == 204:
@@ -221,3 +231,8 @@ def build_login_required(settings: dict, message: str):
         tool_name="Dataverse",
         toolkit_type="dataverse",
     )
+
+
+def entra_authority(settings: dict) -> str:
+    """Authority the platform keys injected tokens by, same as the Login flow's server_url."""
+    return f"https://login.microsoftonline.com/{(settings.get('tenant_id') or '').strip()}"

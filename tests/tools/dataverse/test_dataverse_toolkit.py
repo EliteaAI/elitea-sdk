@@ -349,3 +349,56 @@ def test_describe_entity_unknown_table(http):
     http.api_responses = [FakeResponse(200, {"value": []})]
     with pytest.raises(ToolException, match="No table"):
         tools()["describe_entity"].run({"entity_set": "nope"})
+
+
+def test_platform_injected_token_is_used_without_refresh(http):
+    # Scheduled runs get an access token from the platform under <uuid>:<authority>; no refresh call.
+    settings = {**SETTINGS, "configuration_uuid": "uuid-1"}
+    key = f"uuid-1:https://login.microsoftonline.com/{SETTINGS['tenant_id']}"
+    kit = DataverseToolkit.get_toolkit(dataverse_configuration=settings, toolkit_name="crm",
+                                       tokens={key: {"access_token": "injected-at"}})
+    {t.name: t for t in kit.get_tools()}["who_am_i"].run({})
+    assert http.token_calls == []
+    assert http.api_calls[0]["headers"]["Authorization"] == "Bearer injected-at"
+
+
+def test_token_for_another_credential_is_ignored(http):
+    settings = {**SETTINGS, "configuration_uuid": "uuid-1"}
+    kit = DataverseToolkit.get_toolkit(dataverse_configuration=settings, toolkit_name="crm",
+                                       tokens={"uuid-2:https://login.microsoftonline.com/x": {"access_token": "other"}})
+    {t.name: t for t in kit.get_tools()}["who_am_i"].run({})
+    assert len(http.token_calls) == 1
+    assert http.api_calls[0]["headers"]["Authorization"] == "Bearer at-1"
+
+
+def test_get_tools_passes_runtime_tokens_through(monkeypatch):
+    from elitea_sdk.tools import dataverse as dataverse_module
+    captured = {}
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(dataverse_module.DataverseToolkit, "get_toolkit", staticmethod(spy))
+    with pytest.raises(RuntimeError, match="stop"):
+        dataverse_module.get_tools({"settings": {"dataverse_configuration": SETTINGS, "tokens": {"k": "v"}}})
+    assert captured["tokens"] == {"k": "v"}
+
+
+def test_expired_injected_token_falls_back_to_stored_login_once(http):
+    # The platform cache can hand out a token with ~2 minutes left; a long run must not die on it.
+    http.api_responses = [FakeResponse(401, {}), FakeResponse(200, {"UserId": "u-1"})]
+    settings = {**SETTINGS, "access_token": "stale"}
+
+    assert DataverseConfiguration.check_connection(settings) is None
+
+    assert len(http.token_calls) == 1
+    assert [c["headers"]["Authorization"] for c in http.api_calls] == ["Bearer stale", "Bearer at-1"]
+
+
+def test_injected_token_401_without_stored_login_is_reported(http):
+    http.api_responses = [FakeResponse(401, {})]
+    settings = {**SETTINGS, "access_token": "stale", "refresh_token": None}
+    with pytest.raises(DataverseError, match="rejected"):
+        dv._dataverse_request(settings, "GET", "/WhoAmI")
+    assert http.token_calls == []

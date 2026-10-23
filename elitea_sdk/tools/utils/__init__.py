@@ -232,6 +232,31 @@ def detect_mime_type(file_bytes: bytes, filename: str) -> str:
     return 'application/octet-stream'
 
 
+def normalize_base_url(url: Any) -> Any:
+    """
+    Strip surrounding whitespace and trailing slashes from a configured base URL.
+
+    Toolkits join the base URL with paths that start with '/', so a value entered
+    as 'https://host/' would otherwise produce 'https://host//rest/...'.
+    Non-string values (None, unset) are returned unchanged.
+    """
+    if not isinstance(url, str):
+        return url
+    return url.strip().rstrip('/')
+
+
+def normalize_host(server: Any) -> Any:
+    """
+    Reduce a configured server value to a bare host, e.g. 'https://host/' -> 'host'.
+
+    For clients such as pyral that take a host name and build the scheme and
+    path themselves. Non-string values are returned unchanged.
+    """
+    if not isinstance(server, str):
+        return server
+    return re.sub(r'^https?://', '', server.strip(), flags=re.IGNORECASE).rstrip('/')
+
+
 def normalize_pem_key(private_key: str) -> str:
     """
     Normalize a PEM private key to proper format.

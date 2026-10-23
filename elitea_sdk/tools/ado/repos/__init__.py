@@ -11,7 +11,7 @@ from ....configurations.pgvector import PgVectorConfiguration
 from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...base.tool import BaseAction
 from .repos_wrapper import ReposApiWrapper, normalize_repositories
-from ...utils import check_connection_response
+from ...utils import check_connection_response, normalize_base_url
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
 name = "ado_repos"
@@ -107,7 +107,7 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             # Without a configured repository the project repository list still proves access
             repository_path = f'/{self.repository_id[0]}' if self.repository_id else ''
             response = requests.get(
-                f'{ado_config.organization_url}/{project}/_apis/git/repositories{repository_path}?api-version=7.0',
+                f'{normalize_base_url(ado_config.organization_url)}/{project}/_apis/git/repositories{repository_path}?api-version=7.0',
                 headers={'Authorization': f'Bearer {token}'},
                 timeout=5
             )
