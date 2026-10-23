@@ -7,6 +7,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 from pydantic import ConfigDict, Field
@@ -15,10 +16,14 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda, RunnableBinding
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from elitea_sdk.runtime.clients.routing_escalation import (answer_text, escalation_signal, finish_reason_of, guard_request_context,
+                                                          is_final_answer, last_response_signal, response_signal)
 
 PIN = 'elitea_routing'
 # Prose is ~4 bytes/token, code and JSON ~3; 3 is the conservative bound (same constant as the Gateway).
 BYTES_PER_TOKEN = 3
+GUARD_ANSWER_LIMIT = 12_000  # characters of the candidate answer sent to the guard
+GUARD_TIMEOUT = (3, 30)
 
 
 def estimated_input_tokens(size):
@@ -140,9 +145,7 @@ def observation(message):
     row = projection([message])[0]
     usage = message.usage_metadata or {}
     details = usage.get('input_token_details') or {}
-    finish = message.response_metadata.get('finish_reason') or message.response_metadata.get('stop_reason')
-    finish = {'end_turn': 'stop', 'tool_use': 'tool_calls', 'max_tokens': 'length'}.get(finish, finish)
-    finish = finish if finish in {'stop', 'tool_calls', 'length', 'content_filter', 'refusal', 'pause_turn'} else None
+    finish = finish_reason_of(message)
     def counter(value):
         return value if type(value) is int and 0 <= value <= 1_000_000_000 else 0
     model = message.response_metadata.get('model_name') or message.response_metadata.get('model')
@@ -217,6 +220,14 @@ class AutoChatModel(BaseChatModel):
                         break
             if prior_observation is None and previous is not None:
                 prior_observation = {**observation(previous), 'message_index': len(projection(messages[:previous_index]))}
+            # Optional, only when observed; absent keys keep today's request byte-identical.
+            signals = {}
+            escalation = escalation_signal(configurable)
+            if escalation:
+                signals['escalation'] = escalation
+            last_response = last_response_signal(messages, latest_index, prior_observation)
+            if last_response:
+                signals['last_response'] = last_response
             tools = [convert_to_openai_tool(tool) for tool in self.routing_tools]
             cap = self.settings.get('max_tokens')
             # Unspecified output belongs to the selected measured contract.
@@ -241,7 +252,7 @@ class AutoChatModel(BaseChatModel):
                       'invocation_id': invocation_id, 'scope_id': scope_id,
                       'state_token': previous_binding.get('state_token') if previous_binding else None,
                       'observation': prior_observation,
-                      'prior_pin': binding.get('pin') if binding else None}, timeout=(5, 90))
+                      'prior_pin': binding.get('pin') if binding else None, **signals}, timeout=(5, 90))
             raise_for_refusal(response)
             binding = response.json()
             binding['completed_native_keys'] = completed
@@ -320,23 +331,60 @@ class AutoChatModel(BaseChatModel):
         if sink is not None:
             sink['binding'] = copy.deepcopy(binding)
 
+    def _record_guard(self, messages, response, binding):
+        """Record-only guard: judge the delivered final answer off the request path.
+
+        The turn is never changed or delayed: the request is built here (cheap), sent
+        from a daemon thread, and every failure is ignored. At most one call per
+        invocation (the flag travels with the binding).
+        """
+        if (not self.settings.get('routing_guard', True) or binding.get('action') == 'clarify'
+                or binding.get('guarded') or not is_final_answer(response)):
+            return
+        binding['guarded'] = True
+        try:
+            latest_index = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
+            tools = [m for m in messages[latest_index+1:] if isinstance(m, ToolMessage)]
+            body = {'pin': binding['pin'], 'scope_id': binding['scope_id'], 'invocation_id': binding['invocation_id'],
+                    'request_text_projection': guard_request_context(projection(messages)),
+                    'answer_text': answer_text(response)[:GUARD_ANSWER_LIMIT],
+                    'last_response': response_signal(response, tools)}
+            url = f'{self.owner.base_url}/llm/v1/auto-routing/guard'
+            headers = {**self.owner.headers, 'X-Project-Id': str(self.owner.project_id)}
+            threading.Thread(target=self._send_guard, args=(url, headers, body), daemon=True,
+                             name='auto-routing-guard').start()
+        except Exception:
+            return
+
+    def _send_guard(self, url, headers, body):
+        try:
+            self.owner._request('post', url, headers=headers, json=body, timeout=GUARD_TIMEOUT).raise_for_status()
+        except Exception:
+            pass  # Record-only: the log loses one verdict, the turn is unaffected.
+
     def invoke(self, input, config=None, *, stop=None, **kwargs):
         messages = self._convert_input(input).to_messages()
+        raw = messages
         native, binding = self._materialize(messages, config)
         if native is not None:
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
         response = AIMessage(content=binding['text']) if native is None else native.invoke(messages, config, stop=stop, **kwargs)
+        if native is not None:
+            self._record_guard(raw, response, binding)
         self._remember_response(response, binding, config)
         return self._stamp(response, binding)
 
     async def ainvoke(self, input, config=None, *, stop=None, **kwargs):
         messages = self._convert_input(input).to_messages()
+        raw = messages
         native, binding = await asyncio.to_thread(self._materialize, messages, config)
         if native is not None:
             messages = self._native_messages(native, messages, binding)
             self._admit_native(native, messages, binding, stop, **kwargs)
         response = AIMessage(content=binding['text']) if native is None else await native.ainvoke(messages, config, stop=stop, **kwargs)
+        if native is not None:
+            self._record_guard(raw, response, binding)
         self._remember_response(response, binding, config)
         return self._stamp(response, binding)
 

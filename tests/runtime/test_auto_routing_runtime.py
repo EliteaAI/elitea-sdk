@@ -24,7 +24,7 @@ def setup_auto(native):
             'invocation_id': body['invocation_id'], 'scope_id': body['scope_id'],
             'pin': 'signed-fixture', 'state_token': 'state-fixture', 'expires_at': time.time()+3600})
     owner._request = request;owner.get_llm = Mock(return_value=native)
-    auto = AutoChatModel(owner=owner, settings={'selection': {'mode': 'auto'}})
+    auto = AutoChatModel(owner=owner, settings={'selection': {'mode': 'auto'}, 'routing_guard': False})
     config = {'configurable': {'thread_id': 'runtime-test', 'elitea_routing_run_id': 'server-run', 'elitea_routing_sink': {}}}
     return auto, config, requests
 
