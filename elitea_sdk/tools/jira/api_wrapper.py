@@ -764,7 +764,6 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             values.get('base_url'),
         )
 
-        cls.llm = values.get('llm')
         return super().validate_toolkit(values)
 
     def model_post_init(self, __context) -> None:
@@ -775,7 +774,7 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         if not base_url or not isinstance(base_url, str) or not base_url.startswith('http'):
             return
 
-        from ..client_registry import get_client_registry
+        from ..client_registry import ClientKey, get_client_registry
 
         # Extract auth values (handle SecretStr) - safely check type first
         token = None
@@ -795,19 +794,28 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             'verify_ssl': self.verify_ssl,
         }
 
+        # Custom headers are part of the cache key and are applied once, inside the
+        # factory, so a shared client is never mutated after it was handed out.
+        custom_headers = self.custom_headers or {}
+
         # Factory function to create Jira client (only called if not cached)
         def create_jira_client():
             if token and is_cookie_token(token):
                 session = requests.Session()
                 session.cookies.update(parse_cookie_string(token))
-                return JiraClient(url=self.base_url, session=session, cloud=self.cloud,
+                client = JiraClient(url=self.base_url, session=session, cloud=self.cloud,
                            verify_ssl=self.verify_ssl, api_version=self.api_version)
             elif token:
-                return JiraClient(url=self.base_url, token=token, cloud=self.cloud,
+                client = JiraClient(url=self.base_url, token=token, cloud=self.cloud,
                            verify_ssl=self.verify_ssl, api_version=self.api_version)
             else:
-                return JiraClient(url=self.base_url, username=self.username, password=api_key,
+                client = JiraClient(url=self.base_url, username=self.username, password=api_key,
                            cloud=self.cloud, verify_ssl=self.verify_ssl, api_version=self.api_version)
+            if custom_headers:
+                logger.info(f"Jira tool: applying {len(custom_headers)} custom headers")
+                for header, value in custom_headers.items():
+                    client._update_header(header, value)
+            return client
 
         # Get shared client from registry (or create new one)
         registry = get_client_registry()
@@ -815,15 +823,11 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             service_type='jira',
             base_url=self.base_url,
             auth_config=auth_config,
-            factory=create_jira_client
+            factory=create_jira_client,
+            key=ClientKey.from_legacy(
+                'jira', self.base_url, auth_config, extra={'custom_headers': custom_headers}
+            ),
         )
-
-        # Apply custom headers (toolkit-specific, applied each time)
-        custom_headers = self.custom_headers or {}
-        if custom_headers:
-            logger.info(f"Jira tool: applying {len(custom_headers)} custom headers")
-            for header, value in custom_headers.items():
-                self._client._update_header(header, value)
 
     def _get_client(self) -> Jira:
         if not hasattr(self, '_client') or self._client is None:

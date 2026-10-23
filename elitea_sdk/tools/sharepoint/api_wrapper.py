@@ -470,21 +470,21 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     elitea: Any = None
     _backend: BaseSharepointWrapper = PrivateAttr()
 
-    @model_validator(mode='before')
-    @classmethod
-    def validate_toolkit(cls, values):
-        site_url = values['site_url']
-        client_id = values.get('client_id')
-        raw_secret = values.get('client_secret')
-        raw_token = values.get('token')
-        scopes = values.get('scopes')
+    @model_validator(mode='after')
+    def build_backend(self):
+        # The backend is per instance: it holds this toolkit's credentials.
+        site_url = self.site_url
+        client_id = self.client_id
+        raw_secret = self.client_secret
+        raw_token = self.token
+        scopes = self.scopes
 
         # Unwrap SecretStr → plain text for internal use
         token_plain = (raw_token.get_secret_value()
                        if hasattr(raw_token, 'get_secret_value') else raw_token)
         secret_plain = (raw_secret.get_secret_value()
                         if hasattr(raw_secret, 'get_secret_value') else raw_secret)
-        raw_refresh = values.get('refresh_token')
+        raw_refresh = self.refresh_token
         refresh_plain = (raw_refresh.get_secret_value()
                          if hasattr(raw_refresh, 'get_secret_value') else raw_refresh)
 
@@ -492,18 +492,18 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             # ── Delegated Graph API path ──────────────────────────────
             logging.info(
                 "SharePoint: using Graph API wrapper (delegated access, token + scopes).")
-            cls._backend = SharepointGraphWrapper(
+            self._backend = SharepointGraphWrapper(
                 site_url=site_url,
                 token=token_plain,
                 scopes=scopes,
                 refresh_token=refresh_plain,
                 client_id=client_id,
                 client_secret=secret_plain,
-                oauth_token_endpoint=values.get('oauth_token_endpoint'),
-                oauth_discovery_endpoint=values.get('oauth_discovery_endpoint'),
-                configuration_uuid=values.get('configuration_uuid'),
-                toolkit_id=values.get('toolkit_id'),
-                toolkit_name=values.get('toolkit_name'),
+                oauth_token_endpoint=self.oauth_token_endpoint,
+                oauth_discovery_endpoint=self.oauth_discovery_endpoint,
+                configuration_uuid=self.configuration_uuid,
+                toolkit_id=self.toolkit_id,
+                toolkit_name=self.toolkit_name,
             )
         elif client_id and secret_plain:
             # ── App-credential REST path ──────────────────────────────
@@ -518,7 +518,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             office_client = ClientContext(site_url).with_credentials(credentials)
             logging.info(
                 "SharePoint: using REST wrapper (app credentials).")
-            cls._backend = SharepointRestWrapper(
+            self._backend = SharepointRestWrapper(
                 client=office_client,
                 site_url=site_url,
                 client_id=client_id,
@@ -539,7 +539,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 })())
             logging.info(
                 "SharePoint: using REST wrapper (bearer token, no Graph scopes).")
-            cls._backend = SharepointRestWrapper(
+            self._backend = SharepointRestWrapper(
                 client=office_client,
                 site_url=site_url,
                 client_id=client_id,
@@ -553,7 +553,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 "a token alone for REST bearer-token access.")
 
         logging.info("Successfully authenticated to SharePoint.")
-        return super().validate_toolkit(values)
+        return self
 
     # ------------------------------------------------------------------ #
     #  Backend injection helper                                            #

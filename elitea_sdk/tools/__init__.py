@@ -1,10 +1,15 @@
 import logging
 import types
 from importlib import import_module
-from typing import Optional
+from typing import Any, Dict, Mapping, Optional
 
 from langchain_core.tools import ToolException
 from langgraph.store.base import BaseStore
+
+from ..runtime.credential_slots import (
+    GovernedCredentialError, apply_credential_slots, collect_slot_items, memoize_slot_scans, resolve_run_slots,
+    scan_slots, scrub,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,8 +267,68 @@ def _filter_blocked_tools(toolkit_tools: list, toolkit_type: str) -> list:
         return toolkit_tools
 
 
-def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args, **kwargs):
+def _precheck_tool(tool, raw_settings):
+    """The refusals the build loop makes before it touches a tool's slots: ``(tool_type, slot_scan)``.
+
+    Shared by `release_run_slots` and `get_tools`, so material is never released for a tool the loop refuses.
+    """
+    invalid_tools = [name for name in raw_settings.get('selected_tools', []) if isinstance(name, str) and name.startswith('_')]
+    if invalid_tools:
+        raise ValueError(f"Tool names {invalid_tools} from toolkit '{tool.get('type', '')}' cannot start with '_'")
+    tool_type = TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type'])
+    slot_scan = scan_slots(raw_settings)  # memoized per get_tools call
+    if slot_scan.found and tool_type not in AVAILABLE_TOOLS:
+        raise GovernedCredentialError("UNSUPPORTED_AUTH_MODE")
+    return tool_type, slot_scan
+
+
+def release_run_slots(tools_list, elitea) -> Dict[str, Mapping[str, Any]]:
+    """Release the governed credential slots of every toolkit in `tools_list` with ONE resolver call.
+
+    `tools_list` must be a list (it is iterated twice with `get_tools`). Returns
+    ``{toolkit id (str): {field: envelope}}`` for `get_tools(released_slots=...)`; ``{}`` when the
+    resolver has no ``resolve_all``, nothing needs a release, or a toolkit id repeats (the build loop then
+    resolves per toolkit, as before). A toolkit the loop would refuse (invalid tool names, unsupported type,
+    nested or malformed slot, a stale envelope) is refused here, before anything is built. That guarantee
+    covers the toolkits built by `get_tools`; MCP, application and community tools are built earlier, as before.
+    """
+    resolver = getattr(elitea, 'credential_resolver', None)
+    if not callable(getattr(resolver, 'resolve_all', None)):
+        return {}
+    items, toolkit_ids, checks = [], set(), []
+    for tool in tools_list:
+        raw_settings = tool.get('settings')
+        if not raw_settings:
+            continue
+        if 'type' not in tool:
+            return {}
+        _tool_type, slot_scan = _precheck_tool(tool, raw_settings)
+        if not slot_scan.found:
+            continue
+        toolkit_id = str(tool.get('id'))
+        tool_items = collect_slot_items(raw_settings, toolkit_id, scan=slot_scan)
+        if toolkit_id in toolkit_ids:
+            return {}
+        if tool_items:
+            toolkit_ids.add(toolkit_id)
+            items.extend(tool_items)
+            checks.append((raw_settings, toolkit_id, slot_scan))
+    if not items:
+        return {}
+    released = resolve_run_slots(resolver, items)
+    # Check every envelope against its slot now, so a bad one aborts the run before the first toolkit is built.
+    for raw_settings, toolkit_id, slot_scan in checks:
+        apply_credential_slots(raw_settings, toolkit_id, None, scan=slot_scan, released=released[toolkit_id])
+    return released
+
+
+@memoize_slot_scans
+def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
+              released_slots: Optional[Mapping[str, Mapping[str, Any]]] = None, **kwargs):
     tools = []
+    # Governed slots of the whole run in one release; a caller that builds toolkits one at a time passes its own.
+    if released_slots is None:
+        released_slots = release_run_slots(tools_list, elitea)
 
     for tool in tools_list:
         toolkit_tools = []
@@ -289,14 +354,17 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
         tool = dict(tool)
         tool['settings'] = settings
 
-        # Validate tool names once
-        selected_tools = settings.get('selected_tools', [])
-        invalid_tools = [name for name in selected_tools if isinstance(name, str) and name.startswith('_')]
-        if invalid_tools:
-            raise ValueError(f"Tool names {invalid_tools} from toolkit '{tool.get('type', '')}' cannot start with '_'")
-
-        # Cache tool type and add common settings
-        tool_type = TOOLKIT_TYPE_ALIASES.get(tool['type'], tool['type'])
+        # Validate tool names, type and slot support once (shared with release_run_slots)
+        tool_type, slot_scan = _precheck_tool(tool, raw_settings)
+        # Governed credential slots (C-1009 WP-1D): resolve right before the toolkit is built,
+        # into this local copy only. A slot that cannot be resolved stops here, so a toolkit that
+        # reads a missing secret as anonymous access (e.g. GitHub) is never built without it.
+        released = frozenset()
+        if slot_scan.found:
+            settings, released = apply_credential_slots(
+                settings, str(tool.get('id')), getattr(elitea, 'credential_resolver', None), scan=slot_scan,
+                released=released_slots.get(str(tool.get('id'))))
+            tool['settings'] = settings
         settings['elitea'] = elitea
         settings['llm'] = llm
         settings['store'] = store
@@ -309,7 +377,12 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
 
         # Handle ADO special cases
         if tool_type in ['ado_boards', 'ado_wiki', 'ado_plans']:
-            toolkit_tools.extend(AVAILABLE_TOOLS['ado']['get_tools'](tool_type, tool))
+            try:
+                toolkit_tools.extend(AVAILABLE_TOOLS['ado']['get_tools'](tool_type, tool))
+            except Exception as e:
+                if not released:
+                    raise
+                raise ToolException(f"Error getting tools for {tool_type}: {scrub(str(e), released)}") from None
         elif tool_type == 'mcp':
             logger.debug(f"Skipping MCP toolkit '{tool.get('toolkit_name')}' - handled by runtime toolkit system")
         elif tool_type == 'planning':
@@ -330,6 +403,11 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
                 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
                 if isinstance(e, McpAuthorizationRequired):
                     raise
+                if released:
+                    # Error texts echo inputs (pydantic input_value); never log or raise a released value.
+                    msg = scrub(str(e), released)
+                    logger.error(f"Error getting tools for {tool_type}: {msg}")
+                    raise ToolException(msg if isinstance(e, ToolException) else f"Error getting tools for {tool_type}: {msg}") from None
                 if isinstance(e, ToolException):
                     raise
                 logger.error(f"Error getting tools for {tool_type}: {e}")
