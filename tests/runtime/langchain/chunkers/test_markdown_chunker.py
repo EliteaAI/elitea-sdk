@@ -595,3 +595,27 @@ class TestMarkdownByHeadersChunker:
         for c in chunks:
             assert "method_name" in c.metadata
 
+
+    def test_max_tokens_splits_oversized_section(self):
+        """#7173: a section larger than max_tokens is split into token-sized pieces."""
+        from elitea_sdk.tools.chunkers.utils import tiktoken_length
+        text = "## Big\n" + " ".join(f"word{i}" for i in range(2000))
+        chunks = list(markdown_by_headers_chunker(self._gen(text), config={"max_tokens": 100}))
+        assert len(chunks) > 1
+        assert all(tiktoken_length(c.page_content) <= 100 for c in chunks)
+        assert all(c.metadata["method_name"] == "text" for c in chunks)
+        assert all(c.metadata["headers"] == "Big" for c in chunks)
+        assert [c.metadata["chunk_id"] for c in chunks] == list(range(1, len(chunks) + 1))
+
+    def test_small_section_kept_whole(self):
+        text = "## Sec\nShort content."
+        chunks = list(markdown_by_headers_chunker(self._gen(text), config={"max_tokens": 100}))
+        assert len(chunks) == 1
+        assert chunks[0].metadata["method_name"] == "markdown"
+
+    @pytest.mark.parametrize("max_tokens", [None, -1, 0])
+    def test_no_limit_does_not_split(self, max_tokens):
+        text = "## Big\n" + " ".join(f"word{i}" for i in range(2000))
+        config = {} if max_tokens is None else {"max_tokens": max_tokens}
+        chunks = list(markdown_by_headers_chunker(self._gen(text), config=config))
+        assert len(chunks) == 1
