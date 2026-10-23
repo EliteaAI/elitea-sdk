@@ -4,7 +4,7 @@ import re
 import tempfile
 from logging import getLogger
 from pathlib import Path
-from typing import Generator, List
+from typing import Generator, Iterator, List
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -338,6 +338,11 @@ def _load_content_from_bytes_with_prompt(file_content: bytes, extension: str = N
             os.remove(temp_file_path)
 
 
+def _iter_loaded_documents(loader) -> Iterator[Document]:
+    iter_documents = getattr(loader, 'iter_documents', None)
+    return iter_documents() if callable(iter_documents) else iter(loader.load())
+
+
 def process_document_by_type(content, extension_source: str, document: Document = None, llm = None, chunking_config=None, image_cache=None) \
         -> Generator[Document, None, None]:
     """Process the content of a file based on its type using a configured loader cosidering the origin document.
@@ -405,6 +410,7 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
     elif not extensions:
         extensions = [".txt"]
 
+    loaded_any = False
     for extension in extensions:
         try:
             with tempfile.NamedTemporaryFile(mode='w+b', suffix=extension, delete=False) as temp_file:
@@ -491,10 +497,12 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                 except (TypeError, ValueError):
                     pass
                 loader = loader_cls(file_path=temp_file_path, **loader_kwargs)
-                yield from loader.load()
+                for loaded_document in _iter_loaded_documents(loader):
+                    loaded_any = True
+                    yield loaded_document
                 break
         except Exception as e:
-            if fallback_extensions:
+            if fallback_extensions and not loaded_any:
                 logger.warning(f"Error loading attachment: {str(e)} for file {temp_file_path} (extension: {extension})")
                 logger.warning(f"Continuing with fallback extensions: {fallback_extensions}.")
                 continue

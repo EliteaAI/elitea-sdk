@@ -57,4 +57,7 @@ class TestToolkitConfigSchema:
 
         assert "space_key" in schema.model_fields
         assert "space" not in schema.model_fields
-        assert "Space Key" in schema.model_fields["space_key"].description
+        field = schema.model_fields["space_key"]
+        assert "space key" in field.description.lower()
+        assert not field.is_required()
+        assert field.default is None

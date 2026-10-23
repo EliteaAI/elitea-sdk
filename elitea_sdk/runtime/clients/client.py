@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
 from ..middleware import (
+    InputGuardMiddleware,
     LoggingStrategy,
     ProjectContextMiddleware,
     SensitiveToolGuardMiddleware,
@@ -1174,6 +1175,53 @@ class EliteAClient:
         logger.debug(f"Unsecret response for '{secret_name}': value={mask_sensitive_value(data.get('value', ''))}")
         return data.get('value', None)
 
+    @staticmethod
+    def _with_context_window(llm: Any, context_settings: Optional[dict]) -> Any:
+        """A per-request copy of ``llm`` that tells the context floor the request's real window."""
+        window = (context_settings or {}).get('effective_window')
+        if llm is None or not window or not hasattr(llm, 'model_copy'):
+            return llm
+        try:
+            bound = getattr(llm, 'bound', None)
+            if bound is not None and hasattr(bound, 'model_copy'):
+                stamped = bound.model_copy()
+                object.__setattr__(stamped, '_elitea_context_window', int(window))
+                return llm.model_copy(update={'bound': stamped})
+            stamped = llm.model_copy()
+            object.__setattr__(stamped, '_elitea_context_window', int(window))
+            return stamped
+        except Exception as e:
+            logger.debug(f"Could not stamp context window on LLM: {e}")
+            return llm
+
+    def _summarization_llm(self, summary_llm_settings: Optional[dict]):
+        """The model picked in the context strategy, else the project's low-tier model."""
+        settings = summary_llm_settings or {}
+        max_tokens = settings.get('max_tokens') or 4000
+        model_name = settings.get('model_name')
+        # Building a client never fails for a removed model; the call is what 401s, so check first
+        if model_name:
+            model_project_id = settings.get('model_project_id')
+            available = self.get_available_models()
+            # An empty list means the lookup failed; keep the chosen model rather than guess
+            if available and not any(
+                model.get('name') == model_name
+                and (model_project_id in (None, '') or model.get('project_id') == model_project_id)
+                for model in available
+            ):
+                logger.warning(f"Summarization model '{model_name}' is not available, using low-tier model")
+                model_name = None
+        if model_name:
+            model_config = {'max_tokens': max_tokens}
+            for key in ('temperature', 'reasoning_effort', 'model_project_id'):
+                if settings.get(key) is not None:
+                    model_config[key] = settings[key]
+            try:
+                return self.get_llm(model_name, model_config)
+            except Exception as e:
+                logger.warning(f"Summarization model '{model_name}' unavailable, using low-tier model: {e}")
+        return self.get_low_tier_llm(max_tokens=max_tokens, temperature=settings.get('temperature'))
+
     def _inject_summarization(
         self, middleware_list: list, context_settings: Optional[dict], conversation_id: Optional[str] = None
     ):
@@ -1198,12 +1246,10 @@ class EliteAClient:
         try:
             from ..middleware.summarization import SummarizationMiddleware
 
-            # Get model config from context strategy
-            summary_max_tokens = context_settings.get('max_tokens', 4000)
-            summary_temperature = context_settings.get('temperature', 0.7)
-
-            # Try low-tier model first for cost efficiency
-            summarization_llm = self.get_low_tier_llm(max_tokens=summary_max_tokens, temperature=summary_temperature)
+            summarization_llm = self._summarization_llm(context_settings.get('summary_llm_settings'))
+            if summarization_llm is None:
+                logger.warning("No LLM available for summarization, SummarizationMiddleware not injected")
+                return
 
             # Extract callbacks from context_settings for backend integration
             callbacks = context_settings.get('callbacks', {})
@@ -1265,6 +1311,25 @@ class EliteAClient:
             ))
         except ValueError as e:
             logger.warning("Skipping invalid on-demand Project Context: %s", e)
+
+    def _inject_input_guard(self, middleware_list: list, conversation_id: Optional[str] = None) -> None:
+        """Inject the input guardrail (#6886) when the platform enabled it."""
+        try:
+            from ..toolkits.security import get_input_guard_policy, has_input_guard_config
+
+            if not has_input_guard_config():
+                return
+
+            if any(isinstance(mw, InputGuardMiddleware) for mw in middleware_list):
+                return
+
+            middleware_list.insert(0, InputGuardMiddleware(
+                policy=get_input_guard_policy(),
+                project_id=self.project_id,
+                conversation_id=conversation_id,
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to auto-inject InputGuardMiddleware: {e}")
 
     def _inject_sensitive_tool_guard(
         self,
@@ -1390,6 +1455,8 @@ class EliteAClient:
         # Auto-create middleware based on internal_tools configuration
         # This bridges the UI's internal_tools toggles to the middleware system
         middleware_list = list(middleware) if middleware else []
+        # First, so it inspects the history before summarization rewrites it
+        self._inject_input_guard(middleware_list, conversation_id)
         internal_tools = data.get('meta', {}).get('internal_tools', [])
         if 'planner' in internal_tools:
             # Create PlanningMiddleware when planner is enabled in internal_tools
@@ -1404,6 +1471,7 @@ class EliteAClient:
         self._inject_project_context(middleware_list, project_context, conversation_id)
 
         # Automatically compresses conversation history when threshold is exceeded
+        llm = self._with_context_window(llm, context_settings)
         self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Automatically clears stale tool outputs when a token threshold is exceeded
@@ -1834,6 +1902,8 @@ class EliteAClient:
         # Auto-create middleware based on internal_tools parameter
         # This matches the behavior in application() method
         middleware_list = []
+        # First, so it inspects the history before summarization rewrites it
+        self._inject_input_guard(middleware_list, conversation_id)
         has_planner = 'planner' in internal_tools
         if has_planner:
             from ..middleware.planning import PlanningMiddleware
@@ -1850,6 +1920,7 @@ class EliteAClient:
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
 
         # Automatically compresses conversation history when a threshold is exceeded
+        llm = self._with_context_window(llm, context_settings)
         self._inject_summarization(middleware_list, context_settings, conversation_id)
 
         # Automatically clears stale tool outputs when a token threshold is exceeded
@@ -2220,7 +2291,7 @@ class EliteAClient:
                 else:
                     logger.info(f"Found tool '{tool_name}' using fallback matching ('{actual_tool_name}')")
 
-                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {tool_params}")
+                logger.info(f"Executing tool '{tool_name}' (internal name: '{actual_tool_name}') with parameters: {sorted((tool_params or {}).keys()) if isinstance(tool_params, dict) else type(tool_params).__name__}")
 
                 # Start timing the tool execution
                 start_time = time.time()
