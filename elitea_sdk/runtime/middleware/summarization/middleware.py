@@ -148,6 +148,8 @@ TOOL_RESULT_SUMMARY_PROMPT = (
 # Bounded by the low-tier summarizer's own window, not by the agent model's.
 TOOL_RESULT_SUMMARY_INPUT_CHARS = 128_000
 SUMMARIZED_SENTINEL = '[tool result summarized: context floor]'
+# Same prefix pylon_main uses when it replays the stored summary via chat_history
+SUMMARY_PREFIX = 'Here is a summary of the conversation to date:'
 
 
 # Keeps summary calls out of the run's callback rollup; their usage is reported in auxiliary_usage (#6898)
@@ -412,7 +414,7 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             content = msg.content
 
         if content and isinstance(content, str):
-            if content.startswith("Here is a summary of the conversation to date:"):
+            if content.startswith(SUMMARY_PREFIX):
                 return True
 
         return False
@@ -602,7 +604,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
             'to_preserve_count': len(preserved_messages),
         })
 
-        summary = self._create_summary(messages_to_summarize)
+        # Roll the previous summary into the new one: pylon_main keeps only the latest
+        summary = self._create_summary(
+            [existing_summary, *messages_to_summarize] if existing_summary is not None else messages_to_summarize
+        )
         if summary is None:
             # Keep the history rather than replacing it with an error text
             self._fire_callback('summarized', {**(self.last_context_info or {}), 'summarized': False})
@@ -631,8 +636,9 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         # Fire 'summarized' callback (EliteA-specific)
         self._fire_callback('summarized', self.last_context_info)
 
-        # Return preserved messages only — summary is not stored in state.
-        # pylon_main persists it in conversation meta and sends it back via chat_history.
+        # The summary leads the preserved messages so this turn's model call sees it too
+        # (and history starts on a user turn). pylon_main also persists it in conversation
+        # meta and sends it back via chat_history on later turns.
         # Mark preserved messages so downstream code knows they survived summarization.
         marked_preserved = [
             msg.model_copy(update={"additional_kwargs": {**msg.additional_kwargs, "lc_summarized": True}})
@@ -641,6 +647,10 @@ class SummarizationMiddleware(LangChainSummarizationMiddleware):
         return {
             "messages": [
                 RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                HumanMessage(
+                    content=f"{SUMMARY_PREFIX}\n\n{summary}",
+                    additional_kwargs={'lc_source': 'summarization'},
+                ),
                 *marked_preserved,
             ]
         }

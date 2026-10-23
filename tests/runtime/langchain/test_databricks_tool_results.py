@@ -111,7 +111,7 @@ def test_auto_routing_prepares_results_after_resolving_native_databricks_model()
     from elitea_sdk.runtime.clients.routing import AutoChatModel
     client = ChatAnthropic(model='global.databricks.claude-haiku-4-5', api_key='offline')
     original = ToolMessage(content=[DOCUMENT], tool_call_id='call-1')
-    projected = AutoChatModel._native_messages(client.bind_tools([]), [original], {'invocation_id': 'test'})
+    projected = AutoChatModel._native_messages(client.bind_tools([]), [original], {'invocation_id': 'test', 'config': {}})
     assert json.loads(projected[0].content[0]['text']) == DOCUMENT
     assert original.content == [DOCUMENT]
 

@@ -1,5 +1,6 @@
 """Native message preservation, replay and parallel task isolation without inference."""
 import asyncio
+import json
 import importlib.util
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -202,9 +203,46 @@ def test_classifier_projection_omits_opaque_thinking_but_generation_does_not():
     assert original.content[0]['signature'] == 'sig'
 
 
-def test_unqualified_modality_fails_and_never_silently_drops_image():
+def test_classifier_projection_marks_image_and_still_rejects_unknown_modality():
+    image = HumanMessage(content=[{'type': 'text', 'text': 'describe'}, {'type': 'image_url', 'image_url': {'url': 'data:fixture'}}])
+    assert m.projection([image])[0]['content'] == 'describe\n[image]'
+    assert m.required_modalities([image]) == ['image']
     with pytest.raises(ValueError, match='modality'):
-        m.projection([HumanMessage(content=[{'type': 'image_url', 'image_url': {'url': 'data:fixture'}}])])
+        m.projection([HumanMessage(content=[{'type': 'input_audio', 'input_audio': {'data': 'fixture'}}])])
+
+
+def test_image_reaches_vision_pin_and_requests_image_modality():
+    auto, native, calls = model()
+    task = HumanMessage(content=[{'type': 'text', 'text': 'describe'}, {'type': 'image_url', 'image_url': {'url': 'data:' + 'A'*600000}}])
+    auto.invoke([task], cfg())
+    assert calls[0]['required_modalities'] == ['image']
+    assert calls[0]['generation_input_bytes'] < 100000  # Image sized by tokens, not base64 bytes.
+    assert native.inputs[-1][-1] is task
+
+
+def test_typeless_converse_image_is_sized_as_an_image_not_its_bytes():
+    raw = b'\x89PNG' + b'\x00'*600000
+    payload = {'messages': [{'role': 'user', 'content': [{'text': 'describe'},
+               {'image': {'format': 'png', 'source': {'bytes': raw}}}]}], 'blob': raw}
+    sized = m.sized_images(payload)
+    assert sized['messages'][0]['content'][0] == {'text': 'describe'}
+    assert len(json.dumps(sized)) < 3*m.IMAGE_INPUT_BYTES
+
+
+def test_text_only_pin_replaces_image_with_placeholder():
+    auto, native, calls = model()
+    request = auto.owner._request
+    def text_only(method, url, **kwargs):
+        response = request(method, url, **kwargs)
+        body = response.json()
+        body['config']['supports_vision'] = False
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
+    auto.owner._request = text_only
+    task = HumanMessage(content=[{'type': 'text', 'text': 'describe'}, {'type': 'image_url', 'image_url': {'url': 'data:fixture'}}])
+    auto.invoke([task], cfg())
+    sent = native.inputs[-1][-1].content
+    assert sent == [{'type': 'text', 'text': 'describe'}, {'type': 'text', 'text': m.TEXT_ONLY_IMAGE_TEXT}]
+    assert task.content[1]['type'] == 'image_url'
 
 
 def test_foreign_sibling_binding_never_reused():
@@ -283,10 +321,10 @@ def test_oversized_live_steer_fails_without_selecting_another_model():
     assert len(calls) == 1 and len(native.inputs) == 1
 
 
-def test_multimodal_live_steer_fails_without_rerouting_or_native_dispatch():
+def test_unqualified_modality_live_steer_fails_without_rerouting_or_native_dispatch():
     auto, native, calls = model();task = HumanMessage(content='task')
     first = auto.invoke([task], cfg())
-    steer = HumanMessage(content=[{'type': 'image_url', 'image_url': {'url': 'data:fixture'}}])
+    steer = HumanMessage(content=[{'type': 'input_audio', 'input_audio': {'data': 'fixture'}}])
     with pytest.raises(ValueError, match='modality'):
         auto.invoke([task, first, steer], cfg())
     assert len(calls) == 1 and len(native.inputs) == 1
