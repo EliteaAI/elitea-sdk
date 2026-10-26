@@ -106,7 +106,7 @@ runtime = [
     "cairocffi==1.7.1",
     "rlpycairo==0.3.0",
     "keybert==0.8.3",
-    "sentence-transformers==2.7.0",
+    "sentence-transformers==5.6.0",
     "gensim==4.4.0",
     "scipy==1.17.0",
     "opencv-python==4.13.0.90",
