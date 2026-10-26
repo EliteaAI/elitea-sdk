@@ -106,42 +106,34 @@ def loaded_skill_names_from_messages(messages) -> set:
     return names
 
 
-def _normalized_name(skill: dict) -> str:
+def _normalize_skill_name(skill: dict) -> str:
     return (skill.get('name') or '').strip().lower()
 
 
-def _skill_key(skill: dict) -> tuple:
+def _build_skill_identity(skill: dict) -> tuple:
     return (skill.get('skill_project_id'), skill.get('skill_id'))
 
 
-def _skill_version_id(skill: dict):
-    return skill.get('skill_version_id', skill.get('version_id'))
-
-
-def _source_rank(skill: dict, default: str) -> int:
+def _rank_by_source(skill: dict, default: str) -> int:
     return SOURCE_RANK.get(skill.get('origin') or default, SOURCE_RANK[default])
 
 
 class SkillRegistry:
-    """Every skill one run may search or load, deduplicated by name and keyed by (skill_project_id, skill_id)."""
-
     def __init__(self, entries: list, ranker=None):
         self._entries = list(entries)
-        self._by_name = {_normalized_name(skill): skill for skill in self._entries}
-        self._by_key = {_skill_key(skill): skill for skill in self._entries}
+        self._by_name = {_normalize_skill_name(skill): skill for skill in self._entries}
         self._ranker = ranker or BM25Ranker()
 
     @classmethod
     def from_sources(cls, attached_skills=None, project_skills=None, ranker=None) -> "SkillRegistry":
-        """The agent's own skills win a name clash, then chat participants, then project skills; within a source the lowest skill_id wins."""
         ranked = sorted(
-            [(_source_rank(skill, 'agent'), skill) for skill in attached_skills or []]
-            + [(_source_rank(skill, 'project'), skill) for skill in project_skills or []],
+            [(_rank_by_source(skill, 'agent'), skill) for skill in attached_skills or []]
+            + [(_rank_by_source(skill, 'project'), skill) for skill in project_skills or []],
             key=lambda item: (item[0], item[1].get('skill_id') or 0, item[1].get('name') or ''),
         )
         entries, seen_names = [], set()
         for _rank, skill in ranked:
-            name = _normalized_name(skill)
+            name = _normalize_skill_name(skill)
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
@@ -158,9 +150,6 @@ class SkillRegistry:
     def resolve(self, name: str) -> Optional[dict]:
         return self._by_name.get((name or '').strip().lower())
 
-    def get(self, skill_project_id, skill_id) -> Optional[dict]:
-        return self._by_key.get((skill_project_id, skill_id))
-
     def search(self, query: str, limit: int = SEARCH_SKILLS_RESULT_LIMIT) -> list:
         return [skill for _score, skill in self.search_scored(query, limit)]
 
@@ -169,15 +158,11 @@ class SkillRegistry:
 
 
 class BM25Ranker:
-    """BM25 over name (weighted) and description with OR semantics; quoted phrases are required."""
-
     def rank_scored(self, query: str, skills: list, limit: int = SEARCH_SKILLS_RESULT_LIMIT) -> list:
         return rank_skills_scored(query, skills, limit)
 
 
 class EmbeddingRanker:
-    """Cosine similarity over entry vectors; entries without a vector, or a failed query embedding, fall back to BM25."""
-
     def __init__(self, query_embedder: Callable[[str], list], fallback=None):
         self._query_embedder = query_embedder
         self._fallback = fallback or BM25Ranker()
@@ -194,7 +179,7 @@ class EmbeddingRanker:
             logger.warning("[Skills] query embedding failed, falling back to BM25: %s", e)
             return self._fallback.rank_scored(query, skills, limit)
         scored = sorted(
-            ((_cosine(query_vector, skill['embedding']), index) for index, skill in enumerate(embedded)),
+            ((_compute_cosine_similarity(query_vector, skill['embedding']), index) for index, skill in enumerate(embedded)),
             key=lambda item: (-item[0], item[1]),
         )
         ranked = [(score, embedded[index]) for score, index in scored[:limit]]
@@ -209,7 +194,7 @@ def _has_vector(skill: dict) -> bool:
     return isinstance(vector, (list, tuple)) and len(vector) > 0
 
 
-def _cosine(left: list, right: list) -> float:
+def _compute_cosine_similarity(left: list, right: list) -> float:
     if len(left) != len(right):
         return 0.0
     dot = sum(a * b for a, b in zip(left, right))
@@ -264,14 +249,14 @@ class LoadSkillTool(BaseTool):
                 return LOAD_SKILL_UNKNOWN_LISTED.format(name=skill, available=', '.join(available) or '(none)')
             return LOAD_SKILL_UNKNOWN.format(name=skill)
         name = matched.get('name')
-        normalized_name = _normalized_name(matched)
+        normalized_name = _normalize_skill_name(matched)
         if self._is_invoked(matched):
             logger.info("[Skills] load_skill %r already active via ~name", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
         if normalized_name in self._already_loaded:
             logger.info("[Skills] load_skill %r already loaded in this conversation", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
-        instructions, reason = self._instructions(matched)
+        instructions, reason = self._resolve_instructions(matched)
         if instructions is None:
             logger.warning("[Skills] load_skill %r unavailable: %s", name, reason)
             return LOAD_SKILL_UNAVAILABLE.format(name=name, reason=reason)
@@ -280,12 +265,12 @@ class LoadSkillTool(BaseTool):
         return LOADED_SKILL_RESULT.format(name=name, instructions=instructions)
 
     def _is_invoked(self, matched: dict) -> bool:
-        invoked_keys = {_skill_key(s) for s in self.invoked_skills if s.get('skill_id') is not None}
-        invoked_names = {_normalized_name(s) for s in self.invoked_skills}
-        return (matched.get('skill_id') is not None and _skill_key(matched) in invoked_keys) \
-            or _normalized_name(matched) in invoked_names
+        invoked_keys = {_build_skill_identity(s) for s in self.invoked_skills if s.get('skill_id') is not None}
+        invoked_names = {_normalize_skill_name(s) for s in self.invoked_skills}
+        return (matched.get('skill_id') is not None and _build_skill_identity(matched) in invoked_keys) \
+            or _normalize_skill_name(matched) in invoked_names
 
-    def _instructions(self, matched: dict) -> tuple:
+    def _resolve_instructions(self, matched: dict) -> tuple:
         inline = matched.get('instructions')
         if isinstance(inline, str) and inline.strip():
             return inline, ''
@@ -293,7 +278,8 @@ class LoadSkillTool(BaseTool):
             return None, LOAD_SKILL_UNAVAILABLE_TRANSIENT
         try:
             body = self.body_fetcher(
-                matched.get('skill_project_id'), matched.get('skill_id'), _skill_version_id(matched),
+                matched.get('skill_project_id'), matched.get('skill_id'),
+                matched.get('skill_version_id', matched.get('version_id')),
             )
         except SkillBodyUnavailable as e:
             return None, LOAD_SKILL_UNAVAILABLE_DENIED if e.denied else LOAD_SKILL_UNAVAILABLE_TRANSIENT
@@ -353,13 +339,13 @@ class SearchSkillsTool(BaseTool):
         return self._search(query)
 
 
-def _tokens(text: str) -> List[str]:
+def _tokenize(text: str) -> List[str]:
     normalized = unicodedata.normalize('NFKC', str(text or '')).casefold().replace(DOTTED_SMALL_I, 'i')
     return [
         term
-        for word in _words(normalized)
-        for variant in _format_variants(word)
-        for term in _word_terms(variant)
+        for word in _split_words(normalized)
+        for variant in _expand_format_variants(word)
+        for term in _split_unsegmented_runs(variant)
     ]
 
 
@@ -370,7 +356,7 @@ def _is_word_character(character: str) -> bool:
     return category[0] in WORD_CATEGORY_CLASSES
 
 
-def _words(text: str) -> List[str]:
+def _split_words(text: str) -> List[str]:
     words = []
     current = []
     for character in text:
@@ -384,7 +370,7 @@ def _words(text: str) -> List[str]:
     return words
 
 
-def _format_variants(word: str) -> List[str]:
+def _expand_format_variants(word: str) -> List[str]:
     parts = []
     current = []
     for character in word:
@@ -400,31 +386,30 @@ def _format_variants(word: str) -> List[str]:
     return [''.join(parts)] + parts
 
 
-def _word_terms(word: str) -> List[str]:
+def _split_unsegmented_runs(word: str) -> List[str]:
     terms = []
     position = 0
     for run in UNSEGMENTED_RUN_PATTERN.finditer(word):
         if run.start() > position:
             terms.append(word[position:run.start()])
-        terms.extend(_bigrams(run.group()))
+        terms.extend(_build_bigrams(run.group()))
         position = run.end()
     if position < len(word):
         terms.append(word[position:])
     return terms
 
 
-def _bigrams(run: str) -> List[str]:
+def _build_bigrams(run: str) -> List[str]:
     if len(run) == 1:
         return [run]
     return [run[index:index + 2] for index in range(len(run) - 1)]
 
 
 def parse_skill_query(query: str) -> tuple:
-    """(unique scoring terms, required phrases); phrase terms also score, as in tools/openapi/response_selection."""
     terms, phrases = [], []
     for match in QUERY_PART_PATTERN.finditer(str(query or '')):
         phrase = match.group('phrase')
-        tokens = _tokens(phrase if phrase is not None else match.group('term'))
+        tokens = _tokenize(phrase if phrase is not None else match.group('term'))
         if not tokens:
             continue
         terms.extend(tokens)
@@ -438,24 +423,19 @@ def _contains_phrase(sequence: List[str], phrase: tuple) -> bool:
     return any(tuple(sequence[index:index + length]) == phrase for index in range(len(sequence) - length + 1))
 
 
-def _qualifies(query_terms: List[str], document: Counter, name_terms: set) -> bool:
+def _matches_query_terms(query_terms: List[str], document: Counter, name_terms: set) -> bool:
     content_terms = [term for term in query_terms if term not in SEARCH_SKILLS_STOPWORDS]
     if content_terms:
         return any(document[term] for term in content_terms)
     return any(term in name_terms for term in query_terms)
 
 
-def rank_skills(query: str, skills: list, limit: int = SEARCH_SKILLS_RESULT_LIMIT) -> list:
-    return [skill for _score, skill in rank_skills_scored(query, skills, limit)]
-
-
 def rank_skills_scored(query: str, skills: list, limit: int = SEARCH_SKILLS_RESULT_LIMIT) -> list:
-    """(score, skill) pairs: BM25 with OR semantics over content terms; an all-stopword query matches skill names only; every quoted phrase must appear in name + description; ties keep catalog order."""
     query_terms, phrases = parse_skill_query(query)
     if not query_terms or not skills:
         return []
-    name_tokens = [_tokens(skill.get('name')) for skill in skills]
-    description_tokens = [_tokens(skill.get('description')) for skill in skills]
+    name_tokens = [_tokenize(skill.get('name')) for skill in skills]
+    description_tokens = [_tokenize(skill.get('description')) for skill in skills]
     documents = [
         Counter(names * SEARCH_SKILLS_NAME_WEIGHT + description)
         for names, description in zip(name_tokens, description_tokens)
@@ -479,7 +459,7 @@ def rank_skills_scored(query: str, skills: list, limit: int = SEARCH_SKILLS_RESU
     ):
         if not all(_contains_phrase(names + description, phrase) for phrase in phrases):
             continue
-        if not _qualifies(query_terms, document, set(names)):
+        if not _matches_query_terms(query_terms, document, set(names)):
             continue
         length_normalization = BM25_K1 * (1 - BM25_B + BM25_B * length / average_length)
         score = sum(
@@ -573,11 +553,8 @@ def _registry_description(description: str, max_chars: int, skill: dict) -> str:
     return ' '.join(part for part in (_shorten(description, max_chars), hint) if part) or '(no description)'
 
 
-def skill_reminder_suffix(project_skills) -> str:
-    return SKILL_SEARCH_REMINDER_SUFFIX if project_skills else SKILL_REMINDER_SUFFIX
 
-
-def request_text(task) -> str:
+def extract_request_text(task) -> str:
     if isinstance(task, str):
         return task
     if isinstance(task, list):
@@ -588,23 +565,17 @@ def request_text(task) -> str:
     return ''
 
 
-def suggestion_query(text: str) -> str:
-    """Request words long enough to carry meaning; digits and two-letter words only pull in unrelated skills."""
-    return ' '.join(
-        term for term in _tokens(text)
+def render_skill_suggestions(registry: SkillRegistry, task, excluded_names=()) -> str:
+    query = ' '.join(
+        term for term in _tokenize(extract_request_text(task))
         if len(term) >= SKILL_SUGGESTIONS_MIN_TOKEN_CHARS or not term.isascii()
     )
-
-
-def render_skill_suggestions(registry: SkillRegistry, task, excluded_names=()) -> str:
-    """Per-turn block of the registry's best matches for the user's request, rendered for the uncached suffix."""
-    query = suggestion_query(request_text(task))
     if not query or not len(registry):
         return ""
     excluded = {(name or '').strip().lower() for name in excluded_names}
     scored = [
         (score, skill) for score, skill in registry.search_scored(query, SKILL_SUGGESTIONS_LIMIT + len(excluded))
-        if _normalized_name(skill) not in excluded
+        if _normalize_skill_name(skill) not in excluded
     ]
     floor = scored[0][0] * SKILL_SUGGESTIONS_SCORE_FLOOR if scored else 0
     matches = [skill for score, skill in scored if score >= floor][:SKILL_SUGGESTIONS_LIMIT]

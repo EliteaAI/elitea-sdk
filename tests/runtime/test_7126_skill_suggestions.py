@@ -11,7 +11,7 @@ from elitea_sdk.runtime.langchain.constants import (
     SKILL_SUGGESTIONS_LIMIT,
 )
 from elitea_sdk.runtime.tools.llm import LLMNode
-from elitea_sdk.runtime.tools.skill_tools import SkillRegistry, render_skill_suggestions, request_text, suggestion_query
+from elitea_sdk.runtime.tools.skill_tools import SkillRegistry, render_skill_suggestions, extract_request_text
 
 
 def _skill(skill_id, name, description, **extra):
@@ -90,10 +90,9 @@ def test_digits_and_two_letter_words_do_not_pull_in_skills():
     project = PROJECT + [_skill(13, 'seven', 'Checklist for 7.'), _skill(14, 'hi-bot', 'Says hi.')]
     registry = SkillRegistry.from_sources([], project)
 
-    assert suggestion_query('2 + 2 hi') == ''
     assert render_skill_suggestions(registry, 'What is 2 + 2? hi') == ''
     assert 'seven' not in render_skill_suggestions(registry, 'draft the release notes for build 7')
-    assert suggestion_query('生成报告') != ''
+    assert 'zh-report' in render_skill_suggestions(SkillRegistry.from_sources([], [_skill(30, 'zh-report', '用于生成报告')]), '生成报告')
 
 
 def test_weak_matches_below_half_the_best_score_are_dropped():
@@ -179,6 +178,6 @@ def test_blank_requests_and_empty_registries_suggest_nothing():
 
 
 def test_request_text_handles_every_task_shape():
-    assert request_text('plain') == 'plain'
-    assert request_text([{'type': 'text', 'text': 'a'}, 'junk', {'type': 'text', 'text': 'b'}]) == 'a b'
-    assert request_text({'not': 'text'}) == ''
+    assert extract_request_text('plain') == 'plain'
+    assert extract_request_text([{'type': 'text', 'text': 'a'}, 'junk', {'type': 'text', 'text': 'b'}]) == 'a b'
+    assert extract_request_text({'not': 'text'}) == ''

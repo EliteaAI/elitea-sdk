@@ -966,7 +966,6 @@ class EliteAClient:
         raise ApiDetailsRequestError(f"Failed to fetch application version details for {application_id}/{application_version_id}: {resp.status_code} - {resp.text}")
 
     def get_skill_body(self, skill_project_id: int, skill_id: int, version_id: Optional[int] = None) -> str:
-        """Instructions of one skill version, fetched with the run user's identity so the platform re-checks access."""
         url = f"{self.skill_details_url}/{skill_project_id}/{skill_id}"
         params = {'version_id': version_id} if version_id is not None else None
         response = self._request('get', url, headers=self.headers, params=params, verify=False)

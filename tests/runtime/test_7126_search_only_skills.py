@@ -213,11 +213,10 @@ def test_registry_precedence_is_agent_then_participant_then_project_then_lowest_
     assert registry.resolve('DUP')['skill_id'] == 7
 
 
-def test_registry_keys_entries_by_project_and_skill_id():
+def test_registry_resolves_names_case_insensitively():
     registry = _registry()
 
-    assert registry.get(7, 11)['name'] == 'sql-review'
-    assert registry.get(99, 11) is None
+    assert registry.resolve('SQL-Review')['skill_id'] == 11
     assert registry.resolve('missing') is None
 
 

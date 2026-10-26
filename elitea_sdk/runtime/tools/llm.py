@@ -25,6 +25,8 @@ except ImportError:
 
 from ..langchain.constants import (
     ELITEA_RS,
+    SKILL_REMINDER_SUFFIX,
+    SKILL_SEARCH_REMINDER_SUFFIX,
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
 )
@@ -142,7 +144,6 @@ from .skill_tools import (
     loaded_skill_names_from_messages,
     render_skill_registry_index,
     render_skill_suggestions,
-    skill_reminder_suffix,
 )
 from .tool_binding import (
     build_tool_binding_plan,
@@ -755,7 +756,7 @@ class LLMNode(BaseTool):
             configurable.get('invoked_skills'),
             configurable.get('project_skills'),
             skill_search=configurable.get('skill_search'),
-            skill_body_fetcher=self._skill_body_fetcher(configurable),
+            skill_body_fetcher=self._resolve_skill_body_fetcher(configurable),
         )
 
         def merge_skill_tools(tools):
@@ -1023,21 +1024,21 @@ class LLMNode(BaseTool):
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
 
     @staticmethod
-    def _skill_suggestions_enabled(configurable: dict) -> bool:
+    def _should_suggest_skills(configurable: dict) -> bool:
         if configurable.get('invoked_skills'):
             return False
         settings = configurable.get('skill_search')
         return not (isinstance(settings, dict) and settings.get('suggestions') is False)
 
     @staticmethod
-    def _active_skill_names(configurable: dict, chat_history) -> set:
+    def _collect_active_skill_names(configurable: dict, chat_history) -> set:
         invoked = {
             (skill.get('name') or '').strip().lower()
             for skill in configurable.get('invoked_skills') or [] if isinstance(skill, dict)
         }
         return invoked | loaded_skill_names_from_messages(list(chat_history or []))
 
-    def _skill_body_fetcher(self, configurable: dict):
+    def _resolve_skill_body_fetcher(self, configurable: dict):
         fetcher = configurable.get('skill_body_fetcher')
         if callable(fetcher):
             return fetcher
@@ -1505,11 +1506,11 @@ class LLMNode(BaseTool):
             skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
             if skills_section:
                 logger.info("[Skills] Injected per-turn skills section into system prompt")
-            if skill_registry_advertised and search_only and self._skill_suggestions_enabled(configurable):
+            if skill_registry_advertised and search_only and self._should_suggest_skills(configurable):
                 suggestions = render_skill_suggestions(
                     next(t.registry for t in prebuilt_filtered_tools if isinstance(t, SearchSkillsTool)),
                     func_args.get('task'),
-                    self._active_skill_names(configurable, func_args.get('chat_history')),
+                    self._collect_active_skill_names(configurable, func_args.get('chat_history')),
                 )
                 if suggestions:
                     skills_section = f"{skills_section}\n\n{suggestions}" if skills_section else suggestions
@@ -1518,7 +1519,7 @@ class LLMNode(BaseTool):
             # A one-line reminder in the (already uncached) dynamic suffix puts the
             # instruction last, where it competes with the conversation itself.
             if skill_registry_advertised:
-                reminder = skill_reminder_suffix(configurable.get('project_skills'))
+                reminder = SKILL_SEARCH_REMINDER_SUFFIX if search_only else SKILL_REMINDER_SUFFIX
                 skills_section = f"{skills_section}\n\n{reminder}" if skills_section else reminder
 
             task_content = self._task_message_content(func_args.get('task'))

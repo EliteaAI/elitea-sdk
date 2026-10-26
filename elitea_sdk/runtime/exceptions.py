@@ -178,8 +178,6 @@ class AgentAccessDeniedError(Exception):
 
 
 class SkillBodyUnavailable(Exception):
-    """A skill body could not be fetched on demand; `denied` separates a revoked or deleted skill from a transient failure."""
-
     def __init__(self, message: str, denied: bool = False):
         super().__init__(message)
         self.denied = denied
