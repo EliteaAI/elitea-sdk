@@ -125,7 +125,7 @@ tools = [
     "paramiko>=3.5.1,<4",
     "pygithub==2.3.0",
     "python-gitlab==4.5.0",
-    "gitpython==3.1.59",
+    "gitpython==3.2.1",
     "atlassian-python-api~=4.0.7",
     "jira==3.8.0",
     "qtest-swagger-client==0.0.3",
