@@ -27,6 +27,15 @@ import pytest
 
 dulwich = pytest.importorskip("dulwich")
 
+# The generic PR job overlays this checkout onto a fixed dependency image without
+# installing ``.[runtime]``, so it may still carry the pre-1.2 dulwich. These tests
+# target the pinned version and run wherever it is installed.
+if dulwich.__version__ < (1, 2, 9):
+    pytest.skip(
+        f"requires dulwich >= 1.2.9 (found {'.'.join(map(str, dulwich.__version__))})",
+        allow_module_level=True,
+    )
+
 from elitea_sdk.runtime.langchain.tools import git as sdk_git  # noqa: E402
 
 GIT = shutil.which("git")
