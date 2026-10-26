@@ -234,6 +234,10 @@ class LoadSkillInput(BaseModel):
     skill: str = Field(description="Exact name of the skill to load, as returned by search_skills.")
 
 
+class LoadSkillListedInput(BaseModel):
+    skill: str = Field(description="Exact name of the skill to load, as listed inside <available_skills> in the system prompt.")
+
+
 class LoadSkillTool(BaseTool):
     """Serves only skills in the per-turn registry (structurally enforced); the loaded body is returned as a ToolMessage and never injected into the cached system prefix."""
 
@@ -499,7 +503,7 @@ def build_load_skill_tools(
         logger.debug("[Skills] Binding load_skill with %d attached skills", len(registry))
         return [LoadSkillTool(
             registry=registry, invoked_skills=invoked_skills or [], body_fetcher=skill_body_fetcher,
-            listed=True, description=LOAD_SKILL_LISTED_TOOL_DESCRIPTION,
+            listed=True, description=LOAD_SKILL_LISTED_TOOL_DESCRIPTION, args_schema=LoadSkillListedInput,
         )]
     logger.debug(
         "[Skills] Binding search_skills + load_skill over %d skills (%d attached, %d project)",

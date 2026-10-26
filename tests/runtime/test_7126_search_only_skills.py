@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from elitea_sdk.runtime.clients.client import EliteAClient
 from elitea_sdk.runtime.exceptions import SkillBodyUnavailable
@@ -155,7 +156,7 @@ def test_without_project_skills_only_load_skill_is_bound_with_its_listed_descrip
     tools = build_load_skill_tools(ATTACHED, None, None)
 
     assert [type(tool) for tool in tools] == [LoadSkillTool]
-    assert tools[0].description == main.LoadSkillTool(attached_skills=ATTACHED).description
+    assert convert_to_openai_tool(tools[0]) == convert_to_openai_tool(main.LoadSkillTool(attached_skills=ATTACHED))
     assert 'Body of pirate-tone.' in tools[0].invoke({'skill': 'pirate-tone'})
     assert tools[0].invoke({'skill': 'nope'}) == main.LoadSkillTool(attached_skills=ATTACHED).invoke({'skill': 'nope'})
 
