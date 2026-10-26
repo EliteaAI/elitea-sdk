@@ -422,3 +422,56 @@ class TestSingleAttachmentRead:
         docs = self._loader(content, attachment_index=2, max_tokens=-1).load()
         joined = "\n".join(d.page_content for d in docs)
         assert "FIRST" in joined and "SECOND" in joined
+
+
+class TestAttachmentChunking:
+    """#7173: load() keeps attachment chunks separate and caps them at max_tokens."""
+
+    BIG = "\n".join(f"row {i}, value {i * 7}, some text here" for i in range(2000))
+
+    def _load(self, content, **kwargs):
+        from elitea_sdk.runtime.langchain.document_loaders.EliteAEmailLoader import EliteAEmailLoader
+        return EliteAEmailLoader(file_content=content, file_name="test.eml", **kwargs).load()
+
+    def test_chunks_respect_max_tokens(self):
+        from elitea_sdk.tools.chunkers.utils import tiktoken_length
+        content = _eml_with_attachments([("big.txt", self.BIG)])
+        for max_tokens in (512, 128):
+            docs = self._load(content, max_tokens=max_tokens)
+            assert all(tiktoken_length(d.page_content) <= max_tokens for d in docs)
+        assert len(self._load(content, max_tokens=128)) > len(self._load(content, max_tokens=512))
+
+    def test_attachment_chunks_are_separate_with_context(self):
+        content = _eml_with_attachments([("one.txt", "FIRST"), ("two.txt", "SECOND")])
+        docs = self._load(content, max_tokens=512)
+        body = [d for d in docs if "email_attachment" not in d.metadata]
+        one = [d for d in docs if d.metadata.get("email_attachment") == "one.txt"]
+        two = [d for d in docs if d.metadata.get("email_attachment") == "two.txt"]
+        assert body and one and two
+        assert all("FIRST" not in d.page_content and "SECOND" not in d.page_content for d in body)
+        assert "FIRST" in one[0].page_content and "SECOND" not in one[0].page_content
+        assert one[0].page_content.startswith("**Subject:** Attach Test\n**Attachment: one.txt**")
+        assert one[0].metadata["subject"] == "Attach Test"
+        assert [d.metadata["chunk_id"] for d in docs] == list(range(1, len(docs) + 1))
+
+    def test_csv_attachment_split_on_row_boundaries(self):
+        """max_tokens reaches the CSV loader and overflow is re-split on lines, so no row is cut."""
+        from email.message import EmailMessage
+        from elitea_sdk.tools.chunkers.utils import tiktoken_length
+        rows = ["id,name,value"] + [f"{i},name{i},{i * 3}" for i in range(1500)]
+        msg = EmailMessage()
+        msg["From"], msg["To"], msg["Subject"] = "a@example.com", "b@example.com", "CSV"
+        msg.set_content("See table.")
+        msg.add_attachment("\n".join(rows).encode(), maintype="text", subtype="csv", filename="t.csv")
+        docs = [d for d in self._load(msg.as_bytes(), max_tokens=256)
+                if d.metadata.get("email_attachment") == "t.csv"]
+        assert len(docs) > 1
+        assert all(tiktoken_length(d.page_content) <= 256 for d in docs)
+        body_lines = [line for d in docs for line in d.page_content.split("\n\n", 1)[1].splitlines()]
+        assert body_lines == rows
+
+    def test_get_content_still_combined(self):
+        from elitea_sdk.runtime.langchain.document_loaders.EliteAEmailLoader import EliteAEmailLoader
+        content = _eml_with_attachments([("one.txt", "FIRST"), ("two.txt", "SECOND")])
+        text = EliteAEmailLoader(file_content=content, file_name="test.eml", max_tokens=512).get_content()
+        assert "**Attachment: one.txt**" in text and "SECOND" in text
