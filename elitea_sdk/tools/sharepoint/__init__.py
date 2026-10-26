@@ -185,7 +185,9 @@ class SharepointToolkit(BaseToolkit):
                 toolkit_id=toolkit_id,
                 toolkit_name=toolkit_name,
                 client_id=sp_config.get('client_id'),
-                client_secret=sp_config.get('client_secret'),
+                # An admin-managed app's secret stays server-side: not even a masked copy
+                client_secret=None if sp_config.get('oauth_app_id') else sp_config.get('client_secret'),
+                oauth_app_id=sp_config.get('oauth_app_id'),
             )
             raise exc
 
