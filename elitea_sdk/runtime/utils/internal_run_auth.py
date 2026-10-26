@@ -11,7 +11,8 @@ import re
 from typing import Any, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
-_INTERNAL_PATH = re.compile(r"(?:^|/)app/\d+/mcp(?:/|$)")
+# The same shape Main matches: the path starts with /app/<project>/mcp, then / or nothing
+_INTERNAL_PATH = re.compile(r"^/app/\d+/mcp(?:/|$)")
 
 
 def internal_run_headers(client: Any, url: str, headers: Optional[Mapping[str, str]]) -> Tuple[Optional[dict], Optional[str]]:
@@ -24,7 +25,7 @@ def internal_run_headers(client: Any, url: str, headers: Optional[Mapping[str, s
         return headers, None
     parts = urlsplit(url)
     origin = f"{parts.scheme}://{parts.netloc}".lower()
-    if origin not in origins or not _INTERNAL_PATH.search(parts.path):
+    if origin not in origins or not _INTERNAL_PATH.match(parts.path):
         return headers, None
     merged = {key: value for key, value in dict(headers or {}).items()
               if not (isinstance(key, str) and key.lower() == "authorization")}

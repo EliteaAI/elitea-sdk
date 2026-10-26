@@ -33,6 +33,8 @@ def test_an_internal_endpoint_on_an_allowed_origin_gets_the_run_token(url):
     "http://pylon_main:8080/api/v2/elitea_core/applications/prompt_lib/2",   # not an MCP endpoint
     "http://pylon_main:8081/app/5/mcp/secrets",                      # another port
     "https://mcp.example.com/mcp",
+    "http://pylon_main:8080/x/app/5/mcp/secrets",                    # the shape must start the path
+    "http://pylon_main:8080/app/5/mcpx",
 ])
 def test_any_other_server_is_left_alone(url):
     original = {"Authorization": "Bearer pat"}
