@@ -204,12 +204,14 @@ nodes:
           5. correct_method: Request method matches expected
           6. correct_url: Request URL matches expected
           7. has_structure: Request has proper structure (method, url, name fields)
-          8. no_errors: No error indicators in any output
-          9. cleanup_succeeded: Test folder was deleted successfully
+          8. no_errors: No error indicators in create/get outputs
+
+          Optional cleanup check:
+          9. cleanup_succeeded: Delete result indicates the test folder was deleted successfully. This field must be reported, but it does not affect test_passed.
           
           Return JSON test_results:
           {{
-            "test_passed": boolean (true only if ALL criteria pass),
+            "test_passed": boolean (true only if criteria 1-8 pass),
             "folder_created": boolean,
             "request_created": boolean,
             "request_retrieved": boolean,
