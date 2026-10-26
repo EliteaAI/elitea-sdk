@@ -26,7 +26,7 @@ dependencies = [
     "fastapi==0.115.9",
     "httpcore==1.0.7",
     "urllib3>=2",
-    "certifi==2024.8.30",
+    "certifi==2026.10.19",
     "truststore>=0.10.4",
     "aiohttp>=3.9.0",
     # Pylon 1.2.25 preloads typing-extensions 4.15.0. AnyIO 4.15+ requires
@@ -167,7 +167,7 @@ tools = [
     "googlemaps==4.10.0",
     "tavily-python==0.8.5",
     "yagmail==0.15.293",
-    "pysnc==1.1.10",
+    "pysnc==1.2.1",
     "pyral==1.6.0",
     # textract-py3 is intentionally omitted: its unused xlrd<2 dependency
     # conflicts with Unstructured. Legacy .doc extraction invokes the same
