@@ -39,6 +39,7 @@ def test_critical_and_high_dependency_pins_stay_at_patched_versions():
     assert requirements["pdf2image"] == "==1.17.0"
     assert requirements["pypdf"] == "==6.21.2"
     assert requirements["gitpython"] == "==3.2.1"
+    assert requirements["dulwich"] == "==1.2.9"
     assert requirements["azure-core"] == "==1.38.0"
     assert requirements["lxml"] == "==6.1.0"
     assert "textract-py3" not in requirements

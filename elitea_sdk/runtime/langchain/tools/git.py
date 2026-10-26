@@ -28,13 +28,83 @@ import urllib3
 
 import dulwich  # pylint: disable=E0401
 from dulwich import refs, repo, porcelain, client  # pylint: disable=E0401
-from dulwich.contrib.paramiko_vendor import ParamikoSSHVendor  # pylint: disable=E0401
 
 import paramiko  # pylint: disable=E0401
 import paramiko.transport  # pylint: disable=E0401
 from paramiko import SSHException, Message  # pylint: disable=E0401
 
 from . import log
+
+
+class _ParamikoWrapper:
+    """ File-like wrapper over a paramiko channel, as dulwich expects """
+
+    def __init__(self, ssh_client, channel):
+        self.client = ssh_client
+        self.channel = channel
+        self.channel.setblocking(True)
+
+    @property
+    def stderr(self):  # pylint: disable=C0116
+        return self.channel.makefile_stderr("rb")
+
+    def can_read(self):  # pylint: disable=C0116
+        return self.channel.recv_ready()
+
+    def write(self, data):  # pylint: disable=C0116
+        return self.channel.sendall(data)
+
+    def read(self, n=None):  # pylint: disable=C0116
+        data = self.channel.recv(n or 4096)
+        if not data:
+            return b""
+        if n and len(data) < n:
+            return data + self.read(n - len(data))
+        return data
+
+    def close(self):  # pylint: disable=C0116
+        self.channel.close()
+
+
+class ParamikoSSHVendor:
+    """ Paramiko SSH vendor; dulwich >= 1.2 no longer ships dulwich.contrib """
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def run_command(  # pylint: disable=R0913
+            self, host, command, username=None, port=None, password=None,
+            pkey=None, key_filename=None, ssh_command=None, protocol_version=None,  # pylint: disable=W0613
+            **kwargs,
+    ):  # pylint: disable=C0116
+        connection_kwargs = {"hostname": host}
+        connection_kwargs.update(self.kwargs)
+        if username:
+            connection_kwargs["username"] = username
+        if port:
+            connection_kwargs["port"] = port
+        if password:
+            connection_kwargs["password"] = password
+        if pkey:
+            connection_kwargs["pkey"] = pkey
+        if key_filename:
+            connection_kwargs["key_filename"] = key_filename
+        connection_kwargs.update(kwargs)
+        #
+        ssh_client = paramiko.SSHClient()
+        # Host keys are not verified, matching the patched Transport._verify_key below
+        ssh_client.set_missing_host_key_policy(paramiko.client.MissingHostKeyPolicy())
+        ssh_client.connect(**connection_kwargs)
+        channel = ssh_client.get_transport().open_session()
+        if isinstance(command, bytes):
+            command = command.decode("utf-8")
+        channel.exec_command(command)
+        return _ParamikoWrapper(ssh_client, channel)
+
+
+def _reset_index(repository, tree):
+    """ Check out tree into the working copy (dulwich >= 1.2 moved this to WorkTree) """
+    repository.get_worktree().reset_index(tree)
 
 
 def apply_patches():
@@ -178,7 +248,7 @@ def clone(  # pylint: disable=R0913,R0912,R0914,R0915
         log.info("Checking out branch %s", branch)
         repository[b"refs/heads/" + branch_b] = repository[b"refs/remotes/origin/" + branch_b]
         repository.refs.set_symbolic_ref(b"HEAD", b"refs/heads/" + branch_b)
-        repository.reset_index(repository[b"HEAD"].tree)
+        _reset_index(repository, repository[b"HEAD"].tree)
         #
         branch_to_track = branch
     elif head_tree is not None:
@@ -198,7 +268,7 @@ def clone(  # pylint: disable=R0913,R0912,R0914,R0915
             log.warning("Branch %s was not found. Trying to check out default branch", branch)
         #
         try:
-            repository.reset_index(repository[b"HEAD"].tree)
+            _reset_index(repository, repository[b"HEAD"].tree)
         except:  # pylint: disable=W0702
             log.exception("Failed to checkout default branch")
     else:
