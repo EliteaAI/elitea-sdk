@@ -22,6 +22,8 @@ def client(token=TOKEN, origins=("http://pylon_main:8080",), identity="who-1"):
 
 @pytest.mark.parametrize("url", [
     INTERNAL, "http://PYLON_MAIN:8080/app/2/mcp", "http://pylon_main:8080/app/2/mcp/secrets",
+    "http://pylon_main:8080/x/../app/2/mcp/elitea_core/applications", "http://pylon_main:8080/./app/2/mcp",
+    "http://pylon_main:8080/app/2/%6Dcp/secrets", "http://pylon_main:8080//app//2/mcp/secrets",
 ])
 def test_an_internal_endpoint_on_an_allowed_origin_gets_the_run_token(url):
     headers, identity = internal_run_headers(client(), url, {"authorization": "Bearer pat", "X-Other": "1"})
@@ -30,15 +32,33 @@ def test_an_internal_endpoint_on_an_allowed_origin_gets_the_run_token(url):
 
 @pytest.mark.parametrize("url", [
     "https://evil.example/app/5/mcp/elitea_core/applications",      # another origin, same path
-    "http://pylon_main:8080/api/v2/elitea_core/applications/prompt_lib/2",   # not an MCP endpoint
     "http://pylon_main:8081/app/5/mcp/secrets",                      # another port
     "https://mcp.example.com/mcp",
+    "https://evil.example/x/../app/5/mcp",
+])
+def test_a_server_on_another_origin_is_left_alone(url):
+    original = {"Authorization": "Bearer external"}
+    assert internal_run_headers(client(), url, original) == (original, None)
+
+
+@pytest.mark.parametrize("url", [
+    "http://pylon_main:8080/api/v2/elitea_core/applications/prompt_lib/2",   # not an MCP endpoint
     "http://pylon_main:8080/x/app/5/mcp/secrets",                    # the shape must start the path
     "http://pylon_main:8080/app/5/mcpx",
 ])
-def test_any_other_server_is_left_alone(url):
-    original = {"Authorization": "Bearer pat"}
-    assert internal_run_headers(client(), url, original) == (original, None)
+def test_another_route_on_the_platform_gets_neither_the_run_token_nor_its_own_credentials(url):
+    headers, identity = internal_run_headers(
+        client(), url, {"Authorization": "Bearer pat", "cookie": "s=1", "Proxy-Authorization": "x", "X-Trace": "1"})
+    assert headers == {"X-Trace": "1"} and identity is None
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/x/../app/2/mcp", "/app/2/mcp"), ("/app/2/%6Dcp", "/app/2/mcp"), ("//app//2/mcp/", "/app/2/mcp/"),
+    ("/app/2/%256Dcp", "/app/2/mcp"), ("", "/"),
+])
+def test_the_client_path_is_what_the_client_sends(path, expected):
+    from elitea_sdk.runtime.utils.internal_run_auth import client_path
+    assert client_path(path) == expected
 
 
 def test_a_run_without_a_token_changes_nothing():
