@@ -27,6 +27,8 @@ class McpConnectionConfig(BaseModel):
         default=True,
         description="Whether to verify SSL certificates (set to False for self-signed certs)"
     )
+    # Who an Elitea run token acts for (#7214): the discovery cache key in place of the token; never serialized
+    cache_identity: Optional[str] = Field(default=None, exclude=True)
 
     @validator('url')
     def validate_url(cls, v):

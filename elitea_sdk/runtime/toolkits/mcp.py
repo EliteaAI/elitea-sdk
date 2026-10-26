@@ -18,6 +18,7 @@ from ..tools.mcp_input_schema import build_mcp_args_schema
 from ..tools.mcp_remote_tool import McpRemoteTool
 from ..tools.mcp_inspect_tool import McpInspectTool
 from ..models.mcp_models import McpConnectionConfig
+from ..utils.internal_run_auth import internal_run_headers
 # Migration: Use UnifiedMcpClient (wraps langchain-mcp-adapters) instead of custom McpClient
 from ..utils.mcp_adapter import UnifiedMcpClient as McpClient
 from ..utils.mcp_discovery_cache import (
@@ -396,13 +397,17 @@ class McpToolkit(BaseToolkit):
         # the toolkit's tools).
         oauth_token_injected = kwargs.get('_oauth_token_injected', False)
 
+        # A governed Elitea run's internal MCP authenticates with the run token, on its own origins only (#7214)
+        parsed_headers, cache_identity = internal_run_headers(client, url, parsed_headers)
+
         # Create MCP connection configuration
         try:
             connection_config = McpConnectionConfig(
                 url=url,
                 headers=parsed_headers,
                 session_id=session_id,
-                ssl_verify=ssl_verify
+                ssl_verify=ssl_verify,
+                cache_identity=cache_identity,
             )
         except Exception as e:
             logger.error(f"Invalid MCP connection configuration: {e}")
@@ -551,8 +556,10 @@ class McpToolkit(BaseToolkit):
         use_cache = enable_caching and cache_ttl > 0
         cache_key = None
         if use_cache:
+            key_headers = connection_config.headers if connection_config.cache_identity is None else {
+                "Authorization": f"elitea-run:{connection_config.cache_identity}"}   # not the per-run token (#7214)
             cache_key = resolve_discovery_cache_key(
-                connection_config.url, connection_config.headers, connection_config.ssl_verify
+                connection_config.url, key_headers, connection_config.ssl_verify
             )
             cached_tools = read_cached_discovery(cache_key)
             if cached_tools is not None:
