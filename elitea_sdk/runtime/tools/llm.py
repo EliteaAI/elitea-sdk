@@ -25,7 +25,6 @@ except ImportError:
 
 from ..langchain.constants import (
     ELITEA_RS,
-    SKILL_REMINDER_SUFFIX,
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
 )
@@ -138,9 +137,12 @@ from .hitl import (
 )
 from .skill_tools import (
     LoadSkillTool,
+    SearchSkillsTool,
     build_load_skill_tools,
     loaded_skill_names_from_messages,
     render_skill_registry_index,
+    render_skill_suggestions,
+    skill_reminder_suffix,
 )
 from .tool_binding import (
     build_tool_binding_plan,
@@ -281,6 +283,12 @@ class LLMNode(BaseTool):
         exclude=True,
         description='MiddlewareManager instance for before_model/after_model hooks. '
                     'Used for context management like summarization and context editing.'
+    )
+    elitea_client: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description='Platform client of this run; its get_skill_body fetches lazily-disclosed '
+                    'skill bodies with the run user\'s token when the configurable sets no fetcher.'
     )
     child_dispatcher: Optional[Any] = Field(
         default=None,
@@ -741,9 +749,13 @@ class LLMNode(BaseTool):
             List of filtered tools (or meta-tools + always-bind tools in lazy mode)
         """
         configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
-        # Rebuilt per call: closes over this turn's attached_skills/invoked_skills.
+        # Rebuilt per call: closes over this turn's attached_skills/project_skills/invoked_skills.
         skill_tools = build_load_skill_tools(
-            configurable.get('attached_skills'), configurable.get('invoked_skills')
+            configurable.get('attached_skills'),
+            configurable.get('invoked_skills'),
+            configurable.get('project_skills'),
+            skill_search=configurable.get('skill_search'),
+            skill_body_fetcher=self._skill_body_fetcher(configurable),
         )
 
         def merge_skill_tools(tools):
@@ -1010,12 +1022,34 @@ class LLMNode(BaseTool):
             except Exception as e:
                 logger.debug(f"Failed to report prompt overhead to {type(mw).__name__}: {e}")
 
+    @staticmethod
+    def _skill_suggestions_enabled(configurable: dict) -> bool:
+        if configurable.get('invoked_skills'):
+            return False
+        settings = configurable.get('skill_search')
+        return not (isinstance(settings, dict) and settings.get('suggestions') is False)
+
+    @staticmethod
+    def _active_skill_names(configurable: dict, chat_history) -> set:
+        invoked = {
+            (skill.get('name') or '').strip().lower()
+            for skill in configurable.get('invoked_skills') or [] if isinstance(skill, dict)
+        }
+        return invoked | loaded_skill_names_from_messages(list(chat_history or []))
+
+    def _skill_body_fetcher(self, configurable: dict):
+        fetcher = configurable.get('skill_body_fetcher')
+        if callable(fetcher):
+            return fetcher
+        return getattr(self.elitea_client, 'get_skill_body', None)
+
     def _should_bind_tools(self, configurable: dict) -> bool:
         return (
             len(self.tool_names or []) > 0 or
             (self.lazy_tools_mode and self.tool_registry is not None) or
             bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
-            bool(configurable.get('attached_skills'))  # Bind load_skill for progressive disclosure
+            bool(configurable.get('attached_skills')) or  # Bind search_skills + load_skill for on-demand disclosure
+            bool(configurable.get('project_skills'))
         )
 
     def _report_overhead_estimate(self, state: dict, config: Optional[RunnableConfig]) -> None:
@@ -1430,16 +1464,24 @@ class LLMNode(BaseTool):
                 system_content = f"{system_content}\n\n{tool_index}"
                 logger.debug("[LazyTools] Injected tool index into system prompt")
 
-            # Skill registry (names + descriptions) goes into the CACHED prefix,
-            # rendered in fixed (skill_id, name) order so the block stays
-            # byte-stable across turns. Advertised only when a LoadSkillTool
-            # survived the merge — on a name collision the registry would point
-            # the model at the imposter tool.
+            # The constant skill instruction goes into the CACHED prefix; it names
+            # no skill, so it is byte-identical for every catalog. Advertised only
+            # when both skill tools survived the merge — on a name collision the
+            # instruction would point the model at the imposter tool.
             skill_registry_advertised = False
-            if configurable.get('attached_skills'):
+            search_only = bool(configurable.get('project_skills'))
+            if configurable.get('attached_skills') or search_only:
                 prebuilt_filtered_tools = self.get_filtered_tools(config=config)
-                if any(isinstance(t, LoadSkillTool) for t in prebuilt_filtered_tools):
-                    skill_registry = render_skill_registry_index(configurable.get('attached_skills'))
+                required_skill_tools = (SearchSkillsTool, LoadSkillTool) if search_only else (LoadSkillTool,)
+                if all(
+                    any(isinstance(t, skill_tool_type) for t in prebuilt_filtered_tools)
+                    for skill_tool_type in required_skill_tools
+                ):
+                    skill_registry = render_skill_registry_index(
+                        configurable.get('attached_skills'),
+                        configurable.get('project_skills'),
+                        configurable.get('project_skill_summary'),
+                    )
                     if skill_registry:
                         skill_registry_advertised = True
                         system_content = (
@@ -1447,7 +1489,7 @@ class LLMNode(BaseTool):
                         )
                 else:
                     logger.warning(
-                        "[Skills] load_skill not bound (name collision) — "
+                        "[Skills] search_skills/load_skill not bound (name collision) — "
                         "suppressing skill registry injection this turn"
                     )
 
@@ -1463,15 +1505,21 @@ class LLMNode(BaseTool):
             skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
             if skills_section:
                 logger.info("[Skills] Injected per-turn skills section into system prompt")
+            if skill_registry_advertised and search_only and self._skill_suggestions_enabled(configurable):
+                suggestions = render_skill_suggestions(
+                    next(t.registry for t in prebuilt_filtered_tools if isinstance(t, SearchSkillsTool)),
+                    func_args.get('task'),
+                    self._active_skill_names(configurable, func_args.get('chat_history')),
+                )
+                if suggestions:
+                    skills_section = f"{skills_section}\n\n{suggestions}" if skills_section else suggestions
             # Recency counterweight: the registry sits in the cached prefix, far from
             # the decision point, and loses to transcript anchoring on small models.
             # A one-line reminder in the (already uncached) dynamic suffix puts the
             # instruction last, where it competes with the conversation itself.
             if skill_registry_advertised:
-                skills_section = (
-                    f"{skills_section}\n\n{SKILL_REMINDER_SUFFIX}" if skills_section
-                    else SKILL_REMINDER_SUFFIX
-                )
+                reminder = skill_reminder_suffix(configurable.get('project_skills'))
+                skills_section = f"{skills_section}\n\n{reminder}" if skills_section else reminder
 
             task_content = self._task_message_content(func_args.get('task'))
             _chat_history = list(func_args.get('chat_history', []))

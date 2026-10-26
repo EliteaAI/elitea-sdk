@@ -508,6 +508,10 @@ class Application(BaseTool):
         child_configurable['attached_skills'] = (
             (self.args_runnable.get('version_details') or {}).get('attached_skills') or []
         )
+        child_configurable['project_skills'] = (
+            (self.args_runnable.get('version_details') or {}).get('project_skills') or []
+        )
+        child_configurable.pop('project_skill_summary', None)
         child_configurable['invoked_skills'] = []
         if self.client and self.args_runnable:
             # Standalone child runs as a root graph with its own checkpointer.

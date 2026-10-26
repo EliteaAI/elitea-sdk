@@ -26,7 +26,7 @@ from ..middleware import (
     TransformErrorStrategy,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
-from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
+from ..exceptions import AgentAccessDeniedError, SkillBodyUnavailable, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools, read_declared_failure
@@ -150,6 +150,7 @@ class EliteAClient:
         self.list_toolkits_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tools/prompt_lib/{self.project_id}"
         self.toolkit_details_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool/prompt_lib/{self.project_id}"
         self.secrets_url = f"{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}"
+        self.skill_details_url = f"{self.base_url}{self.api_v2_path}/elitea_core/skill/prompt_lib"
         self.artifacts_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifacts/default/{self.project_id}"
         self.artifact_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}"
         self.bucket_url = f"{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}"
@@ -963,6 +964,26 @@ class EliteAClient:
         logger.error(f"Failed to fetch application version details: {resp.status_code} - {resp.text}."
                      f" Application ID: {application_id}, Version ID: {application_version_id}, Project ID: {self.project_id}")
         raise ApiDetailsRequestError(f"Failed to fetch application version details for {application_id}/{application_version_id}: {resp.status_code} - {resp.text}")
+
+    def get_skill_body(self, skill_project_id: int, skill_id: int, version_id: Optional[int] = None) -> str:
+        """Instructions of one skill version, fetched with the run user's identity so the platform re-checks access."""
+        url = f"{self.skill_details_url}/{skill_project_id}/{skill_id}"
+        params = {'version_id': version_id} if version_id is not None else None
+        response = self._request('get', url, headers=self.headers, params=params, verify=False)
+        if response.status_code in (403, 404):
+            raise SkillBodyUnavailable(
+                f"Skill {skill_project_id}/{skill_id} is not accessible ({response.status_code})", denied=True,
+            )
+        if not response.ok:
+            raise SkillBodyUnavailable(f"Skill {skill_project_id}/{skill_id} fetch failed ({response.status_code})")
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise SkillBodyUnavailable(f"Skill {skill_project_id}/{skill_id} returned no JSON") from e
+        body = ((data or {}).get('version_details') or {}).get('instructions')
+        if not isinstance(body, str) or not body.strip():
+            raise SkillBodyUnavailable(f"Skill {skill_project_id}/{skill_id} has no instructions", denied=True)
+        return body
 
     def unsecret(self, secret_name: str):
         from elitea_sdk.runtime.utils.logging import mask_sensitive_value

@@ -1563,6 +1563,7 @@ def create_graph(
                     child_dispatcher=child_dispatcher,
                     independent_parallel_hitl=independent_parallel_hitl,
                     parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
+                    elitea_client=kwargs.get('elitea_client', None),
                 ))
             elif node_type in ['router', 'decision']:
                 if node_type == 'router':
