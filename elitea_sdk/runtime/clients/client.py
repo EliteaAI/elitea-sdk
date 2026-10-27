@@ -308,6 +308,9 @@ class EliteAClient:
             logger.info(f"[PUBLIC_APP] Successfully fetched public app {application_id}: {data.get('name')}")
             return data
 
+        if resp.status_code == 403 and is_run_token_bearer(self):
+            # a governed run's identity acts in its own project only (#7229): said as such, never a silent drop
+            raise GovernedCredentialError("PUBLIC_AGENT_NOT_ADMITTED")
         logger.error(f"[PUBLIC_APP] Failed to fetch public application: {resp.status_code} - {resp.text}. "
                     f"Application ID: {application_id}")
         raise ApiDetailsRequestError(

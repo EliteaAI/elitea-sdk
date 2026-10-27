@@ -1146,11 +1146,16 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         user_declined_mcp_servers=user_declined_mcp_servers,
                         auto_approve_sensitive_actions=auto_approve_sensitive_actions,
                     ).get_tools())
-                except (McpAuthorizationRequired, GovernedCredentialError):
+                except McpAuthorizationRequired:
                     # OAuth authorization required by nested agent's toolkit — propagate so the
-                    # frontend error handler can emit the mcp_authorization_required event. A governed
-                    # refusal of the sub-agent (#7229) ends the run readably instead of dropping it.
+                    # frontend error handler can emit the mcp_authorization_required event.
                     raise
+                except GovernedCredentialError as refused:
+                    # A governed refusal of the sub-agent (#7229) ends the run readably, naming the
+                    # innermost sub-agent refused, instead of dropping it from the tools
+                    if refused.subagent:
+                        raise
+                    raise GovernedCredentialError(refused.reason_code, tool.get('name')) from refused
                 except Exception as app_err:
                     # Gracefully skip application tools that fail to load (e.g., deleted agents).
                     # McpAuthorizationRequired is re-raised above as it is never transient and

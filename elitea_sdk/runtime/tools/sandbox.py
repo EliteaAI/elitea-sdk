@@ -26,6 +26,16 @@ _FULL_PREAMBLE_NAMES = re.compile(
     r"\b(elitea_client|alita_client|SandboxClient|SandboxArtifact|ApiDetailsRequestError"
     r"|requests|chardet)\b"
 )
+# The client code in the sandbox gets in a governed run (#7229): the run's identity never leaves its worker, so every
+# platform call from code says why it is not available instead of failing on a missing credential.
+_GOVERNED_CLIENT = (
+    "class _GovernedRunPlatformClient:\n"
+    "    def __getattr__(self, name):\n"
+    "        raise PermissionError('The platform client is not available to code in governed runs yet: the run\\'s '\n"
+    "                              'identity never leaves its worker. Use the agent\\'s toolkits (for example the '\n"
+    "                              'artifact toolkit) instead.')\n"
+    "elitea_client = _GovernedRunPlatformClient()\n"
+)
 # Emitted by the code-node state preamble on every run, so it must not count as usage.
 CLIENT_ALIAS_LINE = "alita_client = elitea_client"
 _LIGHT_PREAMBLE = (
@@ -355,15 +365,19 @@ class PyodideSandboxTool(BaseTool):
                     sandbox_client_code = f.read()
                 pyodide_predata += f"{sandbox_client_code.replace('\\n', '\\\n')}\n"
                 # Session auth (#6486): no PAT to hand over, so pass the session reference.
-                # A governed run's only identity is its run token (#7229): it never leaves the worker
+                # A governed run's only identity is its run token (#7229): it never leaves the worker, so code in
+                # the sandbox gets a client that says so instead of failing on a missing credential
                 _token = None if is_run_token_bearer(self.elitea_client) else self.elitea_client.auth_token
                 _session = getattr(self.elitea_client, 'auth_session', None)
                 _cookie = getattr(self.elitea_client, 'session_cookie_name', None)
-                pyodide_predata += (f"elitea_client = SandboxClient(base_url='{self.elitea_client.base_url}',"
-                                    f"project_id={self.elitea_client.project_id},"
-                                    f"auth_token={_token!r},"
-                                    f"auth_session={_session!r},"
-                                    f"session_cookie_name={_cookie!r})\n")
+                if is_run_token_bearer(self.elitea_client):
+                    pyodide_predata += _GOVERNED_CLIENT
+                else:
+                    pyodide_predata += (f"elitea_client = SandboxClient(base_url='{self.elitea_client.base_url}',"
+                                        f"project_id={self.elitea_client.project_id},"
+                                        f"auth_token={_token!r},"
+                                        f"auth_session={_session!r},"
+                                        f"session_cookie_name={_cookie!r})\n")
             except FileNotFoundError:
                 logger.error(f"sandbox_client.py not found. Ensure the file exists.")
 

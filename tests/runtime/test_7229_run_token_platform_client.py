@@ -28,9 +28,13 @@ def _sandbox(auth_token, run_token=None):
     return PyodideSandboxTool.model_construct(elitea_client=client)
 
 
-def test_the_run_token_is_never_written_into_generated_code():
-    prepared = _sandbox(RUN_TOKEN, RUN_TOKEN)._prepare_pyodide_input("print(elitea_client)")
-    assert RUN_TOKEN not in prepared and "auth_token=None" in prepared
+def test_the_run_token_is_never_written_into_generated_code_and_the_client_says_why():
+    prepared = _sandbox(RUN_TOKEN, RUN_TOKEN)._prepare_pyodide_input(
+        "try:\n    elitea_client.list_artifacts('b')\nexcept PermissionError as exc:\n    said = str(exc)\n")
+    assert RUN_TOKEN not in prepared and "SandboxClient(base_url" not in prepared
+    namespace = {}
+    exec(prepared, namespace)  # pylint: disable=W0122
+    assert "not available to code in governed runs" in namespace["said"]
 
 
 def test_a_personal_token_is_still_handed_to_the_sandbox_client_as_before():
@@ -117,3 +121,31 @@ def test_a_governed_refusal_is_not_skipped_in_debug_mode_either():
     with patch.object(tools_mod.ApplicationToolkit, "get_toolkit", side_effect=refused):
         with pytest.raises(GovernedCredentialError):
             get_tools([tool], elitea_client=_FakeClient(), debug_mode=True)
+
+
+
+def test_a_public_sub_agent_refused_to_a_governed_run_is_said_not_dropped():
+    with pytest.raises(GovernedCredentialError) as err:
+        _client(_Response(403, {"error": "INTERNAL_TOKEN_INVALID"})).get_public_app_details(12)
+    assert err.value.reason_code == "PUBLIC_AGENT_NOT_ADMITTED" and "another project" in err.value.message
+    legacy = EliteAClient(base_url="http://pylon_main:8080", project_id=1, auth_token="pat-value")
+    legacy._request = lambda *args, **kwargs: _Response(403, {"error": "x"})  # pylint: disable=W0212
+    from elitea_sdk.runtime.clients.client import ApiDetailsRequestError
+    with pytest.raises(ApiDetailsRequestError):
+        legacy.get_public_app_details(12)
+
+
+def test_the_refusal_names_the_sub_agent_refused_and_survives_a_task_boundary():
+    import pickle  # pylint: disable=C0415
+
+    def refused(client, application_id, application_version_id, **kwargs):
+        raise GovernedCredentialError("PUBLIC_AGENT_NOT_ADMITTED")
+
+    tool = {"type": "application", "name": "public helper", "project_id": 9, "agent_type": "agent",
+            "settings": {"application_id": 12, "application_version_id": 120}}
+    with patch.object(tools_mod.ApplicationToolkit, "get_toolkit", side_effect=refused):
+        with pytest.raises(GovernedCredentialError) as err:
+            get_tools([tool], elitea_client=_FakeClient())
+    assert err.value.subagent == "public helper" and "(sub-agent \u201cpublic helper\u201d)" in err.value.message
+    again = pickle.loads(pickle.dumps(err.value))
+    assert (again.reason_code, again.subagent, again.message) == (err.value.reason_code, "public helper", err.value.message)
