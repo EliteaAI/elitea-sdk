@@ -1,4 +1,5 @@
 import logging
+import re
 from copy import deepcopy
 
 import requests
@@ -26,6 +27,7 @@ from ..middleware import (
     TransformErrorStrategy,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from ..credential_slots import GovernedCredentialError
 from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
@@ -101,6 +103,16 @@ def normalize_app_type(app_type: str) -> str:
 
 class ApiDetailsRequestError(Exception):
     ...
+
+
+def _governed_refusal_code(response) -> Optional[str]:
+    """The reason code of a governed refusal (``{"code", "message"}``, #7229), or None for any other reply."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get('code') if isinstance(body, dict) else None
+    return code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", code) else None
 
 
 class AuthSessionExpiredError(Exception):
@@ -955,6 +967,10 @@ class EliteAClient:
         if resp.ok:
             return resp.json()
         if resp.status_code == 403:
+            governed = _governed_refusal_code(resp)
+            if governed:
+                # Main sealed this run's fetch and refused a credential nothing was decided for (#7229)
+                raise GovernedCredentialError(governed)
             # Expanded details carry credentials, so they need editor access; get_tools still skips sub-agents
             raise AgentAccessDeniedError(
                 f"Loading agent {application_id}/{application_version_id} requires editor access "

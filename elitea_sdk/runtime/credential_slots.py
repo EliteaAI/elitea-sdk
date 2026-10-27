@@ -84,6 +84,10 @@ _MESSAGES: Dict[str, str] = {
     "DENIED_GRANT": "The credential grant is no longer in force; the run was not started.",
     "DENIED_RBAC": "Permission to use this credential was denied; the run was not started.",
     "DENIED_BINDING": "This agent is no longer bound to the credential; the run was not started.",
+    "DENIED_DEVELOPMENT_CHILD": (
+        "A sub-agent of this draft asked for a credential that was not checked for it when the draft started; "
+        "the run was not started."
+    ),
     "EPOCH_MISMATCH": "Access was revoked while the run was starting; the run was not started.",
     "MANDATE_INACTIVE": "The mandate for this run is not active; the run was not started.",
     "MANDATE_EXPIRED": "The mandate for this run has expired; the run was not started.",
