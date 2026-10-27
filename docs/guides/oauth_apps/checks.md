@@ -29,6 +29,15 @@ project and, where noted, a team project.
 - [ ] An app assigned to the **public project** is available to users in **every** project, including their
       personal (private) project — not only inside the public project.
 - [ ] An app assigned to a team project is not offered in other projects.
+- [ ] **Team project wins Public:** in a team project with its own app for a credential type, Public apps are
+      not offered for that type, even when the Public app is Default and the team app is not. Example: Public
+      Default app (Outlook, SharePoint) + team app (Teams, Outlook, SharePoint, not Default) → in the team
+      project Outlook shows the Default/Custom switcher with only the team app (no app selector); other
+      projects still get the Public Default.
+- [ ] The project tier counts only types switched on: a team app with Outlook off does not hide the Public
+      Outlook app in that project.
+- [ ] A credential in a team project that references a Public app reports it as not available once the
+      project has its own app for that type.
 - [ ] There is no "all projects" shortcut: an empty project list is never treated as every project.
 - [ ] The server rejects create, update and Test connection without projects ("Select at least one project"),
       including an update that removes all projects, and rejects unknown project ids ("Unknown project: <id>").

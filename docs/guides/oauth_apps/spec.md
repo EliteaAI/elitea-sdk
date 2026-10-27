@@ -253,7 +253,7 @@ Personal projects have no project tier, so their credentials always use the Publ
 | Admin section, dialog, write-only secret, Test connection | Done; Projects required in the dialog and on the server, Save enabled only after a change (2026-10-27) | Personal projects hidden; "Public" label for the public project; Scope column |
 | Admin validation | Provider, endpoint, scopes | A1, A3, per-scope Default (A4; today one Default per provider platform-wide, newest wins) |
 | Delete / disable | Delete with generic confirm | Impact count and next-app text; disable alternative |
-| Resolution | Per-app project list, required; public project = every project; empty list rejected on save and resolves nowhere (2026-10-27) | Tier precedence (4.1) |
+| Resolution | Per-app project list, required; public project = every project; empty list rejected on save and resolves nowhere; **tier precedence (4.1): a team project's own apps replace Public apps per credential type** (2026-10-27) | — |
 | Credential storage | App uuid stored | `"default"` vs explicit pick (R1, R3, R4) |
 | Project used | Credential's project in the form, agent's project at runtime | Credential's own project everywhere (R6) |
 | Default vs Custom | Existing Custom credentials stay Custom | Default overrides Custom on next use (R8) |
