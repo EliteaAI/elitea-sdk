@@ -1,7 +1,7 @@
 # OAuth Apps (#7149) — verification checklist
 
 Checks for issues found and fixed during development. Each line is one behaviour to verify; run them on
-every change to the feature. Spec: [`oauth_apps_spec.md`](oauth_apps_spec.md).
+every change to the feature. Spec: [spec.md](spec.md).
 
 Setup: an OAuth app in Admin Portal → Configuration → OAuth Apps, a user with a personal (private)
 project and, where noted, a team project.
@@ -19,12 +19,22 @@ project and, where noted, a team project.
 - [ ] Each credential type (Teams, Outlook, SharePoint) has an on/off switch; switching all off is rejected.
 - [ ] The list shows a Credentials column with the types switched on.
 - [ ] "+ New Configuration for App" button label.
+- [ ] Opening an existing app for edit: Save is **disabled** until something changes; reverting the change
+      disables it again. Test connection is available without changes.
+- [ ] Projects is required: Save stays disabled with no project selected ("Required. The app applies only in
+      the selected projects."), for a new app and when editing.
 
 ## Project scope
 
 - [ ] An app assigned to the **public project** is available to users in **every** project, including their
       personal (private) project — not only inside the public project.
 - [ ] An app assigned to a team project is not offered in other projects.
+- [ ] There is no "all projects" shortcut: an empty project list is never treated as every project.
+- [ ] The server rejects create, update and Test connection without projects ("Select at least one project"),
+      including an update that removes all projects, and rejects unknown project ids ("Unknown project: <id>").
+- [ ] An app with no projects (e.g. its only project was deleted) applies nowhere.
+- [ ] A lookup without a project never resolves an app.
+- [ ] The seeded Elitea default app is created with the public project assigned.
 
 ## Credential form — what the user sees
 

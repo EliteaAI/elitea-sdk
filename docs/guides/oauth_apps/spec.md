@@ -58,7 +58,7 @@ admin Test connection are built and verified locally. Per-project precedence, pe
 - Admin changes reach every credential without migrations or user action (except a new sign-in when the app changes).
 
 **Non-goals (separate decisions)**
-- Feature toggle "default app only" platform-wide (`ENTRA_APPS_7149_FEATURE_TOGGLE_PLAN.md`).
+- Feature toggle "default app only" platform-wide (postponed; the original plan used the old `entra_*` names and was not kept).
 - Project admins managing their own project's apps (only platform admins).
 - Providers other than Microsoft Entra ID (the model is ready for them; none added).
 - Personal-project apps.
@@ -91,7 +91,7 @@ Placed after MCP Servers. Visible to platform admins (`configuration.oauth_apps.
 | Name | Required, ≤ 128 chars. Shown to users when they pick an app. |
 | Enabled | On by default. Off = the app applies nowhere; reversible. |
 | Default app | "Users get this app and cannot choose a custom one." See 3.3. |
-| Projects | **Required, nothing preselected.** Options: **"Public — all projects"** and team projects (searchable). Personal projects are not offered. Public **or** team projects, never both. |
+| Projects | **Required on every level, nothing preselected, no "all projects" shortcut.** The admin always picks projects explicitly: the **public project** (its apps apply in every project, like public shared credentials and default models) or team projects (searchable). Personal projects are not offered. Public **or** team projects, never both. An empty list is rejected by the dialog (Save disabled, "Required. The app applies only in the selected projects.") and by the server on create, update and Test connection ("Select at least one project"); unknown project ids are rejected ("Unknown project: <id>"). An app without projects (never valid on save) applies nowhere. |
 
 **App settings**:
 
@@ -110,14 +110,17 @@ policy that blocks app-only tokens is a warning. Uses unsaved form values; an em
 
 ### 3.2 List
 
-Columns: Name, Provider, Client ID, Credentials (chips of the types switched on), Scope ("Public" / project
-names / "No projects"), Status (Enabled, Default). Actions: edit, delete.
+Columns: Name, Provider, Client ID, Credentials (chips of the types switched on), Projects ("N selected" /
+"None"), Status (Enabled, Default). Actions: edit, delete.
+
+**Edit dialog:** Save is enabled only after a change (or Replace secret); reverting the change disables it again.
+Test connection works without changes.
 
 ### 3.3 Admin validation (server-side, on every write)
 
 | # | Rule | Message |
 |---|---|---|
-| A1 | Projects is not empty | "Select Public or at least one team project" |
+| A1 | Projects is not empty and every id exists (create, update, Test connection) | "Select at least one project" / "Unknown project: <id>" |
 | A3 | Public is not combined with team projects | "An app is either for all projects (Public) or for selected team projects, not both" |
 | A4 | At most **one enabled Default app per provider per scope**: one for Public, one per team project (checked on create, edit, enable, Default on, project change; inside a transaction) | "pr_1 already has a default app: <name>" |
 | — | Discovery endpoint on the provider's hosts; scopes only for the provider's credential types; provider unchanged on edit | field-specific |
@@ -211,7 +214,8 @@ Personal projects have no project tier, so their credentials always use the Publ
 | App's projects changed so X isn't covered | Same as disabled for credentials in X. |
 | A credential type switched off on an app | For that type only, the app is treated as disabled (it no longer counts in its tier); other types are unaffected. |
 | App's client ID or endpoint changed | Credentials using it need one new sign-in. |
-| Project deleted | Its id is dropped from app project lists; an app left without projects is inactive ("No projects"). |
+| Project deleted | Its id is dropped from app project lists; an app left without projects applies nowhere ("None" in the list) until the admin assigns projects. |
+| Request without a project | No app resolves: availability is always checked against the credential's project; a missing project never means "everywhere". |
 | Two admins save conflicting Defaults | Second save rejected (A4, transactional check). |
 | Credential saved in Public | Only the Public tier applies. |
 | Admin changes apps while a user's form is open | Save is re-checked on the server (S5); the user sees the error and the form refreshes. |
@@ -246,10 +250,10 @@ Personal projects have no project tier, so their credentials always use the Publ
 | Area | Built (local, uncommitted) | To do for this spec |
 |---|---|---|
 | Provider select (Entra only, disabled), per-type on/off switches | Done (2026-10-26) |
-| Admin section, dialog, write-only secret, Test connection | Done | Projects required with no preselect; "Public — all projects" option; personal projects hidden; Scope column |
+| Admin section, dialog, write-only secret, Test connection | Done; Projects required in the dialog and on the server, Save enabled only after a change (2026-10-27) | Personal projects hidden; "Public" label for the public project; Scope column |
 | Admin validation | Provider, endpoint, scopes | A1, A3, per-scope Default (A4; today one Default per provider platform-wide, newest wins) |
 | Delete / disable | Delete with generic confirm | Impact count and next-app text; disable alternative |
-| Resolution | Per-app project allow-list (empty = all) | Tier precedence (4.1); empty list no longer allowed |
+| Resolution | Per-app project list, required; public project = every project; empty list rejected on save and resolves nowhere (2026-10-27) | Tier precedence (4.1) |
 | Credential storage | App uuid stored | `"default"` vs explicit pick (R1, R3, R4) |
 | Project used | Credential's project in the form, agent's project at runtime | Credential's own project everywhere (R6) |
 | Default vs Custom | Existing Custom credentials stay Custom | Default overrides Custom on next use (R8) |
@@ -258,4 +262,4 @@ Personal projects have no project tier, so their credentials always use the Publ
 | Credential form | 3 modes, scope lock in sign-in window, no Shared | Explicit pick list when several apps, error texts for R5 |
 | Edge cases | — | Project deletion clean-up, transactional Default check |
 
-Detailed history of what was built: `ENTRA_APPS_7149_SUMMARY.md`.
+Detailed history of what was built: [implementation_summary.md](implementation_summary.md).
