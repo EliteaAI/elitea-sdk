@@ -88,6 +88,10 @@ _MESSAGES: Dict[str, str] = {
     "PUBLIC_AGENT_NOT_ADMITTED": (
         "Agents from another project (public agents) are not available to governed runs yet; the run was not started."
     ),
+    "CONTEXT_NOT_LIVE": (
+        "This run is no longer admitted: it ended, was revoked or stayed idle too long. Please start it again."
+    ),
+    "INTERNAL_TOKEN_EXPIRED": "This run reached its time limit. Please start it again.",
     "DENIED_DEVELOPMENT_CHILD": (
         "A sub-agent of this draft asked for a credential that was not checked for it when the draft started "
         "(only the sub-agents the draft calls are checked, each on its own); the run was not started."

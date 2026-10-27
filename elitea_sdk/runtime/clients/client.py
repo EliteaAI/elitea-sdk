@@ -27,7 +27,7 @@ from ..middleware import (
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..credential_slots import REASON_CODE_RE, GovernedCredentialError
-from ..utils.internal_run_auth import is_run_token_bearer
+from ..utils.internal_run_auth import is_run_token_bearer, run_not_live_code
 from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
@@ -274,8 +274,11 @@ class EliteAClient:
 
     def get_app_details(self, application_id: int, version_name: Optional[str] = None):
         url = f"{self.app}/{application_id}" if version_name is None else f"{self.app}/{application_id}/{version_name}"
-        data = self._request('get', url, headers=self.headers, verify=False).json()
-        return data
+        resp = self._request('get', url, headers=self.headers, verify=False)
+        not_live = run_not_live_code(self, resp)
+        if not_live:
+            raise GovernedCredentialError(not_live)   # the run ended, was revoked or went idle (#7229)
+        return resp.json()
 
 
     def get_public_app_details(self, application_id: int, version_name: str = None) -> dict:
@@ -308,6 +311,9 @@ class EliteAClient:
             logger.info(f"[PUBLIC_APP] Successfully fetched public app {application_id}: {data.get('name')}")
             return data
 
+        not_live = run_not_live_code(self, resp)
+        if not_live:
+            raise GovernedCredentialError(not_live)   # the run ended, was revoked or went idle (#7229)
         if resp.status_code == 403 and is_run_token_bearer(self):
             # a governed run's identity acts in its own project only (#7229): said as such, never a silent drop
             raise GovernedCredentialError("PUBLIC_AGENT_NOT_ADMITTED")
@@ -972,6 +978,9 @@ class EliteAClient:
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
+        not_live = run_not_live_code(self, resp)
+        if not_live:
+            raise GovernedCredentialError(not_live)   # the run ended, was revoked or went idle (#7229)
         if resp.status_code == 403:
             governed = _governed_refusal_code(self, resp)
             if governed:

@@ -159,8 +159,7 @@ class _Refused(Exception):
         self.status_code, self.body = status_code, {"error": code}
 
 
-@pytest.mark.parametrize("status_code,code", [(403, "CONTEXT_NOT_LIVE"), (401, "INTERNAL_TOKEN_EXPIRED"),
-                                              (403, "INTERNAL_TOKEN_INVALID")])
+@pytest.mark.parametrize("status_code,code", [(403, "CONTEXT_NOT_LIVE"), (401, "INTERNAL_TOKEN_EXPIRED")])
 def test_a_pipeline_model_call_refused_on_the_run_token_ends_the_run(status_code, code):
     from elitea_sdk.runtime.tools.llm import LLMNode  # pylint: disable=C0415
     from elitea_sdk.runtime.utils.internal_run_auth import run_token_refusal  # pylint: disable=C0415
@@ -179,7 +178,29 @@ def test_other_model_errors_still_become_the_node_answer():
 
     assert run_token_refusal(_Refused(500, "CONTEXT_NOT_LIVE")) is None
     assert run_token_refusal(_Refused(403, "budget")) is None
+    # a route the run token may not use: the run itself is live, so it stays the node's error to report
+    assert run_token_refusal(_Refused(403, "INTERNAL_TOKEN_INVALID")) is None
     node = LLMNode(name="llm_1", description="test", client=SimpleNamespace(model_name="m", _llm_type="fake"))
     with patch.object(LLMNode, "_invoke_llm_internal", side_effect=_Refused(403, "PROVIDER_DENIED")):
         result = node.invoke({"messages": []})
     assert result["messages"][-1].response_metadata.get("llm_node_error") is True
+
+
+@pytest.mark.parametrize("status,code", [(403, "CONTEXT_NOT_LIVE"), (401, "INTERNAL_TOKEN_EXPIRED")])
+@pytest.mark.parametrize("fetch", ["version", "app", "public"])
+def test_a_sub_agent_fetched_after_the_run_stopped_being_live_ends_the_run_readably(status, code, fetch):
+    client = _client(_Response(status, {"error": code, "message": "x"}))
+    call = {"version": lambda: client.get_app_version_details(12, 120), "app": lambda: client.get_app_details(12),
+            "public": lambda: client.get_public_app_details(12)}[fetch]
+    with pytest.raises(GovernedCredentialError) as err:
+        call()
+    assert err.value.reason_code == code and "start it again" in err.value.message
+
+
+def test_a_legacy_client_or_another_refusal_keeps_its_old_handling():
+    legacy = EliteAClient(base_url="http://pylon_main:8080", project_id=1, auth_token="pat-value")
+    legacy._request = lambda *args, **kwargs: _Response(403, {"error": "CONTEXT_NOT_LIVE"})  # pylint: disable=W0212
+    with pytest.raises(AgentAccessDeniedError):
+        legacy.get_app_version_details(12, 120)
+    with pytest.raises(AgentAccessDeniedError):
+        _client(_Response(403, {"error": "INTERNAL_TOKEN_INVALID"})).get_app_version_details(12, 120)
