@@ -16,6 +16,7 @@ from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph
 from langgraph.graph import END, START
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.managed.base import is_managed_value
 from langgraph.prebuilt import InjectedStore
@@ -3595,28 +3596,17 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         (either completed or interrupted). Prevents the add_messages
         reducer from appending new input on top of old state.
         """
-        existing_messages = checkpoint_state.values.get('messages', [])
-        if existing_messages:
-            logger.info(f"[CHECKPOINT] Clearing {len(existing_messages)} existing checkpoint messages")
-            remove_msgs = [
-                RemoveMessage(id=msg.id)
-                for msg in existing_messages
-                if hasattr(msg, 'id') and msg.id
-            ]
-            if remove_msgs:
-                self.update_state(config, {'messages': remove_msgs})
-        if checkpoint_state.values.get('hitl_decisions'):
-            self.update_state(config, {'hitl_decisions': None})
-        if checkpoint_state.values.get('_pipeline_blocked'):
-            self.update_state(config, {'_pipeline_blocked': None})
-        if checkpoint_state.values.get('context_info'):
-            self.update_state(config, {'context_info': None})
+        values = checkpoint_state.values
+        # Remove-all instead of per-ID removal: another run may have rewritten the thread since this read
+        updates = {'messages': [RemoveMessage(id=REMOVE_ALL_MESSAGES)]} if values.get('messages') else {}
         # A previous turn's tool outcome must not leak into a condition evaluated
         # before this turn has called a tool of its own.
-        if checkpoint_state.values.get(TOOL_OUTCOMES_KEY):
-            self.update_state(config, {TOOL_OUTCOMES_KEY: None})
-        if checkpoint_state.values.get(LAST_TOOL_OUTCOME_KEY):
-            self.update_state(config, {LAST_TOOL_OUTCOME_KEY: None})
+        for key in ('hitl_decisions', '_pipeline_blocked', 'context_info', TOOL_OUTCOMES_KEY, LAST_TOOL_OUTCOME_KEY):
+            if values.get(key):
+                updates[key] = None
+        if updates:
+            logger.info(f"[CHECKPOINT] Clearing stale checkpoint keys: {sorted(updates)}")
+            self.update_state(config, updates)
 
     @staticmethod
     def _inject_deferred_chat_history(input: dict, deferred_history: list | None) -> None:
