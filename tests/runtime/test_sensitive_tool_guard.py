@@ -12,7 +12,10 @@ from langgraph.graph.state import CompiledStateGraph
 
 from elitea_sdk.runtime.langchain.assistant import Assistant
 from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable
-from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+from elitea_sdk.runtime.middleware.sensitive_tool_guard import (
+    SensitiveToolGuardMiddleware,
+    normalize_auto_approve,
+)
 from elitea_sdk.runtime.middleware.strategies import LoggingStrategy
 from elitea_sdk.runtime.middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from elitea_sdk.runtime.toolkits.security import (
@@ -2152,6 +2155,111 @@ def test_auto_approve_flag_bypasses_interrupt():
         assert len(interrupt_called) == 0, (
             'auto_approve=True should bypass interrupt() entirely'
         )
+
+
+def _pair_ctx(toolkit_name, toolkit_type, tool_name, approval_toolkit='same'):
+    return {
+        'tool_name': tool_name,
+        'toolkit_name': toolkit_name,
+        'toolkit_type': toolkit_type,
+        'approval_toolkit': toolkit_name if approval_toolkit == 'same' else approval_toolkit,
+        'action_label': f'{toolkit_type}.{tool_name}',
+        'policy_message': 'Authorize?',
+        'tool_args': {},
+    }
+
+
+def _review_with_rejecting_interrupt(guard, ctx):
+    with patch(
+        'elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt',
+        return_value={'action': 'reject', 'value': ''},
+    ) as mocked:
+        return guard._review_sensitive_tool_call(ctx)['action'], mocked.call_count
+
+
+def test_auto_approve_pairs_approve_only_listed_calls():
+    guard = SensitiveToolGuardMiddleware(auto_approve=[['my-github', 'create_pull_request'], ('jira', '*')])
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('my-github', 'github', 'create_pull_request')) == ('approve', 0)
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('jira', 'jira', 'delete_issue')) == ('approve', 0)
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('my-github', 'github', 'delete_file')) == ('reject', 1)
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('x', 'gitlab', 'create_pull_request')) == ('reject', 1)
+
+
+def test_auto_approve_pair_does_not_match_toolkit_type_or_second_toolkit_of_same_type():
+    guard = SensitiveToolGuardMiddleware(auto_approve=[('github', 'create_pull_request'), ('gh-a', 'create_pull_request')])
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('gh-b', 'github', 'create_pull_request')) == ('reject', 1)
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('gh-a', 'github', 'create_pull_request')) == ('approve', 0)
+
+
+def test_auto_approve_empty_pairs_approve_nothing():
+    guard = SensitiveToolGuardMiddleware(auto_approve=[])
+    assert _review_with_rejecting_interrupt(guard, _pair_ctx('github', 'github', 'delete_file')) == ('reject', 1)
+
+
+@pytest.mark.parametrize('value,expected', [(None, False), (True, True), (False, False)])
+def test_auto_approve_bool_like_values_normalize(value, expected):
+    assert normalize_auto_approve(value) is expected
+    assert SensitiveToolGuardMiddleware(auto_approve=value)._auto_approve is expected
+
+
+@pytest.mark.parametrize('value', [2, -1, 0, 1, 'yes', {'a': 'b'}, [('github',)], [('github', 1)], ['ab'], [('', 'x')]])
+def test_auto_approve_bad_shape_raises(value):
+    with pytest.raises(ValueError):
+        SensitiveToolGuardMiddleware(auto_approve=value)
+
+
+def _invoke_tool(registry):
+    return SimpleNamespace(name='invoke_tool', metadata={}, registry=registry)
+
+
+def test_invoke_tool_pair_matches_only_a_registered_toolkit():
+    guard = SensitiveToolGuardMiddleware(auto_approve=[('my-github', 'create_pull_request')])
+    registry = SimpleNamespace(get_toolkit_type=lambda name: {'my-github': 'github'}.get(name))
+    policy = {'action_name': 'x', 'policy_message': 'y'}
+    with patch('elitea_sdk.runtime.middleware.sensitive_tool_guard.get_sensitive_tool_policy', return_value=policy):
+        known = guard._build_sensitive_tool_context(
+            _invoke_tool(registry), {'toolkit': 'my-github', 'tool': 'create_pull_request'})
+        unknown = guard._build_sensitive_tool_context(
+            _invoke_tool(SimpleNamespace(get_toolkit_type=lambda name: None)),
+            {'toolkit': 'my-github', 'tool': 'create_pull_request'})
+        no_registry = guard._build_sensitive_tool_context(
+            _invoke_tool(None), {'toolkit': 'my-github', 'tool': 'create_pull_request'})
+    assert guard._is_approved_pair(known)
+    assert not guard._is_approved_pair(unknown)
+    assert not guard._is_approved_pair(no_registry)
+
+
+def test_inject_sensitive_tool_guard_passes_pairs_to_guard():
+    from elitea_sdk.runtime.clients.client import EliteAClient
+
+    middleware = []
+    with patch('elitea_sdk.runtime.toolkits.security.has_sensitive_tools_config', return_value=True):
+        EliteAClient._inject_sensitive_tool_guard(
+            SimpleNamespace(), middleware, 'c1', [('my-github', 'create_pull_request')])
+    assert middleware[0]._approved_pairs == {('my-github', 'create_pull_request')}
+    assert middleware[0]._auto_approve is False
+
+
+@pytest.mark.parametrize('value', ['yes', [('github',)], 5.5])
+def test_inject_sensitive_tool_guard_rejects_bad_value_instead_of_skipping_guard(value):
+    from elitea_sdk.runtime.clients.client import EliteAClient
+
+    middleware = []
+    with patch('elitea_sdk.runtime.toolkits.security.has_sensitive_tools_config', return_value=True):
+        with pytest.raises(ValueError):
+            EliteAClient._inject_sensitive_tool_guard(SimpleNamespace(), middleware, 'c1', value)
+    assert middleware == []
+
+
+def test_ask_user_stays_interactive_for_pairs():
+    from elitea_sdk.runtime.toolkits.tools import get_tools
+
+    def auto_skip(value):
+        tools = get_tools([{'type': 'internal_tool', 'name': 'ask_user'}], auto_approve_sensitive_actions=value)
+        return tools[0].auto_skip
+
+    assert auto_skip([('github', 'create_pull_request')]) is False
+    assert auto_skip(True) is True
 
 
 def test_hitl_decisions_reducer_appends_and_clears():

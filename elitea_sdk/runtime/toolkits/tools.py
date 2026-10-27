@@ -1,7 +1,7 @@
 import contextvars
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 from langchain_core.tools import StructuredTool, ToolException
@@ -963,13 +963,14 @@ def get_toolkits():
 
 
 @memoize_slot_scans
-def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None, auto_approve_sensitive_actions: bool = False) -> list:
+def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: BaseStore = None, debug_mode: Optional[bool] = False, conversation_id: Optional[str] = None, current_participant_id: Optional[int] = None, memory: Optional[object] = None, mcp_context: Optional[McpContext] = None, auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False) -> list:
     """
     Process tool configurations and return instantiated tools.
 
     Args:
         current_participant_id: The participant ID of the agent being predicted to.
             Used to filter out self-references (prevent agent from calling itself).
+        auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
         mcp_context: All MCP-related parameters bundled together. See McpContext for fields.
     """
     mcp_context = mcp_context or McpContext()
@@ -1200,10 +1201,12 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                                        "but no bucket_name provided in settings")
                 elif tool['name'] == 'ask_user':
                     # Clarifying-question tool. Reuses the HITL pause/resume
-                    # pipeline. auto_skip mirrors auto_approve_sensitive_actions
+                    # pipeline. auto_skip mirrors auto_approve_sensitive_actions=True
+                    # (a list of approved pairs never skips ask_user)
                     # so non-interactive / API-only runs never hang on a human.
                     from ..tools.ask_user import AskUserTool
-                    internal_tools = [AskUserTool(auto_skip=auto_approve_sensitive_actions)]
+                    from ..middleware.sensitive_tool_guard import normalize_auto_approve
+                    internal_tools = [AskUserTool(auto_skip=normalize_auto_approve(auto_approve_sensitive_actions) is True)]
                 # Inject display metadata so FE chips show human-readable names
                 if internal_tools:
                     internal_display_name = INTERNAL_TOOL_DISPLAY_NAMES.get(

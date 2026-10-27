@@ -4,7 +4,7 @@ from copy import deepcopy
 import requests
 from urllib.parse import quote, urlparse
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional, Tuple, Union
 
 from langchain_core.messages import (
     AIMessage, HumanMessage,
@@ -25,6 +25,7 @@ from ..middleware import (
     SensitiveToolGuardMiddleware,
     TransformErrorStrategy,
 )
+from ..middleware.sensitive_tool_guard import normalize_auto_approve
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
@@ -100,11 +101,27 @@ def normalize_app_type(app_type: str) -> str:
 
 
 class ApiDetailsRequestError(Exception):
-    ...
+    def __init__(self, *args, status_code: int | None = None, body=None):
+        super().__init__(*args)
+        self.status_code = status_code
+        self.body = body
 
 
 class AuthSessionExpiredError(Exception):
     """ Platform rejected the runtime's auth session (expired or invalidated) """
+
+
+# Values the Schedules API of elitea_core accepts (models/pd/schedule_list.py)
+SCHEDULE_LIST_MAX_LIMIT = 100
+SCHEDULE_LIST_FILTERS = frozenset(
+    {'entity_type', 'status', 'enabled', 'owner_ids', 'entity_id', 'version_id', 'search', 'sort_by', 'sort_order'})
+SCHEDULE_MAX_ID = 2 ** 31 - 1
+SCHEDULE_RUN_STATUSES = frozenset(
+    {'running', 'success', 'failed', 'skipped', 'blocked', 'waiting_for_approval'})
+SCHEDULE_SORT_BY = frozenset({'name', 'entity_name', 'entity_type', 'next_run', 'last_run', 'enabled'})
+SCHEDULE_SORT_ORDER = frozenset({'asc', 'desc'})
+SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline'})
+SCHEDULE_TRIGGERS = ('manual', 'test')
 
 
 class EliteAClient:
@@ -207,6 +224,324 @@ class EliteAClient:
                     "the user session is no longer valid"
                 )
         return response
+
+    @staticmethod
+    def _schedule_response(resp):
+        """None on 204, the JSON below 400, else ApiDetailsRequestError with status_code and body."""
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = resp.text
+            raise ApiDetailsRequestError(
+                f"Schedule request to {resp.url} failed with status {resp.status_code}",
+                status_code=resp.status_code, body=body,
+            )
+        return None if resp.status_code == 204 else resp.json()
+
+    def _schedules_url(self, *parts) -> str:
+        """URL of the Schedules resource, with optional path parts such as an id and an action."""
+        base = f"{self.base_url}{self.api_v2_path}/elitea_core/schedules/prompt_lib/{self.project_id}"
+        return '/'.join([base, *map(str, parts)])
+
+    def _schedule_call(self, method: str, url: str, **kwargs):
+        # Unlike the older calls, this passes no verify flag, so the session default keeps TLS certificate checks on.
+        return self._schedule_response(
+            self._request(method, url, headers=self.headers, **kwargs))
+
+    @staticmethod
+    def _check_paging(limit, offset, max_limit=None):
+        if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+                or (max_limit is not None and limit > max_limit)):
+            raise ValueError(f"limit must be an int of 1 or more (at most {max_limit}), got {limit!r}")
+        if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= SCHEDULE_MAX_ID:
+            raise ValueError(f"offset must be an int from 0 to {SCHEDULE_MAX_ID}, got {offset!r}")
+
+    def list_schedules(self, limit: int = 20, offset: int = 0, **filters) -> dict:
+        """List one page of schedules in the project.
+
+        Args:
+            limit: Rows per page, an int from 1 to 100.
+            offset: Rows to skip, an int from 0 to 2**31-1.
+            **filters: Query filters, for example entity_type, status, enabled,
+                owner_ids, entity_id, version_id, search. A filter set to None is not sent.
+                A list or tuple (owner_ids) is sent as a list: the key repeats
+                once per item in the query string.
+
+        Returns:
+            The API page as a dict.
+
+        Raises:
+            ValueError: limit is not an int from 1 to 100, offset is not an int
+                of 0 or more, a filter key is unknown, owner_ids is not a list
+                of ints, entity_id or version_id is not an int from 1 to 2**31-1,
+                enabled is not a bool, or sort_by, sort_order, entity_type or status
+                is not an allowed value. No request is sent.
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body` (the parsed JSON, else the text).
+        """
+        self._check_paging(limit, offset, SCHEDULE_LIST_MAX_LIMIT)
+        unknown = sorted(set(filters) - SCHEDULE_LIST_FILTERS)
+        if unknown:
+            raise ValueError(f"unknown schedule filter {unknown}, allowed: {sorted(SCHEDULE_LIST_FILTERS)}")
+        owner_ids = filters.get('owner_ids')
+        if owner_ids is not None and (
+                not isinstance(owner_ids, (list, tuple))
+                or not all(isinstance(i, int) and not isinstance(i, bool) for i in owner_ids)):
+            raise ValueError(f"owner_ids must be a list of ints, got {owner_ids!r}")
+        for key in ('entity_id', 'version_id'):
+            value = filters.get(key)
+            if value is not None and not (
+                    isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= SCHEDULE_MAX_ID):
+                raise ValueError(f"{key} must be an int from 1 to {SCHEDULE_MAX_ID}, got {value!r}")
+        if filters.get('enabled') is not None and not isinstance(filters['enabled'], bool):
+            raise ValueError(f"enabled must be a bool, got {filters['enabled']!r}")
+        for key, allowed in (('sort_by', SCHEDULE_SORT_BY), ('sort_order', SCHEDULE_SORT_ORDER),
+                             ('entity_type', SCHEDULE_ENTITY_TYPES), ('status', SCHEDULE_RUN_STATUSES)):
+            if filters.get(key) is not None and filters[key] not in allowed:
+                raise ValueError(f"{key} must be one of {sorted(allowed)}, got {filters[key]!r}")
+        params = {'limit': limit, 'offset': offset}
+        for key, value in filters.items():
+            if value is not None:
+                params[key] = list(value) if isinstance(value, (list, tuple)) else value
+        return self._schedule_call('get', self._schedules_url(), params=params)
+
+    def get_schedule(self, schedule_id: int) -> dict:
+        """Read one schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            The schedule details as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                404 when the schedule does not exist. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('get', self._schedules_url(schedule_id))
+
+    def create_schedule(self, data: dict) -> dict:
+        """Create a schedule.
+
+        Args:
+            data: The body, sent unchanged. Keys: name, description, entity_type,
+                application_id, version_id, run_mode, prompt, variables, cron,
+                timezone, expires_at, approval_rule, enabled (false saves the
+                schedule paused; default true), risk_ack (a dict with
+                `fingerprint` of a risk 409 and `confirmed_name`, the schedule
+                name, to confirm the risk). The API checks them.
+
+        Returns:
+            The new schedule details as a dict (the API answers 201).
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. A 400 carries
+                the field error in `body`; `status_code` holds the status. A 409
+                with `code` risk_confirmation_required or risk_changed holds a
+                `fingerprint`: retry with `risk_ack` set. A 409 with `code`
+                schedule_blocked cannot be confirmed: `blocking` lists the causes.
+        """
+        return self._schedule_call('post', self._schedules_url(), json=data)
+
+    def update_schedule(self, schedule_id: int, data: dict) -> dict:
+        """Change the fields of a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+            data: The same keys as create_schedule, sent unchanged, including
+                `risk_ack`. It must not hold `enabled`: use pause_schedule and
+                resume_schedule instead.
+
+        Returns:
+            The updated schedule details as a dict.
+
+        Raises:
+            ValueError: `data` holds `enabled`. No request is sent.
+            ApiDetailsRequestError: The API answers 400 or more. A 400 carries
+                the field error in `body`; `status_code` holds the status. A 409
+                with `code` risk_confirmation_required, risk_changed or
+                schedule_blocked is handled as in create_schedule.
+        """
+        if 'enabled' in data:
+            raise ValueError("update_schedule does not change 'enabled'; "
+                             "use pause_schedule or resume_schedule")
+        return self._schedule_call('put', self._schedules_url(schedule_id), json=data)
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        """Delete a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            None (the API answers 204).
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('delete', self._schedules_url(schedule_id))
+
+    def pause_schedule(self, schedule_id: int) -> dict:
+        """Pause a schedule, so it starts no future runs. A run in progress goes on.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            The schedule details as a dict, with `enabled` false.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'pause'))
+
+    def resume_schedule(self, schedule_id: int) -> dict:
+        """Resume a paused schedule, so it runs on its timetable again.
+
+        Args:
+            schedule_id: Id of the schedule.
+
+        Returns:
+            The schedule details as a dict, with `enabled` true.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                409 when the schedule has no version, the project reached its
+                cap of active schedules, or the check finds a risk
+                (`risk_confirmation_required`) or a block (`schedule_blocked`).
+                The error has `status_code` and `body`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'resume'))
+
+    def run_schedule(self, schedule_id: int, trigger: str = 'manual') -> dict:
+        """Start one run of a schedule now.
+
+        Args:
+            schedule_id: Id of the schedule.
+            trigger: 'manual' (Run now, the default) or 'test' (Test run).
+
+        Returns:
+            The API answer (202) as a dict with `run_id`.
+
+        Raises:
+            ValueError: trigger is not 'manual' or 'test'. No request is sent.
+            ApiDetailsRequestError: The API answers 400 or more. A 409 means a
+                run is already active: `body` holds `error` and `active_run_id`.
+        """
+        if trigger not in SCHEDULE_TRIGGERS:
+            raise ValueError(f"trigger must be 'manual' or 'test', got {trigger!r}")
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'run'),
+                                   json={'trigger': trigger})
+
+    def list_schedule_runs(self, schedule_id: int, limit: int = 20, offset: int = 0,
+                           status: str | None = None) -> dict:
+        """List one page of the runs of a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+            limit: Rows per page, an int of 1 or more. The API lowers a value above its cap.
+            offset: Rows to skip, an int of 0 or more.
+            status: Only runs with this status. Not sent when None.
+
+        Returns:
+            The API page as a dict with `total` and `rows`.
+
+        Raises:
+            ValueError: limit or offset is out of range, or status is not a run
+                status. No request is sent.
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        self._check_paging(limit, offset)
+        if status is not None and status not in SCHEDULE_RUN_STATUSES:
+            raise ValueError(f"status must be one of {sorted(SCHEDULE_RUN_STATUSES)}, got {status!r}")
+        params = {'limit': limit, 'offset': offset}
+        if status is not None:
+            params['status'] = status
+        return self._schedule_call('get', self._schedules_url(schedule_id, 'runs'), params=params)
+
+    def check_schedule(self, data: dict) -> dict:
+        """Check a schedule payload before a save.
+
+        Args:
+            data: The same keys as create_schedule, sent unchanged.
+
+        Returns:
+            The check result as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. A 409 with
+                `code` risk_confirmation_required or schedule_blocked keeps
+                `code`, `fingerprint` and `blocking` in `body`.
+        """
+        return self._schedule_call('post', self._schedules_url('check'), json=data)
+
+    def get_schedule_run(self, schedule_id: int, run_id: int) -> dict:
+        """Read the detail of one run of a schedule.
+
+        Args:
+            schedule_id: Id of the schedule.
+            run_id: Id of the run.
+
+        Returns:
+            The run details as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('get', self._schedules_url(schedule_id, 'runs', run_id))
+
+    def get_schedule_settings(self) -> dict:
+        """Read the schedule settings of the project.
+
+        Returns:
+            The settings as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('get', self._schedules_url('settings'))
+
+    def update_schedule_settings(self, data: dict) -> dict:
+        """Change the schedule settings of the project. Only a project admin may do it.
+
+        Args:
+            data: The settings to save, sent unchanged.
+
+        Returns:
+            The saved settings as a dict.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                403 when the caller is not an admin. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('put', self._schedules_url('settings'), json=data)
+
+    def change_schedule_owner(self, schedule_id: int, owner_id: int) -> dict:
+        """Give a schedule to another project member. Only a project admin may do it.
+
+        Args:
+            schedule_id: Id of the schedule.
+            owner_id: User id of the new owner.
+
+        Returns:
+            The schedule details as a dict, with the new owner.
+
+        Raises:
+            ApiDetailsRequestError: The API answers 400 or more, for example
+                400 with `field` owner_id when the user is not a project member,
+                or 403 when the caller is not an admin. The error has
+                `status_code` and `body`.
+        """
+        return self._schedule_call('post', self._schedules_url(schedule_id, 'owner'),
+                                   json={'owner_id': owner_id})
 
     def get_mcp_toolkits(self):
         # Static registry; fetched once per client instead of once per nested get_tools call
@@ -1131,9 +1466,13 @@ class EliteAClient:
         self,
         middleware_list: list,
         conversation_id: Optional[str] = None,
-        auto_approve_sensitive_actions: bool = False,
+        auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
     ) -> None:
-        """Inject sensitive tool authorization middleware when configured."""
+        """Inject sensitive tool authorization middleware when configured.
+
+        auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
+        """
+        approve = normalize_auto_approve(auto_approve_sensitive_actions)
         try:
             from ..toolkits.security import has_sensitive_tools_config
 
@@ -1142,13 +1481,14 @@ class EliteAClient:
 
             if any(isinstance(mw, SensitiveToolGuardMiddleware) for mw in middleware_list):
                 return
-
-            middleware_list.append(SensitiveToolGuardMiddleware(
-                conversation_id=conversation_id,
-                auto_approve=auto_approve_sensitive_actions,
-            ))
         except Exception as e:
             logger.warning(f"Failed to auto-inject SensitiveToolGuardMiddleware: {e}")
+            return
+
+        middleware_list.append(SensitiveToolGuardMiddleware(
+            conversation_id=conversation_id,
+            auto_approve=approve,
+        ))
 
     def _inject_tool_exception_handler(
         self,
@@ -1185,7 +1525,7 @@ class EliteAClient:
                     conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None,
                     is_subgraph: bool = False, middleware: Optional[list] = None,
                     context_settings: Optional[dict] = None,
-                    auto_approve_sensitive_actions: bool = False,
+                    auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
                     openai_compatible: Optional[bool] = None,
                     child_dispatcher: Optional[Any] = None,
                     independent_parallel_hitl: bool = True,
@@ -1193,6 +1533,7 @@ class EliteAClient:
                     user_declined_mcp_servers: Optional[list] = None,
                     project_context: Optional[dict] = None,
                     routing_instructions: Optional[str] = None):
+        auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
             tools = []
         if chat_history is None:
@@ -1640,7 +1981,7 @@ class EliteAClient:
                       ignored_mcp_servers: Optional[list] = None, persona: Optional[str] = "generic",
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
                       context_settings: Optional[dict] = None,
-                      step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
+                      step_limit: Optional[int] = None, auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
                       child_dispatcher: Optional[Any] = None,
                       independent_parallel_hitl: bool = True,
                       parallel_hitl_max_concurrency: int = 8,
@@ -1666,6 +2007,7 @@ class EliteAClient:
             lazy_tools_mode: Enable lazy tools mode to reduce token usage with many toolkits (default: False)
             internal_tools: Optional list of internal tool names (e.g., ['swarm', 'planner']).
                            Enables special modes like swarm for multi-agent collaboration.
+            auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
             context_settings: Optional context params
             step_limit: Optional maximum number of tool execution iterations (default: 25).
                        Use to limit or extend how many tool calls the agent can make per turn.
@@ -1673,6 +2015,7 @@ class EliteAClient:
         Returns:
             Runnable agent ready for execution
         """
+        auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
             tools = []
         if chat_history is None:
