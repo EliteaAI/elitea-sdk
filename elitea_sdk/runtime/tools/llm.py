@@ -26,6 +26,7 @@ except ImportError:
 from ..langchain.constants import (
     ELITEA_RS,
     SKILL_REMINDER_SUFFIX,
+    SKILLS_CAPPED_NOTICE,
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
 )
@@ -741,9 +742,11 @@ class LLMNode(BaseTool):
             List of filtered tools (or meta-tools + always-bind tools in lazy mode)
         """
         configurable = config.get('configurable', {}) if isinstance(config, dict) and config else {}
-        # Rebuilt per call: closes over this turn's attached_skills/invoked_skills.
+        # Rebuilt per call: closes over this turn's attached/invoked/capped skills.
         skill_tools = build_load_skill_tools(
-            configurable.get('attached_skills'), configurable.get('invoked_skills')
+            configurable.get('attached_skills'),
+            configurable.get('invoked_skills'),
+            configurable.get('capped_skills'),
         )
 
         def merge_skill_tools(tools):
@@ -1461,6 +1464,9 @@ class LLMNode(BaseTool):
             # so behavior is byte-identical when no skill was invoked. The injected text rides
             # the System message and is stripped before checkpoint (_strip_system_messages).
             skills_section = self._build_invoked_skills_section(configurable.get('invoked_skills'))
+            capped_notice = self._build_capped_skills_notice(configurable.get('capped_skills'))
+            if capped_notice:
+                skills_section = f"{skills_section}\n\n{capped_notice}" if skills_section else capped_notice
             if skills_section:
                 logger.info("[Skills] Injected per-turn skills section into system prompt")
             # Recency counterweight: the registry sits in the cached prefix, far from
@@ -2099,6 +2105,16 @@ class LLMNode(BaseTool):
         return {"messages": self._prepare_output_messages(new_messages, middleware_updates)}
 
     @staticmethod
+    def _build_capped_skills_notice(capped_skills: Any) -> str:
+        if not isinstance(capped_skills, list):
+            return ""
+        names = [
+            f'"{s["name"]}"' for s in capped_skills
+            if isinstance(s, dict) and isinstance(s.get('name'), str) and s['name'].strip()
+        ]
+        return SKILLS_CAPPED_NOTICE.format(names=', '.join(names)) if names else ""
+
+    @staticmethod
     def _build_invoked_skills_section(invoked_skills: Any) -> str:
         if not invoked_skills or not isinstance(invoked_skills, list):
             return ""
@@ -2113,7 +2129,7 @@ class LLMNode(BaseTool):
                 continue
             if not instructions or not str(instructions).strip():
                 continue
-            # No cap here: elitea_core resolves at most the agent's skill limit per message.
+            # No cap here: elitea_core already applied the per-message ~skill cap.
             entries.append(SKILLS_SECTION_ENTRY.format(name=name, instructions=instructions))
 
         if not entries:

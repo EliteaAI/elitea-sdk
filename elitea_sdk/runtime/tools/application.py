@@ -509,6 +509,7 @@ class Application(BaseTool):
             (self.args_runnable.get('version_details') or {}).get('attached_skills') or []
         )
         child_configurable['invoked_skills'] = []
+        child_configurable['capped_skills'] = []
         if self.client and self.args_runnable:
             # Standalone child runs as a root graph with its own checkpointer.
             # Strip ALL parent pregel internals so the child doesn't inherit

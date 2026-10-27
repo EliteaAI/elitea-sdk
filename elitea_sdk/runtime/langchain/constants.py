@@ -797,6 +797,18 @@ LOAD_SKILL_ALREADY_ACTIVE = LOAD_SKILL_ALREADY_ACTIVE_PREFIX + (
     "instructions or the current request put them in scope."
 )
 
+LOAD_SKILL_CAPPED = (
+    "Skill \"{name}\" was not loaded: the user's message referenced more skills than the "
+    "per-message limit allows, so it is skipped for this message. Do not apply or imitate it; "
+    "tell the user it was skipped because of the per-message skill limit."
+)
+
+SKILLS_CAPPED_NOTICE = (
+    "Your message also referenced {names}, but that exceeds the per-message skill limit, so "
+    "they are NOT applied this turn. Do not load or imitate them; tell the user briefly that "
+    "they were skipped because of the per-message skill limit."
+)
+
 LOAD_SKILL_UNKNOWN = (
     "No skill named \"{name}\" is attached to this agent. Available skills: {available}. "
     "Call load_skill with one of these exact names, or proceed without a skill if none apply."

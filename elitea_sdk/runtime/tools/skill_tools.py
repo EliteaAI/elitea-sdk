@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from ..langchain.constants import (
     INSTRUCTION_REFERENCED_HINT,
     LOAD_SKILL_ALREADY_ACTIVE,
+    LOAD_SKILL_CAPPED,
     LOAD_SKILL_TOOL_DESCRIPTION,
     LOAD_SKILL_UNKNOWN,
     LOADED_SKILL_PREFIX_RE,
@@ -73,6 +74,7 @@ class LoadSkillTool(BaseTool):
     args_schema: type[BaseModel] = LoadSkillInput
     attached_skills: list = Field(exclude=True)
     invoked_skills: list = Field(default_factory=list, exclude=True)
+    capped_skills: list = Field(default_factory=list, exclude=True)
     metadata: dict = {
         "toolkit_type": "internal",
         "toolkit_name": "skills",
@@ -107,6 +109,9 @@ class LoadSkillTool(BaseTool):
                 or (name or '').strip().lower() in invoked_names:
             logger.info("[Skills] load_skill %r already active via ~name", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
+        if _normalized_name(matched) in {_normalized_name(s) for s in self.capped_skills}:
+            logger.info("[Skills] load_skill %r refused: over the per-message ~skill cap", name)
+            return LOAD_SKILL_CAPPED.format(name=name)
         if (name or '').strip().lower() in self._already_loaded:
             logger.info("[Skills] load_skill %r already loaded in this conversation", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
@@ -128,11 +133,19 @@ class LoadSkillTool(BaseTool):
         return self._load(skill)
 
 
-def build_load_skill_tools(attached_skills, invoked_skills=None) -> List[BaseTool]:
+def _normalized_name(skill: dict) -> str:
+    return (skill.get('name') or '').strip().lower()
+
+
+def build_load_skill_tools(attached_skills, invoked_skills=None, capped_skills=None) -> List[BaseTool]:
     if not attached_skills:
         return []
     logger.debug("[Skills] Binding load_skill with %d attached skills", len(attached_skills))
-    return [LoadSkillTool(attached_skills=attached_skills, invoked_skills=invoked_skills or [])]
+    return [LoadSkillTool(
+        attached_skills=attached_skills,
+        invoked_skills=invoked_skills or [],
+        capped_skills=capped_skills or [],
+    )]
 
 
 def render_skill_registry_index(attached_skills) -> str:
