@@ -1,7 +1,7 @@
 import logging
 import re
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Iterable, Optional, Tuple, Union
 
 from jinja2 import DebugUndefined
 from jinja2.sandbox import SandboxedEnvironment
@@ -335,7 +335,7 @@ class Assistant:
                  independent_parallel_hitl: bool = True,
                  parallel_hitl_max_concurrency: int = 8,
                  user_declined_mcp_servers: Optional[list] = None,
-                 auto_approve_sensitive_actions: bool = False):
+                 auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False):
 
         self.app_type = app_type
         self.memory = memory

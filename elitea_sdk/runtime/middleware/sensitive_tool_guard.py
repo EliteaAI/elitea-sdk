@@ -4,7 +4,7 @@ import inspect
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 from uuid import uuid4
 
 from langchain_core.messages.base import message_to_dict
@@ -25,6 +25,23 @@ from ..toolkits.security import (
 )
 
 
+def normalize_auto_approve(value: Any) -> Union[bool, frozenset]:
+    """Return True, False or a frozenset of (toolkit, normalized tool) pairs; raise ValueError on a bad shape."""
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (str, bytes, dict)) or not isinstance(value, Iterable):
+        raise ValueError(f"auto_approve must be a bool or a list of (toolkit, tool) pairs, got {type(value).__name__}")
+    pairs = []
+    for item in value:
+        if (
+            not isinstance(item, (list, tuple)) or len(item) != 2
+            or not all(isinstance(part, str) and part for part in item)
+        ):
+            raise ValueError(f"auto_approve pair must be two non-empty strings, got {item!r}")
+        pairs.append((item[0], item[1] if item[1] == '*' else normalize_tool_name(item[1])))
+    return frozenset(pairs)
+
+
 def normalize_tool_input(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     """Normalize tool arguments into a single payload."""
     if kwargs:
@@ -37,7 +54,10 @@ def normalize_tool_input(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
 
 
 class SensitiveToolGuardMiddleware(Middleware):
-    """Pause execution before running configured sensitive tools."""
+    """Pause execution before running configured sensitive tools.
+
+    auto_approve pairs match the configured toolkit name, not the tool's own toolkit type.
+    """
 
     # Marks this middleware as the sensitive-action guard so trusted contexts
     # (e.g. pipeline Code nodes running static, editor-authored code — issue #5348)
@@ -62,6 +82,8 @@ class SensitiveToolGuardMiddleware(Middleware):
     # the gist of the reason. Keep the head.
     MAX_COMMENT_LEN = 2000
 
+    _approved_pairs: frozenset = frozenset()
+
     # `message` is the single natural-language directive a model reads off the
     # blocked result (there is no duplicate `guidance` field any more). The text
     # must NOT end on a terminal "stopped / not executed" note — that reads as
@@ -84,12 +106,17 @@ class SensitiveToolGuardMiddleware(Middleware):
         self,
         conversation_id: Optional[str] = None,
         callbacks: Optional[Dict[str, Callable]] = None,
-        auto_approve: bool = False,
+        auto_approve: Union[bool, Iterable[tuple[str, str]]] = False,
         **kwargs,
     ):
         super().__init__(conversation_id=conversation_id, callbacks=callbacks, **kwargs)
         self._wrapped_tools_cache: Dict[int, BaseTool] = {}
-        self._auto_approve = auto_approve
+        # True approves every sensitive call; pairs approve only those (toolkit, tool) calls.
+        # Pairs match the configured toolkit name.
+        approve = normalize_auto_approve(auto_approve)
+        self._auto_approve = approve is True
+        if not isinstance(approve, bool):
+            self._approved_pairs = approve
 
     def get_tools(self) -> List[BaseTool]:
         return []
@@ -231,6 +258,12 @@ class SensitiveToolGuardMiddleware(Middleware):
             registry = getattr(tool_to_execute, 'registry', None)
             if registry and toolkit_name:
                 toolkit_type = registry.get_toolkit_type(toolkit_name) or toolkit_type
+        # The model picks the invoke_tool toolkit string, so a pair matches only a toolkit the registry knows.
+        approval_toolkit = toolkit_name
+        if tool_to_execute.name == 'invoke_tool':
+            registry = getattr(tool_to_execute, 'registry', None)
+            known = registry is not None and toolkit_name and registry.get_toolkit_type(toolkit_name)
+            approval_toolkit = toolkit_name if known else None
 
         if not resolved_tool_name:
             return None
@@ -248,17 +281,26 @@ class SensitiveToolGuardMiddleware(Middleware):
             'tool_name': resolved_tool_name,
             'toolkit_name': toolkit_name,
             'toolkit_type': toolkit_type,
+            'approval_toolkit': approval_toolkit,
             'action_label': policy['action_name'],
             'policy_message': policy['policy_message'],
             'tool_args': self._mask_sensitive_tool_args(display_args),
             'tool_args_raw': display_args,
         }
 
+    def _is_approved_pair(self, sensitive_tool_context: dict[str, Any]) -> bool:
+        toolkit = sensitive_tool_context.get('approval_toolkit')
+        if not toolkit:
+            return False
+        tool_name = sensitive_tool_context['tool_name']
+        return (toolkit, tool_name) in self._approved_pairs or (toolkit, '*') in self._approved_pairs
+
     def _review_sensitive_tool_call(self, sensitive_tool_context: dict[str, Any]) -> dict[str, str]:
         # Auto-approve when the project secret allows it (API-only flows).
-        if self._auto_approve:
+        if self._auto_approve or self._is_approved_pair(sensitive_tool_context):
             logger.info(
-                "[HITL] Auto-approving '%s' (auto_approve_sensitive_actions enabled)",
+                "[HITL] Auto-approving (toolkit '%s', tool '%s') (auto_approve_sensitive_actions enabled)",
+                sensitive_tool_context.get('approval_toolkit'),
                 sensitive_tool_context['tool_name'],
             )
             return {'action': 'approve', 'value': ''}

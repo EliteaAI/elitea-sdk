@@ -4,7 +4,7 @@ from copy import deepcopy
 import requests
 from urllib.parse import quote, urlparse
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional, Tuple, Union
 
 from langchain_core.messages import (
     AIMessage, HumanMessage,
@@ -25,6 +25,7 @@ from ..middleware import (
     SensitiveToolGuardMiddleware,
     TransformErrorStrategy,
 )
+from ..middleware.sensitive_tool_guard import normalize_auto_approve
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
@@ -244,8 +245,9 @@ class EliteAClient:
         return '/'.join([base, *map(str, parts)])
 
     def _schedule_call(self, method: str, url: str, **kwargs):
+        # Unlike the older calls, this passes no verify flag, so the session default keeps TLS certificate checks on.
         return self._schedule_response(
-            self._request(method, url, headers=self.headers, verify=False, **kwargs))
+            self._request(method, url, headers=self.headers, **kwargs))
 
     @staticmethod
     def _check_paging(limit, offset, max_limit=None):
@@ -1464,9 +1466,13 @@ class EliteAClient:
         self,
         middleware_list: list,
         conversation_id: Optional[str] = None,
-        auto_approve_sensitive_actions: bool = False,
+        auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
     ) -> None:
-        """Inject sensitive tool authorization middleware when configured."""
+        """Inject sensitive tool authorization middleware when configured.
+
+        auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
+        """
+        approve = normalize_auto_approve(auto_approve_sensitive_actions)
         try:
             from ..toolkits.security import has_sensitive_tools_config
 
@@ -1475,13 +1481,14 @@ class EliteAClient:
 
             if any(isinstance(mw, SensitiveToolGuardMiddleware) for mw in middleware_list):
                 return
-
-            middleware_list.append(SensitiveToolGuardMiddleware(
-                conversation_id=conversation_id,
-                auto_approve=auto_approve_sensitive_actions,
-            ))
         except Exception as e:
             logger.warning(f"Failed to auto-inject SensitiveToolGuardMiddleware: {e}")
+            return
+
+        middleware_list.append(SensitiveToolGuardMiddleware(
+            conversation_id=conversation_id,
+            auto_approve=approve,
+        ))
 
     def _inject_tool_exception_handler(
         self,
@@ -1518,7 +1525,7 @@ class EliteAClient:
                     conversation_id: Optional[str] = None, ignored_mcp_servers: Optional[list] = None,
                     is_subgraph: bool = False, middleware: Optional[list] = None,
                     context_settings: Optional[dict] = None,
-                    auto_approve_sensitive_actions: bool = False,
+                    auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
                     openai_compatible: Optional[bool] = None,
                     child_dispatcher: Optional[Any] = None,
                     independent_parallel_hitl: bool = True,
@@ -1526,6 +1533,7 @@ class EliteAClient:
                     user_declined_mcp_servers: Optional[list] = None,
                     project_context: Optional[dict] = None,
                     routing_instructions: Optional[str] = None):
+        auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
             tools = []
         if chat_history is None:
@@ -1973,7 +1981,7 @@ class EliteAClient:
                       ignored_mcp_servers: Optional[list] = None, persona: Optional[str] = "generic",
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
                       context_settings: Optional[dict] = None,
-                      step_limit: Optional[int] = None, auto_approve_sensitive_actions: bool = False,
+                      step_limit: Optional[int] = None, auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
                       child_dispatcher: Optional[Any] = None,
                       independent_parallel_hitl: bool = True,
                       parallel_hitl_max_concurrency: int = 8,
@@ -1999,6 +2007,7 @@ class EliteAClient:
             lazy_tools_mode: Enable lazy tools mode to reduce token usage with many toolkits (default: False)
             internal_tools: Optional list of internal tool names (e.g., ['swarm', 'planner']).
                            Enables special modes like swarm for multi-agent collaboration.
+            auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
             context_settings: Optional context params
             step_limit: Optional maximum number of tool execution iterations (default: 25).
                        Use to limit or extend how many tool calls the agent can make per turn.
@@ -2006,6 +2015,7 @@ class EliteAClient:
         Returns:
             Runnable agent ready for execution
         """
+        auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
             tools = []
         if chat_history is None:

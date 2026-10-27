@@ -1,5 +1,5 @@
 """
-EL-7011 US-45: the schedules guide `docs/guides/schedules.md`.
+The schedules guide `docs/guides/schedules.md`.
 
 The test runs every Python block of the guide against EliteAClient with
 `requests.Session.request` mocked, so the examples cannot drift from the
@@ -168,26 +168,26 @@ def errors_block():
     return code
 
 
-# AC1 — sections, setup and access (TC-US45-01, TC-US45-02)
+# Checks: sections, setup and access
 
-def test_el7011_us45_r1_1_guide_has_the_sections_in_order():
+def test_guide_has_the_sections_in_order():
     headings = list(split(guide_text(), "##"))
     assert [h for h in headings if h in SECTIONS] == list(SECTIONS)
 
 
-def test_el7011_us45_r1_1_setup_names_the_three_variables():
+def test_setup_names_the_three_variables():
     text = section("Setup")
     for name in ("DEPLOYMENT_URL", "API_KEY", "PROJECT_ID"):
         assert name in text
 
 
-def test_el7011_us45_r1_3_access_section_states_caller_and_own_schedules():
+def test_access_section_states_caller_and_own_schedules():
     text = section("Who sees what")
     assert "acts as its caller" in text
     assert "only their own schedules" in text
 
 
-def test_el7011_us45_r1_2_methods_table_has_arguments_and_endpoint():
+def test_methods_table_has_arguments_and_endpoint():
     rows = {}
     for line in section("Methods").splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -203,7 +203,7 @@ def test_el7011_us45_r1_2_methods_table_has_arguments_and_endpoint():
 
 
 @pytest.mark.parametrize("name", list(ENDPOINTS))
-def test_el7011_us45_r1_2_each_method_example_runs_and_calls_it(env, name):
+def test_each_method_example_runs_and_calls_it(env, name):
     sections = method_sections()
     assert name in sections
     (code,) = python_blocks(sections[name])
@@ -212,23 +212,23 @@ def test_el7011_us45_r1_2_each_method_example_runs_and_calls_it(env, name):
     assert name in api.calls
 
 
-# AC1 — examples stay in step with the client (TC-US45-03, TC-US45-04)
+# Checks: examples stay in step with the client
 
-def test_el7011_us45_r1_2_every_client_call_in_the_guide_exists():
+def test_every_client_call_in_the_guide_exists():
     called = set(re.findall(r"\bclient\.(\w+)\(", guide_text()))
     assert set(ENDPOINTS) <= called
     for name in called:
         assert callable(getattr(EliteAClient, name, None)), name
 
 
-def test_el7011_us45_r1_1_every_code_block_names_its_language():
+def test_every_code_block_names_its_language():
     fences = re.findall(r"^```(\S*)$", guide_text(), re.MULTILINE)
     assert fences
     openings = fences[0::2]
     assert all(openings), openings
 
 
-def test_el7011_us45_r1_1_examples_never_print_the_api_key(env, capsys):
+def test_examples_never_print_the_api_key(env, capsys):
     run(FakeApi(), end_to_end_block())
     for code in python_blocks(section("Methods")):
         run(FakeApi(), setup_block(), code)
@@ -236,9 +236,9 @@ def test_el7011_us45_r1_1_examples_never_print_the_api_key(env, capsys):
     assert API_KEY not in output.out + output.err
 
 
-# AC1 — the pipeline example and the run mode rules (TC-US45-16, TC-US45-17)
+# Checks: the pipeline example and the run mode rules
 
-def test_el7011_us45_r1_4_create_example_sends_a_pipeline_in_entry_point_mode(env):
+def test_create_example_sends_a_pipeline_in_entry_point_mode(env):
     text = method_sections()["create_schedule"]
     (code,) = python_blocks(text)
     api = FakeApi()
@@ -255,13 +255,13 @@ def test_el7011_us45_r1_4_create_example_sends_a_pipeline_in_entry_point_mode(en
     assert "empty input" in text
 
 
-def test_el7011_us45_r1_5_create_section_names_the_run_mode_rules():
+def test_create_section_names_the_run_mode_rules():
     text = method_sections()["create_schedule"]
     assert "A pipeline without `run_mode` gets 400" in text
     assert "`entry_point` with a `prompt` or `variables` gets 400" in text
 
 
-def test_el7011_us45_r1_5_no_example_sends_entry_point_with_input(env):
+def test_no_example_sends_entry_point_with_input(env):
     api = FakeApi()
     run(api, end_to_end_block())
     run(api, setup_block(), python_blocks(method_sections()["create_schedule"])[0])
@@ -270,9 +270,9 @@ def test_el7011_us45_r1_5_no_example_sends_entry_point_with_input(env):
             assert not body.get("prompt") and not body.get("variables")
 
 
-# AC2 — the end-to-end example (TC-US45-05, TC-US45-07, TC-US45-08, TC-US45-18, TC-US45-19)
+# Checks: the end-to-end example
 
-def test_el7011_us45_r2_1_end_to_end_creates_runs_lists_and_deletes(env, capsys):
+def test_end_to_end_creates_runs_lists_and_deletes(env, capsys):
     api = FakeApi()
     run(api, end_to_end_block())
     assert api.calls == ["get_list_of_apps", "get_app_details", "create_schedule",
@@ -284,7 +284,7 @@ def test_el7011_us45_r2_1_end_to_end_creates_runs_lists_and_deletes(env, capsys)
     assert "55" in out and "manual" in out
 
 
-def test_el7011_us45_r4_1_end_to_end_body_fills_one_placeholder(env):
+def test_end_to_end_body_fills_one_placeholder(env):
     api = FakeApi()
     run(api, end_to_end_block())
     (body,) = api.bodies["create_schedule"]
@@ -297,14 +297,14 @@ def test_el7011_us45_r4_1_end_to_end_body_fills_one_placeholder(env):
     }
 
 
-def test_el7011_us45_r4_1_end_to_end_skips_a_pipeline_listed_first(env):
+def test_end_to_end_skips_a_pipeline_listed_first(env):
     api = FakeApi(apps=(PIPELINE, AGENT))
     run(api, end_to_end_block())
     (body,) = api.bodies["create_schedule"]
     assert body["application_id"] == AGENT["id"]
 
 
-def test_el7011_us45_r4_2_text_states_the_placeholder_rule(env):
+def test_text_states_the_placeholder_rule(env):
     text = section("End-to-end example")
     assert "gets 400" in text
     assert "placeholder" in text
@@ -315,7 +315,7 @@ def test_el7011_us45_r4_2_text_states_the_placeholder_rule(env):
     assert placeholders == {v["name"] for v in body["variables"]} == {"topic"}
 
 
-def test_el7011_us45_r2_5_missing_variable_stops_before_any_call(env):
+def test_missing_variable_stops_before_any_call(env):
     env.delenv("API_KEY")
     api = FakeApi()
     with pytest.raises(SystemExit) as stop:
@@ -325,7 +325,7 @@ def test_el7011_us45_r2_5_missing_variable_stops_before_any_call(env):
 
 
 @pytest.mark.parametrize("apps", [(), (PIPELINE,)], ids=["empty", "pipeline_only"])
-def test_el7011_us45_r2_5_no_agent_stops_before_create(env, apps):
+def test_no_agent_stops_before_create(env, apps):
     api = FakeApi(apps=apps)
     with pytest.raises(SystemExit) as stop:
         run(api, end_to_end_block())
@@ -333,9 +333,9 @@ def test_el7011_us45_r2_5_no_agent_stops_before_create(env, apps):
     assert "create_schedule" not in api.calls
 
 
-# AC3 — cleanup in finally (TC-US45-09 to TC-US45-12)
+# Checks: cleanup in finally
 
-def test_el7011_us45_r2_4_failed_run_still_deletes(env):
+def test_failed_run_still_deletes(env):
     api = FakeApi()
     api.answer("run_schedule", (500, {"error": "boom"}))
     with pytest.raises(ApiDetailsRequestError) as error:
@@ -344,7 +344,7 @@ def test_el7011_us45_r2_4_failed_run_still_deletes(env):
     assert api.calls[-2:] == ["run_schedule", "delete_schedule"]
 
 
-def test_el7011_us45_r2_4_failed_runs_list_still_deletes_once(env):
+def test_failed_runs_list_still_deletes_once(env):
     api = FakeApi()
     api.answer("list_schedule_runs", (500, {"error": "boom"}))
     with pytest.raises(ApiDetailsRequestError):
@@ -353,7 +353,7 @@ def test_el7011_us45_r2_4_failed_runs_list_still_deletes_once(env):
     assert api.calls[-1] == "delete_schedule"
 
 
-def test_el7011_us45_r2_4_failed_create_sends_no_delete(env):
+def test_failed_create_sends_no_delete(env):
     api = FakeApi()
     api.answer("create_schedule", (400, {"field": "cron", "error": "bad cron"}))
     with pytest.raises(ApiDetailsRequestError) as error:
@@ -362,7 +362,7 @@ def test_el7011_us45_r2_4_failed_create_sends_no_delete(env):
     assert "delete_schedule" not in api.calls
 
 
-def test_el7011_us45_r2_4_failed_delete_keeps_the_first_error(env, capsys):
+def test_failed_delete_keeps_the_first_error(env, capsys):
     api = FakeApi()
     api.answer("run_schedule", (500, {"error": "boom"}))
     api.answer("delete_schedule", (503, {"error": "down"}))
@@ -372,9 +372,9 @@ def test_el7011_us45_r2_4_failed_delete_keeps_the_first_error(env, capsys):
     assert str(SCHEDULE_ID) in capsys.readouterr().out
 
 
-# AC4 — the error example (TC-US45-13 to TC-US45-15)
+# Checks: the error example
 
-def test_el7011_us45_r3_1_second_run_now_prints_409_and_active_run_id(env, capsys):
+def test_second_run_now_prints_409_and_active_run_id(env, capsys):
     api = FakeApi()
     api.answer("run_schedule", (202, {"run_id": 54}),
                (409, {"code": "run_active", "error": "A run of this schedule is active", "active_run_id": 54}))
@@ -384,7 +384,7 @@ def test_el7011_us45_r3_1_second_run_now_prints_409_and_active_run_id(env, capsy
     assert "409" in out and "54" in out
 
 
-def test_el7011_us45_r3_1_other_errors_reach_the_caller(env, capsys):
+def test_other_errors_reach_the_caller(env, capsys):
     api = FakeApi()
     api.answer("run_schedule", (404, {"code": "not_found", "error": "Schedule not found"}))
     with pytest.raises(ApiDetailsRequestError) as error:
@@ -393,7 +393,7 @@ def test_el7011_us45_r3_1_other_errors_reach_the_caller(env, capsys):
     assert "active_run_id" not in capsys.readouterr().out
 
 
-def test_el7011_us45_r3_1_a_409_without_active_run_reaches_the_caller(env, capsys):
+def test_a_409_without_active_run_reaches_the_caller(env, capsys):
     api = FakeApi()
     deleted = {"code": "version_deleted", "error": "The version of this schedule is deleted"}
     api.answer("run_schedule", (202, {"run_id": 54}), (409, deleted))
@@ -403,14 +403,14 @@ def test_el7011_us45_r3_1_a_409_without_active_run_reaches_the_caller(env, capsy
     assert "still active" not in capsys.readouterr().out
 
 
-def test_el7011_us45_r3_2_errors_text_explains_403_and_404():
+def test_errors_text_explains_403_and_404():
     text = section("Errors")
     assert "403" in text and "right" in text
     assert "404" in text and "another user" in text
 
 
-def test_el7011_us45_r3_2_errors_text_names_the_shared_refusal_body():
-    """BUG-29: every refusal body carries code and error, plus field when one input is wrong."""
+def test_errors_text_names_the_shared_refusal_body():
+    """Every refusal body carries code and error, plus field when one input is wrong."""
     text = section("Errors")
     for key in ('`code`', '`error`', '`field`'):
         assert key in text
@@ -418,28 +418,28 @@ def test_el7011_us45_r3_2_errors_text_names_the_shared_refusal_body():
         assert f'`{code}`' in text
 
 
-def test_el7011_us45_r3_1_errors_example_checks_the_run_active_code():
+def test_errors_example_checks_the_run_active_code():
     (code,) = python_blocks(section("Errors"))
     assert 'error.body.get("code") != "run_active"' in code
 
 
-def test_el7011_us45_r5_3_risk_text_says_every_refusal_has_a_code():
+def test_risk_text_says_every_refusal_has_a_code():
     assert "Every refusal has a `code`" in section("Risk refusals")
 
 
-# AC6 — CR-14: risk_ack, blocked, approval_rule, install (TC-US44-26 to TC-US44-30)
+# Checks: risk_ack, blocked, approval_rule, install
 
-def test_el7011_us45_r5_1_setup_shows_the_install_step():
+def test_setup_shows_the_install_step():
     assert "pip install '.[all]'" in section("Setup")
 
 
-def test_el7011_us45_r5_3_settings_text_names_the_settings_field():
+def test_settings_text_names_the_settings_field():
     text = method_sections()["get_schedule_settings"] + method_sections()["update_schedule_settings"]
     assert "allow_run_without_asking" in text and "approval_rule" not in text
     assert "approval_rule" in method_sections()["create_schedule"]
 
 
-def test_el7011_us45_r5_5_risk_section_runs_the_risk_ack_retry(env):
+def test_risk_section_runs_the_risk_ack_retry(env):
     api = FakeApi()
     api.answer("create_schedule", (409, RISK_409), (201, SCHEDULE))
     (code,) = python_blocks(section("Risk refusals"))
@@ -451,7 +451,7 @@ def test_el7011_us45_r5_5_risk_section_runs_the_risk_ack_retry(env):
     assert api.calls.count("create_schedule") == 2
 
 
-def test_el7011_us45_r5_5_blocked_refusal_is_not_retried(env, capsys):
+def test_blocked_refusal_is_not_retried(env, capsys):
     api = FakeApi()
     api.answer("create_schedule", (409, {"code": "schedule_blocked", "fingerprint": "x",
                                          "blocking": ["secret in prompt"]}))
@@ -460,3 +460,8 @@ def test_el7011_us45_r5_5_blocked_refusal_is_not_retried(env, capsys):
     assert api.calls.count("create_schedule") == 1
     assert "secret in prompt" in capsys.readouterr().out
     assert "schedule_blocked" in section("Risk refusals")
+
+
+def test_setup_explains_tls_check_and_ca_bundle():
+    text = section("Setup")
+    assert "TLS" in text and "REQUESTS_CA_BUNDLE" in text

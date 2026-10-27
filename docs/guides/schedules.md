@@ -37,6 +37,12 @@ schedule_id = 7  # the id of one of your schedules
 
 Never print or log `API_KEY`.
 
+Schedule calls verify the TLS certificate of the host. Other client calls may still skip the check. If the host uses a self-signed or private CA certificate, set `REQUESTS_CA_BUNDLE` to the path of the CA file before you start Python:
+
+```bash
+export REQUESTS_CA_BUNDLE="/path/to/ca.pem"
+```
+
 ## Methods
 
 All calls go to one resource: `/api/v2/elitea_core/schedules/prompt_lib/{project_id}`.

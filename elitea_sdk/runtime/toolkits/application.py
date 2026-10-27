@@ -1,5 +1,5 @@
 import logging
-from typing import List, Any, Optional
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 from langgraph.store.base import BaseStore
 from pydantic import create_model, BaseModel, Field
@@ -123,11 +123,12 @@ class ApplicationToolkit(BaseToolkit):
                     memory: Optional[Any] = None,
                     fallback_llm=None,
                     user_declined_mcp_servers: Optional[list] = None,
-                    auto_approve_sensitive_actions: bool = False):
+                    auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False):
         """
         Get toolkit for an application.
 
         Args:
+            auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
             project_id: Optional project ID where the application lives.
                        If not specified, uses the client's default project.
                        This is needed for public project agents added as participants.
