@@ -57,3 +57,17 @@ def is_run_token_bearer(client: Any) -> bool:
     auth = getattr(client, "internal_run_auth", None) if client is not None else None
     token = getattr(auth, "token", None)
     return isinstance(token, str) and bool(token) and getattr(client, "auth_token", None) == token
+
+
+# The codes Main refuses a call on the run token with once the run is no longer admitted (#7229)
+_RUN_TOKEN_REFUSAL = re.compile(r"\b(CONTEXT_NOT_LIVE|INTERNAL_TOKEN_EXPIRED|INTERNAL_TOKEN_INVALID)\b")
+
+
+def run_token_refusal(exc: BaseException) -> Optional[str]:
+    """The code of a model or platform call Main refused on the run token (the run ended, was revoked or went idle), or
+    None. Every later call of the run is refused the same way, so it ends the run (the worker shows its readable card);
+    it is never an answer for the graph to carry on with."""
+    if getattr(exc, "status_code", None) not in (401, 403):
+        return None
+    found = _RUN_TOKEN_REFUSAL.search(f"{exc} {getattr(exc, 'body', '')}")
+    return found.group(1) if found else None

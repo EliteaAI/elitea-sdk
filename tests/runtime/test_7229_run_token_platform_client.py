@@ -149,3 +149,37 @@ def test_the_refusal_names_the_sub_agent_refused_and_survives_a_task_boundary():
     assert err.value.subagent == "public helper" and "(sub-agent \u201cpublic helper\u201d)" in err.value.message
     again = pickle.loads(pickle.dumps(err.value))
     assert (again.reason_code, again.subagent, again.message) == (err.value.reason_code, "public helper", err.value.message)
+
+
+class _Refused(Exception):
+    """The shape of a model client's 4xx error (openai / anthropic: ``status_code`` and ``body``)."""
+
+    def __init__(self, status_code, code):
+        super().__init__(f"Error code: {status_code} - {{'error': '{code}'}}")
+        self.status_code, self.body = status_code, {"error": code}
+
+
+@pytest.mark.parametrize("status_code,code", [(403, "CONTEXT_NOT_LIVE"), (401, "INTERNAL_TOKEN_EXPIRED"),
+                                              (403, "INTERNAL_TOKEN_INVALID")])
+def test_a_pipeline_model_call_refused_on_the_run_token_ends_the_run(status_code, code):
+    from elitea_sdk.runtime.tools.llm import LLMNode  # pylint: disable=C0415
+    from elitea_sdk.runtime.utils.internal_run_auth import run_token_refusal  # pylint: disable=C0415
+
+    error = _Refused(status_code, code)
+    assert run_token_refusal(error) == code
+    node = LLMNode(name="llm_1", description="test", client=SimpleNamespace(model_name="m", _llm_type="fake"))
+    with patch.object(LLMNode, "_invoke_llm_internal", side_effect=error):
+        with pytest.raises(_Refused):
+            node.invoke({"messages": []})
+
+
+def test_other_model_errors_still_become_the_node_answer():
+    from elitea_sdk.runtime.tools.llm import LLMNode  # pylint: disable=C0415
+    from elitea_sdk.runtime.utils.internal_run_auth import run_token_refusal  # pylint: disable=C0415
+
+    assert run_token_refusal(_Refused(500, "CONTEXT_NOT_LIVE")) is None
+    assert run_token_refusal(_Refused(403, "budget")) is None
+    node = LLMNode(name="llm_1", description="test", client=SimpleNamespace(model_name="m", _llm_type="fake"))
+    with patch.object(LLMNode, "_invoke_llm_internal", side_effect=_Refused(403, "PROVIDER_DENIED")):
+        result = node.invoke({"messages": []})
+    assert result["messages"][-1].response_metadata.get("llm_node_error") is True

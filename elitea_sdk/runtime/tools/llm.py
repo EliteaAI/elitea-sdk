@@ -45,6 +45,7 @@ from ..context_floor import (
     shrink_after_overflow,
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
+from ..utils.internal_run_auth import run_token_refusal
 from ..tool_outcome import outcome_sink
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
@@ -1289,6 +1290,9 @@ class LLMNode(BaseTool):
             budget_error = budget_exceeded_from(e)
             if budget_error is not None:
                 raise budget_error from e
+            if run_token_refusal(e):
+                # The run is no longer admitted (#7229): every later call is refused too
+                raise
             if routing_scope is not None:
                 # Admission/transport failure is not an assistant answer. Let
                 # the Worker's existing error event/card retain traceback and retry.
@@ -4638,6 +4642,9 @@ class LLMNode(BaseTool):
                 if budget_error is not None:
                     _PENDING_TOOL_MESSAGES.set([])
                     raise budget_error from e
+                if run_token_refusal(e):
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise
                 if getattr(self.client, '_llm_type', None) == 'elitea-auto':
                     _PENDING_TOOL_MESSAGES.set([])
                     raise
