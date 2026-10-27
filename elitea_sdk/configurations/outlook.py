@@ -336,6 +336,7 @@ class OutlookConfiguration(BaseModel):
         if oauth_app_id:
             # Default app mode: the platform holds the secret; sign-in sends this reference instead
             provided_settings["oauth_app_id"] = oauth_app_id
+            provided_settings["credential_type"] = "outlook"
             provided_settings["has_mcp_client_secret"] = True
         if provided_settings:
             resource_metadata["provided_settings"] = provided_settings
