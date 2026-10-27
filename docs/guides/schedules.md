@@ -65,8 +65,10 @@ When the API answers 400 or more, the method raises `ApiDetailsRequestError` (se
 ### `list_schedules`
 
 Lists one page of the project schedules. `limit` is 1 to 100.
-Filters go to the query: `entity_type`, `status` (of the last run), `enabled`, `owner_ids`, `entity_id`, `search`, `sort_by` and `sort_order`.
+Filters go to the query: `entity_type`, `status` (of the last run), `enabled`, `owner_ids`, `entity_id`, `version_id`, `search`, `sort_by` and `sort_order`.
 A filter set to `None` is not sent.
+`list_schedules` raises `ValueError` before any request for a `limit` outside 1 to 100, an `offset` outside 0 to 2147483647, an unknown filter key, `owner_ids` that is not a list of ints, an `entity_id` or `version_id` that is not an int from 1 to 2147483647, `enabled` that is not a bool, a `sort_by` that is not one of name, entity_name, entity_type, next_run, last_run, enabled, a `sort_order` that is not asc or desc, an `entity_type` that is not agent or pipeline, or a `status` that is not a run status.
+`list_schedule_runs` raises `ValueError` for a `limit` below 1, an `offset` outside 0 to 2147483647, or a `status` that is not a run status.
 
 ```python
 page = client.list_schedules(limit=10, enabled=True)
@@ -81,7 +83,7 @@ Creates a schedule. The client sends `data` as it is; the API checks it.
 
 Keys: `name`, `description`, `entity_type` (`agent` or `pipeline`), `application_id`, `version_id`, `run_mode`, `prompt`, `variables`, `cron`, `timezone`, `expires_at`, `approval_rule` and `enabled`.
 `enabled` false saves the schedule paused. The default is true.
-`approval_rule` is `pause_and_ask` or `run_without_asking` (see [`get_schedule_settings`](#get_schedule_settings)).
+`approval_rule` is `pause_and_ask` or `run_without_asking`.
 A save can answer 409 for a risk. See [Risk refusals](#risk-refusals).
 
 The run input depends on the entity:
@@ -171,6 +173,7 @@ print(schedule["enabled"], schedule["next_run"])
 
 Starts one run now. It works on a paused schedule too.
 `trigger` is `manual` (Run now, the default) or `test` (Test run): `client.run_schedule(schedule_id, trigger="test")`.
+Another value raises `ValueError` before any request.
 The answer holds the `run_id`. The run itself goes on in the background.
 
 ```python
@@ -223,22 +226,22 @@ print(run["id"], run["status"])
 
 ### `get_schedule_settings`
 
-Reads the project setting for schedules. `approval_rule` tells what a run does when it needs approval:
-`pause_and_ask` pauses the run and waits for an answer, and `run_without_asking` goes on without asking.
+Reads the project setting for schedules. `allow_run_without_asking` (a bool) tells what a run does when it needs approval:
+false pauses the run and waits for an answer, and true goes on without asking.
 
 ```python
 settings = client.get_schedule_settings()
-print(settings["approval_rule"])
+print(settings["allow_run_without_asking"])
 ```
 
 ### `update_schedule_settings`
 
 Changes the project setting. Only a project admin may do it.
-Send `approval_rule` as `pause_and_ask` or `run_without_asking`.
+Send `allow_run_without_asking` as true or false.
 
 ```python
-settings = client.update_schedule_settings({"approval_rule": "run_without_asking"})
-print(settings["approval_rule"])
+settings = client.update_schedule_settings({"allow_run_without_asking": True})
+print(settings["allow_run_without_asking"])
 ```
 
 ## Who sees what
@@ -254,6 +257,7 @@ It has the same rights as that user has in the UI.
 ## Errors
 
 When the API answers 400 or more, the method raises `ApiDetailsRequestError`.
+A bad argument that the client checks itself (see `list_schedules`, `list_schedule_runs`, `run_schedule`) raises `ValueError` and sends no request.
 The error has two fields:
 
 - `status_code`: the HTTP status.

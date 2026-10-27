@@ -110,6 +110,19 @@ class AuthSessionExpiredError(Exception):
     """ Platform rejected the runtime's auth session (expired or invalidated) """
 
 
+# Values the Schedules API of elitea_core accepts (models/pd/schedule_list.py)
+SCHEDULE_LIST_MAX_LIMIT = 100
+SCHEDULE_LIST_FILTERS = frozenset(
+    {'entity_type', 'status', 'enabled', 'owner_ids', 'entity_id', 'version_id', 'search', 'sort_by', 'sort_order'})
+SCHEDULE_MAX_ID = 2 ** 31 - 1
+SCHEDULE_RUN_STATUSES = frozenset(
+    {'running', 'success', 'failed', 'skipped', 'blocked', 'waiting_for_approval'})
+SCHEDULE_SORT_BY = frozenset({'name', 'entity_name', 'entity_type', 'next_run', 'last_run', 'enabled'})
+SCHEDULE_SORT_ORDER = frozenset({'asc', 'desc'})
+SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline'})
+SCHEDULE_TRIGGERS = ('manual', 'test')
+
+
 class EliteAClient:
     def __init__(self,
                  base_url: str,
@@ -234,24 +247,61 @@ class EliteAClient:
         return self._schedule_response(
             self._request(method, url, headers=self.headers, verify=False, **kwargs))
 
+    @staticmethod
+    def _check_paging(limit, offset, max_limit=None):
+        if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+                or (max_limit is not None and limit > max_limit)):
+            raise ValueError(f"limit must be an int of 1 or more (at most {max_limit}), got {limit!r}")
+        if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= SCHEDULE_MAX_ID:
+            raise ValueError(f"offset must be an int from 0 to {SCHEDULE_MAX_ID}, got {offset!r}")
+
     def list_schedules(self, limit: int = 20, offset: int = 0, **filters) -> dict:
         """List one page of schedules in the project.
 
         Args:
-            limit: Rows per page, 1 to 100; the API answers 400 for a value outside that range.
-            offset: Rows to skip.
+            limit: Rows per page, an int from 1 to 100.
+            offset: Rows to skip, an int from 0 to 2**31-1.
             **filters: Query filters, for example entity_type, status, enabled,
-                owner_ids, entity_id, search. A filter set to None is not sent.
+                owner_ids, entity_id, version_id, search. A filter set to None is not sent.
+                A list or tuple (owner_ids) is sent as a list: the key repeats
+                once per item in the query string.
 
         Returns:
             The API page as a dict.
 
         Raises:
+            ValueError: limit is not an int from 1 to 100, offset is not an int
+                of 0 or more, a filter key is unknown, owner_ids is not a list
+                of ints, entity_id or version_id is not an int from 1 to 2**31-1,
+                enabled is not a bool, or sort_by, sort_order, entity_type or status
+                is not an allowed value. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. The error has
                 `status_code` and `body` (the parsed JSON, else the text).
         """
+        self._check_paging(limit, offset, SCHEDULE_LIST_MAX_LIMIT)
+        unknown = sorted(set(filters) - SCHEDULE_LIST_FILTERS)
+        if unknown:
+            raise ValueError(f"unknown schedule filter {unknown}, allowed: {sorted(SCHEDULE_LIST_FILTERS)}")
+        owner_ids = filters.get('owner_ids')
+        if owner_ids is not None and (
+                not isinstance(owner_ids, (list, tuple))
+                or not all(isinstance(i, int) and not isinstance(i, bool) for i in owner_ids)):
+            raise ValueError(f"owner_ids must be a list of ints, got {owner_ids!r}")
+        for key in ('entity_id', 'version_id'):
+            value = filters.get(key)
+            if value is not None and not (
+                    isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= SCHEDULE_MAX_ID):
+                raise ValueError(f"{key} must be an int from 1 to {SCHEDULE_MAX_ID}, got {value!r}")
+        if filters.get('enabled') is not None and not isinstance(filters['enabled'], bool):
+            raise ValueError(f"enabled must be a bool, got {filters['enabled']!r}")
+        for key, allowed in (('sort_by', SCHEDULE_SORT_BY), ('sort_order', SCHEDULE_SORT_ORDER),
+                             ('entity_type', SCHEDULE_ENTITY_TYPES), ('status', SCHEDULE_RUN_STATUSES)):
+            if filters.get(key) is not None and filters[key] not in allowed:
+                raise ValueError(f"{key} must be one of {sorted(allowed)}, got {filters[key]!r}")
         params = {'limit': limit, 'offset': offset}
-        params.update({k: v for k, v in filters.items() if v is not None})
+        for key, value in filters.items():
+            if value is not None:
+                params[key] = list(value) if isinstance(value, (list, tuple)) else value
         return self._schedule_call('get', self._schedules_url(), params=params)
 
     def get_schedule(self, schedule_id: int) -> dict:
@@ -376,9 +426,12 @@ class EliteAClient:
             The API answer (202) as a dict with `run_id`.
 
         Raises:
+            ValueError: trigger is not 'manual' or 'test'. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. A 409 means a
                 run is already active: `body` holds `error` and `active_run_id`.
         """
+        if trigger not in SCHEDULE_TRIGGERS:
+            raise ValueError(f"trigger must be 'manual' or 'test', got {trigger!r}")
         return self._schedule_call('post', self._schedules_url(schedule_id, 'run'),
                                    json={'trigger': trigger})
 
@@ -388,17 +441,22 @@ class EliteAClient:
 
         Args:
             schedule_id: Id of the schedule.
-            limit: Rows per page. The API lowers a value above its cap.
-            offset: Rows to skip.
+            limit: Rows per page, an int of 1 or more. The API lowers a value above its cap.
+            offset: Rows to skip, an int of 0 or more.
             status: Only runs with this status. Not sent when None.
 
         Returns:
             The API page as a dict with `total` and `rows`.
 
         Raises:
+            ValueError: limit or offset is out of range, or status is not a run
+                status. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. The error has
                 `status_code` and `body`.
         """
+        self._check_paging(limit, offset)
+        if status is not None and status not in SCHEDULE_RUN_STATUSES:
+            raise ValueError(f"status must be one of {sorted(SCHEDULE_RUN_STATUSES)}, got {status!r}")
         params = {'limit': limit, 'offset': offset}
         if status is not None:
             params['status'] = status

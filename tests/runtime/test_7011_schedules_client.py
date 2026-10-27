@@ -74,10 +74,66 @@ def test_el7011_r1_4_delete_schedule_returns_none_on_204(client, send, base):
 
 
 def test_el7011_r1_5_list_schedules_sends_paging_and_filters(client, send, base):
-    client.list_schedules(limit=10, offset=20, enabled=True, name=None)
+    client.list_schedules(limit=10, offset=20, enabled=True, search=None)
     args, kwargs = send.call_args
     assert args == ("get", base)
     assert kwargs["params"] == {"limit": 10, "offset": 20, "enabled": True}
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"limit": 0}, {"limit": 101}, {"limit": "10"}, {"limit": True}, {"offset": -1}, {"offset": 1.5}, {"offset": 2**31},
+])
+def test_list_schedules_rejects_bad_paging(client, send, kwargs):
+    with pytest.raises(ValueError):
+        client.list_schedules(**kwargs)
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize("filters", [
+    {"entity-type": "agent"}, {"bogus": 1}, {"owner_ids": [1, "2"]}, {"owner_ids": 5}, {"enabled": "true"},
+    {"entity_id": 0}, {"entity_id": "3"}, {"version_id": True}, {"version_id": -1}, {"version_id": 2**31},
+    {"sort_by": "created"}, {"sort_order": "up"}, {"entity_type": "toolkit"}, {"status": "done"},
+])
+def test_list_schedules_rejects_bad_filters(client, send, filters):
+    with pytest.raises(ValueError):
+        client.list_schedules(**filters)
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize("kwargs", [{"limit": 0}, {"limit": "5"}, {"offset": -1}, {"status": "done"}])
+def test_list_schedule_runs_rejects_bad_input(client, send, kwargs):
+    with pytest.raises(ValueError):
+        client.list_schedule_runs(SCHEDULE_ID, **kwargs)
+    send.assert_not_called()
+
+
+def test_schedule_input_limits_match_the_core_api():
+    from elitea_sdk.runtime.clients import client as module
+    assert module.SCHEDULE_LIST_MAX_LIMIT == 100
+    assert module.SCHEDULE_TRIGGERS == ("manual", "test")
+    assert module.SCHEDULE_LIST_FILTERS == {
+        "entity_type", "status", "enabled", "owner_ids", "entity_id", "version_id", "search", "sort_by", "sort_order"}
+    assert module.SCHEDULE_SORT_BY == {"name", "entity_name", "entity_type", "next_run", "last_run", "enabled"}
+    assert module.SCHEDULE_SORT_ORDER == {"asc", "desc"}
+    assert module.SCHEDULE_ENTITY_TYPES == {"agent", "pipeline"}
+    assert module.SCHEDULE_RUN_STATUSES == {
+        "running", "success", "failed", "skipped", "blocked", "waiting_for_approval"}
+
+
+def test_list_schedules_sends_version_id(client, send):
+    client.list_schedules(version_id=31)
+    assert send.call_args[1]["params"]["version_id"] == 31
+
+
+def test_list_schedules_sends_owner_ids_as_list(client, send):
+    client.list_schedules(owner_ids=(1, 2))
+    assert send.call_args[1]["params"]["owner_ids"] == [1, 2]
+
+
+def test_run_schedule_rejects_unknown_trigger(client, send):
+    with pytest.raises(ValueError):
+        client.run_schedule(SCHEDULE_ID, trigger="cron")
+    send.assert_not_called()
 
 
 def test_el7011_r1_5_list_schedules_returns_json(client, send):

@@ -91,8 +91,8 @@ class FakeApi:
             "change_schedule_owner": [(200, {**SCHEDULE, "owner": {"id": 15, "name": "Bob"}})],
             "check_schedule": [(200, {"risk": "high", "fingerprint": "abc123", "blocking": []})],
             "get_schedule_run": [(200, RUN)],
-            "get_schedule_settings": [(200, {"approval_rule": "pause_and_ask"})],
-            "update_schedule_settings": [(200, {"approval_rule": "run_without_asking"})],
+            "get_schedule_settings": [(200, {"allow_run_without_asking": False})],
+            "update_schedule_settings": [(200, {"allow_run_without_asking": True})],
         }
 
     def answer(self, name, *answers):
@@ -433,9 +433,9 @@ def test_el7011_us45_r5_1_setup_shows_the_install_step():
     assert "pip install '.[all]'" in section("Setup")
 
 
-def test_el7011_us45_r5_3_settings_text_names_the_approval_rule_values():
+def test_el7011_us45_r5_3_settings_text_names_the_settings_field():
     text = method_sections()["get_schedule_settings"] + method_sections()["update_schedule_settings"]
-    assert "pause_and_ask" in text and "run_without_asking" in text
+    assert "allow_run_without_asking" in text and "approval_rule" not in text
     assert "approval_rule" in method_sections()["create_schedule"]
 
 
