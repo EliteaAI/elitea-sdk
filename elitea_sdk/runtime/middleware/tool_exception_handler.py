@@ -43,6 +43,7 @@ from elitea_sdk.runtime.tool_outcome import (
     record_outcome,
     retriable_for,
 )
+from elitea_sdk.runtime.credential_slots import GovernedCredentialError
 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
@@ -87,6 +88,10 @@ def reraise_signal_exceptions(error: Exception) -> None:
 
     # A guardrail block inside a sub-agent must stop the run, not come back as prose
     if isinstance(error, InputGuardrailBlocked):
+        raise error
+
+    # So must a governed refusal (#7229): a sub-agent the platform refused to a governed run ends it readably
+    if isinstance(error, GovernedCredentialError):
         raise error
 
     # Budget rejections bypass the strategies: TransformErrorStrategy would

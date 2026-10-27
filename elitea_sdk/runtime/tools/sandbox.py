@@ -14,6 +14,7 @@ from pydantic import BaseModel, create_model, ConfigDict, Field
 from pydantic.fields import FieldInfo
 
 from ..exceptions import SandboxAdmissionRefused
+from ..utils.internal_run_auth import is_run_token_bearer
 
 logger = logging.getLogger(__name__)
 
@@ -354,11 +355,8 @@ class PyodideSandboxTool(BaseTool):
                     sandbox_client_code = f.read()
                 pyodide_predata += f"{sandbox_client_code.replace('\\n', '\\\n')}\n"
                 # Session auth (#6486): no PAT to hand over, so pass the session reference.
-                _token = self.elitea_client.auth_token
-                _run_auth = getattr(self.elitea_client, 'internal_run_auth', None)
-                if _token and _token == getattr(_run_auth, 'token', None):
-                    # A governed run's only identity is its run token (#7229): it never leaves the worker
-                    _token = None
+                # A governed run's only identity is its run token (#7229): it never leaves the worker
+                _token = None if is_run_token_bearer(self.elitea_client) else self.elitea_client.auth_token
                 _session = getattr(self.elitea_client, 'auth_session', None)
                 _cookie = getattr(self.elitea_client, 'session_cookie_name', None)
                 pyodide_predata += (f"elitea_client = SandboxClient(base_url='{self.elitea_client.base_url}',"

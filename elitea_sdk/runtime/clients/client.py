@@ -1,5 +1,4 @@
 import logging
-import re
 from copy import deepcopy
 
 import requests
@@ -27,7 +26,8 @@ from ..middleware import (
     TransformErrorStrategy,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
-from ..credential_slots import GovernedCredentialError
+from ..credential_slots import REASON_CODE_RE, GovernedCredentialError
+from ..utils.internal_run_auth import is_run_token_bearer
 from ..exceptions import AgentAccessDeniedError, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
@@ -105,14 +105,17 @@ class ApiDetailsRequestError(Exception):
     ...
 
 
-def _governed_refusal_code(response) -> Optional[str]:
-    """The reason code of a governed refusal (``{"code", "message"}``, #7229), or None for any other reply."""
+def _governed_refusal_code(client, response) -> Optional[str]:
+    """The reason code of a governed refusal (``{"code", "message"}``, #7229) of a run on its run token, or None for
+    any other reply or client (a legacy run keeps its editor-access error)."""
+    if not is_run_token_bearer(client):
+        return None
     try:
         body = response.json()
     except ValueError:
         return None
     code = body.get('code') if isinstance(body, dict) else None
-    return code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", code) else None
+    return code if isinstance(code, str) and REASON_CODE_RE.match(code) else None
 
 
 class AuthSessionExpiredError(Exception):
@@ -967,7 +970,7 @@ class EliteAClient:
         if resp.ok:
             return resp.json()
         if resp.status_code == 403:
-            governed = _governed_refusal_code(resp)
+            governed = _governed_refusal_code(self, resp)
             if governed:
                 # Main sealed this run's fetch and refused a credential nothing was decided for (#7229)
                 raise GovernedCredentialError(governed)

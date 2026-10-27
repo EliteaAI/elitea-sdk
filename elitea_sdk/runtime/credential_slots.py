@@ -58,6 +58,7 @@ REDACTED = "[REDACTED]"
 
 _MAX_SCAN_DEPTH = 6
 _CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+REASON_CODE_RE = _CODE_RE   # the reason-code grammar, for callers that read a code off a platform reply
 _FALLBACK_CODE = "DEPENDENCY_UNAVAILABLE"
 _DEFAULT_MESSAGE = "The governed credential could not be applied; the run was not started."
 _STORE_MESSAGE = "The credential store is unavailable; the run was not started. Try again later."
@@ -85,8 +86,8 @@ _MESSAGES: Dict[str, str] = {
     "DENIED_RBAC": "Permission to use this credential was denied; the run was not started.",
     "DENIED_BINDING": "This agent is no longer bound to the credential; the run was not started.",
     "DENIED_DEVELOPMENT_CHILD": (
-        "A sub-agent of this draft asked for a credential that was not checked for it when the draft started; "
-        "the run was not started."
+        "A sub-agent of this draft asked for a credential that was not checked for it when the draft started "
+        "(only the sub-agents the draft calls are checked, each on its own); the run was not started."
     ),
     "EPOCH_MISMATCH": "Access was revoked while the run was starting; the run was not started.",
     "MANDATE_INACTIVE": "The mandate for this run is not active; the run was not started.",

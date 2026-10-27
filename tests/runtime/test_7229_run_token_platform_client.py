@@ -50,6 +50,7 @@ class _Response:
 
 def _client(response):
     client = EliteAClient(base_url="http://pylon_main:8080", project_id=1, auth_token=RUN_TOKEN)
+    client.internal_run_auth = SimpleNamespace(token=RUN_TOKEN, origins=("http://pylon_main:8080",), identity="i")
     client._request = lambda *args, **kwargs: response  # pylint: disable=W0212
     return client
 
@@ -92,3 +93,27 @@ def test_a_sub_agent_that_fails_otherwise_is_still_skipped():
             "settings": {"application_id": 8, "application_version_id": 80}}
     with patch.object(tools_mod.ApplicationToolkit, "get_toolkit", side_effect=broken):
         assert get_tools([tool], elitea_client=_FakeClient()) == []
+
+
+def test_a_legacy_client_keeps_the_editor_access_error_for_any_403():
+    client = EliteAClient(base_url="http://pylon_main:8080", project_id=1, auth_token="pat-value")
+    client._request = lambda *args, **kwargs: _Response(403, {"code": "DENIED_DEVELOPMENT_CHILD"})  # pylint: disable=W0212
+    with pytest.raises(AgentAccessDeniedError):
+        client.get_app_version_details(8, 80)
+
+
+def test_a_governed_refusal_inside_a_tool_call_is_a_signal_not_prose():
+    from elitea_sdk.runtime.middleware.tool_exception_handler import reraise_signal_exceptions
+    with pytest.raises(GovernedCredentialError):
+        reraise_signal_exceptions(GovernedCredentialError("DENIED_DEVELOPMENT_CHILD"))
+
+
+def test_a_governed_refusal_is_not_skipped_in_debug_mode_either():
+    def refused(client, application_id, application_version_id, **kwargs):
+        raise GovernedCredentialError("DENIED_DEVELOPMENT_CHILD")
+
+    tool = {"type": "application", "name": "child", "project_id": 1, "agent_type": "agent",
+            "settings": {"application_id": 8, "application_version_id": 80}}
+    with patch.object(tools_mod.ApplicationToolkit, "get_toolkit", side_effect=refused):
+        with pytest.raises(GovernedCredentialError):
+            get_tools([tool], elitea_client=_FakeClient(), debug_mode=True)

@@ -50,3 +50,10 @@ def internal_run_headers(client: Any, url: str, headers: Optional[Mapping[str, s
         return stripped, None   # the platform's own origin, another route: no credentials of the toolkit's own
     stripped["Authorization"] = f"Bearer {token}"
     return stripped, getattr(auth, "identity", None) or None
+
+
+def is_run_token_bearer(client: Any) -> bool:
+    """Is the client's own bearer the run token (#7229: a governed run whose only platform identity is that token)?"""
+    auth = getattr(client, "internal_run_auth", None) if client is not None else None
+    token = getattr(auth, "token", None)
+    return isinstance(token, str) and bool(token) and getattr(client, "auth_token", None) == token
