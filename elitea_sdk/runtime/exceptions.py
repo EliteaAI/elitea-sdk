@@ -175,3 +175,9 @@ def budget_exceeded_from(exc):
 
 class AgentAccessDeniedError(Exception):
     """Expanded agent details need editor access outside the platform; never skipped silently."""
+
+
+class SkillBodyUnavailable(Exception):
+    def __init__(self, message: str, denied: bool = False):
+        super().__init__(message)
+        self.denied = denied
