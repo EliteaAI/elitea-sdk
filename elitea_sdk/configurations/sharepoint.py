@@ -3,7 +3,9 @@ import requests
 import logging
 from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from .oauth_app_mode import OAUTH_APP_ID_FIELD, require_app_client
 
 log = logging.getLogger(__name__)
 
@@ -18,12 +20,20 @@ class SharepointConfiguration(BaseModel):
                         "required": True,
                         "subsections": [
                             {
-                                "name": "App-only",
-                                "fields": []
+                                "name": "Default app",
+                                "key_fields": ["oauth_app_id"],
+                                "fields": ["oauth_app_id"]
                             },
                             {
-                                "name": "Delegated",
-                                "fields": ["oauth_discovery_endpoint", "scopes", "auto_refresh_token"]
+                                "name": "Custom app",
+                                "key_fields": ["oauth_discovery_endpoint"],
+                                "fields": ["client_id", "client_secret", "oauth_discovery_endpoint", "scopes",
+                                           "auto_refresh_token"]
+                            },
+                            {
+                                "name": "App-only",
+                                "key_fields": ["client_id"],
+                                "fields": ["client_id", "client_secret"]
                             }
                         ]
                     }
@@ -36,8 +46,9 @@ class SharepointConfiguration(BaseModel):
         }
     )
     # Client credentials (shared by both app_auth and delegated flows)
-    client_id: str = Field(description="SharePoint Client ID")
-    client_secret: SecretStr = Field(description="SharePoint Client Secret")
+    oauth_app_id: Optional[str] = OAUTH_APP_ID_FIELD
+    client_id: Optional[str] = Field(default=None, description="SharePoint Client ID")
+    client_secret: Optional[SecretStr] = Field(default=None, description="SharePoint Client Secret")
     site_url: str = Field(description="SharePoint Site URL")
 
     # Additional fields for delegated/OAuth flows
@@ -54,6 +65,11 @@ class SharepointConfiguration(BaseModel):
         default=None, description="Refresh token of the signed-in user (set by Login)",
         json_schema_extra={"hidden": True},
     )
+
+    @model_validator(mode="after")
+    def _app_or_client(self):
+        require_app_client(self)
+        return self
 
     @field_validator("oauth_discovery_endpoint")
     @classmethod
@@ -162,6 +178,7 @@ class SharepointConfiguration(BaseModel):
         toolkit_name: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[SecretStr | str] = None,
+        oauth_app_id: Optional[str] = None,
     ) -> "McpAuthorizationRequired":
         """Build a ``McpAuthorizationRequired`` exception with the same rich metadata
         shape that the MCP OAuth flow produces, so upstream handlers can treat
@@ -267,6 +284,11 @@ class SharepointConfiguration(BaseModel):
                 provided_settings["mcp_client_secret"] = mask_secret(secret_value)
         if effective_scopes:
             provided_settings["scopes"] = effective_scopes
+        if oauth_app_id:
+            # Default app mode: the platform holds the secret; sign-in sends this reference instead
+            provided_settings["oauth_app_id"] = oauth_app_id
+            provided_settings["credential_type"] = "sharepoint"
+            provided_settings["has_mcp_client_secret"] = True
         if provided_settings:
             resource_metadata["provided_settings"] = provided_settings
         log.debug(f"SharePoint resource_metadata (keys): {sorted(resource_metadata.keys())}")
@@ -286,7 +308,7 @@ class SharepointConfiguration(BaseModel):
         return auth_error
 
     @staticmethod
-    def _call_graph_api(site_url: str, access_token: str, oauth_discovery_endpoint: Optional[str], scopes: Optional[List[str]] = None, configuration_uuid: Optional[str] = None) -> str | None:
+    def _call_graph_api(site_url: str, access_token: str, oauth_discovery_endpoint: Optional[str], scopes: Optional[List[str]] = None, configuration_uuid: Optional[str] = None, oauth_app_id: Optional[str] = None, client_id: Optional[str] = None) -> str | None:
         """Health-check an access token using the Microsoft Graph API.
 
         Used by both the delegated flow (Azure AD delegated tokens) and the
@@ -347,6 +369,8 @@ class SharepointConfiguration(BaseModel):
                     scopes=scopes,
                     status=401,
                     configuration_uuid=configuration_uuid,
+                    oauth_app_id=oauth_app_id,
+                    client_id=client_id,
                 )
             elif resp.status_code == 403:
                 return "Access forbidden - token lacks required Microsoft Graph permissions for this site"
@@ -430,6 +454,9 @@ class SharepointConfiguration(BaseModel):
 
         scopes = settings.get("scopes")
         configuration_uuid = settings.get("configuration_uuid")
+        oauth_app_id = settings.get("oauth_app_id")
+        # Default app mode: the client ID is public and needed for the sign-in URL
+        app_client_id = settings.get("client_id") if oauth_app_id else None
         auto_refresh_token = settings.get("auto_refresh_token", False)
         from ..runtime.utils.mcp_oauth import access_token_from_stored_login
         access_token = access_token_from_stored_login(settings)
@@ -444,11 +471,14 @@ class SharepointConfiguration(BaseModel):
                 scopes=scopes,
                 configuration_uuid=configuration_uuid,
                 auto_refresh_token=auto_refresh_token,
+                oauth_app_id=oauth_app_id,
+                client_id=app_client_id,
             )
 
         # Use Graph API for health-check — delegated tokens are Graph tokens
         return SharepointConfiguration._call_graph_api(
-            site_url, access_token, oauth_discovery_endpoint, scopes, configuration_uuid
+            site_url, access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
+            oauth_app_id=oauth_app_id, client_id=app_client_id,
         )
 
     @staticmethod

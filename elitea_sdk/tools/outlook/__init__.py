@@ -94,14 +94,10 @@ class OutlookToolkit(BaseToolkit):
 
         if kwargs.get('tokens') and outlook_config.get('oauth_discovery_endpoint'):
             logger.debug("Outlook configuration includes OAuth discovery endpoint")
-            oauth_endpoint = outlook_config['oauth_discovery_endpoint']
-            config_uuid = outlook_config.get('configuration_uuid')
 
-            token_data = None
-            if config_uuid:
-                token_data = kwargs['tokens'].get(f"{config_uuid}:{oauth_endpoint}")
-            if token_data is None:
-                token_data = kwargs['tokens'].get(oauth_endpoint)
+            # Only a token issued to this credential's client (it may have moved to an admin app)
+            from ...configurations.oauth_app_mode import token_for_credential
+            token_data = token_for_credential(kwargs['tokens'], outlook_config)
 
             if token_data:
                 if isinstance(token_data, dict):
@@ -127,7 +123,9 @@ class OutlookToolkit(BaseToolkit):
                 toolkit_id=toolkit_id,
                 toolkit_name=toolkit_name,
                 client_id=outlook_config.get('client_id'),
-                client_secret=outlook_config.get('client_secret'),
+                # An admin-managed app's secret stays server-side: not even a masked copy
+                client_secret=None if outlook_config.get('oauth_app_id') else outlook_config.get('client_secret'),
+                oauth_app_id=outlook_config.get('oauth_app_id'),
             )
 
         wrapper = OutlookApiWrapper(**wrapper_payload)
