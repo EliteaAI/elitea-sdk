@@ -49,6 +49,7 @@ from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, bud
 from ..tool_outcome import outcome_sink
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
+from ..utils.failure_signals import describe_llm_error
 
 _STANDARD_CONTENT_TYPES = {"text", "image", "image_url", "document", "search_result"}
 
@@ -226,6 +227,15 @@ JSON_INSTRUCTION_TEMPLATE = (
         "3. Use proper JSON syntax with double quotes for strings\n"
         "4. Do not wrap the JSON in code blocks or backticks"
     )
+
+
+def _llm_idle_timeout(client):
+    # ChatAnthropic names it default_request_timeout, ChatOpenAI request_timeout.
+    for attr in ("default_request_timeout", "request_timeout", "timeout"):
+        value = getattr(client, attr, None)
+        if isinstance(value, (int, float)):
+            return value
+    return None
 
 class LLMNode(BaseTool):
     """Enhanced LLM node with chat history and tool binding support"""
@@ -1332,7 +1342,7 @@ class LLMNode(BaseTool):
             logger.error(f"Error in LLM Node: {format_exc()}")
             logger.error(f"Model being used: {model_info}")
             logger.error(f"Error type: {type(e).__name__}")
-            _error_msg = AIMessage(content=f"Error: {e}")
+            _error_msg = AIMessage(content=f"Error: {describe_llm_error(e, _llm_idle_timeout(self.client))}")
             _error_msg.response_metadata['llm_node_error'] = True
             _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
             result = {"messages": [_error_msg]}
@@ -3170,6 +3180,7 @@ class LLMNode(BaseTool):
                         logger.debug(f"Exception in async thread: {e}")
                         exception_container.append(e)
                     finally:
+                        new_loop.run_until_complete(new_loop.shutdown_asyncgens())
                         new_loop.close()
                         asyncio.set_event_loop(None)
                 parent_ctx.run(_inner)
@@ -3237,6 +3248,7 @@ class LLMNode(BaseTool):
                             logger.debug(f"Exception in async thread: {ex}")
                             exception_container.append(ex)
                         finally:
+                            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
                             new_loop.close()
                             asyncio.set_event_loop(None)
                     parent_ctx.run(_inner)
@@ -4923,7 +4935,7 @@ class LLMNode(BaseTool):
                 else:
                     logger.error(f"Error in LLM call during iteration {iteration}: {e}")
                     # Add error message and break the loop
-                    error_msg = f"Error processing tool results in iteration {iteration}: {str(e)}"
+                    error_msg = f"Error processing tool results in iteration {iteration}: {describe_llm_error(e, _llm_idle_timeout(self.client))}"
                     _tagged = AIMessage(content=error_msg)
                     _tagged.response_metadata['llm_node_error'] = True
                     _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__

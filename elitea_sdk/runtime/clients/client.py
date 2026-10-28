@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 MODEL_PROJECT_HEADER = "X-Elitea-Model-Project-Id"
 
 THINKING_BUDGET_TOKENS = {"low": 2048, "medium": 4096, "high": 9092}
+# Per-read httpx timeout: caps the gap between stream chunks, not total duration.
+LLM_STREAM_IDLE_TIMEOUT = 300
 # Name tokens that predate the stored thinking_type field; consulted only while a
 # model row still has that field null (#6819). Delete once every row carries it.
 ADAPTIVE_ONLY_NAME_TOKENS = ("opus-4-7", "opus_4_7", "opus-4.7",
@@ -1032,6 +1034,7 @@ class EliteAClient:
                 "max_tokens": llm_max_tokens,  # Always an integer now
                 "temperature": model_config.get("temperature"),
                 "max_retries": model_config.get("max_retries", 3),
+                "timeout": model_config.get("stream_idle_timeout", LLM_STREAM_IDLE_TIMEOUT),
                 "default_headers": {
                     "openai-organization": str(self.project_id),
                     **({"Authorization": f"Bearer {self.auth_token}"} if getattr(self, 'auth_token', None) else {}),
@@ -1083,6 +1086,7 @@ class EliteAClient:
                 "stream_usage": model_config.get("stream_usage", True),
                 "temperature": model_config.get("temperature"),
                 "max_retries": model_config.get("max_retries", 3),
+                "timeout": model_config.get("stream_idle_timeout", LLM_STREAM_IDLE_TIMEOUT),
                 "seed": model_config.get("seed", None),
                 "openai_organization": str(self.project_id),
             }

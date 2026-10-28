@@ -77,3 +77,23 @@ def log_shadow_failure(logger, **fields) -> None:
     # False once the site enforces the signal by raising instead of returning it (#6401).
     payload["delivered_as_success"] = bool(fields.get("delivered_as_success", True))
     logger.warning("TOOL_FAILURE_SHADOW %s", json.dumps(payload))
+
+
+# Per-read stream timeouts; matched by name so httpx/openai/anthropic need not be importable here.
+_STREAM_STALL_NAMES = frozenset({"ReadTimeout", "APITimeoutError"})
+# Raised when a proxy or upstream closes the connection mid-stream (e.g. its own idle limit).
+_STREAM_CUT_NAMES = frozenset({"RemoteProtocolError", "IncompleteRead", "ChunkedEncodingError"})
+
+
+def describe_llm_error(error: BaseException, idle_timeout: Any = None) -> str:
+    """Readable text for an LLM call failure; a bare per-read timeout only says 'timed out'."""
+    names = {cls.__name__ for cls in type(error).__mro__}
+    cause = error.__cause__ or error.__context__
+    if cause is not None:
+        names |= {cls.__name__ for cls in type(cause).__mro__}
+    if names & _STREAM_STALL_NAMES:
+        secs = f" for {idle_timeout:g}s" if isinstance(idle_timeout, (int, float)) else ""
+        return f"LLM stream stalled: no data received{secs}. The model provider stopped responding; please retry."
+    if names & _STREAM_CUT_NAMES:
+        return "LLM stream interrupted: the connection closed before the response finished; please retry."
+    return str(error)
