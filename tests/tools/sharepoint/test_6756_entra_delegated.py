@@ -63,12 +63,12 @@ def test_nothing_but_the_released_token_is_used():
     with patch("elitea_sdk.tools.sharepoint.SharepointApiWrapper") as wrapper_cls:
         wrapper_cls.return_value = MagicMock(site_url=SITE_URL, get_available_tools=MagicMock(return_value=[]))
         build(delegated(client_id="stray-id", client_secret="stray-secret", refresh_token="stray-refresh",
-                        oauth_discovery_endpoint="https://login.microsoftonline.com/t"),
+                        oauth_app_id="stray-app", oauth_discovery_endpoint="https://login.microsoftonline.com/t"),
               tokens={"cfg-1:https://login.microsoftonline.com/t": {"access_token": "browser-token"}})
     payload = wrapper_cls.call_args.kwargs
     assert payload["token"] == RELEASED and payload["scopes"] == ["https://graph.microsoft.com/.default"]
-    for key in ("client_id", "client_secret", "refresh_token", "oauth_token_endpoint", "oauth_discovery_endpoint",
-                "tokens", "access_token", "auth_mode"):
+    for key in ("client_id", "client_secret", "refresh_token", "oauth_app_id", "oauth_token_endpoint",
+                "oauth_discovery_endpoint", "tokens", "access_token", "auth_mode"):
         assert key not in payload
 
 
