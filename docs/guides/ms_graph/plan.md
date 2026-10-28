@@ -1,6 +1,6 @@
 # ms_graph toolkit — requirements and implementation plan
 
-Version: 2026-10-28 · Status: draft for review · Builds on OAuth Apps (#7149, `docs/guides/oauth_apps/`)
+Version: 2026-10-28 · Status: implemented (branches `feat/ms-graph-toolkit`), see section 5 · Builds on OAuth Apps (#7149, `docs/guides/oauth_apps/`)
 
 ## 1. Requirements (after the interview)
 
@@ -24,8 +24,8 @@ Version: 2026-10-28 · Status: draft for review · Builds on OAuth Apps (#7149, 
 | # | Assumption |
 |---|---|
 | A1 | Scopes are Graph delegated permissions. Bare names (`Mail.Read`) are sent as is; values with the `https://graph.microsoft.com/` prefix are accepted; other resources (`*.sharepoint.com`, `.default` of another API) are rejected — the token is Graph-only. `.default` of Graph is allowed as a literal scope. |
-| A2 | Changing scopes does not invalidate the cached sign-in. A 403 returns a hint: "add `<scope>` and sign in again" (same as Teams). Token key stays `<credential uuid>:<endpoint>`. |
-| A3 | Path rules are not a security boundary for the token (Graph scopes are), they constrain the LLM. They are enforced in the SDK only. |
+| A2 | **Decided:** same as Teams / Outlook / SharePoint. Token key stays `<credential uuid>:<endpoint>`; the stored-login cache is keyed by a fingerprint that includes the scopes, so changed scopes refresh with the new scopes; a 403 tells the user to add the permission and sign in again. |
+| A3 | (confirmed by design) Path rules are not a security boundary for the token (Graph scopes are), they constrain the LLM. They are enforced in the SDK only. |
 | A4 | `$batch` itself is exempt from the method rule; each sub-request is checked, so a batch of GETs works with the `[GET]` default. Read-style `POST` endpoints (`/search/query`) need `POST` in allowed methods (can be narrowed with `allowed_paths`). |
 | A5 | Large-file upload sessions (`createUploadSession`, chunked) are out of v1; simple upload up to a configurable limit (default 25 MB). |
 
@@ -67,6 +67,8 @@ models.py         args schemas
 | `denied_paths` | `[]` | prefixes; deny wins |
 | `max_response_chars` | 20000 | JSON/text truncated with a note |
 | `max_upload_mb` / `max_download_mb` | 25 / 50 | |
+
+Path rules are lists of prefixes (decided); `*` matches one segment.
 | `selected_tools` | all | `graph_request`, `graph_batch` |
 
 **Path matching** (`rules.py`): normalise the path (drop scheme/host, drop `/v1.0` or `/beta`, drop query, collapse `//`, lowercase, percent-decode once, reject `..`). A rule matches when it is a segment-prefix of the path (`/me/messages` matches `/me/messages/123`, not `/me/messagesX`); `*` matches one segment (`/users/*/messages`). Order: method check → deny → allow. Errors name the rule: "DELETE is not allowed by this toolkit (allowed: GET)".
@@ -137,3 +139,33 @@ Result: `{status, headers: <selected: content-type, location, request-id, retry-
 | Huge responses blow up context | `max_response_chars`, `$select` hint, binary to artifact |
 | Rules bypass via path tricks (`%2F`, `..`, case) | Normalisation tests (step 2) |
 | #7149 changes under review | Stacked branches; rebase after #7149 merges |
+
+## 5. Implementation (2026-10-28)
+
+Decisions added during implementation:
+
+| # | Decision |
+|---|---|
+| D1 | `ms_graph` is **opt-in per app**: apps saved without `credential_types` (the seeded Elitea app included) keep serving Teams, Outlook and SharePoint only, and new apps start with Microsoft Graph off. Provider fields `default_credential_types` and `free_scope_types` in `configurations/models/pd/oauth_app.py`. |
+| D2 | Admin `ms_graph` scopes are free text, validated server-side with the same Graph-only rule as the SDK (`normalize_graph_scopes`). |
+| D3 | `graph_request` refuses `/$batch`, so batch sub-requests can never skip the rules. |
+| D4 | `@odata.nextLink` is followed unchanged (keeps `$skiptoken`), only when it is a Graph URL that passes the rules. |
+| D5 | Redirects are followed by hand: to Graph with the token, elsewhere (pre-authenticated download URLs) without it and without the caller's headers. |
+
+| Repo | Changes |
+|---|---|
+| elitea-sdk | `configurations/ms_graph.py`; `tools/ms_graph/` (`__init__`, `api_wrapper`, `graph_client`, `rules`, `models`); registration; 53 unit tests in `tests/tools/ms_graph/` |
+| configurations | provider registry (`ms_graph`, opt-in, free scopes), `admin_view` returns the effective credential types; 5 unit tests |
+| elitea_core | `ms_graph_configuration` in the OAuth proxy keys and the stored-login keys; tests |
+| admin_ui | Microsoft Graph scope group (free text, opt-in), list column default |
+| EliteaUI | `ms_graph` in OAuth app types and stored-login toolkits, icon; tests |
+
+Verified locally: toolkit and credential schemas served; admin create rejects non-Graph scopes and normalises
+the rest; user app list for `ms_graph` returns only apps with Microsoft Graph switched on, other types are
+unaffected; a Default-app credential stores only the app reference and reads back the admin's client ID,
+authority and scopes; check connection asks to sign in with `oauth_app_id` + `credential_type=ms_graph` and
+no secret; the OAuth proxy accepts the app for `ms_graph` and refuses it for `teams`; inside the indexer
+the toolkit loads and refuses a denied path and a non-allowed method.
+
+Not verified: a real Microsoft sign-in and live Graph calls (needs a tenant app with Microsoft Graph switched
+on); the admin dialog and credential form in a browser (Playwright was busy).
