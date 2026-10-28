@@ -94,14 +94,10 @@ class TeamsToolkit(BaseToolkit):
 
         if kwargs.get('tokens') and teams_config.get('oauth_discovery_endpoint'):
             logger.debug("Teams configuration includes OAuth discovery endpoint")
-            oauth_endpoint = teams_config['oauth_discovery_endpoint']
-            config_uuid = teams_config.get('configuration_uuid')
 
-            token_data = None
-            if config_uuid:
-                token_data = kwargs['tokens'].get(f"{config_uuid}:{oauth_endpoint}")
-            if token_data is None:
-                token_data = kwargs['tokens'].get(oauth_endpoint)
+            # Only a token issued to this credential's client (it may have moved to an admin app)
+            from ...configurations.oauth_app_mode import token_for_credential
+            token_data = token_for_credential(kwargs['tokens'], teams_config)
 
             if token_data:
                 if isinstance(token_data, dict):
@@ -127,7 +123,9 @@ class TeamsToolkit(BaseToolkit):
                 toolkit_id=toolkit_id,
                 toolkit_name=toolkit_name,
                 client_id=teams_config.get('client_id'),
-                client_secret=teams_config.get('client_secret'),
+                # An admin-managed app's secret stays server-side: not even a masked copy
+                client_secret=None if teams_config.get('oauth_app_id') else teams_config.get('client_secret'),
+                oauth_app_id=teams_config.get('oauth_app_id'),
             )
 
         wrapper = TeamsApiWrapper(**wrapper_payload)

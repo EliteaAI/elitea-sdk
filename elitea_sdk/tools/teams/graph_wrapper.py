@@ -392,7 +392,7 @@ class TeamsGraphWrapper:
             log.warning("Teams: token refresh failed with HTTP %s", resp.status_code)
             return False
         except Exception as e:
-            log.warning("Teams: token refresh error: %s", e)
+            log.warning("Teams: token refresh error: %s", type(e).__name__)  # never the request (secret, token)
             return False
 
     @staticmethod

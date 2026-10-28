@@ -1,9 +1,10 @@
 import requests
 import logging
 from typing import Optional, List, Dict
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
+from .oauth_app_mode import OAUTH_APP_ID_FIELD, require_app_client
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +38,15 @@ class TeamsConfiguration(BaseModel):
                         "required": True,
                         "subsections": [
                             {
-                                "name": "Delegated",
-                                "fields": ["oauth_discovery_endpoint", "scopes", "auto_refresh_token"]
+                                "name": "Default app",
+                                "key_fields": ["oauth_app_id"],
+                                "fields": ["oauth_app_id"]
+                            },
+                            {
+                                "name": "Custom app",
+                                "key_fields": ["client_id"],
+                                "fields": ["client_id", "client_secret", "oauth_discovery_endpoint", "scopes",
+                                           "auto_refresh_token"]
                             }
                         ]
                     }
@@ -51,8 +59,9 @@ class TeamsConfiguration(BaseModel):
         }
     )
 
-    client_id: str = Field(description="Azure AD Application (client) ID")
-    client_secret: SecretStr = Field(description="Azure AD Client Secret")
+    oauth_app_id: Optional[str] = OAUTH_APP_ID_FIELD
+    client_id: Optional[str] = Field(default=None, description="Azure AD Application (client) ID")
+    client_secret: Optional[SecretStr] = Field(default=None, description="Azure AD Client Secret")
 
     oauth_discovery_endpoint: Optional[str] = Field(
         default=None,
@@ -81,6 +90,11 @@ class TeamsConfiguration(BaseModel):
         if value and not is_entra_url(value):
             raise ValueError("Must be https://login.microsoftonline.com/<tenant_id>")
         return value
+
+    @model_validator(mode="after")
+    def _app_or_client(self):
+        require_app_client(self)
+        return self
 
     @field_validator("scopes", mode="before")
     @classmethod
@@ -117,6 +131,9 @@ class TeamsConfiguration(BaseModel):
         """Delegated flow - verify access token via Graph API."""
         scopes = settings.get("scopes")
         configuration_uuid = settings.get("configuration_uuid")
+        oauth_app_id = settings.get("oauth_app_id")
+        # Default app mode: the client ID is public and needed for the sign-in URL
+        app_client_id = settings.get("client_id") if oauth_app_id else None
         from ..runtime.utils.mcp_oauth import access_token_from_stored_login
         access_token = access_token_from_stored_login(settings)
 
@@ -126,10 +143,13 @@ class TeamsConfiguration(BaseModel):
                 oauth_discovery_endpoint=oauth_discovery_endpoint,
                 scopes=scopes,
                 configuration_uuid=configuration_uuid,
+                oauth_app_id=oauth_app_id,
+                client_id=app_client_id,
             )
 
         return TeamsConfiguration._call_graph_api(
-            access_token, oauth_discovery_endpoint, scopes, configuration_uuid
+            access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
+            oauth_app_id=oauth_app_id, client_id=app_client_id,
         )
 
     @staticmethod
@@ -137,7 +157,9 @@ class TeamsConfiguration(BaseModel):
         access_token: str,
         oauth_discovery_endpoint: str,
         scopes: Optional[List[str]] = None,
-        configuration_uuid: Optional[str] = None
+        configuration_uuid: Optional[str] = None,
+        oauth_app_id: Optional[str] = None,
+        client_id: Optional[str] = None,
     ) -> str | None:
         """Health-check access token using Microsoft Graph Teams API."""
         try:
@@ -158,6 +180,8 @@ class TeamsConfiguration(BaseModel):
                     scopes=scopes,
                     status=401,
                     configuration_uuid=configuration_uuid,
+                    oauth_app_id=oauth_app_id,
+                    client_id=client_id,
                 )
             elif resp.status_code == 403:
                 return (
@@ -203,6 +227,7 @@ class TeamsConfiguration(BaseModel):
         toolkit_name: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[SecretStr | str] = None,
+        oauth_app_id: Optional[str] = None,
     ) -> "McpAuthorizationRequired":
         """Build McpAuthorizationRequired exception for OAuth flow."""
         from ..runtime.utils.mcp_oauth import (
@@ -289,6 +314,11 @@ class TeamsConfiguration(BaseModel):
                 provided_settings["mcp_client_secret"] = mask_secret(secret_value)
         if effective_scopes:
             provided_settings["scopes"] = effective_scopes
+        if oauth_app_id:
+            # Default app mode: the platform holds the secret; sign-in sends this reference instead
+            provided_settings["oauth_app_id"] = oauth_app_id
+            provided_settings["credential_type"] = "teams"
+            provided_settings["has_mcp_client_secret"] = True
         if provided_settings:
             resource_metadata["provided_settings"] = provided_settings
 

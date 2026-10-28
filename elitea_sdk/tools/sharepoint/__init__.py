@@ -25,7 +25,7 @@ SITE_PATH_ERROR = (
 
 
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
-_NOT_FOR_DELEGATED = ('client_id', 'client_secret', 'refresh_token', 'oauth_token_endpoint', 'oauth_discovery_endpoint',
+_NOT_FOR_DELEGATED = ('oauth_app_id', 'client_id', 'client_secret', 'refresh_token', 'oauth_token_endpoint', 'oauth_discovery_endpoint',
                       'tokens', 'access_token', 'auth_mode')
 
 
@@ -150,19 +150,13 @@ class SharepointToolkit(BaseToolkit):
             wrapper_payload = _delegated_payload(wrapper_payload, sp_config)
         elif kwargs.get('tokens') and sp_config.get('oauth_discovery_endpoint'):
             logger.debug(f"Sharepoint configuration includes OAuth discovery endpoint and tokens are provided. Attempting to retrieve access token.")
-            oauth_endpoint = sp_config['oauth_discovery_endpoint']
-            config_uuid = sp_config.get('configuration_uuid')
             # Try credential-specific key first ("<configuration_uuid>:<oauth_discovery_endpoint>").
             # The frontend stores tokens under this composite key so that two SharePoint
             # credentials sharing the same oauth_discovery_endpoint (same Azure AD tenant)
-            # keep their OAuth sessions isolated.
-            token = None
-            if config_uuid:
-                token = kwargs['tokens'].get(f"{config_uuid}:{oauth_endpoint}")
-            # Fallback to plain oauth_discovery_endpoint for backwards compatibility
-            # (legacy sessions or toolkit-level flows that don't use credential UUIDs).
-            if token is None:
-                token = kwargs['tokens'].get(oauth_endpoint)
+            # keep their OAuth sessions isolated; then the plain endpoint (legacy sessions).
+            # Only a token issued to this credential's client counts: it may have moved to an admin app (#7149)
+            from ...configurations.oauth_app_mode import token_for_credential
+            token = token_for_credential(kwargs['tokens'], sp_config)
             # Fallback to site_url key: the frontend may store the token under the
             # SharePoint site URL when tokenStorageKey is not explicitly overridden
             # (e.g. when the auth modal opens without a pre-configured storage key).
@@ -206,7 +200,9 @@ class SharepointToolkit(BaseToolkit):
                 toolkit_id=toolkit_id,
                 toolkit_name=toolkit_name,
                 client_id=sp_config.get('client_id'),
-                client_secret=sp_config.get('client_secret'),
+                # An admin-managed app's secret stays server-side: not even a masked copy
+                client_secret=None if sp_config.get('oauth_app_id') else sp_config.get('client_secret'),
+                oauth_app_id=sp_config.get('oauth_app_id'),
             )
             raise exc
 
