@@ -78,8 +78,22 @@ def test_without_a_released_token_the_toolkit_refuses_and_never_falls_back(token
         with pytest.raises(ToolException) as refused:
             build(delegated(access_token=token, client_id="id", oauth_discovery_endpoint="https://login.microsoftonline.com/t"),
                   tokens={"cfg-1:https://login.microsoftonline.com/t": {"access_token": "browser-token"}})
-    assert "DENIED_DELEGATION_UNSUPPORTED_CALLER" in str(refused.value)
+    # coded (GovernedCredentialError), so the worker ends the run with the readable refusal card, not a trace
+    assert type(refused.value).__name__ == "GovernedCredentialError"
+    assert refused.value.reason_code == "DENIED_DELEGATION_UNSUPPORTED_CALLER"
+    assert "Microsoft sign-in" in str(refused.value) and "DENIED_" not in str(refused.value)
     wrapper_cls.assert_not_called()
+
+
+@pytest.mark.parametrize("code", [
+    "DENIED_SUBJECT_MISMATCH", "DENIED_MANDATE_DELEGATION_UNSUPPORTED", "DENIED_DELEGATION_UNSUPPORTED_CALLER",
+    "DENIED_ASSERTION_UNAVAILABLE", "DENIED_ASSERTION_SOURCE_UNSUPPORTED", "DENIED_OAUTH_APP_UNAVAILABLE",
+    "DELEGATION_EXCHANGE_FAILED",
+])
+def test_each_delegated_refusal_code_has_its_own_readable_text(code):
+    from elitea_sdk.runtime.credential_slots import GovernedCredentialError, _DEFAULT_MESSAGE
+    refused = GovernedCredentialError(code)
+    assert refused.reason_code == code and str(refused) != _DEFAULT_MESSAGE and "_" not in str(refused)
 
 
 def test_the_other_modes_are_unchanged():

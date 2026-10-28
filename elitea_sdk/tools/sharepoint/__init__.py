@@ -9,7 +9,8 @@ from .api_wrapper import SharepointApiWrapper
 from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
 from ...configurations.pgvector import PgVectorConfiguration
-from ...configurations.sharepoint import DELEGATION_UNSUPPORTED, ENTRA_DELEGATED, SharepointConfiguration
+from ...configurations.sharepoint import DELEGATION_UNSUPPORTED_CALLER, ENTRA_DELEGATED, SharepointConfiguration
+from ...runtime.credential_slots import GovernedCredentialError
 from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 from ...runtime.utils.mcp_oauth import entra_token_endpoint
@@ -36,7 +37,8 @@ def _delegated_payload(wrapper_payload: dict, sp_config: dict) -> dict:
     token = sp_config.get('access_token')
     token = token.get_secret_value() if hasattr(token, 'get_secret_value') else token
     if not isinstance(token, str) or not token:
-        raise ToolException(DELEGATION_UNSUPPORTED)
+        # coded, so the run ends with the readable refusal card instead of a generic failure
+        raise GovernedCredentialError(DELEGATION_UNSUPPORTED_CALLER)
     payload = {key: value for key, value in wrapper_payload.items() if key not in _NOT_FOR_DELEGATED}
     payload.update(token=token, scopes=[GRAPH_DEFAULT_SCOPE])
     return payload

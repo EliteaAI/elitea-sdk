@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 # A credential that acts with the signed-in person's Microsoft sign-in (C-1009 #6756): it holds no secret; the platform
 # mints a Graph token on the person's behalf when a governed run starts and puts it in ``access_token``
 ENTRA_DELEGATED = "entra_delegated"
+DELEGATION_UNSUPPORTED_CALLER = "DENIED_DELEGATION_UNSUPPORTED_CALLER"
 DELEGATION_UNSUPPORTED = (
     "DENIED_DELEGATION_UNSUPPORTED_CALLER: this SharePoint credential acts with your Microsoft sign-in, which only "
     "works in runs you start yourself from Elitea."

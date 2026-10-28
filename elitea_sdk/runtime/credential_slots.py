@@ -103,6 +103,32 @@ _MESSAGES: Dict[str, str] = {
     "DEPENDENCY_UNAVAILABLE": (
         "A required platform service is unavailable; the run was not started. Try again later."
     ),
+    # credentials that act with the person's Microsoft sign-in (#6756 step 4); the platform's texts
+    "DENIED_SUBJECT_MISMATCH": (
+        "This Microsoft credential belongs to another identity than the person running the agent; the run was not "
+        "started."
+    ),
+    "DENIED_MANDATE_DELEGATION_UNSUPPORTED": (
+        "Scheduled and webhook runs cannot act with a person's Microsoft sign-in yet; the run was not started."
+    ),
+    "DENIED_DELEGATION_UNSUPPORTED_CALLER": (
+        "This credential acts with your Microsoft sign-in, which only works in runs you start yourself from Elitea; "
+        "the run was not started."
+    ),
+    "DENIED_ASSERTION_UNAVAILABLE": (
+        "Your Microsoft sign-in is not available to this run. Sign in with Microsoft again, then retry."
+    ),
+    "DENIED_ASSERTION_SOURCE_UNSUPPORTED": (
+        "You signed in through your organisation's login page; acting with your Microsoft account needs a connected "
+        "Microsoft account, which is not available yet. The run was not started."
+    ),
+    "DENIED_OAUTH_APP_UNAVAILABLE": (
+        "The Microsoft app this credential uses is not available; ask an administrator. The run was not started."
+    ),
+    "DELEGATION_EXCHANGE_FAILED": (
+        "Microsoft refused to issue a token for this credential (consent or site access missing); ask an "
+        "administrator. The run was not started."
+    ),
     "STORE_DENIED": _STORE_MESSAGE,
     "STORE_SEALED": _STORE_MESSAGE,
     "STORE_UNAVAILABLE": _STORE_MESSAGE,
