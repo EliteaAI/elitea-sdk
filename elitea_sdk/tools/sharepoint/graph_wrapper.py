@@ -205,7 +205,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             logging.warning("SharePoint: token refresh failed with HTTP status %s", resp.status_code)
             return False
         except Exception as e:
-            logging.warning("SharePoint: token refresh error: %s", e)
+            logging.warning("SharePoint: token refresh error: %s", type(e).__name__)  # never the request (secret, token)
             return False
 
     def _get(self, url: str, params: Optional[dict] = None) -> dict:

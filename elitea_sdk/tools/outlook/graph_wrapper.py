@@ -413,7 +413,7 @@ class OutlookGraphWrapper:
             log.warning("Outlook: token refresh failed with HTTP %s", resp.status_code)
             return False
         except Exception as e:
-            log.warning("Outlook: token refresh error: %s", e)
+            log.warning("Outlook: token refresh error: %s", type(e).__name__)  # never the request (secret, token)
             return False
 
     def _get(self, url: str, params: Optional[dict] = None, prefer: Optional[str] = None) -> dict:
