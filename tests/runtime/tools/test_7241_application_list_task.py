@@ -53,3 +53,39 @@ def test_string_and_missing_task_untouched():
     assert _coerce_task_to_str(payload) is payload
     payload = {'x': 1}
     assert _coerce_task_to_str(payload) is payload
+
+
+@pytest.mark.parametrize('value, expected', [(5, '5'), (1.5, '1.5'), (True, 'true'), ({'a': [1, 2]}, '{"a": [1, 2]}')])
+def test_scalar_and_nested_tasks_are_serialized(value, expected):
+    child = StaticApplication()
+    _app(child).invoke({'task': value})
+    assert child.calls[0]['input'] == expected
+
+
+def test_none_task_still_fails_schema_validation_as_before():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        _app(StaticApplication()).invoke({'task': None})
+
+
+def test_caller_input_is_not_mutated():
+    payload = {'task': ['a']}
+    _app(StaticApplication()).invoke(payload)
+    assert payload == {'task': ['a']}
+
+
+def test_non_task_variables_pass_through_unchanged():
+    """Only task is coerced; extra state variables reach the child with their type."""
+    child = StaticApplication()
+    _app(child).invoke({'task': 'go', 'items': [1, 2], 'cfg': {'k': 1}})
+    assert child.calls[0]['input'] == 'go'
+    assert child.calls[0]['items'] == [1, 2]
+    assert child.calls[0]['cfg'] == {'k': 1}
+
+
+def test_tool_call_format_list_task():
+    """Orchestrator-LLM path: ToolCall dict whose args.task is a list."""
+    child = StaticApplication()
+    result = _app(child).invoke({'type': 'tool_call', 'id': 'c1', 'name': 'Yoda', 'args': {'task': ['x']}})
+    assert child.calls[0]['input'] == '["x"]'
+    assert result.tool_call_id == 'c1'
