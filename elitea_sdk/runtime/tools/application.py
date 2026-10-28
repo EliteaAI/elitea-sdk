@@ -23,6 +23,28 @@ applicationToolSchema = create_model(
 )
 
 
+def _coerce_task_to_str(input: Any) -> Any:
+    """Serialize a non-string ``task`` so it passes the ``task: str`` schema.
+
+    An Agent node's Task field can be mapped to a pipeline variable of any type
+    (#7241); a list/dict reaches the tool as-is and fails pydantic validation.
+    """
+    if not isinstance(input, dict):
+        return input
+    task = input.get('task')
+    if task is None or isinstance(task, str):
+        return input
+    if isinstance(task, (list, dict)) and not task:
+        # Empty container == unset task: fall through to formulate_query's
+        # "Task is required" error, same as an empty string variable.
+        return {**input, 'task': ''}
+    try:
+        serialized = json.dumps(task, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        serialized = str(task)
+    return {**input, 'task': serialized}
+
+
 def formulate_query(kwargs, is_subgraph=False):
     """
     Formulate input for nested application invocation.
@@ -223,6 +245,7 @@ class Application(BaseTool):
         was_tool_call_format = tool_call_id is not None
         if was_tool_call_format and not tool_call_id:
             tool_call_id = f"synth_{uuid4().hex[:24]}"
+        input = _coerce_task_to_str(input)
         schema_values = self.args_schema(**input).model_dump() if self.args_schema else {}
         extras = {k: v for k, v in input.items() if k not in schema_values and k != 'chat_history'}
         all_kwargs = {**kwargs, **extras, **schema_values}
