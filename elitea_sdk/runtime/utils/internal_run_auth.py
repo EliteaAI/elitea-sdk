@@ -50,3 +50,40 @@ def internal_run_headers(client: Any, url: str, headers: Optional[Mapping[str, s
         return stripped, None   # the platform's own origin, another route: no credentials of the toolkit's own
     stripped["Authorization"] = f"Bearer {token}"
     return stripped, getattr(auth, "identity", None) or None
+
+
+def is_run_token_bearer(client: Any) -> bool:
+    """Is the client's own bearer the run token (#7229: a governed run whose only platform identity is that token)?"""
+    auth = getattr(client, "internal_run_auth", None) if client is not None else None
+    token = getattr(auth, "token", None)
+    return isinstance(token, str) and bool(token) and getattr(client, "auth_token", None) == token
+
+
+# The codes Main refuses a call on the run token with once the run is no longer live (#7229): ended, revoked, idle past
+# its window or past its cap. A route the run token may not use (``INTERNAL_TOKEN_INVALID``) is not among them: the run
+# itself is still live, so that error stays the caller's to handle.
+RUN_NOT_LIVE_CODES = ("CONTEXT_NOT_LIVE", "INTERNAL_TOKEN_EXPIRED")
+_RUN_TOKEN_REFUSAL = re.compile(r"\b(" + "|".join(RUN_NOT_LIVE_CODES) + r")\b")
+
+
+def run_token_refusal(exc: BaseException) -> Optional[str]:
+    """The code of a model or platform call Main refused because the run is no longer live, or None. Every later call of
+    the run is refused the same way, so it ends the run (the worker shows its readable card); it is never an answer for
+    the graph to carry on with."""
+    if getattr(exc, "status_code", None) not in (401, 403):
+        return None
+    found = _RUN_TOKEN_REFUSAL.search(f"{exc} {getattr(exc, 'body', '')}")
+    return found.group(1) if found else None
+
+
+def run_not_live_code(client: Any, response: Any) -> Optional[str]:
+    """The same for a platform reply to a client on its run token: the code when Main refused it because the run is no
+    longer live (401/403 ``{"error": code}``), else None (any other reply or client)."""
+    if getattr(response, "status_code", None) not in (401, 403) or not is_run_token_bearer(client):
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get("error") if isinstance(body, dict) else None
+    return code if code in RUN_NOT_LIVE_CODES else None

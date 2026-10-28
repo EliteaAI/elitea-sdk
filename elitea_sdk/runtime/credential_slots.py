@@ -58,6 +58,7 @@ REDACTED = "[REDACTED]"
 
 _MAX_SCAN_DEPTH = 6
 _CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+REASON_CODE_RE = _CODE_RE   # the reason-code grammar, for callers that read a code off a platform reply
 _FALLBACK_CODE = "DEPENDENCY_UNAVAILABLE"
 _DEFAULT_MESSAGE = "The governed credential could not be applied; the run was not started."
 _STORE_MESSAGE = "The credential store is unavailable; the run was not started. Try again later."
@@ -84,6 +85,17 @@ _MESSAGES: Dict[str, str] = {
     "DENIED_GRANT": "The credential grant is no longer in force; the run was not started.",
     "DENIED_RBAC": "Permission to use this credential was denied; the run was not started.",
     "DENIED_BINDING": "This agent is no longer bound to the credential; the run was not started.",
+    "PUBLIC_AGENT_NOT_ADMITTED": (
+        "Agents from another project (public agents) are not available to governed runs yet; the run was not started."
+    ),
+    "CONTEXT_NOT_LIVE": (
+        "This run is no longer admitted: it ended, was revoked or stayed idle too long. Please start it again."
+    ),
+    "INTERNAL_TOKEN_EXPIRED": "This run reached its time limit. Please start it again.",
+    "DENIED_DEVELOPMENT_CHILD": (
+        "A sub-agent of this draft asked for a credential that was not checked for it when the draft started "
+        "(only the sub-agents the draft calls are checked, each on its own); the run was not started."
+    ),
     "EPOCH_MISMATCH": "Access was revoked while the run was starting; the run was not started.",
     "MANDATE_INACTIVE": "The mandate for this run is not active; the run was not started.",
     "MANDATE_EXPIRED": "The mandate for this run has expired; the run was not started.",
@@ -107,10 +119,14 @@ class GovernedCredentialError(ToolException):
     name or a value, so it is safe to log, return to the UI and pickle across a task boundary.
     """
 
-    def __init__(self, reason_code: str):
+    def __init__(self, reason_code: str, subagent: Optional[str] = None):
         code = reason_code if isinstance(reason_code, str) and _CODE_RE.match(reason_code) else _FALLBACK_CODE
         self.reason_code = code
-        self.message = _MESSAGES.get(code, _DEFAULT_MESSAGE)
+        # the saved name of the sub-agent refused (#7229), printable and bounded; never an id or a value
+        name = "".join(ch for ch in subagent if ch.isprintable()).strip()[:80] if isinstance(subagent, str) else ""
+        self.subagent = name or None
+        base = _MESSAGES.get(code, _DEFAULT_MESSAGE)
+        self.message = f"{base} (sub-agent \u201c{self.subagent}\u201d)" if self.subagent else base
         super().__init__(self.message)
 
     @property
@@ -118,7 +134,7 @@ class GovernedCredentialError(ToolException):
         return self.reason_code
 
     def __reduce__(self):
-        return (type(self), (self.reason_code,))
+        return (type(self), (self.reason_code, self.subagent))
 
 
 class CredentialEnvelope:

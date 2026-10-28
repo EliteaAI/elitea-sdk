@@ -27,6 +27,8 @@ from ..middleware import (
 )
 from ..middleware.sensitive_tool_guard import normalize_auto_approve
 from ..utils.mcp_oauth import McpAuthorizationRequired
+from ..credential_slots import REASON_CODE_RE, GovernedCredentialError
+from ..utils.internal_run_auth import is_run_token_bearer, run_not_live_code
 from ..exceptions import AgentAccessDeniedError, SkillBodyUnavailable, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
@@ -107,6 +109,19 @@ class ApiDetailsRequestError(Exception):
         super().__init__(*args)
         self.status_code = status_code
         self.body = body
+
+
+def _governed_refusal_code(client, response) -> Optional[str]:
+    """The reason code of a governed refusal (``{"code", "message"}``, #7229) of a run on its run token, or None for
+    any other reply or client (a legacy run keeps its editor-access error)."""
+    if not is_run_token_bearer(client):
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get('code') if isinstance(body, dict) else None
+    return code if isinstance(code, str) and REASON_CODE_RE.match(code) else None
 
 
 class AuthSessionExpiredError(Exception):
@@ -597,8 +612,11 @@ class EliteAClient:
 
     def get_app_details(self, application_id: int, version_name: Optional[str] = None):
         url = f"{self.app}/{application_id}" if version_name is None else f"{self.app}/{application_id}/{version_name}"
-        data = self._request('get', url, headers=self.headers, verify=False).json()
-        return data
+        resp = self._request('get', url, headers=self.headers, verify=False)
+        not_live = run_not_live_code(self, resp)
+        if not_live:
+            raise GovernedCredentialError(not_live)   # the run ended, was revoked or went idle (#7229)
+        return resp.json()
 
 
     def get_public_app_details(self, application_id: int, version_name: str = None) -> dict:
@@ -631,6 +649,12 @@ class EliteAClient:
             logger.info(f"[PUBLIC_APP] Successfully fetched public app {application_id}: {data.get('name')}")
             return data
 
+        not_live = run_not_live_code(self, resp)
+        if not_live:
+            raise GovernedCredentialError(not_live)   # the run ended, was revoked or went idle (#7229)
+        if resp.status_code == 403 and is_run_token_bearer(self):
+            # a governed run's identity acts in its own project only (#7229): said as such, never a silent drop
+            raise GovernedCredentialError("PUBLIC_AGENT_NOT_ADMITTED")
         logger.error(f"[PUBLIC_APP] Failed to fetch public application: {resp.status_code} - {resp.text}. "
                     f"Application ID: {application_id}")
         raise ApiDetailsRequestError(
@@ -1294,7 +1318,14 @@ class EliteAClient:
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
+        not_live = run_not_live_code(self, resp)
+        if not_live:
+            raise GovernedCredentialError(not_live)   # the run ended, was revoked or went idle (#7229)
         if resp.status_code == 403:
+            governed = _governed_refusal_code(self, resp)
+            if governed:
+                # Main sealed this run's fetch and refused a credential nothing was decided for (#7229)
+                raise GovernedCredentialError(governed)
             # Expanded details carry credentials, so they need editor access; get_tools still skips sub-agents
             raise AgentAccessDeniedError(
                 f"Loading agent {application_id}/{application_version_id} requires editor access "
