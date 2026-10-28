@@ -9,7 +9,7 @@ from .api_wrapper import SharepointApiWrapper
 from ..base.tool import BaseAction
 from ..elitea_base import filter_missconfigured_index_tools
 from ...configurations.pgvector import PgVectorConfiguration
-from ...configurations.sharepoint import SharepointConfiguration
+from ...configurations.sharepoint import DELEGATION_UNSUPPORTED, ENTRA_DELEGATED, SharepointConfiguration
 from ..common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 from ...runtime.utils.mcp_oauth import entra_token_endpoint
@@ -22,6 +22,24 @@ SITE_PATH_ERROR = (
     "SharePoint site_path must be relative and start with 'sites/' or 'teams/', "
     "for example 'sites/my-site' or 'teams/my-team'."
 )
+
+
+GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
+_NOT_FOR_DELEGATED = ('client_id', 'client_secret', 'refresh_token', 'oauth_token_endpoint', 'oauth_discovery_endpoint',
+                      'tokens', 'access_token', 'auth_mode')
+
+
+def _delegated_payload(wrapper_payload: dict, sp_config: dict) -> dict:
+    """The wrapper of a credential that acts with the person's Microsoft sign-in (C-1009 #6756): the Graph token the
+    platform released for this run is the bearer, and nothing else is used — no browser token, no client credentials,
+    no refresh. Without a released token (an ungoverned run, an API caller) the toolkit refuses: it never falls back."""
+    token = sp_config.get('access_token')
+    token = token.get_secret_value() if hasattr(token, 'get_secret_value') else token
+    if not isinstance(token, str) or not token:
+        raise ToolException(DELEGATION_UNSUPPORTED)
+    payload = {key: value for key, value in wrapper_payload.items() if key not in _NOT_FOR_DELEGATED}
+    payload.update(token=token, scopes=[GRAPH_DEFAULT_SCOPE])
+    return payload
 
 
 def _resolve_sharepoint_site_url(sp_config: dict, site_path: Optional[str]) -> dict:
@@ -128,7 +146,9 @@ class SharepointToolkit(BaseToolkit):
 
         # handle OAuth flow: specific for Sharepoint (dependent on oauth_discovery_endpoint), can be extended to other tools in the future if needed
         logger.debug(f"[SP OAuth] tokens keys={list(kwargs.get('tokens', {}).keys())}, sp_config site_url={sp_config.get('site_url')}, oauth_endpoint={sp_config.get('oauth_discovery_endpoint')}, config_uuid={sp_config.get('configuration_uuid')}")
-        if kwargs.get('tokens') and sp_config.get('oauth_discovery_endpoint'):
+        if sp_config.get('auth_mode') == ENTRA_DELEGATED:   # C-1009 #6756: the bearer the platform released
+            wrapper_payload = _delegated_payload(wrapper_payload, sp_config)
+        elif kwargs.get('tokens') and sp_config.get('oauth_discovery_endpoint'):
             logger.debug(f"Sharepoint configuration includes OAuth discovery endpoint and tokens are provided. Attempting to retrieve access token.")
             oauth_endpoint = sp_config['oauth_discovery_endpoint']
             config_uuid = sp_config.get('configuration_uuid')
@@ -170,7 +190,8 @@ class SharepointToolkit(BaseToolkit):
         # Proactive OAuth guard: if delegated flow is configured but no token was resolved,
         # raise McpAuthorizationRequired immediately so Chat/agents surface a clean login
         # prompt instead of failing deep inside a tool call with a cryptic error.
-        if sp_config.get('oauth_discovery_endpoint') and not wrapper_payload.get('token'):
+        if sp_config.get('auth_mode') != ENTRA_DELEGATED and sp_config.get('oauth_discovery_endpoint') \
+                and not wrapper_payload.get('token'):
             logger.debug("SharePoint OAuth mode active but no token found — raising McpAuthorizationRequired.")
             exc = SharepointConfiguration._build_mcp_authorization_required(
                 message=(

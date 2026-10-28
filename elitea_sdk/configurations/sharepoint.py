@@ -3,9 +3,17 @@ import requests
 import logging
 from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 log = logging.getLogger(__name__)
+
+# A credential that acts with the signed-in person's Microsoft sign-in (C-1009 #6756): it holds no secret; the platform
+# mints a Graph token on the person's behalf when a governed run starts and puts it in ``access_token``
+ENTRA_DELEGATED = "entra_delegated"
+DELEGATION_UNSUPPORTED = (
+    "DENIED_DELEGATION_UNSUPPORTED_CALLER: this SharePoint credential acts with your Microsoft sign-in, which only "
+    "works in runs you start yourself from Elitea."
+)
 
 class SharepointConfiguration(BaseModel):
     model_config = ConfigDict(
@@ -35,9 +43,9 @@ class SharepointConfiguration(BaseModel):
             }
         }
     )
-    # Client credentials (shared by both app_auth and delegated flows)
-    client_id: str = Field(description="SharePoint Client ID")
-    client_secret: SecretStr = Field(description="SharePoint Client Secret")
+    # Client credentials (shared by both app_auth and delegated flows); required unless auth_mode is entra_delegated
+    client_id: Optional[str] = Field(default=None, description="SharePoint Client ID")
+    client_secret: Optional[SecretStr] = Field(default=None, description="SharePoint Client Secret")
     site_url: str = Field(description="SharePoint Site URL")
 
     # Additional fields for delegated/OAuth flows
@@ -54,6 +62,23 @@ class SharepointConfiguration(BaseModel):
         default=None, description="Refresh token of the signed-in user (set by Login)",
         json_schema_extra={"hidden": True},
     )
+
+    # Set by the platform, never typed: the kind of a governed delegated credential and the token released for a run
+    auth_mode: Optional[str] = Field(default=None, json_schema_extra={"hidden": True},
+                                     description="entra_delegated: acts with the signed-in person's Microsoft sign-in")
+    access_token: Optional[SecretStr] = Field(default=None, json_schema_extra={"hidden": True},
+                                              description="Graph token released for one run (entra_delegated only)")
+
+    @model_validator(mode="after")
+    def _client_unless_delegated(self):
+        if self.auth_mode not in (None, ENTRA_DELEGATED):
+            raise ValueError("auth_mode: only entra_delegated")
+        if self.auth_mode == ENTRA_DELEGATED:
+            if self.client_secret is not None or self.refresh_token is not None:
+                raise ValueError("a credential that acts with the Microsoft sign-in holds no secret")
+        elif self.client_id is None or self.client_secret is None:   # as when both fields were required
+            raise ValueError("client_id and client_secret are required")
+        return self
 
     @field_validator("oauth_discovery_endpoint")
     @classmethod
@@ -98,6 +123,9 @@ class SharepointConfiguration(BaseModel):
         """
         safe_settings = {k: "***" if k in ("client_secret", "access_token", "refresh_token") else v for k, v in settings.items()}
         log.debug(f"Checking SharePoint connection with settings: {safe_settings}")
+        if settings.get("auth_mode") == ENTRA_DELEGATED:
+            # checked by the platform when the credential is probed: no secret here to test
+            return None if settings.get("access_token") else DELEGATION_UNSUPPORTED
         oauth_discovery_endpoint = settings.get("oauth_discovery_endpoint")
         if oauth_discovery_endpoint:
             log.info("Using delegated flow (oauth_discovery_endpoint present)")
