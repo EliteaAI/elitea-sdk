@@ -737,16 +737,10 @@ Before composing each reply, scan this list and decide which skills match. A ski
 
 SKILL_REGISTRY_ENTRY = '<skill_option name="{name}">{description}</skill_option>'
 
-# The registry sits in the cached prefix of every call. Without a budget, 50 skills
-# with 2304-char descriptions add ~30k tokens to each one.
 SKILL_REGISTRY_DESCRIPTION_MAX_CHARS = 512
 SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS = 16000
-# Below this a description stops saying when to use the skill, so past ~133 skills
-# the floor wins over the total budget: every skill stays visible.
 SKILL_REGISTRY_DESCRIPTION_FLOOR_CHARS = 120
 
-# Deterministic text: the rendered <available_skills> block must stay
-# byte-stable for prompt caching.
 INSTRUCTION_REFERENCED_HINT = (
     'Referenced by name in your agent instructions: load this skill whenever '
     'the situation those instructions specify for it applies — never follow '
@@ -761,7 +755,7 @@ SKILL_REMINDER_SUFFIX = (
     "apply only where their scope matches this request."
 )
 
-LOAD_SKILL_TOOL_DESCRIPTION = (
+LOAD_SKILL_LISTED_TOOL_DESCRIPTION = (
     "Load the full instructions for one of this agent's available skills by name. "
     "The system prompt lists each skill as a <skill_option> inside <available_skills>, "
     "giving its name and when to use it; pass the exact name here to retrieve that "
@@ -771,6 +765,68 @@ LOAD_SKILL_TOOL_DESCRIPTION = (
     "follow them exactly for the applicable part of your response. Never apply a "
     "skill you have not loaded. Only skills listed in <available_skills> can be "
     "loaded."
+)
+
+LOAD_SKILL_UNKNOWN_LISTED = (
+    "No skill named \"{name}\" is attached to this agent. Available skills: {available}. "
+    "Call load_skill with one of these exact names, or proceed without a skill if none apply."
+)
+
+SKILL_SEARCH_PROMPT = """Skills with specialised instructions are available on demand. They are not listed here. Skills whose description matches the current request are suggested in a <suggested_skills> block at the end of your instructions for that request; call `load_skill` with the exact name of each suggested skill that applies BEFORE writing your answer. When nothing is suggested but the request might still benefit from a skill, call `search_skills` with a short description of what the user needs, then `load_skill` for each result that applies. Never imitate a skill you have not loaded. Follow each loaded skill's instructions exactly, within its own scope. If no skill applies, answer normally. Do not mention skills, `search_skills` or `load_skill` in your reply."""
+
+SKILL_SUGGESTIONS_HEADER = (
+    "<suggested_skills>\nThese skills match the current request by description. Call load_skill "
+    "for every one that applies to it BEFORE answering; ignore the ones that do not."
+)
+SKILL_SUGGESTIONS_ENTRY = "{name}: {description}"
+SKILL_SUGGESTIONS_FOOTER = "</suggested_skills>"
+SKILL_SUGGESTIONS_LIMIT = 3
+SKILL_SUGGESTIONS_SCORE_FLOOR = 0.5
+SKILL_SUGGESTIONS_MIN_TOKEN_CHARS = 3
+
+SKILL_SEARCH_REMINDER_SUFFIX = (
+    "Before answering: load every skill in <suggested_skills> that applies to this "
+    "request; if none is suggested but the request might still benefit from a skill, "
+    "call search_skills, then load_skill for every result that applies. Never apply "
+    "a skill's behavior without loading it first. Skills loaded earlier apply "
+    "only where their scope matches this request."
+)
+
+SEARCH_SKILLS_TOOL_DESCRIPTION = (
+    "Search the skills available to this agent. Skills are not listed in the "
+    "system prompt, so this is the only way to discover them. Call it whenever "
+    "the user's request might benefit from specialised instructions (a format, "
+    "a procedure, a persona, domain rules), passing a short query describing "
+    "what the user needs; wrap words in double quotes to require them as an "
+    "exact phrase. Returns up to 5 matching skills as `name: description`. "
+    "Then call load_skill with the exact name of each result that applies before "
+    "answering. If nothing matches, answer normally."
+)
+
+SEARCH_SKILLS_RESULT_LIMIT = 5
+SEARCH_SKILLS_DESCRIPTION_MAX_CHARS = 300
+SEARCH_SKILLS_NAME_WEIGHT = 3
+SEARCH_SKILLS_RESULT_ENTRY = "{name}: {description}"
+SEARCH_SKILLS_STOPWORDS = frozenset((
+    "a about above after again against ain all am an and any are aren as at be because been before being below "
+    "between both but by couldn d did didn do does doesn doing don down during each few for from further had "
+    "hadn has hasn have haven having he her here hers herself him himself his how i if in into is isn it its "
+    "itself just ll m ma me mightn more most mustn my myself needn no nor not now o of off on once only or other "
+    "our ours ourselves out over own please re s same shan she should shouldn so some such t than that the their "
+    "theirs them themselves then there these they this those through to too under until up ve very was wasn we "
+    "were weren what when where which while who whom why with won wouldn y you your yours yourself yourselves"
+).split())
+SEARCH_SKILLS_NO_MATCH = (
+    "No matching skills. Try a different query, or answer without a skill."
+)
+
+LOAD_SKILL_TOOL_DESCRIPTION = (
+    "Load the full instructions of a skill by its exact name. Call search_skills "
+    "first to find skill names — skills are not listed anywhere else — unless "
+    "the exact name is already known from the conversation or your instructions. "
+    "Load every skill whose description matches the user's request, but only once "
+    "per skill. After the instructions are returned you MUST follow them exactly "
+    "for the applicable part of your response. Never apply a skill you have not loaded."
 )
 
 LOADED_SKILL_PREFIX = 'Skill "{name}" is now active'
@@ -798,9 +854,16 @@ LOAD_SKILL_ALREADY_ACTIVE = LOAD_SKILL_ALREADY_ACTIVE_PREFIX + (
 )
 
 LOAD_SKILL_UNKNOWN = (
-    "No skill named \"{name}\" is attached to this agent. Available skills: {available}. "
-    "Call load_skill with one of these exact names, or proceed without a skill if none apply."
+    "No skill named \"{name}\" is available to this agent. Call search_skills to find "
+    "the exact name, or proceed without a skill if none apply."
 )
+
+LOAD_SKILL_UNAVAILABLE = (
+    "Skill \"{name}\" could not be loaded: {reason}. Do not imitate it; "
+    "proceed without it or search for another skill."
+)
+LOAD_SKILL_UNAVAILABLE_DENIED = "it is no longer accessible"
+LOAD_SKILL_UNAVAILABLE_TRANSIENT = "its instructions could not be fetched right now"
 
 
 SEARCH_INDEX_ADDON = """

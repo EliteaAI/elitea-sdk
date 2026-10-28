@@ -15,7 +15,7 @@ from elitea_sdk.runtime.langchain.constants import (
     SKILL_REGISTRY_TOTAL_DESCRIPTION_CHARS,
 )
 from elitea_sdk.runtime.tools.llm import LLMNode
-from elitea_sdk.runtime.tools.skill_tools import LoadSkillTool, render_skill_registry_index
+from elitea_sdk.runtime.tools.skill_tools import build_load_skill_tools, render_skill_registry_index
 
 MAX_DESCRIPTION_CHARS = 2304
 ENTRY_RE = re.compile(r'<skill_option name="([^"]*)">(.*?)</skill_option>')
@@ -163,7 +163,7 @@ def test_past_the_floor_every_skill_stays_visible(caplog):
 
 def test_load_skill_returns_the_full_body_of_a_shortened_skill():
     skills = _long_skills(50)
-    tool = LoadSkillTool(attached_skills=skills)
+    tool = build_load_skill_tools(skills)[0]
 
     result = tool.invoke({'skill': 'skill-9'})
 
