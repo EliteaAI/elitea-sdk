@@ -9,6 +9,19 @@ Status: implemented locally, nothing committed. Verified on the local stack (`ht
 > today). Nothing is committed, so no migration ships; local data was converted by hand (section 8).
 > Background: [provider_generalization_research.md](provider_generalization_research.md).
 
+> **2026-10-28 — R8 built as option B.** When a Default app applies in the credential's own project, the
+> credential uses it on next use and the app id is stored by a separate event handler (reads never write;
+> idempotent, version-checked, logged). SharePoint App-only is excluded, the credential's own client fields
+> are kept, and sign-ins are tied to the client they were made with, so users sign in once after a switch.
+> Spec section 12.
+
+> **2026-10-27 — PR review changes.** The server now returns an already-filtered app list (only the
+> Default app when there is one, else only non-default apps) and the form only counts the rows; sign-in and
+> token refresh carry the credential type and the server re-checks the app for it; the form no longer depends
+> on display names, never leaves the auth section blank and keeps validation state when it fills values in.
+> Credentials created before the feature need no migration (spec 4.4). R8 was assessed as unsafe as written
+> (spec section 12).
+
 > **2026-10-26 — requirements clarified for per-project apps.** The full, current specification is
 > **[spec.md](spec.md)** (with a TL;DR for review). This file records what is **built**; items marked
 > ⟶ *spec* below behave differently in the spec and are still to be implemented (spec section 11).

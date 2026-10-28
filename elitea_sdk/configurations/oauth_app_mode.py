@@ -26,3 +26,23 @@ def require_app_client(config) -> None:
         raise ValueError(
             f"Select a Default app or enter {' and '.join(missing)} for a Custom app"
         )
+
+
+def token_for_credential(tokens: dict | None, config: dict) -> dict | str | None:
+    """The browser token for this credential, only when it was issued to the credential's client.
+
+    A sign-in belongs to one OAuth client: once the platform moves a credential to another app,
+    a token made with the previous client must not be used (#7149). Tokens without a recorded
+    client (older sign-ins) are kept as before.
+    """
+    if not tokens:
+        return None
+    endpoint = config.get("oauth_discovery_endpoint")
+    config_uuid = config.get("configuration_uuid")
+    token = tokens.get(f"{config_uuid}:{endpoint}") if config_uuid else None
+    if token is None:
+        token = tokens.get(endpoint)
+    if isinstance(token, dict) and token.get("client_id") and config.get("client_id"):
+        if token["client_id"] != config["client_id"]:
+            return None
+    return token
