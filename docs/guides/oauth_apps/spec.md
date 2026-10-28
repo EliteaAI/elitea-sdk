@@ -84,6 +84,24 @@ client (R7); section 12. Still to do: per-scope defaults and stricter save check
 
 Placed after MCP Servers. Visible to platform admins (`configuration.oauth_apps.view` / `.edit`).
 
+How an app is saved or tested (repo: file · function):
+
+```mermaid
+flowchart TD
+    UI["admin_ui: OAuthAppDialog.jsx<br/>Save / Test connection"] -->|"secret only when replaced;<br/>changed endpoint needs a new secret"| API["admin: api/v2/oauth_apps.py<br/>api/v2/oauth_app_check.py"]
+    API --> M["configurations: methods/oauth_apps.py<br/>_require_admin"]
+    M --> E{"Endpoint changed<br/>and no new secret?"}
+    E -- yes --> R1["Rejected: enter the secret again<br/>(stored secret stays with its endpoint)"]
+    E -- no --> V["oauth_apps.py · validated_app_data<br/>provider, hosts, scopes, Projects required"]
+    V --> P["_require_existing_projects<br/>every project id exists"]
+    P --> K{Save or Test?}
+    K -- Test --> T["check_app_connection<br/>client-credentials call to the app's own token endpoint"]
+    K -- Save --> W["create / update_configuration<br/>public project, type oauth_app, shared=false"]
+    W --> S["Secret → hidden vault of the public project<br/>row keeps only {{secret.uuid}}"]
+    W --> D["_clear_other_defaults<br/>one Default per provider"]
+    D --> C["invalidate_apps_cache"]
+```
+
 ### 3.1 App dialog
 
 **General** (behaviour):
@@ -150,6 +168,21 @@ Only apps that are **enabled** and have the credential's **type switched on** co
 5. Active tier has a Default app → **Default app, no switcher**.
 6. Otherwise → **Default / Custom switcher**; one app is preselected, several → the user picks one.
 
+How the form gets its apps:
+
+```mermaid
+flowchart TD
+    F["EliteaUI: CredentialForm.jsx → ToolSection.jsx<br/>useOAuthAppSubsections"] -->|"GET /configurations/oauth_apps/{project}?type="| A["configurations: api/v2/oauth_apps.py"]
+    A --> L["oauth_apps.py · list_available_apps<br/>_usable_apps: enabled, type on, project covered"]
+    L --> T["_active_tier<br/>project's own apps, else Public"]
+    T --> D{"A Default<br/>in the tier?"}
+    D -- yes --> R1["rows = Default only"]
+    D -- no --> R2["rows = non-default apps"]
+    R1 --> M["credential_mode → mode<br/>default / choice / custom"]
+    R2 --> M
+    M --> U["Form: no rows → Custom only<br/>one Default → no switcher<br/>else switcher; OAuthAppSelect shows a picker if several"]
+```
+
 **The server does the filtering.** The app list a project member gets holds only the active tier, and of that
 tier **only the Default app(s) when there is one, otherwise only the non-default apps**; Default and
 non-default apps are never mixed. The form makes no decisions of its own beyond two checks:
@@ -205,6 +238,34 @@ When a Default app applies, such credentials move to it on next use (R8, section
 
 ## 5. Credential lifecycle
 
+Saving a credential:
+
+```mermaid
+flowchart TD
+    S["Create / update credential<br/>(form, API, MCP)"] --> U["configurations: utils.py<br/>create_configuration / update_configuration"]
+    U --> SH["oauth_apps.py · reject_shared<br/>Teams/Outlook/SharePoint never shared"]
+    SH --> ST["strip_app_client_fields<br/>app id set → app fields dropped, own fields from before kept;<br/>app must be usable in the credential's project"]
+    ST --> RL["record_login_client<br/>a new stored login remembers its client"]
+    RL --> DB["Project schema: configuration row<br/>(secrets as {{secret.…}})"]
+```
+
+Using a credential (agent run, test connection, stored login, form read):
+
+```mermaid
+flowchart TD
+    X["configurations: utils.py · expand_configuration<br/>get_stored_login · decorate_credentials"] --> MC["_merge_configuration"]
+    MC --> RO["oauth_apps.py · resolve_on_use<br/>(credential's own project)"]
+    RO --> D{"Default app resolves?<br/>(SharePoint App-only excluded)"}
+    D -- "yes, not stored yet" --> AD["Use it now, drop the old login,<br/>announce once → oauth_app_default_adopted"]
+    D -- no --> LC{"Stored login of<br/>another client?"}
+    LC -- yes --> DR["Login not used: sign in again"]
+    LC -- no --> K["Keep what it stores"]
+    AD --> AP["apply_oauth_app<br/>client ID, secret, endpoint, scopes from the app"]
+    DR --> AP
+    K --> AP
+    AP --> RT["Runtime: elitea-sdk tools/teams|outlook|sharepoint<br/>oauth_app_mode.py · token_for_credential<br/>(browser token only for the same client)"]
+```
+
 | # | Rule |
 |---|---|
 | R1 | A Default app credential stores **"default"** (whatever the admin designates) or an **explicit app id** (picked from a list). It never stores client ID, secret, endpoint, scopes or refresh settings. A Custom credential stores the user's own app. |
@@ -222,6 +283,27 @@ When a Default app applies, such credentials move to it on next use (R8, section
 | R7 | A stored sign-in (refresh token, browser token) is bound to the app it was made with (app id + client ID). When the resolved app or its client ID / endpoint changes, the old sign-in is ignored and the user signs in once again. A token is never sent with another app's client. |
 | T1 | Token cache keys stay per credential (`<credential uuid>:<endpoint>`) plus the app binding of R7. |
 | T2 | Rotating an app's secret needs no new sign-in (same client ID). |
+
+Sign-in with a Default app credential (the secret never reaches the browser):
+
+```mermaid
+sequenceDiagram
+    participant B as Browser<br/>EliteaUI mcpAuthFlow.helpers.js
+    participant M as Microsoft
+    participant P as elitea_core<br/>api/v2/mcp_oauth_proxy.py
+    participant C as configurations<br/>oauth_apps.py · resolve_app_client
+    B->>M: Authorize (public client ID, admin scopes)
+    M-->>B: Authorization code
+    B->>P: code + oauth_app_id + credential_type
+    Note over P: Works with MCP exposure off
+    P->>C: app id, project, credential type
+    C-->>P: client ID, secret, app token endpoint, admin scopes
+    Note over P: Caller's scope and token endpoint are ignored
+    P->>M: Token request to the app's own endpoint
+    M-->>P: Access + refresh token
+    P-->>B: Tokens (never the secret)
+    Note over B: Stored with the client ID they were issued to
+```
 
 ## 7. Security and server enforcement
 
@@ -311,12 +393,19 @@ Detailed history of what was built: [implementation_summary.md](implementation_s
 **How it works**
 
 ```mermaid
-flowchart LR
-    U[Credential used:<br/>form, sign-in, agent run] --> R{Default app resolves<br/>for its own project?}
+flowchart TD
+    U["Credential used: form, sign-in, agent run<br/>configurations: oauth_apps.py · resolve_on_use"] --> R{"Default app resolves<br/>for its own project?"}
     R -- no --> S[Use what it stores]
-    R -- yes --> D[Use the Default app now<br/>old sign-in not used]
-    D --> E[Event: default adopted]
-    E --> P[Handler stores the app id<br/>re-checks the rule, optimistic version check,<br/>drops the old sign-in, keeps own fields]
+    R -- yes --> D["Use the Default app now<br/>old sign-in not used"]
+    D --> E["Event oauth_app_default_adopted<br/>fired once per credential per process"]
+    E --> H["configurations: events/oauth_app.py"]
+    H --> P["oauth_apps.py · persist_adopted_app"]
+    P --> F{"Fresh re-check: still the winner<br/>and not stored yet?"}
+    F -- no --> N[Nothing written]
+    F -- yes --> W["update_configuration with expected generation<br/>store app id, keep own fields, drop stored login"]
+    W --> G{"Generation<br/>still the same?"}
+    G -- no --> N2["Skipped: a user edit wins,<br/>next use adopts again"]
+    G -- yes --> L[Stored and logged]
 ```
 
 - **Reads never write.** Agent runs, sign-ins and form reads resolve the Default app in memory and only emit
@@ -327,6 +416,79 @@ flowchart LR
 - **Sign-ins**: a stored login records the client it belongs to; one made with another client is not used,
   and browser tokens are used only for the client they were issued to. The user is asked to sign in.
 - **No migration and no bulk job**: credentials switch one by one on their next use.
+
+**Scenarios: what the user and the agent get, and when `oauth_app_id` is stored**
+
+The outcome depends on what the admin configured for the credential's own project X (section 4.1: the
+active tier, already filtered by the server) and on what the credential stores.
+
+| Admin setup for project X | A. New credential (create form) | B. Existing credential with its own Custom app | C. Agent run / test connection / stored login |
+|---|---|---|---|
+| **1. A Default app resolves** | No switcher, only "Sign-in settings are managed by your administrator." Save stores `oauth_app_id`. | Same form as A: the read returns the Default app's settings, the own fields are not sent. The Default app id is **stored** (adoption). | Gets the Default app's client, secret and scopes; the own app is not sent. The Default app id is **stored** (adoption); one new sign-in. |
+| **2. Only non-default apps** | Switcher, Default app tab preselected (several apps: the user picks one). Save on that tab stores `oauth_app_id`. | Switcher, **Custom app** preselected (the user chose it). Nothing stored unless the user switches and saves. | Gets the credential's own app; nothing stored. |
+| **3. No app** | No switcher, Custom app fields only. | Custom app fields, as before. | Gets the credential's own app, as before. |
+
+SharePoint App-only is never replaced (decision 2): in case 1 it behaves like case 3.
+
+```mermaid
+flowchart TD
+    S{"What happens?"} --> A["A. User opens the create form<br/>EliteaUI: CredentialForm.jsx"]
+    S --> B["B. User opens an existing credential<br/>configurations: decorate_credentials"]
+    S --> C["C. Agent run, test connection, stored login<br/>configurations: expand_configuration · get_stored_login"]
+    A --> LA["GET /configurations/oauth_apps<br/>list_available_apps"]
+    LA --> MA{"Apps returned"}
+    MA -- "1: one Default" --> A1["No switcher<br/>managed by your administrator"]
+    MA -- "2: non-defaults" --> A2["Switcher, Default app preselected<br/>picker if several"]
+    MA -- "3: none" --> A3["Custom app fields only"]
+    A1 --> SV["User clicks Save"]
+    A2 --> SV
+    SV --> W1[("oauth_app_id stored<br/>strip_app_client_fields")]
+    B --> RB{"Default app resolves<br/>default_app_for?"}
+    C --> RB
+    RB -- "yes, 1" --> AD["Use the Default app now<br/>own fields not sent, old sign-in not used<br/>resolve_on_use"]
+    AD --> EV["Event oauth_app_default_adopted"]
+    EV --> W2[("oauth_app_id stored<br/>persist_adopted_app")]
+    RB -- "no, 2 or 3" --> ST["Use what the credential stores<br/>own app, or its picked app"]
+    ST --> NW["Nothing written"]
+```
+
+**How the stored app (`oauth_app_id`) appears and changes**
+
+`oauth_app_id` is written only at these points; reads never write it themselves.
+
+| When | Condition | What is written |
+|---|---|---|
+| User saves with the Default app tab | The app is enabled, switched on for the type and applies in the project (checked on save) | `oauth_app_id`; the own client fields from before are kept |
+| A Default app is used (cases 1B, 1C) | A Default app resolves for the credential's own project, the credential stores something else, not SharePoint App-only | The handler stores the Default app id after a fresh re-check, with a version check; own fields kept, stored login dropped |
+| User saves with the Custom app tab | Any time a switcher is shown | `oauth_app_id` removed, own client fields stored |
+| Default goes away later | Admin turns Default off, disables or deletes the app | Nothing: the credential keeps its stored app (option B), or shows "… Switch to Custom app." when the app is gone |
+
+```mermaid
+stateDiagram-v2
+    state "Own app<br/>no oauth_app_id" as Own
+    state "Picked app<br/>oauth_app_id = app P" as Picked
+    state "Default app<br/>oauth_app_id = app D" as Def
+    state "App unavailable<br/>shows Switch to Custom app" as Gone
+    [*] --> Own : created with Custom app (case 3, or 2 on Custom tab)
+    [*] --> Picked : created with Default app tab (case 2)
+    [*] --> Def : created where a Default app applies (case 1A)
+    Own --> Def : next use while a Default app resolves (1B, 1C)
+    Picked --> Def : next use while another app is Default
+    Def --> Def : admin makes another app Default, next use
+    Picked --> Own : user saves Custom app
+    Def --> Own : user saves Custom app (no Default applies)
+    Def --> Gone : app disabled, deleted, type off, out of scope
+    Picked --> Gone : app disabled, deleted, type off, out of scope
+    Gone --> Own : user saves Custom app
+    Gone --> Def : a Default app resolves again, next use
+```
+
+Notes:
+- "Next use" is any of B or C: opening the credential, test connection, sign-in, an agent run. The switch is
+  stored once by the event handler; every later use reads the stored app.
+- While a Default app applies, the form offers no switcher, so moving back to Custom app is possible only after
+  the admin turns Default off (then the switcher returns, case 2).
+- Each change of app needs one new sign-in: a login belongs to the client it was made with (decision 4).
 
 **Known effects**
 
