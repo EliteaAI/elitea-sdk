@@ -380,7 +380,8 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
             try:
                 toolkit_tools.extend(AVAILABLE_TOOLS['ado']['get_tools'](tool_type, tool))
             except Exception as e:
-                if not released:
+                # a coded refusal keeps its code (its text is fixed per code and never holds a value)
+                if not released or isinstance(e, GovernedCredentialError):
                     raise
                 raise ToolException(f"Error getting tools for {tool_type}: {scrub(str(e), released)}") from None
         elif tool_type == 'mcp':
@@ -402,6 +403,9 @@ def get_tools(tools_list, elitea, llm, store: Optional[BaseStore] = None, *args,
                 # Re-raise McpAuthorizationRequired so callers can handle OAuth flows
                 from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
                 if isinstance(e, McpAuthorizationRequired):
+                    raise
+                # a coded refusal keeps its code (its text is fixed per code and never holds a value)
+                if isinstance(e, GovernedCredentialError):
                     raise
                 if released:
                     # Error texts echo inputs (pydantic input_value); never log or raise a released value.

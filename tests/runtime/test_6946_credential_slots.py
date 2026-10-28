@@ -395,6 +395,25 @@ def test_toolkit_tool_exceptions_are_scrubbed_too(monkeypatch):
     assert TOKEN not in str(exc.value) and "[REDACTED]" in str(exc.value)
 
 
+def test_a_coded_refusal_inside_a_toolkit_build_with_released_values_keeps_its_code(monkeypatch):
+    """#6756: a toolkit that refuses with a code while building (e.g. a delegated credential whose released token is
+    empty) must reach the worker coded, so the run ends with the readable refusal card, not a generic failure."""
+    def refuse(*args):
+        raise GovernedCredentialError("DENIED_DELEGATION_UNSUPPORTED_CALLER")
+
+    monkeypatch.setitem(sdk_tools.AVAILABLE_TOOLS, "github", {"get_tools": refuse})
+    monkeypatch.setitem(sdk_tools.AVAILABLE_TOOLS, "ado", {"get_tools": refuse})
+    monkeypatch.setitem(sdk_tools.AVAILABLE_TOOLS, "ado_boards", {})
+    ado_settings = {"ado_configuration": {SLOT_KEY: slot(("personal_access_token",))}}
+    for tool, values in ((_github_tool(), None), (_github_tool(ado_settings, tool_type="ado_boards"),
+                                                  {"personal_access_token": TOKEN})):
+        elitea = SimpleNamespace(credential_resolver=FakeResolver(values) if values else FakeResolver())
+        with pytest.raises(GovernedCredentialError) as exc:
+            sdk_tools.get_tools([tool], elitea, llm=None)
+        assert exc.value.reason_code == "DENIED_DELEGATION_UNSUPPORTED_CALLER"
+        assert TOKEN not in str(exc.value)
+
+
 def test_ado_special_case_errors_are_scrubbed(monkeypatch):
     def get_tools(tool_type, tool):
         raise ValueError(f"bad {tool['settings']['ado_configuration']['personal_access_token']}")
