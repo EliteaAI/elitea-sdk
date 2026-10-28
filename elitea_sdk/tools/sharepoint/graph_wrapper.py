@@ -42,6 +42,18 @@ from ..utils.http_utils import (
 )
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+_GRAPH_HOST = "graph.microsoft.com"
+
+
+def _is_graph_url(url) -> bool:
+    """Is ``url`` an https URL of Microsoft Graph itself (the exact host, the default port)? Page content decides image
+    URLs, so a host that merely contains the Graph name never receives the bearer."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url))
+        return parts.scheme == "https" and parts.hostname == _GRAPH_HOST and parts.port in (None, 443)
+    except ValueError:
+        return False
 _SMALL_FILE_THRESHOLD = 4 * 1024 * 1024   # 4 MB — simple PUT
 _CHUNK_SIZE = 5 * 1024 * 1024             # 5 MB chunks for resumable upload
 
@@ -1469,10 +1481,12 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         """
 
         description = f"[image: {alt or 'no description'}]"
-        if not src or "graph.microsoft.com" not in src:
+        if not src or not _is_graph_url(src):
             return description, None, None
 
         canonical_src = self._onenote_resolve_resource_url(src)
+        if not _is_graph_url(canonical_src):   # the bearer goes to Graph and nowhere else (C-1009 #6756)
+            return description, None, None
         # Derive a stable filename from the resource URL
         resource_match = re.search(r'resources/([^/?]+)', canonical_src)
         resource_id = resource_match.group(1) if resource_match else "unknown"

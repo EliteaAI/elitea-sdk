@@ -113,3 +113,37 @@ def test_access_token_and_auth_mode_are_hidden_platform_fields():
 def test_check_connection_of_a_delegated_credential_needs_a_released_token():
     assert SharepointConfiguration.check_connection(delegated()) is None
     assert "DENIED_DELEGATION_UNSUPPORTED_CALLER" in SharepointConfiguration.check_connection(delegated(access_token=None))
+
+
+@pytest.mark.parametrize("src", [
+    "https://graph.microsoft.com.evil.example/v1.0/x/resources/r1/$value",
+    "https://evil.example/graph.microsoft.com/resources/r1/$value",
+    "http://graph.microsoft.com/v1.0/sites/s/onenote/resources/r1/$value",
+    "https://graph.microsoft.com:8443/v1.0/sites/s/onenote/resources/r1/$value",
+    "https://user@evil.example/?graph.microsoft.com",
+])
+def test_a_onenote_image_outside_graph_never_receives_the_bearer(src):
+    wrapper = SharepointGraphWrapper(site_url=SITE_URL, token=RELEASED, scopes=["https://graph.microsoft.com/.default"])
+    with patch("elitea_sdk.tools.sharepoint.graph_wrapper.requests.get") as get:
+        description, data, _ = wrapper._fetch_onenote_image(src, "alt", True)   # pylint: disable=W0212
+    get.assert_not_called()
+    assert data is None and "image" in description
+
+
+def test_a_graph_onenote_image_is_fetched_with_the_bearer():
+    wrapper = SharepointGraphWrapper(site_url=SITE_URL, token=RELEASED, scopes=["https://graph.microsoft.com/.default"])
+    graph = Graph()
+
+    def get(url, headers=None, **kwargs):
+        if "/onenote/resources/" in url:
+            graph.calls.append((url, dict(headers or {})))
+            response = MagicMock(status_code=200, content=b"\x89PNG\r\n\x1a\n", headers={"Content-Type": "image/png"})
+            response.raise_for_status.return_value = None
+            return response
+        return graph(url, headers=headers, **kwargs)
+
+    with patch("elitea_sdk.tools.sharepoint.graph_wrapper.requests.get", get):
+        wrapper._fetch_onenote_image(   # pylint: disable=W0212
+            "https://graph.microsoft.com/v1.0/sites/x/onenote/resources/r1/$value", "alt", True)
+    [(url, headers)] = [call for call in graph.calls if "/onenote/resources/" in call[0]]
+    assert url.startswith("https://graph.microsoft.com/v1.0/sites/") and headers["Authorization"] == f"Bearer {RELEASED}"
