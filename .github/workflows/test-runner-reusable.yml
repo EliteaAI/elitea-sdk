@@ -829,7 +829,7 @@ jobs:
               
               # Show created SDK bugs
               if [ "$BUGS_CREATED" -gt 0 ]; then
-                echo "### ✅ SDK Bugs Created on ELITEA Board"
+                echo "### ✅ SDK Bugs Created in elitea-sdk"
                 echo ""
                 echo "**Total created: ${BUGS_CREATED} bug(s)**"
                 echo ""
@@ -838,7 +838,7 @@ jobs:
                 COUNTER=1
                 jq -c '.bugs_created[]?' "${BUG_REPORT}" | while read -r item; do
                   TITLE=$(echo "$item" | jq -r '.title')
-                  ISSUE_URL=$(echo "$item" | jq -r '.issue_url // ("https://github.com/EliteaAI/elitea.github.io/issues/" + (.issue_number | tostring))')
+                  ISSUE_URL=$(echo "$item" | jq -r '.issue_url // ("https://github.com/EliteaAI/elitea-sdk/issues/" + (.issue_number | tostring))')
                   TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
                   COMPONENT=$(echo "$item" | jq -r '.affected_component // "N/A"')
                   LABELS=$(echo "$item" | jq -r '(.labels // []) | join(", ")')
@@ -850,7 +850,7 @@ jobs:
               
               # Show created automation bugs
               if [ "$AUTOMATION_BUGS_CREATED" -gt 0 ]; then
-                echo "### 🔌 Automation Bugs Created on ELITEA Board"
+                echo "### 🔌 Automation Bugs Created in elitea-sdk"
                 echo ""
                 echo "**Total created: ${AUTOMATION_BUGS_CREATED} automation bug(s)**"
                 echo ""
@@ -859,7 +859,7 @@ jobs:
                 COUNTER=1
                 jq -c '.automation_bugs_created[]?' "${BUG_REPORT}" | while read -r item; do
                   TITLE=$(echo "$item" | jq -r '.title')
-                  ISSUE_URL=$(echo "$item" | jq -r '.issue_url // ("https://github.com/EliteaAI/elitea.github.io/issues/" + (.issue_number | tostring))')
+                  ISSUE_URL=$(echo "$item" | jq -r '.issue_url // ("https://github.com/EliteaAI/elitea-sdk/issues/" + (.issue_number | tostring))')
                   TEST_IDS=$(echo "$item" | jq -r '(.test_ids // []) | join(", ")')
                   TOOL_NAME=$(echo "$item" | jq -r '.tool_name // "N/A"')
                   ERROR_TYPE=$(echo "$item" | jq -r '.error_type // "N/A"')
@@ -878,7 +878,7 @@ jobs:
                 echo "> [!NOTE]"
                 echo "> The following test failures matched existing bugs and were not re-reported"
                 echo ""
-                jq -r '.duplicates_skipped[]? | . as $e | (if $e.existing_issue_titles then [$e.existing_issue_titles, (if $e.existing_issue_urls then $e.existing_issue_urls else ($e.existing_issue_numbers // [] | map("https://github.com/EliteaAI/elitea.github.io/issues/" + tostring)) end)] | transpose | map("  - **Similar to:** [\(.[0])](\(.[1]))") elif $e.existing_issue_title then ["  - **Similar to:** [\($e.existing_issue_title)](\($e.existing_issue_url // ("https://github.com/EliteaAI/elitea.github.io/issues/" + ($e.existing_issue_number | tostring))))"] else ["  - **Similar to:** N/A"] end) as $links | "- **Tests:** \(($e.test_ids // []) | join(", "))\n" + ($links | join("\n")) + "\n  - **Reason:** \($e.similarity_reason // "N/A")\n"' "${BUG_REPORT}"
+                jq -r '.duplicates_skipped[]? | . as $e | (if $e.existing_issue_titles then [$e.existing_issue_titles, (if $e.existing_issue_urls then $e.existing_issue_urls else ($e.existing_issue_numbers // [] | map("https://github.com/EliteaAI/elitea-sdk/issues/" + tostring)) end)] | transpose | map("  - **Similar to:** [\(.[0])](\(.[1]))") elif $e.existing_issue_title then ["  - **Similar to:** [\($e.existing_issue_title)](\($e.existing_issue_url // ("https://github.com/EliteaAI/elitea-sdk/issues/" + ($e.existing_issue_number | tostring))))"] else ["  - **Similar to:** N/A"] end) as $links | "- **Tests:** \(($e.test_ids // []) | join(", "))\n" + ($links | join("\n")) + "\n  - **Reason:** \($e.similarity_reason // "N/A")\n"' "${BUG_REPORT}"
                 echo ""
                 echo "</details>"
                 echo ""
