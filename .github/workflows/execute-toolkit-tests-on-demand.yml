@@ -1,7 +1,11 @@
 name: Execute Toolkit Tests on Demand
-run-name: "Toolkit Tests on Demand: ${{ inputs.environment }} - ${{ inputs.test_cases_dir == 'custom' && inputs.custom_suites || inputs.test_cases_dir }}${{ inputs.enable_parallel && ' (parallel)' || '' }}"
+run-name: "${{ github.event_name == 'schedule' && 'Nightly ' || '' }}Toolkit Tests on Demand: ${{ inputs.environment || 'local' }} - ${{ inputs.test_cases_dir == 'custom' && inputs.custom_suites || inputs.test_cases_dir || 'all' }}${{ inputs.enable_parallel && ' (parallel)' || '' }}"
 
 on:
+  # Nightly run at 03:00 UTC+3 (00:00 UTC). Scheduled runs carry no inputs, so every
+  # inputs.* reference below falls back to the workflow_dispatch default.
+  schedule:
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       environment:
@@ -87,9 +91,9 @@ jobs:
         uses: ./.github/actions/generate-test-matrix
         with:
           mode: on-demand
-          test_cases_dir: ${{ inputs.test_cases_dir }}
+          test_cases_dir: ${{ inputs.test_cases_dir || 'all' }}
           custom_suites: ${{ inputs.custom_suites }}
-          exclude_suites: ${{ inputs.exclude_suites }}
+          exclude_suites: ${{ github.event_name == 'schedule' && 'bitbucket,figma,qtest,testrail,gitlab' || inputs.exclude_suites }}
 
   test-execution:
     needs: configure-matrix
@@ -103,8 +107,8 @@ jobs:
     with:
       test_cases_dir: ${{ matrix.data.suite }}
       tests_to_run: ${{ matrix.data.tests_to_run }}
-      environment: ${{ inputs.environment == 'custom' && inputs.custom_environment || inputs.environment }}
+      environment: ${{ inputs.environment == 'custom' && inputs.custom_environment || inputs.environment || 'local' }}
       enable_parallel: true
-      enable_bug_reporting: ${{ inputs.enable_bug_reporting }}
-      enable_rp_reporting: ${{ inputs.enable_rp_reporting }}
+      enable_bug_reporting: ${{ inputs.enable_bug_reporting == true }}
+      enable_rp_reporting: ${{ inputs.enable_rp_reporting == true }}
     secrets: inherit
