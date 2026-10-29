@@ -31,6 +31,7 @@ from elitea_sdk.runtime.tool_outcome import (
     ToolResultStatus,
     outcome_sink,
     record_outcome,
+    resolve_run_error,
     run_error_flag,
 )
 from elitea_sdk.runtime.tools.function import (
@@ -845,10 +846,24 @@ class TestRunErrorFlag:
         assert holder == {}
 
     def test_sensitive_tool_reject_sets_nothing(self):
-        node = _node(_tool(lambda issue_number: BLOCKED_PAYLOAD))
-        with run_error_flag() as holder:
-            _run(node)
+        from unittest.mock import patch
 
+        from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+        from elitea_sdk.runtime.toolkits.security import configure_sensitive_tools, reset_sensitive_tools
+
+        configure_sensitive_tools({"jira": ["update_issue"]})
+        try:
+            guarded = SensitiveToolGuardMiddleware().wrap_tool(_tool(lambda issue_number: "x"))
+            node = _node(guarded)
+            with run_error_flag() as holder, patch(
+                "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+                side_effect=lambda payload: {"action": "reject", "value": "no"},
+            ):
+                result = _run(node)
+        finally:
+            reset_sensitive_tools()
+
+        assert result[PIPELINE_BLOCKED_KEY]
         assert holder == {}
 
     def test_reason_is_one_short_line(self):
@@ -880,3 +895,46 @@ class TestRunErrorFlag:
 
     def test_no_open_holder_does_not_fail(self):
         record_outcome(_error("nobody listens"))
+
+        with run_error_flag() as holder:
+            pass
+        assert holder == {}
+
+    def test_same_tool_succeeding_later_clears_the_error(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("first try failed", tool="update_issue", toolkit="jira"))
+            resolve_run_error("update_issue", "jira")
+
+        assert holder == {}
+
+    def test_another_tool_succeeding_keeps_the_error(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("failed", tool="update_issue", toolkit="jira"))
+            resolve_run_error("get_issue", "jira")
+            resolve_run_error("update_issue", "github")
+
+        assert holder["error"]["tool"] == "update_issue"
+
+    def test_a_new_error_after_a_recovery_is_held(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("one", tool="a"))
+            resolve_run_error("a")
+            record_outcome(_error("two", tool="b"))
+
+        assert holder["error"]["reason"] == "two"
+
+    def test_threads_racing_keep_exactly_one_error(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import contextvars
+
+        with run_error_flag() as holder:
+            ctx = contextvars.copy_context()
+            with ThreadPoolExecutor(8) as pool:
+                for n in range(32):
+                    pool.submit(ctx.copy().run, record_outcome, _error(f"e{n}")).result()
+                list(pool.map(lambda n: ctx.copy().run(record_outcome, _error(f"r{n}")), range(32)))
+
+        assert holder["error"]["reason"] == "e0"
+
+    def test_resolve_without_an_open_holder_does_nothing(self):
+        resolve_run_error("update_issue", "jira")

@@ -60,7 +60,7 @@ def outcome_sink() -> Iterator[List[ToolOutcome]]:
         _OUTCOME_SINK.reset(token)
 
 
-# Holds the first failed tool call of a whole run. The holder is one shared mutable dict,
+# Holds the first failed tool call of a whole run, until the same tool succeeds later. The holder is one shared mutable dict,
 # so thread pools that copy the context and nested sinks all write to the same object.
 _RUN_ERROR_FLAG: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
     '_tool_run_error_flag', default=None,
@@ -91,15 +91,25 @@ def _short_reason(message: Optional[str]) -> str:
 
 def _note_run_error(outcome: ToolOutcome) -> None:
     holder = _RUN_ERROR_FLAG.get()
-    if holder is None or _HOLDER_ERROR_KEY in holder:
+    if holder is None or outcome.status is not ToolResultStatus.ERROR:
         return
-    if outcome.status is not ToolResultStatus.ERROR:
-        return
-    holder[_HOLDER_ERROR_KEY] = {
+    # setdefault is one atomic step, so two threads cannot both pass a check and the first error stays
+    holder.setdefault(_HOLDER_ERROR_KEY, {
         'toolkit': outcome.toolkit_type or '',
         'tool': outcome.tool_name or '',
         'reason': _short_reason(outcome.message),
-    }
+    })
+
+
+def resolve_run_error(tool_name: Optional[str], toolkit_type: Optional[str] = None) -> None:
+    """Drop the held error when the same tool has since succeeded: the agent recovered, so the run did not fail."""
+    holder = _RUN_ERROR_FLAG.get()
+    held = (holder or {}).get(_HOLDER_ERROR_KEY)
+    if not held or not tool_name or held.get('tool') != tool_name:
+        return
+    if toolkit_type and held.get('toolkit') and held['toolkit'] != toolkit_type:
+        return
+    holder.pop(_HOLDER_ERROR_KEY, None)
 
 
 def record_outcome(outcome: ToolOutcome) -> None:

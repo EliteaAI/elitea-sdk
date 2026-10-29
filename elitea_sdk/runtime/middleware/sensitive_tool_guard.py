@@ -46,17 +46,6 @@ def normalize_auto_approve(value: Any) -> Union[bool, frozenset]:
     return frozenset(pairs)
 
 
-def normalize_tool_input(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-    """Normalize tool arguments into a single payload."""
-    if kwargs:
-        return kwargs
-    if len(args) == 1:
-        return args[0]
-    if not args:
-        return {}
-    return list(args)
-
-
 class SensitiveToolGuardMiddleware(Middleware):
     """Pause execution before running configured sensitive tools.
 
@@ -189,24 +178,6 @@ class SensitiveToolGuardMiddleware(Middleware):
             value = metadata.get(key)
             if value:
                 return str(value)
-        return None
-
-    @staticmethod
-    def _get_tool_function(tool: BaseTool) -> Callable:
-        if hasattr(tool, 'func') and callable(tool.func):
-            return tool.func
-        if hasattr(tool, '_run') and callable(tool._run):
-            return tool._run
-        if callable(tool):
-            return tool
-        raise ValueError(f"Cannot extract callable from tool '{tool.name}'")
-
-    @staticmethod
-    def _get_async_tool_function(tool: BaseTool) -> Optional[Callable]:
-        if hasattr(tool, 'coroutine') and callable(tool.coroutine):
-            return tool.coroutine
-        if tool.__class__._arun is not BaseTool._arun and hasattr(tool, '_arun') and callable(tool._arun):
-            return tool._arun
         return None
 
     @staticmethod

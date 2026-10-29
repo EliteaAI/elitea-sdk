@@ -47,7 +47,7 @@ from ..context_floor import (
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..utils.internal_run_auth import run_token_refusal
-from ..tool_outcome import ToolOutcome, ToolResultStatus, outcome_sink, record_outcome
+from ..tool_outcome import ToolOutcome, ToolResultStatus, outcome_sink, record_outcome, resolve_run_error
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 from ..utils.failure_signals import describe_llm_error
@@ -4548,6 +4548,12 @@ class LLMNode(BaseTool):
                                 content=serialize_tool_result(tool_result),
                                 tool_call_id=tool_call_id
                             )
+                        if not any(o.status is ToolResultStatus.ERROR for o in recorded):
+                            # A retry that worked: the error held for the run no longer counts
+                            resolve_run_error(
+                                tool_name,
+                                (getattr(tool_to_execute, 'metadata', None) or {}).get('toolkit_type'),
+                            )
                         new_messages.append(_stamp_error_status(tool_message, recorded))
 
                     except GraphBubbleUp:
@@ -4623,6 +4629,11 @@ class LLMNode(BaseTool):
                         tool_call_id=tool_call_id,
                         status="error",
                     )
+                    record_outcome(ToolOutcome(
+                        status=ToolResultStatus.ERROR,
+                        message=f"Tool '{tool_name}' not available",
+                        tool_name=tool_name,
+                    ))
                     new_messages.append(tool_message)
 
             # ── Mid-turn user input injection drain ─────────────────────────
