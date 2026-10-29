@@ -6,6 +6,8 @@ directions: a successful payload containing the word "error" routes to the failu
 branch, and a message-less predecessor makes the expression fail. These tests pin
 the typed replacement and, just as importantly, that it is purely additive.
 """
+
+import contextlib
 import pytest
 import yaml
 from langchain_core.messages import AIMessage, HumanMessage
@@ -805,10 +807,9 @@ class TestRunErrorFlag:
         )
         from langchain_core.messages import HumanMessage
         with run_error_flag() as holder:
-            try:
+            # The node may raise or return the error text; the holder is what the test reads
+            with contextlib.suppress(Exception):
                 node.invoke({"messages": [HumanMessage(content="go")], "input": "go"})
-            except Exception:
-                pass
 
         assert holder["error"]["tool"] == "update_issue"
         assert "tool exploded" in holder["error"]["reason"]

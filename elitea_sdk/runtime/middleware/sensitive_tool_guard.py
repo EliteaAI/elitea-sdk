@@ -3,6 +3,8 @@
 import json
 import logging
 import re
+import types
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 from uuid import uuid4
 
@@ -14,6 +16,10 @@ from .base import Middleware
 from .tool_patching import rebind_invoke_after_copy
 
 logger = logging.getLogger(__name__)
+
+# Tools whose call is already reviewed and running. Keyed by tool, so a nested call of the same tool is
+# not reviewed twice while a different sensitive tool called inside it (a sub-agent) is still reviewed.
+_REVIEWED: ContextVar[frozenset] = ContextVar('sensitive_tool_reviewed', default=frozenset())
 
 from ..toolkits.security import (
     find_sensitive_tool_match,
@@ -413,24 +419,36 @@ class SensitiveToolGuardMiddleware(Middleware):
         original_tool = tool
         copied = tool.model_copy()
         rebind_invoke_after_copy(copied)
-        original_invoke = tool.invoke
-        original_ainvoke = tool.ainvoke
+        # The guard methods are bound to the copy and call the class implementation on whatever
+        # object they are bound to. Middleware that copies this copy later (the tool exception
+        # handler) re-binds them to its own copy, so its patch of func/_run is still reached.
+        # A tool without a native coroutine runs its sync invoke from ainvoke; the flag keeps
+        # that inner call from asking the user a second time. Executors copy the context.
+        def guarded_invoke(tool_self: BaseTool, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            if id(original_tool) not in _REVIEWED.get():
+                blocked = guard._blocked_result_if_rejected(original_tool, input)
+                if blocked is not None:
+                    return blocked
+            token = _REVIEWED.set(_REVIEWED.get() | {id(original_tool)})
+            try:
+                return type(tool_self).invoke(tool_self, input, config, **kwargs)
+            finally:
+                _REVIEWED.reset(token)
 
-        def guarded_invoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
-            blocked = guard._blocked_result_if_rejected(original_tool, input)
-            if blocked is not None:
-                return blocked
-            return original_invoke(input, config=config, **kwargs)
-
-        async def guarded_ainvoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
-            blocked = guard._blocked_result_if_rejected(original_tool, input)
-            if blocked is not None:
-                return blocked
-            return await original_ainvoke(input, config=config, **kwargs)
+        async def guarded_ainvoke(tool_self: BaseTool, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            if id(original_tool) not in _REVIEWED.get():
+                blocked = guard._blocked_result_if_rejected(original_tool, input)
+                if blocked is not None:
+                    return blocked
+            token = _REVIEWED.set(_REVIEWED.get() | {id(original_tool)})
+            try:
+                return await type(tool_self).ainvoke(tool_self, input, config, **kwargs)
+            finally:
+                _REVIEWED.reset(token)
 
         # Pydantic tools reject a plain assignment of a non-field name.
-        object.__setattr__(copied, 'invoke', guarded_invoke)
-        object.__setattr__(copied, 'ainvoke', guarded_ainvoke)
+        object.__setattr__(copied, 'invoke', types.MethodType(guarded_invoke, copied))
+        object.__setattr__(copied, 'ainvoke', types.MethodType(guarded_ainvoke, copied))
         self._wrapped_tools_cache[cache_key] = copied
         return copied
 

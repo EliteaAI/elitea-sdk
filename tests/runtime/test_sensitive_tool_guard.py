@@ -2732,6 +2732,51 @@ class TestGuardRunsBeforeInputCheck:
 
         assert json.loads(result)["type"] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
 
+    def test_exception_handler_after_guard_still_handles_a_failing_approved_tool(self):
+        from elitea_sdk.runtime.tool_outcome import run_error_flag
+
+        def boom(repo: str) -> str:
+            raise RuntimeError("remote refused")
+
+        configure_sensitive_tools({"github": ["delete_repo"]})
+        tool = StructuredTool.from_function(
+            func=boom, name="delete_repo", description="Delete.", args_schema=self._schema(),
+            metadata={"toolkit_type": "github", "toolkit_name": "github"},
+        )
+        guarded = SensitiveToolGuardMiddleware().wrap_tool(tool)
+        handled = ToolExceptionHandlerMiddleware(strategies=[LoggingStrategy()]).wrap_tool(guarded)
+
+        approve = lambda payload: {"action": "approve", "value": ""}  # noqa: E731
+        with run_error_flag() as holder, patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=approve
+        ):
+            result = handled.invoke({"repo": "demo"})
+
+        # The handler turns the exception into text and records it; without it the call raises
+        assert "remote refused" in str(result)
+        assert holder["error"]["tool"] == "delete_repo"
+
+    def test_a_different_sensitive_tool_called_inside_a_reviewed_tool_is_still_reviewed(self):
+        configure_sensitive_tools({"github": ["delete_repo", "delete_file"]})
+        meta = {"toolkit_type": "github", "toolkit_name": "github"}
+        inner = StructuredTool.from_function(
+            func=lambda path: f"deleted {path}", name="delete_file", description="Delete.", metadata=meta)
+        guarded_inner = SensitiveToolGuardMiddleware().wrap_tool(inner)
+        outer = StructuredTool.from_function(
+            func=lambda repo: guarded_inner.invoke({"path": repo}), name="delete_repo", description="Delete.",
+            metadata=meta)
+        guarded_outer = SensitiveToolGuardMiddleware().wrap_tool(outer)
+        seen = []
+
+        def approve(payload):
+            seen.append(payload)
+            return {"action": "approve", "value": ""}
+
+        with patch("elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=approve):
+            guarded_outer.invoke({"repo": "demo"})
+
+        assert len(seen) == 2
+
     def test_async_review_runs_before_validation_error(self, wrapped):
         import asyncio
         reviews = []
