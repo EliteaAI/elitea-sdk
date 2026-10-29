@@ -4,9 +4,10 @@ Consumers (the LLM, the ToolMessage on the wire, a pipeline node's state) read t
 fields instead of each re-deriving them by substring-matching an error string.
 """
 import contextvars
+import re
 from contextlib import contextmanager
 from enum import Enum
-from typing import Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from pydantic import BaseModel
 
@@ -59,8 +60,61 @@ def outcome_sink() -> Iterator[List[ToolOutcome]]:
         _OUTCOME_SINK.reset(token)
 
 
+# Holds the first failed tool call of a whole run, until the same tool succeeds later. The holder is one shared mutable dict,
+# so thread pools that copy the context and nested sinks all write to the same object.
+_RUN_ERROR_FLAG: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    '_tool_run_error_flag', default=None,
+)
+
+_MAX_ERROR_REASON_CHARS = 200
+_HOLDER_ERROR_KEY = 'error'
+
+
+@contextmanager
+def run_error_flag() -> Iterator[Dict[str, Any]]:
+    """Open a run-level holder. ``holder['error']`` is the first ERROR outcome as
+    ``{toolkit, tool, reason}``, or absent when no tool call failed."""
+    holder: Dict[str, Any] = {}
+    token = _RUN_ERROR_FLAG.set(holder)
+    try:
+        yield holder
+    finally:
+        _RUN_ERROR_FLAG.reset(token)
+
+
+def _short_reason(message: Optional[str]) -> str:
+    """One line, capped. A stack trace and anything after it is cut: the reason is shown
+    to people and a trace carries file paths."""
+    text = str(message or '').split('Traceback (most recent call last)')[0]
+    return re.sub(r'\s+', ' ', text).strip()[:_MAX_ERROR_REASON_CHARS]
+
+
+def _note_run_error(outcome: ToolOutcome) -> None:
+    holder = _RUN_ERROR_FLAG.get()
+    if holder is None or outcome.status is not ToolResultStatus.ERROR:
+        return
+    # setdefault is one atomic step, so two threads cannot both pass a check and the first error stays
+    holder.setdefault(_HOLDER_ERROR_KEY, {
+        'toolkit': outcome.toolkit_type or '',
+        'tool': outcome.tool_name or '',
+        'reason': _short_reason(outcome.message),
+    })
+
+
+def resolve_run_error(tool_name: Optional[str], toolkit_type: Optional[str] = None) -> None:
+    """Drop the held error when the same tool has since succeeded: the agent recovered, so the run did not fail."""
+    holder = _RUN_ERROR_FLAG.get()
+    held = (holder or {}).get(_HOLDER_ERROR_KEY)
+    if not held or not tool_name or held.get('tool') != tool_name:
+        return
+    if toolkit_type and held.get('toolkit') and held['toolkit'] != toolkit_type:
+        return
+    holder.pop(_HOLDER_ERROR_KEY, None)
+
+
 def record_outcome(outcome: ToolOutcome) -> None:
-    """No-op unless a caller installed a sink."""
+    """Notes the first error for an open run holder, then appends to the sink if one is open."""
+    _note_run_error(outcome)
     sink = _OUTCOME_SINK.get()
     if sink is not None:
         sink.append(outcome)

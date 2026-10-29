@@ -6,6 +6,8 @@ directions: a successful payload containing the word "error" routes to the failu
 branch, and a message-less predecessor makes the expression fail. These tests pin
 the typed replacement and, just as importantly, that it is purely additive.
 """
+
+import contextlib
 import pytest
 import yaml
 from langchain_core.messages import AIMessage, HumanMessage
@@ -23,7 +25,15 @@ from elitea_sdk.runtime.middleware.strategies import (
 from elitea_sdk.runtime.middleware.tool_exception_handler import (
     ToolExceptionHandlerMiddleware,
 )
-from elitea_sdk.runtime.tool_outcome import ToolErrorClass, ToolResultStatus
+from elitea_sdk.runtime.tool_outcome import (
+    ToolErrorClass,
+    ToolOutcome,
+    ToolResultStatus,
+    outcome_sink,
+    record_outcome,
+    resolve_run_error,
+    run_error_flag,
+)
 from elitea_sdk.runtime.tools.function import (
     LAST_TOOL_OUTCOME_KEY,
     PIPELINE_BLOCKED_KEY,
@@ -740,3 +750,191 @@ class TestStaleOutcomeCleared:
         }
         assert TOOL_OUTCOMES_KEY not in cleared_keys
         assert LAST_TOOL_OUTCOME_KEY not in cleared_keys
+
+
+# ─── Run-level first error ───────────────────────────────────────────
+
+
+def _error(message="boom", tool="t", toolkit="jira"):
+    return ToolOutcome(status=ToolResultStatus.ERROR, message=message, tool_name=tool, toolkit_type=toolkit)
+
+
+class TestRunErrorFlag:
+    def test_pipeline_node_tool_error_sets_holder(self):
+        node = _node(_middleware().wrap_tool(_tool(_raise_runtime)))
+        with run_error_flag() as holder:
+            _run(node)
+
+        assert holder["error"]["tool"] == "update_issue"
+        assert holder["error"]["toolkit"] == "jira"
+        assert "connection refused" in holder["error"]["reason"]
+
+    def test_unwrapped_node_exception_sets_holder(self):
+        node = _node(_tool(_raise_runtime))
+        with run_error_flag() as holder:
+            _run(node)
+
+        assert holder["error"]["tool"] == "update_issue"
+
+    def test_agent_loop_tool_error_sets_holder(self):
+        from langchain_core.messages import AIMessage
+        from elitea_sdk.runtime.tools.llm import LLMNode
+
+        class _Client:
+            def __init__(self):
+                self.calls = 0
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def invoke(self, messages, config=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return AIMessage(content="", tool_calls=[
+                        {"name": "update_issue", "args": {"issue_number": "1"}, "id": "c1"}])
+                return AIMessage(content="done")
+
+        class _Broken(StructuredTool):
+            def invoke(self, input, config=None, **kwargs):
+                raise RuntimeError("tool exploded")
+
+        broken = _Broken.from_function(
+            func=lambda issue_number: "x", name="update_issue", description="d", args_schema=_Args,
+            metadata={"toolkit_type": "jira"},
+        )
+        node = LLMNode(
+            client=_Client(), available_tools=[broken], tool_names=["update_issue"],
+            lazy_tools_mode=False, input_mapping={}, output_variables=["messages"],
+        )
+        from langchain_core.messages import HumanMessage
+        with run_error_flag() as holder:
+            # The node may raise or return the error text; the holder is what the test reads
+            with contextlib.suppress(Exception):
+                node.invoke({"messages": [HumanMessage(content="go")], "input": "go"})
+
+        assert holder["error"]["tool"] == "update_issue"
+        assert "tool exploded" in holder["error"]["reason"]
+
+    def test_skipped_authorization_sets_holder(self):
+        node = _node(_tool(lambda issue_number: "x"))
+        with run_error_flag() as holder:
+            node._build_mcp_auth_skipped_termination({"tool_name": "update_issue", "toolkit_name": "jira"})
+
+        assert holder["error"]["reason"] == "authorization skipped"
+
+    def test_graph_level_skipped_authorization_sets_holder(self):
+        from elitea_sdk.runtime.langchain.langraph_agent import _make_mcp_auth_skip_node
+
+        with run_error_flag() as holder:
+            _make_mcp_auth_skip_node("n", "jira", ["issue"])({})
+
+        assert holder["error"]["reason"] == "authorization skipped"
+
+    def test_first_error_wins(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("first"))
+            record_outcome(_error("second"))
+
+        assert holder["error"]["reason"] == "first"
+
+    def test_success_sets_nothing(self):
+        node = _node(_tool(lambda issue_number: "x"))
+        with run_error_flag() as holder:
+            _run(node)
+            record_outcome(ToolOutcome(status=ToolResultStatus.SUCCESS, message="ok"))
+
+        assert holder == {}
+
+    def test_sensitive_tool_reject_sets_nothing(self):
+        from unittest.mock import patch
+
+        from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+        from elitea_sdk.runtime.toolkits.security import configure_sensitive_tools, reset_sensitive_tools
+
+        configure_sensitive_tools({"jira": ["update_issue"]})
+        try:
+            guarded = SensitiveToolGuardMiddleware().wrap_tool(_tool(lambda issue_number: "x"))
+            node = _node(guarded)
+            with run_error_flag() as holder, patch(
+                "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+                side_effect=lambda payload: {"action": "reject", "value": "no"},
+            ):
+                result = _run(node)
+        finally:
+            reset_sensitive_tools()
+
+        assert result[PIPELINE_BLOCKED_KEY]
+        assert holder == {}
+
+    def test_reason_is_one_short_line(self):
+        message = "line one   with   spaces\nTraceback (most recent call last):\n  File x" + "y" * 400
+        with run_error_flag() as holder:
+            record_outcome(_error(message))
+
+        reason = holder["error"]["reason"]
+        assert "\n" not in reason
+        assert reason == "line one with spaces"
+
+    def test_long_reason_is_capped(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("x" * 500))
+
+        assert len(holder["error"]["reason"]) == 200
+
+    def test_error_survives_nested_sink_and_thread(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import contextvars
+
+        with run_error_flag() as holder:
+            with outcome_sink():
+                ctx = contextvars.copy_context()
+                with ThreadPoolExecutor(1) as pool:
+                    pool.submit(ctx.run, record_outcome, _error("from thread")).result()
+
+        assert holder["error"]["reason"] == "from thread"
+
+    def test_no_open_holder_does_not_fail(self):
+        record_outcome(_error("nobody listens"))
+
+        with run_error_flag() as holder:
+            pass
+        assert holder == {}
+
+    def test_same_tool_succeeding_later_clears_the_error(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("first try failed", tool="update_issue", toolkit="jira"))
+            resolve_run_error("update_issue", "jira")
+
+        assert holder == {}
+
+    def test_another_tool_succeeding_keeps_the_error(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("failed", tool="update_issue", toolkit="jira"))
+            resolve_run_error("get_issue", "jira")
+            resolve_run_error("update_issue", "github")
+
+        assert holder["error"]["tool"] == "update_issue"
+
+    def test_a_new_error_after_a_recovery_is_held(self):
+        with run_error_flag() as holder:
+            record_outcome(_error("one", tool="a"))
+            resolve_run_error("a")
+            record_outcome(_error("two", tool="b"))
+
+        assert holder["error"]["reason"] == "two"
+
+    def test_threads_racing_keep_exactly_one_error(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import contextvars
+
+        with run_error_flag() as holder:
+            ctx = contextvars.copy_context()
+            with ThreadPoolExecutor(8) as pool:
+                for n in range(32):
+                    pool.submit(ctx.copy().run, record_outcome, _error(f"e{n}")).result()
+                list(pool.map(lambda n: ctx.copy().run(record_outcome, _error(f"r{n}")), range(32)))
+
+        assert holder["error"]["reason"] == "e0"
+
+    def test_resolve_without_an_open_holder_does_nothing(self):
+        resolve_run_error("update_issue", "jira")
