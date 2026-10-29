@@ -100,13 +100,18 @@ def is_login_redirect(target: str) -> bool:
     return bool(segments & LOGIN_PATH_SEGMENTS) or AUTHORIZATION_REQUEST_PARAMS <= query
 
 
-def display_url(url: str) -> str:
-    """``url`` for an error message: no credentials, query or fragment."""
+def log_url(url: str) -> str:
+    """``url`` for the worker log: no credentials, query or fragment."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
     host = f"[{host}]" if ":" in host else host
     netloc = f"{host}:{parsed.port}" if parsed.port else host
     return parsed._replace(netloc=netloc, params="", query="", fragment="").geturl()
+
+
+def display_path(url: str) -> str:
+    """``url`` for a user-facing message: the path only, never the host (#7278)."""
+    return urlparse(url).path or "/"
 
 
 def edge_request_id(responses) -> Optional[str]:
@@ -123,7 +128,7 @@ def describe_exchange(method: str, url: str, responses) -> str:
     other than that id."""
     statuses = " -> ".join(str(response.status_code) for response in responses)
     request_id = edge_request_id(responses)
-    return f"{method} {display_url(url)} (statuses: {statuses}{'; ' + request_id if request_id else ''})"
+    return f"{method} {display_path(url)} (statuses: {statuses}{'; ' + request_id if request_id else ''})"
 
 
 def shares_scheme_and_host(url: str, other: str) -> bool:
@@ -235,7 +240,8 @@ class TransportNegotiator:
             if response.status_code not in RESUBMITTABLE_REDIRECTS or not is_same_origin_redirect(url, location):
                 raise McpEndpointError(sso_redirect_message(response.status_code, location))
             if is_login_redirect(location):
-                raise McpEndpointError(login_redirect_message(display_url(location),
+                logger.warning(f"[MCP negotiation] POST {log_url(url)} redirected to the login page {log_url(location)}")
+                raise McpEndpointError(login_redirect_message(display_path(location),
                                                               describe_exchange("POST", url, responses)))
             logger.info(f"[MCP negotiation] Following same-origin redirect {response.status_code} {url} -> {location}")
             url = location
@@ -272,6 +278,8 @@ class TransportNegotiator:
                 raise McpEndpointError(retired_endpoint_message(url, current_transport_url(url)))
         elif status == 400 and self.configured_auth:
             raise ValueError(GITHUB_BAD_TOKEN_MESSAGE)
+        if status >= 400:
+            logger.warning(f"[MCP negotiation] POST {log_url(url)} answered {status}")
         raise_for_unsupported_status(status, url, describe_exchange("POST", url, responses))
         return TransportDecision(STREAMABLE_HTTP, url)
 

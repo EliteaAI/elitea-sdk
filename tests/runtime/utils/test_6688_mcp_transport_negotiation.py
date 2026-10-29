@@ -235,7 +235,7 @@ class TestLegacySseFallback:
             negotiate(f"{SERVER}/events")
 
         assert str(raised.value) == (
-            f"The MCP server returned an error (405) to POST {SERVER}/events (statuses: 405). "
+            f"The MCP server returned an error (405) to POST /events (statuses: 405). "
             "Please verify the server URL and try again."
         )
 
@@ -332,7 +332,7 @@ class TestGithubBadToken:
             negotiate()
 
         assert str(raised.value) == (
-            f"The MCP server returned an error (400) to POST {SERVER}/mcp (statuses: 400). "
+            f"The MCP server returned an error (400) to POST /mcp (statuses: 400). "
             "Please verify the server URL and try again."
         )
 

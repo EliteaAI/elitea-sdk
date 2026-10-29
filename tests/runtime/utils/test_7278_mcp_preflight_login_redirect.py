@@ -6,6 +6,7 @@ method, the URL, each hop's status and the edge request id, never a body or a cr
 """
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -48,46 +49,51 @@ def test_login_redirect_rule(target, expected):
     assert is_login_redirect(target) is expected
 
 
-def test_a_redirect_to_the_login_page_is_not_followed_and_is_reported_readably(monkeypatch):
+def test_a_redirect_to_the_login_page_is_not_followed_and_is_reported_readably(monkeypatch, caplog):
     transport = patch_probe_transport(monkeypatch, routes({
         ("POST", ENDPOINT): respond(302, {"Location": "/forward-auth/login?target=%2Fapp%2F8", "cf-ray": "8f1c-AMS"},
                                     b"<html>secret page body</html>"),
         ("POST", "/forward-auth/login"): respond(405),   # the GET-only login route
     }))
 
-    with pytest.raises(McpEndpointError) as raised:
+    with caplog.at_level(logging.WARNING), pytest.raises(McpEndpointError) as raised:
         negotiate()
 
     message = str(raised.value)
     assert transport.calls == [("POST", f"{SERVER}{ENDPOINT}")]
     assert message == (
-        f"The MCP server redirected the request to a login page ({SERVER}/forward-auth/login) instead of "
-        f"answering POST {SERVER}{ENDPOINT} (statuses: 302; cf-ray: 8f1c-AMS). An MCP client cannot complete "
+        f"The MCP server redirected the request to a login page (/forward-auth/login) instead of "
+        f"answering POST {ENDPOINT} (statuses: 302; cf-ray: 8f1c-AMS). An MCP client cannot complete "
         "that login. Please verify the server URL and authentication in the toolkit settings."
     )
+    assert "platform.example.test" not in message
+    assert f"POST {SERVER}{ENDPOINT} redirected to the login page {SERVER}/forward-auth/login" in caplog.text
     assert extract_user_friendly_mcp_error(raised.value, HEADERS) == message
     assert "(405)" not in message and "fixture-credential" not in message and "secret page body" not in message
 
 
 @pytest.mark.parametrize("header", ["cf-ray", "x-request-id"])
-def test_an_unsupported_status_names_the_method_url_hops_and_request_id(monkeypatch, header):
+def test_an_unsupported_status_names_the_method_path_hops_and_request_id(monkeypatch, caplog, header):
     patch_probe_transport(monkeypatch, routes({
         ("POST", "/mcp"): respond(307, {"Location": f"{SERVER}/mcp/"}),
         ("POST", "/mcp/"): respond(405, {header: "req-42", "Content-Type": "text/plain"}, b"secret body"),
         ("GET", "/mcp/"): respond(200, {"Content-Type": "text/html"}),
     }))
 
-    with pytest.raises(McpEndpointError) as raised:
+    with caplog.at_level(logging.WARNING), pytest.raises(McpEndpointError) as raised:
         negotiate("https://user:pw@platform.example.test/mcp?token=abc")
 
     message = str(raised.value)
     assert message == (
-        f"The MCP server returned an error (405) to POST {SERVER}/mcp/ (statuses: 307 -> 405; {header}: req-42). "
+        f"The MCP server returned an error (405) to POST /mcp/ (statuses: 307 -> 405; {header}: req-42). "
         "Please verify the server URL and try again."
     )
     assert extract_user_friendly_mcp_error(raised.value, HEADERS) == message
-    for secret in ("fixture-credential", "secret body", "pw", "token=abc"):
+    assert f"POST {SERVER}/mcp/ answered 405" in caplog.text
+    for secret in ("fixture-credential", "secret body", "pw", "token=abc", "platform.example.test"):
         assert secret not in message
+    for secret in ("fixture-credential", "secret body", "user:pw", "token=abc"):
+        assert secret not in caplog.text
 
 
 def test_an_ordinary_same_origin_redirect_is_still_followed(monkeypatch):
