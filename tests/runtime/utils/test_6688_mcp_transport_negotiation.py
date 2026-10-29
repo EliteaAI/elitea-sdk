@@ -194,8 +194,8 @@ class TestLoginPages:
 
     def test_a_same_origin_redirect_ending_on_an_html_page_fails_with_the_html_message(self, monkeypatch):
         patch_probe_transport(monkeypatch, routes({
-            ("POST", "/mcp"): respond(302, {"Location": f"{SERVER}/login"}),
-            ("POST", "/login"): respond(200, {"Content-Type": "text/html"}),
+            ("POST", "/mcp"): respond(302, {"Location": f"{SERVER}/welcome"}),
+            ("POST", "/welcome"): respond(200, {"Content-Type": "text/html"}),
         }))
 
         with pytest.raises(McpEndpointError) as raised:
@@ -231,12 +231,12 @@ class TestLegacySseFallback:
             ("GET", "/events"): endpoint_event("https://elsewhere.example/messages/"),
         }))
 
-        with pytest.raises(ValueError) as raised:
+        with pytest.raises(McpEndpointError) as raised:
             negotiate(f"{SERVER}/events")
 
-        assert type(raised.value) is ValueError
         assert str(raised.value) == (
-            "The MCP server returned an error (405). Please verify the server URL and try again."
+            f"The MCP server returned an error (405) to POST /events (statuses: 405). "
+            "Please verify the server URL and try again."
         )
 
     def test_a_retired_sse_endpoint_names_itself_and_suggests_mcp(self, monkeypatch):
@@ -331,7 +331,10 @@ class TestGithubBadToken:
         with pytest.raises(ValueError) as raised:
             negotiate()
 
-        assert str(raised.value) == "The MCP server returned an error (400). Please verify the server URL and try again."
+        assert str(raised.value) == (
+            f"The MCP server returned an error (400) to POST /mcp (statuses: 400). "
+            "Please verify the server URL and try again."
+        )
 
 
 class TestUnauthorized:

@@ -218,6 +218,14 @@ def sso_redirect_message(status: int, location: str) -> str:
     )
 
 
+def login_redirect_message(location: str, exchange: str) -> str:
+    return (
+        f"{SSO_REDIRECT_PREFIX} to a login page ({location}) instead of answering {exchange}. "
+        "An MCP client cannot complete that login. Please verify the server URL and authentication "
+        "in the toolkit settings."
+    )
+
+
 def html_login_page_message() -> str:
     return (
         f"{HTML_LOGIN_PAGE_PREFIX} instead of an MCP/JSON response. This usually means the endpoint "

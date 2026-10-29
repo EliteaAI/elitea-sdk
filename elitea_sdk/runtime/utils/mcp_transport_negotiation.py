@@ -3,7 +3,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from httpx_sse import EventSource
@@ -12,6 +12,7 @@ from .mcp_oauth import (
     GITHUB_BAD_TOKEN_MESSAGE,
     McpEndpointError,
     html_login_page_message,
+    login_redirect_message,
     retired_endpoint_message,
     sso_redirect_message,
 )
@@ -32,6 +33,10 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 LEGACY_SSE_SUFFIX = "/sse"
 CURRENT_TRANSPORT_SUFFIX = "/mcp"
 PROBE_PROTOCOL_VERSION = "2024-11-05"
+LOGIN_PATH_SEGMENTS = frozenset({"login", "forward-auth"})
+AUTHORIZATION_REQUEST_PARAMS = frozenset({"client_id", "response_type"})
+EDGE_REQUEST_ID_HEADERS = ("cf-ray", "x-request-id")
+MAX_REQUEST_ID_LENGTH = 128
 
 UnauthorizedHandler = Callable[[httpx.Response], Awaitable[None]]
 
@@ -85,6 +90,47 @@ def keep_https(source: str, target: str) -> str:
     return urlparse(target)._replace(scheme=origin.scheme, netloc=origin.netloc).geturl()
 
 
+def is_login_redirect(target: str) -> bool:
+    """A redirect into a login or authorization page: a ``login`` or ``forward-auth`` path segment, or an
+    OAuth/OIDC authorization request (``client_id`` and ``response_type`` in the query). Such routes are
+    GET-only, so re-POSTing the probe into them only ends in a misleading 405 (#7278)."""
+    parsed = urlparse(target)
+    segments = {segment.lower() for segment in parsed.path.split("/")}
+    query = set(parse_qs(parsed.query, keep_blank_values=True))
+    return bool(segments & LOGIN_PATH_SEGMENTS) or AUTHORIZATION_REQUEST_PARAMS <= query
+
+
+def log_url(url: str) -> str:
+    """``url`` for the worker log: no credentials, query or fragment."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    host = f"[{host}]" if ":" in host else host
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return parsed._replace(netloc=netloc, params="", query="", fragment="").geturl()
+
+
+def display_path(url: str) -> str:
+    """``url`` for a user-facing message: the path only, never the host (#7278)."""
+    return urlparse(url).path or "/"
+
+
+def edge_request_id(responses) -> Optional[str]:
+    for response in reversed(responses):
+        for name in EDGE_REQUEST_ID_HEADERS:
+            value = response.headers.get(name, "")
+            if value and value.isprintable():
+                return f"{name}: {value[:MAX_REQUEST_ID_LENGTH]}"
+    return None
+
+
+def describe_exchange(method: str, url: str, responses) -> str:
+    """The request and the status of each hop, plus the edge's request id; never a body or a header value
+    other than that id."""
+    statuses = " -> ".join(str(response.status_code) for response in responses)
+    request_id = edge_request_id(responses)
+    return f"{method} {display_path(url)} (statuses: {statuses}{'; ' + request_id if request_id else ''})"
+
+
 def shares_scheme_and_host(url: str, other: str) -> bool:
     connection, endpoint = urlparse(url), urlparse(other)
     return connection.scheme == endpoint.scheme and connection.netloc == endpoint.netloc
@@ -128,7 +174,7 @@ def initialize_request() -> Dict:
     }
 
 
-def raise_for_unsupported_status(status: int, url: str) -> None:
+def raise_for_unsupported_status(status: int, url: str, exchange: str) -> None:
     if status == 404:
         raise ValueError(f"MCP server endpoint not found (404). Please verify the server URL is correct: {url}")
     if status == 403:
@@ -147,8 +193,10 @@ def raise_for_unsupported_status(status: int, url: str) -> None:
             "It may be down for maintenance. Please try again later."
         )
     if status >= 400:
-        raise ValueError(
-            f"The MCP server returned an error ({status}). "
+        # Shown verbatim, except where the user-facing mapper has its own guidance (401, 429)
+        error = ValueError if status in STATUSES_WITH_OWN_MEANING else McpEndpointError
+        raise error(
+            f"The MCP server returned an error ({status}) to {exchange}. "
             "Please verify the server URL and try again."
         )
 
@@ -174,22 +222,27 @@ class TransportNegotiator:
         async with self._probe_client() as client:
             if self.requested_transport == LEGACY_SSE:
                 return await self._confirm_legacy_sse(client)
-            url, response = await asyncio.wait_for(self._post_initialize(client), timeout=PROBE_TIMEOUT_SECONDS)
-            return await self._decide(client, url, response)
+            url, responses = await asyncio.wait_for(self._post_initialize(client), timeout=PROBE_TIMEOUT_SECONDS)
+            return await self._decide(client, url, responses)
 
     def _probe_client(self) -> httpx.AsyncClient:
         factory = build_httpx_client_factory(self.ssl_verify, None, SizeTrip())
         return factory(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS))
 
     async def _post_initialize(self, client: httpx.AsyncClient):
-        url = self.url
+        url, responses = self.url, []
         for _ in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
             response = await self._send_initialize(client, url)
+            responses.append(response)
             if not response.is_redirect:
-                return url, response
+                return url, responses
             location = keep_https(url, urljoin(url, response.headers.get("location", "")))
             if response.status_code not in RESUBMITTABLE_REDIRECTS or not is_same_origin_redirect(url, location):
                 raise McpEndpointError(sso_redirect_message(response.status_code, location))
+            if is_login_redirect(location):
+                logger.warning(f"[MCP negotiation] POST {log_url(url)} redirected to the login page {log_url(location)}")
+                raise McpEndpointError(login_redirect_message(display_path(location),
+                                                              describe_exchange("POST", url, responses)))
             logger.info(f"[MCP negotiation] Following same-origin redirect {response.status_code} {url} -> {location}")
             url = location
         raise McpEndpointError(sso_redirect_message(response.status_code, url))
@@ -204,7 +257,8 @@ class TransportNegotiator:
                                  follow_redirects=False) as response:
             return response
 
-    async def _decide(self, client: httpx.AsyncClient, url: str, response: httpx.Response) -> TransportDecision:
+    async def _decide(self, client: httpx.AsyncClient, url: str, responses) -> TransportDecision:
+        response = responses[-1]
         status = response.status_code
         if response.is_success:
             if is_html(response):
@@ -224,7 +278,9 @@ class TransportNegotiator:
                 raise McpEndpointError(retired_endpoint_message(url, current_transport_url(url)))
         elif status == 400 and self.configured_auth:
             raise ValueError(GITHUB_BAD_TOKEN_MESSAGE)
-        raise_for_unsupported_status(status, url)
+        if status >= 400:
+            logger.warning(f"[MCP negotiation] POST {log_url(url)} answered {status}")
+        raise_for_unsupported_status(status, url, describe_exchange("POST", url, responses))
         return TransportDecision(STREAMABLE_HTTP, url)
 
     async def _confirm_legacy_sse(self, client: httpx.AsyncClient) -> Optional[TransportDecision]:
