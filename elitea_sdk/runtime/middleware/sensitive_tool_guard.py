@@ -1,6 +1,5 @@
 """Sensitive tool authorization guard middleware."""
 
-import inspect
 import json
 import logging
 import re
@@ -8,7 +7,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 from uuid import uuid4
 
 from langchain_core.messages.base import message_to_dict
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 
 from .base import Middleware
@@ -16,7 +15,6 @@ from .tool_patching import rebind_invoke_after_copy
 
 logger = logging.getLogger(__name__)
 
-from ..tools.application import Application
 from ..toolkits.security import (
     find_sensitive_tool_match,
     get_sensitive_tool_policy,
@@ -408,142 +406,54 @@ class SensitiveToolGuardMiddleware(Middleware):
         if cache_key in self._wrapped_tools_cache:
             return self._wrapped_tools_cache[cache_key]
 
-        # Use model_copy to preserve the exact tool type, class, and all attributes.
-        # Only the execution functions (_run/_arun or func/coroutine) are replaced.
+        # Patch invoke/ainvoke of a copy for every tool type. BaseTool.run validates the
+        # input against args_schema before it calls func/_run, so a guard placed there
+        # never sees an empty or invalid call and the user is not asked first.
         guard = self
         original_tool = tool
-
-        if isinstance(tool, StructuredTool) and hasattr(tool, 'func'):
-            copied = tool.model_copy()
-            rebind_invoke_after_copy(copied)
-            original_func = tool.func
-            original_coroutine = getattr(tool, 'coroutine', None)
-
-            def guarded_func(*args: Any, **kwargs: Any) -> Any:
-                tool_input = normalize_tool_input(args, kwargs)
-                ctx = guard._build_sensitive_tool_context(original_tool, tool_input)
-                if ctx:
-                    review = guard._review_sensitive_tool_call(ctx)
-                    if review['action'] == 'reject':
-                        return guard._build_blocked_tool_result(
-                            action_label=ctx['action_label'],
-                            tool_name=ctx['tool_name'],
-                            toolkit_name=ctx['toolkit_name'],
-                            toolkit_type=ctx['toolkit_type'],
-                            user_feedback=review['value'],
-                        )
-                return original_func(*args, **kwargs)
-
-            copied.func = guarded_func
-
-            if original_coroutine is not None:
-                async def guarded_coroutine(*args: Any, **kwargs: Any) -> Any:
-                    tool_input = normalize_tool_input(args, kwargs)
-                    ctx = guard._build_sensitive_tool_context(original_tool, tool_input)
-                    if ctx:
-                        review = guard._review_sensitive_tool_call(ctx)
-                        if review['action'] == 'reject':
-                            return guard._build_blocked_tool_result(
-                                action_label=ctx['action_label'],
-                                tool_name=ctx['tool_name'],
-                                toolkit_name=ctx['toolkit_name'],
-                                toolkit_type=ctx['toolkit_type'],
-                                user_feedback=review['value'],
-                            )
-                    return await original_coroutine(*args, **kwargs)
-
-                copied.coroutine = guarded_coroutine
-
-            self._wrapped_tools_cache[cache_key] = copied
-            return copied
-
-        if isinstance(tool, Application):
-            copied = tool.model_copy()
-            rebind_invoke_after_copy(copied)
-            original_invoke = tool.invoke
-            original_ainvoke = tool.ainvoke
-
-            def guarded_invoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
-                ctx = guard._build_sensitive_tool_context(original_tool, input)
-                if ctx:
-                    review = guard._review_sensitive_tool_call(ctx)
-                    if review['action'] == 'reject':
-                        return guard._build_blocked_tool_result(
-                            action_label=ctx['action_label'],
-                            tool_name=ctx['tool_name'],
-                            toolkit_name=ctx['toolkit_name'],
-                            toolkit_type=ctx['toolkit_type'],
-                            user_feedback=review['value'],
-                        )
-                return original_invoke(input, config=config, **kwargs)
-
-            async def guarded_ainvoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
-                ctx = guard._build_sensitive_tool_context(original_tool, input)
-                if ctx:
-                    review = guard._review_sensitive_tool_call(ctx)
-                    if review['action'] == 'reject':
-                        return guard._build_blocked_tool_result(
-                            action_label=ctx['action_label'],
-                            tool_name=ctx['tool_name'],
-                            toolkit_name=ctx['toolkit_name'],
-                            toolkit_type=ctx['toolkit_type'],
-                            user_feedback=review['value'],
-                        )
-                return await original_ainvoke(input, config=config, **kwargs)
-
-            copied.invoke = guarded_invoke
-            copied.ainvoke = guarded_ainvoke
-            self._wrapped_tools_cache[cache_key] = copied
-            return copied
-
-        # Generic BaseTool subclass (e.g. BaseAction): patch _run/_arun on a copy
         copied = tool.model_copy()
         rebind_invoke_after_copy(copied)
-        original_run = tool._run
-        original_async_func = self._get_async_tool_function(tool)
-        run_accepts_run_manager = "run_manager" in inspect.signature(original_run).parameters
+        original_invoke = tool.invoke
+        original_ainvoke = tool.ainvoke
 
-        def guarded_run(*args: Any, run_manager: Any = None, **kwargs: Any) -> Any:
-            tool_input = normalize_tool_input(args, kwargs)
-            ctx = guard._build_sensitive_tool_context(original_tool, tool_input)
-            if ctx:
-                review = guard._review_sensitive_tool_call(ctx)
-                if review['action'] == 'reject':
-                    return guard._build_blocked_tool_result(
-                        action_label=ctx['action_label'],
-                        tool_name=ctx['tool_name'],
-                        toolkit_name=ctx['toolkit_name'],
-                        toolkit_type=ctx['toolkit_type'],
-                        user_feedback=review['value'],
-                    )
-            if run_accepts_run_manager:
-                return original_run(*args, run_manager=run_manager, **kwargs)
-            return original_run(*args, **kwargs)
+        def guarded_invoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
+            blocked = guard._blocked_result_if_rejected(original_tool, input)
+            if blocked is not None:
+                return blocked
+            return original_invoke(input, config=config, **kwargs)
 
-        # Set as instance attribute to shadow the class method
-        copied._run = guarded_run
+        async def guarded_ainvoke(input: Any, config: Any = None, **kwargs: Any) -> Any:
+            blocked = guard._blocked_result_if_rejected(original_tool, input)
+            if blocked is not None:
+                return blocked
+            return await original_ainvoke(input, config=config, **kwargs)
 
-        if original_async_func is not None:
-            arun_accepts_run_manager = "run_manager" in inspect.signature(original_async_func).parameters
-
-            async def guarded_arun(*args: Any, run_manager: Any = None, **kwargs: Any) -> Any:
-                tool_input = normalize_tool_input(args, kwargs)
-                ctx = guard._build_sensitive_tool_context(original_tool, tool_input)
-                if ctx:
-                    review = guard._review_sensitive_tool_call(ctx)
-                    if review['action'] == 'reject':
-                        return guard._build_blocked_tool_result(
-                            action_label=ctx['action_label'],
-                            tool_name=ctx['tool_name'],
-                            toolkit_name=ctx['toolkit_name'],
-                            toolkit_type=ctx['toolkit_type'],
-                            user_feedback=review['value'],
-                        )
-                if arun_accepts_run_manager:
-                    return await original_async_func(*args, run_manager=run_manager, **kwargs)
-                return await original_async_func(*args, **kwargs)
-
-            copied._arun = guarded_arun
-
+        # Pydantic tools reject a plain assignment of a non-field name.
+        object.__setattr__(copied, 'invoke', guarded_invoke)
+        object.__setattr__(copied, 'ainvoke', guarded_ainvoke)
         self._wrapped_tools_cache[cache_key] = copied
         return copied
+
+    def _blocked_result_if_rejected(self, tool: BaseTool, raw_input: Any) -> Optional[Any]:
+        """Review a sensitive call before the tool validates its input.
+
+        Returns the blocked result on reject, None when the call may go on. An error
+        while building the context or reviewing propagates, so a sensitive call never
+        runs unreviewed.
+        """
+        tool_input = raw_input
+        if isinstance(raw_input, dict) and raw_input.get('type') == 'tool_call':
+            tool_input = raw_input.get('args')
+        ctx = self._build_sensitive_tool_context(tool, tool_input)
+        if not ctx:
+            return None
+        review = self._review_sensitive_tool_call(ctx)
+        if review['action'] != 'reject':
+            return None
+        return self._build_blocked_tool_result(
+            action_label=ctx['action_label'],
+            tool_name=ctx['tool_name'],
+            toolkit_name=ctx['toolkit_name'],
+            toolkit_type=ctx['toolkit_type'],
+            user_feedback=review['value'],
+        )

@@ -334,6 +334,15 @@ alita_state = elitea_state.copy()
         )
         return result
 
+    def _record_blocked_error(self, tool_name: str, reason: str) -> None:
+        """A stop for authorization is a failed step for the run, though the node returns normally."""
+        record_outcome(ToolOutcome(
+            status=ToolResultStatus.ERROR,
+            message=reason,
+            tool_name=tool_name,
+            toolkit_type=(getattr(self.tool, 'metadata', None) or {}).get('toolkit_type'),
+        ))
+
     def _build_mcp_auth_skipped_termination(self, payload: dict) -> dict:
         """Stop a direct Pipeline Toolkit node cleanly after Skip."""
         tool_name = payload.get('tool_name') or self.auth_tool_name or self.tool.name
@@ -345,6 +354,7 @@ alita_state = elitea_state.copy()
             "executed because the required toolkit is unavailable.\n\n"
             "> **Tip:** Authorize the toolkit and run the pipeline again."
         )
+        self._record_blocked_error(tool_name, 'authorization skipped')
         result: dict[str, Any] = {
             "messages": [{"role": "assistant", "content": message}],
             PIPELINE_BLOCKED_KEY: message,
@@ -365,6 +375,7 @@ alita_state = elitea_state.copy()
             "Downstream nodes were not executed with an unavailable tool.\n\n"
             "> **Tip:** Run the pipeline again to load the authorized Toolkit."
         )
+        self._record_blocked_error(tool_name, 'authorized toolkit not available')
         result: dict[str, Any] = {
             "messages": [{"role": "assistant", "content": message}],
             PIPELINE_BLOCKED_KEY: message,

@@ -47,7 +47,7 @@ from ..context_floor import (
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..utils.internal_run_auth import run_token_refusal
-from ..tool_outcome import outcome_sink
+from ..tool_outcome import ToolOutcome, ToolResultStatus, outcome_sink, record_outcome
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 from ..utils.failure_signals import describe_llm_error
@@ -4605,6 +4605,14 @@ class LLMNode(BaseTool):
                             tool_call_id=tool_call_id,
                             status="error",
                         )
+                        # The middleware records its own failures; this one escaped it.
+                        record_outcome(ToolOutcome(
+                            status=ToolResultStatus.ERROR,
+                            message=f"Error executing {tool_name}: {e}",
+                            tool_name=tool_name,
+                            toolkit_type=(getattr(tool_to_execute, 'metadata', None) or {}).get('toolkit_type'),
+                            exception_type=type(e).__name__,
+                        ))
                         new_messages.append(tool_message)
                 else:
                     logger.warning(f"Tool '{tool_name}' not found in available tools")

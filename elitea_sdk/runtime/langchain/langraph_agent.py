@@ -31,6 +31,7 @@ from .utils import (
     propagate_the_input_mapping,
     safe_format,
 )
+from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome
 from ..utils.constants import TOOLKIT_NAME_META
 from ..tools.function import (
     FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
@@ -1064,6 +1065,12 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
             f"because the required data is unavailable without authentication.\n\n"
             f"> **Tip:** Authorize the toolkit and try again."
         )
+        record_outcome(ToolOutcome(
+            status=ToolResultStatus.ERROR,
+            message='authorization skipped',
+            tool_name=node_id,
+            toolkit_type=toolkit_name,
+        ))
         result = {
             "messages": [{"role": "assistant", "content": message}],
             PIPELINE_BLOCKED_KEY: message,

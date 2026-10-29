@@ -2667,3 +2667,146 @@ class TestBlockWithCommentAction:
         still routes to the resume path for the block_with_comment variants."""
         assert LangGraphAgentRunnable._is_hitl_resume({"hitl_action": action}) is True
         assert LangGraphAgentRunnable._is_hitl_resume({"action": action}) is True
+
+
+class TestGuardRunsBeforeInputCheck:
+    """The review comes before args_schema validation, for every tool type."""
+
+    @staticmethod
+    def _schema():
+        from pydantic import BaseModel
+
+        class _Args(BaseModel):
+            repo: str
+
+        return _Args
+
+    def _structured(self):
+        meta = {"toolkit_type": "github", "toolkit_name": "github"}
+        return StructuredTool.from_function(
+            func=lambda repo: f"deleted {repo}", name="delete_repo",
+            description="Delete.", args_schema=self._schema(), metadata=meta,
+        )
+
+    def _generic(self):
+        from langchain_core.tools import BaseTool
+        schema = self._schema()
+
+        class _Generic(BaseTool):
+            name: str = "delete_repo"
+            description: str = "Delete."
+            args_schema: type = schema
+
+            def _run(self, repo: str, **kwargs):
+                return f"deleted {repo}"
+
+        return _Generic(metadata={"toolkit_type": "github", "toolkit_name": "github"})
+
+    @pytest.fixture(params=["structured", "generic"])
+    def wrapped(self, request):
+        configure_sensitive_tools({"github": ["delete_repo"]})
+        tool = self._structured() if request.param == "structured" else self._generic()
+        return SensitiveToolGuardMiddleware().wrap_tool(tool)
+
+    @pytest.mark.parametrize("bad_input", [{}, {"repo": 5}, {"repo": None}])
+    def test_review_runs_before_validation_error(self, wrapped, bad_input):
+        from pydantic import ValidationError
+        reviews = []
+
+        def approve(payload):
+            reviews.append(payload)
+            return {"action": "approve", "value": ""}
+
+        with patch("elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=approve):
+            with pytest.raises((ValidationError, ValueError)):
+                wrapped.invoke(bad_input)
+
+        assert len(reviews) == 1
+
+    def test_reject_on_empty_input_returns_blocked_result(self, wrapped):
+        with patch(
+            "elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt",
+            side_effect=lambda payload: {"action": "reject", "value": "no"},
+        ):
+            result = wrapped.invoke({})
+
+        assert json.loads(result)["type"] == SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE
+
+    def test_async_review_runs_before_validation_error(self, wrapped):
+        import asyncio
+        reviews = []
+
+        def approve(payload):
+            reviews.append(payload)
+            return {"action": "approve", "value": ""}
+
+        async def run():
+            with patch("elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=approve):
+                with pytest.raises(Exception):
+                    await wrapped.ainvoke({})
+
+        asyncio.run(run())
+        assert len(reviews) == 1
+
+    def test_approve_prompts_once_and_runs_tool(self, wrapped):
+        reviews = []
+
+        def approve(payload):
+            reviews.append(payload)
+            return {"action": "approve", "value": ""}
+
+        with patch("elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=approve):
+            result = wrapped.invoke({"repo": "demo"})
+
+        assert result == "deleted demo"
+        assert len(reviews) == 1
+
+    def test_tool_call_envelope_args_are_reviewed(self, wrapped):
+        reviews = []
+
+        def approve(payload):
+            reviews.append(payload)
+            return {"action": "approve", "value": ""}
+
+        envelope = {"type": "tool_call", "id": "c1", "name": "delete_repo", "args": {"repo": "demo"}}
+        with patch("elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=approve):
+            wrapped.invoke(envelope)
+
+        assert reviews[0]["tool_args_raw"] == {"repo": "demo"}
+
+    def test_non_sensitive_tool_is_not_wrapped_or_reviewed(self):
+        configure_sensitive_tools({"github": ["delete_repo"]})
+        tool = StructuredTool.from_function(
+            func=lambda repo: "ok", name="list_repos", description="List.",
+            metadata={"toolkit_type": "github", "toolkit_name": "github"},
+        )
+        guard = SensitiveToolGuardMiddleware()
+
+        assert guard.wrap_tool(tool) is tool
+
+    def test_context_error_does_not_let_call_through(self, wrapped):
+        guard_error = RuntimeError("context failed")
+        with patch.object(
+            SensitiveToolGuardMiddleware, "_build_sensitive_tool_context", side_effect=guard_error,
+        ):
+            with pytest.raises(RuntimeError, match="context failed"):
+                wrapped.invoke({"repo": "demo"})
+
+    def test_pipeline_node_with_empty_input_is_reviewed_first(self, wrapped):
+        from elitea_sdk.runtime.tools.function import FunctionTool
+        reviews = []
+
+        def reject(payload):
+            reviews.append(payload)
+            return {"action": "reject", "value": ""}
+
+        node = FunctionTool(
+            name="delete_node", tool=wrapped, input_mapping={},
+            input_variables=[], output_variables=["out"],
+        )
+        with patch("elitea_sdk.runtime.middleware.sensitive_tool_guard.interrupt", side_effect=reject), \
+                patch("elitea_sdk.runtime.tools.function.dispatch_custom_event"):
+            result = node.invoke({})
+
+        assert len(reviews) == 1
+        assert result["_pipeline_blocked"]
