@@ -15,7 +15,6 @@
 """Merge, hyperlink and comment ranges never stretch an Excel sheet past its written cells (#7286)."""
 
 import zipfile
-from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -28,7 +27,6 @@ from elitea_sdk.runtime.langchain.document_loaders.EliteAExcelLoader import (
     ExcelReadLimitExceeded,
 )
 
-CONTACTS_EXAMPLE = str(Path(__file__).parent / "test_data" / "contacts_example.xlsx")
 FIVE_ROWS = "name | value\nrow 1 | 1\nrow 2 | 2\nrow 3 | 3\nrow 4 | 4"
 
 
@@ -123,32 +121,58 @@ def test_a_comment_far_below_the_data_adds_no_rows(tmp_path):
     assert read_file(path, max_tokens=-1) == {"Sheet": ["a | b"]}
 
 
-def test_the_attached_contacts_workbook_keeps_its_rows_and_drops_the_link_column_tail():
-    content = read_file(CONTACTS_EXAMPLE, max_tokens=-1)
+def contacts_workbook(tmp_path):
+    """The reporter's shape: a directory link from the first contact down to the last row Excel allows."""
+    workbook = Workbook()
+    contacts = workbook.active
+    contacts.title = "Contacts"
+    contacts.append(["Name", "Email", "Directory"])
+    for index in range(1, 21):
+        contacts.append([f"person {index}", f"person{index}@example.com", None])
+    contacts["C2"] = "Open directory"
+    directory = workbook.create_sheet("Directory")
+    directory.append(["Team", "Lead"])
+    directory.append(["Sales", "person 1"])
+    saved = tmp_path / "saved_contacts.xlsx"
+    workbook.save(saved)
+    path = str(tmp_path / "contacts.xlsx")
+    with zipfile.ZipFile(saved) as source, zipfile.ZipFile(path, "w") as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(b"<pageMargins", b'<hyperlinks><hyperlink ref="C2:C1048576" '
+                                                      b'location="Directory!A1"/></hyperlinks><pageMargins')
+            target.writestr(item, data)
+    return path
+
+
+def test_a_link_down_to_the_last_row_keeps_the_contact_rows_only(tmp_path):
+    content = read_file(contacts_workbook(tmp_path), max_tokens=-1)
     contacts = content["Contacts"][0].splitlines()
 
     assert list(content) == ["Contacts", "Directory"]
-    assert len(contacts) == 136
-    assert contacts[2].startswith(" | Anna Petrosyan | anna.p@example.com | EMEA | +374 10 000001 | [Open directory](None)")
-    assert contacts[-1].startswith(" | Hana Sato | hana.s@example.com |  | +374 10 000134 | [Directory!A1](None)")
-    assert content["Directory"] == ["Team | Lead\nSales | Anna Petrosyan\nSupport | Ben Carter"]
+    assert len(contacts) == 21
+    assert contacts[1] == "person 1 | person1@example.com | [Open directory](None)"
+    assert contacts[-1] == "person 20 | person20@example.com | [Directory!A1](None)"
+    assert content["Directory"] == ["Team | Lead\nSales | person 1"]
 
 
-def test_the_attached_contacts_workbook_indexes_like_read_file():
-    read = read_file(CONTACTS_EXAMPLE, max_tokens=512)
+def test_a_link_down_to_the_last_row_indexes_like_read_file(tmp_path):
+    path = contacts_workbook(tmp_path)
+    read = read_file(path, max_tokens=512)
 
-    assert indexed(CONTACTS_EXAMPLE, max_tokens=512) == "\n".join(chunk for chunks in read.values() for chunk in chunks)
+    assert indexed(path, max_tokens=512) == "\n".join(chunk for chunks in read.values() for chunk in chunks)
 
 
 @pytest.mark.parametrize("evaluate_formulas", [False, True])
-def test_read_file_opens_the_workbook_read_only(monkeypatch, evaluate_formulas):
+def test_read_file_opens_the_workbook_read_only(tmp_path, monkeypatch, evaluate_formulas):
     opened = []
     real_load_workbook = excel_module.load_workbook
     monkeypatch.setattr(excel_module, "load_workbook",
                         lambda *args, **kwargs: opened.append(kwargs) or real_load_workbook(*args, **kwargs))
     monkeypatch.setattr(EliteAExcelLoader, "_compute_formula_values", lambda self, file_path: {})
 
-    read_file(CONTACTS_EXAMPLE, max_tokens=-1, evaluate_formulas=evaluate_formulas)
+    read_file(contacts_workbook(tmp_path), max_tokens=-1, evaluate_formulas=evaluate_formulas)
 
     assert opened and all(kwargs.get("read_only") for kwargs in opened)
 
