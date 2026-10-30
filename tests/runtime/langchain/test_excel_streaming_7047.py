@@ -68,6 +68,39 @@ def loaded(path, **kwargs):
     return [(document.metadata["sheet_name"], document.page_content) for document in loader.load()]
 
 
+def written_rows(path, sheet_name):
+    read_only = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = read_only[sheet_name]
+        excel_module._measure_sheet_extent_from_cells(sheet)
+        return sheet.max_row, sheet.max_column
+    finally:
+        read_only.close()
+
+
+def rendered_cell(cell):
+    if cell.hyperlink:
+        return f"[{cell.value or ''}]({cell.hyperlink.target})"
+    return "" if cell.value is None else str(cell.value)
+
+
+def full_read(path, **kwargs):
+    """Render through openpyxl's full load up to the last written cell, the reference the streamed read must match."""
+    loader = EliteAExcelLoader(file_path=path, file_name=path, **kwargs)
+    workbook = load_workbook(path, data_only=True)
+    rendered = []
+    for name in [loader.sheet_name] if loader.sheet_name else workbook.sheetnames:
+        if name not in workbook.sheetnames:
+            rendered.append((name, f"Sheet '{name}' does not exist in the workbook."))
+            continue
+        max_row, max_column = written_rows(path, name)
+        rows = [] if max_row is None else [
+            excel_module.cell_delimiter.join(rendered_cell(cell) for cell in row)
+            for row in workbook[name].iter_rows(max_row=max_row, max_col=max_column)]
+        rendered.extend((name, chunk) for chunk in loader._format_sheet_content(rows))
+    return rendered
+
+
 LOADER_CONFIGS = [
     pytest.param({"max_tokens": -1}, id="one-chunk-per-sheet"),
     pytest.param({"max_tokens": 40}, id="token-windows"),
@@ -79,12 +112,11 @@ LOADER_CONFIGS = [
 
 
 @pytest.mark.parametrize("config", LOADER_CONFIGS)
-def test_streamed_read_matches_the_full_read(tmp_path, monkeypatch, config):
+def test_streamed_read_matches_the_full_read(tmp_path, config):
     path = build_workbook(tmp_path)
     streamed = loaded(path, skip_size_check=True, **config)
-    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
-    assert streamed == loaded(path, skip_size_check=True, **config)
+    assert streamed == full_read(path, skip_size_check=True, **config)
 
 
 def test_every_window_starts_with_the_header_exactly_once(tmp_path):
@@ -135,16 +167,50 @@ def test_streamed_read_keeps_every_row_when_the_dimension_tag_is_missing(tmp_pat
     assert rows[-1] == "omega | last"
 
 
-def test_formula_evaluation_keeps_the_full_read(tmp_path, monkeypatch):
-    path = build_workbook(tmp_path)
+def test_formula_evaluation_streams_and_fills_the_computed_values(tmp_path, monkeypatch):
+    workbook = Workbook()
+    workbook.active.title = "Calc"
+    workbook.active.append([2, "=A1*3"])
+    path = str(tmp_path / "formulas.xlsx")
+    workbook.save(path)
     opened = []
     real_load_workbook = excel_module.load_workbook
     monkeypatch.setattr(excel_module, "load_workbook",
                         lambda *args, **kwargs: opened.append(kwargs) or real_load_workbook(*args, **kwargs))
+    monkeypatch.setattr(EliteAExcelLoader, "_compute_formula_values", lambda self, file_path: {("CALC", "B1"): 6})
 
-    loaded(path, skip_size_check=True, evaluate_formulas=True, max_tokens=40)
+    content = loaded(path, skip_size_check=True, evaluate_formulas=True, max_tokens=-1)
 
-    assert opened and not any(kwargs.get("read_only") for kwargs in opened)
+    assert content == [("Calc", "2 | 6")]
+    assert [kwargs.get("read_only") for kwargs in opened] == [True]
+
+
+def test_a_falsy_computed_value_under_a_link_keeps_its_text(tmp_path, monkeypatch):
+    workbook = Workbook()
+    workbook.active.title = "Calc"
+    workbook.active.append(["=0*1", "=1>2", '=""'])
+    for column in "ABC":
+        workbook.active[f"{column}1"].hyperlink = f"http://example.com/{column}"
+    path = str(tmp_path / "falsy_formulas.xlsx")
+    workbook.save(path)
+    monkeypatch.setattr(EliteAExcelLoader, "_compute_formula_values",
+                        lambda self, file_path: {("CALC", "A1"): 0, ("CALC", "B1"): False, ("CALC", "C1"): ""})
+
+    assert loaded(path, skip_size_check=True, evaluate_formulas=True, max_tokens=-1) == [
+        ("Calc", "[0](http://example.com/A) | [False](http://example.com/B) | [](http://example.com/C)")]
+
+
+def test_a_computed_value_under_a_merge_stays_hidden(tmp_path, monkeypatch):
+    workbook = Workbook()
+    workbook.active.title = "Calc"
+    workbook.active.append(["title", None, "=1+1"])
+    workbook.active.merge_cells("A1:B1")
+    path = str(tmp_path / "merged_formula.xlsx")
+    workbook.save(path)
+    monkeypatch.setattr(EliteAExcelLoader, "_compute_formula_values",
+                        lambda self, file_path: {("CALC", "B1"): "hidden", ("CALC", "C1"): 2})
+
+    assert loaded(path, skip_size_check=True, evaluate_formulas=True, max_tokens=-1) == [("Calc", "title |  | 2")]
 
 
 def test_documents_are_produced_one_window_at_a_time(tmp_path):
@@ -179,14 +245,13 @@ def large_workbook(tmp_path, rows):
     return str(path)
 
 
-def test_indexing_keeps_one_chunk_per_sheet_the_form_submits_as_unbounded(tmp_path, monkeypatch):
+def test_indexing_keeps_one_chunk_per_sheet_the_form_submits_as_unbounded(tmp_path):
     path = large_workbook(tmp_path, 2_000)
     form_config = {".xlsx": {"max_tokens": -1, "skip_size_check": False}}
     streamed = [chunk.page_content for chunk in index_workbook(path, form_config)]
-    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
     assert len(streamed) == 1
-    assert streamed == [chunk.page_content for chunk in index_workbook(path, form_config)]
+    assert streamed == [chunk for _, chunk in full_read(path, max_tokens=-1)]
 
 
 def test_indexing_keeps_a_token_window_the_user_chose(tmp_path):
@@ -228,25 +293,23 @@ def with_wrong_dimension_tags(path):
     return rewritten
 
 
-def test_a_wrong_dimension_tag_does_not_cut_the_sheet(tmp_path, monkeypatch):
+def test_a_wrong_dimension_tag_does_not_cut_the_sheet(tmp_path):
     path = with_wrong_dimension_tags(build_workbook(tmp_path))
     streamed = loaded(path, skip_size_check=True, max_tokens=-1)
-    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
-    assert streamed == loaded(path, skip_size_check=True, max_tokens=-1)
+    assert streamed == full_read(path, skip_size_check=True, max_tokens=-1)
     assert "[sender3@example.com](https://example.com/sender)" in streamed[0][1]
 
 
-def test_an_empty_sheet_streams_like_the_full_read(tmp_path, monkeypatch):
+def test_an_empty_sheet_streams_like_the_full_read(tmp_path):
     workbook = Workbook()
     workbook.active.title = "Empty"
     workbook.create_sheet("Filled").append(["a", "b"])
     path = str(tmp_path / "with_empty.xlsx")
     workbook.save(path)
     streamed = loaded(path, skip_size_check=True, max_tokens=40)
-    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
-    assert streamed == loaded(path, skip_size_check=True, max_tokens=40)
+    assert streamed == full_read(path, skip_size_check=True, max_tokens=40)
 
 
 def test_a_loader_failing_after_it_yielded_does_not_restart_on_a_fallback_extension(monkeypatch):
@@ -379,13 +442,11 @@ def test_the_sparse_fixture_omits_empty_cells_like_excel(tmp_path, annotate):
     pytest.param({"max_tokens": 8}, id="token-windows"),
 ])
 @pytest.mark.parametrize("annotate", SPARSE_LAYOUTS)
-def test_merges_links_and_comments_outside_the_written_cells_stream_like_the_full_read(
-        tmp_path, monkeypatch, annotate, config):
+def test_merges_links_and_comments_outside_the_written_cells_stream_like_the_full_read(tmp_path, annotate, config):
     path = sparse_workbook(tmp_path, annotate.__name__, annotate)
     streamed = loaded(path, skip_size_check=True, **config)
-    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
-    assert streamed == loaded(path, skip_size_check=True, **config)
+    assert streamed == full_read(path, skip_size_check=True, **config)
 
 
 def test_a_whole_column_merge_costs_memory_per_range_not_per_cell(tmp_path):
@@ -403,7 +464,7 @@ def test_a_whole_column_merge_costs_memory_per_range_not_per_cell(tmp_path):
         tracemalloc.stop()
         read_only.close()
 
-    assert read_only.active.max_row == 1_048_576
+    assert read_only.active.max_row == 1
     assert peak < 1_000_000
     assert excel_module._render_streamed_row(("a", "b", "x"), 2, layout) == "a | b | "
 
@@ -443,9 +504,8 @@ def test_placing_links_checks_only_the_merges_on_their_row(tmp_path, monkeypatch
     assert layout.links[(1, 2)].target == "http://example.com/hidden"
 
 
-def test_a_report_with_a_merge_and_a_link_per_row_streams_like_the_full_read(tmp_path, monkeypatch):
+def test_a_report_with_a_merge_and_a_link_per_row_streams_like_the_full_read(tmp_path):
     path = report_with_a_merge_and_a_link_per_row(tmp_path, 50)
     streamed = loaded(path, skip_size_check=True, max_tokens=-1)
-    monkeypatch.setattr(EliteAExcelLoader, "_streams_workbook", lambda self: False)
 
-    assert streamed == loaded(path, skip_size_check=True, max_tokens=-1)
+    assert streamed == full_read(path, skip_size_check=True, max_tokens=-1)
