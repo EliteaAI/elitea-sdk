@@ -25,7 +25,7 @@ from json import loads
 from openpyxl import load_workbook
 from openpyxl.packaging.relationship import get_dependents, get_rels_path
 from openpyxl.utils.cell import range_boundaries
-from openpyxl.xml.constants import COMMENTS_NS, REL_NS, SHEET_MAIN_NS
+from openpyxl.xml.constants import REL_NS, SHEET_MAIN_NS
 from openpyxl.xml.functions import iterparse
 from xlrd import open_workbook
 from langchain_core.documents import Document
@@ -39,7 +39,6 @@ cell_delimiter = " | "
 HYPERLINK_TAG = f"{{{SHEET_MAIN_NS}}}hyperlink"
 RELATIONSHIP_ID_ATTRIBUTE = f"{{{REL_NS}}}id"
 MERGE_CELL_TAG = f"{{{SHEET_MAIN_NS}}}mergeCell"
-COMMENT_TAG = f"{{{SHEET_MAIN_NS}}}comment"
 SHEET_ANNOTATION_MARKERS = (b"hyperlink", b"mergeCell")
 SHEET_SCAN_BLOCK_BYTES = 1 << 20
 
@@ -552,10 +551,13 @@ def _measure_sheet_extent_from_cells(sheet) -> None:
     sheet._max_row, sheet._max_column = last_row, last_column
 
 
-def _widen_sheet_extent(sheet, ref: str) -> Tuple[int, int, int, int]:
-    min_column, min_row, max_column, max_row = range_boundaries(ref)
-    sheet._max_row = max(sheet._max_row or 0, max_row)
-    sheet._max_column = max(sheet._max_column or 0, max_column)
+def _clip_to_sheet_extent(sheet, bounds: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Keep a range inside the written cells so a whole-column annotation cannot add rows or columns (#7286)."""
+    min_column, min_row, max_column, max_row = bounds
+    max_column = min(max_column, sheet.max_column or 0)
+    max_row = min(max_row, sheet.max_row or 0)
+    if min_column > max_column or min_row > max_row:
+        return None
     return min_column, min_row, max_column, max_row
 
 
@@ -601,19 +603,6 @@ def _read_sheet_annotations(sheet) -> _SheetAnnotations:
     return annotations
 
 
-def _sheet_comment_refs(sheet, relationships) -> List[str]:
-    if relationships is None:
-        return []
-    refs = []
-    for relationship in relationships.find(COMMENTS_NS):
-        with sheet.parent._archive.open(relationship.target) as source:
-            for _, element in iterparse(source):
-                if element.tag == COMMENT_TAG and element.get('ref'):
-                    refs.append(element.get('ref'))
-                element.clear()
-    return refs
-
-
 def _render_streamed_row(values, row_number: int, layout: _StreamedSheetLayout) -> str:
     merged_ranges_on_row = layout.merged_ranges_on_row(row_number)
     return cell_delimiter.join(
@@ -622,12 +611,25 @@ def _render_streamed_row(values, row_number: int, layout: _StreamedSheetLayout) 
     )
 
 
+def _measure_sheet_extents(source) -> Dict[str, Tuple[int, int]]:
+    """Return each worksheet's last written row and column, the bound the full read must not pass."""
+    workbook = load_workbook(source, read_only=True, data_only=True)
+    try:
+        extents = {}
+        for sheet in workbook.worksheets:
+            _measure_sheet_extent_from_cells(sheet)
+            extents[sheet.title] = (sheet.max_row, sheet.max_column)
+        return extents
+    finally:
+        workbook.close()
+
+
 def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
     _measure_sheet_extent_from_cells(sheet)
     annotations = _read_sheet_annotations(sheet)
     relationships = _sheet_relationships(sheet)
 
-    merged_ranges = [_MergedRange(*_widen_sheet_extent(sheet, merged_range), xml_order=xml_order)
+    merged_ranges = [_MergedRange(*range_boundaries(merged_range), xml_order=xml_order)
                      for xml_order, merged_range in enumerate(annotations.merged_ranges)]
 
     links: Dict[Tuple[int, int], _StreamedLink] = {}
@@ -641,9 +643,14 @@ def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
     placed_links = []
     for ref, relationship_id, location in annotations.hyperlinks:
         target = relationships.get(relationship_id).Target if relationship_id and relationships else None
-        bounds = _widen_sheet_extent(sheet, ref)
-        positions = list(_cells_of(bounds)) if ":" in ref else [(bounds[1], bounds[0])]
-        placed_links.append((":" in ref, positions, target, location))
+        bounds = range_boundaries(ref)
+        spans_range = ":" in ref
+        if spans_range:
+            bounds = _clip_to_sheet_extent(sheet, bounds)
+            if bounds is None:
+                continue
+        positions = list(_cells_of(bounds)) if spans_range else [(bounds[1], bounds[0])]
+        placed_links.append((spans_range, positions, target, location))
 
     hiding = _ranges_hiding({position for _, positions, _, _ in placed_links for position in positions},
                             merged_ranges)
@@ -655,9 +662,6 @@ def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
         else:
             position = positions[0]
             bind(hiding[position].anchor if position in hiding else position, target, location)
-
-    for ref in _sheet_comment_refs(sheet, relationships):
-        _widen_sheet_extent(sheet, ref)
     return _StreamedSheetLayout(links=links, merged_rows=_MergedRangeSweep(merged_ranges))
 
 
@@ -953,6 +957,9 @@ class EliteAExcelLoader(EliteATableLoader):
 
     def _read_xlsx(self):
         """Reads .xlsx files using openpyxl, with optional formula evaluation."""
+        if not self.evaluate_formulas:
+            return {sheet_name: list(chunks) for sheet_name, chunks in self._stream_xlsx_sheets()}
+        extents = _measure_sheet_extents(self.file_path)
         workbook = load_workbook(self.file_path, data_only=True)
 
         computed_values = {}
@@ -962,12 +969,13 @@ class EliteAExcelLoader(EliteATableLoader):
         sheets = workbook.sheetnames
         if self.sheet_name:
             if self.sheet_name in sheets:
-                sheet_content = self.parse_sheet(workbook[self.sheet_name], computed_values)
+                sheet_content = self.parse_sheet(workbook[self.sheet_name], computed_values,
+                                                 extents.get(self.sheet_name))
             else:
                 sheet_content = [f"Sheet '{self.sheet_name}' does not exist in the workbook."]
             return {self.sheet_name: sheet_content}
         else:
-            return {name: self.parse_sheet(workbook[name], computed_values) for name in sheets}
+            return {name: self.parse_sheet(workbook[name], computed_values, extents.get(name)) for name in sheets}
 
     def _read_xls(self):
         """
@@ -985,11 +993,13 @@ class EliteAExcelLoader(EliteATableLoader):
             # Dictionary comprehension for all sheets
             return {name: self.parse_sheet_xls(workbook.sheet_by_name(name)) for name in sheets}
 
-    def parse_sheet(self, sheet, computed_values=None):
-        """Parses a .xlsx sheet, extracting text/hyperlinks with formula evaluation fallback."""
+    def parse_sheet(self, sheet, computed_values=None, extent: Optional[Tuple[int, int]] = None):
+        """Parses a .xlsx sheet up to its last written cell, extracting text/hyperlinks with formula fallback."""
         sheet_content = []
+        max_row, max_column = extent or (None, None)
+        rows = () if extent and max_row is None else sheet.iter_rows(max_row=max_row, max_col=max_column)
 
-        for row in sheet.iter_rows():
+        for row in rows:
             row_content = []
             for cell in row:
                 value = cell.value
@@ -1105,25 +1115,28 @@ class EliteAExcelLoader(EliteATableLoader):
                 yield sheet_name, chunk
 
     def _stream_xlsx_chunks(self) -> Iterator[Tuple[str, str]]:
+        for sheet_name, chunks in self._stream_xlsx_sheets():
+            for chunk in chunks:
+                yield sheet_name, chunk
+
+    def _stream_xlsx_sheets(self) -> Iterator[Tuple[str, Iterator[str]]]:
+        """Yield each sheet's lazily rendered chunks from one read-only workbook, shared by indexing and read_file."""
         workbook = load_workbook(self.file_path, read_only=True, data_only=True)
         try:
             if self.sheet_name and self.sheet_name not in workbook.sheetnames:
-                yield self.sheet_name, f"Sheet '{self.sheet_name}' does not exist in the workbook."
+                yield self.sheet_name, iter([f"Sheet '{self.sheet_name}' does not exist in the workbook."])
                 return
             for sheet_name in [self.sheet_name] if self.sheet_name else workbook.sheetnames:
-                for chunk in self._iter_row_chunks(self._iter_streamed_rows(workbook[sheet_name])):
-                    yield sheet_name, chunk
+                yield sheet_name, self._iter_row_chunks(self._iter_streamed_rows(workbook[sheet_name]))
         finally:
             workbook.close()
 
     def _iter_streamed_rows(self, sheet) -> Iterator[str]:
         layout = _bind_streamed_sheet_layout(sheet)
-        rows_read = 0
-        for rows_read, values in enumerate(sheet.iter_rows(values_only=True), start=1):
-            yield _render_streamed_row(values, rows_read, layout)
-        blank_row = (None,) * (sheet.max_column or 0)
-        for row_number in range(rows_read + 1, (sheet.max_row or 0) + 1):
-            yield _render_streamed_row(blank_row, row_number, layout)
+        if sheet.max_row is None:
+            return
+        for row_number, values in enumerate(sheet.iter_rows(values_only=True), start=1):
+            yield _render_streamed_row(values, row_number, layout)
 
     def iter_documents(self) -> Iterator[Document]:
         for sheet_name, chunk in self._iter_sheet_chunks():
