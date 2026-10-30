@@ -15,7 +15,9 @@ state:
     value: 2
   sha:
     type: str
-    value: "test/gh25-pr-20260422-132638-wn49"
+    # Use the default branch: dated test branches are removed by the repo's
+    # stale-branch cleanup (20 days) and then get_commits returns 404.
+    value: "main"
   tool_result:
     type: str
   commits_list:
