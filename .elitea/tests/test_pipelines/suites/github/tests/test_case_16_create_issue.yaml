@@ -59,6 +59,11 @@ nodes:
       body:
         type: variable
         value: issue_body
+      # Issues go to the SDK repo, not the suite's GITHUB_TEST_REPO, to keep test
+      # issues out of elitea-testing-public and its project board.
+      repo_name:
+        type: fixed
+        value: ${GITHUB_ISSUES_TEST_REPO:EliteaAI/elitea-sdk}
     output:
       - tool_result
     structured_output: true
@@ -106,6 +111,9 @@ nodes:
       state:
         type: fixed
         value: closed
+      repo_name:
+        type: fixed
+        value: ${GITHUB_ISSUES_TEST_REPO:EliteaAI/elitea-sdk}
     output:
       - tool_result
     structured_output: true
