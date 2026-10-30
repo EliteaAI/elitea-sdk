@@ -87,12 +87,9 @@ def test_a_whole_column_range_adds_no_rows_to_read_file(tmp_path, sheet_xml):
     assert read_file(path, max_tokens=-1) == {"Data": [FIVE_ROWS]}
 
 
-@pytest.mark.parametrize("sheet_xml", [
-    pytest.param('<mergeCells count="1"><mergeCell ref="C1:C10000"/></mergeCells>', id="merge"),
-    pytest.param('<hyperlinks><hyperlink ref="D1:D10000" location="Data!A1"/></hyperlinks>', id="hyperlink"),
-])
-def test_a_long_range_adds_no_rows_when_evaluating_formulas(tmp_path, monkeypatch, sheet_xml):
-    path = five_row_workbook(tmp_path, "long_range.xlsx", sheet_xml)
+@pytest.mark.parametrize("sheet_xml", WHOLE_COLUMN_RANGES)
+def test_a_whole_column_range_adds_no_rows_when_evaluating_formulas(tmp_path, monkeypatch, sheet_xml):
+    path = five_row_workbook(tmp_path, "whole_column.xlsx", sheet_xml)
 
     assert read_with_formulas(path, monkeypatch) == {"Data": [FIVE_ROWS]}
 
@@ -143,13 +140,15 @@ def test_the_attached_contacts_workbook_indexes_like_read_file():
     assert indexed(CONTACTS_EXAMPLE, max_tokens=512) == "\n".join(chunk for chunks in read.values() for chunk in chunks)
 
 
-def test_read_file_opens_a_plain_workbook_read_only(monkeypatch):
+@pytest.mark.parametrize("evaluate_formulas", [False, True])
+def test_read_file_opens_the_workbook_read_only(monkeypatch, evaluate_formulas):
     opened = []
     real_load_workbook = excel_module.load_workbook
     monkeypatch.setattr(excel_module, "load_workbook",
                         lambda *args, **kwargs: opened.append(kwargs) or real_load_workbook(*args, **kwargs))
+    monkeypatch.setattr(EliteAExcelLoader, "_compute_formula_values", lambda self, file_path: {})
 
-    read_file(CONTACTS_EXAMPLE, max_tokens=-1)
+    read_file(CONTACTS_EXAMPLE, max_tokens=-1, evaluate_formulas=evaluate_formulas)
 
     assert opened and all(kwargs.get("read_only") for kwargs in opened)
 

@@ -24,7 +24,7 @@ from json import loads
 
 from openpyxl import load_workbook
 from openpyxl.packaging.relationship import get_dependents, get_rels_path
-from openpyxl.utils.cell import range_boundaries
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 from openpyxl.xml.constants import REL_NS, SHEET_MAIN_NS
 from openpyxl.xml.functions import iterparse
 from xlrd import open_workbook
@@ -509,6 +509,7 @@ class _MergedRangeSweep:
 class _StreamedSheetLayout:
     links: Dict[Tuple[int, int], _StreamedLink]
     merged_rows: _MergedRangeSweep
+    computed_values: Dict[Tuple[int, int], object] = field(default_factory=dict)
 
     def merged_ranges_on_row(self, row: int) -> List[_MergedRange]:
         return self.merged_rows.ranges_on_row(row)
@@ -532,11 +533,16 @@ class _SheetAnnotations:
 
 def _render_streamed_cell(value, layout: _StreamedSheetLayout, position: Tuple[int, int],
                           merged_ranges_on_row: List[_MergedRange]) -> str:
+    computed = value is None and position in layout.computed_values
+    if computed:
+        value = layout.computed_values[position]
     if any(merged.hides(position) for merged in merged_ranges_on_row):
         value = None
     link = layout.links.get(position)
     if link is None:
         return "" if value is None else str(value)
+    if computed and value is not None:
+        return f"[{value}]({link.target})"
     shown = link.text_for_empty_cell if value is None else value
     return f"[{shown or ''}]({link.target})"
 
@@ -611,20 +617,14 @@ def _render_streamed_row(values, row_number: int, layout: _StreamedSheetLayout) 
     )
 
 
-def _measure_sheet_extents(source) -> Dict[str, Tuple[int, int]]:
-    """Return each worksheet's last written row and column, the bound the full read must not pass."""
-    workbook = load_workbook(source, read_only=True, data_only=True)
-    try:
-        extents = {}
-        for sheet in workbook.worksheets:
-            _measure_sheet_extent_from_cells(sheet)
-            extents[sheet.title] = (sheet.max_row, sheet.max_column)
-        return extents
-    finally:
-        workbook.close()
+def _sheet_computed_values(computed_values, sheet_title: str) -> Dict[Tuple[int, int], object]:
+    """Pick one sheet's evaluated formula values by cell position; the formulas library upper-cases sheet names."""
+    sheet_key = sheet_title.upper()
+    return {coordinate_to_tuple(coordinate): value
+            for (name, coordinate), value in computed_values.items() if name == sheet_key}
 
 
-def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
+def _bind_streamed_sheet_layout(sheet, computed_values=None) -> _StreamedSheetLayout:
     _measure_sheet_extent_from_cells(sheet)
     annotations = _read_sheet_annotations(sheet)
     relationships = _sheet_relationships(sheet)
@@ -662,7 +662,8 @@ def _bind_streamed_sheet_layout(sheet) -> _StreamedSheetLayout:
         else:
             position = positions[0]
             bind(hiding[position].anchor if position in hiding else position, target, location)
-    return _StreamedSheetLayout(links=links, merged_rows=_MergedRangeSweep(merged_ranges))
+    return _StreamedSheetLayout(links=links, merged_rows=_MergedRangeSweep(merged_ranges),
+                                computed_values=computed_values or {})
 
 
 def _read_xlsx_rows(openable, sheet_name, start_row, end_row,
@@ -956,26 +957,8 @@ class EliteAExcelLoader(EliteATableLoader):
             return {}
 
     def _read_xlsx(self):
-        """Reads .xlsx files using openpyxl, with optional formula evaluation."""
-        if not self.evaluate_formulas:
-            return {sheet_name: list(chunks) for sheet_name, chunks in self._stream_xlsx_sheets()}
-        extents = _measure_sheet_extents(self.file_path)
-        workbook = load_workbook(self.file_path, data_only=True)
-
-        computed_values = {}
-        if self.evaluate_formulas and isinstance(self.file_path, str):
-            computed_values = self._compute_formula_values(self.file_path)
-
-        sheets = workbook.sheetnames
-        if self.sheet_name:
-            if self.sheet_name in sheets:
-                sheet_content = self.parse_sheet(workbook[self.sheet_name], computed_values,
-                                                 extents.get(self.sheet_name))
-            else:
-                sheet_content = [f"Sheet '{self.sheet_name}' does not exist in the workbook."]
-            return {self.sheet_name: sheet_content}
-        else:
-            return {name: self.parse_sheet(workbook[name], computed_values, extents.get(name)) for name in sheets}
+        """Reads .xlsx files with the streaming reader, with optional formula evaluation."""
+        return {sheet_name: list(chunks) for sheet_name, chunks in self._stream_xlsx_sheets()}
 
     def _read_xls(self):
         """
@@ -992,31 +975,6 @@ class EliteAExcelLoader(EliteATableLoader):
         else:
             # Dictionary comprehension for all sheets
             return {name: self.parse_sheet_xls(workbook.sheet_by_name(name)) for name in sheets}
-
-    def parse_sheet(self, sheet, computed_values=None, extent: Optional[Tuple[int, int]] = None):
-        """Parses a .xlsx sheet up to its last written cell, extracting text/hyperlinks with formula fallback."""
-        sheet_content = []
-        max_row, max_column = extent or (None, None)
-        rows = () if extent and max_row is None else sheet.iter_rows(max_row=max_row, max_col=max_column)
-
-        for row in rows:
-            row_content = []
-            for cell in row:
-                value = cell.value
-                # Fall back to computed formula value when openpyxl returns None
-                # formulas library stores sheet names uppercased, so normalize for lookup
-                if value is None and computed_values:
-                    value = computed_values.get((sheet.title.upper(), cell.coordinate))
-
-                if cell.hyperlink:
-                    hyperlink = cell.hyperlink.target
-                    cell_value = value or ''
-                    row_content.append(f"[{cell_value}]({hyperlink})")
-                else:
-                    row_content.append(str(value) if value is not None else "")
-            sheet_content.append(cell_delimiter.join(row_content))
-
-        return self._format_sheet_content(sheet_content)
 
     def parse_sheet_xls(self, sheet):
         """
@@ -1103,8 +1061,7 @@ class EliteAExcelLoader(EliteATableLoader):
 
     def _streams_workbook(self) -> bool:
         extension = os.path.splitext(str(self.file_name or ''))[-1].lower()
-        return (self.skip_size_check and extension == '.xlsx'
-                and not self.evaluate_formulas and not self._is_row_range_mode())
+        return self.skip_size_check and extension == '.xlsx' and not self._is_row_range_mode()
 
     def _iter_sheet_chunks(self) -> Iterator[Tuple[str, str]]:
         if self._streams_workbook():
@@ -1121,18 +1078,22 @@ class EliteAExcelLoader(EliteATableLoader):
 
     def _stream_xlsx_sheets(self) -> Iterator[Tuple[str, Iterator[str]]]:
         """Yield each sheet's lazily rendered chunks from one read-only workbook, shared by indexing and read_file."""
+        computed_values = {}
+        if self.evaluate_formulas and isinstance(self.file_path, str):
+            computed_values = self._compute_formula_values(self.file_path)
         workbook = load_workbook(self.file_path, read_only=True, data_only=True)
         try:
             if self.sheet_name and self.sheet_name not in workbook.sheetnames:
                 yield self.sheet_name, iter([f"Sheet '{self.sheet_name}' does not exist in the workbook."])
                 return
             for sheet_name in [self.sheet_name] if self.sheet_name else workbook.sheetnames:
-                yield sheet_name, self._iter_row_chunks(self._iter_streamed_rows(workbook[sheet_name]))
+                sheet_values = _sheet_computed_values(computed_values, sheet_name)
+                yield sheet_name, self._iter_row_chunks(self._iter_streamed_rows(workbook[sheet_name], sheet_values))
         finally:
             workbook.close()
 
-    def _iter_streamed_rows(self, sheet) -> Iterator[str]:
-        layout = _bind_streamed_sheet_layout(sheet)
+    def _iter_streamed_rows(self, sheet, computed_values=None) -> Iterator[str]:
+        layout = _bind_streamed_sheet_layout(sheet, computed_values)
         if sheet.max_row is None:
             return
         for row_number, values in enumerate(sheet.iter_rows(values_only=True), start=1):
