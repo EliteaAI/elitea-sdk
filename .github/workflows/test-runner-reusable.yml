@@ -41,6 +41,11 @@ env:
 jobs:
   test-execution:
     runs-on: ubuntu-latest
+    # Container jobs default to sh (dash), whose echo expands \n inside JSON strings
+    # and breaks every `echo "$item" | jq` in the summary steps (jq exit 4).
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: read
       packages: read
