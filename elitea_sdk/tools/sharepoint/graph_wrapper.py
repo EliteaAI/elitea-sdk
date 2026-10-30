@@ -846,10 +846,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     "include_extensions / skip_extensions filters.",
                     _result_size, limit_files)
 
-            if not result:
-                raise ToolException(
-                    "Can not get files or folder is empty. "
-                    "Please, double check folder name and read permissions.")
             return result
         except ToolException:
             raise
