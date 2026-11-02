@@ -51,11 +51,13 @@ def fake(monkeypatch):
             body = json.loads(self.rfile.read(length) or b"{}") if length else {}
             with state.lock:
                 state.requests.append({"path": self.path, "body": body, "headers": dict(self.headers)})
-            status, payload = state.next(self.path)
+            status, payload, *extra = state.next(self.path)
             data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            for name, value in (extra[0] if extra else {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -166,20 +168,25 @@ class TestCheckConnection:
     def test_empty_key(self):
         assert TavilyConfiguration.check_connection({"api_key": " "}) == "Tavily API key is required"
 
-    def test_ip_block_429_says_key_was_not_checked(self, fake):
-        # #7329: Tavily blocks a whole source for ~60s and answers every key, even a garbage one, with this
-        # 429. Reporting it as a rate limit on the key misled testers; the key simply was not checked.
+    def test_429_says_key_was_not_checked_and_when_to_retry(self, fake):
+        # #7329: /usage is limited to 10 requests per 10 minutes (docs.tavily.com rate limits) and answers 429
+        # before looking at the key, so an invalid key looked "rate limited". Say the key was not checked.
         fake.reply("/usage", (429, {"detail": {"error": "Your request has been blocked due to excessive "
-                                                         "requests. Please reduce the rate of requests."}}))
+                                                         "requests. Please reduce the rate of requests."}},
+                              {"Retry-After": "60"}))
         message = TavilyConfiguration.check_connection({"api_key": KEY})
-        assert "temporarily blocking requests from this server" in message
-        assert "key was not checked" in message
-        assert "Invalid" not in message
+        assert message == ("Tavily limits key checks to 10 per 10 minutes, so the key was not checked. "
+                           "Try again in 60 seconds.")
 
-    def test_plain_429_keeps_rate_limit_message(self, fake):
-        fake.reply("/usage", (429, {"detail": {"error": "Too many requests"}}))
-        assert TavilyConfiguration.check_connection({"api_key": KEY}) == \
-            "Tavily rate limit reached, please try again later"
+    def test_429_does_not_depend_on_the_body_text(self, fake):
+        # Tavily: use the status and Retry-After, not the message text, which varies by limit type
+        fake.reply("/usage", (429, {"detail": {"error": "anything else"}}, {"Retry-After": "120"}))
+        assert TavilyConfiguration.check_connection({"api_key": KEY}).endswith("Try again in 120 seconds.")
+
+    @pytest.mark.parametrize("headers", [{}, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}])
+    def test_429_without_numeric_retry_after(self, fake, headers):
+        fake.reply("/usage", (429, {}, headers))
+        assert TavilyConfiguration.check_connection({"api_key": KEY}).endswith("Try again in a few minutes.")
 
 
 # ---- metering ---------------------------------------------------------------------------------
@@ -394,14 +401,6 @@ class TestErrorsAndSecrets:
             with pytest.raises(ToolException, match=match) as error:
                 tools(Platform())["web_search"].api_wrapper.web_search("q")
         assert KEY not in str(error.value) and KEY not in caplog.text
-
-    def test_ip_block_429_during_a_run_is_named(self, fake, monkeypatch):
-        # #7329: the same per-source block can hit a live search; the agent sees why, not a quota message
-        monkeypatch.setattr("elitea_sdk.tools.tavily.api_wrapper._sleep", lambda _s: None)
-        fake.reply("/search", (429, {"detail": {"error": "Your request has been blocked due to excessive "
-                                                          "requests. Please reduce the rate of requests."}}))
-        with pytest.raises(ToolException, match="temporarily blocking requests from this server"):
-            tools(Platform())["web_search"].api_wrapper.web_search("q")
 
     def test_no_results(self, fake):
         fake.reply("/search", search_ok(results=[]))
