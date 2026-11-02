@@ -51,11 +51,13 @@ def fake(monkeypatch):
             body = json.loads(self.rfile.read(length) or b"{}") if length else {}
             with state.lock:
                 state.requests.append({"path": self.path, "body": body, "headers": dict(self.headers)})
-            status, payload = state.next(self.path)
+            status, payload, *extra = state.next(self.path)
             data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            for name, value in (extra[0] if extra else {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -165,6 +167,26 @@ class TestCheckConnection:
 
     def test_empty_key(self):
         assert TavilyConfiguration.check_connection({"api_key": " "}) == "Tavily API key is required"
+
+    def test_429_says_key_was_not_checked_and_when_to_retry(self, fake):
+        # #7329: /usage is limited to 10 requests per 10 minutes (docs.tavily.com rate limits) and answers 429
+        # before looking at the key, so an invalid key looked "rate limited". Say the key was not checked.
+        fake.reply("/usage", (429, {"detail": {"error": "Your request has been blocked due to excessive "
+                                                         "requests. Please reduce the rate of requests."}},
+                              {"Retry-After": "60"}))
+        message = TavilyConfiguration.check_connection({"api_key": KEY})
+        assert message == ("Tavily limits key checks to 10 per 10 minutes, so the key was not checked. "
+                           "Try again in 60 seconds.")
+
+    def test_429_does_not_depend_on_the_body_text(self, fake):
+        # Tavily: use the status and Retry-After, not the message text, which varies by limit type
+        fake.reply("/usage", (429, {"detail": {"error": "anything else"}}, {"Retry-After": "120"}))
+        assert TavilyConfiguration.check_connection({"api_key": KEY}).endswith("Try again in 120 seconds.")
+
+    @pytest.mark.parametrize("headers", [{}, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}])
+    def test_429_without_numeric_retry_after(self, fake, headers):
+        fake.reply("/usage", (429, {}, headers))
+        assert TavilyConfiguration.check_connection({"api_key": KEY}).endswith("Try again in a few minutes.")
 
 
 # ---- metering ---------------------------------------------------------------------------------
