@@ -54,5 +54,12 @@ class TavilyConfiguration(BaseModel):
         if response.status_code in (403, 432, 433):
             return "Tavily rejected the key: plan or usage limit reached"
         if response.status_code == 429:
-            return "Tavily rate limit reached, please try again later"
+            # /usage allows 10 requests per 10 minutes and answers 429 before looking at the key
+            return ("Tavily limits key checks to 10 per 10 minutes, so the key was not checked. "
+                    f"Try again {_retry_hint(response)}.")
         return f"Tavily connection check failed (HTTP {response.status_code})"
+
+
+def _retry_hint(response) -> str:
+    retry_after = (response.headers.get("Retry-After") or "").strip()
+    return f"in {retry_after} seconds" if retry_after.isdigit() else "in a few minutes"
