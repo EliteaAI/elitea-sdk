@@ -6,6 +6,17 @@ DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 # Deployment-level only (tests, egress proxies): a tenant-set URL would capture the bearer key
 TAVILY_BASE_URL_ENV = "TAVILY_API_BASE_URL"
 CHECK_TIMEOUT_SECONDS = 10
+# Tavily's per-source block: it answers every key with 429 for ~60s, so the key itself is not checked
+IP_BLOCK_MARKER = "blocked due to excessive requests"
+IP_BLOCK_MESSAGE = ("Tavily is temporarily blocking requests from this server, so the key was not checked. "
+                    "Try again in a minute.")
+
+
+def is_ip_block(response) -> bool:
+    try:
+        return IP_BLOCK_MARKER in (response.text or "").lower()
+    except Exception:  # pylint: disable=W0703
+        return False
 
 
 def tavily_base_url() -> str:
@@ -54,5 +65,5 @@ class TavilyConfiguration(BaseModel):
         if response.status_code in (403, 432, 433):
             return "Tavily rejected the key: plan or usage limit reached"
         if response.status_code == 429:
-            return "Tavily rate limit reached, please try again later"
+            return IP_BLOCK_MESSAGE if is_ip_block(response) else "Tavily rate limit reached, please try again later"
         return f"Tavily connection check failed (HTTP {response.status_code})"

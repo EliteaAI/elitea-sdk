@@ -15,7 +15,7 @@ from pydantic import Field, PrivateAttr, SecretStr, create_model
 from ..elitea_base import BaseToolApiWrapper
 from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils.metering import ToolSpendDenied, metered_call
-from ...configurations.tavily import tavily_base_url
+from ...configurations.tavily import IP_BLOCK_MARKER, tavily_base_url
 from ...runtime.utils.utils import PREDICT_RUN_ID_HEADER
 
 logger = logging.getLogger(__name__)
@@ -245,6 +245,8 @@ class TavilyApiWrapper(BaseToolApiWrapper):
         if isinstance(error, ForbiddenError):
             return "Tavily refused the request: the key's plan or credit limit is reached."
         if isinstance(error, UsageLimitExceededError):
+            if IP_BLOCK_MARKER in str(error).lower():
+                return "Tavily is temporarily blocking requests from this server. Try again in a minute."
             return "Tavily rate limit reached. Try again later."
         if isinstance(error, (TavilyTimeout, requests.Timeout)):
             return "Tavily did not respond in time. Try again later."

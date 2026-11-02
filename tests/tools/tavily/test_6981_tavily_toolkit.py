@@ -166,6 +166,21 @@ class TestCheckConnection:
     def test_empty_key(self):
         assert TavilyConfiguration.check_connection({"api_key": " "}) == "Tavily API key is required"
 
+    def test_ip_block_429_says_key_was_not_checked(self, fake):
+        # #7329: Tavily blocks a whole source for ~60s and answers every key, even a garbage one, with this
+        # 429. Reporting it as a rate limit on the key misled testers; the key simply was not checked.
+        fake.reply("/usage", (429, {"detail": {"error": "Your request has been blocked due to excessive "
+                                                         "requests. Please reduce the rate of requests."}}))
+        message = TavilyConfiguration.check_connection({"api_key": KEY})
+        assert "temporarily blocking requests from this server" in message
+        assert "key was not checked" in message
+        assert "Invalid" not in message
+
+    def test_plain_429_keeps_rate_limit_message(self, fake):
+        fake.reply("/usage", (429, {"detail": {"error": "Too many requests"}}))
+        assert TavilyConfiguration.check_connection({"api_key": KEY}) == \
+            "Tavily rate limit reached, please try again later"
+
 
 # ---- metering ---------------------------------------------------------------------------------
 
@@ -379,6 +394,14 @@ class TestErrorsAndSecrets:
             with pytest.raises(ToolException, match=match) as error:
                 tools(Platform())["web_search"].api_wrapper.web_search("q")
         assert KEY not in str(error.value) and KEY not in caplog.text
+
+    def test_ip_block_429_during_a_run_is_named(self, fake, monkeypatch):
+        # #7329: the same per-source block can hit a live search; the agent sees why, not a quota message
+        monkeypatch.setattr("elitea_sdk.tools.tavily.api_wrapper._sleep", lambda _s: None)
+        fake.reply("/search", (429, {"detail": {"error": "Your request has been blocked due to excessive "
+                                                          "requests. Please reduce the rate of requests."}}))
+        with pytest.raises(ToolException, match="temporarily blocking requests from this server"):
+            tools(Platform())["web_search"].api_wrapper.web_search("q")
 
     def test_no_results(self, fake):
         fake.reply("/search", search_ok(results=[]))
