@@ -8,7 +8,7 @@ toolkits:
 state:
   query:
     type: str
-    value: "Template"
+    value: "[DO_NOT_DELETE] TC-003 Page with label"
   tool_result:
     type: str
   test_results:
