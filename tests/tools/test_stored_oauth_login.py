@@ -56,6 +56,12 @@ def test_refresh_token_field_is_hidden_and_stored_as_secret(config_cls):
     assert "refresh_token" not in config_cls.model_json_schema().get("required", [])
 
 
+def test_7345_entra_token_endpoint_accepts_v2_authority():
+    # A ".../<tenant>/v2.0" discovery endpoint gave ".../v2.0/oauth2/v2.0/token", which Entra answers with 404
+    assert entra_token_endpoint(AUTHORITY + "/v2.0") == f"{AUTHORITY}/oauth2/v2.0/token"
+    assert entra_token_endpoint(AUTHORITY + "/v2.0/") == f"{AUTHORITY}/oauth2/v2.0/token"
+
+
 def test_entra_token_endpoint_shape():
     # The v2 token endpoint is <authority>/oauth2/v2.0/token (SharePoint used a wrong path before).
     assert entra_token_endpoint(AUTHORITY + "/") == f"{AUTHORITY}/oauth2/v2.0/token"
