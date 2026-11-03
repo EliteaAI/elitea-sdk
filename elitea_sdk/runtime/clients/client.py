@@ -29,7 +29,7 @@ from ..middleware.sensitive_tool_guard import normalize_auto_approve
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..credential_slots import REASON_CODE_RE, GovernedCredentialError
 from ..utils.internal_run_auth import is_run_token_bearer, run_not_live_code
-from ..exceptions import AgentAccessDeniedError, SkillBodyUnavailable, budget_exceeded_from
+from ..exceptions import AgentAccessDeniedError, SkillBodyUnavailable, SkillFileUnavailable, budget_exceeded_from
 from ..tool_outcome import ToolOutcome, ToolResultStatus, classify_tool_error, retriable_for
 from ...tools import get_available_toolkit_models, instantiate_toolkit
 from ...tools.base_indexer_toolkit import IndexTools, read_declared_failure
@@ -185,6 +185,7 @@ class EliteAClient:
         self.toolkit_details_url = f"{self.base_url}{self.api_v2_path}/elitea_core/tool/prompt_lib/{self.project_id}"
         self.secrets_url = f"{self.base_url}{self.api_v2_path}/secrets/secret/{self.project_id}"
         self.skill_details_url = f"{self.base_url}{self.api_v2_path}/elitea_core/skill/prompt_lib"
+        self.skill_file_url = f"{self.base_url}{self.api_v2_path}/elitea_core/skill_file/prompt_lib"
         self.artifacts_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifacts/default/{self.project_id}"
         self.artifact_url = f"{self.base_url}{self.api_v2_path}/artifacts/artifact/default/{self.project_id}"
         self.bucket_url = f"{self.base_url}{self.api_v2_path}/artifacts/buckets/{self.project_id}"
@@ -199,6 +200,7 @@ class EliteAClient:
         # #6913: sub-agent version details pre-expanded by the platform, keyed "app_id:version_id"
         self.prefetched_version_details: Dict[str, dict] = {}
         self._mcp_toolkits_cache = None
+        self._skill_file_cache: Dict[tuple, bytes] = {}
         self._session = requests.Session()
         # No PAT: authenticate exactly like the browser does, with the user's session cookie.
         # Scoped to our own host so a redirect elsewhere never carries the cookie along.
@@ -1353,6 +1355,26 @@ class EliteAClient:
         if not isinstance(body, str) or not body.strip():
             raise SkillBodyUnavailable(f"Skill {skill_project_id}/{skill_id} has no instructions", denied=True)
         return body
+
+    def get_skill_file(self, skill_project_id: Optional[int], skill_id: int, version_id: int, path: str) -> bytes:
+        """Bytes of one file bundled with a skill version, fetched once per run because a version's files never change."""
+        project_id = self.project_id if skill_project_id is None else skill_project_id
+        cache_key = (project_id, version_id, path)
+        if cache_key in self._skill_file_cache:
+            return self._skill_file_cache[cache_key]
+        url = f"{self.skill_file_url}/{project_id}/{skill_id}/{version_id}/{quote(path, safe='/')}"
+        response = self._request('get', url, headers=self.headers, verify=False)
+        if response.status_code in (403, 404):
+            raise SkillFileUnavailable(
+                f"Skill file {project_id}/{skill_id}/{version_id}/{path} is not accessible ({response.status_code})",
+                denied=True,
+            )
+        if not response.ok:
+            raise SkillFileUnavailable(
+                f"Skill file {project_id}/{skill_id}/{version_id}/{path} fetch failed ({response.status_code})"
+            )
+        self._skill_file_cache[cache_key] = response.content
+        return response.content
 
     def unsecret(self, secret_name: str):
         from elitea_sdk.runtime.utils.logging import mask_sensitive_value

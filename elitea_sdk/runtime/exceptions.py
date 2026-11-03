@@ -181,3 +181,7 @@ class SkillBodyUnavailable(Exception):
     def __init__(self, message: str, denied: bool = False):
         super().__init__(message)
         self.denied = denied
+
+
+class SkillFileUnavailable(SkillBodyUnavailable):
+    """A skill file the run cannot fetch; ``denied`` when access was refused rather than failing transiently."""

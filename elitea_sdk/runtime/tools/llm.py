@@ -141,9 +141,13 @@ from .hitl import (
 )
 from .skill_tools import (
     LoadSkillTool,
+    ReadSkillFileTool,
     SearchSkillsTool,
+    SkillFileTool,
     build_load_skill_tools,
     loaded_skill_names_from_messages,
+    read_skill_file_keys_from_messages,
+    render_loaded_skill,
     render_skill_registry_index,
     render_skill_suggestions,
 )
@@ -768,6 +772,7 @@ class LLMNode(BaseTool):
             configurable.get('project_skills'),
             skill_search=configurable.get('skill_search'),
             skill_body_fetcher=self._resolve_skill_body_fetcher(configurable),
+            skill_file_fetcher=getattr(self.elitea_client, 'get_skill_file', None),
         )
 
         def merge_skill_tools(tools):
@@ -2177,7 +2182,7 @@ class LLMNode(BaseTool):
             if not instructions or not str(instructions).strip():
                 continue
             # No cap here: elitea_core resolves at most the agent's skill limit per message.
-            entries.append(SKILLS_SECTION_ENTRY.format(name=name, instructions=instructions))
+            entries.append(render_loaded_skill(SKILLS_SECTION_ENTRY, name, instructions, skill.get('files')))
 
         if not entries:
             return ""
@@ -4422,10 +4427,12 @@ class LLMNode(BaseTool):
                 # Seed load_skill with bodies already in context so a re-load
                 # answers "already active" (#5698); semantics documented on
                 # loaded_skill_names_from_messages.
-                if isinstance(tool_to_execute, LoadSkillTool):
+                if isinstance(tool_to_execute, (LoadSkillTool, SkillFileTool)):
                     tool_to_execute.mark_already_loaded(
                         loaded_skill_names_from_messages(new_messages)
                     )
+                if isinstance(tool_to_execute, ReadSkillFileTool):
+                    tool_to_execute.mark_already_read(read_skill_file_keys_from_messages(new_messages))
 
                 if tool_to_execute:
                     try:

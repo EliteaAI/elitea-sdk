@@ -865,6 +865,76 @@ LOAD_SKILL_UNAVAILABLE = (
 LOAD_SKILL_UNAVAILABLE_DENIED = "it is no longer accessible"
 LOAD_SKILL_UNAVAILABLE_TRANSIENT = "its instructions could not be fetched right now"
 
+SKILL_ROOT_URI = "skill://{name}"
+
+SKILL_FILES_BLOCK = """Skill root: skill://{name}/
+Read this skill's files only with read_skill_file(skill="{name}", path="{example}") and list them with list_skill_files(skill="{name}", dir="<folder>"), passing paths relative to the skill root; never use other tools for these files and never treat skill:// as a filesystem path.{scripts_note}
+<skill_files>
+{listing}
+</skill_files>"""
+SKILL_FILES_BLOCK_END = "</skill_files>"
+SKILL_FILES_SCRIPTS_NOTE = "\nYou cannot run scripts here; read one and follow it yourself."
+SKILL_FILES_LISTING_LIMIT = 30
+SKILL_FILES_LISTING_FILE = "{path} ({size})"
+SKILL_FILES_LISTING_DIRECTORY = "{path}/ ({count} {unit})"
+SKILL_FILES_LISTING_MORE = "… and {count} more"
+SKILL_SCRIPT_DIRECTORY = "scripts"
+SKILL_SCRIPT_EXTENSIONS = (".py", ".js", ".sh")
+SKILL_SHELL_UNAVAILABLE = "[shell command execution is not available on this platform]"
+SKILL_DIR_PLACEHOLDERS = ("${CLAUDE_SKILL_DIR}", "${CLAUDE_PLUGIN_ROOT}")
+
+READ_SKILL_FILE_TOOL_DESCRIPTION = (
+    "Read one file bundled with a loaded skill. A loaded skill that has files lists them in a "
+    "<skill_files> block under its skill root (skill://<name>/). Pass the skill's exact name and the "
+    "file's path relative to that root, such as path=\"forms.md\" or path=\"scripts/check.py\". A skill "
+    "that is not loaded yet is loaded by the same call, its instructions first. For a large text file pass start_line and end_line (1-based, "
+    "inclusive) to read part of it. Use this tool, never another file tool, for skill files."
+)
+LIST_SKILL_FILES_TOOL_DESCRIPTION = (
+    "List the files bundled with a loaded skill, with their sizes. Pass dir to list one folder, such as "
+    "dir=\"scripts\"; omit it to list every file. A skill that is not loaded yet is loaded by the same call."
+)
+
+READ_SKILL_FILE_PREFIX = 'Skill "{name}" file "{path}"{lines}'
+READ_SKILL_FILE_LINES = " lines {start}-{end}"
+READ_SKILL_FILE_PREFIX_RE = re.compile(
+    '^Skill "([^"]+)" file "([^"]+)"((?: lines [0-9]+-(?:[0-9]+|end))?):\n'
+)
+READ_SKILL_FILE_RESULT = READ_SKILL_FILE_PREFIX + """:
+<skill_file path="{path}">
+{content}
+</skill_file>"""
+READ_SKILL_FILE_ALREADY_READ = (
+    'Skill "{name}" file "{path}"{lines} is already in this conversation. Use the earlier result '
+    'instead of reading it again.'
+)
+LIST_SKILL_FILES_RESULT = 'Files of skill "{name}" under {root}:\n{listing}'
+SKILL_FILE_AFTER_LOAD = "{loaded}\n\n{result}"
+
+SKILL_FILE_UNKNOWN_SKILL = (
+    "No skill named \"{name}\" with files is available to this agent. Skills with files: {available}. "
+    "Pass one of these exact names, or proceed without the file."
+)
+SKILL_FILE_SKILL_NOT_LOADED = (
+    "Skill \"{name}\" is not loaded in this conversation, so its files cannot be read yet. "
+    "Call load_skill with \"{name}\" first, then read its files."
+)
+SKILL_FILE_SKILL_WITHOUT_FILES = "Skill \"{name}\" has no files; its instructions are all it provides."
+SKILL_FILE_OUTSIDE_ROOT = (
+    "Path \"{path}\" is outside skill \"{name}\". Pass a path relative to the skill root, "
+    "as listed in <skill_files>."
+)
+SKILL_FILE_NOT_FOUND = (
+    "Skill \"{name}\" has no file \"{path}\". Did you mean: {suggestions}? "
+    "Call list_skill_files(skill=\"{name}\") to see every file."
+)
+SKILL_FILE_FOLDER_NOT_FOUND = "Skill \"{name}\" has no folder \"{path}\". Its folders: {available}."
+SKILL_FILE_BINARY = "\"{path}\" is a binary {content_type} of {size} bytes; it cannot be read as text."
+SKILL_FILE_UNAVAILABLE = "Skill \"{name}\" file \"{path}\" could not be read: {reason}."
+SKILL_FILE_UNAVAILABLE_DENIED = "it is no longer accessible"
+SKILL_FILE_UNAVAILABLE_TRANSIENT = "it could not be fetched right now"
+SKILL_FILE_SUGGESTION_LIMIT = 3
+
 
 SEARCH_INDEX_ADDON = """
 ## Indexed Document Search
