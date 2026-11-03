@@ -1267,6 +1267,7 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                 tool_handled = True
                 # remote mcp tool initialization with token injection
                 settings = dict(tool['settings'])
+                settings.pop('credential_form', None)   # Main's stamp for request_credential (#7228), not an MCP option
                 url = settings.get('url')
 
                 # Normalize deprecated endpoint forms (e.g. Atlassian /v1/sse -> /v1/mcp/authv2)
@@ -1788,6 +1789,16 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
         _envelopes.clear()
     _released_slots.clear()
     logger.debug(f"[RUNTIME_TOOLS] EliteA tools loaded: {_elitea_loaded_count} tools")
+
+    # (#7228) a governed run whose token scope holds `credentials`: the shape-only credential form tool, once
+    from ..tools.request_credential import RequestCredentialTool, credential_form_requested
+    if credential_form_requested(tools_list, elitea_client) and not any(
+            getattr(t, 'name', None) == RequestCredentialTool().name for t in tools):
+        form_tool = RequestCredentialTool()
+        form_tool.metadata = {'toolkit_type': 'internal', 'toolkit_name': 'request_credential',
+                              'display_name': 'Credential form'}
+        _patch_tool_invoke(form_tool)
+        tools.append(form_tool)
 
     # Add MCP tools registered via elitea-mcp CLI (static registry)
     # Note: Tools with type='mcp' are already handled in main loop above
