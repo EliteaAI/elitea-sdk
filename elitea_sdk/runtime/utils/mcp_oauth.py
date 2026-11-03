@@ -1040,7 +1040,8 @@ def entra_token_endpoint(oauth_discovery_endpoint: str) -> str:
     """Token endpoint for an Entra authority such as https://login.microsoftonline.com/<tenant>."""
     if not is_entra_url(oauth_discovery_endpoint):
         raise ValueError("OAuth authority must be https://login.microsoftonline.com/<tenant>")
-    return f"{oauth_discovery_endpoint.rstrip('/')}/oauth2/v2.0/token"
+    # the token path already carries v2.0, so ".../<tenant>/v2.0" must not double it
+    return f"{oauth_discovery_endpoint.rstrip('/').removesuffix('/v2.0')}/oauth2/v2.0/token"
 
 
 def access_token_from_stored_login(settings: dict, default_scope: str = "https://graph.microsoft.com/.default"):

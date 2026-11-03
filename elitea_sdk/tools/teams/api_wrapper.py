@@ -65,7 +65,7 @@ class TeamsApiWrapper(BaseModel):
 
         token_endpoint = self.oauth_token_endpoint
         if not token_endpoint and self.oauth_discovery_endpoint:
-            base = self.oauth_discovery_endpoint.rstrip("/")
+            base = self.oauth_discovery_endpoint.rstrip("/").removesuffix("/v2.0")
             token_endpoint = f"{base}/oauth2/v2.0/token"
 
         client_secret_str = None
