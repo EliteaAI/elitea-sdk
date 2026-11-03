@@ -10,8 +10,11 @@ entry carries none. Loaded bodies are ToolMessages that ride the message history
 never the cached prefix.
 """
 
+import difflib
+import json
 import logging
 import math
+import posixpath
 import re
 import unicodedata
 from collections import Counter
@@ -23,9 +26,13 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, PrivateAttr
 
 from ..exceptions import SkillBodyUnavailable
+from ...tools.utils.file_metadata import bound_read_result
 from ..langchain.constants import (
     INSTRUCTION_REFERENCED_HINT,
+    LIST_SKILL_FILES_RESULT,
+    LIST_SKILL_FILES_TOOL_DESCRIPTION,
     LOAD_SKILL_ALREADY_ACTIVE,
+    LOAD_SKILL_ALREADY_ACTIVE_RE,
     LOAD_SKILL_LISTED_TOOL_DESCRIPTION,
     LOAD_SKILL_TOOL_DESCRIPTION,
     LOAD_SKILL_UNAVAILABLE,
@@ -35,6 +42,11 @@ from ..langchain.constants import (
     LOAD_SKILL_UNKNOWN_LISTED,
     LOADED_SKILL_PREFIX_RE,
     LOADED_SKILL_RESULT,
+    READ_SKILL_FILE_ALREADY_READ,
+    READ_SKILL_FILE_LINES,
+    READ_SKILL_FILE_PREFIX_RE,
+    READ_SKILL_FILE_RESULT,
+    READ_SKILL_FILE_TOOL_DESCRIPTION,
     SEARCH_SKILLS_DESCRIPTION_MAX_CHARS,
     SEARCH_SKILLS_NAME_WEIGHT,
     SEARCH_SKILLS_NO_MATCH,
@@ -56,6 +68,30 @@ from ..langchain.constants import (
     SKILL_SUGGESTIONS_LIMIT,
     SKILL_SUGGESTIONS_MIN_TOKEN_CHARS,
     SKILL_SUGGESTIONS_SCORE_FLOOR,
+    SKILL_DIR_PLACEHOLDERS,
+    SKILL_FILE_BINARY,
+    SKILL_FILE_FOLDER_NOT_FOUND,
+    SKILL_FILE_NOT_FOUND,
+    SKILL_FILE_OUTSIDE_ROOT,
+    SKILL_FILE_AFTER_LOAD,
+    SKILL_FILE_SKILL_NOT_LOADED,
+    SKILL_FILE_SKILL_WITHOUT_FILES,
+    SKILL_FILE_SUGGESTION_LIMIT,
+    SKILL_FILE_UNAVAILABLE,
+    SKILL_FILE_UNAVAILABLE_DENIED,
+    SKILL_FILE_UNAVAILABLE_TRANSIENT,
+    SKILL_FILE_UNKNOWN_SKILL,
+    SKILL_FILES_BLOCK,
+    SKILL_FILES_BLOCK_END,
+    SKILL_FILES_LISTING_DIRECTORY,
+    SKILL_FILES_LISTING_FILE,
+    SKILL_FILES_LISTING_LIMIT,
+    SKILL_FILES_LISTING_MORE,
+    SKILL_FILES_SCRIPTS_NOTE,
+    SKILL_ROOT_URI,
+    SKILL_SCRIPT_DIRECTORY,
+    SKILL_SCRIPT_EXTENSIONS,
+    SKILL_SHELL_UNAVAILABLE,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,24 +107,23 @@ WORD_CATEGORY_CLASSES = frozenset("LNM")
 FORMAT_CATEGORY = "Cf"
 ZERO_WIDTH_SPACE = "​"
 DOTTED_SMALL_I = "i̇"
+SKILL_URI_SCHEME = 'skill://'
+SHELL_FENCE_PATTERN = re.compile(r'^[ \t]*```!.*?^[ \t]*```[ \t]*$', re.MULTILINE | re.DOTALL)
+SHELL_LINE_PATTERN = re.compile(r'^[ \t]*!`.*$', re.MULTILINE)
 UNSEGMENTED_RUN_PATTERN = re.compile(
     "[฀-໿က-႟ក-៿々-〇぀-ヿ㐀-鿿"
     "가-힯豈-﫿\U00020000-\U0003134f]+"
 )
 
 
-def loaded_skill_names_from_messages(messages) -> set:
-    """Names (lowercased) of skills whose loaded bodies are present in the given
-    message history. Derived from context rather than stored state: if
-    summarization drops a body, its name disappears from this set and a genuine
-    re-load becomes possible again.
+def collect_tool_results(messages, tool_name: str) -> list:
+    """Text results in the history of calls to ``tool_name``, matched through the owning AIMessage's tool_calls.
 
-    Only ToolMessages whose tool_call_id maps back to a load_skill call (via the
-    owning AIMessage's tool_calls) are counted, so another tool's output that
-    happens to start with the loaded-skill marker cannot suppress a genuine
-    load. Unmappable ids fail open (not counted): the worst case is one
-    duplicate body, never a permanently unloadable skill."""
-    names = set()
+    Only ToolMessages whose tool_call_id maps back to a call of that tool count, so
+    another tool's output that happens to start with the same marker is ignored.
+    Unmappable ids fail open (not counted).
+    """
+    results = []
     call_tool_names = {}
     for message in messages or []:
         for tool_call in getattr(message, 'tool_calls', None) or []:
@@ -97,13 +132,116 @@ def loaded_skill_names_from_messages(messages) -> set:
             if call_id:
                 call_tool_names[call_id] = call_name
         content = getattr(message, 'content', None)
-        if getattr(message, 'type', '') == 'tool' and isinstance(content, str):
-            if call_tool_names.get(getattr(message, 'tool_call_id', None)) != 'load_skill':
-                continue
-            match = LOADED_SKILL_PREFIX_RE.match(content)
-            if match:
-                names.add(match.group(1).strip().lower())
-    return names
+        if getattr(message, 'type', '') == 'tool' and isinstance(content, str) \
+                and call_tool_names.get(getattr(message, 'tool_call_id', None)) == tool_name:
+            results.append(content)
+    return results
+
+
+def loaded_skill_names_from_messages(messages) -> set:
+    """Names (lowercased) of skills whose loaded bodies are present in the given
+    message history. Derived from context rather than stored state: if
+    summarization drops a body, its name disappears from this set and a genuine
+    re-load becomes possible again. The worst case of an unmappable call id is one
+    duplicate body, never a permanently unloadable skill."""
+    results = [
+        content for tool_name in ('load_skill', 'read_skill_file', 'list_skill_files')
+        for content in collect_tool_results(messages, tool_name)
+    ]
+    return {
+        match.group(1).strip().lower()
+        for match in (LOADED_SKILL_PREFIX_RE.match(content) for content in results)
+        if match
+    }
+
+
+def split_auto_loaded(content: str) -> tuple:
+    """A file tool's result as the skill it loaded on the way (empty when it loaded none) and its own answer."""
+    if not LOADED_SKILL_PREFIX_RE.match(content):
+        return '', content
+    loaded, _separator, answer = content.partition(SKILL_FILES_BLOCK_END)
+    return loaded + SKILL_FILES_BLOCK_END, answer.lstrip('\n')
+
+
+def read_skill_file_keys_from_messages(messages) -> set:
+    """(skill, path, lines) of skill file reads whose contents are still in the history, derived like loaded skills."""
+    return {
+        (match.group(1).strip().lower(), match.group(2), match.group(3))
+        for match in (
+            READ_SKILL_FILE_PREFIX_RE.match(split_auto_loaded(content)[1])
+            for content in collect_tool_results(messages, 'read_skill_file')
+        )
+        if match
+    }
+
+
+def select_skill_files(files) -> list:
+    """The manifest entries that name a path."""
+    return [entry for entry in files or [] if isinstance(entry, dict) and entry.get('path')]
+
+
+def format_file_size(size) -> str:
+    """A file size the way the listing shows it: bytes below 1 KB, then whole KB, then MB."""
+    size = size if isinstance(size, int) and size >= 0 else 0
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{math.ceil(size / 1024)} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def render_skill_body(name: str, instructions: str) -> str:
+    """The body with skill directory placeholders pointing at the skill root and shell commands disabled."""
+    root = SKILL_ROOT_URI.format(name=name)
+    for placeholder in SKILL_DIR_PLACEHOLDERS:
+        instructions = instructions.replace(placeholder, root)
+    instructions = SHELL_FENCE_PATTERN.sub(SKILL_SHELL_UNAVAILABLE, instructions)
+    return SHELL_LINE_PATTERN.sub(SKILL_SHELL_UNAVAILABLE, instructions)
+
+
+def has_scripts(files: list) -> bool:
+    """Whether a skill bundles anything the model might try to execute."""
+    return any(
+        entry['path'].split('/', 1)[0].lower() == SKILL_SCRIPT_DIRECTORY
+        or entry['path'].lower().endswith(SKILL_SCRIPT_EXTENSIONS)
+        for entry in files
+    )
+
+
+def render_skill_files_listing(files: list) -> str:
+    """Top-level files with sizes and folders collapsed to a file count, capped at the listing limit."""
+    folders = Counter(entry['path'].split('/', 1)[0] for entry in files if '/' in entry['path'])
+    entries = sorted(
+        [(entry['path'], SKILL_FILES_LISTING_FILE.format(path=entry['path'], size=format_file_size(entry.get('size'))))
+         for entry in files if '/' not in entry['path']]
+        + [(folder, SKILL_FILES_LISTING_DIRECTORY.format(path=folder, count=count, unit='file' if count == 1 else 'files'))
+           for folder, count in folders.items()],
+        key=lambda item: item[0].casefold(),
+    )
+    lines = [line for _key, line in entries[:SKILL_FILES_LISTING_LIMIT]]
+    if len(entries) > SKILL_FILES_LISTING_LIMIT:
+        lines.append(SKILL_FILES_LISTING_MORE.format(count=len(entries) - SKILL_FILES_LISTING_LIMIT))
+    return '\n'.join(lines)
+
+
+def render_skill_files_block(name: str, files) -> str:
+    """The skill root, how to read its files and their listing; empty for a skill without files."""
+    files = select_skill_files(files)
+    if not files:
+        return ''
+    return SKILL_FILES_BLOCK.format(
+        name=name,
+        example=min((entry['path'] for entry in files), key=lambda path: (path.count('/'), path.casefold())),
+        scripts_note=SKILL_FILES_SCRIPTS_NOTE if has_scripts(files) else '',
+        listing=render_skill_files_listing(files),
+    )
+
+
+def render_loaded_skill(template: str, name: str, instructions: str, files=None) -> str:
+    """A loaded skill as the model reads it: the template around the rendered body, then its files block."""
+    rendered = template.format(name=name, instructions=render_skill_body(name, str(instructions)))
+    files_block = render_skill_files_block(name, files)
+    return f"{rendered}\n\n{files_block}" if files_block else rendered
 
 
 def _normalize_skill_name(skill: dict) -> str:
@@ -240,7 +378,8 @@ class LoadSkillTool(BaseTool):
     }
     _already_loaded: set = PrivateAttr(default_factory=set)
 
-    def _load(self, skill: str) -> str:
+    def load(self, skill: str) -> str:
+        """The skill's body as load_skill answers it, or the reason the model gets instead."""
         matched = self.registry.resolve(skill)
         if not matched:
             logger.info("[Skills] load_skill unknown name %r; %d skills available", skill, len(self.registry))
@@ -262,7 +401,7 @@ class LoadSkillTool(BaseTool):
             return LOAD_SKILL_UNAVAILABLE.format(name=name, reason=reason)
         self._already_loaded.add(normalized_name)
         logger.info("[Skills] load_skill served %r", name)
-        return LOADED_SKILL_RESULT.format(name=name, instructions=instructions)
+        return render_loaded_skill(LOADED_SKILL_RESULT, name, instructions, matched.get('files'))
 
     def _is_invoked(self, matched: dict) -> bool:
         invoked_keys = {_build_skill_identity(s) for s in self.invoked_skills if s.get('skill_id') is not None}
@@ -296,10 +435,229 @@ class LoadSkillTool(BaseTool):
         self._already_loaded.update((n or '').strip().lower() for n in names or ())
 
     def _run(self, skill: str, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        return self._load(skill)
+        return self.load(skill)
 
     async def _arun(self, skill: str, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        return self._load(skill)
+        return self.load(skill)
+
+
+class ReadSkillFileInput(BaseModel):
+    skill: str = Field(description="Exact name of a skill that has files.")
+    path: str = Field(description="Path of the file relative to the skill root, as listed in <skill_files>, such as \"forms.md\".")
+    start_line: Optional[int] = Field(default=None, description="First line to read (1-based, inclusive). Omit to read from the beginning.")
+    end_line: Optional[int] = Field(default=None, description="Last line to read (1-based, inclusive). Omit to read to the end.")
+
+
+class ListSkillFilesInput(BaseModel):
+    skill: str = Field(description="Exact name of a skill that has files.")
+    dir: Optional[str] = Field(default=None, description="Folder relative to the skill root, such as \"scripts\". Omit to list every file.")
+
+
+class SkillFileTool(BaseTool):
+    """Serves the files of skills in the registry or active through ~name this turn, and nothing else; a skill not
+    loaded yet is loaded through ``loader`` by the same call."""
+
+    registry: Any = Field(exclude=True)
+    invoked_skills: list = Field(default_factory=list, exclude=True)
+    loader: Optional[Any] = Field(default=None, exclude=True)
+    metadata: dict = {
+        "toolkit_type": "internal",
+        "toolkit_name": "skills",
+        "display_name": "Skills",
+    }
+    _already_loaded: set = PrivateAttr(default_factory=set)
+
+    def mark_already_loaded(self, names) -> None:
+        """Seed the names of skills whose bodies are in the conversation (called by the tool loop)."""
+        self._already_loaded.update((n or '').strip().lower() for n in names or ())
+
+    def _resolve_loaded_skill(self, skill: str) -> tuple:
+        """The skill entry, its files and the body this call loaded (empty when already loaded), or the refusal."""
+        normalized = (skill or '').strip().lower()
+        invoked = {_normalize_skill_name(s): s for s in self.invoked_skills if isinstance(s, dict)}
+        matched = self.registry.resolve(skill) or invoked.get(normalized)
+        if not matched:
+            available = sorted({
+                s.get('name') for s in self.registry.entries + list(invoked.values()) if select_skill_files(s.get('files'))
+            })
+            return None, [], SKILL_FILE_UNKNOWN_SKILL.format(name=skill, available=', '.join(available) or '(none)'), ''
+        name = matched.get('name')
+        files = select_skill_files(matched.get('files'))
+        if not files:
+            return None, [], SKILL_FILE_SKILL_WITHOUT_FILES.format(name=name), ''
+        if normalized in self._already_loaded or normalized in invoked:
+            return matched, files, None, ''
+        if self.loader is None:
+            logger.info("[Skills] %s refused for %r: not loaded", self.name, name)
+            return None, [], SKILL_FILE_SKILL_NOT_LOADED.format(name=name), ''
+        loaded = self.loader.load(name)
+        if LOAD_SKILL_ALREADY_ACTIVE_RE.match(loaded):
+            loaded = ''
+        elif not LOADED_SKILL_PREFIX_RE.match(loaded):
+            return None, [], loaded, ''
+        self._already_loaded.add(normalized)
+        logger.info("[Skills] %s loaded %r on the way", self.name, name)
+        return matched, files, None, loaded
+
+    @staticmethod
+    def _after_load(loaded: str, answer) -> str:
+        """The tool's answer, after the skill body this call loaded."""
+        return SKILL_FILE_AFTER_LOAD.format(loaded=loaded, result=answer) if loaded else answer
+
+
+def normalize_skill_path(name: str, path: str) -> Optional[str]:
+    """The path relative to the skill root, or None when it points outside the skill."""
+    path = (path or '').strip()
+    if path.lower().startswith(SKILL_URI_SCHEME):
+        root_name, _separator, path = path[len(SKILL_URI_SCHEME):].partition('/')
+        if root_name.strip().lower() != (name or '').strip().lower():
+            return None
+    if path.startswith('/'):
+        return None
+    normalized = posixpath.normpath(path) if path else ''
+    if normalized == '..' or normalized.startswith('../'):
+        return None
+    return '' if normalized == '.' else normalized
+
+
+def find_skill_file(files: list, path: str) -> tuple:
+    """The manifest entry for a path (exact, then case-insensitive) and, when there is none, the closest manifest paths."""
+    exact = [entry for entry in files if entry['path'] == path]
+    if exact:
+        return exact[0], []
+    folded = [entry for entry in files if entry['path'].casefold() == path.casefold()]
+    if len(folded) == 1:
+        return folded[0], []
+    if folded:
+        return None, [entry['path'] for entry in folded]
+    by_folded = {entry['path'].casefold(): entry['path'] for entry in files}
+    closest = difflib.get_close_matches(path.casefold(), list(by_folded), n=SKILL_FILE_SUGGESTION_LIMIT, cutoff=0)
+    return None, [by_folded[match] for match in closest]
+
+
+def describe_line_range(start_line: Optional[int], end_line: Optional[int]) -> str:
+    """The line range as it appears in a read result; empty for a whole-file read."""
+    if start_line is None and end_line is None:
+        return ''
+    return READ_SKILL_FILE_LINES.format(start=start_line or 1, end='end' if end_line is None else end_line)
+
+
+class ReadSkillFileTool(SkillFileTool):
+    name: str = "read_skill_file"
+    description: str = READ_SKILL_FILE_TOOL_DESCRIPTION
+    args_schema: type[BaseModel] = ReadSkillFileInput
+    file_fetcher: Optional[Any] = Field(default=None, exclude=True)
+    _already_read: set = PrivateAttr(default_factory=set)
+
+    def mark_already_read(self, keys) -> None:
+        """Seed the (skill, path, lines) reads whose contents are in the conversation (called by the tool loop)."""
+        self._already_read.update(keys or ())
+
+    def _read(self, skill: str, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None):
+        """One file of a skill as text, after its body when this call loaded it, or the reason the model gets."""
+        matched, files, refusal, loaded = self._resolve_loaded_skill(skill)
+        if refusal:
+            return refusal
+        return self._after_load(loaded, self._read_file(matched, files, path, start_line, end_line))
+
+    def _read_file(self, matched: dict, files: list, path: str, start_line: Optional[int], end_line: Optional[int]):
+        """One file of a loaded skill as text, or the reason the model gets instead."""
+        name = matched.get('name')
+        relative_path = normalize_skill_path(name, path)
+        if relative_path is None:
+            return SKILL_FILE_OUTSIDE_ROOT.format(name=name, path=path)
+        entry, suggestions = find_skill_file(files, relative_path)
+        if entry is None:
+            return SKILL_FILE_NOT_FOUND.format(
+                name=name, path=path, suggestions=', '.join(f'"{s}"' for s in suggestions),
+            )
+        file_path = entry['path']
+        lines = describe_line_range(start_line, end_line)
+        read_key = (_normalize_skill_name(matched), file_path, lines)
+        if read_key in self._already_read:
+            return READ_SKILL_FILE_ALREADY_READ.format(name=name, path=file_path, lines=lines)
+        if not entry.get('is_text'):
+            return SKILL_FILE_BINARY.format(
+                path=file_path, content_type=entry.get('content_type') or 'file', size=entry.get('size') or 0,
+            )
+        content, reason = self._fetch(matched, file_path)
+        if content is None:
+            logger.warning("[Skills] read_skill_file %r/%r unavailable: %s", name, file_path, reason)
+            return SKILL_FILE_UNAVAILABLE.format(name=name, path=file_path, reason=reason)
+        bounded = bound_read_result(content, file_path, start_line=start_line, end_line=end_line)
+        if not isinstance(bounded, str):
+            return json.dumps(bounded, ensure_ascii=False)
+        self._already_read.add(read_key)
+        logger.info("[Skills] read_skill_file served %r/%r", name, file_path)
+        return READ_SKILL_FILE_RESULT.format(name=name, path=file_path, lines=lines, content=bounded)
+
+    def _fetch(self, matched: dict, path: str) -> tuple:
+        """The file's text, or None and the reason it could not be fetched."""
+        if not callable(self.file_fetcher):
+            return None, SKILL_FILE_UNAVAILABLE_TRANSIENT
+        try:
+            data = self.file_fetcher(
+                matched.get('skill_project_id'), matched.get('skill_id'),
+                matched.get('skill_version_id', matched.get('version_id')), path,
+            )
+        except SkillBodyUnavailable as e:
+            return None, SKILL_FILE_UNAVAILABLE_DENIED if e.denied else SKILL_FILE_UNAVAILABLE_TRANSIENT
+        except Exception as e:  # pylint: disable=W0703
+            logger.warning("[Skills] file fetch for %r/%r failed: %s", matched.get('name'), path, e)
+            return None, SKILL_FILE_UNAVAILABLE_TRANSIENT
+        if isinstance(data, str):
+            return data, ''
+        return bytes(data or b'').decode('utf-8', errors='replace'), ''
+
+    def _run(self, skill: str, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
+             run_manager: Optional[CallbackManagerForToolRun] = None):
+        return self._read(skill, path, start_line, end_line)
+
+    async def _arun(self, skill: str, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
+                    run_manager: Optional[CallbackManagerForToolRun] = None):
+        return self._read(skill, path, start_line, end_line)
+
+
+class ListSkillFilesTool(SkillFileTool):
+    name: str = "list_skill_files"
+    description: str = LIST_SKILL_FILES_TOOL_DESCRIPTION
+    args_schema: type[BaseModel] = ListSkillFilesInput
+
+    def _list(self, skill: str, folder: Optional[str] = None) -> str:
+        """The files of a skill, or of one of its folders, after its body when this call loaded it."""
+        matched, files, refusal, loaded = self._resolve_loaded_skill(skill)
+        if refusal:
+            return refusal
+        return self._after_load(loaded, self._list_files(matched, files, folder))
+
+    def _list_files(self, matched: dict, files: list, folder: Optional[str]) -> str:
+        """The files of a loaded skill, or of one of its folders, with sizes."""
+        name = matched.get('name')
+        relative_folder = normalize_skill_path(name, folder or '')
+        if relative_folder is None:
+            return SKILL_FILE_OUTSIDE_ROOT.format(name=name, path=folder)
+        prefix = f"{relative_folder.rstrip('/')}/" if relative_folder else ''
+        selected = [entry for entry in files if entry['path'].casefold().startswith(prefix.casefold())]
+        if not selected:
+            folders = sorted({
+                posixpath.dirname(entry['path']) for entry in files if '/' in entry['path']
+            }, key=str.casefold)
+            return SKILL_FILE_FOLDER_NOT_FOUND.format(name=name, path=folder, available=', '.join(folders) or '(none)')
+        listing = '\n'.join(
+            SKILL_FILES_LISTING_FILE.format(path=entry['path'], size=format_file_size(entry.get('size')))
+            for entry in sorted(selected, key=lambda entry: entry['path'].casefold())
+        )
+        return LIST_SKILL_FILES_RESULT.format(
+            name=name, root=f"{SKILL_ROOT_URI.format(name=name)}/{prefix}", listing=listing,
+        )
+
+    def _run(self, skill: str, dir: Optional[str] = None,  # pylint: disable=W0622
+             run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        return self._list(skill, dir)
+
+    async def _arun(self, skill: str, dir: Optional[str] = None,  # pylint: disable=W0622
+                    run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        return self._list(skill, dir)
 
 
 class SearchSkillsInput(BaseModel):
@@ -475,23 +833,35 @@ def rank_skills_scored(query: str, skills: list, limit: int = SEARCH_SKILLS_RESU
 
 def build_load_skill_tools(
     attached_skills, invoked_skills=None, project_skills=None, skill_search=None, skill_body_fetcher=None,
+    skill_file_fetcher=None,
 ) -> List[BaseTool]:
     if not attached_skills and not project_skills:
         return []
     registry = SkillRegistry.from_sources(attached_skills, project_skills, build_skill_ranker(skill_search))
     if not project_skills:
         logger.debug("[Skills] Binding load_skill with %d attached skills", len(registry))
-        return [LoadSkillTool(
+        tools = [LoadSkillTool(
             registry=registry, invoked_skills=invoked_skills or [], body_fetcher=skill_body_fetcher,
             listed=True, description=LOAD_SKILL_LISTED_TOOL_DESCRIPTION, args_schema=LoadSkillListedInput,
         )]
-    logger.debug(
-        "[Skills] Binding search_skills + load_skill over %d skills (%d attached, %d project)",
-        len(registry), len(attached_skills or []), len(project_skills or []),
-    )
-    return [
-        SearchSkillsTool(registry=registry),
-        LoadSkillTool(registry=registry, invoked_skills=invoked_skills or [], body_fetcher=skill_body_fetcher),
+    else:
+        logger.debug(
+            "[Skills] Binding search_skills + load_skill over %d skills (%d attached, %d project)",
+            len(registry), len(attached_skills or []), len(project_skills or []),
+        )
+        tools = [
+            SearchSkillsTool(registry=registry),
+            LoadSkillTool(registry=registry, invoked_skills=invoked_skills or [], body_fetcher=skill_body_fetcher),
+        ]
+    if not any(select_skill_files(skill.get('files')) for skill in registry.entries):
+        return tools
+    logger.debug("[Skills] Binding read_skill_file + list_skill_files: a registry skill has files")
+    loader = tools[-1]
+    return tools + [
+        ReadSkillFileTool(
+            registry=registry, invoked_skills=invoked_skills or [], loader=loader, file_fetcher=skill_file_fetcher,
+        ),
+        ListSkillFilesTool(registry=registry, invoked_skills=invoked_skills or [], loader=loader),
     ]
 
 
