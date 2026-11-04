@@ -29,7 +29,6 @@ from ..langchain.constants import (
     SKILL_SEARCH_REMINDER_SUFFIX,
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
-    SKILL_SCRIPT_DEFAULT_ATTACHMENT_BUCKET,
 )
 from ..langchain.utils import (
     args_match_normalized,
@@ -1070,7 +1069,7 @@ class LLMNode(BaseTool):
         return SkillScriptRunner(
             ScriptRunContext(
                 client=self.elitea_client,
-                bucket=configurable.get('attachment_bucket') or SKILL_SCRIPT_DEFAULT_ATTACHMENT_BUCKET,
+                bucket=configurable.get('attachment_bucket') or 'attachments',
                 conversation_key=str(conversation_key),
             ),
             file_fetcher=self.elitea_client.get_skill_file,

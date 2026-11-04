@@ -10,17 +10,13 @@ from unittest.mock import MagicMock
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from elitea_sdk.runtime.langchain.constants import (
-    RUN_SKILL_SCRIPT_NO_OUTPUT,
-    SKILL_FILES_RUN_SCRIPTS_NOTE,
-    SKILL_FILES_SCRIPTS_NOTE,
-    SKILL_SCRIPT_INLINE_OUTPUT_CHARS,
-    SKILL_SCRIPT_OUTPUT_PREVIEW_CHARS,
-)
+from elitea_sdk.runtime.langchain.constants import SKILL_FILES_RUN_SCRIPTS_NOTE, SKILL_FILES_SCRIPTS_NOTE
 from elitea_sdk.runtime.langchain.sandbox_types import CodeExecutionResult
 from elitea_sdk.runtime.tool_outcome import ToolResultStatus, outcome_sink
 from elitea_sdk.runtime.tools.llm import LLMNode
 from elitea_sdk.runtime.tools.skill_script_runner import (
+    INLINE_OUTPUT_CHARS,
+    OUTPUT_PREVIEW_CHARS,
     SCRATCH_ROOT_PREFIX,
     ScratchCaps,
     ScriptRunContext,
@@ -156,14 +152,15 @@ class FakeClient:
             return {info.filename: archive.read(info) for info in archive.infolist()}
 
 
-DRIVER = '''import asyncio, ast, json, sys
-program = sys.stdin.read()
-body, last = program.rstrip("\\n").rsplit("\\n", 1)
+DRIVER = '''import ast, asyncio, json, sys
+tree = ast.parse(sys.stdin.read())
+last = ast.Expression(tree.body.pop().value)
 namespace = {}
-pending = eval(compile(body, "<program>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT), namespace)
-if asyncio.iscoroutine(pending):
-    asyncio.run(pending)
-sys.stdout.write(json.dumps(eval(last, namespace)))
+exec(compile(tree, "<program>", "exec"), namespace)
+value = eval(compile(last, "<program>", "eval", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT), namespace)
+if asyncio.iscoroutine(value):
+    value = asyncio.run(value)
+sys.stdout.write(json.dumps(value))
 '''
 
 
@@ -383,7 +380,7 @@ def test_an_uncaught_exception_is_exit_code_1_with_the_traceback(tmp_path):
 def test_a_script_without_output_says_so(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    assert _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}) == f'Exit code 0\n{RUN_SKILL_SCRIPT_NO_OUTPUT}'
+    assert _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}) == 'Exit code 0\n(no output)'
 
 
 def test_a_timeout_is_an_error_that_says_nothing_was_captured(tmp_path):
@@ -404,15 +401,18 @@ def test_output_over_the_ceiling_is_saved_and_previewed_then_readable_by_range(t
     lines = result.split('\n')
     assert lines[0] == 'Exit code 0'
     assert lines[1].startswith('Output too large (') and 'skill-output://call1' in lines[1]
-    assert f'Preview (first {SKILL_SCRIPT_OUTPUT_PREVIEW_CHARS} characters):' in result
+    assert f'Preview (first {OUTPUT_PREVIEW_CHARS} characters):' in result
     assert 'NEEDLE' not in result
-    assert len(result) < SKILL_SCRIPT_INLINE_OUTPUT_CHARS
+    assert len(result) < INLINE_OUTPUT_CHARS
     reader = _read_output_tool(runner)
     tail = reader.invoke({'ref': 'skill-output://call1', 'start_line': 1200, 'end_line': 1201})
     assert tail.startswith('Script output skill-output://call1 lines 1200-1201:\n<script_output>\n')
     assert 'NEEDLE=abc123' in tail
-    assert reader.invoke({'ref': 'skill-output://nope'}).startswith('Saved script output skill-output://nope is no longer available')
-    assert reader.invoke({'ref': 'call1'}).startswith('"call1" is not a saved script output reference')
+    assert reader.invoke({'ref': 'skill-output://nope'}).startswith('"skill-output://nope" is not an available saved script output.')
+    downloads_before = sum(1 for call in client.calls if call[0] == 'download')
+    assert reader.invoke({'ref': 'call1'}).startswith('"call1" is not an available saved script output.')
+    assert reader.invoke({'ref': 'skill-output://../../call1'}).startswith('"skill-output://../../call1" is not an available')
+    assert sum(1 for call in client.calls if call[0] == 'download') == downloads_before
 
 
 def test_a_shell_script_is_refused_with_a_python_only_message(tmp_path):
@@ -450,7 +450,7 @@ def test_running_a_script_of_a_skill_not_loaded_yet_loads_it_first(tmp_path):
     result = _run_tool(runner, loaded=()).invoke({'skill': 'demo', 'path': 'scripts/helper.py'})
 
     assert result.startswith('Skill "demo" is now active')
-    assert result.endswith(f'\n\nExit code 0\n{RUN_SKILL_SCRIPT_NO_OUTPUT}')
+    assert result.endswith('\n\nExit code 0\n(no output)')
     assert loaded_skill_names_from_messages([
         AIMessage(content='', tool_calls=[{'id': 'c1', 'name': 'run_skill_script', 'args': {}}]),
         ToolMessage(content=result, tool_call_id='c1'),

@@ -48,7 +48,6 @@ from ..langchain.constants import (
     READ_SKILL_FILE_RESULT,
     READ_SKILL_FILE_TOOL_DESCRIPTION,
     READ_SKILL_OUTPUT_TOOL_DESCRIPTION,
-    RUN_SKILL_SCRIPT_NOT_PYTHON,
     RUN_SKILL_SCRIPT_TOOL_DESCRIPTION,
     SEARCH_SKILLS_DESCRIPTION_MAX_CHARS,
     SEARCH_SKILLS_NAME_WEIGHT,
@@ -92,18 +91,13 @@ from ..langchain.constants import (
     SKILL_FILES_LISTING_MORE,
     SKILL_FILES_RUN_SCRIPTS_NOTE,
     SKILL_FILES_SCRIPTS_NOTE,
-    SKILL_OUTPUT_BAD_REF,
-    SKILL_OUTPUT_NOT_FOUND,
-    SKILL_OUTPUT_RESULT,
-    SKILL_OUTPUT_URI_RE,
     SKILL_ROOT_URI,
     SKILL_SCRIPT_DIRECTORY,
     SKILL_SCRIPT_EXTENSIONS,
     SKILL_SHELL_UNAVAILABLE,
-    SKILL_SCRIPT_INLINE_OUTPUT_CHARS,
 )
 from .sandbox import _read_sandbox_limits_from_env
-from .skill_script_runner import is_python_script
+from .skill_script_runner import INLINE_OUTPUT_CHARS, is_python_script
 
 logger = logging.getLogger(__name__)
 
@@ -695,7 +689,7 @@ class RunSkillScriptInput(BaseModel):
 class RunSkillScriptTool(SkillFileTool):
     name: str = "run_skill_script"
     description: str = RUN_SKILL_SCRIPT_TOOL_DESCRIPTION.format(
-        timeout=int(_read_sandbox_limits_from_env()['timeout_seconds']), inline_chars=SKILL_SCRIPT_INLINE_OUTPUT_CHARS,
+        timeout=int(_read_sandbox_limits_from_env()['timeout_seconds']), inline_chars=INLINE_OUTPUT_CHARS,
     )
     args_schema: type[BaseModel] = RunSkillScriptInput
     runner: Any = Field(exclude=True)
@@ -718,7 +712,10 @@ class RunSkillScriptTool(SkillFileTool):
                 name=name, path=path, suggestions=', '.join(f'"{s}"' for s in suggestions),
             )
         if not is_python_script(entry['path']):
-            return RUN_SKILL_SCRIPT_NOT_PYTHON.format(path=entry['path'])
+            return (
+                f'"{entry["path"]}" cannot run here: only Python (.py) scripts run on this platform. '
+                'Read it with read_skill_file and follow it yourself.'
+            )
         return self.runner.run(matched, manifest, entry['path'], args, files)
 
     def _run(self, skill: str, path: str, args: Optional[List[str]] = None, files: Optional[List[str]] = None,
@@ -751,17 +748,18 @@ class ReadSkillOutputTool(BaseTool):
 
     def _read(self, ref: str, start_line: Optional[int] = None, end_line: Optional[int] = None):
         """A saved script output as text, or the reason the model gets instead."""
-        match = SKILL_OUTPUT_URI_RE.match((ref or '').strip())
-        if not match:
-            return SKILL_OUTPUT_BAD_REF.format(ref=ref)
-        call_id = match.group(1)
-        text = self.store.read_output(call_id)
+        text = self.store.read_output(ref)
         if text is None:
-            return SKILL_OUTPUT_NOT_FOUND.format(ref=ref)
-        bounded = bound_read_result(text, f"{call_id}.txt", start_line=start_line, end_line=end_line)
+            return (
+                f'"{ref}" is not an available saved script output. Pass the skill-output://<id> reference exactly as '
+                "a run_skill_script result gave it; if it has expired with the conversation's script storage, run the "
+                "script again."
+            )
+        bounded = bound_read_result(text, "script-output.txt", start_line=start_line, end_line=end_line)
         if not isinstance(bounded, str):
             return json.dumps(bounded, ensure_ascii=False)
-        return SKILL_OUTPUT_RESULT.format(ref=ref, lines=describe_line_range(start_line, end_line), content=bounded)
+        lines = describe_line_range(start_line, end_line)
+        return f"Script output {ref}{lines}:\n<script_output>\n{bounded}\n</script_output>"
 
     def _run(self, ref: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
              run_manager: Optional[CallbackManagerForToolRun] = None):
