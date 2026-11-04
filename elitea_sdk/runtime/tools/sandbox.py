@@ -267,6 +267,56 @@ def _cgroup_memory_pressure_pct() -> Optional[float]:
         return None
 
 
+def enforce_sandbox_admission(limits: Dict[str, Any]) -> None:
+    """Refuse a new Deno sandbox, retriably, while the pod is at its concurrency or memory-pressure limit."""
+    max_concurrent = limits["max_concurrent"]
+    if max_concurrent and max_concurrent > 0:
+        n_deno = _count_deno_processes()
+        if n_deno >= max_concurrent:
+            logger.warning(
+                "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
+                n_deno, max_concurrent,
+            )
+            raise SandboxAdmissionRefused(
+                f"Sandbox busy: {n_deno} concurrent executions at limit "
+                f"{max_concurrent}. Retry shortly.",
+                "service_busy",
+            )
+
+    pressure_pct = limits["memory_pressure_pct"]
+    if pressure_pct and pressure_pct > 0:
+        current_pressure = _cgroup_memory_pressure_pct()
+        if current_pressure is not None and current_pressure >= pressure_pct:
+            logger.warning(
+                "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
+                current_pressure, pressure_pct,
+            )
+            raise SandboxAdmissionRefused(
+                f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
+                f"{pressure_pct}%. Retry shortly.",
+                "out_of_memory",
+            )
+
+
+def build_offline_pyodide_sandbox():
+    """The local sandbox third-party code runs in: no network, no subprocesses, no FFI, only the Pyodide cache dirs
+    readable. Never the remote sandbox service, whose runner has network on and no per-call network setting."""
+    from ..langchain.pyodide_sandbox import PyodideSandbox
+    sandbox_base = os.environ.get("SANDBOX_BASE", os.path.expanduser('~/.cache/pyodide'))
+    sandbox_tmp = os.path.join(sandbox_base, "tmp")
+    deno_cache = os.environ.get("DENO_DIR", os.path.expanduser('~/.cache/deno'))
+    return PyodideSandbox(
+        stateful=False,
+        allow_env=["SANDBOX_BASE"],
+        allow_read=[sandbox_base, sandbox_tmp, deno_cache],
+        allow_write=[sandbox_tmp, deno_cache],
+        allow_net=False,
+        allow_run=False,
+        allow_ffi=False,
+        node_modules_dir="auto",
+    )
+
+
 # Create input schema for the sandbox tool
 sandbox_tool_input = create_model(
     "SandboxToolInput",
@@ -491,33 +541,7 @@ class PyodideSandboxTool(BaseTool):
                 # Reject (soft, retriable) rather than spawn another sandbox when the
                 # box is already at capacity. Both checks read shared OS/cgroup state,
                 # are self-healing (no counter to leak), and fail OPEN on probe error.
-                max_concurrent = limits["max_concurrent"]
-                if max_concurrent and max_concurrent > 0:
-                    n_deno = _count_deno_processes()
-                    if n_deno >= max_concurrent:
-                        logger.warning(
-                            "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
-                            n_deno, max_concurrent,
-                        )
-                        raise SandboxAdmissionRefused(
-                            f"Sandbox busy: {n_deno} concurrent executions at limit "
-                            f"{max_concurrent}. Retry shortly.",
-                            "service_busy",
-                        )
-
-                pressure_pct = limits["memory_pressure_pct"]
-                if pressure_pct and pressure_pct > 0:
-                    current_pressure = _cgroup_memory_pressure_pct()
-                    if current_pressure is not None and current_pressure >= pressure_pct:
-                        logger.warning(
-                            "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
-                            current_pressure, pressure_pct,
-                        )
-                        raise SandboxAdmissionRefused(
-                            f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
-                            f"{pressure_pct}%. Retry shortly.",
-                            "out_of_memory",
-                        )
+                enforce_sandbox_admission(limits)
             # --- End admission gate ----------------------------------------------
             gate_s = time.perf_counter() - arun_start
 

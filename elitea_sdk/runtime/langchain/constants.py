@@ -874,6 +874,13 @@ Read this skill's files only with read_skill_file(skill="{name}", path="{example
 </skill_files>"""
 SKILL_FILES_BLOCK_END = "</skill_files>"
 SKILL_FILES_SCRIPTS_NOTE = "\nYou cannot run scripts here; read one and follow it yourself."
+SKILL_FILES_RUN_SCRIPTS_NOTE = (
+    "\nRun one of this skill's Python scripts with run_skill_script(skill=\"{name}\", path=\"{example}\", args=[...], "
+    "files=[...]): it runs offline in a sandbox with the skill's files at /skills/{name}/, in a working directory "
+    "that persists between script calls of this conversation (it may expire between sessions); attachments named in "
+    "files appear under inputs/, and anything the script writes directly under output/ is shared with the user. Only "
+    ".py files run; other scripts cannot run on this platform."
+)
 SKILL_FILES_LISTING_LIMIT = 30
 SKILL_FILES_LISTING_FILE = "{path} ({size})"
 SKILL_FILES_LISTING_DIRECTORY = "{path}/ ({count} {unit})"
@@ -934,6 +941,87 @@ SKILL_FILE_UNAVAILABLE = "Skill \"{name}\" file \"{path}\" could not be read: {r
 SKILL_FILE_UNAVAILABLE_DENIED = "it is no longer accessible"
 SKILL_FILE_UNAVAILABLE_TRANSIENT = "it could not be fetched right now"
 SKILL_FILE_SUGGESTION_LIMIT = 3
+
+RUN_SKILL_SCRIPT_TOOL_DESCRIPTION = (
+    "Run a Python script bundled with a loaded skill, when the skill's instructions say to. Pass the skill's exact "
+    "name, the script's path relative to the skill root (such as path=\"scripts/check.py\"), its command-line "
+    "arguments as a list of strings, and in files the names of conversation attachments the script must read. The "
+    "script runs offline in a Python sandbox with no network and no platform access, for at most "
+    "{timeout} seconds: the skill's files are at /skills/<name>/, the working directory persists between script "
+    "calls of this conversation (it may expire between sessions), attachments named in files appear under inputs/, "
+    "and files the script writes directly under output/ are shared with the user as attachments. The result is "
+    "\"Exit code N\" followed by what the script printed; output over {inline_chars} characters is saved and "
+    "returned as a preview with a skill-output:// reference for read_skill_output. Only .py files run."
+)
+READ_SKILL_OUTPUT_TOOL_DESCRIPTION = (
+    "Read the saved output of an earlier run_skill_script call whose result named a skill-output:// reference, by "
+    "line range (1-based, inclusive). Omit start_line and end_line to read it from the beginning."
+)
+
+RUN_SKILL_SCRIPT_RESULT_PREFIX = "Exit code {exit_code}"
+RUN_SKILL_SCRIPT_RESULT_PREFIX_RE = re.compile(r'^Exit code (-?[0-9]+)')
+RUN_SKILL_SCRIPT_STDERR_HEADING = "[stderr]"
+RUN_SKILL_SCRIPT_NO_OUTPUT = "(no output)"
+RUN_SKILL_SCRIPT_TIMEOUT_RESULT = (
+    "Exit code -1 (timed out after {timeout} s)\nNo output was captured; the script was stopped."
+)
+RUN_SKILL_SCRIPT_OUTPUT_SAVED = (
+    "Output too large ({size}). Full output saved as {ref}; read it with "
+    "read_skill_output(ref=\"{ref}\", start_line=1, end_line=200).\nPreview (first {preview_chars} characters):\n"
+    "{preview}"
+)
+RUN_SKILL_SCRIPT_FILES_SHARED = "Files shared: {listing}"
+RUN_SKILL_SCRIPT_SCRATCH_CAP_EXCEEDED = (
+    "Files written by this call were not kept: the conversation's script storage would exceed {cap}. "
+    "Delete files the scripts no longer need, or write results under output/."
+)
+RUN_SKILL_SCRIPT_NOT_PYTHON = (
+    "\"{path}\" cannot run here: only Python (.py) scripts run on this platform. Read it with read_skill_file and "
+    "follow it yourself."
+)
+RUN_SKILL_SCRIPT_INPUT_NOT_FOUND = (
+    "No attachment named \"{name}\" is in this conversation. Attachments available: {available}."
+)
+RUN_SKILL_SCRIPT_INPUT_NONE = "(none)"
+RUN_SKILL_SCRIPT_SCRATCH_OVER_CAP = (
+    "The script cannot start: the conversation's script storage holds {usage}, over the limit of {cap}. "
+    "A script may delete files it no longer needs."
+)
+RUN_SKILL_SCRIPT_INPUT_OVER_CAP = (
+    "The script cannot start: attachment \"{name}\" is {size}, over the {cap} limit for one staged file."
+)
+RUN_SKILL_SCRIPT_UNAVAILABLE = "The script could not be run: {reason}."
+RUN_SKILL_SCRIPT_UNAVAILABLE_SANDBOX = "the sandbox is not available right now"
+RUN_SKILL_SCRIPT_UNAVAILABLE_STAGING = "the skill's files could not be fetched right now"
+RUN_SKILL_SCRIPT_UNAVAILABLE_SCRATCH = "the conversation's script storage could not be reached"
+RUN_SKILL_SCRIPT_UNAVAILABLE_STORAGE = "the run has no storage for scripts"
+RUN_SKILL_SCRIPT_TRACE_LABEL = "Skill Scripts"
+
+SKILL_OUTPUT_URI = "skill-output://{call_id}"
+SKILL_OUTPUT_URI_RE = re.compile(r'^skill-output://([A-Za-z0-9_-]+)$')
+SKILL_OUTPUT_RESULT = "Script output {ref}{lines}:\n<script_output>\n{content}\n</script_output>"
+SKILL_OUTPUT_BAD_REF = (
+    "\"{ref}\" is not a saved script output reference. Pass the skill-output://<id> reference exactly as a "
+    "run_skill_script result gave it."
+)
+SKILL_OUTPUT_NOT_FOUND = (
+    "Saved script output {ref} is no longer available (it was never saved, or the conversation's script storage "
+    "expired). Run the script again if its output is still needed."
+)
+
+SKILL_SCRIPT_INLINE_OUTPUT_CHARS = 30_000
+SKILL_SCRIPT_OUTPUT_PREVIEW_CHARS = 2_000
+SKILL_SCRATCH_MAX_FILE_BYTES = 10 * 1024 * 1024
+SKILL_SCRATCH_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+SKILL_SCRATCH_MAX_FILES = 200
+SKILL_SCRATCH_PREFIX = ".scratch"
+SKILL_SCRATCH_OUTPUTS_FOLDER = ".outputs"
+SKILL_SCRIPT_INPUTS_FOLDER = "inputs"
+SKILL_SCRIPT_OUTBOX_FOLDER = "output"
+SKILL_SCRIPT_WORK_ROOT = "/work"
+SKILL_SCRIPT_SKILLS_ROOT = "/skills"
+SKILL_SCRIPT_PYTHON_EXTENSION = ".py"
+SKILL_SCRIPT_DEFAULT_ATTACHMENT_BUCKET = "attachments"
 
 
 SEARCH_INDEX_ADDON = """

@@ -29,6 +29,7 @@ from ..langchain.constants import (
     SKILL_SEARCH_REMINDER_SUFFIX,
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
+    SKILL_SCRIPT_DEFAULT_ATTACHMENT_BUCKET,
 )
 from ..langchain.utils import (
     args_match_normalized,
@@ -139,6 +140,7 @@ from .hitl import (
     HITL_VIA_CALL_ID_KEY,
     PendingHITLEntry,
 )
+from .skill_script_runner import ScriptRunContext, SkillScriptRunner
 from .skill_tools import (
     LoadSkillTool,
     ReadSkillFileTool,
@@ -773,6 +775,7 @@ class LLMNode(BaseTool):
             skill_search=configurable.get('skill_search'),
             skill_body_fetcher=self._resolve_skill_body_fetcher(configurable),
             skill_file_fetcher=getattr(self.elitea_client, 'get_skill_file', None),
+            skill_script_runner=self._build_skill_script_runner(configurable),
         )
 
         def merge_skill_tools(tools):
@@ -1053,6 +1056,25 @@ class LLMNode(BaseTool):
             for skill in configurable.get('invoked_skills') or [] if isinstance(skill, dict)
         }
         return invoked | loaded_skill_names_from_messages(list(chat_history or []))
+
+    def _build_skill_script_runner(self, configurable: dict):
+        """A runner for this turn's scripts keyed by the conversation (a durable child's thread id is not one), or None
+        when the run has no client or nothing to key the files by."""
+        conversation_key = (
+            configurable.get('conversation_id')
+            or configurable.get('__parallel_hitl_root_thread_id__')
+            or configurable.get('thread_id')
+        )
+        if not conversation_key or not callable(getattr(self.elitea_client, 'get_skill_file', None)):
+            return None
+        return SkillScriptRunner(
+            ScriptRunContext(
+                client=self.elitea_client,
+                bucket=configurable.get('attachment_bucket') or SKILL_SCRIPT_DEFAULT_ATTACHMENT_BUCKET,
+                conversation_key=str(conversation_key),
+            ),
+            file_fetcher=self.elitea_client.get_skill_file,
+        )
 
     def _resolve_skill_body_fetcher(self, configurable: dict):
         fetcher = configurable.get('skill_body_fetcher')

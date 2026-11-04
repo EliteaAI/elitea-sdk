@@ -201,6 +201,7 @@ class EliteAClient:
         self.prefetched_version_details: Dict[str, dict] = {}
         self._mcp_toolkits_cache = None
         self._skill_file_cache: Dict[tuple, bytes] = {}
+        self._skill_scratch_cache: Dict[str, bytes] = {}
         self._session = requests.Session()
         # No PAT: authenticate exactly like the browser does, with the user's session cookie.
         # Scoped to our own host so a redirect elsewhere never carries the cookie along.
