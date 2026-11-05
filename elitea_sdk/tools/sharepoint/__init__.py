@@ -198,7 +198,7 @@ class SharepointToolkit(BaseToolkit):
                 oauth_discovery_endpoint=sp_config['oauth_discovery_endpoint'],
                 scopes=sp_config.get('scopes'),
                 configuration_uuid=sp_config.get('configuration_uuid'),
-                auto_refresh_token=sp_config.get('auto_refresh_token', False),
+                auto_refresh_token=sp_config.get('auto_refresh_token'),
                 toolkit_id=toolkit_id,
                 toolkit_name=toolkit_name,
                 client_id=sp_config.get('client_id'),

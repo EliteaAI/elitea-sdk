@@ -126,6 +126,7 @@ class OutlookToolkit(BaseToolkit):
                 # An admin-managed app's secret stays server-side: not even a masked copy
                 client_secret=None if outlook_config.get('oauth_app_id') else outlook_config.get('client_secret'),
                 oauth_app_id=outlook_config.get('oauth_app_id'),
+                auto_refresh_token=outlook_config.get('auto_refresh_token'),
             )
 
         wrapper = OutlookApiWrapper(**wrapper_payload)
