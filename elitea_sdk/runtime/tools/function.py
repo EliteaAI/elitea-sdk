@@ -22,6 +22,7 @@ from ..tool_outcome import (
     outcome_sink,
     record_outcome,
     retriable_for,
+    run_failure_message,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from typing import Any, Optional, Union
@@ -318,7 +319,7 @@ alita_state = elitea_state.copy()
         message = "\n\n".join(parts)
 
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
 
@@ -356,7 +357,7 @@ alita_state = elitea_state.copy()
         )
         self._record_blocked_error(tool_name, 'authorization skipped')
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
         for var in self.output_variables or []:
@@ -377,7 +378,7 @@ alita_state = elitea_state.copy()
         )
         self._record_blocked_error(tool_name, 'authorized toolkit not available')
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
         for var in self.output_variables or []:
@@ -705,8 +706,8 @@ alita_state = elitea_state.copy()
                 retry_after=getattr(e, 'retry_after', None),
             ))
             return {"messages": [
-                {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
-                        \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}"""}]}
+                run_failure_message(f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
+                        \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}""")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

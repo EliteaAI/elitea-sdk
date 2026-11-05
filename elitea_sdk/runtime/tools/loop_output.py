@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from .loop import process_response
 from ..langchain.utils import _extract_json, create_pydantic_model, propagate_the_input_mapping
+from ..tool_outcome import run_failure_message
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +156,9 @@ Answer must be JSON only extractable by JSON.LOADS."""
         except ValidationError:
             logger.error(f"ValidationError: {format_exc()}")
             return {
-                "messages": [{"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {result} raised ValidationError. 
+                "messages": [run_failure_message(f"""Tool input to the {self.tool.name} with value {result} raised ValidationError. 
         \n\nTool schema is {dumps(params)} \n\nand the input to LLM was 
-        {input_[-1].content}"""}]}
+        {input_[-1].content}""")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

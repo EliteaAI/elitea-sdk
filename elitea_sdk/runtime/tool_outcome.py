@@ -42,6 +42,17 @@ class ToolOutcome(BaseModel):
     original_size: Optional[int] = None
 
 
+# response_metadata key on an assistant message the SDK writes to report its own failure
+# (a failed node, a stopped pipeline, a step limit). The text reads like a normal answer,
+# so a consumer that must tell the two apart reads this flag, never the text.
+RUN_FAILURE_NOTICE_KEY = 'run_failure_notice'
+
+
+def run_failure_message(content: str) -> Dict[str, Any]:
+    """An assistant message dict that reports a failure, tagged for add_messages to keep."""
+    return {"role": "assistant", "content": content, "response_metadata": {RUN_FAILURE_NOTICE_KEY: True}}
+
+
 # Channel from the middleware that builds an outcome back to the caller that needs it.
 # Caller-owned so a stale read is impossible: no sink installed, nothing recorded.
 _OUTCOME_SINK: contextvars.ContextVar[Optional[List[ToolOutcome]]] = contextvars.ContextVar(

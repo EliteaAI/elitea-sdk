@@ -47,7 +47,14 @@ from ..context_floor import (
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..utils.internal_run_auth import run_token_refusal
-from ..tool_outcome import ToolOutcome, ToolResultStatus, outcome_sink, record_outcome, resolve_run_error
+from ..tool_outcome import (
+    RUN_FAILURE_NOTICE_KEY,
+    ToolOutcome,
+    ToolResultStatus,
+    outcome_sink,
+    record_outcome,
+    resolve_run_error,
+)
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 from ..utils.failure_signals import describe_llm_error
@@ -4949,7 +4956,7 @@ class LLMNode(BaseTool):
                             break
                         logger.error(f"Error retrying LLM after truncation: {retry_error}")
                         error_msg = f"Failed to retry after truncation: {str(retry_error)}"
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(AIMessage(content=error_msg, response_metadata={RUN_FAILURE_NOTICE_KEY: True}))
                         break
                     else:
                         # Couldn't find tool message, add error and break
@@ -4963,7 +4970,7 @@ class LLMNode(BaseTool):
                                 "Context window exceeded. The conversation or tool results are too large. "
                                 "Try using tools with smaller output limits (e.g., max_items, max_depth parameters)."
                             )
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(AIMessage(content=error_msg, response_metadata={RUN_FAILURE_NOTICE_KEY: True}))
                         break
                 else:
                     logger.error(f"Error in LLM call during iteration {iteration}: {e}")
@@ -5011,7 +5018,7 @@ class LLMNode(BaseTool):
             
             # Add warning message - CLI or calling code can detect this and prompt user
             warning_msg = f"Maximum tool execution iterations ({effective_limit}) reached. Stopping tool execution."
-            new_messages.append(AIMessage(content=warning_msg))
+            new_messages.append(AIMessage(content=warning_msg, response_metadata={RUN_FAILURE_NOTICE_KEY: True}))
         else:
             logger.info(f"Tool execution completed after {iteration} iterations")
 

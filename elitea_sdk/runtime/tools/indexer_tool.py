@@ -9,6 +9,7 @@ from typing import Any, Optional, Union
 from langchain_core.messages import ToolCall
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from ..langchain.utils import _extract_json, propagate_the_input_mapping
+from ..tool_outcome import run_failure_message
 from pydantic import ValidationError
 from time import time
 
@@ -70,7 +71,7 @@ class IndexerNode(BaseTool):
                     )
                 except Exception as e:
                     logger.error(f"Chunking error: {format_exc()}")
-                    return {"messages": [{"role": "assistant", "content": f"""Chunking tool {self.chunking_tool} raised an error.\n\nError: {format_exc()}"""}]}
+                    return {"messages": [run_failure_message(f"""Chunking tool {self.chunking_tool} raised an error.\n\nError: {format_exc()}""")]}
             index_results = self.index_tool.invoke({"documents": chunks if chunks else result}, config=config, kwargs=kwargs)
             logger.info(f"IndexNode response: {index_results}")
             total_time = round((time() - start_time), 2)
@@ -82,9 +83,9 @@ class IndexerNode(BaseTool):
         except Exception as e:
             logger.error(f"ValidationError: {format_exc()}")
             return {
-                "messages": [{"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {result} raised ValidationError. 
+                "messages": [run_failure_message(f"""Tool input to the {self.tool.name} with value {result} raised ValidationError. 
         \n\nTool schema is {dumps(params)} \n\nand the input to LLM was 
-        {func_args}\n{e}"""}]}
+        {func_args}\n{e}""")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)
