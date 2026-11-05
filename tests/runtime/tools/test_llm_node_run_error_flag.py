@@ -191,3 +191,70 @@ def test_normal_tool_loop_leaves_the_holder_empty():
 
     assert holder == {}
     assert result["messages"][-1].content == "done"
+
+
+class RecoveringClient(LoopedClient):
+    """Asks for one tool call, fails once with a context error, then answers."""
+
+    def invoke(self, messages, config=None):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(content="", tool_calls=[{"name": "read_file", "args": {"path": "a"}, "id": "call_1"}])
+        if self.calls == 2:
+            raise self.error
+        return AIMessage(content="recovered answer")
+
+
+def test_context_error_recovered_by_the_retry_leaves_the_holder_empty():
+    client = RecoveringClient(FakeBadRequestError("maximum context length reached"))
+    with run_error_flag() as holder:
+        result = _looped_node(client).invoke({"messages": [HumanMessage(content="go")]})
+
+    last = result["messages"][-1]
+    assert client.calls == 3
+    assert holder == {}
+    assert last.content == "recovered answer"
+    assert "llm_node_error" not in last.response_metadata
+
+
+def _context_error_without_tool_message():
+    node = _looped_node(LoopedClient(FakeBadRequestError("unused")))
+    error = FakeBadRequestError("maximum context length reached")
+
+    def drop_tool_messages_and_fail(messages, *args, **kwargs):
+        messages[:] = [m for m in messages if not isinstance(m, ToolMessage)]
+        raise error
+
+    with patch.object(LLMNode, "_enforce_context_floor", side_effect=drop_tool_messages_and_fail):
+        return node.invoke({"messages": [HumanMessage(content="go")]})
+
+
+def test_nested_agent_raises_on_the_context_error_message():
+    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+
+    result = _context_error_without_tool_message()
+
+    with pytest.raises(RuntimeError, match="Nested agent LLM failed .*Context window exceeded"):
+        _raise_if_llm_node_error(result)
+
+
+def test_nested_agent_raises_on_the_failed_retry_message():
+    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+
+    _, last = _run_looped(FakeBadRequestError("maximum context length reached"))
+
+    with pytest.raises(RuntimeError, match="Nested agent LLM failed .*Failed to retry after truncation"):
+        _raise_if_llm_node_error({"messages": [HumanMessage(content="go"), last]})
+
+
+def test_model_error_stays_in_the_holder_after_a_later_good_call(llm_node):
+    with run_error_flag() as holder:
+        with patch.object(LLMNode, "_invoke_llm_internal", side_effect=FakeBadRequestError("first failure")):
+            llm_node.invoke({"messages": []})
+        with patch.object(
+            LLMNode, "_invoke_llm_internal", return_value={"messages": [AIMessage(content="all good")]}
+        ):
+            result = llm_node.invoke({"messages": []})
+
+    assert result["messages"][-1].content == "all good"
+    assert "first failure" in holder["error"]["reason"], holder

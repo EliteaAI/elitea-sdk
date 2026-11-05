@@ -252,6 +252,8 @@ def _llm_error_message(content, exc, client):
     message = AIMessage(content=content)
     message.response_metadata['llm_node_error'] = True
     message.response_metadata['llm_node_exception_type'] = type(exc).__name__
+    # The holder is never cleared by a later good call: a model error is final for its node,
+    # and a recovered nested agent must not hide a node that failed.
     note_run_error(ToolOutcome(
         status=ToolResultStatus.ERROR,
         message=describe_llm_error(exc, _llm_idle_timeout(client)),
