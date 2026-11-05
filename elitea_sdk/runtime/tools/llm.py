@@ -4977,7 +4977,7 @@ class LLMNode(BaseTool):
                                 "Context window exceeded. The conversation or tool results are too large. "
                                 "Try using tools with smaller output limits (e.g., max_items, max_depth parameters)."
                             )
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(_llm_error_message(error_msg, e, self.client))
                         break
                 else:
                     logger.error(f"Error in LLM call during iteration {iteration}: {e}")
