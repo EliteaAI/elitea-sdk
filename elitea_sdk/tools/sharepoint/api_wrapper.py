@@ -463,6 +463,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     "Graph API backend (SharepointGraphWrapper).")
     refresh_token: Optional[SecretStr] = None
     oauth_token_endpoint: Optional[str] = None
+    # Ask for offline_access at sign-in unless switched off (#7415)
+    auto_refresh_token: Optional[bool] = None
     oauth_discovery_endpoint: Optional[str] = None
     configuration_uuid: Optional[str] = None
     toolkit_id: Optional[int] = None
@@ -504,6 +506,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 configuration_uuid=self.configuration_uuid,
                 toolkit_id=self.toolkit_id,
                 toolkit_name=self.toolkit_name,
+                auto_refresh_token=self.auto_refresh_token,
             )
         elif client_id and secret_plain:
             # ── App-credential REST path ──────────────────────────────

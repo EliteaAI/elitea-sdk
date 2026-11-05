@@ -145,11 +145,13 @@ class TeamsConfiguration(BaseModel):
                 configuration_uuid=configuration_uuid,
                 oauth_app_id=oauth_app_id,
                 client_id=app_client_id,
+                auto_refresh_token=settings.get("auto_refresh_token"),
             )
 
         return TeamsConfiguration._call_graph_api(
             access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
             oauth_app_id=oauth_app_id, client_id=app_client_id,
+            auto_refresh_token=settings.get("auto_refresh_token"),
         )
 
     @staticmethod
@@ -160,6 +162,7 @@ class TeamsConfiguration(BaseModel):
         configuration_uuid: Optional[str] = None,
         oauth_app_id: Optional[str] = None,
         client_id: Optional[str] = None,
+        auto_refresh_token: Optional[bool] = None,
     ) -> str | None:
         """Health-check access token using Microsoft Graph Teams API."""
         try:
@@ -182,6 +185,7 @@ class TeamsConfiguration(BaseModel):
                     configuration_uuid=configuration_uuid,
                     oauth_app_id=oauth_app_id,
                     client_id=client_id,
+                    auto_refresh_token=auto_refresh_token,
                 )
             elif resp.status_code == 403:
                 return (
@@ -228,6 +232,7 @@ class TeamsConfiguration(BaseModel):
         client_id: Optional[str] = None,
         client_secret: Optional[SecretStr | str] = None,
         oauth_app_id: Optional[str] = None,
+        auto_refresh_token: Optional[bool] = None,
     ) -> "McpAuthorizationRequired":
         """Build McpAuthorizationRequired exception for OAuth flow."""
         from ..runtime.utils.mcp_oauth import (
@@ -235,7 +240,8 @@ class TeamsConfiguration(BaseModel):
             fetch_oauth_authorization_server_metadata,
         )
 
-        effective_scopes = ["offline_access", *normalize_teams_scopes(scopes)]
+        from .oauth_app_mode import sign_in_scopes
+        effective_scopes = sign_in_scopes(normalize_teams_scopes(scopes), auto_refresh_token)
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         azure_v2_endpoint = f"{base_discovery}/v2.0/.well-known/openid-configuration"
