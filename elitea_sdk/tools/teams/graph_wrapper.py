@@ -288,6 +288,7 @@ class TeamsGraphWrapper:
         configuration_uuid: Optional[str] = None,
         toolkit_id: Optional[int] = None,
         toolkit_name: Optional[str] = None,
+        auto_refresh_token: Optional[bool] = None,
     ):
         self._token = token
         self._scopes = scopes
@@ -298,6 +299,7 @@ class TeamsGraphWrapper:
         self._oauth_discovery_endpoint = oauth_discovery_endpoint
         self._configuration_uuid = configuration_uuid
         self._toolkit_id = toolkit_id
+        self._auto_refresh_token = auto_refresh_token
         self._toolkit_name = toolkit_name
         self._me: Optional[dict] = None
         self._users: Dict[str, dict] = {}         # lower(email / id) -> user
@@ -334,6 +336,7 @@ class TeamsGraphWrapper:
             toolkit_name=self._toolkit_name,
             client_id=self._client_id,
             client_secret=self._client_secret,
+            auto_refresh_token=self._auto_refresh_token,
         )
         auth_error.tool_name = None
         raise auth_error
