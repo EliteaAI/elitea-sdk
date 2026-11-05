@@ -17,6 +17,17 @@ OAUTH_APP_ID_FIELD = Field(
 )
 
 
+def sign_in_scopes(scopes, auto_refresh_token=None) -> list:
+    """Scopes a Microsoft sign-in asks for (#7415).
+
+    ``offline_access`` makes Microsoft return a refresh token, so it is asked for unless token
+    refresh is switched off (Auto refresh token off on the credential or the admin's app). A
+    missing setting keeps it, as before: older credentials never stored the switch.
+    """
+    wanted = [scope for scope in (scopes or []) if scope and scope != "offline_access"]
+    return wanted if auto_refresh_token is False else ["offline_access", *wanted]
+
+
 def require_app_client(config) -> None:
     """A credential needs either an admin app or its own client (Custom app)."""
     if getattr(config, "oauth_app_id", None):

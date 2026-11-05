@@ -198,7 +198,7 @@ class SharepointConfiguration(BaseModel):
         scopes: Optional[List[str]],
         status: Optional[int] = None,
         configuration_uuid: Optional[str] = None,
-        auto_refresh_token: bool = False,
+        auto_refresh_token: Optional[bool] = None,
         toolkit_id: Optional[int] = None,
         toolkit_name: Optional[str] = None,
         client_id: Optional[str] = None,
@@ -220,12 +220,10 @@ class SharepointConfiguration(BaseModel):
             fetch_oauth_authorization_server_metadata,
         )
 
-        # Always inject offline_access in delegated OAuth mode so Azure AD returns
-        # a refresh_token in the token exchange response. The auto_refresh_token
-        # flag previously gated this, but the feature spec requires it by default.
-        effective_scopes = list(scopes or [])
-        if "offline_access" not in effective_scopes:
-            effective_scopes.insert(0, "offline_access")
+        # offline_access makes Azure AD return a refresh_token; it's left out only when token refresh
+        # is switched off explicitly (#7415). A missing setting keeps it, as since #170.
+        from .oauth_app_mode import sign_in_scopes
+        effective_scopes = sign_in_scopes(scopes, auto_refresh_token)
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         # Azure AD v2.0 well-known URL — injected as an extra candidate so the
@@ -482,7 +480,7 @@ class SharepointConfiguration(BaseModel):
         oauth_app_id = settings.get("oauth_app_id")
         # Default app mode: the client ID is public and needed for the sign-in URL
         app_client_id = settings.get("client_id") if oauth_app_id else None
-        auto_refresh_token = settings.get("auto_refresh_token", False)
+        auto_refresh_token = settings.get("auto_refresh_token")
         from ..runtime.utils.mcp_oauth import access_token_from_stored_login
         access_token = access_token_from_stored_login(settings)
         if not access_token:
