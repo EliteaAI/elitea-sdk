@@ -22,6 +22,7 @@ from typing import Any, Callable, List, Optional
 from xml.sax.saxutils import escape as xml_escape
 
 from langchain_core.callbacks import CallbackManagerForToolRun
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -694,37 +695,55 @@ class RunSkillScriptTool(SkillFileTool):
     args_schema: type[BaseModel] = RunSkillScriptInput
     runner: Any = Field(exclude=True)
 
-    def _run_script(self, skill: str, path: str, args: Optional[List[str]], files: Optional[List[str]]) -> str:
-        """One script run of a loaded skill, after its body when this call loaded it, or the reason the model gets."""
+    def _resolve_script(self, skill: str, path: str):
+        """The loaded skill, its manifest, the script's path and the body this call loaded, or the reason the model
+        gets instead."""
         matched, manifest, refusal, loaded = self._resolve_loaded_skill(skill)
         if refusal:
-            return refusal
-        return self._after_load(loaded, self._run_resolved(matched, manifest, path, args or [], files or []))
-
-    def _run_resolved(self, matched: dict, manifest: list, path: str, args: List[str], files: List[str]) -> str:
+            return None, refusal
         name = matched.get('name')
         relative_path = normalize_skill_path(name, path)
         if relative_path is None:
-            return SKILL_FILE_OUTSIDE_ROOT.format(name=name, path=path)
+            return None, self._after_load(loaded, SKILL_FILE_OUTSIDE_ROOT.format(name=name, path=path))
         entry, suggestions = find_skill_file(manifest, relative_path)
         if entry is None:
-            return SKILL_FILE_NOT_FOUND.format(
+            return None, self._after_load(loaded, SKILL_FILE_NOT_FOUND.format(
                 name=name, path=path, suggestions=', '.join(f'"{s}"' for s in suggestions),
-            )
+            ))
         if not is_python_script(entry['path']):
-            return (
+            return None, self._after_load(loaded, (
                 f'"{entry["path"]}" cannot run here: only Python (.py) scripts run on this platform. '
                 'Read it with read_skill_file and follow it yourself.'
-            )
-        return self.runner.run(matched, manifest, entry['path'], args, files)
+            ))
+        return (matched, manifest, entry['path'], loaded), None
+
+    def _result(self, loaded: str, outcome):
+        """The run's text, after the body this call loaded, carrying the run's facts when the sandbox ran it."""
+        text, facts = outcome
+        content = self._after_load(loaded, text)
+        if facts is None:
+            return content
+        return ToolMessage(content=content, artifact=facts, name=self.name, tool_call_id='')
 
     def _run(self, skill: str, path: str, args: Optional[List[str]] = None, files: Optional[List[str]] = None,
-             run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        return self._run_script(skill, path, args, files)
+             run_manager: Optional[CallbackManagerForToolRun] = None):
+        target, refusal = self._resolve_script(skill, path)
+        if refusal:
+            return refusal
+        matched, manifest, script, loaded = target
+        return self._result(loaded, self.runner.run(
+            matched, manifest, script, args or [], files or [], run_manager.get_child() if run_manager else None,
+        ))
 
     async def _arun(self, skill: str, path: str, args: Optional[List[str]] = None, files: Optional[List[str]] = None,
-                    run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        return self._run_script(skill, path, args, files)
+                    run_manager: Optional[CallbackManagerForToolRun] = None):
+        target, refusal = self._resolve_script(skill, path)
+        if refusal:
+            return refusal
+        matched, manifest, script, loaded = target
+        return self._result(loaded, await self.runner.arun(
+            matched, manifest, script, args or [], files or [], run_manager.get_child() if run_manager else None,
+        ))
 
 
 class ReadSkillOutputInput(BaseModel):

@@ -1,6 +1,6 @@
 """Runs inside the Pyodide sandbox, never in the worker: unpacks the staged skill and working files, runs one skill
 script with its own stdout and stderr, and reports its exit code with every working file it added, changed or
-deleted (#7185). The runner submits this file's source followed by ``await run({...})``."""
+deleted, naming instead of sending the ones over the size caps (#7185). The runner submits this file's source followed by ``await run({...})``."""
 import base64
 import contextlib
 import hashlib
@@ -30,8 +30,13 @@ async def run(params: dict) -> dict:
     sys.path[:0] = [os.path.dirname(script), skill_root]
     await load_bundled_packages(skill_root, script)
     exit_code, stdout, stderr = run_script(script)
-    changed, deleted = collect_changes(work, params['manifest'], params['inputs'])
-    return {'exit_code': exit_code, 'stdout': stdout, 'stderr': stderr, 'files': changed, 'deleted': deleted}
+    changed, too_large, deleted = collect_changes(
+        work, params['manifest'], params['inputs'], params['max_file_bytes'], params['max_total_bytes'],
+    )
+    return {
+        'exit_code': exit_code, 'stdout': stdout, 'stderr': stderr,
+        'files': changed, 'too_large': too_large, 'deleted': deleted,
+    }
 
 
 async def load_bundled_packages(skill_root: str, script: str) -> None:
@@ -77,18 +82,28 @@ def run_script(script: str) -> tuple:
     return exit_code, stdout.getvalue(), stderr.getvalue()
 
 
-def collect_changes(work: str, manifest: dict, inputs_folder: str) -> tuple:
-    """Working files that differ from the staged manifest, base64-encoded, and the staged paths no longer there."""
-    changed = {}
+def collect_changes(work: str, manifest: dict, inputs_folder: str, max_file_bytes: int, max_total_bytes: int) -> tuple:
+    """Working files that differ from the staged manifest, base64-encoded; the changed ones left out because they pass
+    a size cap, since encoding them could exhaust the sandbox's memory; and the staged paths no longer there."""
+    changed, too_large = {}, []
+    total = 0
     for root, _dirs, names in os.walk(work):
         for name in names:
             full = os.path.join(root, name)
             relative = os.path.relpath(full, work).replace(os.sep, '/')
             if relative.split('/', 1)[0] == inputs_folder:
                 continue
+            if os.path.getsize(full) > max_file_bytes:
+                too_large.append(relative)
+                continue
             with open(full, 'rb') as handle:
                 data = handle.read()
-            if manifest.get(relative) != hashlib.sha256(data).hexdigest():
-                changed[relative] = base64.b64encode(data).decode('ascii')
+            if manifest.get(relative) == hashlib.sha256(data).hexdigest():
+                continue
+            if total + len(data) > max_total_bytes:
+                too_large.append(relative)
+                continue
+            total += len(data)
+            changed[relative] = base64.b64encode(data).decode('ascii')
     deleted = [path for path in manifest if not os.path.exists(os.path.join(work, path))]
-    return changed, deleted
+    return changed, sorted(too_large), deleted

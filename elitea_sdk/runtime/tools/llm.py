@@ -139,7 +139,7 @@ from .hitl import (
     HITL_VIA_CALL_ID_KEY,
     PendingHITLEntry,
 )
-from .skill_script_runner import ScriptRunContext, SkillScriptRunner
+from .skill_script_runner import ScriptRunContext, SkillScriptRunner, is_canonical_uuid
 from .skill_tools import (
     LoadSkillTool,
     ReadSkillFileTool,
@@ -1057,20 +1057,20 @@ class LLMNode(BaseTool):
         return invoked | loaded_skill_names_from_messages(list(chat_history or []))
 
     def _build_skill_script_runner(self, configurable: dict):
-        """A runner for this turn's scripts keyed by the conversation (a durable child's thread id is not one), or None
-        when the run has no client or nothing to key the files by."""
-        conversation_key = (
-            configurable.get('conversation_id')
-            or configurable.get('__parallel_hitl_root_thread_id__')
-            or configurable.get('thread_id')
-        )
-        if not conversation_key or not callable(getattr(self.elitea_client, 'get_skill_file', None)):
+        """A runner for this turn's scripts, keyed by the conversation the platform verified for the run, or None when
+        the run has no client or the platform sent no such conversation."""
+        scratch = configurable.get('skill_scratch') or {}
+        conversation_uuid = scratch.get('conversation_uuid')
+        if not is_canonical_uuid(conversation_uuid) or not scratch.get('bucket'):
+            return None
+        if not callable(getattr(self.elitea_client, 'get_skill_file', None)):
             return None
         return SkillScriptRunner(
             ScriptRunContext(
                 client=self.elitea_client,
-                bucket=configurable.get('attachment_bucket') or 'attachments',
-                conversation_key=str(conversation_key),
+                scratch_bucket=scratch['bucket'],
+                attachment_bucket=configurable.get('attachment_bucket') or scratch['bucket'],
+                conversation_uuid=conversation_uuid,
             ),
             file_fetcher=self.elitea_client.get_skill_file,
         )

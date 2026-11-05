@@ -949,7 +949,8 @@ RUN_SKILL_SCRIPT_TOOL_DESCRIPTION = (
     "script runs offline in a Python sandbox with no network and no platform access, for at most "
     "{timeout} seconds: the skill's files are at /skills/<name>/, the working directory persists between script "
     "calls of this conversation (it may expire between sessions), attachments named in files appear under inputs/, "
-    "and files the script writes directly under output/ are shared with the user as attachments. The result is "
+    "and files the script writes directly under output/ are shared with the user as attachments. Files a script "
+    "writes are kept even when it fails, so a later call sees what a failed one left behind. The result is "
     "\"Exit code N\" followed by what the script printed; output over {inline_chars} characters is saved and "
     "returned as a preview with a skill-output:// reference for read_skill_output. Only .py files run."
 )

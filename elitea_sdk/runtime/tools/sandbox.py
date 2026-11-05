@@ -298,23 +298,25 @@ def enforce_sandbox_admission(limits: Dict[str, Any]) -> None:
             )
 
 
-def build_offline_pyodide_sandbox():
-    """The local sandbox third-party code runs in: no network, no subprocesses, no FFI, only the Pyodide cache dirs
-    readable. Never the remote sandbox service, whose runner has network on and no per-call network setting."""
-    from ..langchain.pyodide_sandbox import PyodideSandbox
+def local_sandbox_permissions() -> dict:
+    """The Deno grants of every local Pyodide sandbox: only the SANDBOX_BASE variable and the Pyodide assets readable,
+    nothing on the host writable, no module fetched, no subprocesses, no FFI. Network stays each caller's choice."""
     sandbox_base = os.environ.get("SANDBOX_BASE", os.path.expanduser('~/.cache/pyodide'))
-    sandbox_tmp = os.path.join(sandbox_base, "tmp")
-    deno_cache = os.environ.get("DENO_DIR", os.path.expanduser('~/.cache/deno'))
-    return PyodideSandbox(
-        stateful=False,
-        allow_env=["SANDBOX_BASE"],
-        allow_read=[sandbox_base, sandbox_tmp, deno_cache],
-        allow_write=[sandbox_tmp, deno_cache],
-        allow_net=False,
-        allow_run=False,
-        allow_ffi=False,
-        node_modules_dir="auto",
-    )
+    return {
+        'allow_env': ["SANDBOX_BASE"],
+        'allow_read': [os.path.join(sandbox_base, "pyodide")],
+        'allow_write': False,
+        'allow_run': False,
+        'allow_ffi': False,
+        'allow_remote_modules': False,
+    }
+
+
+def build_offline_pyodide_sandbox():
+    """The local sandbox third-party code runs in, with no network. Never the remote sandbox service, whose runner has
+    network on and no per-call network setting."""
+    from ..langchain.pyodide_sandbox import PyodideSandbox
+    return PyodideSandbox(stateful=False, allow_net=False, node_modules_dir="auto", **local_sandbox_permissions())
 
 
 # Create input schema for the sandbox tool
@@ -461,22 +463,11 @@ class PyodideSandboxTool(BaseTool):
 
             from ..langchain.pyodide_sandbox import PyodideSandbox
 
-            # Air-gapped settings
-            sandbox_base = os.environ.get("SANDBOX_BASE", os.path.expanduser('~/.cache/pyodide'))
-            sandbox_tmp = os.path.join(sandbox_base, "tmp")
-            deno_cache = os.environ.get("DENO_DIR", os.path.expanduser('~/.cache/deno'))
-
-            # Configure sandbox with performance optimizations
             self._sandbox = PyodideSandbox(
                 stateful=self.stateful,
-                #
-                allow_env=["SANDBOX_BASE"],
-                allow_read=[sandbox_base, sandbox_tmp, deno_cache],
-                allow_write=[sandbox_tmp, deno_cache],
-                #
                 allow_net=self.allow_net,
-                # Use auto node_modules_dir for better caching
-                node_modules_dir="auto"
+                node_modules_dir="auto",
+                **local_sandbox_permissions(),
             )
             logger.info(f"PyodideSandbox initialized successfully (stateful={self.stateful})")
         except Exception as e:

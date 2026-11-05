@@ -1,4 +1,5 @@
 """A loaded skill's Python script runs in the offline sandbox and its results reach the model, the scratch and the user (#7185)."""
+import asyncio
 import io
 import json
 import subprocess
@@ -32,7 +33,7 @@ from elitea_sdk.runtime.tools.skill_tools import (
     loaded_skill_names_from_messages,
 )
 
-CONVERSATION = 'conv-uuid-1'
+CONVERSATION = '6f1c2b8e-3d4a-4f5b-9c7d-0e1f2a3b4c5d'
 BUCKET = 'attachments'
 STEP1 = '''import json, os, sys
 print("step1: progress", file=sys.stderr)
@@ -66,12 +67,15 @@ DELETE = 'import os\nos.remove("out/step1.json")\nprint("deleted")\n'
 SLOW = 'import time\ntime.sleep(5)\n'
 NETWORK = 'import urllib.request\nurllib.request.urlopen("https://example.com")\n'
 CLIENT = 'print(elitea_client)\n'
+WRITE = 'import sys\nopen(sys.argv[1], "w").write(sys.argv[1])\nprint("wrote", sys.argv[1])\n'
+WRITE_BIG = 'import os, sys\nos.makedirs("output", exist_ok=True)\nopen(sys.argv[1], "wb").write(b"z" * int(sys.argv[2]))\n'
 
 SKILL_FILES = {
     'SKILL.md': '# demo', 'scripts/step1.py': STEP1, 'scripts/step2.py': STEP2, 'scripts/helper.py': HELPER,
     'scripts/uses_helper.py': USES_HELPER, 'scripts/share.py': SHARE, 'scripts/fail.py': FAIL,
     'scripts/raises.py': RAISES, 'scripts/big.py': BIG, 'scripts/read_input.py': READ_INPUT,
     'scripts/delete.py': DELETE, 'scripts/slow.py': SLOW, 'scripts/network.py': NETWORK, 'scripts/client.py': CLIENT,
+    'scripts/write.py': WRITE, 'scripts/write_big.py': WRITE_BIG,
     'scripts/run.sh': 'echo no\n', 'reference.md': 'ref',
 }
 
@@ -103,7 +107,6 @@ class FakeClient:
         self.objects = {}
         self.buckets = {BUCKET}
         self.calls = []
-        self._skill_scratch_cache = {}
         self._files = {skill['name']: {path: content for path, content in SKILL_FILES.items()} for skill in skills}
         self._skills = {skill['skill_id']: skill for skill in skills}
         for name, data in (attachments or {}).items():
@@ -193,7 +196,7 @@ def _runner(client=None, tmp_path=None, caps=None, limits=None, sandbox=None, ca
     client = client or FakeClient()
     ids = iter(call_ids)
     runner = SkillScriptRunner(
-        ScriptRunContext(client=client, bucket=BUCKET, conversation_key=CONVERSATION),
+        ScriptRunContext(client=client, scratch_bucket=BUCKET, attachment_bucket=BUCKET, conversation_uuid=CONVERSATION),
         file_fetcher=client.get_skill_file, sandbox_factory=lambda: sandbox or CPythonSandbox(),
         limits=limits or LIMITS, caps=caps, call_id_factory=lambda: next(ids), sandbox_base=str(tmp_path),
     )
@@ -206,6 +209,10 @@ def _tools(runner, attached=(DEMO,), loaded=('demo',)):
         if hasattr(tool, 'mark_already_loaded'):
             tool.mark_already_loaded(loaded)
     return tools
+
+
+def _content(result):
+    return getattr(result, 'content', result)
 
 
 def _run_tool(runner, **kwargs):
@@ -262,7 +269,7 @@ def test_the_description_states_the_sandbox_contract():
 def test_a_script_runs_with_its_arguments_and_its_output_comes_back_after_the_exit_code(tmp_path):
     runner, client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/step1.py', 'args': ['42'], 'files': []})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/step1.py', 'args': ['42'], 'files': []}))
 
     head, printed, heading, progress = result.split('\n')
     assert head == 'Exit code 0'
@@ -277,7 +284,7 @@ def test_a_file_the_first_script_wrote_is_staged_back_for_the_second_call(tmp_pa
     assert json.loads(client.scratch_files()['out/step1.json'])['token'] == '42'
     assert json.loads(client.scratch_files()['out/step1.json'])['skill_dir'] == str(tmp_path / 'skills' / 'demo')
 
-    result = tool.invoke({'skill': 'demo', 'path': 'scripts/step2.py', 'args': ['--input', 'out/step1.json']})
+    result = _content(tool.invoke({'skill': 'demo', 'path': 'scripts/step2.py', 'args': ['--input', 'out/step1.json']}))
 
     assert result == 'Exit code 0\nSTEP2_RESULT=4242'
 
@@ -285,7 +292,7 @@ def test_a_file_the_first_script_wrote_is_staged_back_for_the_second_call(tmp_pa
 def test_a_script_imports_its_sibling_module(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    assert _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/uses_helper.py'}) == 'Exit code 0\nhelper 7'
+    assert _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/uses_helper.py'})) == 'Exit code 0\nhelper 7'
 
 
 def test_a_file_deleted_by_a_script_leaves_the_scratch(tmp_path):
@@ -293,7 +300,7 @@ def test_a_file_deleted_by_a_script_leaves_the_scratch(tmp_path):
     tool = _run_tool(runner)
     tool.invoke({'skill': 'demo', 'path': 'scripts/step1.py', 'args': ['1']})
 
-    result = tool.invoke({'skill': 'demo', 'path': 'scripts/delete.py'})
+    result = _content(tool.invoke({'skill': 'demo', 'path': 'scripts/delete.py'}))
 
     assert result == 'Exit code 0\ndeleted'
     assert client.scratch_files() == {}
@@ -302,7 +309,7 @@ def test_a_file_deleted_by_a_script_leaves_the_scratch(tmp_path):
 def test_files_under_output_become_attachments_and_subfolders_stay_scratch(tmp_path):
     runner, client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/share.py'})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/share.py'}))
 
     assert result == 'Exit code 0\nshared\nFiles shared: deck.txt (4 B)'
     assert client.objects[(BUCKET, f'{CONVERSATION}/call1/deck.txt')][0] == b'deck'
@@ -312,7 +319,7 @@ def test_files_under_output_become_attachments_and_subfolders_stay_scratch(tmp_p
 def test_a_promoted_file_is_announced_to_the_conversation_as_file_modified(tmp_path, monkeypatch):
     events = []
     monkeypatch.setattr('elitea_sdk.runtime.tools.skill_script_runner.dispatch_custom_event',
-                        lambda name, payload: events.append((name, payload)))
+                        lambda name, data, config=None: events.append((name, data)))
     runner, _client = _runner(tmp_path=tmp_path)
 
     _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/share.py'})
@@ -322,6 +329,30 @@ def test_a_promoted_file_is_announced_to_the_conversation_as_file_modified(tmp_p
     assert payload['filepath'] == f'/{BUCKET}/{CONVERSATION}/call1/deck.txt'
     assert (payload['tool_name'], payload['toolkit'], payload['operation_type']) == ('run_skill_script', 'skills', 'create')
     assert payload['meta'] == {'bucket': BUCKET, 'file_size': 4, 'source': 'generated'}
+
+
+def test_a_shared_file_reaches_the_runs_callbacks_even_when_the_run_context_is_gone_after_the_sandbox(tmp_path):
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.runnables.config import var_child_runnable_config
+    events = []
+
+    class Recorder(BaseCallbackHandler):
+        def on_custom_event(self, name, data, **kwargs):
+            events.append(name)
+
+    inner = CPythonSandbox()
+
+    class LosesTheRunContext:
+        async def execute(self, program, **kwargs):
+            result = await inner.execute(program, **kwargs)
+            var_child_runnable_config.set(None)
+            return result
+
+    runner, _client = _runner(tmp_path=tmp_path, sandbox=LosesTheRunContext())
+
+    asyncio.run(_run_tool(runner).ainvoke({'skill': 'demo', 'path': 'scripts/share.py'}, config={'callbacks': [Recorder()]}))
+
+    assert events == ['file_modified']
 
 
 def test_a_promoted_file_gets_a_key_no_earlier_call_shares(tmp_path):
@@ -341,7 +372,7 @@ def test_a_named_attachment_is_staged_under_inputs_newest_copy_first(tmp_path):
     client.objects[(BUCKET, f'{CONVERSATION}/call0/notes.txt')] = (b'promoted later', '2026-11-03T00:00:00Z')
     runner, _client = _runner(client=client, tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'args': ['notes.txt'], 'files': ['notes.txt']})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'args': ['notes.txt'], 'files': ['notes.txt']}))
 
     assert result == 'Exit code 0\npromoted later'
     assert 'inputs/notes.txt' not in client.scratch_files()
@@ -351,7 +382,7 @@ def test_an_unknown_attachment_name_lists_what_is_available(tmp_path):
     client = FakeClient(attachments={'deck.pptx': b'x', 'notes.txt': b'y'})
     runner, _client = _runner(client=client, tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'files': ['missing.pdf']})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'files': ['missing.pdf']}))
 
     assert result == 'No attachment named "missing.pdf" is in this conversation. Attachments available: deck.pptx, notes.txt.'
     assert not any(call[0] == 'upload' for call in client.calls)
@@ -361,7 +392,7 @@ def test_a_non_zero_exit_keeps_the_output_and_flags_the_result_as_an_error(tmp_p
     runner, _client = _runner(tmp_path=tmp_path)
 
     with outcome_sink() as recorded:
-        result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/fail.py'})
+        result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/fail.py'}))
 
     assert result == 'Exit code 3\npartial\n[stderr]\nERR: broken'
     assert [outcome.status for outcome in recorded] == [ToolResultStatus.ERROR]
@@ -371,7 +402,7 @@ def test_a_non_zero_exit_keeps_the_output_and_flags_the_result_as_an_error(tmp_p
 def test_an_uncaught_exception_is_exit_code_1_with_the_traceback(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/raises.py'})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/raises.py'}))
 
     assert result.startswith('Exit code 1\n[stderr]\nTraceback')
     assert result.endswith('ValueError: boom')
@@ -380,23 +411,31 @@ def test_an_uncaught_exception_is_exit_code_1_with_the_traceback(tmp_path):
 def test_a_script_without_output_says_so(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    assert _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}) == 'Exit code 0\n(no output)'
+    assert _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'})) == 'Exit code 0\n(no output)'
 
 
 def test_a_timeout_is_an_error_that_says_nothing_was_captured(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path, limits={**LIMITS, 'timeout_seconds': 1.0})
 
     with outcome_sink() as recorded:
-        result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/slow.py'})
+        result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/slow.py'}))
 
     assert result == 'Exit code -1 (timed out after 1 s)\nNo output was captured; the script was stopped.'
     assert [outcome.status for outcome in recorded] == [ToolResultStatus.ERROR]
 
 
+def test_a_timed_out_run_carries_its_facts(tmp_path):
+    runner, _client = _runner(tmp_path=tmp_path, limits={**LIMITS, 'timeout_seconds': 1.0})
+
+    message = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/slow.py'})
+
+    assert message.artifact == {'exit_code': -1, 'timed_out': True, 'stdout_bytes': 0, 'stderr_bytes': 0, 'shared': []}
+
+
 def test_output_over_the_ceiling_is_saved_and_previewed_then_readable_by_range(tmp_path):
     runner, client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/big.py'})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/big.py'}))
 
     lines = result.split('\n')
     assert lines[0] == 'Exit code 0'
@@ -418,7 +457,7 @@ def test_output_over_the_ceiling_is_saved_and_previewed_then_readable_by_range(t
 def test_a_shell_script_is_refused_with_a_python_only_message(tmp_path):
     runner, client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/run.sh'})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/run.sh'}))
 
     assert result == (
         '"scripts/run.sh" cannot run here: only Python (.py) scripts run on this platform. Read it with '
@@ -430,7 +469,7 @@ def test_a_shell_script_is_refused_with_a_python_only_message(tmp_path):
 def test_an_unknown_script_path_suggests_the_closest_files(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/step3.py'})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/step3.py'}))
 
     assert result.startswith('Skill "demo" has no file "scripts/step3.py". Did you mean: ')
     assert '"scripts/step1.py"' in result and '"scripts/step2.py"' in result
@@ -439,7 +478,7 @@ def test_an_unknown_script_path_suggests_the_closest_files(tmp_path):
 def test_a_path_outside_the_skill_is_refused(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': '../other/x.py'})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': '../other/x.py'}))
 
     assert result.startswith('Path "../other/x.py" is outside skill "demo"')
 
@@ -447,7 +486,7 @@ def test_a_path_outside_the_skill_is_refused(tmp_path):
 def test_running_a_script_of_a_skill_not_loaded_yet_loads_it_first(tmp_path):
     runner, _client = _runner(tmp_path=tmp_path)
 
-    result = _run_tool(runner, loaded=()).invoke({'skill': 'demo', 'path': 'scripts/helper.py'})
+    result = _content(_run_tool(runner, loaded=()).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}))
 
     assert result.startswith('Skill "demo" is now active')
     assert result.endswith('\n\nExit code 0\n(no output)')
@@ -471,7 +510,7 @@ def test_a_scratch_over_its_cap_stops_the_script_before_it_starts(tmp_path):
     runner, _client = _runner(client=client, tmp_path=tmp_path, caps=ScratchCaps(max_total_bytes=100))
 
     with outcome_sink() as recorded:
-        result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'})
+        result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}))
 
     assert result == (
         "The script cannot start: the conversation's script storage holds 200 B in 1 files, over the limit of "
@@ -482,20 +521,55 @@ def test_a_scratch_over_its_cap_stops_the_script_before_it_starts(tmp_path):
 
 
 def test_files_that_would_overflow_the_scratch_are_not_kept_and_the_model_is_told(tmp_path):
-    runner, client = _runner(tmp_path=tmp_path, caps=ScratchCaps(max_total_bytes=60))
+    client = FakeClient()
+    _seed_scratch(client, {'old.bin': b'o' * 995})
+    runner, _client = _runner(client=client, tmp_path=tmp_path, caps=ScratchCaps(max_total_bytes=1000))
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/step1.py', 'args': ['y' * 100]})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/write.py', 'args': ['new.txt']}))
 
     assert result.split('\n')[0] == 'Exit code 0'
     assert "Files written by this call were not kept" in result
-    assert client.scratch_files() == {}
+    assert set(client.scratch_files()) == {'old.bin'}
+
+
+def test_a_file_over_a_cap_is_named_and_never_leaves_the_sandbox(tmp_path):
+    runner, client = _runner(tmp_path=tmp_path, caps=ScratchCaps(max_file_bytes=100))
+    sent = []
+    sandbox = CPythonSandbox()
+    original = sandbox.execute
+    async def execute(program, **kwargs):
+        result = await original(program, **kwargs)
+        sent.append(result.result)
+        return result
+    sandbox.execute = execute
+    runner.sandbox_factory = lambda: sandbox
+
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/write_big.py', 'args': ['output/huge.bin', '500']}))
+
+    assert 'Files not kept: output/huge.bin.' in result
+    assert 'Files shared' not in result
+    assert sent[0]['files'] == {}
+    assert sent[0]['too_large'] == ['output/huge.bin']
+
+
+def test_attachments_that_would_bring_the_staged_files_over_the_cap_are_refused(tmp_path):
+    client = FakeClient(attachments={'a.bin': b'a' * 40, 'b.bin': b'b' * 40})
+    _seed_scratch(client, {'old.bin': b'o' * 30})
+    runner, _client = _runner(client=client, tmp_path=tmp_path, caps=ScratchCaps(max_file_bytes=50, max_total_bytes=100))
+
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py', 'files': ['a.bin', 'b.bin']}))
+
+    assert result == (
+        'The script cannot start: with attachment "b.bin" the files staged for this run come to 110 B, over the '
+        '100 B a run can stage.'
+    )
 
 
 def test_an_attachment_over_the_per_file_cap_is_refused(tmp_path):
     client = FakeClient(attachments={'huge.bin': b'z' * 50})
     runner, _client = _runner(client=client, tmp_path=tmp_path, caps=ScratchCaps(max_file_bytes=10))
 
-    result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'files': ['huge.bin']})
+    result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'files': ['huge.bin']}))
 
     assert result == 'The script cannot start: attachment "huge.bin" is 50 B, over the 10 B limit for one staged file.'
 
@@ -535,6 +609,42 @@ def test_the_offline_sandbox_denies_network_and_subprocesses(monkeypatch):
     assert '--allow-net' not in sandbox._build_command()
 
 
+def test_the_offline_sandbox_can_write_nothing_read_only_pyodide_and_fetch_no_module(monkeypatch):
+    from elitea_sdk.runtime.tools.sandbox import build_offline_pyodide_sandbox
+    import elitea_sdk.runtime.langchain.pyodide_sandbox as module
+    monkeypatch.setenv('PYODIDE_SANDBOX_PKG', 'main.js')
+    monkeypatch.setenv('SANDBOX_BASE', '/sandbox')
+    monkeypatch.setenv('DENO_DIR', '/sandbox/.deno_dir')
+    monkeypatch.setattr(module.shutil, 'which', lambda name: '/usr/bin/deno')
+
+    command = build_offline_pyodide_sandbox()._build_command()
+
+    assert not [flag for flag in command if flag.startswith('--allow-write')]
+    assert [flag for flag in command if flag.startswith('--allow-read')] == ['--allow-read=/sandbox/pyodide']
+    assert {'--no-remote', '--no-npm'} <= set(command)
+
+
+@pytest.mark.parametrize('allow_net', [True, False])
+def test_the_python_sandbox_tool_can_write_nothing_read_only_pyodide_and_fetch_no_module(monkeypatch, allow_net):
+    import elitea_sdk.runtime.langchain.pyodide_sandbox as module
+    import elitea_sdk.runtime.tools.sandbox as sandbox_module
+    monkeypatch.setenv('PYODIDE_SANDBOX_PKG', 'main.js')
+    monkeypatch.setenv('SANDBOX_BASE', '/sandbox')
+    monkeypatch.setenv('DENO_DIR', '/sandbox/.deno_dir')
+    monkeypatch.delenv('SANDBOX_SERVICE_URL', raising=False)
+    monkeypatch.setattr(module.shutil, 'which', lambda name: '/usr/bin/deno')
+    monkeypatch.setattr(sandbox_module, '_is_deno_available', lambda: True)
+    tool = sandbox_module.PyodideSandboxTool(allow_net=allow_net)
+
+    tool._initialize_sandbox()
+    command = tool._sandbox._build_command()
+
+    assert not [flag for flag in command if flag.startswith('--allow-write')]
+    assert [flag for flag in command if flag.startswith('--allow-read')] == ['--allow-read=/sandbox/pyodide']
+    assert {'--no-remote', '--no-npm'} <= set(command)
+    assert ('--allow-net' in command) is allow_net
+
+
 def test_the_offline_sandbox_ignores_the_remote_sandbox_service(monkeypatch):
     from elitea_sdk.runtime.tools.sandbox import build_offline_pyodide_sandbox
     import elitea_sdk.runtime.langchain.pyodide_sandbox as module
@@ -555,7 +665,7 @@ def test_a_pod_without_the_local_sandbox_reports_the_script_as_unavailable(tmp_p
     runner.sandbox_factory = missing_deno
 
     with outcome_sink() as recorded:
-        result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'})
+        result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}))
 
     assert result == 'The script could not be run: the sandbox is not available right now.'
     assert [outcome.status for outcome in recorded] == [ToolResultStatus.ERROR]
@@ -570,7 +680,7 @@ def test_a_sandbox_that_never_ran_the_program_is_reported_as_unavailable(tmp_pat
     runner, _client = _runner(tmp_path=tmp_path, sandbox=broken)
 
     with outcome_sink() as recorded:
-        result = _run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'})
+        result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}))
 
     assert result == 'The script could not be run: the sandbox is not available right now.'
     assert [outcome.status for outcome in recorded] == [ToolResultStatus.ERROR]
@@ -581,19 +691,217 @@ def _node(client, **fields):
                    output_variables=['messages'], return_type='dict', elitea_client=client, **fields)
 
 
-def test_the_llm_node_builds_a_runner_from_the_conversation_and_the_attachment_bucket():
+def test_the_llm_node_keys_the_runner_by_the_conversation_the_platform_verified():
     client = FakeClient()
     node = _node(client)
 
-    runner = node._build_skill_script_runner({'thread_id': 'conv-7', 'attachment_bucket': 'chat-files'})
-    root_runner = node._build_skill_script_runner({'thread_id': 'child-1', '__parallel_hitl_root_thread_id__': 'conv-7'})
-    child_runner = node._build_skill_script_runner({
-        'conversation_id': 'conv-uuid', 'thread_id': 'conv-uuid:dispatch_ab12:My Agent:call_1',
-        '__parallel_hitl_root_thread_id__': 'conv-uuid:dispatch_ab12:My Agent:call_1',
+    runner = node._build_skill_script_runner({
+        'skill_scratch': {'conversation_uuid': CONVERSATION, 'bucket': 'platform-files'},
+        'attachment_bucket': 'chat-files', 'conversation_id': 'something-else', 'thread_id': 'other',
+    })
+    without_toolkit = node._build_skill_script_runner({
+        'skill_scratch': {'conversation_uuid': CONVERSATION, 'bucket': 'platform-files'},
     })
 
-    assert (runner.context.bucket, runner.context.conversation_key, runner.context.client) == ('chat-files', 'conv-7', client)
-    assert (root_runner.context.bucket, root_runner.context.conversation_key) == (BUCKET, 'conv-7')
-    assert child_runner.context.conversation_key == 'conv-uuid'
-    assert node._build_skill_script_runner({}) is None
-    assert _node(None)._build_skill_script_runner({'thread_id': 'conv-7'}) is None
+    assert (runner.context.conversation_uuid, runner.context.client) == (CONVERSATION, client)
+    assert (runner.context.scratch_bucket, runner.context.attachment_bucket) == ('platform-files', 'chat-files')
+    assert (without_toolkit.context.scratch_bucket, without_toolkit.context.attachment_bucket) == ('platform-files', 'platform-files')
+
+
+@pytest.mark.parametrize('configurable', [
+    {},
+    {'conversation_id': CONVERSATION, 'thread_id': CONVERSATION, '__parallel_hitl_root_thread_id__': CONVERSATION},
+    {'skill_scratch': {'conversation_uuid': CONVERSATION}},
+    {'skill_scratch': {'conversation_uuid': 'conv-7', 'bucket': 'b'}},
+    {'skill_scratch': {'conversation_uuid': '_skill_scratch', 'bucket': 'b'}},
+    {'skill_scratch': {'conversation_uuid': f'{CONVERSATION}/../x', 'bucket': 'b'}},
+    {'skill_scratch': {'conversation_uuid': CONVERSATION.upper(), 'bucket': 'b'}},
+    {'skill_scratch': {'conversation_uuid': CONVERSATION.replace('-', ''), 'bucket': 'b'}},
+])
+def test_the_llm_node_binds_no_runner_without_a_verified_conversation_uuid(configurable):
+    assert _node(FakeClient())._build_skill_script_runner(configurable) is None
+
+
+def test_the_llm_node_binds_no_runner_without_a_client():
+    assert _node(None)._build_skill_script_runner({'skill_scratch': {'conversation_uuid': CONVERSATION, 'bucket': 'b'}}) is None
+
+
+@pytest.mark.parametrize('key', ['conv-7', '_skill_scratch', '..', f'{CONVERSATION}/x', CONVERSATION.upper(), None])
+def test_a_runner_refuses_a_key_that_is_not_a_conversation_uuid(key):
+    with pytest.raises(ValueError):
+        ScriptRunContext(client=FakeClient(), scratch_bucket=BUCKET, attachment_bucket=BUCKET, conversation_uuid=key)
+
+
+def test_scratch_goes_to_the_platform_bucket_and_attachments_come_from_and_go_to_the_toolkit_bucket(tmp_path):
+    client = FakeClient()
+    client.buckets.add('platform-files')
+    client.objects[('chat-files', f'{CONVERSATION}/notes.txt')] = (b'from the toolkit bucket', '2026-11-01T00:00:00Z')
+    client.buckets.add('chat-files')
+    runner = SkillScriptRunner(
+        ScriptRunContext(client=client, scratch_bucket='platform-files', attachment_bucket='chat-files',
+                         conversation_uuid=CONVERSATION),
+        file_fetcher=client.get_skill_file, sandbox_factory=CPythonSandbox, limits=LIMITS,
+        call_id_factory=lambda: 'call1', sandbox_base=str(tmp_path),
+    )
+    tool = _run_tool(runner)
+
+    read = _content(tool.invoke({'skill': 'demo', 'path': 'scripts/read_input.py', 'args': ['notes.txt'], 'files': ['notes.txt']}))
+    tool.invoke({'skill': 'demo', 'path': 'scripts/share.py'})
+
+    assert read == 'Exit code 0\nfrom the toolkit bucket'
+    assert ('platform-files', f'{SCRATCH_ROOT_PREFIX}/{CONVERSATION}/scratch.zip') in client.objects
+    assert ('chat-files', f'{CONVERSATION}/call1/deck.txt') in client.objects
+    assert not [key for bucket, key in client.objects if bucket != 'platform-files' and key.startswith(SCRATCH_ROOT_PREFIX)]
+
+
+def test_a_run_carries_its_facts_for_usage(tmp_path):
+    (tmp_path / 'share').mkdir()
+    (tmp_path / 'fail').mkdir()
+    sharing, _client = _runner(tmp_path=tmp_path / 'share')
+    failing, _client = _runner(tmp_path=tmp_path / 'fail')
+
+    shared = _run_tool(sharing).invoke({'skill': 'demo', 'path': 'scripts/share.py'})
+    failed = _run_tool(failing).invoke({'skill': 'demo', 'path': 'scripts/fail.py'})
+    refused = _run_tool(failing).invoke({'skill': 'demo', 'path': 'scripts/run.sh'})
+
+    assert shared.artifact == {'exit_code': 0, 'timed_out': False, 'stdout_bytes': 7, 'stderr_bytes': 0, 'shared': ['deck.txt']}
+    assert failed.artifact == {'exit_code': 3, 'timed_out': False, 'stdout_bytes': 8, 'stderr_bytes': 12, 'shared': []}
+    assert isinstance(refused, str)
+
+
+def test_two_overlapping_runs_of_one_conversation_both_keep_their_files(tmp_path):
+    client = FakeClient()
+    second, _client = _runner(client=client, tmp_path=tmp_path / 'second', call_ids=('callB',))
+    inner = CPythonSandbox()
+
+    class FinishesTheOtherRunFirst:
+        async def execute(self, program, **kwargs):
+            result = await inner.execute(program, **kwargs)
+            await second.arun(DEMO, DEMO['files'], 'scripts/write.py', ['b.txt'], [])
+            return result
+
+    first, _client = _runner(client=client, tmp_path=tmp_path / 'first', sandbox=FinishesTheOtherRunFirst(), call_ids=('callA',))
+    (tmp_path / 'first').mkdir()
+    (tmp_path / 'second').mkdir()
+
+    asyncio.run(first.arun(DEMO, DEMO['files'], 'scripts/write.py', ['a.txt'], []))
+
+    assert set(client.scratch_files()) == {'a.txt', 'b.txt'}
+
+
+def test_a_run_from_an_event_loop_leaves_the_loop_free_while_the_script_runs():
+    runner, _client = _runner()
+    ticks = []
+
+    class SlowSandbox:
+        async def execute(self, program, **kwargs):
+            await asyncio.sleep(0.3)
+            return CodeExecutionResult(status='success', execution_time=0.3, result={
+                'exit_code': 0, 'stdout': '', 'stderr': '', 'files': {}, 'too_large': [], 'deleted': [],
+            })
+
+    runner.sandbox_factory = SlowSandbox
+
+    async def ticker():
+        while True:
+            ticks.append(1)
+            await asyncio.sleep(0.01)
+
+    async def main():
+        ticking = asyncio.create_task(ticker())
+        await _run_tool(runner).ainvoke({'skill': 'demo', 'path': 'scripts/helper.py'})
+        ticking.cancel()
+
+    asyncio.run(main())
+
+    assert len(ticks) > 10
+
+
+def _spawns_recording_their_temp_directory(monkeypatch):
+    import os
+    import elitea_sdk.runtime.langchain.pyodide_sandbox as module
+    monkeypatch.setenv('PYODIDE_SANDBOX_PKG', 'main.js')
+    monkeypatch.setattr(module.shutil, 'which', lambda name: '/usr/bin/deno')
+    spawned, deno_dirs = [], []
+    answer = json.dumps({'stdout': 'ok', 'stderr': None, 'result': None, 'success': True}).encode()
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return answer, b''
+
+    async def create_subprocess_exec(*cmd, env=None, **kwargs):
+        spawned.append((env['TMPDIR'], os.path.isdir(env['TMPDIR'])))
+        deno_dirs.append(env['DENO_DIR'])
+        return Process()
+
+    def run(cmd, env=None, **kwargs):
+        spawned.append((env['TMPDIR'], os.path.isdir(env['TMPDIR'])))
+        deno_dirs.append(env['DENO_DIR'])
+        return subprocess.CompletedProcess(cmd, 0, stdout=answer, stderr=b'')
+
+    monkeypatch.setattr(module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(module.subprocess, 'run', run)
+    return module, spawned, deno_dirs
+
+
+def test_every_sandbox_run_gets_a_temporary_directory_of_its_own_removed_after_it(monkeypatch):
+    import os
+    monkeypatch.setenv('DENO_DIR', '/shared/deno_dir')
+    module, spawned, deno_dirs = _spawns_recording_their_temp_directory(monkeypatch)
+    sandbox = module.PyodideSandbox(allow_net=False)
+    sync_sandbox = module.SyncPyodideSandbox(allow_net=False)
+
+    asyncio.run(sandbox.execute('print(1)'))
+    asyncio.run(sandbox.execute('print(2)'))
+    sync_sandbox.execute('print(3)')
+
+    directories = [directory for directory, _existed in spawned]
+    assert [existed for _directory, existed in spawned] == [True, True, True]
+    assert len(set(directories)) == 3 and os.environ.get('TMPDIR') not in directories
+    assert not any(os.path.exists(directory) for directory in directories)
+    assert [os.path.dirname(deno_dir) for deno_dir in deno_dirs] == directories
+
+
+def test_a_cancelled_sandbox_run_stops_deno_before_its_temporary_directory_is_removed(monkeypatch):
+    import os
+    import elitea_sdk.runtime.langchain.pyodide_sandbox as module
+    monkeypatch.setenv('PYODIDE_SANDBOX_PKG', 'main.js')
+    monkeypatch.setattr(module.shutil, 'which', lambda name: '/usr/bin/deno')
+    seen = []
+
+    class RunningProcess:
+        returncode = None
+
+        def __init__(self, directory):
+            self.directory = directory
+
+        async def communicate(self, input=None):
+            await asyncio.sleep(3600)
+
+        def kill(self):
+            seen.append(('kill', os.path.isdir(self.directory)))
+            self.returncode = -9
+
+        async def wait(self):
+            seen.append(('exited', os.path.isdir(self.directory)))
+            return self.returncode
+
+    async def create_subprocess_exec(*cmd, env=None, **kwargs):
+        seen.append(('spawn', env['TMPDIR']))
+        return RunningProcess(env['TMPDIR'])
+
+    monkeypatch.setattr(module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+
+    async def cancel_mid_run():
+        run = asyncio.create_task(module.PyodideSandbox(allow_net=False).execute('print(1)'))
+        await asyncio.sleep(0.05)
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+    asyncio.run(cancel_mid_run())
+
+    (_spawn, directory), *rest = seen
+    assert rest == [('kill', True), ('exited', True)]
+    assert not os.path.exists(directory)
