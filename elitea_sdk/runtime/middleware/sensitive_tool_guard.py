@@ -100,9 +100,12 @@ class SensitiveToolGuardMiddleware(Middleware):
         conversation_id: Optional[str] = None,
         callbacks: Optional[Dict[str, Callable]] = None,
         auto_approve: Union[bool, Iterable[tuple[str, str]]] = False,
+        batch_approvals: bool = False,
         **kwargs,
     ):
         super().__init__(conversation_id=conversation_id, callbacks=callbacks, **kwargs)
+        # Only a literal True turns it on; a truthy string from a payload must not.
+        self.batch_approvals = batch_approvals is True
         self._wrapped_tools_cache: Dict[int, BaseTool] = {}
         # True approves every sensitive call; pairs approve only those (toolkit, tool) calls.
         # Pairs match the configured toolkit name.
@@ -270,6 +273,47 @@ class SensitiveToolGuardMiddleware(Middleware):
         tool_name = sensitive_tool_context['tool_name']
         return (toolkit, tool_name) in self._approved_pairs or (toolkit, '*') in self._approved_pairs
 
+    def pending_review(self, tool: BaseTool, tool_input: Any) -> Optional[dict[str, Any]]:
+        """Return the review context when this call needs a human decision, else None.
+
+        None means the tool is not sensitive or the call is auto-approved. Used to collect
+        every sensitive call of one AI message before any of them runs.
+        """
+        ctx = self._build_sensitive_tool_context(tool, tool_input)
+        if not ctx or self._auto_approve or self._is_approved_pair(ctx):
+            return None
+        return ctx
+
+    def _normalize_resume_value(self, resume_value: Any) -> dict[str, str]:
+        if not isinstance(resume_value, dict):
+            # Non-dict resume payloads are treated as approve.  Each sensitive
+            # tool call is reviewed independently — approving one invocation
+            # never carries over to a later call of the same tool (issue
+            # #5245: prompt on EVERY sensitive invocation).
+            return {'action': 'approve', 'value': str(resume_value or '')}
+
+        action = str(resume_value.get('action', 'approve')).strip().lower()
+        value = str(resume_value.get('value', '') or '')
+
+        # 'block_with_comment' (issue #5318) is a reject that carries a free-text
+        # note. Map it onto the reject execution path so the tool is blocked; the
+        # note rides `value` -> the blocked-tool result's `denial_reason`, the
+        # AI-native signal the model reads to decide its next step. Any other
+        # unrecognized action falls back to approve (the historical default for
+        # malformed/legacy resume payloads).
+        if action in self.BLOCK_WITH_COMMENT_ACTIONS:
+            action = 'reject'
+        elif action not in {'approve', 'reject'}:
+            action = 'approve'
+
+        if len(value) > self.MAX_COMMENT_LEN:
+            value = value[:self.MAX_COMMENT_LEN]
+
+        return {
+            'action': action,
+            'value': value,
+        }
+
     def _review_sensitive_tool_call(self, sensitive_tool_context: dict[str, Any]) -> dict[str, str]:
         # Auto-approve when the project secret allows it (API-only flows).
         if self._auto_approve or self._is_approved_pair(sensitive_tool_context):
@@ -279,6 +323,14 @@ class SensitiveToolGuardMiddleware(Middleware):
                 sensitive_tool_context['tool_name'],
             )
             return {'action': 'approve', 'value': ''}
+
+        # A decision the user already gave for this exact call in a batch pause.
+        # Read it once and clear it, so it never answers a later call or a later interrupt().
+        from ..tools.llm import _RESUMED_SENSITIVE_DECISION
+        resumed = _RESUMED_SENSITIVE_DECISION.get(None)
+        if resumed is not None:
+            _RESUMED_SENSITIVE_DECISION.set(None)
+            return self._normalize_resume_value(resumed)
 
         # Capture intermediate messages accumulated by __perform_tool_calling
         # before the interrupt.  These will be stored in the checkpoint and
@@ -327,35 +379,7 @@ class SensitiveToolGuardMiddleware(Middleware):
         if serialized_pending:
             interrupt_payload['_pending_messages'] = serialized_pending
 
-        resume_value = interrupt(interrupt_payload)
-        if not isinstance(resume_value, dict):
-            # Non-dict resume payloads are treated as approve.  Each sensitive
-            # tool call is reviewed independently — approving one invocation
-            # never carries over to a later call of the same tool (issue
-            # #5245: prompt on EVERY sensitive invocation).
-            return {'action': 'approve', 'value': str(resume_value or '')}
-
-        action = str(resume_value.get('action', 'approve')).strip().lower()
-        value = str(resume_value.get('value', '') or '')
-
-        # 'block_with_comment' (issue #5318) is a reject that carries a free-text
-        # note. Map it onto the reject execution path so the tool is blocked; the
-        # note rides `value` -> the blocked-tool result's `denial_reason`, the
-        # AI-native signal the model reads to decide its next step. Any other
-        # unrecognized action falls back to approve (the historical default for
-        # malformed/legacy resume payloads).
-        if action in self.BLOCK_WITH_COMMENT_ACTIONS:
-            action = 'reject'
-        elif action not in {'approve', 'reject'}:
-            action = 'approve'
-
-        if len(value) > self.MAX_COMMENT_LEN:
-            value = value[:self.MAX_COMMENT_LEN]
-
-        return {
-            'action': action,
-            'value': value,
-        }
+        return self._normalize_resume_value(interrupt(interrupt_payload))
 
     def _could_be_sensitive(self, tool: BaseTool) -> bool:
         """Quick check whether a tool could match any sensitive tools config entry."""

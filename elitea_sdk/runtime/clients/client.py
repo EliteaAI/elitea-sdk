@@ -1544,10 +1544,12 @@ class EliteAClient:
         middleware_list: list,
         conversation_id: Optional[str] = None,
         auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
+        batch_sensitive_approvals: bool = False,
     ) -> None:
         """Inject sensitive tool authorization middleware when configured.
 
         auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
+        batch_sensitive_approvals: True collects the sensitive calls of one AI message into one pause.
         """
         approve = normalize_auto_approve(auto_approve_sensitive_actions)
         try:
@@ -1565,6 +1567,7 @@ class EliteAClient:
         middleware_list.append(SensitiveToolGuardMiddleware(
             conversation_id=conversation_id,
             auto_approve=approve,
+            batch_approvals=batch_sensitive_approvals,
         ))
 
     def _inject_tool_exception_handler(
@@ -1609,7 +1612,8 @@ class EliteAClient:
                     parallel_hitl_max_concurrency: int = 8,
                     user_declined_mcp_servers: Optional[list] = None,
                     project_context: Optional[dict] = None,
-                    routing_instructions: Optional[str] = None):
+                    routing_instructions: Optional[str] = None,
+                    batch_sensitive_approvals: bool = False):
         auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
             tools = []
@@ -1692,7 +1696,9 @@ class EliteAClient:
         self._inject_context_editing(middleware_list, context_settings, conversation_id)
 
         # Inject sensitive tool authorization guard when configured
-        self._inject_sensitive_tool_guard(middleware_list, conversation_id, auto_approve_sensitive_actions)
+        self._inject_sensitive_tool_guard(
+            middleware_list, conversation_id, auto_approve_sensitive_actions, batch_sensitive_approvals,
+        )
 
         # add ToolExceptionHandlerMiddleware to handle tool errors with LLM messages
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
@@ -2063,7 +2069,8 @@ class EliteAClient:
                       independent_parallel_hitl: bool = True,
                       parallel_hitl_max_concurrency: int = 8,
                       user_declined_mcp_servers: Optional[list] = None,
-                      project_context: Optional[dict] = None):
+                      project_context: Optional[dict] = None,
+                      batch_sensitive_approvals: bool = False):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -2085,6 +2092,7 @@ class EliteAClient:
             internal_tools: Optional list of internal tool names (e.g., ['swarm', 'planner']).
                            Enables special modes like swarm for multi-agent collaboration.
             auto_approve_sensitive_actions: True approves every sensitive action; a list of (toolkit, tool) pairs approves only those pairs.
+            batch_sensitive_approvals: True raises one pause for the sensitive calls of one AI message (default off).
             context_settings: Optional context params
             step_limit: Optional maximum number of tool execution iterations (default: 25).
                        Use to limit or extend how many tool calls the agent can make per turn.
@@ -2143,7 +2151,9 @@ class EliteAClient:
         self._inject_context_editing(middleware_list, context_settings, conversation_id)
 
         # Inject sensitive tool authorization guard when configured
-        self._inject_sensitive_tool_guard(middleware_list, conversation_id, auto_approve_sensitive_actions)
+        self._inject_sensitive_tool_guard(
+            middleware_list, conversation_id, auto_approve_sensitive_actions, batch_sensitive_approvals,
+        )
 
         # LangChainAssistant constructor calls get_tools() which may raise McpAuthorizationRequired
         # The exception will propagate naturally to the indexer worker's outer handler

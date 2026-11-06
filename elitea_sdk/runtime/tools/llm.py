@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -181,6 +182,22 @@ NESTED_REASONING_ONLY_CONTINUATION_PROMPT = (
 _PENDING_TOOL_MESSAGES: contextvars.ContextVar[list] = contextvars.ContextVar(
     '_pending_tool_messages', default=[],
 )
+
+# The decision a user already gave for the tool call that runs right now, set by
+# __perform_tool_calling after a batch sensitive pause. The guard reads it before
+# it calls interrupt() and clears it, so a decision answers its own call only.
+_RESUMED_SENSITIVE_DECISION: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    '_resumed_sensitive_decision', default=None,
+)
+
+
+@contextlib.contextmanager
+def _resumed_decision_scope(decision: Optional[dict]):
+    token = _RESUMED_SENSITIVE_DECISION.set(decision)
+    try:
+        yield
+    finally:
+        _RESUMED_SENSITIVE_DECISION.reset(token)
 
 
 def _args_match_normalized(args_a: dict, args_b: dict) -> bool:
@@ -2049,6 +2066,14 @@ class LLMNode(BaseTool):
                     ),
                     pending_capture_base=_durable_base_count,
                     parked_holder=parked_holder,
+                    # Only a batch resume carries decisions for regular calls. The
+                    # audit channel in state is never a source: its ids may repeat.
+                    batch_decisions=(
+                        hitl_ctx.get('hitl_decisions')
+                        if hitl_ctx and hitl_ctx.get('parallel_calls')
+                        and isinstance(hitl_ctx.get('hitl_decisions'), list)
+                        else None
+                    ),
                 )
             )
 
@@ -4272,9 +4297,108 @@ class LLMNode(BaseTool):
         )
         _langgraph_interrupt(aggregate)  # raises GraphInterrupt → parent pregel
 
+    def _batch_approval_guard(self):
+        """Return the sensitive-tool guard when it batches approvals, else None."""
+        wrapping = getattr(self.middleware_manager, 'wrapping_middleware', None)
+        if not isinstance(wrapping, list):
+            return None
+        for middleware in wrapping:
+            if (
+                getattr(middleware, 'GUARDS_SENSITIVE_ACTIONS', False)
+                and getattr(middleware, 'batch_approvals', False) is True
+            ):
+                return middleware
+        return None
+
+    def _pause_for_batch_sensitive_calls(
+        self, guard, tool_calls, new_messages, config, decisions_by_id, capture_start,
+    ):
+        """Raise ONE pause for every regular sensitive call of this AI message.
+
+        Calls with a decision, calls already done and Application calls are left out.
+        Nothing runs before the pause, so the resume runs all calls in message order.
+        Two or more open calls pause here; one open call pauses here only when other
+        calls of the message were already decided, so those decisions are not lost.
+        The pending entries carry names only, never arguments.
+        """
+        from langchain_core.messages import message_to_dict
+        from .application import Application
+
+        message_ids = set()
+        open_calls = []
+        for tool_call in tool_calls:
+            is_dict = isinstance(tool_call, dict)
+            tool_name = tool_call.get('name', '') if is_dict else getattr(tool_call, 'name', '')
+            tool_args = tool_call.get('args', {}) if is_dict else getattr(tool_call, 'args', {})
+            tool_call_id = tool_call.get('id', '') if is_dict else getattr(tool_call, 'id', '')
+            if not tool_call_id:
+                continue
+            message_ids.add(tool_call_id)
+            if tool_call_id in decisions_by_id or self._tool_call_already_completed(
+                tool_call_id, new_messages,
+            ):
+                continue
+            tool = self._resolve_tool_to_execute(tool_name, config)
+            if tool is None or isinstance(tool, Application):
+                continue
+            ctx = guard.pending_review(tool, tool_args)
+            if ctx is not None:
+                open_calls.append((tool_call_id, ctx))
+
+        decided_here = [d for call_id, d in decisions_by_id.items() if call_id in message_ids]
+        if len(open_calls) < 2 and not (open_calls and decided_here):
+            return
+
+        pending = [
+            {
+                HITL_INTERRUPT_ID_KEY: f'hitl_{uuid4().hex}',
+                HITL_TOOL_CALL_ID_KEY: call_id,
+                'guardrail_type': 'sensitive_tool',
+                'toolkit_name': ctx.get('toolkit_name') or ctx.get('toolkit_type') or '',
+                'toolkit_type': ctx.get('toolkit_type') or '',
+                'tool_name': ctx['tool_name'],
+                'action_label': ctx['action_label'],
+                'message': ctx['policy_message'],
+                'available_actions': ['approve', 'reject', 'block_with_comment'],
+            }
+            for call_id, ctx in open_calls
+        ]
+        intermediate = list(new_messages[capture_start:])
+        _PENDING_TOOL_MESSAGES.set(intermediate)
+        pending_serialized = []
+        for message in intermediate:
+            try:
+                pending_serialized.append(message_to_dict(message))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        aggregate = {
+            'type': 'hitl',
+            'guardrail_type': 'parallel_sensitive_tools',
+            'batch': 'sequential',
+            'message': pending[0]['message'],
+            'pending': pending,
+            '_pending_messages': pending_serialized,
+            # Answers already given in this message. They survive the next pause,
+            # because no call runs before every sensitive call has an answer.
+            '_batch_decided': [
+                {
+                    HITL_TOOL_CALL_ID_KEY: d.get(HITL_TOOL_CALL_ID_KEY),
+                    'action': d.get('action', 'approve'),
+                    'value': d.get('value', ''),
+                }
+                for d in decided_here
+            ],
+        }
+        logger.info(
+            "[HITL] Batching %d sensitive tool call(s) into one pause (%d already decided)",
+            len(pending), len(decided_here),
+        )
+        _langgraph_interrupt(aggregate)  # raises GraphInterrupt
+
     async def __perform_tool_calling(
         self, completion, messages, llm_client, config, hitl_decisions=None,
         pending_hitl_entries=None, pending_capture_base=None, parked_holder=None,
+        batch_decisions=None,
     ):
         # Several historical branches import ToolMessage locally.  Bind it
         # before any awaited tool invocation so an exception raised before one
@@ -4328,6 +4452,13 @@ class LLMNode(BaseTool):
         _injection_thread_id = (config or {}).get('configurable', {}).get('thread_id')
         effective_limit = self.steps_limit
         _injection_budget_max = self.steps_limit * 2
+
+        decisions_by_call_id = {
+            d[HITL_TOOL_CALL_ID_KEY]: d
+            for d in (batch_decisions or [])
+            if isinstance(d, dict) and d.get(HITL_TOOL_CALL_ID_KEY)
+            and not d.get(HITL_VIA_CALL_ID_KEY)
+        }
 
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
@@ -4393,6 +4524,20 @@ class LLMNode(BaseTool):
                     raise
                 tool_calls = []  # handled in bulk; skip the sequential loop below
 
+            # Decisions from a batch resume answer the resumed message only; a later
+            # model turn can reuse a call id, so it never sees them.
+            turn_decisions = decisions_by_call_id if iteration == 1 else {}
+            batch_guard = self._batch_approval_guard()
+            if batch_guard is not None and tool_calls:
+                try:
+                    self._pause_for_batch_sensitive_calls(
+                        batch_guard, tool_calls, new_messages, config,
+                        turn_decisions, _pending_capture_start,
+                    )
+                except GraphBubbleUp:
+                    _PENDING_TOOL_MESSAGES.set([])
+                    raise
+
             for tool_call in tool_calls:
                 tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call,
                                                                                                   'name',
@@ -4454,7 +4599,13 @@ class LLMNode(BaseTool):
 
                         # The middleware turns a tool exception into prose, so the call looks like a
                         # success; the sink is how this loop and the run callbacks learn it failed.
-                        with outcome_sink() as recorded:
+                        # Application children run in this context; only a regular tool may
+                        # read the resumed decision, or a child's guard would take it.
+                        call_decision = (
+                            None if is_application
+                            else turn_decisions.get(tool_call_id)
+                        )
+                        with outcome_sink() as recorded, _resumed_decision_scope(call_decision):
                             tool_result = None
                             if is_application:
                                 # Application overrides invoke() (not ainvoke) to read tool_call_id

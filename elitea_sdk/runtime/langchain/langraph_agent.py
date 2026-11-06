@@ -2455,11 +2455,22 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 or original_ai_dict.get('data', {}).get('tool_calls') \
                                 or []
 
+                        # A batch pause keeps the answers of earlier rounds, because no
+                        # call of the message runs before all of them are answered.
+                        answered = {
+                            d.get('tool_call_id') for d in decisions if isinstance(d, dict)
+                        }
+                        carried = [
+                            dict(d) for d in (hitl_interrupt.get('_batch_decided') or [])
+                            if isinstance(d, dict) and d.get('tool_call_id')
+                            and d['tool_call_id'] not in answered
+                        ]
+
                         resume_ctx = {
                             'parallel_calls': list(parallel_calls),
                             'content': (original_ai_dict or {}).get('content', '')
                                 if isinstance(original_ai_dict, dict) else '',
-                            'hitl_decisions': list(decisions),
+                            'hitl_decisions': [*decisions, *carried],
                             # The node replays every Application call in the
                             # original fan-out. Keep the checkpoint-authoritative
                             # pending set so untouched children can be carried
@@ -3255,7 +3266,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
     # Internal payload keys that must never leak to the UI/transport layer.
     _HITL_INTERNAL_KEYS = (
-        'tool_args_raw', '_pending_messages',
+        'tool_args_raw', '_pending_messages', '_batch_decided',
         '_source_node_name',
         '_parent_tool_name', '_parent_tool_args', '_parent_tool_call_id',
         *HITL_PRIVATE_ROUTING_KEYS,
