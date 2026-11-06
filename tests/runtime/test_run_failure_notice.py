@@ -25,6 +25,9 @@ from elitea_sdk.runtime.tools.loop_output import LoopToolNode
 from elitea_sdk.runtime.tools.tool import ToolNode
 
 
+FAILED_NOTICE = "The tool {name} failed. Open the run log for details."
+
+
 class _Args(BaseModel):
     issue_number: str = Field(description="The issue number")
 
@@ -208,7 +211,23 @@ class TestValidationFailureNodes:
             result = node.invoke({"text": "go"})
 
         _assert_tagged(result["messages"])
-        assert "raised ValidationError" in result["messages"][0]["content"]
+        assert result["messages"][0]["content"] == FAILED_NOTICE.format(name="update_issue")
+
+    def test_agent_node_notice_hides_input_schema_and_error_but_logs_detail(self, caplog):
+        node = AgentNode(
+            tool=_make_schema_tool(), task="Do {text}",
+            input_variables=["text"], output_variables=["out"],
+        )
+        with patch("elitea_sdk.runtime.tools.agent.dispatch_custom_event"):
+            with caplog.at_level("ERROR", logger="elitea_sdk.runtime.tools.agent"):
+                result = node.invoke({"text": "secret-input"})
+
+        content = result["messages"][0]["content"]
+        assert "secret-input" not in content
+        assert "Tool schema" not in content
+        assert "issue_number" not in content
+        assert "validation error" not in content.lower()
+        assert any(r.exc_info for r in caplog.records)
 
     def test_indexer_node_index_error_is_tagged(self):
         node = IndexerNode(
@@ -220,7 +239,38 @@ class TestValidationFailureNodes:
             result = node.invoke({})
 
         _assert_tagged(result["messages"])
-        assert "raised ValidationError" in result["messages"][0]["content"]
+        assert result["messages"][0]["content"] == FAILED_NOTICE.format(name="update_issue")
+
+    def test_indexer_node_notice_hides_input_schema_and_error_but_logs_detail(self, caplog):
+        node = IndexerNode(
+            tool=_tool(lambda issue_number: "secret-document"),
+            index_tool=StructuredTool.from_function(
+                func=lambda documents: _raise_runtime(documents),
+                name="index_docs", description="Index documents"),
+            input_mapping={"issue_number": {"type": "fixed", "value": "1"}},
+            input_variables=[], output_variables=["out"],
+        )
+        with patch("elitea_sdk.runtime.tools.indexer_tool.dispatch_custom_event"):
+            with caplog.at_level("ERROR", logger="elitea_sdk.runtime.tools.indexer_tool"):
+                result = node.invoke({})
+
+        content = result["messages"][0]["content"]
+        assert "secret-document" not in content
+        assert "connection refused" not in content
+        assert "Tool schema" not in content
+        assert "connection refused" in caplog.text
+
+    def test_indexer_node_notice_when_the_tool_call_itself_fails(self):
+        node = IndexerNode(
+            tool=_tool(_raise_runtime),
+            input_mapping={"issue_number": {"type": "fixed", "value": "1"}},
+            input_variables=[], output_variables=["out"],
+        )
+        with patch("elitea_sdk.runtime.tools.indexer_tool.dispatch_custom_event"):
+            result = node.invoke({})
+
+        _assert_tagged(result["messages"])
+        assert result["messages"][0]["content"] == FAILED_NOTICE.format(name="update_issue")
 
 
 def _read_tool():

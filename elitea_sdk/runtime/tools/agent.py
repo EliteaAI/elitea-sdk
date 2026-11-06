@@ -1,13 +1,11 @@
 import logging
 from json import dumps
-from traceback import format_exc
 from typing import Any, Optional, Union
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.messages import ToolCall
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
-from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
 from ..langchain.utils import log_tool_result
@@ -34,9 +32,6 @@ class AgentNode(BaseTool):
             config: Optional[RunnableConfig] = None,
             **kwargs: Any,
     ) -> Any:
-        params = convert_to_openai_tool(self.tool).get(
-            'function', {'parameters': {}}).get(
-            'parameters', {'properties': {}}).get('properties', {})
         input_ = []
         last_message = {}
         logger.debug(f"AgentNode input: {self.input_variables}")
@@ -73,11 +68,9 @@ class AgentNode(BaseTool):
                 return {self.output_variables[0]: tool_result,
                         "messages": [{"role": "assistant", "content": message_result}]}
         except ValidationError:
-            logger.error(f"ValidationError: {format_exc()}")
+            logger.error("AgentNode %s failed", self.tool.name, exc_info=True)
             return {
-                "messages": [run_failure_message(f"""Tool input to the {self.tool.name} with value {agent_input} raised ValidationError. 
-        \n\nTool schema is {dumps(params)} \n\nand the input to LLM was 
-        {task}""")]}
+                "messages": [run_failure_message(f"The tool {self.tool.name} failed. Open the run log for details.")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

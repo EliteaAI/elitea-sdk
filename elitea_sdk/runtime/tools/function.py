@@ -26,7 +26,6 @@ from ..tool_outcome import (
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from typing import Any, Optional, Union
-from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
 from .sandbox import CLIENT_ALIAS_LINE
@@ -489,10 +488,6 @@ alita_state = elitea_state.copy()
             config: Optional[RunnableConfig] = None,
             **kwargs: Any,
     ) -> Any:
-        params = convert_to_openai_tool(self.tool).get(
-            'function', {'parameters': {}}).get(
-            'parameters', {'properties': {}}).get('properties', {})
-
         func_args = propagate_the_input_mapping(input_mapping=self.input_mapping, input_variables=self.input_variables,
                                                 state=state)
 
