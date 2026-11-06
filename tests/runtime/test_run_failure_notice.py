@@ -6,15 +6,17 @@ messages whose text reads like a normal answer. Each carries
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-from elitea_sdk.runtime.langchain.langraph_agent import _make_mcp_auth_skip_node
+from elitea_sdk.runtime.langchain.langraph_agent import LangGraphAgentRunnable, _make_mcp_auth_skip_node
 from elitea_sdk.runtime.tool_outcome import RUN_FAILURE_NOTICE_KEY, run_failure_message
 from elitea_sdk.runtime.tools.agent import AgentNode
 from elitea_sdk.runtime.tools.application import Application
@@ -92,6 +94,15 @@ class TestFunctionTool:
         assert "connection refused" not in content
         assert "42" not in content
         assert "Tool schema" not in content
+
+    def test_exception_branch_logs_the_detail_but_not_the_arguments(self, caplog):
+        with caplog.at_level("ERROR", logger="elitea_sdk.runtime.tools.function"):
+            _run(_function_node(_tool(_raise_runtime)))
+
+        failed = [r for r in caplog.records if r.name == "elitea_sdk.runtime.tools.function" and r.exc_info]
+        assert len(failed) == 1
+        assert "connection refused" in str(failed[0].exc_info[1])
+        assert "42" not in failed[0].getMessage()
 
     def test_successful_call_message_is_not_tagged(self):
         result = _run(_function_node(_tool(lambda issue_number: "done")))
@@ -383,6 +394,20 @@ class TestLlmProviderErrors:
         assert error.response_metadata.get('llm_node_error') is True
         assert error.response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True
 
+    @pytest.mark.parametrize('error, expected', [
+        pytest.param(
+            httpx.ReadTimeout('timed out'),
+            'Error: LLM stream stalled: no data received. The model provider stopped responding; please retry.',
+            id='stalled-stream',
+        ),
+        pytest.param(RuntimeError('Error code: 400 - bad request'), 'Error: Error code: 400 - bad request', id='http-400'),
+    ])
+    def test_provider_error_answer_keeps_the_text_the_platform_matches(self, error, expected):
+        # elitea_core marks a model failure by this exact "Error: " prefix and shows the text after it
+        result = _run_llm(_llm_node(_RaisingCompletionClient(error)))
+
+        assert _ai_messages(result)[-1].content == expected
+
     @pytest.mark.parametrize('error_text, expected', [
         pytest.param('invalid credentials for the model', 'Model configuration error', id='non-recoverable'),
         pytest.param('provider down', 'Error processing tool results', id='other'),
@@ -498,3 +523,34 @@ class TestNestedApplication:
         stored = _after_add_messages(result['messages'])[0]
         assert stored.content == 'all done'
         assert RUN_FAILURE_NOTICE_KEY not in stored.response_metadata
+
+    @pytest.mark.parametrize('flag, value', [
+        pytest.param(PIPELINE_BLOCKED_KEY, 'stopped', id='pipeline-blocked'),
+        pytest.param('tool_execution_limit_reached', True, id='step-limit'),
+    ])
+    def test_a_child_that_stopped_reaches_the_parent_as_a_tagged_message(self, flag, value):
+        response = {'messages': [HumanMessage(content='go'), AIMessage(content='stopped')], 'output': 'stopped', flag: value}
+
+        result = _nested_app(response)._run(task='go')
+
+        _assert_tagged(result['messages'])
+
+
+class TestNamesTheWorkerReads:
+    """The indexer worker reads these names as plain strings, so a rename must fail a test here."""
+
+    def test_the_tag_and_the_blocked_key_keep_their_names(self):
+        assert RUN_FAILURE_NOTICE_KEY == 'run_failure_notice'
+        assert PIPELINE_BLOCKED_KEY == '_pipeline_blocked'
+        assert run_failure_message('text') == {
+            'role': 'assistant', 'content': 'text', 'response_metadata': {'run_failure_notice': True},
+        }
+
+    def test_a_run_stopped_at_the_step_limit_carries_the_flag_and_the_output(self):
+        fake = SimpleNamespace(get_state=lambda config: SimpleNamespace(values={'messages': [], 'output': 'old'}))
+
+        result = LangGraphAgentRunnable._handle_graph_recursion_error(fake, {}, 'thread-1', 25)
+
+        assert result['tool_execution_limit_reached'] is True
+        assert result['execution_finished'] is False
+        assert result['output'].startswith('Tool step limit 25 reached')
