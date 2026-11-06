@@ -4470,7 +4470,8 @@ class LLMNode(BaseTool):
             call_id = d.get(HITL_TOOL_CALL_ID_KEY)
             if not call_id:
                 continue
-            # A reject or a block on a repeated id must win over an approve.
+            # The client can send two answers for one call; a reject or a block
+            # must win over an approve, whatever the order.
             if call_id not in decisions_by_call_id or d.get('action', 'approve') != 'approve':
                 decisions_by_call_id[call_id] = d
 
@@ -4538,15 +4539,12 @@ class LLMNode(BaseTool):
                     raise
                 tool_calls = []  # handled in bulk; skip the sequential loop below
 
-            # Decisions from a batch resume answer the resumed message only; a later
-            # model turn can reuse a call id, so it never sees them.
-            turn_decisions = decisions_by_call_id if iteration == 1 else {}
             batch_guard = self._batch_approval_guard()
             if batch_guard is not None and tool_calls:
                 try:
                     self._pause_for_batch_sensitive_calls(
                         batch_guard, tool_calls, new_messages, config,
-                        turn_decisions, _pending_capture_start,
+                        decisions_by_call_id, _pending_capture_start,
                     )
                 except GraphBubbleUp:
                     _PENDING_TOOL_MESSAGES.set([])
@@ -4617,7 +4615,7 @@ class LLMNode(BaseTool):
                         # read the resumed decision, or a child's guard would take it.
                         call_decision = (
                             None if is_application
-                            else turn_decisions.get(tool_call_id)
+                            else decisions_by_call_id.get(tool_call_id)
                         )
                         with outcome_sink() as recorded, _resumed_decision_scope(call_decision):
                             tool_result = None

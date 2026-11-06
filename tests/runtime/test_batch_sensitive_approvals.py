@@ -6,6 +6,7 @@ phase builds a fresh runnable, as every HTTP request does in production.
 import json
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
@@ -285,6 +286,21 @@ class TestBatchPause:
         assert len(first.get('hitl_interrupts') or []) <= 1
         assert recorder.executed == []
 
+    @pytest.mark.parametrize('order', ['approve_first', 'reject_first'])
+    def test_two_answers_for_one_call_block_it(self, order):
+        memory, recorder, cfg, first = _start(CALLS2)
+        pending = first['hitl_interrupts']
+        approve = _decide(pending, only={'create_file'})
+        reject = _decide(pending, action='reject', only={'create_file'})
+        both = approve + reject if order == 'approve_first' else reject + approve
+
+        final, _ = _resume(
+            memory, recorder, cfg, CALLS2, both + _decide(pending, only={'delete_file'}),
+        )
+
+        assert final['execution_finished'] is True
+        assert recorder.executed == ['delete_file']
+
     def test_single_sensitive_call_keeps_single_pause(self):
         calls = [('read_file', 'c0'), ('create_file', 'c1')]
         _, _, _, first = _start(calls)
@@ -340,6 +356,17 @@ class TestNoStaleDecision:
 
         assert final['execution_finished'] is True
         assert recorder.executed == ['create_file', 'delete_file', 'create_file', 'delete_file']
+
+    def test_reused_call_ids_in_a_later_turn_run_nothing_again(self):
+        memory, recorder, cfg, first = _start(CALLS2, later_calls=CALLS2)
+
+        final, _ = _resume(
+            memory, recorder, cfg, CALLS2, _decide(first['hitl_interrupts']), later_calls=CALLS2,
+        )
+
+        assert final['execution_finished'] is True
+        assert not final.get('hitl_interrupts')
+        assert recorder.executed == ['create_file', 'delete_file']
 
     def test_block_with_comment_keeps_note_in_blocked_result(self):
         memory, recorder, cfg, first = _start(CALLS2, later_calls=LATER2)
